@@ -230,12 +230,16 @@ describe('Conversations workspace integration', () => {
     updateSnapshot(baseEnvelope(true));
     render(<App />);
 
-    const switcher = screen.getByRole('tablist', { name: 'Workspace' });
+    const switcher = screen.getByRole('group', { name: 'Workspace' });
     expect(switcher).not.toBeNull();
-    const convTab = within(switcher).getByRole('tab', { name: 'Conversations' });
+    const dashBtn = within(switcher).getByRole('button', { name: 'Dashboard' });
+    expect(dashBtn).toHaveAttribute('aria-pressed', 'true');
+    const convTab = within(switcher).getByRole('button', { name: 'Conversations' });
+    expect(convTab).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(convTab);
     expect(getState().view).toBe('conversations');
+    expect(convTab).toHaveAttribute('aria-pressed', 'true');
 
     // Rail mounts with its search input + the browsed conversation row.
     await waitFor(() => {
@@ -250,7 +254,7 @@ describe('Conversations workspace integration', () => {
   it('2: switcher is absent when transcriptsEnabled is false', () => {
     updateSnapshot(baseEnvelope(false));
     render(<App />);
-    expect(screen.queryByRole('tablist', { name: 'Workspace' })).toBeNull();
+    expect(screen.queryByRole('group', { name: 'Workspace' })).toBeNull();
   });
 
   it('3: a Sessions-row entry button opens the reader for that session', async () => {
@@ -281,7 +285,7 @@ describe('Conversations workspace integration', () => {
     render(<App />);
 
     // Enter the view via the switcher, then type a needle to search.
-    fireEvent.click(screen.getByRole('tab', { name: 'Conversations' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     const input = (await waitFor(() => {
       const el = document.querySelector<HTMLInputElement>('.conv-rail-search-input');
       expect(el).not.toBeNull();
@@ -543,14 +547,14 @@ describe('Conversations workspace integration', () => {
     // Bootstrap (the /api/data shape): switcher shown.
     updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:00Z'));
     render(<App />);
-    expect(screen.getByRole('tablist', { name: 'Workspace' })).not.toBeNull();
+    expect(screen.getByRole('group', { name: 'Workspace' })).not.toBeNull();
 
     // A NEWER snapshot that ALSO carries the field (the FIXED SSE envelope —
     // _serve_api_events now injects transcriptsEnabled per connection). The
     // store replaces the whole snapshot on every tick, so the switcher must
     // PERSIST rather than vanishing ~15s after bootstrap.
     act(() => { updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:15Z')); });
-    expect(screen.getByRole('tablist', { name: 'Workspace' })).not.toBeNull();
+    expect(screen.getByRole('group', { name: 'Workspace' })).not.toBeNull();
 
     // Contract pin: a still-newer snapshot that OMITS the field hides the
     // switcher. This is exactly the pre-fix SSE behavior — it documents that
@@ -558,6 +562,6 @@ describe('Conversations workspace integration', () => {
     // loses the gate. The day the backend injection is dropped, this branch
     // reproduces the regression (switcher gone after the first SSE tick).
     act(() => { updateSnapshot(baseEnvelope(undefined, '2026-05-13T10:00:30Z')); });
-    expect(screen.queryByRole('tablist', { name: 'Workspace' })).toBeNull();
+    expect(screen.queryByRole('group', { name: 'Workspace' })).toBeNull();
   });
 });

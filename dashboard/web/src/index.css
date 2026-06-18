@@ -5,7 +5,15 @@
   --border-soft: rgba(255,255,255,0.06);
   --text: #d9dde5;
   --text-dim: #8b92a3;
-  --text-faint: #5a6070;
+  /* A6 — split the formerly-overloaded faint token. --text-faint is now
+     FOREGROUND-only, lightened to clear WCAG AA (≥4.5:1) on both panel
+     backgrounds (#7a8295 → 4.81:1 on #11131c, 4.97:1 on #0d0f16). The old
+     #5a6070 slate lives on as --surface-faint for the background/border
+     fills, so --text on those fills (#d9dde5 on #5a6070 → 4.62:1) is
+     unchanged. Never point a `color:` at --surface-faint or a fill at
+     --text-faint. */
+  --text-faint: #7a8295;
+  --surface-faint: #5a6070;
   --accent-green: #3ddc84;
   --accent-purple: #c084fc;
   --accent-pink: #ec4899;
@@ -49,6 +57,39 @@ body { padding: 16px; box-sizing: border-box; }
 
 /* Utility — referenced from dashboard.html for secondary / parenthetical text. */
 .mute { color: var(--text-dim); }
+
+/* Visually-hidden (A3) — removed from the visual layout but kept in the
+   accessibility tree. Backs the off-screen page <h1>. Standard clip-rect. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+/* Keyboard bypass (A7) — off-screen until focused, then pinned top-left
+   above the topbar. Honors prefers-reduced-motion for the slide-in. */
+.skip-link {
+  position: fixed;
+  top: 8px; left: 8px;
+  z-index: 9999;
+  padding: 8px 14px;
+  background: var(--panel-bg-2);
+  color: var(--text);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  transform: translateY(-200%);
+  opacity: 0;
+}
+.skip-link:focus {
+  transform: translateY(0);
+  opacity: 1;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skip-link { transition: transform 120ms ease, opacity 120ms ease; }
+}
 
 /* -------- Header bar -------- */
 .topbar {
@@ -422,12 +463,12 @@ body { padding: 16px; box-sizing: border-box; }
   border-bottom: 1px solid var(--accent-line);
 }
 .panel-header .icon { width: 18px; height: 18px; }
-.panel-header h3 {
+.panel-header h2 {
   margin: 0; font-size: 15px; font-weight: 700;
   letter-spacing: 0.2px;
   font-family: var(--font-mono);
 }
-.panel-header h3 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
+.panel-header h2 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
 
 .panel-body { flex: 1 1 auto; }
 
@@ -1410,6 +1451,23 @@ mark.current {
   outline: 2px solid var(--accent-orange);
   outline-offset: 1px;
 }
+/* The Sessions model-chip is a real <button> (A9) for keyboard operability.
+   Strip only the native button chrome so it renders byte-identical to the
+   prior <span>. Background / padding / radius / text color all come from
+   the .chip + .chip.<model> rules (same 0,2,0 specificity, declared earlier
+   in source order) — so this reset deliberately does NOT set background,
+   padding, or color, which would otherwise win and flatten the chip.
+   font/line-height:inherit keep the chip from inheriting the UA button
+   font and growing taller. The mobile `.chip.model-chip { position:
+   relative }` + ::before 44px hit area stack on top of this. */
+.chip.model-chip {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
 
 /* ----- Panel Tab focus (Phase 10) ----- */
 /* Suppress the default focus outline but keep the panel focusable.
@@ -1823,7 +1881,7 @@ mark.current {
 .model-stack > span.opus    { background: var(--chip-opus); }
 .model-stack > span.sonnet  { background: var(--chip-sonnet); }
 .model-stack > span.haiku   { background: var(--chip-haiku); }
-.model-stack > span.other   { background: var(--text-faint); }
+.model-stack > span.other   { background: var(--surface-faint); }
 
 /* Weekly / Monthly panel-foot — single line "<n>w total · $324.18" with
    the dim label, faint dot separator, and bright tabular-nums total.
@@ -1865,7 +1923,7 @@ mark.current {
 .detail-card .chip.opus    { background: var(--chip-opus); }
 .detail-card .chip.sonnet  { background: var(--chip-sonnet); }
 .detail-card .chip.haiku   { background: var(--chip-haiku); }
-.detail-card .chip.other   { background: var(--text-faint); color: var(--text); }
+.detail-card .chip.other   { background: var(--surface-faint); color: var(--text); }
 
 .tokens-row {
   display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
@@ -3199,7 +3257,7 @@ mark.current {
   }
   .modal-handle {
     width: 36px; height: 4px;
-    background: var(--text-faint);
+    background: var(--surface-faint);
     border-radius: 2px;
     margin: 8px auto 4px;
     flex-shrink: 0;
@@ -7159,7 +7217,7 @@ mark.current {
 .conv-todo-item { display: flex; align-items: flex-start; gap: 9px; padding: 5px 6px;
   border-radius: 6px; font-size: 14px; }
 .conv-todo-item .conv-ico { margin-top: 1px; }
-.conv-todo-ring { width: 14px; height: 14px; border: 2px solid var(--text-faint);
+.conv-todo-ring { width: 14px; height: 14px; border: 2px solid var(--surface-faint);
   border-radius: 50%; flex: 0 0 auto; margin-top: 1px; }
 .conv-todo-ring--cur { border-color: var(--accent-amber);
   border-right-color: transparent; border-bottom-color: transparent; }

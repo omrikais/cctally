@@ -86,9 +86,9 @@ export function CacheReportPanel() {
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
           <div className="cr-panel-header-inner">
-            <h3 style={{ color: TEAL }}>
+            <h2 style={{ color: TEAL }}>
               Cache Report <span className="sub">(loading)</span>
-            </h3>
+            </h2>
           </div>
           <PanelGrip />
         </div>
@@ -112,7 +112,7 @@ export function CacheReportPanel() {
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
           <div className="cr-panel-header-inner">
-            <h3 style={{ color: TEAL }}>Cache Report</h3>
+            <h2 style={{ color: TEAL }}>Cache Report</h2>
           </div>
           <PanelGrip />
         </div>
@@ -246,10 +246,10 @@ export function CacheReportPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div className="cr-panel-header-inner">
-          <h3 style={{ color: headerColor }}>
+          <h2 style={{ color: headerColor }}>
             Cache Report
             {chromeAmber && <span className="sub">⚠ Today</span>}
-          </h3>
+          </h2>
         </div>
         <PanelGrip />
       </div>

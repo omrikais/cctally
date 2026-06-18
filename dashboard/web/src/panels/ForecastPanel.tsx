@@ -28,10 +28,10 @@ export function ForecastPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" style={{ color: 'var(--accent-pink)' }}>
+        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-pink)' }}>
           <use href="/static/icons.svg#crystal-ball" />
         </svg>
-        <h3 style={{ color: 'var(--accent-pink)' }}>Forecast</h3>
+        <h2 style={{ color: 'var(--accent-pink)' }}>Forecast</h2>
         <ShareIcon
           panel="forecast"
           panelLabel="Forecast"
@@ -54,7 +54,7 @@ export function ForecastPanel() {
         <div className="fc-row fc-wkavg">
           <div className="left">
             <div className="icon-box">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#trending-up" />
               </svg>
             </div>
@@ -68,7 +68,7 @@ export function ForecastPanel() {
         <div className="fc-row fc-24h">
           <div className="left">
             <div className="icon-box">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#flame" />
               </svg>
             </div>
@@ -83,7 +83,7 @@ export function ForecastPanel() {
         <div className="fc-row fc-budget-100">
           <div className="left">
             <div className="icon-box">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#dollar" />
               </svg>
             </div>
@@ -97,7 +97,7 @@ export function ForecastPanel() {
         <div className="fc-row fc-budget-90">
           <div className="left">
             <div className="icon-box">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#dollar" />
               </svg>
             </div>
@@ -111,7 +111,7 @@ export function ForecastPanel() {
       </div>
       <div className="panel-foot fc-conf">
         <div className="lbl">
-          <svg className="icon">
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#clock" />
           </svg>
           Confidence:<span className="val">{fc?.confidence ?? '—'}</span>

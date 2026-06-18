@@ -148,7 +148,7 @@ export function SessionsControls() {
             title="Filter (f)"
             onClick={openFilter}
           >
-            <svg className="icon">
+            <svg className="icon" aria-hidden="true">
               <use href="/static/icons.svg#funnel" />
             </svg>
           </button>
@@ -180,7 +180,7 @@ export function SessionsControls() {
           title="Search (/)"
           onClick={openSearch}
         >
-          <svg className="icon">
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#magnifier" />
           </svg>
         </button>
@@ -251,7 +251,7 @@ export function SessionsControls() {
         title="Cycle sort"
         onClick={onSortClick}
       >
-        <svg className="icon">
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#sort-updown" />
         </svg>
         <span className="label">

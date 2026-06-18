@@ -100,12 +100,12 @@ export function BlocksPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" style={{ color: 'var(--accent-blue)' }}>
+          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-blue)' }}>
             <use href="/static/icons.svg#layers" />
           </svg>
-          <h3 style={{ color: 'var(--accent-blue)' }}>
+          <h2 style={{ color: 'var(--accent-blue)' }}>
             Blocks <span className="sub">(5h · current week)</span>
-          </h3>
+          </h2>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <ShareIcon
@@ -129,7 +129,7 @@ export function BlocksPanel() {
               });
             }}
           >
-            <svg className="icon">
+            <svg className="icon" aria-hidden="true">
               <use href={`/static/icons.svg#${collapsed ? 'chevron-down' : 'chevron-up'}`} />
             </svg>
           </button>

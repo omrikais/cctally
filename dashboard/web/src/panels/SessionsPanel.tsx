@@ -102,12 +102,12 @@ export function SessionsPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" style={{ color: 'var(--accent-orange)' }}>
+          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-orange)' }}>
             <use href="/static/icons.svg#clock" />
           </svg>
-          <h3 style={{ color: 'var(--accent-orange)' }}>
+          <h2 style={{ color: 'var(--accent-orange)' }}>
             Recent Sessions <span className="sub">({total} total)</span>
-          </h3>
+          </h2>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {!isMobile && <SessionsControls />}
@@ -132,7 +132,7 @@ export function SessionsPanel() {
               });
             }}
           >
-            <svg className="icon">
+            <svg className="icon" aria-hidden="true">
               <use href={`/static/icons.svg#${collapsed ? 'chevron-down' : 'chevron-up'}`} />
             </svg>
           </button>
@@ -186,7 +186,7 @@ export function SessionsPanel() {
                           });
                         }}
                       >
-                        <svg className="icon">
+                        <svg className="icon" aria-hidden="true">
                           <use href="/static/icons.svg#file-text" />
                         </svg>
                       </button>
@@ -195,15 +195,14 @@ export function SessionsPanel() {
                   </td>
                   <td>{r.duration_min}m</td>
                   <td onClick={(e) => e.stopPropagation()}>
-                    <span
+                    <button
+                      type="button"
                       className={`chip model-chip ${chipCls}`}
-                      role="button"
-                      tabIndex={-1}
                       aria-label={chipLabel}
                       onClick={() => dispatch({ type: 'SET_FILTER', text: r.model })}
                     >
                       {r.model}
-                    </span>
+                    </button>
                   </td>
                   <td className="project">
                     {r.project_key && r.project_key !== '(unknown)' ? (

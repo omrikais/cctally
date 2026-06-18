@@ -102,12 +102,12 @@ export function DailyPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" style={{ color: 'var(--accent-indigo)' }}>
+          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-indigo)' }}>
             <use href="/static/icons.svg#grid" />
           </svg>
-          <h3 style={{ color: 'var(--accent-indigo)' }}>
+          <h2 style={{ color: 'var(--accent-indigo)' }}>
             Daily <span className="sub">heatmap · 30 days</span>
-          </h3>
+          </h2>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <ShareIcon
@@ -131,7 +131,7 @@ export function DailyPanel() {
               });
             }}
           >
-            <svg className="icon">
+            <svg className="icon" aria-hidden="true">
               <use href={`/static/icons.svg#${collapsed ? 'chevron-down' : 'chevron-up'}`} />
             </svg>
           </button>

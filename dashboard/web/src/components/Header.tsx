@@ -34,7 +34,10 @@ export function Header() {
   const update = useSyncExternalStore(subscribeStore, () => getState().update);
   const currentVersion = update.state?.current_version ?? null;
   return (
-    <div className="topbar">
+    <header className="topbar">
+      {/* Heading outline root (A3) — visually hidden so the topbar design
+          is untouched, but it anchors the page's h1 → h2 (panel) outline. */}
+      <h1 className="sr-only">cctally dashboard</h1>
       <div className="stat topbar-brand" data-mobile-keep="primary" data-stat="brand">
         <span className="brand-name">cctally</span>
         {currentVersion ? (
@@ -48,7 +51,7 @@ export function Header() {
           chrome is identical for users without the feature. */}
       <ViewSwitcher />
       <div className="stat" data-mobile-keep="primary" data-stat="week">
-        <svg className="icon">
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#calendar" />
         </svg>
         <span className="k">Week</span>
@@ -73,7 +76,7 @@ export function Header() {
         ) : null}
       </div>
       <div className="stat" data-mobile-keep="secondary" data-stat="vs-last-week">
-        <svg className="icon" style={{ color: 'var(--accent-green)' }}>
+        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-green)' }}>
           <use href="/static/icons.svg#trending-up" />
         </svg>
         <span className="mute">vs last week</span>
@@ -95,7 +98,7 @@ export function Header() {
           aria-label="Open settings"
           onClick={() => dispatchKey('s')}
         >
-          <svg className="icon">
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#settings" />
           </svg>
         </button>
@@ -105,7 +108,7 @@ export function Header() {
           aria-label="Open help"
           onClick={() => dispatchKey('?')}
         >
-          <svg className="icon">
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#help-circle" />
           </svg>
         </button>
@@ -116,12 +119,12 @@ export function Header() {
           title="Sync now (r)"
           aria-label="Sync now"
         >
-          <svg className="icon">
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#refresh" />
           </svg>
           <SyncChip />
         </button>
       </div>
-    </div>
+    </header>
   );
 }

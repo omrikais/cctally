@@ -64,12 +64,12 @@ export function RecentAlertsPanel(): JSX.Element {
         style={{ justifyContent: 'space-between' }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" style={{ color: 'var(--accent-amber)' }}>
+          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-amber)' }}>
             <use href="/static/icons.svg#bell" />
           </svg>
-          <h3 style={{ color: 'var(--accent-amber)' }}>
+          <h2 style={{ color: 'var(--accent-amber)' }}>
             Recent alerts <span className="sub">(last 10)</span>
-          </h3>
+          </h2>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <button
@@ -87,7 +87,7 @@ export function RecentAlertsPanel(): JSX.Element {
               });
             }}
           >
-            <svg className="icon">
+            <svg className="icon" aria-hidden="true">
               <use
                 href={`/static/icons.svg#${collapsed ? 'chevron-down' : 'chevron-up'}`}
               />

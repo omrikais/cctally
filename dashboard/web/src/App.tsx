@@ -32,18 +32,25 @@ export function App() {
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
   return (
     <>
+      {/* Keyboard bypass (A7) — first tab stop; reveals on :focus and
+          moves focus (not just scroll) to the <main> region below. */}
+      <a className="skip-link" href="#main-content">Skip to main content</a>
       <Header />
-      {view === 'conversations' ? (
-        <ConversationsView />
-      ) : (
-        <PanelGridDnd items={panelOrder}>
-          <div className="grid">
-            {panelOrder.map((id, index) => (
-              <PanelHost key={id} id={id} index={index} />
-            ))}
-          </div>
-        </PanelGridDnd>
-      )}
+      {/* Landmark (A2). tabIndex=-1 lets the skip-link land keyboard/SR
+          focus inside the region, not merely the scroll position. */}
+      <main id="main-content" tabIndex={-1}>
+        {view === 'conversations' ? (
+          <ConversationsView />
+        ) : (
+          <PanelGridDnd items={panelOrder}>
+            <div className="grid">
+              {panelOrder.map((id, index) => (
+                <PanelHost key={id} id={id} index={index} />
+              ))}
+            </div>
+          </PanelGridDnd>
+        )}
+      </main>
       <Footer />
       <HelpOverlay />
       <SettingsOverlay />

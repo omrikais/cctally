@@ -71,10 +71,10 @@ export function CurrentWeekPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" style={{ color: 'var(--accent-green)' }}>
+        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-green)' }}>
           <use href="/static/icons.svg#trending-up" />
         </svg>
-        <h3 style={{ color: 'var(--accent-green)' }}>Current Week</h3>
+        <h2 style={{ color: 'var(--accent-green)' }}>Current Week</h2>
         {showChip && freshness && (
           <span
             className={
@@ -102,7 +102,7 @@ export function CurrentWeekPanel() {
             <div className="cw-big">
               <div className="label">Used (7d)</div>
               <div className="num">{fmt.pct1(cw?.used_pct)}</div>
-              <ProgressBar percent={cw?.used_pct} cells={30} />
+              <ProgressBar percent={cw?.used_pct} cells={30} label="7-day usage" />
               <div className="progress-scale">
                 <span>0%</span>
                 <span>50%</span>
@@ -112,7 +112,7 @@ export function CurrentWeekPanel() {
           </div>
           <div className="cw-right">
             <div className="cw-kv kv-spent">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#dollar" />
               </svg>
               <div className="body">
@@ -127,7 +127,7 @@ export function CurrentWeekPanel() {
               </div>
             </div>
             <div className="cw-kv kv-reset">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#refresh" />
               </svg>
               <div className="body">
@@ -141,7 +141,7 @@ export function CurrentWeekPanel() {
               </div>
             </div>
             <div className="cw-kv kv-five-hour">
-              <svg className="icon">
+              <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#activity" />
               </svg>
               <div className="body">
@@ -180,7 +180,7 @@ export function CurrentWeekPanel() {
             </div>
             {fhb && (
               <div className="cw-kv kv-block">
-                <svg className="icon">
+                <svg className="icon" aria-hidden="true">
                   <use href="/static/icons.svg#clock" />
                 </svg>
                 <div className="body">
@@ -209,7 +209,7 @@ export function CurrentWeekPanel() {
         </div>
       </div>
       <div className="panel-foot cw-foot">
-        <svg className="icon">
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#clock" />
         </svg>
         Last snapshot: <span>{fmt.agoSec(cw?.last_snapshot_age_sec)}</span>

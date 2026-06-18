@@ -7,12 +7,34 @@ import { ShareIcon } from '../components/ShareIcon';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
-import { buildTrendSparkData } from '../store/selectors';
+import { buildTrendSparkData, type TrendChartDatum } from '../store/selectors';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
+
+// A5 — accessible summary for the role="img" sparkline. Describes the
+// series span, the latest $/1% value, and its direction vs the prior week
+// (mirrors the table's delta read) without needing the visual bars.
+function buildSparkLabel(data: TrendChartDatum[]): string {
+  if (data.length === 0) return '$/1% trend: no data';
+  const last = data[data.length - 1];
+  const prev = data.length > 1 ? data[data.length - 2] : null;
+  const latest =
+    last.dollar_per_pct == null ? 'n/a' : fmt.usd2(last.dollar_per_pct);
+  let dir = '';
+  if (prev && last.dollar_per_pct != null && prev.dollar_per_pct != null) {
+    const d = last.dollar_per_pct - prev.dollar_per_pct;
+    dir =
+      Math.abs(d) < 0.005
+        ? ', flat vs prior week'
+        : d > 0
+          ? ', up vs prior week'
+          : ', down vs prior week';
+  }
+  return `$/1% trend over ${data.length} weeks; latest ${latest}${dir}`;
+}
 
 export function TrendPanel() {
   const env = useSnapshot();
@@ -25,6 +47,10 @@ export function TrendPanel() {
   const tableData = trendOverride
     ? applyTableSort(decorated, TREND_COLUMNS, trendOverride)
     : decorated;
+  // A5 — text summary for the sparkline (a multi-point series, so role="img"
+  // on the grid wrapper, not progressbar). Covers the weeks span + the
+  // latest $/1% value and its direction vs the prior week.
+  const sparkLabel = buildSparkLabel(data);
   return (
     <section
       className="panel accent-amber"
@@ -42,12 +68,12 @@ export function TrendPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" style={{ color: 'var(--accent-amber)' }}>
+        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-amber)' }}>
           <use href="/static/icons.svg#bar-chart" />
         </svg>
-        <h3 style={{ color: 'var(--accent-amber)' }}>
+        <h2 style={{ color: 'var(--accent-amber)' }}>
           $/1% Trend <span className="sub">(8 weeks)</span>
-        </h3>
+        </h2>
         <ShareIcon
           panel="trend"
           panelLabel="Trend"
@@ -82,7 +108,7 @@ export function TrendPanel() {
           </tbody>
         </table>
         <div className="trend-spark-title">$/1% trend:</div>
-        <div className="trend-spark" id="trend-spark">
+        <div className="trend-spark" id="trend-spark" role="img" aria-label={sparkLabel}>
           <Sparkline data={data} />
         </div>
         <div className="trend-spark-legend">

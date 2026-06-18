@@ -34,15 +34,15 @@ export function ProjectsPanel() {
   const header = (
     <div className="panel-header" style={{ justifyContent: 'space-between' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <svg className="icon" style={{ color: 'var(--accent-magenta)' }}>
+        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-magenta)' }}>
           <use href="/static/icons.svg#folder" />
         </svg>
-        <h3 style={{ color: 'var(--accent-magenta)' }}>
+        <h2 style={{ color: 'var(--accent-magenta)' }}>
           Projects{' '}
           <span className="sub">
             {isUnavailable ? '(unavailable)' : `(${rows.length} this week)`}
           </span>
-        </h3>
+        </h2>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
         <ShareIcon
@@ -152,7 +152,12 @@ export function ProjectsPanel() {
                   title={r.key}
                 >
                   <span className="name">{r.key}</span>
-                  <div className="lb-bar" style={barStyle} />
+                  {/* A5 — decorative cost-relative bar. The enclosing
+                      role="button" row already names the project, cost,
+                      and %, so the bar conveys nothing new (and its width
+                      is cost-vs-leader, NOT the project's usage %, so a
+                      progressbar valuenow would mislead). */}
+                  <div className="lb-bar" style={barStyle} aria-hidden="true" />
                   <span className="cost">{fmt.usd2(r.cost_usd)}</span>
                   <span className="pct">
                     {r.attributed_pct == null ? '—' : fmt.pct0(r.attributed_pct)}
@@ -169,6 +174,7 @@ export function ProjectsPanel() {
                 <div
                   className="lb-bar muted"
                   style={{ '--w': `${(tailCost / leaderCost) * 100}%` } as CSSProperties}
+                  aria-hidden="true"
                 />
                 <span className="cost muted">{fmt.usd2(tailCost)}</span>
                 <span className="pct muted">

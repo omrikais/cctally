@@ -25,7 +25,8 @@ describe('<SessionsPanel />', () => {
     expect(header).not.toBeNull();
     const useEl = header?.querySelector('svg use');
     expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#clock');
-    const sub = header?.querySelector('h3 .sub');
+    // Panel title demoted h3 → h2 for the document heading outline (#207 A3).
+    const sub = header?.querySelector('h2 .sub');
     expect(sub?.textContent).toMatch(/20 total/);
   });
 

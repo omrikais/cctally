@@ -9,7 +9,7 @@ import { tryQuit } from '../store/actions';
 
 export function Footer() {
   return (
-    <div className="footer">
+    <footer className="footer">
       <span className="kb">
         <kbd>↑/↓</kbd> scroll
       </span>
@@ -48,6 +48,6 @@ export function Footer() {
       >
         <kbd>q</kbd> quit
       </button>
-    </div>
+    </footer>
   );
 }
