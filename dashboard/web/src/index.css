@@ -6804,7 +6804,12 @@ mark.current {
   #root .conv-view,
   #root .conv-view--mobile {
     grid-template-columns: 1fr;
-    height: calc(var(--mobile-vh) - var(--topbar-h) - 16px);
+    /* #205 S4 (parked A) — the mobile --topbar-h budget (104px) under-counts the
+       real ~148px two/three-row topbar + body padding + margins, leaving ~64px of
+       document overflow that lets the sticky topbar scroll over the reader's Back
+       button. Enlarge the subtraction (scoped to this conv-view rule, NOT the shared
+       --topbar-h) so the document itself can't scroll behind the sticky topbar. */
+    height: calc(var(--mobile-vh) - var(--topbar-h) - 88px);
     gap: 0;
     overflow: hidden;
     margin-bottom: 12px;
