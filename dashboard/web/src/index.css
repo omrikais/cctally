@@ -1882,16 +1882,17 @@ mark.current {
 
 /* Share affordance — rendered in panel headers and modal headers for
    every share-capable panel (spec §6.1, plan §M1.9). Visual treatment
-   matches the surrounding header chrome (.panel-collapse-toggle): muted
-   icon by default, lifts on hover, accent outline on focus-visible.
-   Plan uses --muted/--fg/--accent tokens; this codebase ships
+   matches the surrounding header chrome (.panel-collapse-toggle):
+   full-contrast icon at rest (#207 C7 — was muted), hover adds a faint
+   background, accent outline on focus-visible. Plan uses
+   --muted/--fg/--accent tokens; this codebase ships
    --text-dim/--text/--accent-blue. */
 .share-icon {
   background: transparent;
   border: 0;
   padding: 4px;
   cursor: pointer;
-  color: var(--text-dim);
+  color: var(--text);
   display: inline-flex;
   align-items: center;
   border-radius: 4px;
