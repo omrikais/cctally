@@ -666,6 +666,7 @@ body { padding: 16px; box-sizing: border-box; }
 .sess-table tbody td.cost-mid  { color: var(--accent-amber); }
 .sess-table tbody td.cost-high { color: var(--accent-red); }
 .sess-table tbody td.cost-xs   { color: var(--accent-green); }
+.sess-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 
 .chip {
   display: inline-block; padding: 1px 8px; border-radius: 4px;
@@ -3985,6 +3986,7 @@ mark.current {
 .projects-table tbody td.cost-mid  { color: var(--accent-amber); }
 .projects-table tbody td.cost-high { color: var(--accent-red); }
 .projects-table tbody td.cost-xs   { color: var(--accent-green); }
+.projects-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 .projects-table tbody tr { cursor: pointer; }
 .projects-table tbody tr:hover { background: rgba(217, 70, 239, 0.06); }
 .projects-table tbody tr.selected {
@@ -4089,6 +4091,8 @@ mark.current {
 .drill-session-row .cost.cost-mid { color: var(--accent-amber); }
 .drill-bar-row .cost.cost-high,
 .drill-session-row .cost.cost-high { color: var(--accent-red); }
+.drill-bar-row .cost.cost-none,
+.drill-session-row .cost.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 .drill-session-row {
   display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
   align-items: center; padding: 4px 0; border: none;
@@ -4200,8 +4204,10 @@ mark.current {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Row 1 right: cost. Use the four cost-class hooks already applied
-   * by costClass() in ProjectsModal.tsx. */
+  /* Row 1 right: cost. Use the cost-class hooks already applied
+   * by costClass() in ProjectsModal.tsx (incl. cost-none for unknown
+   * cost — #207 B4, so a null-cost cell keeps the mobile layout). */
+  #root .projects-table td.cost-none,
   #root .projects-table td.cost-xs,
   #root .projects-table td.cost-low,
   #root .projects-table td.cost-mid,
