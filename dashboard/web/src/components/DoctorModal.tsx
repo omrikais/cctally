@@ -89,7 +89,12 @@ export function DoctorModal(): JSX.Element | null {
     subscribeStore,
     () => topmostStoreFocusLayer(getState()) === 'doctor',
   );
-  useModalFocus(cardRef, { active: open, trapEnabled });
+  // initialFocus: 'container' (not the default 'first'): the first focusable —
+  // the refresh button — self-disables on open (the auto-fired refresh() sets
+  // loading=true synchronously). A focused element that becomes disabled is
+  // blurred by the browser, dropping focus to <body>. Focusing the container
+  // (tabIndex=-1, never disabled) keeps focus inside the dialog.
+  useModalFocus(cardRef, { active: open, trapEnabled, initialFocus: 'container' });
 
   if (!open) return null;
 
@@ -102,6 +107,7 @@ export function DoctorModal(): JSX.Element | null {
         role="dialog"
         aria-modal="true"
         aria-labelledby="doctor-modal-title"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
         <header className="modal-header">

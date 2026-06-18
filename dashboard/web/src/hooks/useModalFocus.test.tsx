@@ -20,6 +20,27 @@ function Harness({ active, trapEnabled = true }: { active: boolean; trapEnabled?
   );
 }
 
+// Variant exercising `initialFocus: 'container'` — the dialog container is
+// tabIndex=-1 (so it is NOT in the focusables list), and focus lands on the
+// container itself on open. Models the Doctor modal, whose first control
+// self-disables on open (#207 A1).
+function ContainerFocusHarness({ active, trapEnabled = true }: { active: boolean; trapEnabled?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useModalFocus(ref, { active, trapEnabled, initialFocus: 'container' });
+  return (
+    <div>
+      <button id="trigger">trigger</button>
+      {active && (
+        <div ref={ref} role="dialog" tabIndex={-1}>
+          <button id="first">first</button>
+          <input id="mid" />
+          <select id="sel"><option>a</option></select>
+        </div>
+      )}
+    </div>
+  );
+}
+
 describe('useModalFocus', () => {
   beforeEach(() => { document.body.innerHTML = ''; });
 
@@ -68,5 +89,37 @@ describe('useModalFocus', () => {
     expect(focusSpy).not.toHaveBeenCalled();
     expect(document.activeElement?.id).toBe('first'); // unchanged, not back to trigger
     focusSpy.mockRestore();
+  });
+
+  describe("initialFocus: 'container'", () => {
+    it('focuses the dialog container itself on activate (not the first focusable)', () => {
+      const { rerender } = render(<ContainerFocusHarness active={false} />);
+      document.getElementById('trigger')!.focus();
+      rerender(<ContainerFocusHarness active={true} />);
+      // Focus is on the container (role=dialog, tabIndex=-1), NOT the first button.
+      // This is what keeps focus inside the dialog even when the first control
+      // self-disables (#207 A1) — the container can never be disabled.
+      const active = document.activeElement as HTMLElement | null;
+      expect(active?.getAttribute('role')).toBe('dialog');
+      expect(active?.id).not.toBe('first');
+    });
+
+    it('Tab from the container moves to the first focusable', () => {
+      render(<ContainerFocusHarness active={true} />);
+      const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+      dialog.focus(); // on the container itself (not among the focusables)
+      fireEvent.keyDown(document, { key: 'Tab' });
+      expect(document.activeElement?.id).toBe('first');
+    });
+
+    it('Shift+Tab from the container wraps to the LAST focusable (no backward escape)', () => {
+      render(<ContainerFocusHarness active={true} />);
+      const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+      dialog.focus(); // on the container itself (not among the focusables)
+      fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+      // Without the idx===-1 trap-edge branch, Shift+Tab from the container would
+      // escape the dialog backwards. It must wrap to the last focusable instead.
+      expect(document.activeElement?.id).toBe('sel');
+    });
   });
 });

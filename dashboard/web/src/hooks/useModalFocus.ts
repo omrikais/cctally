@@ -45,6 +45,14 @@ export interface UseModalFocusOptions {
   trapEnabled?: boolean;
   /** Optional id of the trigger to restore to; falls back to document.activeElement at open. */
   triggerId?: string;
+  /**
+   * Where to move focus on open. Default `'first'` focuses the first focusable
+   * (the standard a11y move). `'container'` focuses the dialog container itself
+   * — needed when the first control self-disables on open (a focused element
+   * that becomes `disabled` is blurred by the browser, dropping focus to
+   * `<body>`). The container is `tabIndex=-1`, so it can never be disabled.
+   */
+  initialFocus?: 'first' | 'container';
 }
 
 /**
@@ -54,7 +62,7 @@ export interface UseModalFocusOptions {
  */
 export function useModalFocus(
   containerRef: RefObject<HTMLElement>,
-  { active, trapEnabled = true, triggerId }: UseModalFocusOptions,
+  { active, trapEnabled = true, triggerId, initialFocus = 'first' }: UseModalFocusOptions,
 ): void {
   // Focus-in on activate; restore on deactivate/unmount. Keyed on `active` (NOT trapEnabled),
   // so suspending under a higher layer never triggers a spurious restore.
@@ -65,8 +73,13 @@ export function useModalFocus(
       (document.activeElement as HTMLElement | null);
     const container = containerRef.current;
     if (container) {
-      const focusable = getFocusable(container);
-      (focusable[0] ?? container).focus();
+      if (initialFocus === 'container') {
+        // Focus the container itself (tabIndex=-1 so it can't be disabled).
+        container.focus();
+      } else {
+        const focusable = getFocusable(container);
+        (focusable[0] ?? container).focus();
+      }
     }
     return () => {
       if (trigger && typeof trigger.focus === 'function' && document.contains(trigger)) {
@@ -79,7 +92,7 @@ export function useModalFocus(
     };
     // containerRef is stable; intentionally excluded from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, triggerId]);
+  }, [active, triggerId, initialFocus]);
 
   // Tab-trap — attached only while open AND topmost.
   useEffect(() => {
@@ -100,7 +113,17 @@ export function useModalFocus(
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
       const activeEl = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && activeEl === first) {
+      const idx = activeEl ? focusable.indexOf(activeEl) : -1;
+      if (idx === -1) {
+        // Focus is inside the container but NOT on a focusable — e.g. on the
+        // container itself when `initialFocus: 'container'` is used (the
+        // container is tabIndex=-1, so it's absent from `focusable`). Drive Tab
+        // to the first focusable and Shift+Tab to the last, so neither edge
+        // escapes the dialog. (We already returned early above if focus lives
+        // outside the container, so reaching here means focus is inside it.)
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && activeEl === first) {
         e.preventDefault();
         last.focus();
       } else if (!e.shiftKey && activeEl === last) {
