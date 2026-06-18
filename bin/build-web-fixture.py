@@ -14,6 +14,12 @@ DEFAULT_FIXTURE_PATH = Path("dashboard/web/__tests__/fixtures/envelope.json")
 
 
 def build_envelope() -> dict:
+    # The header's "vs last week" delta (#207 B1) is, in the real envelope,
+    # the is_current trend row's `delta`. Keep ONE source of truth so a
+    # cross-checking test can't drift: the current trend row below reuses
+    # this same value.
+    VS_LAST_WEEK_DELTA = -0.05
+
     # Header
     header = {
         "week_label": "Apr 21–28",
@@ -22,7 +28,7 @@ def build_envelope() -> dict:
         "dollar_per_pct": 1.23,
         "forecast_pct": 68.5,
         "forecast_verdict": "ok",
-        "vs_last_week_delta": -0.05,
+        "vs_last_week_delta": VS_LAST_WEEK_DELTA,
     }
 
     # Current week — 17 milestones (17% used)
@@ -60,13 +66,19 @@ def build_envelope() -> dict:
         "explain": None,
     }
 
-    # Trend — 8 rows for spark panel, 12 rows for modal
+    # Trend — 8 rows for spark panel, 12 rows for modal. The is_current row's
+    # `delta` reuses the header's vs-last-week value (single source of truth,
+    # #207 B1) so the fixture is internally consistent.
     def mk_row(i: int, is_current: bool) -> dict:
         return {
             "label": f"W{i:02d}",
             "used_pct": 15.0 + i * 2.3,
             "dollar_per_pct": 1.10 + i * 0.04,
-            "delta": None if i == 0 else round((i - 4) * 0.02, 4),
+            "delta": (
+                VS_LAST_WEEK_DELTA if is_current
+                else None if i == 0
+                else round((i - 4) * 0.02, 4)
+            ),
             "is_current": is_current,
         }
 

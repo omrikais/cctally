@@ -214,7 +214,7 @@
         "label": "W07",
         "used_pct": 31.099999999999998,
         "dollar_per_pct": 1.3800000000000001,
-        "delta": 0.06,
+        "delta": -0.05,
         "is_current": true
       }
     ],
@@ -310,7 +310,7 @@
         "label": "W11",
         "used_pct": 40.3,
         "dollar_per_pct": 1.54,
-        "delta": 0.14,
+        "delta": -0.05,
         "is_current": true
       }
     ]

@@ -1,8 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { Header } from '../src/components/Header';
+import { _resetForTests, updateSnapshot } from '../src/store/store';
+import fixture from './fixtures/envelope.json';
+import type { Envelope } from '../src/types/envelope';
 
 describe('Header — mobile additions', () => {
+  // Seed a snapshot so the value-gated stats render (#207 B1: the
+  // "vs last week" stat hides when its delta is null; the fixture's
+  // delta is non-null, so the stat — and its data-mobile-keep — renders).
+  beforeEach(() => {
+    _resetForTests();
+    updateSnapshot(fixture as unknown as Envelope);
+  });
+
   it('renders ⚙ settings and ? help icon buttons', () => {
     render(<Header />);
     const settings = screen.getByRole('button', { name: /open settings/i });

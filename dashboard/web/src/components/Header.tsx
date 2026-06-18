@@ -75,12 +75,39 @@ export function Header() {
           <span className="pill-warn">{verdict?.label ?? 'WARN'}</span>
         ) : null}
       </div>
-      <div className="stat" data-mobile-keep="secondary" data-stat="vs-last-week">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-green)' }}>
-          <use href="/static/icons.svg#trending-up" />
-        </svg>
-        <span className="mute">vs last week</span>
-      </div>
+      {/* "vs last week" $/1% delta (#207 B1). Hidden when null. The SVG
+          icon is the ONLY arrow — the visible text shows the magnitude +
+          "vs last week"; direction is conveyed by the icon, its color, and
+          the aria-label (never by a duplicated text arrow), so color-blind
+          and screen-reader users get the direction without relying on hue. */}
+      {h?.vs_last_week_delta != null && (() => {
+        const d = h.vs_last_week_delta;
+        const flat = Math.abs(d) < 0.02;            // parity with the TUI dim band
+        const good = d < 0;                          // cheaper per 1% is better
+        const icon = flat ? 'minus' : good ? 'trending-down' : 'trending-up';
+        const color = flat
+          ? 'var(--text-dim)'
+          : good ? 'var(--accent-green)' : 'var(--accent-red)';
+        const dirWord = flat ? 'flat' : good ? 'down' : 'up';
+        const mag = fmt.usd2(Math.abs(d));           // e.g. "$0.12"
+        const text = flat ? 'flat vs last week' : `${mag} vs last week`;
+        const aria = flat
+          ? '$/1% flat versus last week'
+          : `$/1% ${dirWord} ${mag} versus last week`;
+        return (
+          <div
+            className="stat"
+            data-mobile-keep="secondary"
+            data-stat="vs-last-week"
+            aria-label={aria}
+          >
+            <svg className="icon" aria-hidden="true" style={{ color }}>
+              <use href={`/static/icons.svg#${icon}`} />
+            </svg>
+            <span className="mute">{text}</span>
+          </div>
+        );
+      })()}
       <div className="topbar-actions">
         {/* Doctor aggregate chip (spec §6.1). Renders nothing until
             the first SSE tick carrying snap.doctor lands. Click +

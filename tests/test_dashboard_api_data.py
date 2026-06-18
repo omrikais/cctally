@@ -3,6 +3,7 @@ import datetime as dt
 import http.client
 import json
 import threading
+import types
 
 import pytest
 
@@ -358,3 +359,39 @@ def test_envelope_monthly_emits_rows_when_snapshot_populated():
     # Monthly rows have no used_pct or week boundaries.
     assert "used_pct" not in env["monthly"]["rows"][0]
     assert "week_start_at" not in env["monthly"]["rows"][0]
+
+
+def test_header_vs_last_week_delta_null_on_empty_trend():
+    """#207 B1: with no trend rows (and so no ``is_current`` row), the
+    header's vs-last-week delta is None so the client hides the stat."""
+    ns = load_script()
+    snap = ns["_empty_dashboard_snapshot"]()
+    env = ns["snapshot_to_envelope"](
+        snap, now_utc=dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc))
+    assert env["header"]["vs_last_week_delta"] is None
+
+
+def test_header_vs_last_week_delta_uses_is_current_row():
+    """#207 B1: the vs-last-week delta is the ``is_current`` trend row's
+    ``delta_dpp`` — selected by the flag, NOT by position [-1]. A trailing
+    non-current row proves the selector picks by ``is_current``."""
+    ns = load_script()
+    snap = ns["_empty_dashboard_snapshot"]()
+
+    def mk(label, dpp, delta, cur):
+        return types.SimpleNamespace(
+            week_label=label, used_pct=10.0, dollars_per_percent=dpp,
+            delta_dpp=delta, is_current=cur, spark_height=1,
+        )
+
+    # Oldest-first; the current week is the flagged row, NOT positionally
+    # guaranteed last — a trailing non-current row proves the selector
+    # picks by is_current, not by [-1].
+    snap.trend = [
+        mk("W1", 1.30, None, False),
+        mk("W2", 1.23, -0.07, True),
+        mk("W3-stale", 9.99, 8.76, False),
+    ]
+    env = ns["snapshot_to_envelope"](
+        snap, now_utc=dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc))
+    assert env["header"]["vs_last_week_delta"] == -0.07

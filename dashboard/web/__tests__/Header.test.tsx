@@ -48,12 +48,15 @@ describe('<Header />', () => {
     expect(document.querySelector('.pill-warn')).toBeNull();
   });
 
-  it('renders trending-up icon + vs last week mute label', () => {
+  it('renders the signed vs-last-week delta (#207 B1): fixture delta -0.05 → trending-down + "$0.05 vs last week"', () => {
     render(<Header />);
-    expect(screen.getByText('vs last week')).toBeInTheDocument();
-    const uses = document.querySelectorAll('svg use');
-    const hrefs = Array.from(uses).map((u) => u.getAttribute('href'));
-    expect(hrefs).toContain('/static/icons.svg#trending-up');
+    // Fixture header.vs_last_week_delta = -0.05 (cheaper this week) →
+    // direction "down", green, magnitude "$0.05 vs last week".
+    expect(screen.getByText('$0.05 vs last week')).toBeInTheDocument();
+    const stat = document.querySelector('[data-stat="vs-last-week"]') as HTMLElement | null;
+    expect(stat).not.toBeNull();
+    expect(stat?.getAttribute('aria-label')?.toLowerCase()).toContain('down');
+    expect(stat?.querySelector('use')?.getAttribute('href')).toBe('/static/icons.svg#trending-down');
   });
 
   it('renders a sync-chip span inside a topbar-sync button wrapper', () => {

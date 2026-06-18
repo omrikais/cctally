@@ -4988,6 +4988,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "_error":       f"{type(exc).__name__}: {exc}",
         }
 
+    # B1 (#207): the "vs last week" header delta reuses the is_current trend
+    # row's delta_dpp ($/1% vs the previous trend row — normally the prior
+    # subscription week). Select by the is_current FLAG, not snap.trend[-1]:
+    # snap.trend is oldest-first by week_start_date and reset/credit handling
+    # can synthesize an intervening row, so position -1 is not guaranteed to
+    # be the current week (Codex P1). reversed() picks the latest if ever
+    # multiple are flagged. Null-safe: None when no row is current, or when
+    # the current row's delta_dpp is itself None — both hide the stat.
+    _current_trend = next(
+        (r for r in reversed(snap.trend) if r.is_current), None
+    ) if snap.trend else None
+
     return {
         "envelope_version": 2,
         "generated_at":     _iso_z(snap.generated_at),
@@ -5011,7 +5023,9 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "dollar_per_pct":     dollar_pp,
             "forecast_pct":       header_fcast_pct,
             "forecast_verdict":   verdict,
-            "vs_last_week_delta": None,   # populated if/when trend comparison lands
+            "vs_last_week_delta": (
+                _current_trend.delta_dpp if _current_trend is not None else None
+            ),
         },
 
         "current_week":
