@@ -14,6 +14,13 @@
      --text-faint. */
   --text-faint: #7a8295;
   --surface-faint: #5a6070;
+  /* Daily heatmap bucket fills — single source for cells + legend (#207 C5). */
+  --daily-h0: rgba(255,255,255,0.02);
+  --daily-h1: rgba(96,165,250,0.18);
+  --daily-h2: rgba(129,140,248,0.30);
+  --daily-h3: rgba(192,132,252,0.38);
+  --daily-h4: rgba(236,72,153,0.42);
+  --daily-h5: rgba(251,146,60,0.55);
   --accent-green: #3ddc84;
   --accent-purple: #c084fc;
   --accent-pink: #ec4899;
@@ -2093,13 +2100,16 @@ mark.current {
 .daily-legend .scale { display: flex; gap: 3px; }
 .daily-legend .scale span {
   width: 16px; height: 10px; border-radius: 3px; display: block;
+  /* C5 (#207): faint outline so the near-transparent h0 swatch still reads
+     as the "Less" end (cells carry their own border, so this is consistent). */
+  border: 1px solid var(--border-soft);
 }
-.daily-legend .scale .h0 { background: rgba(255, 255, 255, 0.05); }
-.daily-legend .scale .h1 { background: rgba(96,165,250,0.10); }
-.daily-legend .scale .h2 { background: rgba(96,165,250,0.22); }
-.daily-legend .scale .h3 { background: rgba(192,132,252,0.32); }
-.daily-legend .scale .h4 { background: rgba(236,72,153,0.40); }
-.daily-legend .scale .h5 { background: rgba(251,191,36,0.50); }
+.daily-legend .scale .h0 { background: var(--daily-h0); }
+.daily-legend .scale .h1 { background: var(--daily-h1); }
+.daily-legend .scale .h2 { background: var(--daily-h2); }
+.daily-legend .scale .h3 { background: var(--daily-h3); }
+.daily-legend .scale .h4 { background: var(--daily-h4); }
+.daily-legend .scale .h5 { background: var(--daily-h5); }
 
 .daily-cal-grid {
   display: grid;
@@ -2169,14 +2179,14 @@ mark.current {
 
 /* Bucket fills are layered UNDER the sheen via background-color so the
    gradient highlight rides on top of every bucket cleanly. */
-.daily-cell.h0 { background-color: rgba(255, 255, 255, 0.02); color: rgba(255, 255, 255, 0.30); }
+.daily-cell.h0 { background-color: var(--daily-h0); color: rgba(255, 255, 255, 0.30); }
 .daily-cell.h0 .d { color: rgba(255, 255, 255, 0.40); }
 .daily-cell.h0 .c { color: rgba(255, 255, 255, 0.35); font-weight: 600; }
-.daily-cell.h1 { background-color: rgba(96,165,250,0.18); }
-.daily-cell.h2 { background-color: rgba(129,140,248,0.30); }
-.daily-cell.h3 { background-color: rgba(192,132,252,0.38); }
-.daily-cell.h4 { background-color: rgba(236,72,153,0.42); }
-.daily-cell.h5 { background-color: rgba(251,146,60,0.55); border-color: rgba(251,146,60,0.55); }
+.daily-cell.h1 { background-color: var(--daily-h1); }
+.daily-cell.h2 { background-color: var(--daily-h2); }
+.daily-cell.h3 { background-color: var(--daily-h3); }
+.daily-cell.h4 { background-color: var(--daily-h4); }
+.daily-cell.h5 { background-color: var(--daily-h5); border-color: rgba(251,146,60,0.55); }
 .daily-cell.h5 .c { color: #fff7e8; }
 .daily-cell.h5 .d { color: rgba(255,255,255,0.85); }
 
