@@ -108,7 +108,13 @@ export function TrendPanel() {
           </tbody>
         </table>
         <div className="trend-spark-title">$/1% trend:</div>
-        <div className="trend-spark" id="trend-spark" role="img" aria-label={sparkLabel}>
+        <div
+          className="trend-spark"
+          id="trend-spark"
+          role="img"
+          aria-label={sparkLabel}
+          style={{ gridTemplateColumns: `repeat(${Math.max(1, data.length)}, 1fr)` }}
+        >
           <Sparkline data={data} />
         </div>
         <div className="trend-spark-legend">

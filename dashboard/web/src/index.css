@@ -670,7 +670,7 @@ body { padding: 16px; box-sizing: border-box; }
 .trend-table tbody td.delta-neg { color: var(--accent-green); }
 .trend-spark-title { margin-top: 18px; color: var(--accent-cyan); font-weight: 700; }
 .trend-spark {
-  display: grid; grid-template-columns: repeat(9, 1fr); gap: 6px;
+  display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px;
   align-items: end; height: 72px; margin: 10px 0 6px;
 }
 .trend-spark .bar { background: var(--accent-purple); border-radius: 2px; }
