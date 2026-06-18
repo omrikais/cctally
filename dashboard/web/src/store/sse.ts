@@ -1,9 +1,15 @@
 import type { Envelope } from '../types/envelope';
-import { dispatch, updateSnapshot, resetSnapshotOrdering } from './store';
+import { dispatch, updateSnapshot, resetSnapshotOrdering, getState } from './store';
 import { coerceUpdateState, coerceUpdateSuppress } from './update';
 
 let es: EventSource | null = null;
 let disconnected = false;
+// B2/B3 (#207): the bootstrap fetch failed AND no snapshot has landed from
+// any source yet — i.e. cold-start with no data. Distinct from `disconnected`
+// (which is a drop AFTER first data). `startGeneration` guards against a late
+// reject from a superseded startSSE() raising the error view after recovery.
+let bootstrapError = false;
+let startGeneration = 0;
 const statusSubs = new Set<() => void>();
 
 // Threshold-actions T15: cold-start re-arm flag (spec §4.3, §8.7).
@@ -23,6 +29,8 @@ export interface SSECallbacks {
 
 export function isDisconnected(): boolean { return disconnected; }
 
+export function isBootstrapError(): boolean { return bootstrapError; }
+
 export function subscribeConnectionStatus(fn: () => void): () => void {
   statusSubs.add(fn);
   return () => { statusSubs.delete(fn); };
@@ -38,6 +46,12 @@ function emitStatus(): void {
 export function startSSE(cb: SSECallbacks = {}): void {
   if (es) { es.close(); es = null; }
   disconnected = false;
+  // B2/B3: re-arm the bootstrap-error flag on every fresh start, and bump
+  // the start-generation token. The bootstrap closure captures `myGen` so a
+  // late reject from a SUPERSEDED start (a second startSSE only closes the
+  // old EventSource, not the in-flight old fetch) can't raise the error.
+  bootstrapError = false;
+  const myGen = ++startGeneration;
   // Re-arm the cold-start rule on every fresh startSSE — the next
   // INGEST_SNAPSHOT_ALERTS dispatch (from bootstrap or first update)
   // will populate seenAlertIds without surfacing toasts.
@@ -58,6 +72,9 @@ export function startSSE(cb: SSECallbacks = {}): void {
       const r = await fetch('/api/data');
       const snap = (await r.json()) as Envelope;
       if (updateSnapshot(snap)) {
+        // A snapshot landed — clear any bootstrap-error view (defensive;
+        // normally false on the success path).
+        if (bootstrapError) { bootstrapError = false; emitStatus(); }
         ingestAlerts(snap);
         ingestUpdate(snap);
         ingestDoctor(snap);
@@ -66,6 +83,14 @@ export function startSSE(cb: SSECallbacks = {}): void {
       cb.onConnect?.();
     } catch (err) {
       console.error('initial snapshot failed:', err);
+      // Only raise the error view if THIS start is still current AND no
+      // snapshot has landed from any source (an SSE update can beat the
+      // bootstrap fetch's reject). A late reject after recovery / after a
+      // newer startSSE is then a no-op (Codex P2 race guard).
+      if (myGen === startGeneration && getState().snapshot == null && !bootstrapError) {
+        bootstrapError = true;
+        emitStatus();
+      }
     }
   })();
 
@@ -74,6 +99,9 @@ export function startSSE(cb: SSECallbacks = {}): void {
     try {
       const snap = JSON.parse(ev.data) as Envelope;
       if (updateSnapshot(snap)) {
+        // A snapshot landed via SSE — clear any bootstrap-error view so a
+        // cold start that recovers through the stream self-heals (B2/B3).
+        if (bootstrapError) { bootstrapError = false; emitStatus(); }
         ingestAlerts(snap);
         ingestUpdate(snap);
         ingestDoctor(snap);
@@ -189,6 +217,9 @@ export function closeSSE(): void {
   if (es) { es.close(); es = null; }
   // disconnected=false here models a clean teardown, not a retry-in-progress.
   disconnected = false;
+  // Re-arm the bootstrap-error flag too (B2/B3) — a clean teardown clears
+  // any cold-start error so the next startSSE begins fresh.
+  bootstrapError = false;
   // Re-arm cold-start so the next startSSE begins in cold-start mode
   // (matches startSSE's own re-arm on entry; defensive).
   isFirstTick = true;
@@ -199,6 +230,8 @@ export function closeSSE(): void {
 export function _resetForTests(): void {
   if (es) { es.close(); es = null; }
   disconnected = false;
+  bootstrapError = false;
+  startGeneration = 0;
   isFirstTick = true;
   statusSubs.clear();
 }
