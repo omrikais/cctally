@@ -59,7 +59,7 @@ html, body {
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
-body { padding: 16px; box-sizing: border-box; max-width: 1760px; margin: 0 auto; }
+body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto; }
 * { box-sizing: border-box; }
 
 /* Utility — referenced from dashboard.html for secondary / parenthetical text. */
@@ -154,10 +154,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 1760px; margin: 0 auto;
   margin-bottom: 16px;
 }
 @media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
-/* C2 (#207): a third column on wide displays. minmax(0, …) keeps the
-   min-width:0 contract so a wide non-wrapping label can't inflate one
-   column. Pairs with the body max-width:1760px cap above. */
-@media (min-width: 1600px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+/* C2 (#207): the grid stays 2-col for all widths >=1100px. A 3-col rule
+   for wide displays was tried but QA showed it shrinks panels below the
+   Sessions table's intrinsic width (clipping the Cost column), so the
+   body max-width:1600px cap above (centering the shell) is what prevents
+   the "sparse, left-hugging panels" finding instead. */
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
 /* Brand cluster: "cctally vX.Y.Z [↑ vA.B.C]" sits at the start of the
