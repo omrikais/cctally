@@ -1457,15 +1457,21 @@ mark.current {
    the .chip + .chip.<model> rules (same 0,2,0 specificity, declared earlier
    in source order) — so this reset deliberately does NOT set background,
    padding, or color, which would otherwise win and flatten the chip.
-   font/line-height:inherit keep the chip from inheriting the UA button
-   font and growing taller. The mobile `.chip.model-chip { position:
-   relative }` + ::before 44px hit area stack on top of this. */
+   The font longhands (mono / 10px / 800 / 1px / 14.5px) are restated
+   explicitly here because this 0,2,0 rule outranks the later global
+   "Axis chips" `.chip` rule (0,1,0) that supplies them — `font: inherit`
+   would otherwise win and pull the surrounding 13px/400 table font,
+   growing the chip taller and wider. The mobile `.chip.model-chip
+   { position: relative }` + ::before 44px hit area stack on top of this. */
 .chip.model-chip {
   appearance: none;
   -webkit-appearance: none;
   border: none;
-  font: inherit;
-  line-height: inherit;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  line-height: 14.5px;
   cursor: pointer;
 }
 
