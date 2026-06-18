@@ -911,9 +911,14 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         // #205 S1 — close the mobile outline sheet on a genuine conversation
-        // change (incl. Back → null); a same-id re-select leaves it. Read the
-        // PRIOR selectedConversationId (state, not action) before the overwrite.
-        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false } : {}),
+        // change (incl. Back → null); a same-id re-select leaves it. #205 S2 —
+        // also close find on a genuine change: its anchor list is session-scoped
+        // + point-in-time, so it's stale for a new conversation (symmetric with
+        // the OPEN_CONVERSATION switch-cleanup). Without this, the new mobile
+        // Find button lets open-find → Back → reselect auto-reopen the bar and
+        // pop the keyboard. Read the PRIOR selectedConversationId (state, not
+        // action) before the overwrite.
+        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false, convFindOpen: false } : {}),
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen

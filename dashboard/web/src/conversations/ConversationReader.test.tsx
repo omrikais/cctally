@@ -724,6 +724,30 @@ describe('ConversationReader', () => {
     expect(screen.queryByRole('button', { name: /jump to latest/i })).toBeNull();
   });
 
+  it('#205 S2 (F3) — the Find button toggles the find bar and reflects aria-pressed', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], null));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="h1"]')).not.toBeNull());
+
+    // Role-scoped to 'button' so it never matches the FindBar's same-named
+    // textbox (aria-label "Find in conversation") once the bar is open.
+    const findBtn = screen.getByRole('button', { name: /find in conversation/i });
+    expect(findBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(container.querySelector('.conv-findbar')).toBeNull();
+
+    // Open: the gated FindBar mounts (empty needle ⇒ no fetch fired) and
+    // aria-pressed flips. Integration-level: proves button → store → gated bar.
+    await act(async () => { fireEvent.click(findBtn); await Promise.resolve(); });
+    await waitFor(() => expect(container.querySelector('.conv-findbar')).not.toBeNull());
+    expect(getState().convFindOpen).toBe(true);
+    expect(screen.getByRole('button', { name: /find in conversation/i }).getAttribute('aria-pressed')).toBe('true');
+
+    // Close: a second click unmounts the bar and clears aria-pressed.
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /find in conversation/i })); await Promise.resolve(); });
+    await waitFor(() => expect(container.querySelector('.conv-findbar')).toBeNull());
+    expect(getState().convFindOpen).toBe(false);
+  });
+
   it('End key triggers jump-to-latest but NOT while the filter popover is open (spec §4/§5 guard)', async () => {
     // Single fully-paged page so the target is already loaded; the End key reuses
     // the same handler as the button. The named `End` key is NOT covered by the

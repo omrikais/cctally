@@ -1136,6 +1136,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: isMobileRef.current ? 'TOGGLE_CONV_OUTLINE_MOBILE' : 'TOGGLE_CONV_OUTLINE' });
   }, []);
 
+  // #205 S2 (F3) — Find toggle, mirroring toggleOutline: one stable handler
+  // shared by the button (the `/` keymap is the keyboard counterpart). Reads
+  // live store state at click time (convFindOpen is store state, so no stale
+  // closure) to open or close the find bar. No isMobile branch — the button
+  // shows on both breakpoints; the find bar floats over the body either way.
+  const toggleFind = useCallback(() => {
+    dispatch({ type: getState().convFindOpen ? 'CLOSE_CONV_FIND' : 'OPEN_CONV_FIND' });
+  }, []);
+
   const keymapBindings = useMemo(
     () => {
       // §4/§5 (Codex P2 #7) — the named-key guard also excludes an open filter
@@ -1284,6 +1293,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               onClick={() => { void jumpToLatest(); }}
             >{jumpingLatest ? '… ' : ''}Latest ↓</button>
           )}
+          {/* #205 S2 (F3) — Find toggle. Mirrors the outline toggle's
+              aria-pressed semantics + chrome; gives the `/` shortcut a visible,
+              tappable counterpart (the only find affordance on touch). */}
+          <button
+            type="button"
+            className="conv-find-toggle"
+            aria-pressed={convFindOpen}
+            aria-label="Find in conversation"
+            title="Find in conversation (/)"
+            onClick={toggleFind}
+          >🔍 Find</button>
           {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
               the EFFECTIVE open flag (mobile sheet flag on mobile, persisted pref
               on desktop). On mobile it opens the slide-over sheet (#205 S1). */}

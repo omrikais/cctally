@@ -3002,6 +3002,18 @@ mark.current {
     font-size: 16px;
   }
 
+  /* #205 S2 (F4) — the generic `input{16px}` guard above loses on specificity
+     to these per-class rules: `.conv-rail-search-input` / `.conv-findbar-input`
+     are (0,1,0); `.conv-rail-filters-field input` is (0,1,1). Re-assert 16px
+     with a `#root` prefix so each outranks its desktop rule and iOS stops
+     auto-zooming on focus (the id-selector specificity-floor convention — the
+     property is respelled, not inherited). The filters selector intentionally
+     covers the date AND number inputs (cost Min/Max, cache rebuilds) — all
+     share the 12px rule and all auto-zoom today. */
+  #root .conv-rail-search-input { font-size: 16px; }
+  #root .conv-findbar-input { font-size: 16px; }
+  #root .conv-rail-filters-field input { font-size: 16px; }
+
   /* Tap-target floor: anything the user taps must be at least 44×44 px
      (Apple HIG). Inner glyphs scale independently. The sub-rules below
      target the specific selectors that today render below 44px. */
@@ -4905,6 +4917,26 @@ mark.current {
 }
 .conv-outline-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-outline-toggle[aria-pressed="true"] {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
+/* #205 S2 (F3) — Find toggle. Mirrors .conv-outline-toggle chrome so the reader
+   controls read uniformly (and Session 4's tap-target sweep sizes them as one
+   set). */
+.conv-find-toggle {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-find-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-find-toggle[aria-pressed="true"] {
   color: var(--accent-blue);
   border-color: var(--accent-blue);
 }

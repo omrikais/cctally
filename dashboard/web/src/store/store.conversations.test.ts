@@ -194,6 +194,26 @@ describe('conversation view state', () => {
     expect(getState().convFindOpen).toBe(true);
   });
 
+  it('#205 S2 — a genuine SELECT_CONVERSATION change closes an open find bar', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    expect(getState().convFindOpen).toBe(true);
+    // Back → null and a subsequent row select are both SELECT_CONVERSATION; a
+    // genuine id change (incl. → null) closes find so the newly-reachable mobile
+    // Find button can't auto-reopen the bar on the next conversation.
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: null });
+    expect(getState().convFindOpen).toBe(false);
+  });
+
+  it('#205 S2 — a same-id SELECT_CONVERSATION leaves find untouched', () => {
+    _resetForTests();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'abc' }); // same id ⇒ no reset
+    expect(getState().convFindOpen).toBe(true);
+  });
+
   it('view state does not persist across loadInitial', () => {
     dispatch({ type: 'SET_VIEW', view: 'conversations' });
     _resetForTests();
