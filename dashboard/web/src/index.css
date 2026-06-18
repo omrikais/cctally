@@ -59,7 +59,7 @@ html, body {
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
-body { padding: 16px; box-sizing: border-box; }
+body { padding: 16px; box-sizing: border-box; max-width: 1760px; margin: 0 auto; }
 * { box-sizing: border-box; }
 
 /* Utility — referenced from dashboard.html for secondary / parenthetical text. */
@@ -154,6 +154,10 @@ body { padding: 16px; box-sizing: border-box; }
   margin-bottom: 16px;
 }
 @media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+/* C2 (#207): a third column on wide displays. minmax(0, …) keeps the
+   min-width:0 contract so a wide non-wrapping label can't inflate one
+   column. Pairs with the body max-width:1760px cap above. */
+@media (min-width: 1600px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
 /* Brand cluster: "cctally vX.Y.Z [↑ vA.B.C]" sits at the start of the
