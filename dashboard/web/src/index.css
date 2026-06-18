@@ -6845,6 +6845,28 @@ mark.current {
      space). Re-prefixed with #root + respelled per the id-selector
      specificity gotcha so it outranks the desktop dot rule. */
   #root .conv-reader-thread > .conv-sidechain::before { display: none; }
+  /* #205 S1 (F1) — minimal "contain the card" header guardrail. .conv-sidechain-head
+     is a nowrap flex row whose rigid flex:0 0 auto meta column (~218px) — once the
+     card is clamped to the viewport — crushes the title column to ~0 and stacks the
+     stats one-or-two-tokens-per-line. Let the row wrap, pin the title column to fill
+     line 1 (flex-basis:0 so a long title can't orphan the glyph onto its own line),
+     and drop the meta to its own full-width line (its children may wrap there too).
+     This is only the no-crush floor — the header's full visual polish / stat density
+     is F7/Session 3. #root-prefixed + every property respelled per the id-selector
+     specificity gotcha so it outranks the desktop rules. */
+  #root .conv-sidechain-head { flex-wrap: wrap; }
+  #root .conv-sidechain-headtext {
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0;
+    min-width: 0;
+  }
+  #root .conv-sidechain-meta {
+    flex-grow: 0;
+    flex-shrink: 0;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
   #root .conv-item {
     padding: 8px 11px;
     border-radius: 7px;
