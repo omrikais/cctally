@@ -2,10 +2,14 @@ import { Fragment, useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
+import { abbreviateModel } from '../lib/modelName';
 import type { ConversationItem, SubagentMeta } from '../types/conversation';
 import type { SubagentNode } from './groupSidechains';
 
 const LABEL_MAX = 60;
+// #205 S3 (F7) — a roomier cap on mobile so the 2-line CSS clamp on
+// .conv-sidechain-title governs the visible truncation, not this slice.
+const MOBILE_LABEL_MAX = 120;
 
 // #166: subagent result status badge. Always a bare ✓ on the happy path (the
 // word "completed" would be noise); the word is spelled out only on failure
@@ -23,7 +27,7 @@ function statusBadge(status?: string) {
 // First non-blank line of the subagent's task prompt (its root message text),
 // trimmed + truncated; falls back to the subagent hash when the root has no
 // prose. Exported for unit testing.
-export function subagentSummaryLabel(items: ConversationItem[], subagentKey: string): string {
+export function subagentSummaryLabel(items: ConversationItem[], subagentKey: string, maxLen: number = LABEL_MAX): string {
   // First NON-meta item, not items[0]: a subagent file can open with an
   // injected `meta` row (skill body / SessionStart injection) whose text would
   // otherwise leak "Base directory for this skill…" as the card title (Codex
@@ -32,7 +36,7 @@ export function subagentSummaryLabel(items: ConversationItem[], subagentKey: str
   const text = root?.text ?? '';
   const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
   if (!firstLine) return `Subagent ${subagentKey}`;
-  return firstLine.length > LABEL_MAX ? `${firstLine.slice(0, LABEL_MAX).trimEnd()}…` : firstLine;
+  return firstLine.length > maxLen ? `${firstLine.slice(0, maxLen).trimEnd()}…` : firstLine;
 }
 
 // §5 — per-child render context the reader threads down so a nested subagent
@@ -53,6 +57,9 @@ export interface SidechainChildContext {
   // so a grandchild's spawn chip (which lives in a CHILD thread item) is also
   // suppressed in favor of its nested card.
   suppressToolUseIds?: Set<string>;
+  // #205 S3 (F7) — threaded so a nested card abbreviates models + widens its
+  // title cap on mobile WITHOUT a per-card matchMedia listener.
+  isMobile?: boolean;
 }
 
 // One subagent thread (one agent-*.jsonl file) as a disclosure (#155). Summary =
@@ -89,6 +96,7 @@ export function SidechainGroup({
   children,
   depth = 0,
   childCtx,
+  isMobile,
 }: {
   subagentKey: string;
   items: ConversationItem[];
@@ -125,6 +133,9 @@ export function SidechainGroup({
   depth?: number;
   // §5 — the reader-threaded per-key machinery for the recursive children.
   childCtx?: SidechainChildContext;
+  // #205 S3 (F7) — passed by the reader to the top-level card; nested cards
+  // read childCtx.isMobile instead (threaded via renderChild).
+  isMobile?: boolean;
 }) {
   const [userOpen, setUserOpen] = useState(false);
   const open = userOpen || forceOpen;
@@ -144,12 +155,16 @@ export function SidechainGroup({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceOpen]);
 
-  const label = subagentSummaryLabel(items, subagentKey);
+  const mobile = isMobile ?? childCtx?.isMobile ?? false;
+  const label = subagentSummaryLabel(items, subagentKey, mobile ? MOBILE_LABEL_MAX : LABEL_MAX);
   // `in` narrows: the meta arm has neither cost_usd nor model (injected content
   // carries no turn cost / model), so guard the access instead of summing/listing
   // phantom fields.
   const cost = items.reduce((acc, it) => acc + ('cost_usd' in it ? (it.cost_usd ?? 0) : 0), 0);
   const models = [...new Set(items.map((it) => ('model' in it ? it.model : null)).filter(Boolean))] as string[];
+  // #205 S3 (F7) — abbreviate + RE-dedupe on mobile (an alias id and its
+  // date-stamped twin collapse to one display name).
+  const modelText = (mobile ? Array.from(new Set(models.map(abbreviateModel))) : models).join(', ');
 
   // §5 — bucket the recursive children by the parent-thread member they anchor
   // after (child.spawnAnchorUuid). A child whose anchor is null (or whose anchor
@@ -183,6 +198,7 @@ export function SidechainGroup({
       getCardRef={childCtx?.getCardRef}
       onOpenChange={childCtx?.onOpenChange}
       forceOpen={childCtx?.forcedOpenKeys?.has(child.subagentKey) ?? false}
+      isMobile={childCtx?.isMobile}
       children={child.children}
       depth={child.depth}
       childCtx={childCtx}
@@ -243,7 +259,7 @@ export function SidechainGroup({
           )}
         </span>
         <span className="conv-sidechain-meta">
-          {models.length > 0 && <span className="conv-sidechain-model">{models.join(', ')}</span>}
+          {models.length > 0 && <span className="conv-sidechain-model">{modelText}</span>}
           <span>{items.length} msgs</span>
           <span className="conv-sidechain-cost">{fmt.usd2(cost)}</span>
           <span className="conv-chev" aria-hidden="true" />

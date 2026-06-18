@@ -5149,6 +5149,21 @@ mark.current {
   cursor: pointer;
 }
 .conv-rail-empty-clear:hover { border-color: var(--accent-blue); }
+/* #205 S3 (F8) — retry affordance in the browse-list error state. */
+.conv-rail-retry {
+  display: inline-block;
+  margin-top: 8px;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-rail-retry:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-rail-row {
   display: block;
   width: 100%;
@@ -6813,6 +6828,22 @@ mark.current {
        scrollWidth; the per-child clamp below is what makes scrollWidth fit. */
     overflow-x: hidden;
   }
+  /* #205 S3 (F6) — condense the sticky reader header: trim its padding, cap a
+     long title at 2 lines, and keep the meta to a single ellipsized line (with
+     the abbreviated model list it fits; the ellipsis is the tail backstop).
+     #root-prefixed + every property respelled per the specificity-floor. */
+  #root .conv-reader-head { padding: 8px 12px; }
+  #root .conv-reader-title {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  #root .conv-reader-meta {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   /* #177 S5 — below the mobile breakpoint the outline never renders as a
      column; it slides in over the reader as a sheet with a dimming backdrop.
      Re-prefixed with #root + each property respelled per the id-selector
@@ -6898,6 +6929,16 @@ mark.current {
     flex-shrink: 0;
     flex-basis: 100%;
     flex-wrap: wrap;
+  }
+  /* #205 S3 (F7) — let the subagent-card title wrap to 2 lines instead of the
+     desktop one-line ellipsis ("Impl…"). #root-prefixed + every property
+     respelled per the id-selector specificity-floor convention. */
+  #root .conv-sidechain-title {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
   #root .conv-item {
     padding: 8px 11px;

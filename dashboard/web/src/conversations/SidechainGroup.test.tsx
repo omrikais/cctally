@@ -387,3 +387,49 @@ describe('SidechainGroup header (#193)', () => {
     expect(document.querySelector('.conv-sidechain-title')!.textContent).toBe('Do the analysis');
   });
 });
+
+describe('subagentSummaryLabel maxLen (#205 S3 F7)', () => {
+  const prompt = 'x'.repeat(100); // 100 chars, no newline
+
+  it('defaults to a 60-char cap (existing behavior)', () => {
+    const label = subagentSummaryLabel([member('r', { text: prompt })], 'h');
+    expect(label.length).toBe(61); // 60 + ellipsis
+    expect(label.endsWith('…')).toBe(true);
+  });
+
+  it('honors a larger explicit maxLen', () => {
+    const label = subagentSummaryLabel([member('r', { text: prompt })], 'h', 120);
+    expect(label).toBe(prompt); // 100 < 120 → no truncation
+  });
+});
+
+describe('SidechainGroup mobile model abbreviation (#205 S3 F7)', () => {
+  // Two distinct ids that collapse to the SAME abbreviation — must de-dupe.
+  const items = [
+    member('s1', { kind: 'assistant', text: 'Audit', cost_usd: 0.1, model: 'claude-opus-4-8-20251101' } as Partial<ConversationItem>),
+    member('s2', { kind: 'assistant', text: 'More',  cost_usd: 0.1, model: 'claude-opus-4-8' } as Partial<ConversationItem>),
+  ];
+
+  it('abbreviates + de-duplicates the model list when isMobile', () => {
+    const { container } = render(<SidechainGroup subagentKey="k1" items={items} nested={false} isMobile />);
+    const model = container.querySelector('.conv-sidechain-model')!.textContent!;
+    expect(model).toBe('opus-4-8');                 // both collapse to one
+    expect(model).not.toContain('claude-');
+    expect(model).not.toContain('20251101');
+  });
+
+  it('renders the full ids on desktop (isMobile false)', () => {
+    const { container } = render(<SidechainGroup subagentKey="k1" items={items} nested={false} isMobile={false} />);
+    const model = container.querySelector('.conv-sidechain-model')!.textContent!;
+    expect(model).toContain('claude-opus-4-8-20251101');
+    expect(model).toContain('claude-opus-4-8');
+  });
+
+  it('shows >60 chars of a no-meta fallback title on mobile (MOBILE_LABEL_MAX path)', () => {
+    const long = 'Implement the conversation reader find bar and wire up the n and N step bindings cleanly';
+    const longItems = [member('r', { kind: 'assistant', text: long, cost_usd: 0 } as Partial<ConversationItem>)];
+    const { container } = render(<SidechainGroup subagentKey="k1" items={longItems} nested={false} isMobile />);
+    const title = container.querySelector('.conv-sidechain-title')!.textContent!;
+    expect(title.length).toBeGreaterThan(61); // desktop would cap at 60 + ellipsis
+  });
+});

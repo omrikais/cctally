@@ -1976,3 +1976,34 @@ describe('deriveReaderTitle (#188 promoted command)', () => {
     expect(title).toBe('cctally-dev');
   });
 });
+
+// ---- #205 S3 (F6) — reader meta model abbreviation on mobile ----------
+describe('reader meta model abbreviation (#205 S3 F6)', () => {
+  function multiModelDetail() {
+    const d = detail([makeItem({ uuid: 'h1' })]);
+    d.models = ['claude-haiku-4-5-20251001', 'claude-opus-4-8'];
+    return d;
+  }
+
+  it('abbreviates the model list on mobile', async () => {
+    stubMobileMedia(true);
+    _resetForTests();
+    mockFetchOnce(multiModelDetail());
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
+    const meta = container.querySelector('.conv-reader-meta')!.textContent!;
+    expect(meta).toContain('haiku-4-5');
+    expect(meta).toContain('opus-4-8');
+    expect(meta).not.toContain('claude-haiku-4-5-20251001');
+  });
+
+  it('renders the full ids on desktop', async () => {
+    stubMobileMedia(false);
+    _resetForTests();
+    mockFetchOnce(multiModelDetail());
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
+    const meta = container.querySelector('.conv-reader-meta')!.textContent!;
+    expect(meta).toContain('claude-haiku-4-5-20251001');
+  });
+});

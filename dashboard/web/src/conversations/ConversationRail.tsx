@@ -182,7 +182,7 @@ export function ConversationRail() {
 interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
-  const { rows, loading, error, hasMore, loadMore, filterDegraded } = useConversations();
+  const { rows, loading, error, hasMore, loadMore, filterDegraded, retry } = useConversations();
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   // filters spec §1 dual-branch parity — a one-line muted note when the
   // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
@@ -190,7 +190,14 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
   const degradedNote = filterDegraded
     ? <div className="conv-rail-filters-degraded">Project/cost/rebuild filters apply once indexing finishes.</div>
     : null;
-  if (error) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">{error}</div></div>;
+  if (error) return (
+    <div className="conv-rail-list">{degradedNote}
+      <div className="conv-rail-empty">
+        {error}
+        <button type="button" className="conv-rail-retry" onClick={() => retry()}>Retry</button>
+      </div>
+    </div>
+  );
   if (loading && rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">Loading…</div></div>;
   if (rows.length === 0) {
     // spec §4 Empty state — filtered-to-zero is DISTINCT from no-conversations-

@@ -46,6 +46,8 @@ export interface UseConversations {
   // was requested but the rollup was non-authoritative (the live fallback can only
   // filter by date). The rail surfaces a muted note.
   filterDegraded: boolean;
+  // #205 S3 (F8) — user-initiated re-load of page 1 after a failed fetch.
+  retry: () => void;
 }
 
 const PAGE = 50;
@@ -109,6 +111,17 @@ export function useConversations(): UseConversations {
         setLoading(false);
       });
   }, []);
+
+  // #205 S3 (F8) — explicit retry for the dead error state. Clears the error
+  // and shows the "Loading…" branch (rows are empty on a failed first load),
+  // then re-issues page 1. loadFirstPage itself is NOT changed to flip loading
+  // (it is shared with the silent SSE revalidation, which must not flash a
+  // spinner over a populated list) — only this wrapper sets it.
+  const retry = useCallback(() => {
+    setError(null);
+    setLoading(true);
+    loadFirstPage();
+  }, [loadFirstPage]);
 
   // Filter-change reset (filters spec §4): a filter change wipes the accumulated
   // tail, rewinds the cursor to offset 0, and refetches page 1 with the new
@@ -184,5 +197,5 @@ export function useConversations(): UseConversations {
     }
   }, [nextOffset]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore, filterDegraded };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, filterDegraded, retry };
 }

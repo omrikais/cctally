@@ -18,11 +18,15 @@ let searchDepth: 'prose-only' | 'full' = 'full';
 let searchLoadingMore = false;
 let filterDegraded = false;
 const loadMoreSpy = vi.fn();
+// #205 S3 (F8) — overridable error + retry spy so the error-branch Retry button
+// can be exercised. Default error null preserves every existing browse test.
+let browseError: string | null = null;
+const retrySpy = vi.fn();
 
 vi.mock('../hooks/useConversations', () => ({
   useConversations: () => ({
-    rows: browseRows, loading: false, error: null, hasMore: false,
-    loadMore: () => Promise.resolve(), filterDegraded,
+    rows: browseRows, loading: false, error: browseError, hasMore: false,
+    loadMore: () => Promise.resolve(), filterDegraded, retry: retrySpy,
   }),
 }));
 // Stub the popover so the rail render doesn't reach useConversationFacets' live
@@ -82,6 +86,8 @@ beforeEach(() => {
   searchLoadingMore = false;
   filterDegraded = false;
   loadMoreSpy.mockReset();
+  browseError = null;
+  retrySpy.mockClear();
 });
 afterEach(() => {
   _resetForTests();
@@ -429,5 +435,16 @@ describe('ConversationRail', () => {
     fireEvent.click(clear);
     expect(getState().conversationFilters.rebuildMin).toBeNull();
     expect(getState().conversationFilters.projects).toEqual([]);
+  });
+});
+
+describe('ConversationRail browse-list error state (#205 S3 F8)', () => {
+  it('shows a Retry button in the error state that calls retry()', () => {
+    browseError = "Couldn't load conversations.";
+    render(<ConversationRail />);
+    const btn = screen.getByRole('button', { name: /retry/i });
+    expect(btn).toBeTruthy();
+    fireEvent.click(btn);
+    expect(retrySpy).toHaveBeenCalledTimes(1);
   });
 });

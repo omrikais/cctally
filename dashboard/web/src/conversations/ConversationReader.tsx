@@ -16,6 +16,7 @@ import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFo
 import { insertTimeMarkers } from './insertTimeMarkers';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
+import { abbreviateModel } from '../lib/modelName';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ConversationItem, ConversationOutline, SubagentMeta } from '../types/conversation';
 
@@ -886,8 +887,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       getCardRef,
       onOpenChange: handleSubagentOpenChange,
       suppressToolUseIds,
+      isMobile,
     }),
-    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds],
+    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds, isMobile],
   );
 
   // Reset the focused-turn cursor to the top on a session switch (the reused
@@ -1250,7 +1252,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         <div className="conv-reader-headmain">
           <div className="conv-reader-title">{title || detail.session_id}</div>
           <div className="conv-reader-meta">
-            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
+            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {(isMobile ? Array.from(new Set(detail.models.map(abbreviateModel))) : detail.models).join(', ')}
           </div>
         </div>
         <div className="conv-reader-controls">
@@ -1394,6 +1396,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   // §5 (Codex P1-D) — force-open iff this key is in the ancestor
                   // chain set (a jump into a nested target opens this parent too).
                   forceOpen={detail.session_id === sessionId && forcedOpenKeys.has(g.subagentKey)}
+                  isMobile={isMobile}
                   riseClassName={riseClass}
                   riseStyle={riseStyle}
                   // §5 — recursive nesting: the child subagent threads + this

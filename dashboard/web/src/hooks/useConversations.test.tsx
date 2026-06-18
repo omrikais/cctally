@@ -213,4 +213,16 @@ describe('useConversations', () => {
     const { result } = renderHook(() => useConversations());
     await waitFor(() => expect(result.current.filterDegraded).toBe(true));
   });
+
+  it('recovers from a failed first load via retry() (#205 S3 F8)', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('boom'));
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.error).toBe("Couldn't load conversations."));
+    expect(result.current.rows).toHaveLength(0);
+
+    mockFetchOnce(page1);
+    await act(async () => { result.current.retry(); });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect(result.current.error).toBeNull();
+  });
 });
