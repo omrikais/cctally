@@ -1,5 +1,6 @@
-import { useState, useSyncExternalStore } from 'react';
+import { useRef, useState, useSyncExternalStore } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
+import { useModalFocus } from '../hooks/useModalFocus';
 import { getState, subscribeStore } from '../store/store';
 import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -94,10 +95,17 @@ export function HelpOverlay() {
     // registration order (#159). Mirrors `#help-overlay { z-index: 1000 }`.
     { key: 'Escape', scope: 'overlay', layer: 1000, action: () => setOpen(false), when: () => open },
   ]);
+  // a11y focus management (#207 A1). Help is a local-state overlay that can open
+  // over anything (z-index 1000); it moves focus into itself, and the
+  // contains-guard in `useModalFocus` keeps every lower surface from fighting.
+  // `trapEnabled` defaults to true. Called BEFORE the `!open` early-return so
+  // the hook order stays stable (Rules of Hooks).
+  const cardRef = useRef<HTMLDivElement>(null);
+  useModalFocus(cardRef, { active: open });
   if (!open) return null;
   return (
     <div id="help-overlay" onClick={() => setOpen(false)}>
-      <div className="help-card" onClick={(e) => e.stopPropagation()}>
+      <div ref={cardRef} className="help-card" onClick={(e) => e.stopPropagation()}>
         <div className="help-header">
           <h2>{isMobile ? 'Help' : 'Keybindings'}</h2>
           <button

@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   dispatch,
   getState,
@@ -10,6 +10,7 @@ import {
 } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
+import { useModalFocus } from '../hooks/useModalFocus';
 import type {
   AlertAxis,
   AlertsSettingsEnvelope,
@@ -275,6 +276,14 @@ export function SettingsOverlay() {
     markersEnabledServer,
   ]);
 
+  // a11y focus management (#207 A1). Settings is a local-state surface; it is
+  // mutually exclusive with a panel modal (the `s` keybinding is guarded by
+  // `!openModal`), so `trapEnabled` defaults to true and the contains-guard in
+  // `useModalFocus` handles any Help-over-Settings case. Called BEFORE the
+  // `!open` early-return so the hook order stays stable (Rules of Hooks).
+  const cardRef = useRef<HTMLDivElement>(null);
+  useModalFocus(cardRef, { active: open });
+
   if (!open) return null;
 
   const tzTargetValue =
@@ -439,6 +448,7 @@ export function SettingsOverlay() {
     <div id="settings-root">
       <div className="modal-backdrop" onClick={close} />
       <div
+        ref={cardRef}
         className="modal-card accent-orange"
         role="dialog"
         aria-modal="true"

@@ -1,7 +1,13 @@
 import type { ReactNode } from 'react';
-import { useMemo } from 'react';
+import { useMemo, useRef, useSyncExternalStore } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
-import { dispatch } from '../store/store';
+import {
+  dispatch,
+  getState,
+  subscribeStore,
+  topmostStoreFocusLayer,
+} from '../store/store';
+import { useModalFocus } from '../hooks/useModalFocus';
 
 interface ModalProps {
   title: string;
@@ -23,10 +29,20 @@ export function Modal({ title, accentClass, children, headerExtras }: ModalProps
     [],
   );
   useKeymap(bindings);
+  // a11y focus management (#207 A1). Modal only mounts while a panel modal is
+  // open, so `active` is always true here. The Tab-trap suspends when a
+  // higher store-tracked layer (Share/Composer/Update) opens on top.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const trapEnabled = useSyncExternalStore(
+    subscribeStore,
+    () => topmostStoreFocusLayer(getState()) === 'panel',
+  );
+  useModalFocus(cardRef, { active: true, trapEnabled });
   return (
     <div id="modal-root">
       <div className="modal-backdrop" onClick={close} />
       <div
+        ref={cardRef}
         className={`modal-card ${accentClass}`}
         role="dialog"
         aria-modal="true"

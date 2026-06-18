@@ -25,9 +25,15 @@
 // The Esc binding goes through the same useKeymap modal-scope route
 // the UpdateModal uses, gated on `doctorModalOpen` so the binding
 // stays inert when the modal is closed.
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
-import { dispatch, getState, subscribeStore } from '../store/store';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  dispatch,
+  getState,
+  subscribeStore,
+  topmostStoreFocusLayer,
+} from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
+import { useModalFocus } from '../hooks/useModalFocus';
 import {
   useDoctorReport,
   type DoctorCategory,
@@ -74,12 +80,24 @@ export function DoctorModal(): JSX.Element | null {
     if (open) void refresh();
   }, [open, refresh]);
 
+  // a11y focus management (#207 A1). Called BEFORE the `!open` early-return so
+  // the hook order stays stable (Rules of Hooks). `active: open` drives
+  // focus-in/restore; the Tab-trap suspends when a higher store-tracked layer
+  // opens above the doctor modal.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const trapEnabled = useSyncExternalStore(
+    subscribeStore,
+    () => topmostStoreFocusLayer(getState()) === 'doctor',
+  );
+  useModalFocus(cardRef, { active: open, trapEnabled });
+
   if (!open) return null;
 
   return (
     <div className="update-modal-root" onClick={close}>
       <div className="modal-backdrop" />
       <div
+        ref={cardRef}
         className="modal-card doctor-modal-card"
         role="dialog"
         aria-modal="true"

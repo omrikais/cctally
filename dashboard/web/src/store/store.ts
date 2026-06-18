@@ -618,6 +618,26 @@ export function selectLiveTailEnabled(s: UIState = state): boolean {
   return s.dashboardPrefs.live_tail !== false;
 }
 
+// a11y focus management (#207 A1) — the highest STORE-TRACKED open focus layer,
+// by fixed priority. Drives `trapEnabled` for `useModalFocus`: a panel modal
+// suspends its Tab-trap when Share/Composer/Update opens on top of it (panel
+// modals stay mounted under the share layer — `ModalRoot` and `ShareModalRoot`
+// are siblings — so a trap keyed only on "is a panel modal open" would keep
+// yanking focus back into the underlying panel). `SettingsOverlay`/`HelpOverlay`
+// track their open-state in component-local React state and are intentionally
+// NOT seen here — the `useModalFocus` contains-guard covers them (Settings is
+// mutually exclusive with a panel modal, and Help moves focus into itself).
+export type StoreFocusLayer = 'composer' | 'share' | 'update' | 'doctor' | 'panel' | null;
+
+export function topmostStoreFocusLayer(s: UIState): StoreFocusLayer {
+  if (s.composerModal) return 'composer';
+  if (s.shareModal) return 'share';
+  if (s.update.modalOpen) return 'update';
+  if (s.doctorModalOpen) return 'doctor';
+  if (s.openModal != null) return 'panel';
+  return null;
+}
+
 export function subscribeStore(fn: () => void): () => void {
   subscribers.add(fn);
   return () => { subscribers.delete(fn); };
