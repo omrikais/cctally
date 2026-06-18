@@ -25,7 +25,9 @@
   --font-prose: "Newsreader", Georgia, serif;
   /* Effective sticky-topbar height. Used as the scroll-margin-top floor
      so panel headers don't slide under the bar when scrollIntoView() or
-     a hash-jump targets them. Mobile bumps this in the @media block. */
+     a hash-jump targets them, and as the conv-view height budget. The
+     mobile @media block re-defines this as a safe-area-aware calc() so it
+     tracks the taller two-row bar incl. env(safe-area-inset-top) (#206). */
   --topbar-h: 64px;
 }
 
@@ -3663,9 +3665,15 @@ mark.current {
     min-height: 44px;
   }
 
-  /* Mobile two-row topbar measures ~80px tall + 8px page padding +
-     8px topbar margin-bottom + a few px headroom. */
-  :root { --topbar-h: 104px; }
+  /* Real two-row mobile topbar = ~142px of fixed chrome (content +
+     padding-bottom + border) PLUS the variable top padding that grows
+     with the safe-area inset. Measured 147.75px headless (no inset) at
+     320–390 widths. The max(6px, env(safe-area-inset-top)) term is the
+     SAME one .topbar uses for its padding-top (~L3041), so --topbar-h now
+     tracks the real bar height at ANY inset — fixing both the .panel
+     scroll-margin anchor (~44px too high at the old flat 104px) and the
+     conv-view height budget below, on notched devices included. #206. */
+  :root { --topbar-h: calc(142px + max(6px, env(safe-area-inset-top))); }
 
   /* Settings sheet — match the bottom-sheet pattern used by Help and
      panel modals. Without this override `#settings-root` stays
@@ -6804,12 +6812,16 @@ mark.current {
   #root .conv-view,
   #root .conv-view--mobile {
     grid-template-columns: 1fr;
-    /* #205 S4 (parked A) — the mobile --topbar-h budget (104px) under-counts the
-       real ~148px two/three-row topbar + body padding + margins, leaving ~64px of
-       document overflow that lets the sticky topbar scroll over the reader's Back
-       button. Enlarge the subtraction (scoped to this conv-view rule, NOT the shared
-       --topbar-h) so the document itself can't scroll behind the sticky topbar. */
-    height: calc(var(--mobile-vh) - var(--topbar-h) - 88px);
+    /* #206 — --topbar-h is now safe-area-aware (it tracks the real ~148px two-row
+       bar incl. env(safe-area-inset-top)), so this calc only has to subtract the
+       surrounding chrome: body top+bottom padding (8+8) + topbar margin-bottom (8)
+       + conv-view margin-bottom (12) = 36px, plus a 4px sub-pixel buffer. Because
+       --topbar-h carries the inset, the document height stays 100dvh − 4 at ANY
+       inset, so it can't scroll behind the sticky topbar (over the reader's Back
+       button) — superseding the #205 S4 − 88px constant, which was calibrated for
+       the no-inset headless case only and regained ~30px overflow on notched
+       devices. */
+    height: calc(var(--mobile-vh) - var(--topbar-h) - 40px);
     gap: 0;
     overflow: hidden;
     margin-bottom: 12px;

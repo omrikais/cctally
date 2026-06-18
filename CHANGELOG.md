@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard conversation viewer — the mobile fix that stops the sticky topbar from hiding `← Back` now holds on notched phones, and in-page panel jumps land correctly.** The mobile topbar height budget (`--topbar-h`) was a flat 104px, but the real two-row mobile header renders ~148px; the #205 reader-height fix compensated only for the no-safe-area (headless) case, so on a notched device (`env(safe-area-inset-top)`) roughly 30px of document overflow returned and the sticky topbar could again scroll over the reader's `← Back` button. `--topbar-h` is now measured safe-area-aware (`calc(142px + max(6px, env(safe-area-inset-top)))`) so it tracks the real header height at any inset — the conversation reader fills the viewport with no document overflow on every phone, and because that same variable is every panel's scroll-anchor floor, in-page jumps and `scrollIntoView()` now land panel titles flush just below the header instead of ~44px under it. Desktop is byte-identical (#206).
+
 ## [1.50.0] - 2026-06-18
 
 ### Fixed
