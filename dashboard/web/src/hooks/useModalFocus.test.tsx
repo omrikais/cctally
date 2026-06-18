@@ -1,6 +1,6 @@
 import { useRef } from 'react';
 import { render, fireEvent } from '@testing-library/react';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useModalFocus } from './useModalFocus';
 
 function Harness({ active, trapEnabled = true }: { active: boolean; trapEnabled?: boolean }) {
@@ -54,9 +54,19 @@ describe('useModalFocus', () => {
   });
 
   it('toggling trapEnabled does not re-restore focus (only deactivation does)', () => {
-    const { rerender } = render(<Harness active={true} trapEnabled={true} />);
+    // Start closed with the trigger focused so it becomes the captured restore target.
+    const { rerender } = render(<Harness active={false} trapEnabled={true} />);
+    const trigger = document.getElementById('trigger')!;
+    trigger.focus();
+    rerender(<Harness active={true} trapEnabled={true} />);
     expect(document.activeElement?.id).toBe('first');
+    // Spy AFTER focus-in so we only observe the toggle. If the focus-in effect wrongly
+    // depended on trapEnabled, toggling it would run cleanup (restore→trigger.focus) then
+    // re-run focus-in — the spy would fire. It must not.
+    const focusSpy = vi.spyOn(trigger, 'focus');
     rerender(<Harness active={true} trapEnabled={false} />);
+    expect(focusSpy).not.toHaveBeenCalled();
     expect(document.activeElement?.id).toBe('first'); // unchanged, not back to trigger
+    focusSpy.mockRestore();
   });
 });
