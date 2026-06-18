@@ -2042,6 +2042,13 @@ mark.current {
 .panel-empty {
   text-align: center; color: var(--text-faint); font-size: 12px; padding: 24px 0;
 }
+/* Center the empty-state copy in the panel body instead of top-anchoring,
+   so tall panels don't show dead space below the message (#207 C3). */
+.panel-body:has(> .panel-empty) {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
 
 /* -------- Blocks panel (fuel gauge) -------- */
 .panel.blocks-collapsed { max-height: 480px; }
