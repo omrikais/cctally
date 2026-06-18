@@ -2467,7 +2467,7 @@ mark.current {
 }
 .panel-host:hover,
 .panel-host:hover > .panel {
-  cursor: grab;
+  cursor: pointer;
 }
 .panel-host.is-dragging:hover,
 .panel-host.is-dragging:hover > .panel {
