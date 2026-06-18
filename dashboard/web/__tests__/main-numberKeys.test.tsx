@@ -1,10 +1,20 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { _resetForTests, getState, dispatch } from '../src/store/store';
+import { _resetForTests, getState, dispatch, updateSnapshot } from '../src/store/store';
 import { openPanelByPosition } from '../src/lib/openPanelByPosition';
+import type { Envelope } from '../src/types/envelope';
+
+// A snapshot with empty sessions — enough to clear the #207 B2/B3 no-data
+// guard (openPanelByPosition is a no-op until a snapshot lands) while keeping
+// the Sessions opener a safe no-op (no session id to resolve).
+const SNAP = {
+  header: {},
+  sessions: { total: 0, rows: [], sort_key: 'started_desc' },
+} as unknown as Envelope;
 
 beforeEach(() => {
   localStorage.clear();
   _resetForTests();
+  updateSnapshot(SNAP);
 });
 
 describe('openPanelByPosition', () => {
@@ -22,11 +32,10 @@ describe('openPanelByPosition', () => {
   it('uses the registered openAction (Sessions has a special opener that does NOT just OPEN_MODAL kind=session)', () => {
     // Sessions panel registry uses openMostRecentSessionModal which still
     // dispatches OPEN_MODAL kind=session, but only after resolving an id
-    // from the current snapshot. Without a snapshot, it should be a no-op
-    // and openModal stays null.
+    // from the current snapshot. The seeded snapshot has EMPTY sessions, so
+    // there's no id to resolve and the opener is a safe no-op (openModal
+    // stays null). The point is no crash.
     openPanelByPosition(4);
-    // No snapshot loaded in this test → openMostRecentSessionModal is a
-    // safe no-op; openModal stays null. The point is no crash.
     expect(getState().openModal).toBeNull();
   });
 

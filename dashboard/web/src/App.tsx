@@ -12,6 +12,11 @@ import { ModalRoot } from './modals/ModalRoot';
 import { ShareModalRoot } from './share/ShareModalRoot';
 import { ConversationsView } from './conversations/ConversationsView';
 import { getState, subscribeStore } from './store/store';
+import { useSnapshot } from './hooks/useSnapshot';
+import { useConnectionStatus } from './hooks/useConnectionStatus';
+import { deriveAppState } from './lib/appState';
+import { ConnectionBanner } from './components/ConnectionBanner';
+import { SkeletonGrid } from './components/SkeletonGrid';
 
 export function App() {
   // Stable items array for the sortable grid. dnd-kit's rectSortingStrategy
@@ -30,6 +35,13 @@ export function App() {
   // its own view-aware keymap bindings only while active, so the dashboard
   // panel digits/letters can't fire over the unmounted grid.
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
+  // B2/B3 (#207): connection / bootstrap state drives the dashboard body —
+  // a cold-start skeleton grid (loading), a shared error banner (failed
+  // bootstrap), or the live grid with a stale banner + dim overlay when a
+  // post-first-data connection drops.
+  const env = useSnapshot();
+  const { disconnected, bootstrapError } = useConnectionStatus();
+  const appState = deriveAppState(env, bootstrapError);
   return (
     <>
       {/* Keyboard bypass (A7) — first tab stop; reveals on :focus and
@@ -41,14 +53,21 @@ export function App() {
       <main id="main-content" tabIndex={-1}>
         {view === 'conversations' ? (
           <ConversationsView />
+        ) : appState === 'loading' ? (
+          <SkeletonGrid count={panelOrder.length} />
+        ) : appState === 'error' ? (
+          <ConnectionBanner kind="error" />
         ) : (
-          <PanelGridDnd items={panelOrder}>
-            <div className="grid">
-              {panelOrder.map((id, index) => (
-                <PanelHost key={id} id={id} index={index} />
-              ))}
-            </div>
-          </PanelGridDnd>
+          <>
+            {disconnected && <ConnectionBanner kind="stale" />}
+            <PanelGridDnd items={panelOrder}>
+              <div className={`grid${disconnected ? ' is-stale' : ''}`}>
+                {panelOrder.map((id, index) => (
+                  <PanelHost key={id} id={id} index={index} />
+                ))}
+              </div>
+            </PanelGridDnd>
+          </>
         )}
       </main>
       <Footer />

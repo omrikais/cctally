@@ -564,6 +564,52 @@ body { padding: 16px; box-sizing: border-box; }
 .warn-banner.good { background-color: var(--accent-green); color: #0b2a16; }
 .warn-banner.warn { background-color: var(--accent-amber); color: #1a1400; }
 .warn-banner.over { background-color: var(--accent-red);   color: #ffe7e7; }
+
+/* #207 B2/B3 — connection feedback (disconnect banner, stale dim, skeleton).
+   A distinct `.stale-banner` family so it never collides with the verdict
+   `.warn-banner` above. */
+.stale-banner {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 14px; margin-bottom: 10px; border-radius: 6px;
+  font-size: 13px; font-weight: 700;
+  font-family: var(--font-mono);
+}
+.stale-banner .icon { width: 15px; height: 15px; }
+.stale-banner-stale { background: var(--accent-amber); color: #1a1400; }
+.stale-banner-error { background: var(--accent-red);   color: #ffe7e7; }
+.stale-banner-hint { font-weight: 500; opacity: 0.85; }
+.stale-banner-hint code { font-family: var(--font-mono); }
+
+/* Stale dim — a static .55 opacity over the whole grid signals "not live"
+   across all panels at once (cheaper than per-panel chips, covers all). No
+   transition, so prefers-reduced-motion is moot. */
+.grid.is-stale { opacity: 0.55; }
+
+/* Cold-start skeleton cards (B3). Static muted fills by default; the shimmer
+   animation is gated on prefers-reduced-motion: no-preference. */
+.panel.is-skeleton { pointer-events: none; }
+.panel.is-skeleton .skel {
+  background: var(--surface-faint);
+  border-radius: 6px;
+}
+.panel.is-skeleton .skel-header { height: 18px; width: 45%; margin-bottom: 16px; }
+.panel.is-skeleton .skel-line { height: 12px; width: 100%; margin-bottom: 10px; }
+.panel.is-skeleton .skel-line.short { width: 60%; }
+@media (prefers-reduced-motion: no-preference) {
+  .panel.is-skeleton .skel {
+    background: linear-gradient(90deg,
+      var(--surface-faint) 25%,
+      rgba(255, 255, 255, 0.12) 37%,
+      var(--surface-faint) 63%);
+    background-size: 400% 100%;
+    animation: skel-shimmer 1.4s ease-in-out infinite;
+  }
+  @keyframes skel-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
+}
 .fc-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 6px 0;
