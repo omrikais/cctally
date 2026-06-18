@@ -59,7 +59,7 @@ export function ConversationsView() {
                   <button
                     type="button"
                     className="conv-outline-backdrop"
-                    aria-label="Close outline"
+                    aria-label="Dismiss outline (tap outside)"
                     onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
                   />
                   <div className="conv-outline-sheet">

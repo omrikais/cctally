@@ -3010,9 +3010,9 @@ mark.current {
      property is respelled, not inherited). The filters selector intentionally
      covers the date AND number inputs (cost Min/Max, cache rebuilds) — all
      share the 12px rule and all auto-zoom today. */
-  #root .conv-rail-search-input { font-size: 16px; }
-  #root .conv-findbar-input { font-size: 16px; }
-  #root .conv-rail-filters-field input { font-size: 16px; }
+  #root .conv-rail-search-input { font-size: 16px; min-height: 44px; }
+  #root .conv-findbar-input { font-size: 16px; min-height: 44px; }
+  #root .conv-rail-filters-field input { font-size: 16px; min-height: 44px; }
 
   /* Tap-target floor: anything the user taps must be at least 44×44 px
      (Apple HIG). Inner glyphs scale independently. The sub-rules below
@@ -6804,7 +6804,7 @@ mark.current {
   #root .conv-view,
   #root .conv-view--mobile {
     grid-template-columns: 1fr;
-    height: calc(100vh - var(--topbar-h) - 16px);
+    height: calc(var(--mobile-vh) - var(--topbar-h) - 16px);
     gap: 0;
     overflow: hidden;
     margin-bottom: 12px;
@@ -6956,6 +6956,7 @@ mark.current {
   #root .view-seg {
     padding: 4px 10px;
     font-size: 12px;
+    min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
   /* #205 S1 (F1) — fit the reader controls toolbar to the pane so .conv-reader
      can never horizontally overflow / shear. Controls take their own full-width
@@ -6972,12 +6973,14 @@ mark.current {
     display: flex;
     width: 100%;
     border-radius: 6px;
+    min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
   #root .conv-focus-seg-btn {
     flex: 1;
     justify-content: center;
     padding: 7px 4px;
     font-size: 11px;
+    min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
   /* #205 S1 (F2) — the mobile outline slide-over gets a titled header with a
      visible ✕. The sheet stacks this fixed header over the scrolling panel. */
@@ -7001,8 +7004,8 @@ mark.current {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 38px;
-    height: 38px;
+    width: 44px;   /* #205 S4 (F5) — was 38px; edit in place (a new earlier rule loses on source order) */
+    height: 44px;
     border: 1px solid var(--border-soft);
     border-radius: 8px;
     background: var(--panel-bg);
@@ -7011,6 +7014,65 @@ mark.current {
     cursor: pointer;
   }
   #root .conv-outline-close:hover { color: var(--text); border-color: var(--accent-blue); }
+
+  /* #205 S4 (F5) — mobile touch-target sweep: raise every interactive control
+     in the conversation viewer to a ≥44×44px effective hit area. Each rule is
+     `#root`-prefixed to clear the id-selector specificity floor; every property
+     is respelled (not inherited). The two carve-outs (the copy-button `::before`
+     hit-area expansion below, and inline content links per WCAG 2.5.5) are
+     documented in the spec §3/§4F. */
+
+  /* §4A reader header */
+  #root .conv-back { min-height: 44px; }
+  /* Latest / Find / Outline as one 44px row of three equal buttons */
+  #root .conv-jump-latest,
+  #root .conv-find-toggle,
+  #root .conv-outline-toggle { flex: 1; min-height: 44px; }
+
+  /* §4B find bar */
+  #root .conv-findbar-nav,
+  #root .conv-findbar-close { width: 44px; height: 44px; }
+
+  /* §4C filters popover */
+  #root .conv-rail-filters-chip { min-height: 44px; min-width: 44px; }
+  #root .conv-rail-filters-proj { min-height: 44px; }
+  #root .conv-rail-filters-proj input[type="checkbox"] { width: 18px; height: 18px; }
+  #root .conv-rail-filters-done,
+  #root .conv-rail-filters-clear { min-height: 44px; }
+
+  /* §4D browse rail */
+  #root .conv-rail-filters-btn { min-height: 44px; }
+  #root .conv-rail-filters-activechip,
+  #root .conv-rail-filters-clearall,
+  #root .conv-rail-chip,
+  #root .conv-rail-retry,
+  #root .conv-rail-empty-clear { min-height: 44px; min-width: 44px; }
+  #root .conv-rail-more { min-height: 44px; }
+
+  /* §4E session outline */
+  #root .conv-outline-entry { min-height: 44px; }
+  #root .conv-jump-cluster-btn { min-height: 44px; min-width: 44px; }
+
+  /* §4F transcript body controls */
+  #root .conv-jump-top { width: 44px; height: 44px; }   /* round FAB; 34→44 */
+  #root .conv-new-pill { min-height: 44px; }
+  #root .conv-hidden-run { min-height: 44px; }
+  #root .conv-loadfull-btn { min-height: 44px; }
+  #root .conv-chip > summary,
+  #root .conv-meta > summary,
+  #root .conv-system-marker > summary { min-height: 44px; box-sizing: border-box; }
+
+  /* #205 S4 (F5) — corner copy buttons can't grow to a literal 44px without
+     covering code/diff/terminal/web content; expand the HIT AREA invisibly
+     instead (mirrors the .chip.model-chip pattern). The absolute corner
+     variants already establish a containing block, so the ::before anchors to
+     the button in every placement. */
+  #root .conv-copy-btn { position: relative; }
+  #root .conv-copy-btn::before {
+    content: "";
+    position: absolute;
+    inset: -11px;   /* ~24px glyph + 22px → ≥44px tappable */
+  }
 }
 
 /* ===== #177 S2 — decision & planning tool cards ===== */

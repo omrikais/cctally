@@ -465,6 +465,24 @@ describe('Conversations workspace integration', () => {
     await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
   });
 
+  it('18: the mobile outline backdrop has a distinct aria-label from the ✕ close (no duplicate)', async () => {
+    // #205 S4 (parked B) — backdrop + ✕ both used aria-label="Close outline";
+    // a screen reader hit two adjacent identically-named buttons. The ✕ keeps
+    // "Close outline"; the backdrop gets a distinct label.
+    stubMobileMedia(true);
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
+    render(<App />);
+
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).not.toBeNull());
+    const backdrop = document.querySelector<HTMLButtonElement>('.conv-outline-backdrop')!;
+    const closeBtn = document.querySelector<HTMLButtonElement>('.conv-outline-close')!;
+    expect(closeBtn.getAttribute('aria-label')).toBe('Close outline');
+    expect(backdrop.getAttribute('aria-label')).toBe('Dismiss outline (tap outside)');
+    expect(backdrop.getAttribute('aria-label')).not.toBe(closeBtn.getAttribute('aria-label'));
+  });
+
   // #177 S6 — the '/' rebind matrix (F8). Reader open → opens find; no reader →
   // focuses the rail search input; modal open → neither (guard suppresses it).
   it('12: "/" opens the find bar when a reader is open', async () => {
