@@ -209,6 +209,7 @@ export function SessionsPanel() {
                       <button
                         type="button"
                         className="project-cell-link"
+                        title={r.project}
                         aria-label={`Open Projects modal for ${r.project_key}`}
                         onClick={(e) => {
                           // stopPropagation so the enclosing <tr>'s

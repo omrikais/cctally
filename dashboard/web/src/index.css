@@ -707,7 +707,11 @@ body { padding: 16px; box-sizing: border-box; }
 .sess-table tbody td { padding: 5px 10px 5px 0; white-space: nowrap; }
 .sess-table tbody td.num { text-align: right; }
 .sess-table tbody td.started { color: var(--accent-cyan); }
-.sess-table tbody td.project { color: var(--accent-blue); }
+.sess-table tbody td.project { color: var(--accent-blue); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.sess-table tbody td.project .project-cell-link {
+  display: block; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .sess-table tbody td.cost-low  { color: var(--accent-green); }
 .sess-table tbody td.cost-mid  { color: var(--accent-amber); }
 .sess-table tbody td.cost-high { color: var(--accent-red); }
@@ -3633,6 +3637,10 @@ mark.current {
     font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* C4 (#207): undo the desktop 220px cap on mobile, where the cell
+     truncates via flex:1 1 auto + min-width:0 instead. Equal specificity
+     (0,2,2) + later source order beats the new desktop rule. */
+  .sess-table tbody td.project { max-width: none; }
   /* row 1 right = cost (col 5) */
   .sess-table td.num {
     order: 2;
