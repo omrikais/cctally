@@ -1610,6 +1610,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ru.set_defaults(func=c.cmd_record_usage)
 
+    rc = sub.add_parser(
+        "record-credit",
+        help="Record an in-place weekly credit the auto-detector misses",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Record an in-place weekly (7d) credit that the auto-detector
+            misses (a sub-25pp, non-zero drop — e.g. Anthropic lowered your
+            7d % from 46 to 31 without a clean reset). Writes a
+            week_reset_events row, lowers hwm-7d, and inserts a post-credit
+            snapshot so reports and the statusline read the credited value.
+            Preview + confirm by default.
+            """
+        ),
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              cctally record-credit --to 31              # baseline auto-read from HWM
+              cctally record-credit --to 31 --dry-run    # preview, write nothing
+              cctally record-credit --to 31 --yes        # apply without prompting
+
+            Exit codes: 0 success (incl. --dry-run and an interactive decline),
+            2 validation/refuse, 3 on a database error.
+            """
+        ),
+    )
+    rc.add_argument("--to", required=True, type=float,
+                    help="New post-credit weekly %% (0-100).")
+    rc.add_argument("--from", dest="from_pct", type=float, default=None,
+                    help="Pre-credit baseline %% (default: current HWM for the week).")
+    rc.add_argument("--at", default=None,
+                    help="Effective credit moment (ISO; naive=UTC; default now).")
+    rc.add_argument("--week", default=None,
+                    help="week_start_date YYYY-MM-DD (default: current week).")
+    rc.add_argument("--dry-run", action="store_true",
+                    help="Preview only; write nothing.")
+    rc.add_argument("--yes", action="store_true",
+                    help="Apply without the confirm prompt.")
+    rc.add_argument("--force", action="store_true",
+                    help="Re-record when a credit is already fully recorded for the week.")
+    rc.add_argument("--json", action="store_true",
+                    help="Machine output (schemaVersion 1).")
+    rc.set_defaults(func=c.cmd_record_credit)
+
     rfu = sub.add_parser(
         "refresh-usage",
         help="Force-fetch 7d/5h percent from OAuth API and record it",

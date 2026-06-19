@@ -319,3 +319,52 @@ def test_dryrun_human_preview(ns, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "record-credit" in out and "46" in out and "31" in out
     assert "dry-run" in out.lower()
+
+
+# ── week resolution at a reset boundary (S11) ──────────────────────────
+
+
+def test_s11_resolves_active_week_not_stale_latest(ns, monkeypatch, capsys):
+    """At a reset boundary, default --week resolves the window containing
+    --at/now, not merely the most-recent snapshot's (just-ended) week."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-20T06:00:00Z")
+    conn = ns["open_db"]()
+    # Just-ended week: window [06-06 05:00, 06-13 05:00); its latest snapshot
+    # is the MOST RECENT row overall (captured 06-13 04:50).
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date,"
+        " week_end_date, week_start_at, week_end_at, weekly_percent, page_url,"
+        " source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("2026-06-13T04:50:00Z", "2026-06-06", "2026-06-13",
+         "2026-06-06T05:00:00+00:00", "2026-06-13T05:00:00+00:00", 90.0,
+         None, "userscript", "{}"))
+    # Active week: window [06-13 05:00, 06-20 05:00 ... ) actually the new
+    # week is [06-20 05:00, 06-27 05:00) — contains now=06-20 06:00.
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date,"
+        " week_end_date, week_start_at, week_end_at, weekly_percent, page_url,"
+        " source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("2026-06-20T05:30:00Z", "2026-06-20", "2026-06-27",
+         "2026-06-20T05:00:00+00:00", "2026-06-27T05:00:00+00:00", 46.0,
+         None, "userscript", "{}"))
+    conn.commit(); conn.close()
+    # Capture the resolved plan via the dry-run JSON envelope.
+    rc = ns["cmd_record_credit"](_rc_args(to=31.0, dry_run=True, json=True))
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["week"]["weekStartDate"] == "2026-06-20"   # active, not 06-06
+
+
+# ── parser registration smoke ──────────────────────────────────────────
+
+
+def test_record_credit_help_smoke():
+    import pathlib
+    import subprocess
+    binary = pathlib.Path(__file__).resolve().parent.parent / "bin" / "cctally"
+    proc = subprocess.run(
+        [sys.executable, str(binary), "record-credit", "--help"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0
+    assert "--to" in proc.stdout
