@@ -6,10 +6,16 @@
 //     tooltips and disabled attribute. (Save preset went live in M2.4;
 //     + Basket went live in M3.5.)
 //   - Format radio dispatches onOptionsChange with new format.
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActionBar } from './ActionBar';
 import { _resetForTests } from '../store/store';
+import {
+  installGlobalKeydown,
+  uninstallGlobalKeydown,
+  registerKeymap,
+  _resetForTests as _resetKeymap,
+} from '../store/keymap';
 import type { ShareOptions } from './types';
 
 // Mirrors production `defaultShareOptions()` in ShareModal.tsx — spec
@@ -206,6 +212,40 @@ describe('<ActionBar>', () => {
     fireEvent.click(preset);
     // Popover renders a role=dialog with aria-label "Save preset".
     expect(screen.getByRole('dialog', { name: /save preset/i })).toBeInTheDocument();
+  });
+
+  // #207 D10 — Esc inside the open save popover closes ONLY the popover, not the
+  // share modal that registered a lower-layer (200) overlay Esc.
+  it('Esc closes only the open save popover, not the layer-200 modal Esc', async () => {
+    _resetKeymap();
+    installGlobalKeydown();
+    try {
+      const onModalEsc = vi.fn();
+      registerKeymap([
+        { key: 'Escape', scope: 'overlay', layer: 200, action: onModalEsc, when: () => true },
+      ]);
+      render(
+        <ActionBar
+          panel="weekly"
+          templateId="weekly-recap"
+          options={defaults()}
+          onOptionsChange={() => {}}
+        />,
+      );
+      const preset = screen.getByRole('button', { name: /save preset/i });
+      fireEvent.click(preset);                               // open popover
+      expect(screen.getByRole('dialog', { name: /save preset/i })).toBeInTheDocument();
+      expect(preset.getAttribute('aria-expanded')).toBe('true');
+
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      await waitFor(() =>
+        expect(screen.queryByRole('dialog', { name: /save preset/i })).not.toBeInTheDocument(),
+      );
+      expect(onModalEsc).not.toHaveBeenCalled();             // layer-205 popover Esc won
+    } finally {
+      uninstallGlobalKeydown();
+    }
   });
 
   it('Format radio dispatches onOptionsChange with new format', () => {

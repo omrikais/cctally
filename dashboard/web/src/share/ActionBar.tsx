@@ -21,13 +21,14 @@
 // `!options.reveal_projects ? false : true` (i.e. honor the checkbox).
 // Because the preview already has a reveal=true copy in the iframe,
 // every export does a SEPARATE fetch — never re-use the preview body.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { renderShare, ShareApiError } from './api';
 import type { ShareFormat, ShareOptions, SharePanelId } from './types';
 import { sharePanelLabel, shareFormatExt } from './panelLabels';
 import { dispatch, getState } from '../store/store';
 import { makeBasketItem } from '../store/basketSlice';
 import { SavePresetPopover } from './SavePresetPopover';
+import { useKeymap } from '../hooks/useKeymap';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
 import { appendHistory } from './presetsApi';
@@ -139,6 +140,16 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [savingOpen]);
+
+  // #207 D10 — Esc inside the open "Save preset…" popover closes ONLY the
+  // popover, not the surrounding share/composer modal. Same layer (205) and
+  // rationale as PresetDropdown: above ShareModal's 200, below ComposerModal's
+  // 210 + Help's 1000. `when: () => savingOpen` keeps the modal's Esc untouched
+  // when the popover is closed.
+  useKeymap(useMemo(() => [{
+    key: 'Escape', scope: 'overlay' as const, layer: 205,
+    when: () => savingOpen, action: () => setSavingOpen(false),
+  }], [savingOpen]));
 
   // Clear stale error banner when the user pivots to a different format
   // or template — otherwise the prior "Copy failed: …" lingers while the

@@ -16,7 +16,7 @@
 // from the share modal's own close handler. Esc closes the modal
 // (which un-mounts this dropdown); for "just close the menu" the user
 // re-clicks the trigger or any other element.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   listPresets,
   listHistory,
@@ -24,6 +24,7 @@ import {
   type HistoryRecord,
   ShareApiError,
 } from './presetsApi';
+import { useKeymap } from '../hooks/useKeymap';
 import type { SharePanelId, ShareOptions } from './types';
 
 interface Props {
@@ -101,6 +102,17 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
+
+  // #207 D10 — Esc inside the open menu closes ONLY the menu. Registered at
+  // overlay scope, layer 205: above ShareModal's layer-200 Esc (so it wins
+  // while the menu is open and the dispatcher returns before the modal's Esc)
+  // but below ComposerModal's layer-210 (so it can never steal the composer's
+  // Esc) and below Help's 1000. `when: () => open` makes the modal's Esc behave
+  // exactly as before once the menu is closed.
+  useKeymap(useMemo(() => [{
+    key: 'Escape', scope: 'overlay' as const, layer: 205,
+    when: () => open, action: () => setOpen(false),
+  }], [open]));
 
   const names = Object.keys(presets).sort();
 

@@ -17,6 +17,12 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PresetDropdown } from './PresetDropdown';
 import type { ShareOptions } from './types';
+import {
+  installGlobalKeydown,
+  uninstallGlobalKeydown,
+  registerKeymap,
+  _resetForTests as _resetKeymap,
+} from '../store/keymap';
 
 function defaults(): ShareOptions {
   return {
@@ -195,6 +201,39 @@ describe('<PresetDropdown>', () => {
     await screen.findByRole('menu');
     fireEvent.mouseDown(screen.getByTestId('outside'));
     await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument());
+  });
+
+  // #207 D10 — Esc inside an open preset menu must close ONLY the menu, not the
+  // share/composer modal that registered a lower-layer overlay Esc.
+  it('Esc closes only the open preset menu, not the layer-200 modal Esc', async () => {
+    _resetKeymap();
+    installGlobalKeydown();
+    try {
+      const onModalEsc = vi.fn();
+      // Stand-in for ShareModal's overlay-scope Esc (layer 200): the menu's
+      // layer-205 Esc must win while the menu is open and the dispatcher must
+      // return before reaching this one.
+      registerKeymap([
+        { key: 'Escape', scope: 'overlay', layer: 200, action: onModalEsc, when: () => true },
+      ]);
+      mockFetchBoth({ presets: {} });
+      render(
+        <PresetDropdown panel="weekly" onPick={() => {}} onManage={() => {}} />,
+      );
+      const trigger = screen.getByRole('button', { name: /presets/i });
+      fireEvent.click(trigger);                              // open
+      await screen.findByRole('menu');
+      expect(trigger.getAttribute('aria-expanded')).toBe('true');
+
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /presets/i }).getAttribute('aria-expanded')).toBe('false'),
+      );
+      expect(onModalEsc).not.toHaveBeenCalled();             // layer-205 menu Esc won
+    } finally {
+      uninstallGlobalKeydown();
+    }
   });
 
   // ---- M4.3 — "Recent shares" history group ----
