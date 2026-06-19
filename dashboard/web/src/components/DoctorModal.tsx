@@ -187,7 +187,7 @@ function DoctorCategoryRow({
   );
 }
 
-function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
+export function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
   const [showDetails, setShowDetails] = useState(false);
   const hasDetails = c.details && Object.keys(c.details).length > 0;
   return (
@@ -200,6 +200,9 @@ function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
       </p>
       {c.remediation && (
         <p className="doctor-modal__remediation">→ {c.remediation}</p>
+      )}
+      {c.severity !== 'ok' && !c.remediation && (
+        <p className="doctor-modal__remediation">→ Run <code>cctally doctor</code> for the full report</p>
       )}
       {hasDetails && (
         <>
