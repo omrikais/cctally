@@ -1,4 +1,5 @@
 import { fmt } from '../lib/fmt';
+import { stepDay } from './dailyNav';
 import type { DailyPanelRow } from '../types/envelope';
 
 interface Props {
@@ -40,8 +41,34 @@ export function DailyMiniBars({ rows, selectedDate, onSelect }: Props) {
   return (
     <section className="daily-modal-bars" aria-label="30-day cost">
       <div className="daily-modal-bars-head">
-        <span>30-day cost · selected: {selectedDate ? formatAxis(selectedDate) : '—'}</span>
-        <span className="hint">↑↓ navigate · click any bar</span>
+        <span className="daily-bars-nav">
+          <button
+            type="button"
+            className="daily-step-btn"
+            aria-label="Step to older day"
+            disabled={stepDay(rows, selectedDate, 'older') === null}
+            onClick={() => {
+              const d = stepDay(rows, selectedDate, 'older');
+              if (d) onSelect(d);
+            }}
+          >
+            ‹
+          </button>
+          <span>30-day cost · selected: {selectedDate ? formatAxis(selectedDate) : '—'}</span>
+          <button
+            type="button"
+            className="daily-step-btn"
+            aria-label="Step to newer day"
+            disabled={stepDay(rows, selectedDate, 'newer') === null}
+            onClick={() => {
+              const d = stepDay(rows, selectedDate, 'newer');
+              if (d) onSelect(d);
+            }}
+          >
+            ›
+          </button>
+        </span>
+        <span className="hint">‹ › to step · tap a bar</span>
       </div>
       <div className="daily-modal-bars-grid" role="img" aria-label="30-day cost histogram">
         {ordered.map((r) => {

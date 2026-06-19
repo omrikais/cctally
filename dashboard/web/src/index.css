@@ -2322,6 +2322,13 @@ mark.current {
   letter-spacing: 0;
 }
 
+/* Daily-modal prev/next day stepper (#214 M2-3): hidden on desktop.
+   `.daily-bars-nav` collapses to its children so the desktop layout is
+   unchanged; the mobile block (max-width:640px) turns it into a flex row
+   and reveals the `.daily-step-btn` controls. */
+.daily-bars-nav { display: contents; }
+.daily-step-btn { display: none; }
+
 .daily-modal-bars-grid {
   display: grid;
   grid-template-columns: repeat(30, minmax(6px, 1fr));
@@ -4012,6 +4019,19 @@ mark.current {
     bottom: 0;
     background: var(--panel-bg);
   }
+
+  /* #214 M2-3: reveal the Daily-modal prev/next day stepper on mobile.
+     The `‹ ›` buttons flank the selected-day label and get a real
+     ≥44px box (layout room exists in the bars head). They mirror ↑↓
+     exactly via the shared stepDay helper and disable at the boundaries. */
+  .daily-bars-nav { display: inline-flex; align-items: center; gap: 6px; }
+  .daily-step-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 44px; min-height: 44px;
+    background: transparent; border: 1px solid var(--border-soft);
+    border-radius: 6px; color: inherit; font: inherit; cursor: pointer;
+  }
+  .daily-step-btn:disabled { opacity: 0.4; cursor: default; }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------

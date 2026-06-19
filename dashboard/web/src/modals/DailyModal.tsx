@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { DailyMiniBars } from './DailyMiniBars';
+import { stepDay } from './dailyNav';
 import { PeriodDetailCard } from './PeriodDetailCard';
 import { ShareIcon } from '../components/ShareIcon';
 import { useSnapshot } from '../hooks/useSnapshot';
@@ -64,12 +65,8 @@ export function DailyModal() {
         scope: 'modal',
         when: () => getState().openModal === 'daily',
         action: () => {
-          const cur = effectiveDate;
-          if (!cur) return;
-          const idx = rows.findIndex((r) => r.date === cur);
-          // rows[] is newest-first → idx+1 is one day OLDER.
-          if (idx < 0 || idx >= rows.length - 1) return;
-          setSelectedDate(rows[idx + 1].date);
+          const target = stepDay(rows, effectiveDate, 'older');
+          if (target) setSelectedDate(target);
         },
       },
       {
@@ -77,12 +74,8 @@ export function DailyModal() {
         scope: 'modal',
         when: () => getState().openModal === 'daily',
         action: () => {
-          const cur = effectiveDate;
-          if (!cur) return;
-          const idx = rows.findIndex((r) => r.date === cur);
-          // rows[] is newest-first → idx-1 is one day NEWER.
-          if (idx <= 0) return;
-          setSelectedDate(rows[idx - 1].date);
+          const target = stepDay(rows, effectiveDate, 'newer');
+          if (target) setSelectedDate(target);
         },
       },
     ]);
