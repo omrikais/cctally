@@ -3385,7 +3385,20 @@ mark.current {
     background: var(--panel-bg);
     z-index: 1;
   }
-  .modal-header h2 { font-size: 17px; font-weight: 600; }
+  /* M1-3: keep the sticky mobile header one line so a long title (e.g.
+     "Current Week — per-percent milestones") never wraps and crowds the
+     share/close buttons. flex:1 1 auto + min-width:0 lets the h2 take the
+     row and ellipsize; the trailing buttons stay fixed-size. */
+  .modal-header h2 {
+    font-size: 17px; font-weight: 600;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .modal-header .share-icon,
+  .modal-header .modal-close { flex-shrink: 0; }
   .modal-close {
     width: 44px; height: 44px;
     display: inline-flex; align-items: center; justify-content: center;
@@ -3396,6 +3409,19 @@ mark.current {
     /* Reserve scrollbar gutter is overkill on phones (no visible
        scrollbar by default); release the gutter to gain a few px. */
     scrollbar-gutter: auto;
+  }
+
+  /* M1-2: the Session/Block token grid renders up to 5 fixed 1fr tiles.
+     Because 1fr carries an implicit min-width:auto, a wide token count
+     (e.g. 17,201,931) forces its track past its share and the right-most
+     tile (CACHE READ) clips off-screen at phone width. minmax(0, 1fr)
+     removes the implicit minimum so each track can shrink and the long
+     number wraps/ellipsizes within its tile. 2-up keeps each tile wide
+     enough for an 8-digit count at 390px. Applies to Session + Block
+     (shared .msess-tok-grid) and the cache-rebuild variant. */
+  .msess-tok-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .msess-tok-grid.msess-rebuild-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   /* Modal multi-column tables (Weekly / Monthly via PeriodTable;
