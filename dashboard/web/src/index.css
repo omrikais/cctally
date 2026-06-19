@@ -3080,11 +3080,34 @@ mark.current {
   font-size: 11px;
   font-weight: 600;
 }
-.composer-preview {
-  width: 100%; height: 100%;
-  border: 1px solid var(--border-soft);
-  background: white;
+/* M1-4: the preview iframe is wrapped in a labeled document frame so the
+   WYSIWYG white card (a light-theme export) reads as paper, not a broken
+   panel on the dark dashboard. The <figure> now occupies the grid/flex
+   slot the bare iframe used to hold, so it must zero its default margins
+   and re-fill, and the iframe fills the frame below the caption. */
+.composer-preview-frame {
+  margin: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+}
+.composer-preview-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+}
+.composer-preview {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: none;          /* the frame now owns the border/radius */
+  border-radius: 0 0 6px 6px;
+  background: white;
   /* M1-1: contain the preview iframe's internal scroll. */
   overscroll-behavior: contain;
 }
@@ -3953,9 +3976,16 @@ mark.current {
      The .composer-modal-mobile class is toggled by useIsMobile() in
      ComposerModal.tsx so the JS and CSS stay in lockstep on the same
      MOBILE_MEDIA_QUERY threshold. */
+  /* M1-4: at 390px the Title + Theme + Format + 2 checkboxes broke into
+     three cramped wrap lines. Give the Title its own full-width row so the
+     remaining controls read as one deliberate row beneath it. */
   .composer-modal-mobile .composer-knobs {
     flex-wrap: wrap;
     gap: 8px;
+    row-gap: 10px;
+  }
+  .composer-modal-mobile .composer-knobs > label:first-child {
+    flex: 1 0 100%;   /* Title input on its own full-width row */
   }
   .composer-modal-mobile .composer-body {
     grid-template-columns: 1fr;

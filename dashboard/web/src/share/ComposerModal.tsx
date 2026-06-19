@@ -491,13 +491,16 @@ export function ComposerModal() {
           onRemove={(id) => dispatch({ type: 'BASKET_REMOVE', id })}
           onPreviewOnly={(_id) => { /* M4 niceties; not part of M3.6 */ }}
         />
-        <iframe
-          className="composer-preview"
-          title="Combined preview"
-          tabIndex={-1}
-          sandbox="allow-same-origin"
-          srcDoc={composeResp?.body ?? '<p>Composing&hellip;</p>'}
-        />
+        <figure className="composer-preview-frame">
+          <figcaption className="composer-preview-label">Preview · {theme}</figcaption>
+          <iframe
+            className="composer-preview"
+            title="Combined preview"
+            tabIndex={-1}
+            sandbox="allow-same-origin"
+            srcDoc={composeResp?.body ?? '<p>Composing&hellip;</p>'}
+          />
+        </figure>
       </div>
       {busy ? <div className="composer-busy">Composing&hellip;</div> : null}
       {composeErr ? <div className="composer-error" role="alert">{composeErr}</div> : null}
