@@ -33,11 +33,12 @@ describe('<HelpOverlay />', () => {
     expect(card).not.toBeNull();
     // h2 "Keybindings"
     expect(card?.querySelector('h2')?.textContent).toBe('Keybindings');
-    // 18 table rows: 11 panel keys (1-9 + 0 for position 10, em-dash
-    // for position 11 cache-report per spec 2026-05-21) + r, s, drag
-    // tip, Shift+arrows, ↑/↓, ?, Esc.
+    // 26 table rows: 11 panel keys (1-9 + 0 for position 10, em-dash
+    // for position 11 cache-report per spec 2026-05-21) + 12 data-driven
+    // HELP_ROWS single-key rows (#207 D1: r, s, d, S, B, f, /, c, n/N, q,
+    // ?, Esc) + 3 combo/gesture rows (Hold+drag, Shift+arrows, ↑/↓).
     const rows = card?.querySelectorAll('table tr');
-    expect(rows?.length).toBe(18);
+    expect(rows?.length).toBe(26);
     // Meta line with server URL
     const meta = card?.querySelector('p.meta');
     expect(meta?.textContent).toMatch(/cctally/);

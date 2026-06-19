@@ -36,7 +36,7 @@ describe('<SettingsOverlay />', () => {
     render(<SettingsOverlay />);
     const user = userEvent.setup();
     await user.keyboard('s');
-    await user.click(screen.getByText('Reset to defaults'));
+    await user.click(screen.getByText('Reset view preferences'));
     // RESET_PREFS now persists a fresh prefs object (defaults) instead of
     // removing the key, so the preserved onboardingToastSeen flag survives
     // the next page load. Verify the persisted blob equals defaults.
