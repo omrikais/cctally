@@ -1638,7 +1638,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rc.add_argument("--to", required=True, type=float,
                     help="New post-credit weekly %% (0-100).")
-    rc.add_argument("--from", dest="from_pct", type=float, default=None,
+    rc.add_argument("--from", dest="from_pct", metavar="FROM", type=float, default=None,
                     help="Pre-credit baseline %% (default: current HWM for the week).")
     rc.add_argument("--at", default=None,
                     help="Effective credit moment (ISO; naive=UTC; default now).")

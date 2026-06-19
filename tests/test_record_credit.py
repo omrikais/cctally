@@ -142,6 +142,44 @@ def test_apply_happy_path_s1(ns, monkeypatch):
     assert (ns["_cctally_core"].APP_DIR / "hwm-7d").read_text().split()[1] == "31.0"
 
 
+def test_apply_stores_effective_reset_in_utc_on_non_utc_host(ns, monkeypatch):
+    """Under a non-UTC host TZ, the credited week's effective_reset_at_utc
+    (and old_week_end_at) MUST be stored with a +00:00 spelling, not the host
+    offset — parse_iso_datetime returns a host-local-offset datetime and the
+    _utc column must not re-introduce that pattern. The instant must still be
+    the expected floored hour (2026-06-19T14:00 UTC).
+
+    Non-vacuity: revert the .astimezone(dt.timezone.utc) in _apply_credit and
+    this fails — the stored value carries -04:00/-05:00. (Existing tests run
+    TZ=Etc/UTC, which is exactly why they were blind to this.)"""
+    import time
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    # Non-UTC zone; tzset() so parse_iso_datetime's host-localization picks it up.
+    # conftest's autouse _restore_process_timezone restores the process TZ after.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    assert rc == 0
+    conn = ns["open_db"]()
+    ev = conn.execute(
+        "SELECT effective_reset_at_utc, old_week_end_at, "
+        "       unixepoch(effective_reset_at_utc) "
+        "FROM week_reset_events WHERE new_week_end_at=?",
+        ("2026-06-20T05:00:00+00:00",)).fetchone()
+    conn.close()
+    assert ev is not None
+    # UTC spelling, not a host offset (-04:00/-05:00).
+    assert ev[0].endswith("+00:00"), f"stored host offset, not UTC: {ev[0]!r}"
+    assert ev[1].endswith("+00:00"), f"old_week_end_at host offset: {ev[1]!r}"
+    assert "-04:00" not in ev[0] and "-05:00" not in ev[0]
+    # Same instant either way: floored to the 14:00 UTC hour.
+    expected = int(dt.datetime(2026, 6, 19, 14, 0,
+                               tzinfo=dt.timezone.utc).timestamp())
+    assert ev[2] == expected
+    assert ev[0] == "2026-06-19T14:00:00+00:00"
+
+
 def test_s7_non_vacuity_snapshot_is_load_bearing(ns, monkeypatch):
     """Stash the synthetic-snapshot insert -> weekly no longer reads 31."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")

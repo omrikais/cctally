@@ -2368,7 +2368,12 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
     """Run the full artifact set: pivots (via _fire_in_place_credit) + snapshot
     + clear stale reset-zero marker. Idempotent / completion-safe."""
     c = _cctally()
-    effective_dt = parse_iso_datetime(plan.effective_iso, "effective")
+    # parse_iso_datetime returns a host-local-offset aware datetime; convert to
+    # UTC so _fire_in_place_credit persists effective_reset_at_utc / old_week_end_at
+    # with a +00:00 spelling (matches the live in-place-credit path, which already
+    # passes _floor_to_hour(now_utc)). Same instant either way (unixepoch-safe),
+    # but a host offset in a *_utc column re-introduces the host-local pattern.
+    effective_dt = parse_iso_datetime(plan.effective_iso, "effective").astimezone(dt.timezone.utc)
     _fire_in_place_credit(
         conn, plan.week_start_date, plan.cur_end_canon, plan.to_pct,
         observed_pre_credit_pct=plan.from_pct, effective_dt=effective_dt,
