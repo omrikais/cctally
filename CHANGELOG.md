@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Dashboard (mobile) — prev/next day stepper on the Daily modal.** On a phone the Daily modal's thirty selectable day bars don't fit, so the modal now shows ‹ prev / next › day-stepper controls at the mobile breakpoint (desktop keeps the full bar row and the existing ↑↓ keyboard nav, which the stepper shares its `stepDay()` helper with) (#214).
+
+### Fixed
+- **Dashboard (mobile) — modal & overlay correctness.** Opening any of the seven overlays (modal, share, composer, settings, update, doctor, help) now locks page scroll on both `<html>` and `<body>`, so the page no longer scrolls behind the overlay, and each overlay's own scroll region contains its overscroll. The Session and Block detail modals reflow their token grid two-up so an 8-digit CACHE READ value no longer clips, long modal titles ellipsize to one line, and the share composer preview is framed as a labeled "Preview · <theme>" document (#214).
+- **Dashboard (mobile) — touch-target ergonomics.** Controls that fell below the 44×44px touch-target minimum at phone widths — session-list buttons, the open-conversation affordance, the sortable column header, the doctor chip, and settings checkboxes/radios — are lifted to ≥44px, and the session-row model chip is edge-anchored so it no longer steals taps meant for the row's project link (#214).
+- **Dashboard (mobile) — single-column layout & content flow.** Panels now size to their content instead of reserving the desktop 320px floor, so sparse panels (Projects, Cache Report, Recent Alerts) stop showing large dead space; every panel header stays on one line; the Daily heatmap cell is `$`-prefixed; the session card uses a deterministic two-row grid (project + cost, then started · duration · model); and the Projects panel gives the name column the flexible track so common names are no longer clipped. All changes are gated to ≤640px, so desktop output is byte-unchanged (#214).
+
 ## [1.51.0] - 2026-06-19
 
 ### Added
