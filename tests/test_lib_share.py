@@ -425,6 +425,48 @@ def test_line_chart_with_reference_lines():
     assert _lib_share.PALETTE_LIGHT["ref_alarm"] in out
 
 
+def test_line_chart_right_edge_xtick_label_right_anchored():
+    """Right-most x-tick label is right-anchored so it doesn't clip the viewBox (#215).
+
+    The right-most sample lands at the inner-box right edge (ix + iw). A
+    centered (anchor="middle") label there overflows the chart's right padding
+    and is clipped at the SVG viewBox boundary — most visible for wide labels
+    (10-char ISO dates, as the `$ / day` current-week chart uses) at narrow
+    render widths. The edge tick is right-aligned (anchor="end") so its full
+    width stays inside the plot; interior + left-edge ticks stay centered.
+    """
+    import re
+    chart = LineChart(
+        points=tuple(
+            ChartPoint(x_label=f"2026-04-2{i}", x_value=float(i), y_value=float(i + 1))
+            for i in range(7)
+        ),
+        y_label="$ / day",
+    )
+    out = _lib_share._render_line_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=20, y=20, width=600, height=220,
+    )
+    # ix = 20 + 50 = 70, iw = 600 - 50 - 10 = 540 → right edge at x = 610.
+    # svg_text serializes attrs lexically: fill, font-size, text-anchor, x, y,
+    # so text-anchor precedes x in every tick tag.
+    ticks = re.findall(
+        r'<text\b[^>]*text-anchor="(?P<anchor>[^"]+)"[^>]*\bx="(?P<x>[\d.]+)"[^>]*>'
+        r'(?P<label>2026-04-2\d)</text>',
+        out,
+    )
+    by_label = {label: (anchor, float(x)) for anchor, x, label in ticks}
+    assert set(by_label) == {f"2026-04-2{i}" for i in range(7)}, by_label
+    # Right-most tick sits exactly at the inner-box right edge and must be
+    # end-anchored.
+    assert abs(by_label["2026-04-26"][1] - 610.0) < 1e-6, by_label
+    assert by_label["2026-04-26"][0] == "end", \
+        f"right-edge tick must be anchor=end, got {by_label['2026-04-26']}"
+    # Interior and left-edge ticks stay centered.
+    assert by_label["2026-04-20"][0] == "middle", by_label  # left edge (x=70)
+    assert by_label["2026-04-23"][0] == "middle", by_label  # interior
+
+
 def test_svg_chrome_header_includes_title_subtitle_timestamp():
     snap = _make_minimal_snapshot()
     out = _lib_share._render_svg_header(snap, palette=_lib_share.PALETTE_LIGHT,

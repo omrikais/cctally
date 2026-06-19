@@ -539,10 +539,22 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
             elements.append(f'<polyline {_serialize_attrs(attrs)}/>')
 
     # X-tick labels (one per primary sample, positioned by x_value).
+    # The right-most sample lands at the inner-box right edge (ix + iw). A
+    # centered (anchor="middle") label there overflows the chart's right
+    # padding and is clipped at the SVG viewBox boundary — most visible for
+    # wide labels (10-char ISO dates, as the `$ / day` current-week chart
+    # uses) at narrow render widths (#215). Right-align (anchor="end") any tick
+    # that lands on the right edge so its full width stays inside the plot;
+    # interior + left-edge ticks stay centered. Position-based (not index-based)
+    # so a forecast chart whose last *primary* sample sits mid-plot — with a
+    # projected ray extending past it via multi_series — keeps that tick
+    # centered rather than mis-anchoring a non-edge label.
+    right_edge_x = ix + iw
     for p in pts:
         tx = ix + scale_x(p.x_value)
+        anchor = "end" if tx >= right_edge_x - 1e-6 else "middle"
         elements.append(svg_text(tx, iy + ih + 14, p.x_label,
-                                 font_size=10, fill=palette["muted"], anchor="middle"))
+                                 font_size=10, fill=palette["muted"], anchor=anchor))
 
     # Y-axis label.
     elements.append(svg_text(ix - 10, iy + ih / 2, chart.y_label,
