@@ -108,3 +108,44 @@ def test_resolves_current_week_and_hwm_from(ns, monkeypatch):
     conn.close()
     rc = ns["cmd_record_credit"](_rc_args())   # dry-run
     assert rc == 0
+
+
+# ── apply: happy path (S1) + non-vacuity (S7) ──────────────────────────
+
+
+def _weekly_reads(ns):
+    """Run `weekly` and return the current week's rendered integer percent.
+    Use the reset-aware HWM helper as the source of truth for the assertion."""
+    conn = ns["open_db"]()
+    try:
+        return ns["_resolve_reset_aware_hwm"](
+            conn, "2026-06-13", WS_AT, WE_AT)
+    finally:
+        conn.close()
+
+
+def test_apply_happy_path_s1(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    assert rc == 0
+    conn = ns["open_db"]()
+    ev = conn.execute("SELECT observed_pre_credit_pct, new_week_end_at "
+                      "FROM week_reset_events WHERE new_week_end_at=?",
+                      ("2026-06-20T05:00:00+00:00",)).fetchone()
+    assert ev is not None and float(ev[0]) == 46.0
+    snap = conn.execute("SELECT weekly_percent, source FROM weekly_usage_snapshots "
+                        "WHERE source='record-credit'").fetchone()
+    assert snap is not None and float(snap[0]) == 31.0
+    conn.close()
+    assert _weekly_reads(ns) == 31.0     # reset-aware HWM now reads 31
+    assert (ns["_cctally_core"].APP_DIR / "hwm-7d").read_text().split()[1] == "31.0"
+
+
+def test_s7_non_vacuity_snapshot_is_load_bearing(ns, monkeypatch):
+    """Stash the synthetic-snapshot insert -> weekly no longer reads 31."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    monkeypatch.setitem(ns, "_insert_credit_snapshot", lambda *a, **k: 0)
+    ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    assert _weekly_reads(ns) != 31.0     # empty post-credit segment

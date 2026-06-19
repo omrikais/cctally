@@ -2321,6 +2321,42 @@ def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
     return None if not row or row[0] is None else float(row[0])
 
 
+def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None)):
+    """Insert the post-credit snapshot at plan.to_pct, tagged source='record-credit'."""
+    fhp, fhr, fhk = five_hour
+    payload = json.dumps(
+        {"kind": "record-credit", "from": plan.from_pct, "to": plan.to_pct,
+         "effective": plan.effective_iso},
+        separators=(",", ":"),
+    )
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, weekly_percent, page_url, source, payload_json, "
+        " five_hour_percent, five_hour_resets_at, five_hour_window_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (plan.captured_iso, plan.week_start_date,
+         parse_iso_datetime(plan.week_end_at, "we").date().isoformat(),
+         plan.week_start_at, plan.week_end_at, plan.to_pct, None,
+         "record-credit", payload, fhp, fhr, fhk),
+    )
+    conn.commit()
+    return conn.total_changes
+
+
+def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
+    """Run the full artifact set: pivots (via _fire_in_place_credit) + snapshot
+    + clear stale reset-zero marker. Idempotent / completion-safe."""
+    c = _cctally()
+    effective_dt = parse_iso_datetime(plan.effective_iso, "effective")
+    _fire_in_place_credit(
+        conn, plan.week_start_date, plan.cur_end_canon, plan.to_pct,
+        observed_pre_credit_pct=plan.from_pct, effective_dt=effective_dt,
+    )
+    c._insert_credit_snapshot(conn, plan, five_hour=five_hour)
+    _clear_reset_zero_marker()
+
+
 def cmd_record_credit(args) -> int:
     c = _cctally()
     now = _command_as_of()
@@ -2369,11 +2405,12 @@ def cmd_record_credit(args) -> int:
             eprint(f"record-credit: {e}")
             return 2
 
-        # 4. Output + apply (Tasks 2-5). For now, dry-run prints nothing-stub
-        #    and real apply is unimplemented.
+        # 4. Output + apply (Tasks 3-5 add 5h copy, existing-event handling,
+        #    and the preview/confirm/JSON surface).
         if getattr(args, "dry_run", False):
             return 0
-        raise NotImplementedError  # replaced in Task 2
+        _apply_credit(conn, plan)
+        return 0
     finally:
         conn.close()
 
