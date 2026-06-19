@@ -35,6 +35,13 @@ function fmtChunkRange(firstIso: string, lastIso: string): string {
     : `${MONTH_ABBR[m1 - 1]} ${d1} - ${MONTH_ABBR[m2 - 1]} ${d2}`;
 }
 
+// #214 M3-3: mobile collapses to a ceil integer to fit the narrow 7-col grid;
+// the `$` keeps the magnitude unambiguous. Desktop keeps full usd2 precision.
+export function formatDailyCell(costUsd: number, isMobile: boolean): string {
+  if (costUsd <= 0) return '—';
+  return isMobile ? `$${Math.ceil(costUsd)}` : fmt.usd2(costUsd);
+}
+
 function Cell({
   r,
   staggerIndex,
@@ -45,14 +52,12 @@ function Cell({
   isMobile: boolean;
 }) {
   const dd = r.date.slice(8, 10);  // "YYYY-MM-DD" → "DD"
-  // Mobile rounds to the ceiling integer so 6-char "$50.27" collapses
-  // to 2-3 chars and fits the narrower 7-col grid (W-col hidden via CSS).
-  // Desktop keeps the full "$NN.NN" precision. Tooltip stays usd2 — title
-  // attributes don't fire on touch anyway, so desktop precision is the
-  // only consumer.
-  const cellCost = r.cost_usd > 0
-    ? (isMobile ? `${Math.ceil(r.cost_usd)}` : fmt.usd2(r.cost_usd))
-    : '—';
+  // Mobile rounds to the ceiling integer (with a leading "$" so the magnitude
+  // stays unambiguous) so 6-char "$50.27" collapses to "$51" and fits the
+  // narrower 7-col grid (W-col hidden via CSS). Desktop keeps the full
+  // "$NN.NN" precision. Tooltip stays usd2 — title attributes don't fire on
+  // touch anyway, so desktop precision is the only consumer.
+  const cellCost = formatDailyCell(r.cost_usd, isMobile);
   const tooltip = [
     `${r.label} · ${r.cost_usd > 0 ? fmt.usd2(r.cost_usd) : '—'}`,
     ...r.models.map((m) => `${m.display} ${m.cost_pct.toFixed(0)}%`),
