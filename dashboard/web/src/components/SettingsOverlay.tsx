@@ -884,7 +884,7 @@ export function SettingsOverlay() {
               {tzSubmitting ? 'Saving…' : 'Save'}
             </button>
             <button className="settings-btn" type="button" onClick={reset}>
-              Reset to defaults
+              Reset view preferences
             </button>
             <button className="settings-btn" type="button" onClick={close}>
               Cancel

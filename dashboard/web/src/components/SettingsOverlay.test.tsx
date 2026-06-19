@@ -202,6 +202,18 @@ describe('<SettingsOverlay /> test-alert axis picker', () => {
   });
 });
 
+describe('<SettingsOverlay /> reset button label (#207 D9)', () => {
+  it('labels the reset button "Reset view preferences" and posts nothing', () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    render(<SettingsOverlay />);
+    openSettings();
+    const btn = screen.getByRole('button', { name: /reset view preferences/i });
+    fireEvent.click(btn);
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/settings', expect.anything());
+  });
+});
+
 describe('<SettingsOverlay /> test-alert inline confirmation (#207 D4)', () => {
   it('shows an inline confirmation when the test alert is queued', async () => {
     const fetchMock = vi.fn(
