@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`record-credit` — manually record an in-place weekly credit the auto-detector misses.** When Anthropic lowers your 7-day usage counter mid-window by a sub-25pp, non-zero amount (e.g. 46%→31%) instead of a clean reset, neither auto-detector fires and the monotonic clamp pins every display at the stale peak. `cctally record-credit --to 31` records the credit explicitly and repairs the data: it writes a reset event, lowers `hwm-7d`, clears stale replays, and inserts a post-credit snapshot so reports and the statusline read the credited value — the same repair the automatic large-drop detector performs. Preview-and-confirm by default (`--dry-run` / `--yes`), with `--from` / `--at` / `--week` overrides, a `--force` clean re-record that never touches real history, and a `--json` (schemaVersion 1) envelope. See `docs/commands/record-credit.md`.
+
 ### Fixed
 - **Dashboard conversation viewer — the mobile fix that stops the sticky topbar from hiding `← Back` now holds on notched phones, and in-page panel jumps land correctly.** The mobile topbar height budget (`--topbar-h`) was a flat 104px, but the real two-row mobile header renders ~148px; the #205 reader-height fix compensated only for the no-safe-area (headless) case, so on a notched device (`env(safe-area-inset-top)`) roughly 30px of document overflow returned and the sticky topbar could again scroll over the reader's `← Back` button. `--topbar-h` is now measured safe-area-aware (`calc(142px + max(6px, env(safe-area-inset-top)))`) so it tracks the real header height at any inset — the conversation reader fills the viewport with no document overflow on every phone, and because that same variable is every panel's scroll-anchor floor, in-page jumps and `scrollIntoView()` now land panel titles flush just below the header instead of ~44px under it. Desktop is byte-identical (#206).
 
