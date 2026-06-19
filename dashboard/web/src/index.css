@@ -4069,8 +4069,22 @@ mark.current {
      source order, so a bare-class mobile margin override would lose; the
      #panel-sessions + class selector (id specificity) wins regardless. */
   .sess-open-conv { position: relative; }
-  .sess-open-conv::before { content: ""; position: absolute; inset: -16px; }
-  #panel-sessions .sess-open-conv { margin-right: 12px; }
+  /* Asymmetric inset (P3-3, Playwright-confirmed): the dense 2-line
+     session card stacks a project link directly ABOVE this icon (this
+     card's row 1) and the next card's project link below, with only
+     ~8px gaps. A symmetric -16px pseudo reached up into the project
+     link's glyph band and stole its taps (QA: the link's center became
+     un-tappable — sess-open-conv intercepted pointer events). Trim the
+     TOP inset to clear the project link; keep left/right/bottom (bottom
+     stays within the card's own padding, QA-verified not to reach the
+     next card). A full 44px-TALL hit area is physically impossible here
+     without overlapping the stacked links, so the result is ~45px wide
+     × ~35px tall (up from 13×13) with NO neighbor tap-stealing. The
+     #panel-sessions margin (id specificity) wins over the base
+     .sess-open-conv margin at :4984 and pushes the started-time text
+     clear of the -16px right edge. */
+  .sess-open-conv::before { content: ""; position: absolute; inset: -6px -16px -16px -16px; }
+  #panel-sessions .sess-open-conv { margin-right: 18px; }
 
   /* .th-sortable: the real sort hit target is the <th tabIndex={0}>, not
      the inner presentational .th-sort-btn (tabIndex={-1}). Give the inner
