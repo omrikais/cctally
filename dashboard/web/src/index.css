@@ -828,6 +828,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .modal-backdrop {
   position: absolute; inset: 0;
   background: rgba(0, 0, 0, 0.55);
+  /* M1-1: the backdrop never scrolls; stop any flick on it from chaining
+     to the body. */
+  overscroll-behavior: none;
 }
 .modal-card {
   position: relative; z-index: 1;
@@ -867,6 +870,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
      between the initial render and the next SSE tick once the scrollbar
      materializes. */
   scrollbar-gutter: stable;
+  /* M1-1: keep a flick at the scroll boundary from chaining to the
+     (now scroll-locked) body. Covers panel modals AND Settings, which
+     reuse .modal-body. */
+  overscroll-behavior: contain;
 }
 .empty-state { color: var(--text-dim); padding: 18px; text-align: center; }
 
@@ -2693,6 +2700,9 @@ mark.current {
   position: fixed; inset: 0; z-index: 200;
   display: flex; align-items: center; justify-content: center;
   background: rgba(0, 0, 0, 0.55);
+  /* M1-1: the share overlay backdrop never scrolls; don't chain a flick
+     to the body or a lower overlay. */
+  overscroll-behavior: none;
 }
 .share-modal {
   position: relative; z-index: 1;
@@ -2726,6 +2736,9 @@ mark.current {
   flex: 1; overflow: auto; padding: 14px 18px;
   display: flex; flex-direction: column; gap: 14px;
   scrollbar-gutter: stable;
+  /* M1-1: contain scroll so a flick past the boundary doesn't chain to
+     the locked body or the lower panel-modal layer. */
+  overscroll-behavior: contain;
 }
 .share-section {
   display: flex; flex-direction: column; gap: 10px;
@@ -2853,6 +2866,8 @@ mark.current {
   padding: 12px;
   overflow: auto;
   font-size: 13px;
+  /* M1-1: contain the preview-pane scroll. */
+  overscroll-behavior: contain;
 }
 .share-preview-iframe {
   background: #ffffff;
@@ -3011,10 +3026,14 @@ mark.current {
 .composer-body {
   flex: 1; display: grid; grid-template-columns: minmax(220px, 320px) 1fr;
   gap: 16px; padding: 16px; min-height: 0; overflow: hidden;
+  /* M1-1: contain scroll chaining within the composer body. */
+  overscroll-behavior: contain;
 }
 .composer-section-list {
   list-style: none; padding: 0; margin: 0;
   overflow-y: auto;
+  /* M1-1: contain the section-list scroll. */
+  overscroll-behavior: contain;
 }
 .composer-section-row {
   display: flex; align-items: center; gap: 8px;
@@ -3066,6 +3085,8 @@ mark.current {
   border: 1px solid var(--border-soft);
   background: white;
   min-height: 0;
+  /* M1-1: contain the preview iframe's internal scroll. */
+  overscroll-behavior: contain;
 }
 .composer-busy, .composer-error {
   padding: 6px 18px;
@@ -3746,6 +3767,10 @@ mark.current {
     padding-top: max(16px, env(safe-area-inset-top));
     padding-bottom: max(16px, env(safe-area-inset-bottom));
     overflow-y: auto;
+    /* M1-1: the Help sheet is a full-screen scrollable mobile surface;
+       contain its scroll so a flick at the boundary doesn't chain to the
+       locked body. */
+    overscroll-behavior: contain;
   }
   #help-overlay .help-gesture-list {
     list-style: none;
