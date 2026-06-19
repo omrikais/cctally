@@ -35,7 +35,10 @@ export function Toast() {
 
   return (
     <>
-      <OnboardingToast />
+      {/* #207 D8 — keep the onboarding toast MOUNTED (so its 8s auto-dismiss
+          timer keeps running) but visually suppressed while a status/alert
+          toast is live, so the two can't overlap at narrow widths. */}
+      <OnboardingToast suppressed={toast != null} />
       {toast?.kind === 'status' && (
         <div className="toast" role="status" aria-live="polite">
           {toast.text}

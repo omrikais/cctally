@@ -7,7 +7,7 @@ const AUTO_DISMISS_MS = 8000;
 const DESKTOP_COPY = 'New: hold any card to rearrange the dashboard.';
 const MOBILE_COPY  = 'Tap to drill in · long-press to rearrange · ⟳ to refresh';
 
-export function OnboardingToast() {
+export function OnboardingToast({ suppressed = false }: { suppressed?: boolean } = {}) {
   const isMobile = useIsMobile();
   const desktopSeen = useSyncExternalStore(
     subscribeStore,
@@ -32,8 +32,12 @@ export function OnboardingToast() {
 
   if (seen) return null;
 
+  // #207 D8 — when a status/alert toast is live, stay MOUNTED (the 8s
+  // auto-dismiss timer above keeps running) but hide visually so the two
+  // toasts can't overlap. Conditionally UNmounting would restart the timer
+  // each time a 2.5s status toast fires, prolonging onboarding.
   return (
-    <div className="onboarding-toast" role="status" aria-live="polite">
+    <div className="onboarding-toast" role="status" aria-live="polite" hidden={suppressed}>
       <span className="onboarding-toast-msg">{msg}</span>
       <button
         className="onboarding-toast-dismiss"
