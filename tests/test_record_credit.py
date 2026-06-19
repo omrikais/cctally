@@ -183,3 +183,64 @@ def test_s10_expired_5h_is_null(ns, monkeypatch):
                         "WHERE source='record-credit'").fetchone()
     conn.close()
     assert snap[0] is None
+
+
+# ── existing-event handling (S4, S8, S9) + marker clear ─────────────────
+
+
+def _apply_once(ns):
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    return ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+
+
+def test_s8_completion_path_after_half_apply(ns, monkeypatch):
+    """Event present, no command-owned snapshot -> plain rerun finishes it."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn)
+    # Simulate crash: fire pivots only, NO synthetic snapshot.
+    eff = dt.datetime(2026, 6, 19, 14, 0, tzinfo=dt.timezone.utc)
+    ns["_fire_in_place_credit"](conn, "2026-06-13", "2026-06-20T05:00:00+00:00",
+                                31.0, observed_pre_credit_pct=46.0, effective_dt=eff)
+    conn.close()
+    assert _weekly_reads(ns) != 31.0                  # half-applied
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))  # no --force
+    assert rc == 0 and _weekly_reads(ns) == 31.0      # completed
+
+
+def test_s4_fully_applied_refused(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    assert _apply_once(ns) == 0
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))  # again, no force
+    assert rc == 2                                    # refused
+
+
+def test_s9_force_scope_keeps_real_history(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    assert _apply_once(ns) == 0
+    conn = ns["open_db"]()
+    conn.execute("INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date,"
+                 " week_end_date, week_start_at, week_end_at, weekly_percent, page_url,"
+                 " source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("2026-06-19T15:00:00Z", "2026-06-13", "2026-06-20", WS_AT, WE_AT,
+                  33.0, None, "userscript", "{}"))
+    conn.commit(); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True, force=True))
+    assert rc == 0
+    conn = ns["open_db"]()
+    kept = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots "
+                        "WHERE source='userscript' AND weekly_percent=33.0").fetchone()[0]
+    owned = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots "
+                         "WHERE source='record-credit'").fetchone()[0]
+    conn.close()
+    assert kept == 1 and owned == 1                   # real row kept, single re-do'd synthetic
+
+
+def test_apply_clears_reset_zero_marker(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    ns["_arm_reset_zero_marker"](
+        "2026-06-13", "2026-06-20T05:00:00+00:00",
+        baseline_pct=46.0, first_zero_iso="2026-06-19T14:00:00+00:00")
+    assert ns["_read_reset_zero_marker"]() is not None
+    ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    assert ns["_read_reset_zero_marker"]() is None

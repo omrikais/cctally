@@ -2377,6 +2377,16 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
     _clear_reset_zero_marker()
 
 
+def _force_clear_credit(conn, week_start_date, event_id):
+    """Delete ONLY command-owned synthetic rows + the event + its milestones."""
+    conn.execute("DELETE FROM weekly_usage_snapshots "
+                 " WHERE week_start_date=? AND source='record-credit'", (week_start_date,))
+    conn.execute("DELETE FROM percent_milestones "
+                 " WHERE week_start_date=? AND reset_event_id=?", (week_start_date, event_id))
+    conn.execute("DELETE FROM week_reset_events WHERE id=?", (event_id,))
+    conn.commit()
+
+
 def cmd_record_credit(args) -> int:
     c = _cctally()
     now = _command_as_of()
@@ -2404,9 +2414,28 @@ def cmd_record_credit(args) -> int:
             we_at = we_at if isinstance(we_at, str) else we_at.isoformat(timespec="seconds")
             week_start_date = parse_iso_datetime(ws_at, "ws_at").date().isoformat()
 
+        # Resolve any existing credit event for this week up front — needed
+        # both for the --from default fallback (a half-applied credit empties
+        # the post-credit segment, so the reset-aware HWM reads NULL) and the
+        # apply-time completion/refuse/force branch (step 4a).
+        cur_end_canon = _canonicalize_optional_iso(we_at, "record-credit.week_end")
+        existing = conn.execute(
+            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct "
+            "FROM week_reset_events WHERE new_week_end_at=?",
+            (cur_end_canon,)).fetchone()
+
         # 2. Resolve --from default.
         if getattr(args, "from_pct", None) is not None:
             from_pct, from_source = float(args.from_pct), "explicit"
+        elif existing is not None and existing[2] is not None:
+            # A credit event already exists for this week (completion or
+            # --force re-record). Its recorded observed_pre_credit_pct is the
+            # AUTHENTIC pre-credit baseline; prefer it over the reset-aware
+            # HWM. The post-credit segment's MAX(weekly_percent) would
+            # otherwise pick up the post-credit value (31) or a later real
+            # status-line reading, mis-deriving the baseline and causing the
+            # stale-replay DELETE to (wrongly) match real history.
+            from_pct, from_source = float(existing[2]), "hwm"
         else:
             hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
             if hwm is None:
@@ -2425,10 +2454,32 @@ def cmd_record_credit(args) -> int:
             eprint(f"record-credit: {e}")
             return 2
 
-        # 4. Output + apply (Tasks 4-5 add existing-event handling and the
-        #    preview/confirm/JSON surface).
+        # 4. Output + apply (Task 5 adds the preview/confirm/JSON surface).
         if getattr(args, "dry_run", False):
             return 0
+
+        # 4a. Existing-event handling. _fire_in_place_credit commits the
+        #     event + cleanup BEFORE the synthetic snapshot, so a crash in
+        #     between leaves a half-applied credit (event present, no
+        #     command-owned snapshot, post-credit segment empty). `existing`
+        #     was resolved up front (above) keyed on cur_end_canon.
+        if existing is not None and not getattr(args, "force", False):
+            owned = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                " WHERE week_start_date=? AND source='record-credit' "
+                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+                (plan.week_start_date, existing[1])).fetchone()
+            if owned is not None:
+                # Fully applied -> refuse by default.
+                eprint(f"record-credit: a credit is already recorded for this "
+                       f"week (effective={existing[1]}, pre_credit={existing[2]}); "
+                       f"pass --force to re-record")
+                return 2
+            # else: half-applied -> fall through (completion path; the
+            # pivots in _fire_in_place_credit are idempotent).
+        elif existing is not None and getattr(args, "force", False):
+            _force_clear_credit(conn, plan.week_start_date, existing[0])
+
         five_hour = _resolve_prior_5h(conn, at_dt)
         _apply_credit(conn, plan, five_hour=five_hour)
         return 0
