@@ -1,7 +1,7 @@
-import { useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
-import { getState, subscribeStore } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
 
@@ -102,6 +102,15 @@ export function HelpOverlay() {
   // the hook order stays stable (Rules of Hooks).
   const cardRef = useRef<HTMLDivElement>(null);
   useModalFocus(cardRef, { active: open });
+  // #207 D2: while Help is open, the always-on hotkeys (digits, r/q/n/N,
+  // c/S/B/f//) must be inert. Help is component-local and invisible to the
+  // store's modal fields, so it explicitly tracks itself via a depth counter.
+  // Declared BEFORE the `!open` early-return so the hook order stays stable.
+  useEffect(() => {
+    if (!open) return;
+    dispatch({ type: 'INCREMENT_CHROME_OVERLAY' });
+    return () => dispatch({ type: 'DECREMENT_CHROME_OVERLAY' });
+  }, [open]);
   if (!open) return null;
   return (
     <div id="help-overlay" onClick={() => setOpen(false)}>

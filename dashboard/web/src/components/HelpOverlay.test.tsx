@@ -5,7 +5,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HelpOverlay } from './HelpOverlay';
-import { _resetForTests, dispatch } from '../store/store';
+import { _resetForTests, dispatch, getState } from '../store/store';
 import {
   installGlobalKeydown,
   uninstallGlobalKeydown,
@@ -115,6 +115,20 @@ describe('<HelpOverlay /> Esc layering is deterministic (#156)', () => {
     // Help closed (overlay gone), conversations Esc never fired.
     expect(document.querySelector('#help-overlay')).toBeNull();
     expect(convEsc).not.toHaveBeenCalled();
+  });
+});
+
+describe('<HelpOverlay /> tracks chromeOverlayOpen (#207 D2)', () => {
+  it('increments chromeOverlayOpen while open and decrements on close', () => {
+    render(<HelpOverlay />);
+    expect(getState().chromeOverlayOpen).toBe(0);
+    openHelp();                 // '?' toggles it open
+    expect(document.querySelector('#help-overlay')).not.toBeNull();
+    expect(getState().chromeOverlayOpen).toBe(1);
+    // Close via the overlay's own Esc (layer 1000) — the counter must drop.
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('#help-overlay')).toBeNull();
+    expect(getState().chromeOverlayOpen).toBe(0);
   });
 });
 

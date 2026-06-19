@@ -18,18 +18,25 @@ import type { Binding } from './keymap';
 // into ModalRoot or fire `q`/`r` invisibly underneath. The Update and
 // Doctor modals each manage their own `Escape` via modal-scope bindings,
 // so closing them is unaffected by this guard. See
-// `gotcha: project_global_hotkeys_modal_guard`. (Task 3 widens this.)
+// `gotcha: project_global_hotkeys_modal_guard`.
+//
+// #207 D2: the guard now also blocks a panel modal (`openModal`), the
+// search/filter input modes (`inputMode`), and the component-local chrome
+// overlays Settings/Help (`chromeOverlayOpen`) — none of which it checked
+// before, so `r`/`q`/`n`/`N`/digits used to fire underneath all of them.
 export function _globalKeyGuard(): boolean {
   const s = getState();
   // Modal-layering guard only — the view gate (#156) now lives in the keymap
   // dispatcher (these panel globals are scope:'global' → default 'dashboard').
-  return !s.update.modalOpen && !s.doctorModalOpen;
+  return !s.openModal && !s.update.modalOpen && !s.doctorModalOpen
+    && s.inputMode === null && s.chromeOverlayOpen === 0;
 }
 
 // Doctor key (`d`) uses a composite guard per spec §6.4 (Codex M5):
 // - !openModal      — a panel modal isn't currently up.
 // - !update.modalOpen — the update modal (own root) isn't up.
 // - inputMode === null — search/filter input modes own the keyboard.
+// - chromeOverlayOpen === 0 — Settings/Help aren't up (#207 D2).
 // The bare _globalKeyGuard pattern would let `d` fire through a
 // panel modal or during text-input mode. The same triple guard the
 // share/composer/basket keys use (see share/keyboardShare.ts).
@@ -38,6 +45,7 @@ export function _doctorOpenGuard(): boolean {
   if (s.openModal !== null) return false;
   if (s.update.modalOpen) return false;
   if (s.inputMode !== null) return false;
+  if (s.chromeOverlayOpen !== 0) return false;
   return true;
 }
 
@@ -78,7 +86,8 @@ export function buildGlobalKeyBindings(): Binding[] {
       key: 'c',
       scope: 'sessions',
       // scope:'sessions' → default 'dashboard'; the dispatcher gates the view.
-      when: () => !getState().openModal,
+      // chromeOverlayOpen === 0 keeps `c` inert under Settings/Help (#207 D2).
+      when: () => !getState().openModal && getState().chromeOverlayOpen === 0,
       action: () => {
         const cur = getState().prefs.sessionsCollapsed;
         dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: !cur } });

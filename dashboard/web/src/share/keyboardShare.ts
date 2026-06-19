@@ -79,6 +79,8 @@ export function buildShareKeyBinding(): Binding {
       if (s.openModal !== null) return false;
       if (s.update.modalOpen) return false;
       if (s.inputMode !== null) return false;
+      // #207 D2: Settings/Help own the keyboard while open.
+      if (s.chromeOverlayOpen !== 0) return false;
       return true;
     },
     action: () => {

@@ -284,6 +284,16 @@ export function SettingsOverlay() {
   const cardRef = useRef<HTMLDivElement>(null);
   useModalFocus(cardRef, { active: open });
 
+  // #207 D2: while Settings is open, the always-on hotkeys (digits, r/q/n/N,
+  // c/S/B/f//) must be inert. Settings is component-local and invisible to the
+  // store's modal fields, so it explicitly tracks itself via a depth counter.
+  // Declared BEFORE the `!open` early-return so the hook order stays stable.
+  useEffect(() => {
+    if (!open) return;
+    dispatch({ type: 'INCREMENT_CHROME_OVERLAY' });
+    return () => dispatch({ type: 'DECREMENT_CHROME_OVERLAY' });
+  }, [open]);
+
   if (!open) return null;
 
   const tzTargetValue =

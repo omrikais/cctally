@@ -83,13 +83,14 @@ export function SessionsControls() {
       key: 'f',
       scope: 'sessions',
       action: openFilter,
-      when: () => !getState().openModal && !filterExpanded,
+      // chromeOverlayOpen === 0 keeps `f` inert under Settings/Help (#207 D2).
+      when: () => !getState().openModal && !filterExpanded && getState().chromeOverlayOpen === 0,
     },
     {
       key: '/',
       scope: 'sessions',
       action: openSearch,
-      when: () => !getState().openModal && !searchExpanded,
+      when: () => !getState().openModal && !searchExpanded && getState().chromeOverlayOpen === 0,
     },
   ]);
   // NOTE: main does not bind `s` to sort cycling — `s` is the global
