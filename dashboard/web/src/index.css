@@ -3770,10 +3770,10 @@ mark.current {
      .sessions-ctrls is the sole sort control. Match-highlight class
      stays applied at the <tr> level.
 
-     Implementation note: uses the flex-wrap-with-explicit-order
-     pattern from Task 6's #mtr-table / #mcw-table rather than the
-     plan's grid-area approach — grid would have stacked the three
-     meta cells (started, dur, chip) instead of flowing them inline.
+     Implementation note: a fixed grid-template-areas (#214 M3-4) pins the
+     deterministic 2-line shape that flex-wrap could not guarantee — the
+     "started dur . chip" row keeps the three meta cells inline via the 1fr
+     spacer column (project + cost on row 1; meta row below).
   */
   .sess-table { width: 100%; }
   .sess-table thead { display: none; }
