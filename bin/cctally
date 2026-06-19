@@ -845,6 +845,7 @@ _parse_credit_at = _cctally_record._parse_credit_at
 _build_credit_plan = _cctally_record._build_credit_plan
 _resolve_reset_aware_hwm = _cctally_record._resolve_reset_aware_hwm
 _insert_credit_snapshot = _cctally_record._insert_credit_snapshot
+_resolve_prior_5h = _cctally_record._resolve_prior_5h
 _apply_credit = _cctally_record._apply_credit
 cmd_record_credit = _cctally_record.cmd_record_credit
 _hook_tick_log_line = _cctally_record._hook_tick_log_line

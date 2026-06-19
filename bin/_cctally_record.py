@@ -2344,6 +2344,26 @@ def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None)):
     return conn.total_changes
 
 
+def _resolve_prior_5h(conn, at_dt):
+    """Return the most-recent snapshot's (five_hour_percent, five_hour_resets_at,
+    five_hour_window_key) iff that 5h window is still active (resets_at > at_dt),
+    else (None, None, None) — so the synthetic row doesn't blank the live 5h
+    display, and never inflates the 5h HWM (copies an already-<=MAX value)."""
+    row = conn.execute(
+        "SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key "
+        "FROM weekly_usage_snapshots "
+        "WHERE five_hour_resets_at IS NOT NULL AND five_hour_window_key IS NOT NULL "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()
+    if row is None:
+        return (None, None, None)
+    try:
+        if parse_iso_datetime(row[1], "prior.5h_resets") > at_dt:
+            return (row[0], row[1], int(row[2]))
+    except ValueError:
+        pass
+    return (None, None, None)
+
+
 def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
     """Run the full artifact set: pivots (via _fire_in_place_credit) + snapshot
     + clear stale reset-zero marker. Idempotent / completion-safe."""
@@ -2405,11 +2425,12 @@ def cmd_record_credit(args) -> int:
             eprint(f"record-credit: {e}")
             return 2
 
-        # 4. Output + apply (Tasks 3-5 add 5h copy, existing-event handling,
-        #    and the preview/confirm/JSON surface).
+        # 4. Output + apply (Tasks 4-5 add existing-event handling and the
+        #    preview/confirm/JSON surface).
         if getattr(args, "dry_run", False):
             return 0
-        _apply_credit(conn, plan)
+        five_hour = _resolve_prior_5h(conn, at_dt)
+        _apply_credit(conn, plan, five_hour=five_hour)
         return 0
     finally:
         conn.close()

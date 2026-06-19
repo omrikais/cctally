@@ -149,3 +149,37 @@ def test_s7_non_vacuity_snapshot_is_load_bearing(ns, monkeypatch):
     monkeypatch.setitem(ns, "_insert_credit_snapshot", lambda *a, **k: 0)
     ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert _weekly_reads(ns) != 31.0     # empty post-credit segment
+
+
+# ── 5h preservation (S10) ──────────────────────────────────────────────
+
+
+def test_s10_copies_active_5h(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.execute("UPDATE weekly_usage_snapshots SET five_hour_percent=22.0, "
+                 "five_hour_resets_at=?, five_hour_window_key=? ",
+                 ("2026-06-19T18:00:00+00:00", 1750356000))
+    conn.commit(); conn.close()
+    ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    conn = ns["open_db"]()
+    snap = conn.execute("SELECT five_hour_percent, five_hour_window_key "
+                        "FROM weekly_usage_snapshots WHERE source='record-credit'").fetchone()
+    conn.close()
+    assert float(snap[0]) == 22.0 and int(snap[1]) == 1750356000
+
+
+def test_s10_expired_5h_is_null(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.execute("UPDATE weekly_usage_snapshots SET five_hour_percent=22.0, "
+                 "five_hour_resets_at=? ", ("2026-06-19T10:00:00+00:00",))  # past
+    conn.commit(); conn.close()
+    ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    conn = ns["open_db"]()
+    snap = conn.execute("SELECT five_hour_percent FROM weekly_usage_snapshots "
+                        "WHERE source='record-credit'").fetchone()
+    conn.close()
+    assert snap[0] is None
