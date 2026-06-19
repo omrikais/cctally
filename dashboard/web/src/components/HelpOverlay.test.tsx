@@ -118,6 +118,17 @@ describe('<HelpOverlay /> Esc layering is deterministic (#156)', () => {
   });
 });
 
+describe('<HelpOverlay /> documents the share + doctor + sessions shortcuts (#207 D1)', () => {
+  it('renders the S (share), d (Doctor), and c (collapse) rows when open', () => {
+    render(<HelpOverlay />);
+    openHelp();
+    expect(screen.getByText(/share the focused panel/i)).toBeInTheDocument();
+    expect(screen.getByText(/open Doctor/i)).toBeInTheDocument();
+    expect(screen.getByText(/collapse \/ expand the Sessions panel/i)).toBeInTheDocument();
+    expect(screen.getByText(/quit \(close the tab\)/i)).toBeInTheDocument();
+  });
+});
+
 describe('<HelpOverlay /> tracks chromeOverlayOpen (#207 D2)', () => {
   it('increments chromeOverlayOpen while open and decrements on close', () => {
     render(<HelpOverlay />);

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { dispatch, getState, subscribeStore } from '../store/store';
@@ -8,6 +8,29 @@ import { useIsMobile } from '../hooks/useIsMobile';
 interface KeyTableProps {
   panelOrder: readonly PanelId[];
 }
+
+// Data-driven non-positional shortcut rows (#207 D1). Single-key
+// global/sessions bindings live HERE so the keybindings help can never drift
+// out of sync with the live keymap — HelpOverlay.coverage.test.tsx fails RED
+// if a future global/sessions hotkey lands without a row. The digit/positional
+// panel-open rows (`panelOrder`-derived) and the multi-key combo rows
+// (Hold+drag, Shift+↑/↓, ↑/↓) are NOT single registered keys and stay rendered
+// separately below. `ConversationsKeyTable` (view:'conversations' keys) is
+// excluded from the coverage assertion and stays untouched.
+export const HELP_ROWS: ReadonlyArray<{ keys: string[]; desc: string }> = [
+  { keys: ['r'], desc: 'force refresh' },
+  { keys: ['s'], desc: 'open Settings' },
+  { keys: ['d'], desc: 'open Doctor' },
+  { keys: ['S'], desc: 'share the focused panel (focus a panel first)' },
+  { keys: ['B'], desc: 'open the report composer' },
+  { keys: ['f'], desc: 'filter Sessions' },
+  { keys: ['/'], desc: 'search Sessions' },
+  { keys: ['c'], desc: 'collapse / expand the Sessions panel' },
+  { keys: ['n', 'N'], desc: 'next / previous search match' },
+  { keys: ['q'], desc: 'quit (close the tab)' },
+  { keys: ['?'], desc: 'toggle this help' },
+  { keys: ['Esc'], desc: 'close' },
+];
 
 function KeyTable({ panelOrder }: KeyTableProps) {
   return (
@@ -33,13 +56,21 @@ function KeyTable({ panelOrder }: KeyTableProps) {
             <td>Open {PANEL_REGISTRY[id]?.label ?? id} modal</td>
           </tr>
         ))}
-        <tr><td><kbd>r</kbd></td><td>force refresh</td></tr>
-        <tr><td><kbd>s</kbd></td><td>open Settings</td></tr>
+        {HELP_ROWS.map((row) => (
+          <tr key={row.desc}>
+            <td>
+              {row.keys
+                .map<ReactNode>((k) => <kbd key={k}>{k}</kbd>)
+                .reduce((acc, el) => [acc, ' / ', el])}
+            </td>
+            <td>{row.desc}</td>
+          </tr>
+        ))}
+        {/* Multi-key combos / gestures — not single registered keys, so they
+            stay hand-written and are excluded from the coverage assertion. */}
         <tr><td>Hold + drag a card</td><td>rearrange the dashboard</td></tr>
         <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd></td><td>swap focused card with neighbor</td></tr>
         <tr><td><kbd>↑</kbd>/<kbd>↓</kbd></td><td>Select period (Weekly/Monthly/Daily modal)</td></tr>
-        <tr><td><kbd>?</kbd></td><td>toggle this help</td></tr>
-        <tr><td><kbd>Esc</kbd></td><td>close</td></tr>
       </tbody>
     </table>
   );
