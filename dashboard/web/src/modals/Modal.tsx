@@ -9,6 +9,7 @@ import {
 } from '../store/store';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { ModalHeader } from './ModalHeader';
 
 interface ModalProps {
   title: string;
@@ -57,13 +58,12 @@ export function Modal({ title, accentClass, children, headerExtras }: ModalProps
             handle sets the visual expectation only. Dismissal paths
             remain X-button, backdrop tap, and Esc. */}
         <div className="modal-handle" aria-hidden="true" />
-        <header className="modal-header">
-          <h2 id="modal-title">{title}</h2>
-          {headerExtras}
-          <button className="modal-close" aria-label="Close" onClick={close}>
-            ×
-          </button>
-        </header>
+        <ModalHeader
+          title={title}
+          titleId="modal-title"
+          headerExtras={headerExtras}
+          onClose={close}
+        />
         <div id="modal-body" className="modal-body">
           {children}
         </div>

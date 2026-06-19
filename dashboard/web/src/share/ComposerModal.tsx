@@ -29,6 +29,7 @@ import { bannerVisible } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { ModalHeader } from '../modals/ModalHeader';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
 import type { ShareFormat, ShareTheme } from './types';
@@ -387,6 +388,20 @@ export function ComposerModal() {
 
   if (!composerModal?.open) return null;
 
+  // Shared header for both the empty-basket and populated render paths —
+  // de-duplicates what used to be two identical header/close blocks (the
+  // "two close buttons" called out in #210). The close glyph itself comes
+  // from the single-sourced <ModalCloseButton> inside <ModalHeader>.
+  const header = (
+    <ModalHeader
+      title="Compose report"
+      titleId={COMPOSER_MODAL_TITLE_ID}
+      className="composer-modal-header"
+      onClose={() => dispatch(closeComposer())}
+      closeClassName="composer-modal-close"
+    />
+  );
+
   if (basket.items.length === 0) {
     return (
       <div
@@ -395,17 +410,7 @@ export function ComposerModal() {
         aria-modal="true"
         aria-labelledby={COMPOSER_MODAL_TITLE_ID}
       >
-        <header className="composer-modal-header">
-          <h2 id={COMPOSER_MODAL_TITLE_ID}>Compose report</h2>
-          <button
-            type="button"
-            className="composer-modal-close"
-            onClick={() => dispatch(closeComposer())}
-            aria-label="Close"
-          >
-            ×
-          </button>
-        </header>
+        {header}
         <p className="composer-empty-message">
           Basket is empty. Open any panel&apos;s share menu and pick + Basket to add a section.
         </p>
@@ -420,17 +425,7 @@ export function ComposerModal() {
       aria-modal="true"
       aria-labelledby={COMPOSER_MODAL_TITLE_ID}
     >
-      <header className="composer-modal-header">
-        <h2 id={COMPOSER_MODAL_TITLE_ID}>Compose report</h2>
-        <button
-          type="button"
-          className="composer-modal-close"
-          onClick={() => dispatch(closeComposer())}
-          aria-label="Close"
-        >
-          ×
-        </button>
-      </header>
+      {header}
       <div className="composer-knobs">
         <label>
           Title

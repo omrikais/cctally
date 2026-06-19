@@ -34,6 +34,8 @@ import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { getState } from '../store/store';
+import { ModalHeader } from '../modals/ModalHeader';
+import { ModalCloseButton } from '../modals/ModalCloseButton';
 
 interface Props {
   panel: SharePanelId;
@@ -210,9 +212,11 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
           save preset → close). The close button is then re-positioned
           to its visual top-right slot via CSS
           `.share-modal-close { position: absolute; top: 12px; right: 18px }`. */}
-      <header className="share-modal-header">
-        <h2 id={titleId}>Share {panelLabel} report</h2>
-      </header>
+      <ModalHeader
+        title={`Share ${panelLabel} report`}
+        titleId={titleId}
+        className="share-modal-header"
+      />
 
       <div className="share-modal-body">
         <section className="share-section share-gallery-section" aria-label="Template gallery">
@@ -263,15 +267,15 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
 
       {/* Close button — last in DOM, positioned absolutely into the
           header slot via CSS so tab order is correct without altering
-          the visual layout. Esc remains the universal backstop. */}
-      <button
-        type="button"
+          the visual layout. Esc remains the universal backstop. Rendered
+          via the shared <ModalCloseButton> (single close-glyph source,
+          #210) but kept OUT of the <ModalHeader> above precisely so it
+          stays last in the DOM for spec §12.2 tab order. */}
+      <ModalCloseButton
         className="share-modal-close"
-        aria-label="Close share modal"
-        onClick={onClose}
-      >
-        ×
-      </button>
+        label="Close share modal"
+        onClose={onClose}
+      />
 
       <ManagePresetsModal
         open={manageOpen}

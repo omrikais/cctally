@@ -20,6 +20,7 @@ import type { SharePanelId } from './types';
 import { dispatch } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
 import { sharePanelLabel } from './panelLabels';
+import { ModalHeader } from '../modals/ModalHeader';
 
 interface Props {
   open: boolean;
@@ -173,17 +174,13 @@ export function ManagePresetsModal({ open, onClose }: Props) {
       aria-labelledby={MANAGE_PRESETS_TITLE_ID}
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="share-manage-header">
-        <h2 id={MANAGE_PRESETS_TITLE_ID}>Manage presets</h2>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          className="share-manage-close"
-        >
-          ×
-        </button>
-      </div>
+      <ModalHeader
+        title="Manage presets"
+        titleId={MANAGE_PRESETS_TITLE_ID}
+        className="share-manage-header"
+        onClose={onClose}
+        closeClassName="share-manage-close"
+      />
       {error ? (
         <div className="share-manage-error" role="alert">{error}</div>
       ) : null}
