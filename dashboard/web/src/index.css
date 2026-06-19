@@ -2609,6 +2609,13 @@ mark.current {
   margin: 4px 0 0 0;
 }
 
+/* #207 D4 — inline confirmation when a test alert is dispatched. */
+.settings-ok {
+  color: var(--accent-green, #4ade80);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
 /* -------- Alerts panel: collapsed state -------- */
 .panel.alerts-collapsed { max-height: 360px; }
 .panel.alerts-collapsed .panel-body { overflow-y: auto; overflow-x: hidden; }

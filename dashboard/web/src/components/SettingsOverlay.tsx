@@ -162,6 +162,9 @@ export function SettingsOverlay() {
   const [liveTail, setLiveTail] = useState<boolean>(liveTailServer);
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
+  // #207 D4: inline success confirmation for the happy path (dispatch ===
+  // 'queued'), so the only feedback isn't the auto-dismissing alert toast.
+  const [testOk, setTestOk] = useState(false);
   const [testAxis, setTestAxis] = useState<AlertAxis>('weekly');
   // Only consulted when testAxis === 'projected' (mirrors the CLI's
   // `alerts test --axis projected --metric`); ignored for other axes.
@@ -711,6 +714,7 @@ export function SettingsOverlay() {
                 onClick={async () => {
                   setTestSubmitting(true);
                   setTestError(null);
+                  setTestOk(false);
                   try {
                     const res = await fetch('/api/alerts/test', {
                       method: 'POST',
@@ -742,7 +746,9 @@ export function SettingsOverlay() {
                     if (body.alert) {
                       dispatch({ type: 'SHOW_ALERT_TOAST', alert: body.alert });
                     }
-                    if (body.dispatch !== 'queued') {
+                    if (body.dispatch === 'queued') {
+                      setTestOk(true);
+                    } else {
                       setTestError(body.dispatch ?? body.reason ?? `HTTP ${res.status}`);
                     }
                   } catch (e) {
@@ -762,6 +768,9 @@ export function SettingsOverlay() {
               </p>
               {testError && (
                 <div className="modal-error">Test failed: {testError}</div>
+              )}
+              {testOk && (
+                <div className="settings-ok">Test alert dispatched ✓</div>
               )}
             </div>
           </fieldset>

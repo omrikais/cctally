@@ -202,6 +202,41 @@ describe('<SettingsOverlay /> test-alert axis picker', () => {
   });
 });
 
+describe('<SettingsOverlay /> test-alert inline confirmation (#207 D4)', () => {
+  it('shows an inline confirmation when the test alert is queued', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({ dispatch: 'queued', alert: null }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    openSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'Send test alert' }));
+    expect(await screen.findByText(/dispatched/i)).toBeTruthy();
+  });
+
+  it('shows the error, not the confirmation, on a non-queued dispatch', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({ dispatch: 'osascript-failed' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    openSettings();
+    fireEvent.click(screen.getByRole('button', { name: 'Send test alert' }));
+    expect(await screen.findByText(/test failed/i)).toBeTruthy();
+    expect(screen.queryByText(/dispatched/i)).toBeNull();
+  });
+});
+
 // Notifier dropdown (Phase B). Parent-modal integration tests: mount the real
 // SettingsOverlay, seed `alerts_settings.notifier` / `command_configured`,
 // open via the `s` keymap, and assert (a) the "Custom command" option is
