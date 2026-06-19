@@ -2296,6 +2296,88 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         eprint(f"[record-usage] post-credit cleanup failed: {exc}")
 
 
+def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
+    """The floored MAX(weekly_percent) the statusline _hwm_clamp computes:
+    MAX over snapshots captured at/after the latest in-week reset effective."""
+    floor_row = conn.execute(
+        "SELECT MAX(effective_reset_at_utc) FROM week_reset_events "
+        " WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?) "
+        "   AND unixepoch(effective_reset_at_utc) <  unixepoch(?)",
+        (week_start_at, week_end_at),
+    ).fetchone()
+    floor_iso = floor_row[0] if floor_row and floor_row[0] else None
+    if floor_iso is not None:
+        row = conn.execute(
+            "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
+            " WHERE week_start_date = ? AND unixepoch(captured_at_utc) >= unixepoch(?)",
+            (week_start_date, floor_iso),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
+            " WHERE week_start_date = ?",
+            (week_start_date,),
+        ).fetchone()
+    return None if not row or row[0] is None else float(row[0])
+
+
+def cmd_record_credit(args) -> int:
+    c = _cctally()
+    now = _command_as_of()
+    try:
+        at_dt = _parse_credit_at(getattr(args, "at", None), now)
+    except ValueError as e:
+        eprint(f"record-credit: {e}")
+        return 2
+    conn = open_db()
+    try:
+        # 1. Resolve the week.
+        if getattr(args, "week", None):
+            week_start_date = args.week
+            ws_at, we_at = _get_canonical_boundary_for_date(conn, week_start_date)
+            if not ws_at or not we_at:
+                eprint(f"record-credit: no snapshot for --week {week_start_date}")
+                return 2
+        else:
+            fetched = _fetch_current_week_snapshots(conn, at_dt)
+            if fetched is None:
+                eprint("record-credit: no snapshot week contains --at; pass --week")
+                return 2
+            ws_at, we_at, _samples = fetched
+            ws_at = ws_at if isinstance(ws_at, str) else ws_at.isoformat(timespec="seconds")
+            we_at = we_at if isinstance(we_at, str) else we_at.isoformat(timespec="seconds")
+            week_start_date = parse_iso_datetime(ws_at, "ws_at").date().isoformat()
+
+        # 2. Resolve --from default.
+        if getattr(args, "from_pct", None) is not None:
+            from_pct, from_source = float(args.from_pct), "explicit"
+        else:
+            hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+            if hwm is None:
+                eprint("record-credit: no usage history for the week; pass --from")
+                return 2
+            from_pct, from_source = hwm, "hwm"
+
+        # 3. Validate + build plan.
+        try:
+            plan = _build_credit_plan(
+                week_start_date=week_start_date, week_start_at=ws_at,
+                week_end_at=we_at, from_pct=from_pct, from_source=from_source,
+                to_pct=args.to, at_dt=at_dt, now=now,
+            )
+        except ValueError as e:
+            eprint(f"record-credit: {e}")
+            return 2
+
+        # 4. Output + apply (Tasks 2-5). For now, dry-run prints nothing-stub
+        #    and real apply is unimplemented.
+        if getattr(args, "dry_run", False):
+            return 0
+        raise NotImplementedError  # replaced in Task 2
+    finally:
+        conn.close()
+
+
 def cmd_record_usage(args: argparse.Namespace) -> int:
     """Record usage data from Claude Code status line rate_limits."""
     c = _cctally()

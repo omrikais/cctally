@@ -77,3 +77,34 @@ def test_build_plan_rejects_at_outside_window(ns):
     with pytest.raises(ValueError, match="window"):
         _plan(ns, at_dt=dt.datetime(2026, 6, 12, 0, 0, tzinfo=dt.timezone.utc),
               now=dt.datetime(2026, 6, 12, 0, 0, tzinfo=dt.timezone.utc))
+
+
+# ── integration: cmd_record_credit ────────────────────────────────────
+
+
+def _seed_week(ns, conn, *, pct=46.0, captured="2026-06-18T21:12:00Z"):
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, weekly_percent, page_url, source, payload_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (captured, "2026-06-13", "2026-06-20", WS_AT, WE_AT, pct,
+         None, "userscript", "{}"),
+    )
+    conn.commit()
+
+
+def _rc_args(**over):
+    a = dict(to=31.0, from_pct=None, at=None, week=None,
+             dry_run=True, yes=False, json=False, force=False)
+    a.update(over)
+    return argparse.Namespace(**a)
+
+
+def test_resolves_current_week_and_hwm_from(ns, monkeypatch):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.close()
+    rc = ns["cmd_record_credit"](_rc_args())   # dry-run
+    assert rc == 0
