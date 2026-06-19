@@ -57,6 +57,12 @@ export function registerKeymap(list: Binding[]): () => void {
   return () => list.forEach((b) => bindings.delete(b));
 }
 
+/** Read-only snapshot of currently-registered bindings (test/introspection
+ *  use; #207 D1). Pure — does not mutate the Set. */
+export function registeredBindings(): ReadonlyArray<Pick<Binding, 'key' | 'scope' | 'view'>> {
+  return [...bindings].map(({ key, scope, view }) => ({ key, scope, view }));
+}
+
 export function installGlobalKeydown(): void {
   if (handler) return;
   handler = (e: KeyboardEvent): void => {
