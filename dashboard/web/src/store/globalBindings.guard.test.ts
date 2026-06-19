@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { _resetForTests, dispatch, getState } from './store';
+import { _resetForTests, dispatch } from './store';
 import {
   _resetForTests as _resetKeymap,
   installGlobalKeydown,

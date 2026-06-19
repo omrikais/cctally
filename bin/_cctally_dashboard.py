@@ -5401,6 +5401,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_static_file(self.static_dir / "dashboard.html",
                                     "text/html; charset=utf-8")
+        elif path == "/favicon.ico":
+            # #207 D11 — serve the SVG favicon for the browser's default
+            # /favicon.ico request so it stops 404-ing even absent the
+            # <link rel="icon"> in dashboard.html. Vite copies public/ verbatim
+            # into the build output, so favicon.svg lands under static_dir.
+            self._serve_static_file(self.static_dir / "favicon.svg",
+                                    "image/svg+xml")
         elif path.startswith("/static/"):
             # Defense in depth: a lexical ".." pre-check is bypassable via
             # percent-encoding (e.g., %2e%2e), so the authoritative guard is the
