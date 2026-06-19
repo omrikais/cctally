@@ -74,7 +74,7 @@ afterEach(() => {
 });
 
 describe('scroll-lock wiring (per overlay root)', () => {
-  it('panel Modal (via ModalRoot) locks body while open, restores on close', () => {
+  it('panel Modal (via ModalRoot) locks page scroll while open, restores on close', () => {
     const { unmount } = render(<ModalRoot />);
     act(() => dispatch({ type: 'OPEN_MODAL', kind: 'alerts' }));
     expect(document.documentElement.style.overflow).toBe('hidden');
@@ -83,7 +83,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     unmount();
   });
 
-  it('Share modal locks body while open (via ShareModalRoot slot)', () => {
+  it('Share modal locks page scroll while open (via ShareModalRoot slot)', () => {
     const { unmount } = render(<ShareModalRoot />);
     act(() => dispatch(openShareModal('weekly', null)));
     expect(document.documentElement.style.overflow).toBe('hidden');
@@ -92,7 +92,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     unmount();
   });
 
-  it('Composer locks body while open (via ShareModalRoot sibling)', () => {
+  it('Composer locks page scroll while open (via ShareModalRoot sibling)', () => {
     const { unmount } = render(<ShareModalRoot />);
     act(() => dispatch(openComposer()));
     expect(document.documentElement.style.overflow).toBe('hidden');
@@ -101,7 +101,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     unmount();
   });
 
-  it('Doctor modal locks body while open', () => {
+  it('Doctor modal locks page scroll while open', () => {
     const { unmount } = render(<DoctorModal />);
     act(() => dispatch({ type: 'OPEN_DOCTOR_MODAL' }));
     expect(document.documentElement.style.overflow).toBe('hidden');
@@ -130,7 +130,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     unmount();
   });
 
-  it('Settings overlay locks body while open (s key), restores on close', () => {
+  it('Settings overlay locks page scroll while open (s key), restores on close', () => {
     const { unmount } = render(<SettingsOverlay />);
     // Production open path: the `s` global key (no store action).
     act(() => {
@@ -145,7 +145,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     unmount();
   });
 
-  it('Help overlay locks body while open (? key), restores on close', () => {
+  it('Help overlay locks page scroll while open (? key), restores on close', () => {
     const { unmount } = render(<HelpOverlay />);
     // Production open path: the `?` global toggle key (no store action).
     act(() => {
