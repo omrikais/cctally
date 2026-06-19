@@ -55,6 +55,7 @@ beforeEach(() => {
   _resetScrollLock();
   installGlobalKeydown();
   document.body.innerHTML = '';
+  document.documentElement.style.overflow = '';
   document.body.style.overflow = '';
   // The share/doctor roots fetch on mount/open; stub so nothing hangs and
   // no unhandled-rejection noise leaks. The body is irrelevant to the lock.
@@ -67,6 +68,7 @@ beforeEach(() => {
 afterEach(() => {
   uninstallGlobalKeydown();
   _resetKeymap();
+  document.documentElement.style.overflow = '';
   document.body.style.overflow = '';
   vi.unstubAllGlobals();
 });
@@ -75,36 +77,36 @@ describe('scroll-lock wiring (per overlay root)', () => {
   it('panel Modal (via ModalRoot) locks body while open, restores on close', () => {
     const { unmount } = render(<ModalRoot />);
     act(() => dispatch({ type: 'OPEN_MODAL', kind: 'alerts' }));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     act(() => dispatch({ type: 'CLOSE_MODAL' }));
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
   it('Share modal locks body while open (via ShareModalRoot slot)', () => {
     const { unmount } = render(<ShareModalRoot />);
     act(() => dispatch(openShareModal('weekly', null)));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     act(() => dispatch(closeShareModal()));
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
   it('Composer locks body while open (via ShareModalRoot sibling)', () => {
     const { unmount } = render(<ShareModalRoot />);
     act(() => dispatch(openComposer()));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     act(() => dispatch(closeComposer()));
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
   it('Doctor modal locks body while open', () => {
     const { unmount } = render(<DoctorModal />);
     act(() => dispatch({ type: 'OPEN_DOCTOR_MODAL' }));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     act(() => dispatch({ type: 'CLOSE_DOCTOR_MODAL' }));
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
@@ -113,7 +115,7 @@ describe('scroll-lock wiring (per overlay root)', () => {
     // modalOpen with null state -> modal NOT rendered -> NOT locked (Codex finding).
     act(() => dispatch({ type: 'OPEN_UPDATE_MODAL' }));
     expect(getState().update.state).toBeNull();
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     // Give it a state so it actually renders, then assert locked.
     act(() =>
       dispatch({
@@ -122,9 +124,9 @@ describe('scroll-lock wiring (per overlay root)', () => {
         suppress: { skipped_versions: [], remind_after: null },
       }),
     );
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     act(() => dispatch({ type: 'CLOSE_UPDATE_MODAL' }));
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
@@ -134,12 +136,12 @@ describe('scroll-lock wiring (per overlay root)', () => {
     act(() => {
       fireEvent.keyDown(document, { key: 's' });
     });
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     // Close via the modal-scope Esc binding the overlay registers.
     act(() => {
       fireEvent.keyDown(document, { key: 'Escape' });
     });
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 
@@ -149,12 +151,12 @@ describe('scroll-lock wiring (per overlay root)', () => {
     act(() => {
       fireEvent.keyDown(document, { key: '?' });
     });
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(document.documentElement.style.overflow).toBe('hidden');
     // `?` toggles, so a second press closes it.
     act(() => {
       fireEvent.keyDown(document, { key: '?' });
     });
-    expect(document.body.style.overflow).toBe('');
+    expect(document.documentElement.style.overflow).toBe('');
     unmount();
   });
 });

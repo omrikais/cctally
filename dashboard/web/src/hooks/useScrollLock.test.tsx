@@ -2,51 +2,64 @@ import { renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { useScrollLock, _resetForTests } from './useScrollLock';
 
+const htmlOverflow = () => document.documentElement.style.overflow;
+const bodyOverflow = () => document.body.style.overflow;
+
+function resetOverflow() {
+  document.documentElement.style.overflow = '';
+  document.body.style.overflow = '';
+}
+
 beforeEach(() => {
   _resetForTests();
-  document.body.style.overflow = '';
+  resetOverflow();
 });
 
 afterEach(() => {
-  document.body.style.overflow = '';
+  resetOverflow();
 });
 
 describe('useScrollLock', () => {
-  it('locks body overflow on mount and restores the prior value on unmount', () => {
-    document.body.style.overflow = 'visible';
+  it('locks <html>+<body> overflow on mount and restores the prior values on unmount', () => {
+    // <html> is the real viewport scroller — it is the load-bearing lock.
+    document.documentElement.style.overflow = 'visible';
+    document.body.style.overflow = 'auto';
     const { unmount } = renderHook(() => useScrollLock(true));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(htmlOverflow()).toBe('hidden');
+    expect(bodyOverflow()).toBe('hidden');
     unmount();
-    expect(document.body.style.overflow).toBe('visible');
+    expect(htmlOverflow()).toBe('visible');
+    expect(bodyOverflow()).toBe('auto');
   });
 
   it('is a no-op when inactive', () => {
+    document.documentElement.style.overflow = 'scroll';
     document.body.style.overflow = 'scroll';
     const { unmount } = renderHook(() => useScrollLock(false));
-    expect(document.body.style.overflow).toBe('scroll');
+    expect(htmlOverflow()).toBe('scroll');
+    expect(bodyOverflow()).toBe('scroll');
     unmount();
-    expect(document.body.style.overflow).toBe('scroll');
+    expect(htmlOverflow()).toBe('scroll');
   });
 
   it('stays locked until the LAST of two stacked locks releases (refcount)', () => {
-    document.body.style.overflow = '';
     const a = renderHook(() => useScrollLock(true));
     const b = renderHook(() => useScrollLock(true));
-    expect(document.body.style.overflow).toBe('hidden');
+    expect(htmlOverflow()).toBe('hidden');
     a.unmount();
-    // one lock still held -> body stays locked
-    expect(document.body.style.overflow).toBe('hidden');
+    // one lock still held -> page stays locked
+    expect(htmlOverflow()).toBe('hidden');
     b.unmount();
     // both released -> restored to the original ''
-    expect(document.body.style.overflow).toBe('');
+    expect(htmlOverflow()).toBe('');
   });
 
   it('does not capture "hidden" as the original when a second lock acquires', () => {
-    document.body.style.overflow = 'auto';
+    document.documentElement.style.overflow = 'auto';
     const a = renderHook(() => useScrollLock(true)); // saves 'auto', sets 'hidden'
     const b = renderHook(() => useScrollLock(true)); // must NOT re-save 'hidden'
     b.unmount();
     a.unmount();
-    expect(document.body.style.overflow).toBe('auto');
+    expect(htmlOverflow()).toBe('auto');
   });
 });
