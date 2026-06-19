@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.0] - 2026-06-19
+
 ### Added
 - **Dashboard (mobile) — prev/next day stepper on the Daily modal.** On a phone the Daily modal's thirty selectable day bars don't fit, so the modal now shows ‹ prev / next › day-stepper controls at the mobile breakpoint (desktop keeps the full bar row and the existing ↑↓ keyboard nav, which the stepper shares its `stepDay()` helper with) (#214).
 
