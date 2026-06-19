@@ -3702,19 +3702,28 @@ mark.current {
     width: auto;
   }
   #panel-sessions > .sessions-ctrls .search-container .ctrl-btn {
-    width: 32px; min-width: 32px;
-    height: 36px; min-height: 36px;
+    width: 44px; min-width: 44px;
+    height: 44px; min-height: 44px;
     padding: 0;
   }
   #panel-sessions > .sessions-ctrls > .ctrl-btn {
     flex: 0 0 auto;
-    width: 36px; min-width: 36px;
-    height: 36px; min-height: 36px;
+    width: 44px; min-width: 44px;
+    height: 44px; min-height: 44px;
     padding: 0;
     display: inline-flex; align-items: center; justify-content: center;
   }
+  /* #214 M2-1: a saved filter renders .ctrl-btn.as-chip as the same direct
+     child with visible text + ×; the square 44px pin would clip it, so the
+     +class out-specifies the square rule and keeps the chip's text while
+     just flooring its height to 44px. */
+  #panel-sessions > .sessions-ctrls > .ctrl-btn.as-chip {
+    width: auto; min-width: 0;
+    height: auto; min-height: 44px;
+    padding: 4px 10px;
+  }
   /* Sort pill is icon-only on mobile — drop the verbose
-     "sort: started desc" label so the trailing button stays 36×36. */
+     "sort: started desc" label so the trailing button stays square. */
   #panel-sessions > .sessions-ctrls #sort-pill .label { display: none; }
 
   /* Sessions table → dense two-line rows. The 5-column table
@@ -4032,6 +4041,46 @@ mark.current {
     border-radius: 6px; color: inherit; font: inherit; cursor: pointer;
   }
   .daily-step-btn:disabled { opacity: 0.4; cursor: default; }
+
+  /* #214 M2-1: 44px mobile touch targets for sub-floor controls.
+     Hybrid mechanism: an invisible inset ::before expands the touch area
+     where the control must stay visually compact; a real box where there
+     is layout room. JSDOM cannot evaluate @media, so these are verified by
+     hit-testing / getBoundingClientRect in the Playwright QA phase. */
+
+  /* .sess-open-conv (open-conversation icon button): invisible ~45px hit
+     area via an inset ::before, plus a separator margin from the started
+     time. The base .sess-open-conv rule lives AFTER this @media block in
+     source order, so a bare-class mobile margin override would lose; the
+     #panel-sessions + class selector (id specificity) wins regardless. */
+  .sess-open-conv { position: relative; }
+  .sess-open-conv::before { content: ""; position: absolute; inset: -16px; }
+  #panel-sessions .sess-open-conv { margin-right: 12px; }
+
+  /* .th-sortable: the real sort hit target is the <th tabIndex={0}>, not
+     the inner presentational .th-sort-btn (tabIndex={-1}). Give the inner
+     button a real 44px height so the <th> grows downward into its own row
+     (no pseudo overhang stealing taps from the first data row). Confirmed
+     rendered at phone width in the Trend panel. */
+  .th-sortable .th-sort-btn { min-height: 44px; }
+
+  /* .doctor-chip (topbar pill): vertical-only invisible 44px so the #206
+     topbar height budget stays intact (a real 44px box would grow the
+     topbar). The base .doctor-chip rule has no position, so adding
+     position:relative here wins by source order. */
+  .doctor-chip { position: relative; }
+  .doctor-chip::before { content: ""; position: absolute; inset: -12px 0; }
+
+  /* Settings checkbox/radio rows: a 44px flex label row + an 18px box.
+     Scoped via :has() to checkbox/radio labels ONLY, so the Notifier
+     select, alert-test selects, and custom-tz text-input labels (which
+     share the broad .settings-fs label selector) are untouched. */
+  .settings-fs label:has(input[type="checkbox"]),
+  .settings-fs label:has(input[type="radio"]) {
+    min-height: 44px; display: flex; align-items: center; gap: 8px; padding: 6px 0;
+  }
+  .settings-fs input[type="checkbox"],
+  .settings-fs input[type="radio"] { width: 18px; height: 18px; }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------
