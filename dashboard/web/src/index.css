@@ -4186,8 +4186,10 @@ mark.current {
  * `.projects-row` rule above has its `.panel-body .projects-row` chain
  * implied; the mobile @media override must outrank that or it loses. */
 @media (max-width: 640px) {
+  /* #214 M3-5: the name was a fixed 90px while the aria-hidden decorative
+     bar hogged 1fr. Give the name the flexible track; shrink the bar. */
   #root .projects-row {
-    grid-template-columns: 90px 1fr 50px 36px;
+    grid-template-columns: minmax(0, 1fr) 48px 50px 36px;
     padding: 4px;
   }
 }
