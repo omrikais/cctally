@@ -398,7 +398,7 @@ export function ComposerModal() {
             onClick={() => dispatch(closeComposer())}
             aria-label="Close"
           >
-            ⤬
+            ×
           </button>
         </header>
         <p className="composer-empty-message">
@@ -423,7 +423,7 @@ export function ComposerModal() {
           onClick={() => dispatch(closeComposer())}
           aria-label="Close"
         >
-          ⤬
+          ×
         </button>
       </header>
       <div className="composer-knobs">

@@ -181,7 +181,7 @@ export function ManagePresetsModal({ open, onClose }: Props) {
           aria-label="Close"
           className="share-manage-close"
         >
-          ⤬
+          ×
         </button>
       </div>
       {error ? (

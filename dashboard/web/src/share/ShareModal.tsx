@@ -265,7 +265,7 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
         aria-label="Close share modal"
         onClick={onClose}
       >
-        ⤬
+        ×
       </button>
 
       <ManagePresetsModal
