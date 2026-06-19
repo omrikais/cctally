@@ -68,7 +68,8 @@ export function DailyMiniBars({ rows, selectedDate, onSelect }: Props) {
             ›
           </button>
         </span>
-        <span className="hint">‹ › to step · tap a bar</span>
+        <span className="hint hint-desktop">↑↓ navigate · click any bar</span>
+        <span className="hint hint-mobile">‹ › to step · tap a bar</span>
       </div>
       <div className="daily-modal-bars-grid" role="img" aria-label="30-day cost histogram">
         {ordered.map((r) => {

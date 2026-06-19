@@ -2328,6 +2328,9 @@ mark.current {
    and reveals the `.daily-step-btn` controls. */
 .daily-bars-nav { display: contents; }
 .daily-step-btn { display: none; }
+/* Desktop shows the ↑↓/click hint; the ‹ › tap hint is mobile-only
+   (the stepper buttons it names are display:none above 640px). */
+.daily-modal-bars-head .hint-mobile { display: none; }
 
 .daily-modal-bars-grid {
   display: grid;
@@ -4045,8 +4048,14 @@ mark.current {
     min-width: 44px; min-height: 44px;
     background: transparent; border: 1px solid var(--border-soft);
     border-radius: 6px; color: inherit; font: inherit; cursor: pointer;
+    /* the head font is 11px uppercase; bump the chevron so it's legible
+       in the 44px box (font:inherit above resets it, so set after). */
+    font-size: 18px; line-height: 1;
   }
   .daily-step-btn:disabled { opacity: 0.4; cursor: default; }
+  /* Swap the bars-head hint to the tap-oriented copy on mobile. */
+  .daily-modal-bars-head .hint-desktop { display: none; }
+  .daily-modal-bars-head .hint-mobile { display: inline; }
 
   /* #214 M2-1: 44px mobile touch targets for sub-floor controls.
      Hybrid mechanism: an invisible inset ::before expands the touch area
@@ -4078,9 +4087,10 @@ mark.current {
   .doctor-chip::before { content: ""; position: absolute; inset: -12px 0; }
 
   /* Settings checkbox/radio rows: a 44px flex label row + an 18px box.
-     Scoped via :has() to checkbox/radio labels ONLY, so the Notifier
-     select, alert-test selects, and custom-tz text-input labels (which
-     share the broad .settings-fs label selector) are untouched. */
+     Scoped via :has() to labels that wrap a checkbox/radio. This INCLUDES
+     the custom-tz "Custom:" row (it wraps a radio AND a text input — the
+     larger flex row is benign/nicer there) and EXCLUDES the Notifier /
+     alert-test <select> labels, which have no checkbox/radio. */
   .settings-fs label:has(input[type="checkbox"]),
   .settings-fs label:has(input[type="radio"]) {
     min-height: 44px; display: flex; align-items: center; gap: 8px; padding: 6px 0;
