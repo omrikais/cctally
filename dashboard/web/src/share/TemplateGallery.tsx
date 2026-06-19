@@ -28,8 +28,8 @@ const ARCHETYPES: ReadonlyArray<{
   placeholderDescription: string;
 }> = [
   { id: 'recap', label: 'Recap', placeholderDescription: 'Text + tiny chart' },
-  { id: 'visual', label: 'Visual', placeholderDescription: 'Coming in M2' },
-  { id: 'detail', label: 'Detail', placeholderDescription: 'Coming in M2' },
+  { id: 'visual', label: 'Visual', placeholderDescription: 'Coming soon' },
+  { id: 'detail', label: 'Detail', placeholderDescription: 'Coming soon' },
 ];
 
 // Map a server-returned template.id to its archetype. The kernel's

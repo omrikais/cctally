@@ -15,11 +15,11 @@
 //   - `Period` defaults to the panel's "current focus" (e.g. Weekly →
 //     current week). M1 surfaces the three kinds (current / previous /
 //     custom). Custom shows two date inputs (HTML5 <input type="date">).
-//   - `Project allowlist` is stubbed in M1 — the spec leaves the
-//     real multi-select popover for a later milestone (no UX detail
-//     beyond "multi-select popover"). The stub renders a disabled
-//     button with a "Coming in M3+" tooltip; the underlying
-//     ShareOptions.project_allowlist stays null (= include all).
+//   - `Project allowlist` is not yet shipped — the per-project
+//     multi-select popover is a future addition (no UX detail beyond
+//     "multi-select popover"). Until then a disabled "All projects"
+//     indicator truthfully tells the user exports cover every project;
+//     the underlying ShareOptions.project_allowlist stays null (= include all).
 import type { ShareOptions, SharePeriod } from './types';
 
 interface Props {
@@ -130,18 +130,17 @@ export function Knobs({ options, onChange }: Props) {
       <div className="share-knob">
         <span className="share-knob-label">Projects</span>
         {/*
-          M1: the multi-select popover ships in a later milestone (spec
-          §6.3 says "multi-select popover with real project names"). The
-          underlying `project_allowlist` stays null (= all projects). The
-          disabled button is a placeholder so the layout matches the §6.2
-          ASCII diagram.
+          The per-project multi-select popover is a future addition (spec
+          §6.3 says "multi-select popover with real project names"). Until
+          then `project_allowlist` stays null (= all projects); the disabled
+          button is a placeholder so the layout matches the §6.2 ASCII diagram.
         */}
         <button
           type="button"
           className="share-knob-allowlist-stub"
           disabled
           aria-disabled="true"
-          title="Project allowlist — coming in M3+"
+          title="Exports include all projects"
         >
           All projects
         </button>

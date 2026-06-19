@@ -81,4 +81,21 @@ describe('<TemplateGallery>', () => {
     fireEvent.click(screen.getByRole('radio', { name: /recap/i }));
     expect(onSelect).toHaveBeenCalledWith('weekly-recap');
   });
+
+  // #207 D5 — the Visual/Detail placeholder copy must not leak an internal
+  // milestone codename ("M2"). The defensive `!tmpl` placeholder branch stays
+  // (graceful degradation), but its copy is neutralized to "Coming soon".
+  it('placeholder copy is neutral (no internal milestone codename)', () => {
+    render(
+      <TemplateGallery
+        panel="weekly"
+        templates={[recap]}
+        error={null}
+        selectedTemplateId="weekly-recap"
+        onSelect={() => {}}
+      />,
+    );
+    expect(screen.queryByText(/M2/)).toBeNull();
+    expect(screen.getAllByText(/Coming soon/i).length).toBeGreaterThan(0);
+  });
 });

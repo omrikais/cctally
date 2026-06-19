@@ -98,4 +98,13 @@ describe('<Knobs>', () => {
     expect(screen.getByLabelText(/custom period start date/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/custom period end date/i)).toBeInTheDocument();
   });
+
+  // #207 D5 — the disabled "All projects" indicator stays (it truthfully says
+  // exports cover all projects) but must not leak an internal milestone
+  // codename ("M3+").
+  it('All projects knob has no M3 codename', () => {
+    render(<Knobs options={defaults()} onChange={() => {}} />);
+    const btn = screen.getByRole('button', { name: /all projects/i });
+    expect(btn.getAttribute('title') ?? '').not.toMatch(/M3/);
+  });
 });
