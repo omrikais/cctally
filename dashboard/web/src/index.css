@@ -3778,63 +3778,56 @@ mark.current {
   .sess-table { width: 100%; }
   .sess-table thead { display: none; }
   .sess-table tbody, .sess-table tr { display: block; width: 100%; }
+  /* #214 M3-4: pin a deterministic 2-line card so every row reads identically.
+     Flex-wrap couldn't guarantee the 2-then-3 split; grid-template-areas does.
+     CSS-only on the existing <td> DOM (no JSX -> desktop <table> unchanged). */
   .sess-table tr.session-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
+    display: grid;
+    grid-template-columns: auto auto 1fr auto;
+    grid-template-areas:
+      "project project project cost"
+      "started dur     .       chip";
     column-gap: 10px;
     row-gap: 2px;
+    align-items: baseline;
     padding: 8px 6px;
     border-bottom: 1px solid var(--border-soft);
     cursor: pointer;
   }
   .sess-table tbody td { padding: 0; border: none; white-space: normal; }
-  /* row 1 left = project (col 4) */
-  .sess-table td.project {
-    order: 1;
-    flex: 1 1 auto; min-width: 0;
+  .sess-table td.project {              /* DOM nth-child(4) */
+    grid-area: project;
+    min-width: 0;
     font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   /* C4 (#207): undo the desktop 220px cap on mobile, where the cell
-     truncates via flex:1 1 auto + min-width:0 instead. Equal specificity
+     truncates via min-width:0 + ellipsis instead. Equal specificity
      (0,2,2) + later source order beats the new desktop rule. */
   .sess-table tbody td.project { max-width: none; }
-  /* row 1 right = cost (col 5) */
-  .sess-table td.num {
-    order: 2;
-    flex: 0 0 auto;
-    margin-left: auto;
+  .sess-table td.num {                  /* DOM nth-child(5) — cost */
+    grid-area: cost;
+    justify-self: end;
     font-weight: 700;
     text-align: right;
   }
-  /* row 2 = started · dur · chip — flows inline via flex-wrap.
-     `tbody` qualifier ties desktop's .sess-table tbody td.started
+  /* `tbody` qualifier ties desktop's .sess-table tbody td.started
      accent-cyan rule on specificity (0,2,2); source order then wins. */
-  .sess-table tbody td.started {
-    order: 3;
-    flex: 0 0 auto;
-    margin-top: 2px;
+  .sess-table tbody td.started {        /* DOM nth-child(1) — has the open-conv button */
+    grid-area: started;
     color: var(--text-dim); font-size: 12px;
   }
-  .sess-table td:nth-child(2) { /* duration */
-    order: 4;
-    flex: 0 0 auto;
+  .sess-table td:nth-child(2) {         /* duration */
+    grid-area: dur;
     color: var(--text-dim); font-size: 12px;
   }
-  .sess-table td:nth-child(3) { /* model chip cell */
-    order: 5;
-    flex: 0 0 auto;
+  .sess-table td:nth-child(3) {         /* model chip cell */
+    grid-area: chip;
+    justify-self: end;
     display: inline-flex; align-items: center;
-    /* #214 M2-2: push the model-filter chip to the right edge of row 2 so
-       it is clearly gapped from the passive "started · dur" text, removing
-       the reproduced mobile mis-tap (tapping the card applied a model
-       filter instead of opening the Session modal). CSS-only — moving cells
-       in JSX would regress the desktop table. */
-    margin-left: auto;
   }
-  .sess-table td.started::after,
-  .sess-table td:nth-child(2)::after {
+  /* keep started->dur separator; drop dur->chip (the 1fr spacer edge-separates the chip) */
+  .sess-table td.started::after {
     content: " · ";
     color: var(--text-faint);
   }
