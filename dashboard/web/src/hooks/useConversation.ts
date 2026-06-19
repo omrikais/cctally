@@ -277,6 +277,15 @@ export function useConversation(sessionId: string | null): UseConversation {
           cost_usd: body.cost_usd, models: body.models,                // refresh whole-session header even on empty
           title: body.title ?? prev.title,                            // #193 P1-4: a rewritten ai-title reaches the open reader
           git_branch: body.git_branch, project_label: body.project_label,
+          // Jump-to-latest staleness fix: last_anchor (the conversation's final
+          // rendered turn) and last_activity_utc both GROW as the transcript does.
+          // The server recomputes them from the whole-session tail on every
+          // response (incl. this `after=<window>` poll), so adopt the fresh values
+          // — without this the "Latest ↓" control kept jumping to the entry-time
+          // final turn rather than the genuinely-newest one. `?? prev` guards the
+          // (empty-conversation only) null so an established session never regresses.
+          last_anchor: body.last_anchor ?? prev.last_anchor,
+          last_activity_utc: body.last_activity_utc ?? prev.last_activity_utc,
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
           page: prev.page,                                             // stays fully-paged (next_after === null)
         } : prev));

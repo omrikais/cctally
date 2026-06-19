@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard conversation viewer — `Latest ↓` now follows live-streamed turns instead of landing on a stale entry-time message.** The jump-to-latest control (and the `End` key) jumps to the conversation's final rendered turn. While a conversation was open and live-tailing, new turns streamed in but the control kept jumping to whichever turn was newest at the moment you opened the conversation — the live-tail merge refreshed the message list and header totals but never advanced the recorded "latest turn" pointer (or the last-activity timestamp). Both now track each appended turn, so `Latest ↓` / `End` always lands on the genuinely newest message in a live session.
+
 ## [1.52.0] - 2026-06-19
 
 ### Added

@@ -111,6 +111,45 @@ describe('useConversation', () => {
     expect(result.current.hasMore).toBe(false);
   });
 
+  it('refreshes last_anchor when a live tail append adds a new final turn (jump-to-latest staleness)', async () => {
+    // REGRESSION (jump-to-latest stale anchor): the "Latest ↓" control jumps to
+    // detail.last_anchor. pollTail's partial merge refreshed items/cost/models/
+    // title but DROPPED last_anchor, so after a live append the anchor stayed at
+    // the page-1 (entry-time) final turn — clicking "Latest" landed on a stale
+    // message, never the genuinely-newest one.
+    //
+    // Page 1: it1+it2 fully paged; last_anchor = it2 (the final turn at load).
+    mockOnce(detail([it1, it2], null, { last_anchor: { session_id: 's', uuid: 'u2', id: 2 } }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.detail?.last_anchor?.id).toBe(2);
+
+    // A live tail append adds it3 — now the genuinely-final turn. The server's
+    // response carries a FRESH last_anchor (id 3, computed from the whole-session
+    // tail). The merge must adopt it so jump-to-latest targets the newest turn.
+    mockOnce(detail([it1, it2, it3], null, { last_anchor: { session_id: 's', uuid: 'u3', id: 3 } }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+
+    // RED before fix: last_anchor stuck at id 2 (page-1 value). GREEN after: id 3.
+    expect(result.current.detail?.last_anchor?.id).toBe(3);
+    expect(result.current.detail?.last_anchor?.uuid).toBe('u3');
+  });
+
+  it('refreshes last_activity_utc on a live tail append (same dropped-field class as last_anchor)', async () => {
+    // last_activity_utc grows with each new turn too; pollTail dropped it for the
+    // same reason it dropped last_anchor. Lock it so the merge keeps carrying the
+    // whole-session-fresh value forward.
+    mockOnce(detail([it1, it2], null, { last_activity_utc: '2026-01-01T02:00:00Z' }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.detail?.last_activity_utc).toBe('2026-01-01T02:00:00Z');
+
+    mockOnce(detail([it1, it2, it3], null, { last_activity_utc: '2026-01-01T03:30:00Z' }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.last_activity_utc).toBe('2026-01-01T03:30:00Z'));
+  });
+
   it('drains a >PAGE tail burst within one tick (#175 F4, §6 overlap)', async () => {
     // Page 1: fully paged with a single item (well inside TAIL_WINDOW=10, so the
     // overlap fetches carry no `after=` cursor — the whole accumulator IS the
