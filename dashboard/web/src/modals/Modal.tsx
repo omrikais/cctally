@@ -8,6 +8,7 @@ import {
   topmostStoreFocusLayer,
 } from '../store/store';
 import { useModalFocus } from '../hooks/useModalFocus';
+import { useScrollLock } from '../hooks/useScrollLock';
 
 interface ModalProps {
   title: string;
@@ -38,6 +39,9 @@ export function Modal({ title, accentClass, children, headerExtras }: ModalProps
     () => topmostStoreFocusLayer(getState()) === 'panel',
   );
   useModalFocus(cardRef, { active: true, trapEnabled });
+  // M1-1: lock background page scroll while a panel modal is open. Modal
+  // mounts only while open, so the active value is always true here.
+  useScrollLock(true);
   return (
     <div id="modal-root">
       <div className="modal-backdrop" onClick={close} />

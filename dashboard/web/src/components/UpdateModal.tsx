@@ -1,6 +1,7 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
+import { useScrollLock } from '../hooks/useScrollLock';
 import { UpdateIdleModal } from './UpdateIdleModal';
 import { UpdateRunningModal } from './UpdateRunningModal';
 import { UpdateSuccessModal } from './UpdateSuccessModal';
@@ -54,6 +55,14 @@ export function UpdateModal() {
     [],
   );
   useKeymap(bindings);
+
+  // M1-1: lock background page scroll. The active value MUST mirror the
+  // render condition below — the modal returns null for BOTH !modalOpen
+  // and !state, and an SSE/update-refresh can swap update.state without
+  // closing modalOpen, so keying on modalOpen alone would hold a lock
+  // while the modal is not rendered. Declared before the early returns
+  // (Rules of Hooks).
+  useScrollLock(update.modalOpen && update.state != null);
 
   if (!update.modalOpen) return null;
   if (!update.state) return null;

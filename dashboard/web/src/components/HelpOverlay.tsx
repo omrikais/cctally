@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
+import { useScrollLock } from '../hooks/useScrollLock';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -133,6 +134,10 @@ export function HelpOverlay() {
   // the hook order stays stable (Rules of Hooks).
   const cardRef = useRef<HTMLDivElement>(null);
   useModalFocus(cardRef, { active: open });
+  // M1-1: lock background page scroll while the Help sheet is open (it's a
+  // full-screen scrollable mobile sheet, so it genuinely scroll-bleeds).
+  // Declared BEFORE the `!open` early-return so the hook order stays stable.
+  useScrollLock(open);
   // #207 D2: while Help is open, the always-on hotkeys (digits, r/q/n/N,
   // c/S/B/f//) must be inert. Help is component-local and invisible to the
   // store's modal fields, so it explicitly tracks itself via a depth counter.

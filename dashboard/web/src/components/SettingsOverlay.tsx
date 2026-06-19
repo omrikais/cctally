@@ -11,6 +11,7 @@ import {
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
+import { useScrollLock } from '../hooks/useScrollLock';
 import type {
   AlertAxis,
   AlertsSettingsEnvelope,
@@ -286,6 +287,10 @@ export function SettingsOverlay() {
   // `!open` early-return so the hook order stays stable (Rules of Hooks).
   const cardRef = useRef<HTMLDivElement>(null);
   useModalFocus(cardRef, { active: open });
+
+  // M1-1: lock background page scroll while Settings is open. Declared
+  // BEFORE the `!open` early-return so the hook order stays stable.
+  useScrollLock(open);
 
   // #207 D2: while Settings is open, the always-on hotkeys (digits, r/q/n/N,
   // c/S/B/f//) must be inert. Settings is component-local and invisible to the

@@ -28,6 +28,7 @@ import { makeBasketItem } from '../store/basketSlice';
 import { bannerVisible } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
+import { useScrollLock } from '../hooks/useScrollLock';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
 import type { ShareFormat, ShareTheme } from './types';
@@ -94,6 +95,10 @@ export function ComposerModal() {
   // applied to both the empty-state and the populated path so the
   // stylesheet rules can target either.
   const isMobile = useIsMobile();
+  // M1-1: lock background page scroll while the composer is open. Declared
+  // before the early `return null` below (Rules of Hooks); keyed on the
+  // open value so the effect's cleanup decrements the refcount on close.
+  useScrollLock(composerModal?.open ?? false);
   // Focus restoration (spec §12.8 + M4.4): capture the element that
   // had focus when the composer opened (BasketChip click, B keymap, or
   // a future "Customize…" button) and restore focus to it on close.

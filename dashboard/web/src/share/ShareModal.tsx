@@ -32,6 +32,7 @@ import { PresetDropdown } from './PresetDropdown';
 import { ManagePresetsModal } from './ManagePresetsModal';
 import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
+import { useScrollLock } from '../hooks/useScrollLock';
 import { getState } from '../store/store';
 
 interface Props {
@@ -101,6 +102,10 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
   const [manageOpen, setManageOpen] = useState(false);
   // Title id for aria-labelledby. Stable across renders.
   const titleId = 'share-modal-title';
+
+  // M1-1: lock background page scroll. ShareModal mounts only when
+  // ShareModalRoot's slot is non-null, so it's always "open" when mounted.
+  useScrollLock(true);
 
   // Esc-to-close at overlay scope. Overlay > modal in SCOPE_ORDER so
   // Esc closes the share modal first when layered atop a panel modal.

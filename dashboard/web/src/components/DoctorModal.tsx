@@ -34,6 +34,7 @@ import {
 } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
+import { useScrollLock } from '../hooks/useScrollLock';
 import {
   useDoctorReport,
   type DoctorCategory,
@@ -95,6 +96,10 @@ export function DoctorModal(): JSX.Element | null {
   // blurred by the browser, dropping focus to <body>. Focusing the container
   // (tabIndex=-1, never disabled) keeps focus inside the dialog.
   useModalFocus(cardRef, { active: open, trapEnabled, initialFocus: 'container' });
+
+  // M1-1: lock background page scroll while the doctor modal is open.
+  // Declared BEFORE the `!open` early-return so the hook order stays stable.
+  useScrollLock(open);
 
   if (!open) return null;
 
