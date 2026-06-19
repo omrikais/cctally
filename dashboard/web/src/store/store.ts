@@ -429,6 +429,10 @@ export interface UIState {
   // modals if a future iteration wants that pattern.
   doctor: DoctorAggregate | null;
   doctorModalOpen: boolean;
+  /** Depth counter of open component-local chrome overlays (Settings/Help).
+   *  Lets the global/sessions key guards suppress hotkeys under those
+   *  overlays, which are NOT in `openModal`/`doctorModalOpen` (#207 D2). */
+  chromeOverlayOpen: number;
 }
 
 function defaultPrefs(): Prefs {
@@ -582,6 +586,7 @@ function loadInitial(): UIState {
     basket: { items: loadBasketFromStorage(), rejectedReason: null },
     doctor: null,
     doctorModalOpen: false,
+    chromeOverlayOpen: 0,
   };
 }
 
@@ -829,7 +834,9 @@ export type Action =
   //   precedent — flag-only, no reset of any other slice.
   | { type: 'SET_DOCTOR_AGGREGATE'; doctor: DoctorAggregate | null }
   | { type: 'OPEN_DOCTOR_MODAL' }
-  | { type: 'CLOSE_DOCTOR_MODAL' };
+  | { type: 'CLOSE_DOCTOR_MODAL' }
+  | { type: 'INCREMENT_CHROME_OVERLAY' }
+  | { type: 'DECREMENT_CHROME_OVERLAY' };
 
 // Transient-modal slots dismissed whenever the top-level workspace switches
 // (#158), so no panel modal floats over the destination body. Covers the panel
@@ -1421,6 +1428,12 @@ export function dispatch(action: Action): void {
       break;
     case 'CLOSE_DOCTOR_MODAL':
       state = { ...state, doctorModalOpen: false };
+      break;
+    case 'INCREMENT_CHROME_OVERLAY':
+      state = { ...state, chromeOverlayOpen: state.chromeOverlayOpen + 1 };
+      break;
+    case 'DECREMENT_CHROME_OVERLAY':
+      state = { ...state, chromeOverlayOpen: Math.max(0, state.chromeOverlayOpen - 1) };
       break;
   }
   emit();
