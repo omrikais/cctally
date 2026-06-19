@@ -3790,6 +3790,12 @@ mark.current {
     order: 5;
     flex: 0 0 auto;
     display: inline-flex; align-items: center;
+    /* #214 M2-2: push the model-filter chip to the right edge of row 2 so
+       it is clearly gapped from the passive "started · dur" text, removing
+       the reproduced mobile mis-tap (tapping the card applied a model
+       filter instead of opening the Session modal). CSS-only — moving cells
+       in JSX would regress the desktop table. */
+    margin-left: auto;
   }
   .sess-table td.started::after,
   .sess-table td:nth-child(2)::after {
