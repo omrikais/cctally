@@ -2465,9 +2465,10 @@ def _force_clear_credit(conn, week_start_date):
 
 
 def _count_stale_replays(conn, plan):
-    """Count the pre-credit replay rows the _fire_in_place_credit DELETE will
-    touch (captured at/after the credit moment within a 1.0pp band of from),
-    for the preview / --json `staleReplaysDeleted` field. Read-only."""
+    """Count the pre-credit replay rows the _apply_credit stale-replay DELETE
+    (step 4c, inline) will touch (captured at/after the credit moment within a
+    1.0pp band of from), for the preview / --json `staleReplaysDeleted` field.
+    Read-only."""
     row = conn.execute(
         "SELECT COUNT(*) FROM weekly_usage_snapshots "
         " WHERE week_start_date = ? "

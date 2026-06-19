@@ -1619,8 +1619,9 @@ def build_parser() -> argparse.ArgumentParser:
             Record an in-place weekly (7d) credit that the auto-detector
             misses (a sub-25pp, non-zero drop — e.g. Anthropic lowered your
             7d % from 46 to 31 without a clean reset). Writes a
-            week_reset_events row, lowers hwm-7d, and inserts a post-credit
-            snapshot so reports and the statusline read the credited value.
+            weekly_credit_floors clamp row (no week re-anchor — the same week
+            continues), lowers hwm-7d, and inserts a post-credit snapshot so
+            reports and the statusline read the credited value.
             Preview + confirm by default.
             """
         ),
