@@ -244,3 +244,78 @@ def test_apply_clears_reset_zero_marker(ns, monkeypatch):
     assert ns["_read_reset_zero_marker"]() is not None
     ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert ns["_read_reset_zero_marker"]() is None
+
+
+# ── output: preview / confirm matrix / --json / dry-run (S2,S3,S5,S6) ───
+
+
+import json as _json
+
+
+def test_json_yes_envelope(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True, json=True))
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["schemaVersion"] == 1
+    assert out["applied"] is True and out["dryRun"] is False and out["forced"] is False
+    assert out["week"]["weekStartDate"] == "2026-06-13"
+    assert out["credit"]["fromPct"] == 46.0 and out["credit"]["toPct"] == 31.0
+    assert out["credit"]["fromSource"] == "hwm"
+    assert out["credit"]["effectiveAtUtc"].endswith("Z")
+    assert out["actions"]["hwm7dBefore"] == 46.0 and out["actions"]["hwm7dAfter"] == 31.0
+    assert out["actions"]["resetEventInserted"] is True
+    assert out["actions"]["postCreditSnapshotInserted"] is True
+
+
+def test_json_dryrun_envelope(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=True, json=True))
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["applied"] is False and out["dryRun"] is True
+    # nothing written
+    conn = ns["open_db"]()
+    owned = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots "
+                         "WHERE source='record-credit'").fetchone()[0]
+    conn.close()
+    assert owned == 0
+
+
+def test_json_requires_yes_or_dryrun(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=False, json=True))
+    assert rc == 2
+    assert "record-credit:" in capsys.readouterr().err
+
+
+def test_non_tty_refused(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=False, json=False))
+    assert rc == 2
+    assert "record-credit:" in capsys.readouterr().err
+
+
+def test_to_ge_from_plain_stderr_even_with_json(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(to=50.0, dry_run=True, json=True))
+    assert rc == 2
+    cap = capsys.readouterr()
+    assert "record-credit:" in cap.err
+    assert cap.out.strip() == ""        # no JSON on a validation error
+
+
+def test_dryrun_human_preview(ns, monkeypatch, capsys):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=True, json=False))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "record-credit" in out and "46" in out and "31" in out
+    assert "dry-run" in out.lower()

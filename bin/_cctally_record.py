@@ -2387,6 +2387,78 @@ def _force_clear_credit(conn, week_start_date, event_id):
     conn.commit()
 
 
+def _count_stale_replays(conn, plan):
+    """Count the pre-credit replay rows the _fire_in_place_credit DELETE will
+    touch (captured at/after the credit moment within a 1.0pp band of from),
+    for the preview / --json `staleReplaysDeleted` field. Read-only."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM weekly_usage_snapshots "
+        " WHERE week_start_date = ? "
+        "   AND unixepoch(captured_at_utc) >= unixepoch(?) "
+        "   AND ABS(weekly_percent - ?) < 1.0",
+        (plan.week_start_date, plan.effective_iso, float(plan.from_pct)),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _credit_preview_text(plan, *, stale_replays, dry_run):
+    """Human preview (spec §5). Shown before the confirm prompt and as the
+    whole body under --dry-run."""
+    eff_dt = parse_iso_datetime(plan.effective_iso, "effective").astimezone(dt.timezone.utc)
+    cap_dt = parse_iso_datetime(plan.captured_iso, "captured").astimezone(dt.timezone.utc)
+    we_dt = parse_iso_datetime(plan.week_end_at, "week_end").astimezone(dt.timezone.utc)
+    src = "current HWM" if plan.from_source == "hwm" else "explicit"
+    lines = [
+        "record-credit — weekly in-place credit",
+        f"  week:        {plan.week_start_date} -> "
+        f"{we_dt.strftime('%Y-%m-%d %H:%M')} UTC",
+        f"  from -> to:  {plan.from_pct:g}% -> {plan.to_pct:g}%   (from: {src})",
+        f"  effective:   {eff_dt.strftime('%Y-%m-%d %H:%M')} UTC  "
+        f"(floored from {cap_dt.strftime('%Y-%m-%d %H:%M')})",
+        "  writes:",
+        f"    + week_reset_events  (effective={plan.effective_iso}, "
+        f"pre_credit={plan.from_pct:g})",
+        f"    ~ hwm-7d             {plan.from_pct:g} -> {plan.to_pct:g}",
+        f"    - stale replays      {stale_replays} rows",
+        f"    + snapshot           captured={plan.captured_iso}, "
+        f"weekly_percent={plan.to_pct:g}",
+    ]
+    if dry_run:
+        lines.append("  (dry-run — nothing written)")
+    return "\n".join(lines)
+
+
+def _credit_json(plan, *, applied, dry_run, forced, stale_replays, hwm_before):
+    """The --json envelope (schemaVersion 1, spec §5); all datetimes …Z."""
+    def _z(iso):
+        return parse_iso_datetime(iso, "z").astimezone(
+            dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return {
+        "schemaVersion": 1,
+        "applied": applied,
+        "dryRun": dry_run,
+        "forced": forced,
+        "week": {
+            "weekStartDate": plan.week_start_date,
+            "weekStartAt": _z(plan.week_start_at),
+            "weekEndAt": _z(plan.week_end_at),
+        },
+        "credit": {
+            "fromPct": plan.from_pct,
+            "toPct": plan.to_pct,
+            "fromSource": plan.from_source,
+            "effectiveAtUtc": _z(plan.effective_iso),
+        },
+        "actions": {
+            "resetEventInserted": applied,
+            "hwm7dBefore": hwm_before,
+            "hwm7dAfter": plan.to_pct if applied else hwm_before,
+            "staleReplaysDeleted": stale_replays,
+            "postCreditSnapshotInserted": applied,
+        },
+    }
+
+
 def cmd_record_credit(args) -> int:
     c = _cctally()
     now = _command_as_of()
@@ -2454,16 +2526,56 @@ def cmd_record_credit(args) -> int:
             eprint(f"record-credit: {e}")
             return 2
 
-        # 4. Output + apply (Task 5 adds the preview/confirm/JSON surface).
-        if getattr(args, "dry_run", False):
+        # 4. Output + confirm matrix (spec §5).
+        is_json = getattr(args, "json", False)
+        is_dry = getattr(args, "dry_run", False)
+        is_yes = getattr(args, "yes", False)
+        is_force = getattr(args, "force", False)
+        stale_replays = _count_stale_replays(conn, plan)
+        hwm_before = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+        if hwm_before is None:
+            hwm_before = plan.from_pct
+
+        # --dry-run: preview only, write nothing, exit 0 (TTY or not,
+        # with/without --json).
+        if is_dry:
+            if is_json:
+                print(json.dumps(_credit_json(
+                    plan, applied=False, dry_run=True, forced=False,
+                    stale_replays=stale_replays, hwm_before=hwm_before)))
+            else:
+                print(_credit_preview_text(plan, stale_replays=stale_replays,
+                                           dry_run=True))
             return 0
+
+        # --json (not dry-run) must be paired with --yes; never prompts.
+        if is_json and not is_yes:
+            eprint("record-credit: --json requires --yes or --dry-run")
+            return 2
+
+        # No --yes: prompt (TTY) or refuse (non-TTY).
+        if not is_yes:
+            if not sys.stdin.isatty():
+                eprint("record-credit: stdin not a TTY: pass --yes to apply "
+                       "or --dry-run to preview")
+                return 2
+            print(_credit_preview_text(plan, stale_replays=stale_replays,
+                                       dry_run=False))
+            try:
+                reply = input("Proceed? [y/N] ")
+            except EOFError:
+                reply = ""
+            if reply.strip().lower() not in ("y", "yes"):
+                print("aborted — nothing written")
+                return 0
 
         # 4a. Existing-event handling. _fire_in_place_credit commits the
         #     event + cleanup BEFORE the synthetic snapshot, so a crash in
         #     between leaves a half-applied credit (event present, no
         #     command-owned snapshot, post-credit segment empty). `existing`
         #     was resolved up front (above) keyed on cur_end_canon.
-        if existing is not None and not getattr(args, "force", False):
+        forced = False
+        if existing is not None and not is_force:
             owned = conn.execute(
                 "SELECT 1 FROM weekly_usage_snapshots "
                 " WHERE week_start_date=? AND source='record-credit' "
@@ -2477,11 +2589,21 @@ def cmd_record_credit(args) -> int:
                 return 2
             # else: half-applied -> fall through (completion path; the
             # pivots in _fire_in_place_credit are idempotent).
-        elif existing is not None and getattr(args, "force", False):
+        elif existing is not None and is_force:
             _force_clear_credit(conn, plan.week_start_date, existing[0])
+            forced = True
 
         five_hour = _resolve_prior_5h(conn, at_dt)
         _apply_credit(conn, plan, five_hour=five_hour)
+
+        if is_json:
+            print(json.dumps(_credit_json(
+                plan, applied=True, dry_run=False, forced=forced,
+                stale_replays=stale_replays, hwm_before=hwm_before)))
+        else:
+            print(f"record-credit: applied — week {plan.week_start_date} "
+                  f"{plan.from_pct:g}% -> {plan.to_pct:g}% "
+                  f"(effective {plan.effective_iso})")
         return 0
     finally:
         conn.close()
