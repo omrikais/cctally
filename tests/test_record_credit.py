@@ -38,6 +38,106 @@ def _plan(ns, **over):
     return ns["_build_credit_plan"](**kw)
 
 
+# ── R0: weekly_credit_floors schema-init (no migration) ────────────────
+
+
+def test_weekly_credit_floors_table_created_no_migration(ns):
+    """open_db() creates weekly_credit_floors via CREATE TABLE IF NOT EXISTS
+    (schema-init, NOT a migration): the table exists on a fresh DB AND opening
+    leaves user_version unchanged from the existing-schema head."""
+    conn = ns["open_db"]()
+    try:
+        # Table exists with the spec'd columns.
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(weekly_credit_floors)").fetchall()}
+        assert {"id", "week_start_date", "effective_at_utc",
+                "observed_pre_credit_pct", "applied_at_utc"} <= cols
+        uv1 = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+    # Re-open: the IF NOT EXISTS path is a no-op and user_version is stable
+    # (no migration was registered for this table).
+    conn = ns["open_db"]()
+    try:
+        uv2 = conn.execute("PRAGMA user_version").fetchone()[0]
+        # The table must NOT be tracked by the migration framework.
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM schema_migrations").fetchall()}
+    finally:
+        conn.close()
+    assert uv1 == uv2
+    assert not any("credit_floor" in n for n in names)
+
+
+# ── R1: _reset_aware_floor (union of both floor sources) ───────────────
+
+
+def test_reset_aware_floor_empty_is_none(ns):
+    conn = ns["open_db"]()
+    try:
+        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT) is None
+    finally:
+        conn.close()
+
+
+def test_reset_aware_floor_credit_floor_only(ns):
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_credit_floors (week_start_date, effective_at_utc,"
+            " observed_pre_credit_pct, applied_at_utc) VALUES (?,?,?,?)",
+            ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
+             "2026-06-19T14:37:00Z"))
+        conn.commit()
+        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT)
+        assert got == "2026-06-19T14:00:00+00:00"
+    finally:
+        conn.close()
+
+
+def test_reset_aware_floor_latest_wins_mixed_offsets(ns):
+    """A row in EACH table with mixed Z / +00:00 spellings: the latest instant
+    wins via unixepoch() ordering (NOT a textual MAX, which would mis-order
+    'Z' vs '+00:00')."""
+    conn = ns["open_db"]()
+    try:
+        # week_reset_events leg: earlier, 'Z' spelling.
+        conn.execute(
+            "INSERT INTO week_reset_events (detected_at_utc, old_week_end_at,"
+            " new_week_end_at, effective_reset_at_utc, observed_pre_credit_pct)"
+            " VALUES (?,?,?,?,?)",
+            ("2026-06-15T00:00:00Z", "2026-06-15T10:00:00Z",
+             "2026-06-20T05:00:00+00:00", "2026-06-15T10:00:00Z", 50.0))
+        # weekly_credit_floors leg: LATER, '+00:00' spelling.
+        conn.execute(
+            "INSERT INTO weekly_credit_floors (week_start_date, effective_at_utc,"
+            " observed_pre_credit_pct, applied_at_utc) VALUES (?,?,?,?)",
+            ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
+             "2026-06-19T14:37:00Z"))
+        conn.commit()
+        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT)
+        assert got == "2026-06-19T14:00:00+00:00"   # the later credit floor
+    finally:
+        conn.close()
+
+
+def test_reset_aware_floor_reset_event_out_of_window_ignored(ns):
+    """A week_reset_events row whose effective falls OUTSIDE [ws, we) is not a
+    floor for this week."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO week_reset_events (detected_at_utc, old_week_end_at,"
+            " new_week_end_at, effective_reset_at_utc, observed_pre_credit_pct)"
+            " VALUES (?,?,?,?,?)",
+            ("2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z",
+             "2026-06-06T05:00:00+00:00", "2026-06-01T00:00:00Z", 50.0))
+        conn.commit()
+        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT) is None
+    finally:
+        conn.close()
+
+
 def test_parse_at_naive_is_utc(ns):
     got = ns["_parse_credit_at"]("2026-06-19T14:00", NOW)
     assert got == dt.datetime(2026, 6, 19, 14, 0, tzinfo=dt.timezone.utc)
@@ -125,15 +225,24 @@ def _weekly_reads(ns):
 
 
 def test_apply_happy_path_s1(ns, monkeypatch):
+    """S1 (M2): --to 31 --yes writes a weekly_credit_floors row, NO
+    week_reset_events row, forces hwm-7d, inserts a source='record-credit'
+    snapshot, and the reset-aware HWM reads 31."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert rc == 0
     conn = ns["open_db"]()
-    ev = conn.execute("SELECT observed_pre_credit_pct, new_week_end_at "
-                      "FROM week_reset_events WHERE new_week_end_at=?",
-                      ("2026-06-20T05:00:00+00:00",)).fetchone()
-    assert ev is not None and float(ev[0]) == 46.0
+    # M2: a weekly_credit_floors row, NOT a week_reset_events row.
+    fl = conn.execute(
+        "SELECT effective_at_utc, observed_pre_credit_pct "
+        "FROM weekly_credit_floors WHERE week_start_date=?",
+        ("2026-06-13",)).fetchone()
+    assert fl is not None and float(fl[1]) == 46.0
+    assert fl[0] == "2026-06-19T14:00:00+00:00"   # floored to hour, UTC spelling
+    n_events = conn.execute(
+        "SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+    assert n_events == 0, "record-credit must NOT write a week_reset_events row (M2)"
     snap = conn.execute("SELECT weekly_percent, source FROM weekly_usage_snapshots "
                         "WHERE source='record-credit'").fetchone()
     assert snap is not None and float(snap[0]) == 31.0
@@ -142,42 +251,199 @@ def test_apply_happy_path_s1(ns, monkeypatch):
     assert (ns["_cctally_core"].APP_DIR / "hwm-7d").read_text().split()[1] == "31.0"
 
 
-def test_apply_stores_effective_reset_in_utc_on_non_utc_host(ns, monkeypatch):
-    """Under a non-UTC host TZ, the credited week's effective_reset_at_utc
-    (and old_week_end_at) MUST be stored with a +00:00 spelling, not the host
-    offset — parse_iso_datetime returns a host-local-offset datetime and the
-    _utc column must not re-introduce that pattern. The instant must still be
-    the expected floored hour (2026-06-19T14:00 UTC).
+def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):
+    """Under a non-UTC host TZ, the credit floor's effective_at_utc MUST be
+    stored with a +00:00 spelling, not the host offset — and the instant must
+    still be the expected floored hour (2026-06-19T14:00 UTC).
 
-    Non-vacuity: revert the .astimezone(dt.timezone.utc) in _apply_credit and
+    Non-vacuity: drop the .astimezone(dt.timezone.utc) in _apply_credit and
     this fails — the stored value carries -04:00/-05:00. (Existing tests run
     TZ=Etc/UTC, which is exactly why they were blind to this.)"""
     import time
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
-    # Non-UTC zone; tzset() so parse_iso_datetime's host-localization picks it up.
-    # conftest's autouse _restore_process_timezone restores the process TZ after.
     monkeypatch.setenv("TZ", "America/New_York")
     time.tzset()
     conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert rc == 0
     conn = ns["open_db"]()
-    ev = conn.execute(
-        "SELECT effective_reset_at_utc, old_week_end_at, "
-        "       unixepoch(effective_reset_at_utc) "
-        "FROM week_reset_events WHERE new_week_end_at=?",
-        ("2026-06-20T05:00:00+00:00",)).fetchone()
+    fl = conn.execute(
+        "SELECT effective_at_utc, unixepoch(effective_at_utc) "
+        "FROM weekly_credit_floors WHERE week_start_date=?",
+        ("2026-06-13",)).fetchone()
     conn.close()
-    assert ev is not None
-    # UTC spelling, not a host offset (-04:00/-05:00).
-    assert ev[0].endswith("+00:00"), f"stored host offset, not UTC: {ev[0]!r}"
-    assert ev[1].endswith("+00:00"), f"old_week_end_at host offset: {ev[1]!r}"
-    assert "-04:00" not in ev[0] and "-05:00" not in ev[0]
-    # Same instant either way: floored to the 14:00 UTC hour.
+    assert fl is not None
+    assert fl[0].endswith("+00:00"), f"stored host offset, not UTC: {fl[0]!r}"
+    assert "-04:00" not in fl[0] and "-05:00" not in fl[0]
     expected = int(dt.datetime(2026, 6, 19, 14, 0,
                                tzinfo=dt.timezone.utc).timestamp())
-    assert ev[2] == expected
-    assert ev[0] == "2026-06-19T14:00:00+00:00"
+    assert fl[1] == expected
+    assert fl[0] == "2026-06-19T14:00:00+00:00"
+
+
+def test_s12_no_reanchor(ns, monkeypatch):
+    """S12 (M2-defining): after a credit, NO week_reset_events row exists AND
+    the current-week window start stays the ORIGINAL week_start_at, not the
+    credit moment — proves "same week" (no re-anchor)."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
+    assert rc == 0
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+        # The window start the forecast/weekly current-week resolver returns
+        # must be the original 2026-06-13 anchor, NOT the credit moment.
+        fetched = ns["_fetch_current_week_snapshots"](
+            conn, dt.datetime(2026, 6, 19, 14, 37, tzinfo=dt.timezone.utc))
+        assert fetched is not None
+        ws_at = fetched[0]
+        ws_iso = ws_at if isinstance(ws_at, str) else ws_at.isoformat()
+        ws_dt = dt.datetime.fromisoformat(str(ws_iso).replace("Z", "+00:00"))
+        assert ws_dt == dt.datetime(2026, 6, 13, 5, 0, tzinfo=dt.timezone.utc), (
+            f"window re-anchored to {ws_dt!r} instead of the original 2026-06-13")
+    finally:
+        conn.close()
+
+
+def _statusline_seven_token(ns, monkeypatch, *, reported_7d, seven_resets_epoch):
+    """Drive the REAL `cmd_statusline` end-to-end and return its rendered 7d
+    integer percent. Feeds stdin a CC-hook JSON whose 7d used_percentage is
+    `reported_7d`; the closure-resident `_hwm_clamp` clamps the displayed value
+    UP to the reset-aware HWM, so a reported value below the post-credit HWM
+    surfaces the HWM. This exercises the actual statusline clamp (NOT a re-
+    implemented SQL), so reverting the _hwm_clamp floor change makes S14 RED."""
+    import io
+    import json as _j
+    payload = {
+        "session_id": "s14",
+        "model": {"id": "claude-sonnet-4-5", "display_name": "Sonnet 4.5"},
+        "workspace": {"current_dir": "/tmp"},
+        "transcript_path": "/nonexistent/s14.jsonl",
+        "rate_limits": {
+            "seven_day": {"used_percentage": reported_7d,
+                          "resets_at": seven_resets_epoch},
+        },
+        "cost": {"total_cost_usd": 0.0},
+    }
+    raw = _j.dumps(payload).encode("utf-8")
+
+    class _Stdin:
+        buffer = io.BytesIO(raw)
+    monkeypatch.setattr(sys, "stdin", _Stdin())
+    args = ns["build_parser"]().parse_args(["statusline", "--no-color"])
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = ns["cmd_statusline"](args)
+    assert rc == 0, buf.getvalue()
+    line = buf.getvalue()
+    import re
+    m = re.search(r"7d (\d+)%", line)
+    assert m is not None, f"no 7d token in statusline output: {line!r}"
+    return int(m.group(1))
+
+
+def test_s13_write_clamp_stores_post_credit_tick(ns, monkeypatch):
+    """S13 (M2 linchpin): after a credit (floor in place), a record-usage tick
+    at 37 (below the pre-credit peak 46) is STORED, not suppressed by the
+    monotonic clamp, and the reset-aware HWM then reads 37.
+
+    Non-vacuity (RED proof): without the _reset_aware_floor change at the
+    write-site clamp, 37 < pre-credit MAX 46 -> should_insert=False -> the 37
+    tick is never stored (n37==0) and the HWM stays at 31.
+
+    Anchored to REAL now: `cmd_record_usage` stamps the inserted row's
+    capturedAt via wall-clock `now_utc_iso()` (NOT _command_as_of), so we build
+    a current week whose window contains real now, credit at now-2h, and tick at
+    real now — keeping the tick's capture at/after the floor and inside the
+    window without a hardcoded clock (memory: record-usage test time-bomb)."""
+    real_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    ws_dt = (real_now - dt.timedelta(days=3)).replace(
+        hour=5, minute=0, second=0)
+    we_dt = ws_dt + dt.timedelta(days=7)
+    wsd = ws_dt.date().isoformat()
+    ws_at = ws_dt.isoformat()
+    we_at = we_dt.isoformat()
+    at_credit = real_now - dt.timedelta(hours=2)
+
+    def hwm(conn=None):
+        owned = conn is None
+        if owned:
+            conn = ns["open_db"]()
+        try:
+            return ns["_resolve_reset_aware_hwm"](conn, wsd, ws_at, we_at)
+        finally:
+            if owned:
+                conn.close()
+
+    conn = ns["open_db"]()
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date,"
+        " week_end_date, week_start_at, week_end_at, weekly_percent, page_url,"
+        " source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+        ((ws_dt + dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+         wsd, we_dt.date().isoformat(), ws_at, we_at, 46.0,
+         None, "userscript", "{}"))
+    conn.commit(); conn.close()
+    monkeypatch.setenv("CCTALLY_AS_OF", at_credit.isoformat().replace("+00:00", "Z"))
+    assert ns["cmd_record_credit"](_rc_args(
+        to=31.0, dry_run=False, yes=True, week=wsd)) == 0
+    assert hwm() == 31.0
+    # Real post-credit tick at 37 (below the pre-credit peak 46). Capture lands
+    # at wall-clock now (>= the now-2h floor), inside the window.
+    monkeypatch.delenv("CCTALLY_AS_OF", raising=False)
+    resets_epoch = int(we_dt.timestamp())
+    rc = ns["cmd_record_usage"](argparse.Namespace(
+        percent=37.0, resets_at=resets_epoch,
+        five_hour_percent=None, five_hour_resets_at=None,
+        page_url=None, week_start_name=None))
+    assert rc == 0
+    conn = ns["open_db"]()
+    try:
+        n37 = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date=? AND weekly_percent=37.0",
+            (wsd,)).fetchone()[0]
+        post = hwm(conn)
+    finally:
+        conn.close()
+    assert n37 == 1, "post-credit 37 tick was suppressed by the monotonic clamp"
+    assert post == 37.0
+
+
+def test_s14_statusline_floored_to_post_credit(ns, monkeypatch):
+    """S14: the statusline 7d clamp surfaces the post-credit value (31), not the
+    stale pre-credit 46. A reported 20% (below both) makes the clamp expose the
+    reset-aware HWM, which is floored to the credit (31).
+
+    Non-vacuity (RED proof): revert the _hwm_clamp _reset_aware_floor change and
+    the bucket-wide MAX clamps to 46."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    assert ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True)) == 0
+    seven_resets = int(dt.datetime(2026, 6, 20, 5, 0,
+                                   tzinfo=dt.timezone.utc).timestamp())
+    got = _statusline_seven_token(
+        ns, monkeypatch, reported_7d=20.0, seven_resets_epoch=seven_resets)
+    assert got == 31, f"statusline 7d not floored to post-credit: {got}"
+
+
+def test_s15_project_floored_to_post_credit(ns, monkeypatch):
+    """S15: `project`'s _load_week_snapshots reports the credited week's per-week
+    MAX as the post-credit value (31), not the stale 46.
+
+    Non-vacuity (RED proof): revert the _load_week_snapshots floor and the
+    per-week MAX returns 46."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    assert ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True)) == 0
+    since = dt.datetime(2026, 6, 13, 0, 0, tzinfo=dt.timezone.utc)
+    until = dt.datetime(2026, 6, 20, 0, 0, tzinfo=dt.timezone.utc)
+    snaps = ns["_load_week_snapshots"](since, until)
+    key = dt.datetime(2026, 6, 13, 5, 0, tzinfo=dt.timezone.utc)
+    assert snaps.get(key) == 31.0, f"project week MAX not floored: {snaps!r}"
 
 
 def test_s7_non_vacuity_snapshot_is_load_bearing(ns, monkeypatch):
@@ -232,17 +498,37 @@ def _apply_once(ns):
 
 
 def test_s8_completion_path_after_half_apply(ns, monkeypatch):
-    """Event present, no command-owned snapshot -> plain rerun finishes it."""
+    """S8 (M2): floor row present (effective 14:00), NO command-owned snapshot
+    -> a plain rerun at a LATER time (15:00) finishes it, REUSING the existing
+    14:00 effective (not a fresh floor_to_hour(15:00)=15:00), so no stale
+    [14:00,15:00) pre-credit replay leaks into the floored MAX."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn)
-    # Simulate crash: fire pivots only, NO synthetic snapshot.
-    eff = dt.datetime(2026, 6, 19, 14, 0, tzinfo=dt.timezone.utc)
-    ns["_fire_in_place_credit"](conn, "2026-06-13", "2026-06-20T05:00:00+00:00",
-                                31.0, observed_pre_credit_pct=46.0, effective_dt=eff)
-    conn.close()
-    assert _weekly_reads(ns) != 31.0                  # half-applied
+    # Simulate crash between 4a and 4d: floor row only, NO synthetic snapshot.
+    conn.execute(
+        "INSERT INTO weekly_credit_floors (week_start_date, effective_at_utc,"
+        " observed_pre_credit_pct, applied_at_utc) VALUES (?,?,?,?)",
+        ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
+         "2026-06-19T14:00:00Z"))
+    conn.commit(); conn.close()
+    assert _weekly_reads(ns) != 31.0                  # half-applied (no snapshot)
+    # Rerun an HOUR later — no --force; default --from reads the floor's
+    # observed_pre_credit_pct (46).
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T15:07:00Z")
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))  # no --force
     assert rc == 0 and _weekly_reads(ns) == 31.0      # completed
+    # The floor's effective is STILL 14:00 (reused, not moved to 15:00), and
+    # there is exactly one floor row (the INSERT OR IGNORE deduped).
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT effective_at_utc FROM weekly_credit_floors "
+            "WHERE week_start_date=?", ("2026-06-13",)).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0][0] == "2026-06-19T14:00:00+00:00", (
+        f"effective moved forward instead of being reused: {rows[0][0]!r}")
 
 
 def test_s4_fully_applied_refused(ns, monkeypatch):
@@ -303,7 +589,7 @@ def test_json_yes_envelope(ns, monkeypatch, capsys):
     assert out["credit"]["fromSource"] == "hwm"
     assert out["credit"]["effectiveAtUtc"].endswith("Z")
     assert out["actions"]["hwm7dBefore"] == 46.0 and out["actions"]["hwm7dAfter"] == 31.0
-    assert out["actions"]["resetEventInserted"] is True
+    assert out["actions"]["creditFloorInserted"] is True
     assert out["actions"]["postCreditSnapshotInserted"] is True
 
 

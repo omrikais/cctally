@@ -212,6 +212,7 @@ WeekRef = _cctally_core.WeekRef
 _canonicalize_optional_iso = _cctally_core._canonicalize_optional_iso
 make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
+_reset_aware_floor = _cctally_core._reset_aware_floor
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
 
 # === Path constants — re-exported from _cctally_core ================
@@ -634,6 +635,9 @@ cmd_sync_week = _cctally_sync_week.cmd_sync_week
 # module-private (no external caller).
 _cctally_project = _load_sibling("_cctally_project")
 cmd_project = _cctally_project.cmd_project
+# Re-exported so the record-credit tests can assert `project`'s per-week MAX
+# is reset-aware-floored (S15, #209).
+_load_week_snapshots = _cctally_project._load_week_snapshots
 # Shared per-project cost compute (#19/#121, spec §7.1). Re-exported so the
 # per-project budget display (cmd_budget) and the Task 3 firing path reach it
 # via the cctally namespace.

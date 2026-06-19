@@ -500,20 +500,22 @@ def _build_statusline_injections(warn_once):
                     # (_apply_reset_events_to_subweeks: post-reset window
                     # start_ts := effective_reset_at_utc) by flooring the
                     # MAX to snapshots captured at/after the latest reset
-                    # effective WITHIN this window. unixepoch() on both
-                    # sides — reset rows carry mixed offset spellings
-                    # (+00:00 / +03:00) while captured_at_utc uses 'Z', so a
-                    # lexical compare would misorder them (same rule as the
-                    # 5h-block cross-reset flag).
-                    floor_row = conn.execute(
-                        "SELECT MAX(effective_reset_at_utc) "
-                        "FROM week_reset_events "
-                        "WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?) "
-                        "  AND unixepoch(effective_reset_at_utc) <  unixepoch(?)",
-                        (week_start_dt.isoformat(), week_end_dt.isoformat()),
-                    ).fetchone()
-                    floor_iso = (
-                        floor_row[0] if floor_row and floor_row[0] else None
+                    # effective WITHIN this window.
+                    #
+                    # The floor is the LATEST in-week effective across BOTH
+                    # `week_reset_events` (Anthropic resets / >=25pp auto-
+                    # credits) and `weekly_credit_floors` (manual `record-
+                    # credit` partial credits — record-credit M2, #209): a
+                    # partial credit lowers the clamp floor WITHOUT re-
+                    # anchoring the week, so without the credit-floor leg the
+                    # statusline would re-clamp the post-credit 31% back UP to
+                    # the stale pre-credit 46% peak. `_reset_aware_floor`
+                    # unions both legs with `unixepoch()` ordering (mixed
+                    # Z / +00:00 offset spellings; lexical MAX would misorder
+                    # them — same rule as the 5h-block cross-reset flag).
+                    floor_iso = c._reset_aware_floor(
+                        conn, week_start_date,
+                        week_start_dt.isoformat(), week_end_dt.isoformat(),
                     )
                     if floor_iso is not None:
                         row = conn.execute(

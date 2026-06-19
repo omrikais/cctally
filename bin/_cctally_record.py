@@ -170,6 +170,7 @@ from _cctally_core import (
     compute_week_bounds,
     parse_date_str,
     _canonicalize_optional_iso,
+    _reset_aware_floor,
     make_week_ref,
     _get_alerts_config,
     _AlertsConfigError,
@@ -2181,9 +2182,9 @@ class CreditPlan:
     week_end_at: str
     cur_end_canon: str
     from_pct: float
-    from_source: str          # "hwm" | "explicit"
+    from_source: str          # "hwm" | "explicit" | "prior_credit"
     to_pct: float
-    effective_iso: str        # week_reset_events.effective_reset_at_utc (floored to hour)
+    effective_iso: str        # weekly_credit_floors.effective_at_utc (floored to hour)
     captured_iso: str         # synthetic snapshot captured_at_utc (un-floored), 'Z'
 
 
@@ -2202,9 +2203,18 @@ def _parse_credit_at(value, now):
 
 
 def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
-                       from_pct, from_source, to_pct, at_dt, now):
+                       from_pct, from_source, to_pct, at_dt, now,
+                       effective_override=None):
     """Validate inputs and build a CreditPlan. Pure (no DB/file I/O).
-    Raises ValueError(msg) on any violation — caller maps to exit 2."""
+    Raises ValueError(msg) on any violation — caller maps to exit 2.
+
+    `effective_override` (an ISO string) is the completion-path reuse of an
+    EXISTING `weekly_credit_floors.effective_at_utc` (spec §4a): when present,
+    the plan's effective is that value rather than `floor_to_hour(at)`, so a
+    rerun of a half-applied credit at a later wall-clock keeps the original
+    floor moment and never leaks a stale pre-credit replay into the floored
+    MAX. The synthetic snapshot's captured timestamp stays the un-floored
+    `at` either way."""
     to_pct = _normalize_percent(to_pct)
     from_pct = _normalize_percent(from_pct)
     if not (0.0 <= to_pct <= 100.0) or not (0.0 <= from_pct <= 100.0):
@@ -2217,7 +2227,12 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
         raise ValueError(f"--at {at_dt.isoformat()} is outside the week window")
     if at_dt > now:
         raise ValueError("--at is in the future")
-    effective_dt = _floor_to_hour(at_dt)
+    if effective_override is not None:
+        effective_iso = parse_iso_datetime(
+            effective_override, "effective_override"
+        ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+    else:
+        effective_iso = _floor_to_hour(at_dt).isoformat(timespec="seconds")
     cur_end_canon = _canonicalize_optional_iso(week_end_at, "record-credit.week_end")
     return CreditPlan(
         week_start_date=week_start_date,
@@ -2227,7 +2242,7 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
         from_pct=from_pct,
         from_source=from_source,
         to_pct=to_pct,
-        effective_iso=effective_dt.isoformat(timespec="seconds"),
+        effective_iso=effective_iso,
         captured_iso=at_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
     )
 
@@ -2298,14 +2313,13 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
 
 def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
     """The floored MAX(weekly_percent) the statusline _hwm_clamp computes:
-    MAX over snapshots captured at/after the latest in-week reset effective."""
-    floor_row = conn.execute(
-        "SELECT MAX(effective_reset_at_utc) FROM week_reset_events "
-        " WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?) "
-        "   AND unixepoch(effective_reset_at_utc) <  unixepoch(?)",
-        (week_start_at, week_end_at),
-    ).fetchone()
-    floor_iso = floor_row[0] if floor_row and floor_row[0] else None
+    MAX over snapshots captured at/after the latest in-week clamp floor. The
+    floor is the latest effective across BOTH `week_reset_events` and
+    `weekly_credit_floors` (`_reset_aware_floor`) so a manual partial credit
+    (record-credit M2, #209) lowers the resolved HWM without re-anchoring the
+    week — used both as the `--from` default and as the assertion source of
+    truth in the record-credit tests."""
+    floor_iso = _reset_aware_floor(conn, week_start_date, week_start_at, week_end_at)
     if floor_iso is not None:
         row = conn.execute(
             "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
@@ -2324,9 +2338,14 @@ def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
 def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None)):
     """Insert the post-credit snapshot at plan.to_pct, tagged source='record-credit'."""
     fhp, fhr, fhk = five_hour
+    # Normalize effective to a +00:00 UTC spelling in the payload (matches the
+    # stored weekly_credit_floors.effective_at_utc on a non-UTC host).
+    effective_utc = parse_iso_datetime(
+        plan.effective_iso, "snapshot.effective"
+    ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
     payload = json.dumps(
         {"kind": "record-credit", "from": plan.from_pct, "to": plan.to_pct,
-         "effective": plan.effective_iso},
+         "effective": effective_utc},
         separators=(",", ":"),
     )
     conn.execute(
@@ -2365,30 +2384,83 @@ def _resolve_prior_5h(conn, at_dt):
 
 
 def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
-    """Run the full artifact set: pivots (via _fire_in_place_credit) + snapshot
-    + clear stale reset-zero marker. Idempotent / completion-safe."""
+    """Apply the M2 same-window partial-credit artifacts (record-credit, #209,
+    spec §4). Unlike the >=25pp auto-credit path (`_fire_in_place_credit`), this
+    writes NO `week_reset_events` row — the window-resolution code never sees a
+    credit, so the week is NOT re-anchored. It only lowers the clamp floor.
+
+    Side-effect ordering mirrors `_fire_in_place_credit`'s discipline: the
+    INSERT OR IGNORE of the floor row is dedup-gated by UNIQUE(week_start_date,
+    effective_at_utc), but the hwm force-write, stale-replay DELETE, and
+    synthetic-snapshot INSERT run UNCONDITIONALLY so a rerun finishes a crash-
+    half-applied credit (memory: project_dedup_must_not_gate_side_effects). All
+    are individually idempotent (file overwrite; DELETE on a stable predicate;
+    the synthetic snapshot is re-INSERTed only after `_force_clear_credit` or on
+    the completion path where none exists yet).
+
+    `plan.effective_iso` is `floor_to_hour(at)`. parse_iso_datetime returns a
+    host-local-offset aware datetime; convert to UTC so `effective_at_utc`
+    persists with a +00:00 spelling, not a host offset, in the `*_utc` column.
+    On the completion / --force re-apply path the CALLER passes a `plan` whose
+    `effective_iso` is the EXISTING floor row's `effective_at_utc` (NOT a fresh
+    floor_to_hour(now)) — spec §4a completion-effective reuse."""
     c = _cctally()
-    # parse_iso_datetime returns a host-local-offset aware datetime; convert to
-    # UTC so _fire_in_place_credit persists effective_reset_at_utc / old_week_end_at
-    # with a +00:00 spelling (matches the live in-place-credit path, which already
-    # passes _floor_to_hour(now_utc)). Same instant either way (unixepoch-safe),
-    # but a host offset in a *_utc column re-introduces the host-local pattern.
     effective_dt = parse_iso_datetime(plan.effective_iso, "effective").astimezone(dt.timezone.utc)
-    _fire_in_place_credit(
-        conn, plan.week_start_date, plan.cur_end_canon, plan.to_pct,
-        observed_pre_credit_pct=plan.from_pct, effective_dt=effective_dt,
+    effective_iso = effective_dt.isoformat(timespec="seconds")
+    pre_credit = float(plan.from_pct)
+
+    # 4a. INSERT the credit floor (no week_reset_events row — the whole point).
+    conn.execute(
+        "INSERT OR IGNORE INTO weekly_credit_floors "
+        "(week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc) "
+        "VALUES (?, ?, ?, ?)",
+        (plan.week_start_date, effective_iso, pre_credit, now_utc_iso()),
     )
+    conn.commit()
+
+    # 4b. Force-write hwm-7d so the external statusline render reflects the
+    # post-credit value (the normal write-site monotonic guard would refuse to
+    # decrease the file).
+    try:
+        (_cctally_core.APP_DIR / "hwm-7d").write_text(
+            f"{plan.week_start_date} {plan.to_pct}\n"
+        )
+    except OSError:
+        pass
+
+    # 4c. Stale-replay DELETE: drop pre-credit-valued replays that land at/after
+    # the floor (the gotcha_statusline_replay_race_after_credit defense; same
+    # 1.0pp band as the auto path). unixepoch() on both sides for offset safety.
+    try:
+        conn.execute(
+            "DELETE FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(weekly_percent - ?) < 1.0",
+            (plan.week_start_date, effective_iso, pre_credit),
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        eprint(f"[record-credit] post-credit cleanup failed: {exc}")
+
+    # 4d. INSERT the synthetic post-credit snapshot at plan.to_pct.
     c._insert_credit_snapshot(conn, plan, five_hour=five_hour)
+
+    # 4e. Clear a stale same-week reset-zero marker so the next record-usage
+    # tick can't confirm a phantom reset-to-zero off it.
     _clear_reset_zero_marker()
 
 
-def _force_clear_credit(conn, week_start_date, event_id):
-    """Delete ONLY command-owned synthetic rows + the event + its milestones."""
+def _force_clear_credit(conn, week_start_date):
+    """--force scope (M2, spec §4): delete ONLY this week's command-owned
+    synthetic snapshots (`source='record-credit'`) + its `weekly_credit_floors`
+    row(s). Never touches real status-line snapshots, and never
+    `week_reset_events` / `percent_milestones` — a partial credit writes
+    neither (no event row -> no segmentation; no milestones)."""
     conn.execute("DELETE FROM weekly_usage_snapshots "
                  " WHERE week_start_date=? AND source='record-credit'", (week_start_date,))
-    conn.execute("DELETE FROM percent_milestones "
-                 " WHERE week_start_date=? AND reset_event_id=?", (week_start_date, event_id))
-    conn.execute("DELETE FROM week_reset_events WHERE id=?", (event_id,))
+    conn.execute("DELETE FROM weekly_credit_floors "
+                 " WHERE week_start_date=?", (week_start_date,))
     conn.commit()
 
 
@@ -2412,21 +2484,26 @@ def _credit_preview_text(plan, *, stale_replays, dry_run):
     eff_dt = parse_iso_datetime(plan.effective_iso, "effective").astimezone(dt.timezone.utc)
     cap_dt = parse_iso_datetime(plan.captured_iso, "captured").astimezone(dt.timezone.utc)
     we_dt = parse_iso_datetime(plan.week_end_at, "week_end").astimezone(dt.timezone.utc)
-    src = "current HWM" if plan.from_source == "hwm" else "explicit"
+    src = {
+        "hwm": "current HWM",
+        "explicit": "explicit",
+        "prior_credit": "prior credit",
+    }.get(plan.from_source, plan.from_source)
     lines = [
         "record-credit — weekly in-place credit",
-        f"  week:        {plan.week_start_date} -> "
+        f"  week:          {plan.week_start_date} -> "
         f"{we_dt.strftime('%Y-%m-%d %H:%M')} UTC",
-        f"  from -> to:  {plan.from_pct:g}% -> {plan.to_pct:g}%   (from: {src})",
-        f"  effective:   {eff_dt.strftime('%Y-%m-%d %H:%M')} UTC  "
+        f"  from -> to:    {plan.from_pct:g}% -> {plan.to_pct:g}%   (from: {src})",
+        f"  effective:     {eff_dt.strftime('%Y-%m-%d %H:%M')} UTC  "
         f"(floored from {cap_dt.strftime('%Y-%m-%d %H:%M')})",
         "  writes:",
-        f"    + week_reset_events  (effective={plan.effective_iso}, "
+        f"    + weekly_credit_floors  (effective={plan.effective_iso}, "
         f"pre_credit={plan.from_pct:g})",
-        f"    ~ hwm-7d             {plan.from_pct:g} -> {plan.to_pct:g}",
-        f"    - stale replays      {stale_replays} rows",
-        f"    + snapshot           captured={plan.captured_iso}, "
+        f"    ~ hwm-7d                {plan.from_pct:g} -> {plan.to_pct:g}",
+        f"    - stale replays         {stale_replays} rows",
+        f"    + snapshot              captured={plan.captured_iso}, "
         f"weekly_percent={plan.to_pct:g}",
+        "  note: same week — no window re-anchor (no week_reset_events row)",
     ]
     if dry_run:
         lines.append("  (dry-run — nothing written)")
@@ -2455,7 +2532,7 @@ def _credit_json(plan, *, applied, dry_run, forced, stale_replays, hwm_before):
             "effectiveAtUtc": _z(plan.effective_iso),
         },
         "actions": {
-            "resetEventInserted": applied,
+            "creditFloorInserted": applied,
             "hwm7dBefore": hwm_before,
             "hwm7dAfter": plan.to_pct if applied else hwm_before,
             "staleReplaysDeleted": stale_replays,
@@ -2491,28 +2568,33 @@ def cmd_record_credit(args) -> int:
             we_at = we_at if isinstance(we_at, str) else we_at.isoformat(timespec="seconds")
             week_start_date = parse_iso_datetime(ws_at, "ws_at").date().isoformat()
 
-        # Resolve any existing credit event for this week up front — needed
+        # Resolve any existing credit FLOOR for this week up front — needed
         # both for the --from default fallback (a half-applied credit empties
         # the post-credit segment, so the reset-aware HWM reads NULL) and the
-        # apply-time completion/refuse/force branch (step 4a).
-        cur_end_canon = _canonicalize_optional_iso(we_at, "record-credit.week_end")
+        # apply-time completion/refuse/force branch (M2 keys on
+        # weekly_credit_floors, NOT week_reset_events — a partial credit never
+        # writes a reset-event row). Latest floor wins (a --force re-apply at a
+        # new effective leaves the old row only until _force_clear_credit
+        # deletes it; pick the newest defensively).
         existing = conn.execute(
-            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct "
-            "FROM week_reset_events WHERE new_week_end_at=?",
-            (cur_end_canon,)).fetchone()
+            "SELECT id, effective_at_utc, observed_pre_credit_pct "
+            "FROM weekly_credit_floors WHERE week_start_date=? "
+            "ORDER BY unixepoch(effective_at_utc) DESC, id DESC LIMIT 1",
+            (week_start_date,)).fetchone()
 
         # 2. Resolve --from default.
         if getattr(args, "from_pct", None) is not None:
             from_pct, from_source = float(args.from_pct), "explicit"
         elif existing is not None and existing[2] is not None:
-            # A credit event already exists for this week (completion or
+            # A credit floor already exists for this week (completion or
             # --force re-record). Its recorded observed_pre_credit_pct is the
             # AUTHENTIC pre-credit baseline; prefer it over the reset-aware
             # HWM. The post-credit segment's MAX(weekly_percent) would
             # otherwise pick up the post-credit value (31) or a later real
             # status-line reading, mis-deriving the baseline and causing the
-            # stale-replay DELETE to (wrongly) match real history.
-            from_pct, from_source = float(existing[2]), "hwm"
+            # stale-replay DELETE to (wrongly) match real history. fromSource
+            # is 'prior_credit' (spec §5).
+            from_pct, from_source = float(existing[2]), "prior_credit"
         else:
             hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
             if hwm is None:
@@ -2520,12 +2602,38 @@ def cmd_record_credit(args) -> int:
                 return 2
             from_pct, from_source = hwm, "hwm"
 
+        is_force = getattr(args, "force", False)
+
+        # 2a. Classify the existing-floor state (M2, spec §4/§5). A
+        #     `weekly_credit_floors` row may be:
+        #       - half-applied (floor row present, NO command-owned snapshot
+        #         at/after its effective): a crash between 4a and 4d. A plain
+        #         rerun FINISHES it, reusing the existing effective_at_utc (NOT
+        #         a fresh floor_to_hour(now)) so no stale [old,new) replay leaks
+        #         into the floored MAX (spec §4a completion-effective reuse).
+        #       - fully applied (floor row + command-owned snapshot): refuse by
+        #         default; --force clears + re-records at a fresh effective.
+        is_completion = False
+        if existing is not None and not is_force:
+            owned = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                " WHERE week_start_date=? AND source='record-credit' "
+                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+                (week_start_date, existing[1])).fetchone()
+            is_completion = owned is None
+
+        # The effective the plan should carry: a half-applied completion reuses
+        # the EXISTING floor row's effective; a first credit / --force re-apply
+        # uses floor_to_hour(at) (computed inside _build_credit_plan).
+        reuse_effective = existing[1] if is_completion else None
+
         # 3. Validate + build plan.
         try:
             plan = _build_credit_plan(
                 week_start_date=week_start_date, week_start_at=ws_at,
                 week_end_at=we_at, from_pct=from_pct, from_source=from_source,
                 to_pct=args.to, at_dt=at_dt, now=now,
+                effective_override=reuse_effective,
             )
         except ValueError as e:
             eprint(f"record-credit: {e}")
@@ -2535,7 +2643,6 @@ def cmd_record_credit(args) -> int:
         is_json = getattr(args, "json", False)
         is_dry = getattr(args, "dry_run", False)
         is_yes = getattr(args, "yes", False)
-        is_force = getattr(args, "force", False)
         stale_replays = _count_stale_replays(conn, plan)
         hwm_before = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
         if hwm_before is None:
@@ -2574,28 +2681,24 @@ def cmd_record_credit(args) -> int:
                 print("aborted — nothing written")
                 return 0
 
-        # 4a. Existing-event handling. _fire_in_place_credit commits the
-        #     event + cleanup BEFORE the synthetic snapshot, so a crash in
-        #     between leaves a half-applied credit (event present, no
-        #     command-owned snapshot, post-credit segment empty). `existing`
-        #     was resolved up front (above) keyed on cur_end_canon.
+        # 4a. Existing-floor handling (M2; state classified at step 2a).
+        #     _apply_credit commits the floor row + cleanup BEFORE the synthetic
+        #     snapshot, so a crash in between leaves a half-applied credit
+        #     (floor row, no command-owned snapshot). `existing` /
+        #     `is_completion` were resolved up front (above) keyed on
+        #     week_start_date / weekly_credit_floors.
         forced = False
         if existing is not None and not is_force:
-            owned = conn.execute(
-                "SELECT 1 FROM weekly_usage_snapshots "
-                " WHERE week_start_date=? AND source='record-credit' "
-                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
-                (plan.week_start_date, existing[1])).fetchone()
-            if owned is not None:
+            if not is_completion:
                 # Fully applied -> refuse by default.
                 eprint(f"record-credit: a credit is already recorded for this "
                        f"week (effective={existing[1]}, pre_credit={existing[2]}); "
                        f"pass --force to re-record")
                 return 2
-            # else: half-applied -> fall through (completion path; the
-            # pivots in _fire_in_place_credit are idempotent).
+            # else: half-applied -> fall through (completion path; the plan
+            # reuses the existing effective and the apply steps are idempotent).
         elif existing is not None and is_force:
-            _force_clear_credit(conn, plan.week_start_date, existing[0])
+            _force_clear_credit(conn, plan.week_start_date)
             forced = True
 
         five_hour = _resolve_prior_5h(conn, at_dt)
@@ -3143,38 +3246,43 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
             eprint(f"[record-usage] reset-event detection failed: {exc}")
 
         # 7-day usage is monotonically non-decreasing within a billing week
-        # — UNTIL Anthropic issues an in-place weekly credit. When a
-        # week_reset_events row exists for THIS week_end_at, the MAX query
-        # filters to samples captured at-or-after the segment's
-        # effective_reset_at_utc so a fresh post-credit OAuth value (e.g.
-        # 2%) lands instead of being held back by stale pre-credit history
-        # (e.g. 67%). When no event row exists, COALESCE defaults to
-        # epoch-zero so the filter is a no-op and legacy clamp behavior
-        # is preserved byte-identically.
+        # — UNTIL an in-place weekly credit lowers it. There are TWO credit
+        # shapes and BOTH must floor this clamp, or a real post-credit tick
+        # is suppressed and never stored:
+        #   (a) an Anthropic mid-week reset / >=25pp auto-credit writes a
+        #       `week_reset_events` row (it also re-anchors the window); and
+        #   (b) a manual `record-credit` partial credit writes a
+        #       `weekly_credit_floors` row WITHOUT re-anchoring the week
+        #       (record-credit M2, #209).
+        # `_reset_aware_floor` returns the LATEST in-week effective across
+        # both legs. The MAX query then filters to samples captured at-or-
+        # after that floor, so a fresh post-credit OAuth value (e.g. 37%
+        # after a 46->31 credit) lands instead of being held back by stale
+        # pre-credit history (46%). Without the credit-floor leg, the 37%
+        # tick is `round(37,1) < round(46,1)` -> should_insert=False ->
+        # never stored, cascading to every latest-snapshot surface
+        # (the M2 linchpin; spec §4a, test S13).
+        # When neither leg has a row, the floor is None -> '1970-...' epoch-
+        # zero default -> the filter is a no-op and legacy clamp behavior is
+        # preserved byte-identically.
         # NB: comparison wrapped with ``unixepoch()`` on BOTH sides.
-        # ``captured_at_utc`` is stored with `Z` suffix, but
-        # ``effective_reset_at_utc`` may have a non-UTC offset on
-        # historical backfill rows written before Bug 3 was fixed
-        # (parse_iso_datetime returned host-local). Lex string compare
-        # on mixed offsets silently mis-orders moments for non-UTC
-        # hosts (CLAUDE.md gotcha: 5h-block cross-reset flag — "all
-        # comparisons go through unixepoch(), NOT lex
-        # BETWEEN/`<`/`>`"). Same rule applies here.
+        # ``captured_at_utc`` is stored with `Z` suffix, but the floor may
+        # carry a non-UTC / +00:00 offset spelling. Lex string compare on
+        # mixed offsets silently mis-orders moments for non-UTC hosts
+        # (CLAUDE.md gotcha: 5h-block cross-reset flag — "all comparisons go
+        # through unixepoch(), NOT lex BETWEEN/`<`/`>`"). Same rule here, and
+        # inside `_reset_aware_floor`'s own ORDER BY.
+        clamp_floor_iso = _reset_aware_floor(
+            conn, week_start_date, week_start_at, week_end_at,
+        ) or "1970-01-01T00:00:00Z"
         max_row = conn.execute(
             """
             SELECT MAX(weekly_percent) AS v
               FROM weekly_usage_snapshots
              WHERE week_start_date = ?
-               AND unixepoch(captured_at_utc) >= unixepoch(COALESCE(
-                 (SELECT effective_reset_at_utc
-                    FROM week_reset_events
-                   WHERE new_week_end_at = ?
-                   ORDER BY id DESC
-                   LIMIT 1),
-                 '1970-01-01T00:00:00Z'
-               ))
+               AND unixepoch(captured_at_utc) >= unixepoch(?)
             """,
-            (week_start_date, week_end_at),
+            (week_start_date, clamp_floor_iso),
         ).fetchone()
         if max_row and max_row["v"] is not None and round(weekly_percent, 1) < round(float(max_row["v"]), 1):
             should_insert = False

@@ -175,27 +175,46 @@ def test_reset_aware_clamp_without_event_preserves_legacy_behavior(ns):
 
 def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
     """With a week_reset_events row, the MAX query filters to samples
-    captured at-or-after effective_reset_at_utc. Pre-credit 67% no
-    longer dominates; a fresh post-credit 4% lands.
+    captured at-or-after the reset-aware floor. Pre-credit 67% no longer
+    dominates; a fresh post-credit 4% lands.
     Uses a past end_at so this test exercises the CLAMP alone, not the
     in-place credit detection branch (which would also fire on a future
     end_at and double-write the event row).
+
+    The seeded event's effective and the seeded captured timestamps are
+    anchored RELATIVE to the dynamic past window so they fall inside the
+    `[week_start_at, week_end_at)` the write-site clamp derives from
+    `resets_at` (record-credit M2 unified the clamp onto the window-based
+    `_reset_aware_floor` predicate, not a `new_week_end_at` string match —
+    a stale fixed effective from a far-earlier month would now correctly fall
+    outside the window and not floor this week; memory: record-usage test
+    time-bomb).
     """
     end_at_iso, end_at_epoch = _past_week_end_iso()
     week_start_date, _ = _week_start_for(end_at_iso)
-    effective_iso = "2026-05-15T17:00:00+00:00"
+    end_dt = dt.datetime.fromisoformat(end_at_iso)
+    week_start_at = (end_dt - dt.timedelta(days=7)).isoformat(timespec="seconds")
+    # Floor effective ~2 days before the window end (in-window); pre-credit
+    # sample before it, post-credit sample after it.
+    effective_dt = end_dt - dt.timedelta(days=2)
+    effective_iso = effective_dt.isoformat(timespec="seconds")
+    pre_iso = (effective_dt - dt.timedelta(hours=6)).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+    post_iso = (effective_dt + dt.timedelta(hours=1)).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
 
     conn = ns["open_db"]()
     try:
         # Pre-credit 67% sample.
         _seed_usage_snapshot(
             conn,
-            captured_at_utc="2026-05-13T10:00:00Z",
+            captured_at_utc=pre_iso,
             week_start_date=week_start_date,
+            week_start_at=week_start_at,
             week_end_at=end_at_iso,
             weekly_percent=67.0,
         )
-        # Event row marking the segment boundary.
+        # Event row marking the segment boundary (effective in-window).
         _seed_reset_event(
             conn,
             new_week_end_at=end_at_iso,
@@ -205,8 +224,9 @@ def test_reset_aware_clamp_with_event_filters_to_post_credit(ns):
         # clamp's MAX over the post-segment window starts at 2%).
         _seed_usage_snapshot(
             conn,
-            captured_at_utc="2026-05-15T18:00:00Z",
+            captured_at_utc=post_iso,
             week_start_date=week_start_date,
+            week_start_at=week_start_at,
             week_end_at=end_at_iso,
             weekly_percent=2.0,
         )
@@ -1845,32 +1865,52 @@ def test_reset_aware_clamp_handles_non_utc_event_offset(ns):
     """
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, week_end_date = _week_start_for(end_iso)
+    end_dt = dt.datetime.fromisoformat(end_iso)
+    week_start_at = (end_dt - dt.timedelta(days=7)).isoformat(timespec="seconds")
+    # Effective floor ~2 days before the window end (IN-window — record-credit
+    # M2 unified the clamp onto `_reset_aware_floor`'s window predicate, so the
+    # event's effective must fall in [week_start_at, week_end_at); a far-earlier
+    # fixed month would no longer floor this week). Store it with a NEGATIVE
+    # -03:00 offset (legacy Bug-3 host shape), and a pre-credit captured `Z`
+    # string that is LEX-greater than the effective string but unixepoch-EARLIER
+    # — the exact lex-vs-unixepoch trap this regression guards.
+    # Pin the hour to 12 so the -3h / -1h shifts below never roll the date
+    # over (keeps the lex-trap arithmetic on a single calendar day).
+    effective_utc = (end_dt - dt.timedelta(days=2)).replace(
+        hour=12, minute=0, second=0)
+    # `-03:00` wall-clock spelling of effective_utc (== effective_utc - 3h local).
+    effective_neg = effective_utc.astimezone(
+        dt.timezone(dt.timedelta(hours=-3))).isoformat(timespec="seconds")
+    # Pre-credit sample 1h before the floor (unixepoch-earlier), `Z` spelling.
+    pre_utc = effective_utc - dt.timedelta(hours=1)
+    pre_z = pre_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+    # Guard the trap: the `Z` string is lex-GREATER than the `-03:00` string
+    # (so a lexical >= filter would WRONGLY include it) yet the real instant is
+    # earlier. If this guard ever fails, the regression is no longer exercised.
+    assert pre_z > effective_neg, (pre_z, effective_neg)
+    assert pre_utc < effective_utc
 
     conn = ns["open_db"]()
     try:
-        # Pre-credit 67% snapshot — captured BEFORE the credit moment
-        # in real time but LEX-greater than the effective string due
-        # to the legacy `-03:00` offset on the event row.
+        # Pre-credit 67% snapshot — captured BEFORE the credit moment in real
+        # time but LEX-greater than the effective string due to the -03:00 offset.
         _seed_usage_snapshot(
             conn,
-            captured_at_utc="2026-03-01T15:00:00Z",
+            captured_at_utc=pre_z,
             week_start_date=week_start_date,
             week_end_date=week_end_date,
+            week_start_at=week_start_at,
             week_end_at=end_iso,
             weekly_percent=67.0,
         )
-        # Event row with NEGATIVE-offset effective_reset_at_utc
-        # (legacy shape that Bug 3 would have written from a host
-        # like America/Buenos_Aires before the .astimezone(UTC) fix).
-        # Real UTC equivalent: 2026-03-01T17:00:00Z.
+        # Event row with NEGATIVE-offset effective_reset_at_utc (legacy shape
+        # that Bug 3 would have written from a host like America/Buenos_Aires
+        # before the .astimezone(UTC) fix).
         conn.execute(
             "INSERT INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
             " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-            ("2026-03-01T14:35:00-03:00",
-             "2026-03-01T14:00:00-03:00",
-             end_iso,
-             "2026-03-01T14:00:00-03:00"),
+            (effective_neg, effective_neg, end_iso, effective_neg),
         )
         conn.commit()
     finally:

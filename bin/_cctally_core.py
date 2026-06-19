@@ -1365,6 +1365,34 @@ def open_db() -> sqlite3.Connection:
         """
     )
 
+    # In-place weekly partial-credit floor (issue #209, record-credit M2).
+    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / NO user_version
+    # bump — the same framework-untracked posture as `project_budget_milestones`
+    # above. A `record-credit` invocation records a weekly credit (e.g.
+    # 46% -> 31%) WITHOUT writing a `week_reset_events` row: a credit lowers the
+    # current-7d clamp floor only and must NOT re-anchor the week window (the
+    # `week_reset_events`-driven window-resolution code would otherwise show a
+    # spurious "new week" and corrupt the forecast rate). `_reset_aware_floor`
+    # (below) unions this table with `week_reset_events` so the four MAX-clamp
+    # sites floor the current % to the post-credit value while the window stays
+    # put. `effective_at_utc` is `floor_to_hour(at)` in UTC; `applied_at_utc` is
+    # audit-only (kept out of goldens). Lives BEFORE the migration dispatcher: a
+    # plain CREATE on a framework-untracked table never touches
+    # `schema_migrations`, so the dispatcher's fresh-install snapshot is
+    # unaffected. See docs/superpowers/specs/2026-06-19-record-credit-weekly-design.md §2/§4a.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_credit_floors (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_start_date         TEXT    NOT NULL,
+            effective_at_utc        TEXT    NOT NULL,
+            observed_pre_credit_pct REAL    NOT NULL,
+            applied_at_utc          TEXT    NOT NULL,
+            UNIQUE(week_start_date, effective_at_utc)
+        )
+        """
+    )
+
     # Migration framework dispatcher. Replaces the prior inline gate stack
     # (has_blocks + _migration_done) with the framework's _run_pending_-
     # migrations entry point. See spec §2.3, §5.2 + the migration handlers
@@ -1521,6 +1549,54 @@ def _get_latest_row_for_week(
         """,
         (week_ref.week_start.isoformat(), as_of_utc),
     ).fetchone()
+
+
+def _reset_aware_floor(
+    conn: sqlite3.Connection,
+    week_start_date: str,
+    week_start_at: str,
+    week_end_at: str,
+) -> str | None:
+    """Return the latest in-week clamp floor (an ISO timestamp) across BOTH
+    `week_reset_events` and `weekly_credit_floors`, or None when neither has a
+    row for this week.
+
+    This is the single chokepoint the four MAX-clamp sites consult to floor the
+    current 7d % to the most-recent in-place credit / reset effective moment
+    (record-credit M2, issue #209, spec §4a):
+      - statusline `_hwm_clamp` 7d (bin/_cctally_statusline.py)
+      - the record-usage write-site monotonic clamp (bin/_cctally_record.py)
+      - `_resolve_reset_aware_hwm` (the --from default helper)
+      - `project`'s `_load_week_snapshots` per-week MAX (bin/_cctally_project.py)
+
+    A `week_reset_events` row counts iff its `effective_reset_at_utc` falls in
+    `[week_start_at, week_end_at)`; a `weekly_credit_floors` row counts iff its
+    `week_start_date` matches (record-credit always stamps `effective_at_utc`
+    inside the week, validated at plan-build time).
+
+    The latest floor wins via `ORDER BY unixepoch(floor_at) DESC LIMIT 1` —
+    `unixepoch()`, NOT a textual `MAX(...)`: the two legs carry mixed offset
+    spellings (`Z` / `+00:00`), and a lexical MAX would silently mis-order them
+    on a non-UTC host (the same gotcha as the statusline clamp / 5h-block
+    cross-reset flag; see the comment at bin/_cctally_statusline.py)."""
+    row = conn.execute(
+        """
+        SELECT floor_at FROM (
+            SELECT effective_reset_at_utc AS floor_at
+              FROM week_reset_events
+             WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
+               AND unixepoch(effective_reset_at_utc) <  unixepoch(?)
+            UNION ALL
+            SELECT effective_at_utc AS floor_at
+              FROM weekly_credit_floors
+             WHERE week_start_date = ?
+        )
+        ORDER BY unixepoch(floor_at) DESC
+        LIMIT 1
+        """,
+        (week_start_at, week_end_at, week_start_date),
+    ).fetchone()
+    return row[0] if row and row[0] else None
 
 
 def get_latest_usage_for_week(

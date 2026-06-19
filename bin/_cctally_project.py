@@ -26,7 +26,13 @@ import json
 import os
 import sys
 
-from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
+from _cctally_core import (
+    _command_as_of,
+    _reset_aware_floor,
+    eprint,
+    open_db,
+    parse_iso_datetime,
+)
 from _lib_fmt import stable_sum
 
 
@@ -53,22 +59,59 @@ def _load_week_snapshots(
     `+03:00` from pre-UTC-cast canonicalizer history) coalesce into one
     bucket instead of splitting and silently dropping the higher value.
 
+    Reset-aware (record-credit M2, #209): each week's MAX is restricted to
+    snapshots captured at-or-after that week's latest in-place clamp floor
+    (`_reset_aware_floor`, the union of `week_reset_events` +
+    `weekly_credit_floors`). Without this, a credited week's per-project Used %
+    would read the stale pre-credit peak (e.g. 46) instead of the post-credit
+    value (e.g. 31) — the same floor the statusline / write-clamp / `--from`
+    helper apply (spec §4a, test S15). The floor compare uses `unixepoch()` on
+    both sides (mixed `Z` / `+00:00` offset spellings).
+
     Returns an empty dict if the stats DB has no relevant rows.
     """
     conn = open_db()
     try:
         cur = conn.execute(
-            "SELECT week_start_at, weekly_percent FROM weekly_usage_snapshots "
+            "SELECT week_start_date, week_start_at, week_end_at, "
+            "       captured_at_utc, weekly_percent "
+            "FROM weekly_usage_snapshots "
             "WHERE week_start_at IS NOT NULL "
             "AND week_end_at IS NOT NULL "
             "AND datetime(week_start_at) < datetime(?) "
             "AND datetime(week_end_at) > datetime(?)",
             (until.isoformat(), since.isoformat()),
         )
+        rows = cur.fetchall()
+        # Resolve each week's clamp floor once (keyed on week_start_date) so a
+        # mid-week credit doesn't re-inflate the per-project Used %. None means
+        # "no floor" — every captured row counts.
+        floor_epoch: dict[str, int | None] = {}
+
+        def _floor_for(wsd, ws_iso, we_iso):
+            if wsd not in floor_epoch:
+                f_iso = _reset_aware_floor(conn, wsd, ws_iso, we_iso)
+                floor_epoch[wsd] = (
+                    int(parse_iso_datetime(f_iso, "project.floor").timestamp())
+                    if f_iso else None
+                )
+            return floor_epoch[wsd]
+
         result: dict[dt.datetime, float] = {}
-        for ws_iso, pct in cur.fetchall():
+        for wsd, ws_iso, we_iso, cap_iso, pct in rows:
             if ws_iso is None or pct is None:
                 continue
+            floor = _floor_for(wsd, ws_iso, we_iso)
+            if floor is not None and cap_iso is not None:
+                try:
+                    cap_epoch = int(
+                        parse_iso_datetime(str(cap_iso), "project.cap").timestamp()
+                    )
+                except ValueError:
+                    cap_epoch = None
+                # Drop pre-floor (stale pre-credit) snapshots from the MAX.
+                if cap_epoch is not None and cap_epoch < floor:
+                    continue
             ws = dt.datetime.fromisoformat(
                 str(ws_iso).replace("Z", "+00:00")
             )

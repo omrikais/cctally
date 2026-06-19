@@ -1,0 +1,11 @@
+record-credit — weekly in-place credit
+  week:          2026-06-13 -> 2026-06-20 05:00 UTC
+  from -> to:    46% -> 31%   (from: current HWM)
+  effective:     2026-06-19 14:00 UTC  (floored from 2026-06-19 14:37)
+  writes:
+    + weekly_credit_floors  (effective=2026-06-19T14:00:00+00:00, pre_credit=46)
+    ~ hwm-7d                46 -> 31
+    - stale replays         0 rows
+    + snapshot              captured=2026-06-19T14:37:00Z, weekly_percent=31
+  note: same week — no window re-anchor (no week_reset_events row)
+  (dry-run — nothing written)

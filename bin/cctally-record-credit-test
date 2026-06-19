@@ -9,19 +9,20 @@
 # gotcha_sqlite_writer_version_dirties_fixtures). Goldens compare semantic
 # TEXTUAL output (preview / --json envelope), never raw .db bytes.
 #
-# Determinism: CCTALLY_AS_OF pins "now"; TZ=Etc/UTC; the reused
-# _fire_in_place_credit stamps week_reset_events.detected_at_utc via
-# wall-clock now_utc_iso() (audit-only, not in any clamp/display/--json),
-# so goldens select AROUND it — the --json envelope carries only
-# effectiveAtUtc and never detected_at_utc.
+# Determinism: CCTALLY_AS_OF pins "now"; TZ=Etc/UTC. M2 (#209): a credit
+# writes a weekly_credit_floors row (NOT a week_reset_events row) — the week
+# is NOT re-anchored. weekly_credit_floors.applied_at_utc is stamped via
+# wall-clock now_utc_iso() (audit-only, not in any clamp/display/--json), so
+# goldens carry only effectiveAtUtc and never applied_at_utc.
 #
 # Scenarios (spec §6):
 #   S1  surface — --to 31 --yes applies; `report` then renders 31% for the
 #       post-credit segment (the usage-snapshot repair surfaces here without
 #       JSONL cost fixtures; `weekly` recomputes cost from session_entries
 #       and shows nothing in an empty scratch — see Task 2 note).
-#   S2  dry-run — DB row count unchanged; preview text matches a golden.
-#   S5  --json --yes — envelope matches a golden (detected_at_utc absent).
+#   S2  dry-run — DB row count unchanged; preview text matches a golden
+#       (now: `+ weekly_credit_floors` + the same-week-no-re-anchor note).
+#   S5  --json --yes — envelope matches a golden (creditFloorInserted; M2).
 #   S6  non-TTY — without --yes/--dry-run refused (exit 2).
 #
 # Pattern: dynamic-import of bin/cctally (matches the selfheal harness).
