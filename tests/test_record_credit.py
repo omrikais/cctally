@@ -301,6 +301,34 @@ def test_non_tty_refused(ns, monkeypatch, capsys):
     assert "record-credit:" in capsys.readouterr().err
 
 
+def test_db_error_exits_3(ns, monkeypatch, capsys):
+    """A sqlite3.DatabaseError raised inside the DB work returns exit 3 with a
+    plain-text `record-credit:` on stderr (docs §Exit codes "3 — a database
+    error"; spec §4).
+
+    Non-vacuity: before the fix, `conn = open_db()` sat OUTSIDE the function's
+    try/finally, so this exception fell through to the global handler and the
+    command exited 1. With the fix (open_db() inside the try + an
+    `except sqlite3.DatabaseError -> return 3` arm) it returns 3. Stash the fix
+    and this asserts 1, not 3.
+
+    Patch `open_db` on `cmd_record_credit`'s own module namespace
+    (`__globals__` IS `_cctally_record.__dict__`) — the bare `open_db()` call
+    resolves there, NOT through the `cctally` ns, so `setitem(ns, ...)` would
+    not intercept it.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    g = ns["cmd_record_credit"].__globals__
+
+    def boom(*a, **k):
+        raise sqlite3.DatabaseError("boom")
+
+    monkeypatch.setitem(g, "open_db", boom)
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=True, json=False))
+    assert rc == 3
+    assert "record-credit:" in capsys.readouterr().err
+
+
 def test_to_ge_from_plain_stderr_even_with_json(ns, monkeypatch, capsys):
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn); conn.close()

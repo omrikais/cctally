@@ -2353,7 +2353,7 @@ def _resolve_prior_5h(conn, at_dt):
         "SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key "
         "FROM weekly_usage_snapshots "
         "WHERE five_hour_resets_at IS NOT NULL AND five_hour_window_key IS NOT NULL "
-        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()
+        "ORDER BY unixepoch(captured_at_utc) DESC, id DESC LIMIT 1").fetchone()
     if row is None:
         return (None, None, None)
     try:
@@ -2460,15 +2460,15 @@ def _credit_json(plan, *, applied, dry_run, forced, stale_replays, hwm_before):
 
 
 def cmd_record_credit(args) -> int:
-    c = _cctally()
     now = _command_as_of()
     try:
         at_dt = _parse_credit_at(getattr(args, "at", None), now)
     except ValueError as e:
         eprint(f"record-credit: {e}")
         return 2
-    conn = open_db()
+    conn = None
     try:
+        conn = open_db()
         # 1. Resolve the week.
         if getattr(args, "week", None):
             week_start_date = args.week
@@ -2605,8 +2605,17 @@ def cmd_record_credit(args) -> int:
                   f"{plan.from_pct:g}% -> {plan.to_pct:g}% "
                   f"(effective {plan.effective_iso})")
         return 0
+    except sqlite3.DatabaseError as e:
+        # Documented exit 3 (docs/commands/record-credit.md "3 — a database
+        # error"). The inner ValueError->2 / EOFError paths return before
+        # reaching here, so this only catches genuine DB failures from
+        # open_db() through _apply_credit/output. Plain-text on stderr,
+        # matching the record-credit: <msg> convention of the validation paths.
+        eprint(f"record-credit: {e}")
+        return 3
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def cmd_record_usage(args: argparse.Namespace) -> int:

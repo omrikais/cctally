@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Golden / surface harness for `cctally record-credit` (issue #209).
+#
+# record-credit is a WRITE command, so — following the
+# bin/cctally-record-usage-selfheal-test precedent — the seeded state is
+# built INLINE in a scratch HOME rather than from a committed .db fixture.
+# That dodges the SQLite byte-portability / writer-version gotchas the
+# committed-fixture path hits (gotcha_sqlite_golden_not_byte_portable_across_versions,
+# gotcha_sqlite_writer_version_dirties_fixtures). Goldens compare semantic
+# TEXTUAL output (preview / --json envelope), never raw .db bytes.
+#
+# Determinism: CCTALLY_AS_OF pins "now"; TZ=Etc/UTC; the reused
+# _fire_in_place_credit stamps week_reset_events.detected_at_utc via
+# wall-clock now_utc_iso() (audit-only, not in any clamp/display/--json),
+# so goldens select AROUND it — the --json envelope carries only
+# effectiveAtUtc and never detected_at_utc.
+#
+# Scenarios (spec §6):
+#   S1  surface — --to 31 --yes applies; `report` then renders 31% for the
+#       post-credit segment (the usage-snapshot repair surfaces here without
+#       JSONL cost fixtures; `weekly` recomputes cost from session_entries
+#       and shows nothing in an empty scratch — see Task 2 note).
+#   S2  dry-run — DB row count unchanged; preview text matches a golden.
+#   S5  --json --yes — envelope matches a golden (detected_at_utc absent).
+#   S6  non-TTY — without --yes/--dry-run refused (exit 2).
+#
+# Pattern: dynamic-import of bin/cctally (matches the selfheal harness).
+
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-golden-diff.sh"
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GOLDEN_DIR="$REPO_ROOT/tests/fixtures/record-credit"
+AS_OF="2026-06-19T14:37:00Z"
+
+# Dedicated golden-diff scratch dir, cleaned independently of the per-scenario
+# scratch HOMEs. Pointing GOLDEN_DIFF_TMPDIR at a per-scenario HOME that the
+# harness later `rm -rf`s leaves _lib-golden-diff.sh temp files racing the
+# teardown (cosmetic `rm: Directory not empty`). Keeping it separate sidesteps
+# that — set once, torn down at the very end.
+GDT="$(mktemp -d -t cctally-rc-gdt.XXXXXX)"
+export GOLDEN_DIFF_TMPDIR="$GDT"
+trap 'rm -rf "$GDT"' EXIT
+
+pass_count=0
+fail_count=0
+
+assert_eq () {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $label"
+        printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Seed a 46% current week into a fresh scratch HOME.
+seed_week () {
+    local scratch="$1"
+    REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$scratch" TZ=Etc/UTC \
+    CCTALLY_AS_OF="$AS_OF" python3 - <<'PY'
+import importlib.util, os, pathlib, sys
+from importlib.machinery import SourceFileLoader
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+assert str(mod.APP_DIR).startswith(os.environ["HOME"]), "harness isolation broken"
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+conn = mod.open_db()
+conn.execute(
+    "INSERT INTO weekly_usage_snapshots "
+    "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+    " week_end_at, weekly_percent, page_url, source, payload_json) "
+    "VALUES (?,?,?,?,?,?,?,?,?)",
+    ("2026-06-18T21:12:00Z", "2026-06-13", "2026-06-20",
+     "2026-06-13T05:00:00+00:00", "2026-06-20T05:00:00+00:00", 46.0,
+     None, "userscript", "{}"),
+)
+conn.commit(); conn.close()
+PY
+}
+
+# Drive the record-credit subcommand via the real CLI parser. Honors
+# CCTALLY_AS_OF + TZ; pass the subcommand flags after the scratch HOME.
+rc_cli () {
+    local scratch="$1"; shift
+    HOME="$scratch" TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$REPO_ROOT/bin/cctally" record-credit "$@"
+}
+
+run_cli () {
+    # $1=scratch HOME, rest=cctally args. Honors CCTALLY_AS_OF + TZ.
+    local scratch="$1"; shift
+    HOME="$scratch" TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        "$REPO_ROOT/bin/cctally" "$@"
+}
+
+snap_count () {
+    local scratch="$1"
+    REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$scratch" python3 - <<'PY'
+import importlib.util, os, pathlib, sys
+from importlib.machinery import SourceFileLoader
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+conn = mod.open_db()
+n = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
+conn.close()
+print(n)
+PY
+}
+
+# ── S1: apply surfaces 31% in `report` ─────────────────────────────────
+# Apply via the CLI subcommand, then assert the repaired usage % surfaces
+# in the `report` CLI (`report` joins usage snapshots directly; `weekly`
+# recomputes cost from session_entries and renders nothing in an empty
+# scratch, so `report` is the faithful surface for the snapshot repair).
+S1="$(mktemp -d -t cctally-rc-s1.XXXXXX)"
+seed_week "$S1" >/dev/null
+rc_cli "$S1" --to 31 --yes >/dev/null 2>&1
+s1_ec=$?
+assert_eq "S1 record-credit --to 31 --yes exit code" "0" "$s1_ec"
+report_out=$(run_cli "$S1" report 2>/dev/null)
+if printf '%s\n' "$report_out" | grep -q '31.00%'; then
+    echo "PASS S1 report renders 31% post-credit"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL S1 report renders 31% post-credit"
+    printf '%s\n' "$report_out" | head -20
+    fail_count=$((fail_count + 1))
+fi
+rm -rf "$S1"
+
+# ── S2: --dry-run writes nothing; preview text matches golden ──────────
+S2="$(mktemp -d -t cctally-rc-s2.XXXXXX)"
+seed_week "$S2" >/dev/null
+before=$(snap_count "$S2")
+preview=$(rc_cli "$S2" --to 31 --dry-run 2>&1)
+s2_ec=$?
+after=$(snap_count "$S2")
+assert_eq "S2 --dry-run exit code" "0" "$s2_ec"
+assert_eq "S2 --dry-run leaves snapshot count unchanged" "$before" "$after"
+preview_file="$S2/preview.txt"
+printf '%s\n' "$preview" > "$preview_file"
+if _golden_diff_files "S2 dry-run preview" "$GOLDEN_DIR/dry-run-preview.txt" "$preview_file"; then
+    echo "PASS S2 dry-run preview matches golden"
+    pass_count=$((pass_count + 1))
+else
+    fail_count=$((fail_count + 1))
+fi
+rm -rf "$S2"
+
+# ── S5: --json --yes envelope matches golden ───────────────────────────
+S5="$(mktemp -d -t cctally-rc-s5.XXXXXX)"
+seed_week "$S5" >/dev/null
+json_out=$(rc_cli "$S5" --to 31 --json --yes 2>/dev/null)
+s5_ec=$?
+assert_eq "S5 --json --yes exit code" "0" "$s5_ec"
+json_file="$S5/envelope.json"
+printf '%s\n' "$json_out" | python3 -m json.tool > "$json_file" 2>/dev/null
+if _golden_diff_files "S5 --json envelope" "$GOLDEN_DIR/json-envelope.json" "$json_file"; then
+    echo "PASS S5 --json envelope matches golden"
+    pass_count=$((pass_count + 1))
+else
+    fail_count=$((fail_count + 1))
+fi
+rm -rf "$S5"
+
+# ── S6: non-TTY without --yes/--dry-run is refused ─────────────────────
+S6="$(mktemp -d -t cctally-rc-s6.XXXXXX)"
+seed_week "$S6" >/dev/null
+s6_out=$(rc_cli "$S6" --to 31 </dev/null 2>&1)
+s6_ec=$?
+assert_eq "S6 non-TTY (no --yes/--dry-run) refused exit 2" "2" "$s6_ec"
+if printf '%s\n' "$s6_out" | grep -q '^record-credit:'; then
+    echo "PASS S6 non-TTY refusal prints record-credit: on stderr"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL S6 non-TTY refusal message"
+    printf '%s\n' "$s6_out" | head
+    fail_count=$((fail_count + 1))
+fi
+rm -rf "$S6"
+
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]
