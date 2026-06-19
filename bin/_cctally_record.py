@@ -2174,6 +2174,64 @@ def _read_reset_zero_marker():
     return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
 
 
+@dataclass(frozen=True)
+class CreditPlan:
+    week_start_date: str
+    week_start_at: str
+    week_end_at: str
+    cur_end_canon: str
+    from_pct: float
+    from_source: str          # "hwm" | "explicit"
+    to_pct: float
+    effective_iso: str        # week_reset_events.effective_reset_at_utc (floored to hour)
+    captured_iso: str         # synthetic snapshot captured_at_utc (un-floored), 'Z'
+
+
+def _parse_credit_at(value, now):
+    """Parse --at as an aware UTC datetime; default to `now`. Naive => UTC
+    (mirrors bin/_cctally_five_hour.py:88), NOT parse_iso_datetime (host-local)."""
+    if value is None:
+        return now
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(f"--at: {e}") from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
+                       from_pct, from_source, to_pct, at_dt, now):
+    """Validate inputs and build a CreditPlan. Pure (no DB/file I/O).
+    Raises ValueError(msg) on any violation — caller maps to exit 2."""
+    to_pct = _normalize_percent(to_pct)
+    from_pct = _normalize_percent(from_pct)
+    if not (0.0 <= to_pct <= 100.0) or not (0.0 <= from_pct <= 100.0):
+        raise ValueError("--to/--from must be in [0, 100]")
+    if to_pct >= from_pct:
+        raise ValueError(f"not a credit: to >= from ({to_pct} >= {from_pct})")
+    ws = parse_iso_datetime(week_start_at, "week_start_at")
+    we = parse_iso_datetime(week_end_at, "week_end_at")
+    if not (ws <= at_dt < we):
+        raise ValueError(f"--at {at_dt.isoformat()} is outside the week window")
+    if at_dt > now:
+        raise ValueError("--at is in the future")
+    effective_dt = _floor_to_hour(at_dt)
+    cur_end_canon = _canonicalize_optional_iso(week_end_at, "record-credit.week_end")
+    return CreditPlan(
+        week_start_date=week_start_date,
+        week_start_at=week_start_at,
+        week_end_at=week_end_at,
+        cur_end_canon=cur_end_canon,
+        from_pct=from_pct,
+        from_source=from_source,
+        to_pct=to_pct,
+        effective_iso=effective_dt.isoformat(timespec="seconds"),
+        captured_iso=at_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
                           *, observed_pre_credit_pct, effective_dt):
     """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
