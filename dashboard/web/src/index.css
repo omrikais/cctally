@@ -3202,6 +3202,39 @@ mark.current {
     padding-right: max(8px, env(safe-area-inset-right));
   }
 
+  /* #214 M3-1: sparse single-column panels shouldn't reserve the desktop
+     320px floor — collapse to content height (kills the dead-space scroll).
+     Desktop 2-col keeps its floor; this rule is inside the 640px block.
+     The base .panel{min-height:320px} precedes this block, so this same-
+     specificity rule wins by source order — no #root prefix needed. */
+  .panel { min-height: 0; }
+
+  /* #214 M3-2: keep panel headers on one line at phone width.
+     Font-shrink does the real work; the ellipsis guard + the nested
+     title-wrapper's min-width:0 are the fallback (an inline-styled wrapper
+     defaults to min-width:auto, which would block h2 from ever ellipsizing). */
+  .panel-header { gap: 6px; }
+  .panel-header > div:first-child { min-width: 0; }   /* nested title wrapper (Sessions/Blocks/Daily/Projects/Recent Alerts/Cache Report) */
+  .panel-header h2 {
+    font-size: 13px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .panel-header h2 .sub { font-size: 11px; }
+  .panel-header .icon,
+  .panel-header .chip { flex-shrink: 0; }
+  .panel-header .chip { white-space: nowrap; }
+  /* Current Week freshness chip (renders only when aging/stale) — CSS cap is
+     the default path (CurrentWeekPanel has no isMobile signal to branch on). */
+  .panel-header .chip.chip-aging,
+  .panel-header .chip.chip-stale {
+    max-width: 50vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* iOS auto-zooms when the user taps an <input> with computed font-size
      < 16px. Bump every interactive text field to 16px on phones to
      suppress the zoom. Includes the Sessions filter/search inputs and
