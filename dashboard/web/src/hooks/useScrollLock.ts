@@ -26,3 +26,13 @@ export function useScrollLock(active: boolean): void {
     };
   }, [active]);
 }
+
+/** Test-only: reset the module-level lock state between tests so a test that
+ *  forgets to unmount an open overlay can't poison `lockCount` for later
+ *  tests in the same file. Never imported by production code (tree-shaken
+ *  out of the bundle). Mirrors the `_resetForTests` convention in
+ *  `store/store.ts` and `store/keymap.ts`. */
+export function _resetForTests(): void {
+  lockCount = 0;
+  savedOverflow = '';
+}

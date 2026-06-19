@@ -1,6 +1,11 @@
 import { renderHook } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
-import { useScrollLock } from './useScrollLock';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { useScrollLock, _resetForTests } from './useScrollLock';
+
+beforeEach(() => {
+  _resetForTests();
+  document.body.style.overflow = '';
+});
 
 afterEach(() => {
   document.body.style.overflow = '';

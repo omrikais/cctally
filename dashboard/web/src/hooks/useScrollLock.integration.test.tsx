@@ -24,6 +24,7 @@ import {
   uninstallGlobalKeydown,
   _resetForTests as _resetKeymap,
 } from '../store/keymap';
+import { _resetForTests as _resetScrollLock } from './useScrollLock';
 import { ModalRoot } from '../modals/ModalRoot';
 import { ShareModalRoot } from '../share/ShareModalRoot';
 import { DoctorModal } from '../components/DoctorModal';
@@ -51,6 +52,7 @@ beforeEach(() => {
   localStorage.clear();
   _resetForTests();
   _resetKeymap();
+  _resetScrollLock();
   installGlobalKeydown();
   document.body.innerHTML = '';
   document.body.style.overflow = '';
