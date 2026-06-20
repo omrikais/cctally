@@ -147,7 +147,7 @@ What stays in bin/cctally:
   c.ORIGINAL_SYS_ARGV = list(sys.argv)``.
 - ``eprint``, ``now_utc_iso``, ``parse_iso_datetime``, ``open_db``,
   ``load_config``, ``save_config``, ``_now_utc``, ``_command_as_of``,
-  ``format_display_dt``, ``resolve_display_tz``,
+  ``format_display_dt``,
   ``normalize_display_tz_value``, ``_render_migration_error_banner``,
   ``_aggregate_daily``, ``_aggregate_monthly``, ``_aggregate_weekly``,
   ``_calculate_entry_cost``, ``_canonical_5h_window_key``,
@@ -305,7 +305,6 @@ from _cctally_core import (
 )
 from _lib_display_tz import (
     format_display_dt,
-    resolve_display_tz,
     normalize_display_tz_value,
     _compute_display_block,
 )
@@ -8472,11 +8471,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     _c_boot.ORIGINAL_ENTRYPOINT = shutil.which("cctally")
     _c_boot._UPDATE_WORKER = UpdateWorker()
 
-    # Resolve display tz (--tz overrides config.display.tz). The dashboard's
-    # envelope-emitted display block (Tasks 11-12) reads this; for now,
-    # stash on args so downstream selectors can pick it up uniformly.
+    # Load config for the bind-host + expose-transcripts resolution below. (#217
+    # S1 / U7b: dropped the dead ``args._resolved_tz = resolve_display_tz(...)``
+    # write — nothing in the dashboard ever read it back; the envelope display
+    # block it was speculatively staged for was never wired. Each report
+    # subcommand resolves + reads its own ``args._resolved_tz`` independently.)
     config = load_config()
-    args._resolved_tz = resolve_display_tz(args, config)
 
     # Resolve bind host: --host flag > config.dashboard.bind > argparse default.
     # `--host` defaults to None (Task 2) so we can distinguish "user explicitly

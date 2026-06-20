@@ -1,4 +1,5 @@
 import sqlite3, sys, pathlib
+import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 import _cctally_cache as cc
@@ -3597,3 +3598,136 @@ def test_rollup_fill_does_not_call_assemble_session(monkeypatch):
         "SELECT cache_rebuild_count FROM conversation_sessions "
         "WHERE session_id='rb1'").fetchone()[0]
     assert stored == _full_assembly_rebuild_count(c, "rb1") == 3
+
+
+# --- U7b: cost-map / latest-meta SQL consolidation parity (#217 S1) ---------
+# These pin the consolidated shapes against the prior per-path SQL so a future
+# regression (or the refactor itself) cannot silently change a cost or a
+# latest-non-null cwd/branch. The cost-map test feeds the SAME turn keys to both
+# public maps and a hand-rolled per-key reference; the meta-map test exercises
+# the "latest non-null cwd vs git_branch land on DIFFERENT rows" edge that a
+# plain MAX() would get wrong.
+
+def _reference_turn_costs(c, keys):
+    """Independent per-(msg_id,req_id) cost reference computed one key at a time
+    (NOT via the production helper), so the parity assertion is non-vacuous."""
+    out = {}
+    for m, r in keys:
+        if m is None or r is None:
+            continue
+        row = c.execute(
+            "SELECT model, input_tokens, output_tokens, cache_create_tokens, "
+            "cache_read_tokens, cost_usd_raw FROM session_entries "
+            "WHERE msg_id=? AND req_id=?", (m, r)).fetchone()
+        if row is None:
+            continue
+        out[(m, r)] = cq._entry_cost(*row)
+    return out
+
+
+def test_session_and_turn_cost_map_share_helper_parity():
+    """_session_cost_map and _turn_cost_map must agree with an independent
+    per-key cost reference — proving the extracted shared (msg_id,req_id) cost
+    helper both delegate to is correct across multiple sessions + a vendor
+    cost_usd_raw override + a key absent from session_entries."""
+    c = _conn()
+    # s1: two turns; m2/r2 carries a vendor cost_usd_raw override.
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         model=_MODEL, msg_id="m1", req_id="r1")
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=1000, out=500, cc=200, cr=100)
+    _msg(c, session_id="s1", uuid="a2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         model=_MODEL, msg_id="m2", req_id="r2")
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=10, cost_usd_raw=4.25)
+    # s2: one turn.
+    _msg(c, session_id="s2", uuid="a3", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="assistant",
+         model=_MODEL, msg_id="m3", req_id="r3")
+    _entry(c, source_path="b.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m3", req_id="r3", inp=2000, out=1000)
+    # A turn key present in conversation_messages but ABSENT from session_entries
+    # (a <synthetic> walker-skipped row) -> contributes 0 by omission.
+    _msg(c, session_id="s2", uuid="a4", source_path="b.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-02T00:00:05Z", entry_type="assistant",
+         model=_MODEL, msg_id="m4", req_id="r4")
+
+    keys = [("m1", "r1"), ("m2", "r2"), ("m3", "r3"), ("m4", "r4"),
+            (None, None)]
+    ref_turn = _reference_turn_costs(c, keys)
+    turn = cq._turn_cost_map(c, keys)
+    assert turn == ref_turn, (turn, ref_turn)
+
+    # _session_cost_map sums the per-(msg,req) costs into the owning session.
+    sess = cq._session_cost_map(c, ["s1", "s2"])
+    assert sess["s1"] == pytest.approx(
+        ref_turn[("m1", "r1")] + ref_turn[("m2", "r2")])
+    assert sess["s2"] == pytest.approx(ref_turn[("m3", "r3")])
+    # The override turn is the dominant cost -> sanity that it actually flowed.
+    assert sess["s1"] >= 4.25
+
+
+def test_session_latest_meta_map_parity_latest_non_null_distinct_rows():
+    """_session_latest_meta_map must return the LATEST non-null cwd and the
+    LATEST non-null git_branch INDEPENDENTLY — even when they land on different
+    rows, and even when the newest row has them NULL. A plain MAX() (or a single
+    row's values) would get this wrong."""
+    c = _conn()
+    # Three rows, ascending time. cwd's latest non-null is on the MIDDLE row
+    # (newest row has cwd NULL); git_branch's latest non-null is on the NEWEST.
+    _msg(c, session_id="s1", uuid="r1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         cwd="/old/proj", git_branch="old-branch")
+    _msg(c, session_id="s1", uuid="r2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="human",
+         cwd="/new/proj", git_branch=None)
+    _msg(c, session_id="s1", uuid="r3", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:10Z", entry_type="human",
+         cwd=None, git_branch="new-branch")
+    # A second session with ALL-NULL meta -> (None, None).
+    _msg(c, session_id="s2", uuid="z1", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="human")
+
+    meta = cq._session_latest_meta_map(c, ["s1", "s2"])
+    assert meta["s1"] == ("/new/proj", "new-branch"), meta["s1"]
+    assert meta["s2"] == (None, None)
+
+
+def _reference_latest_meta(c, sids):
+    """Independent per-session latest-non-null cwd/branch reference computed via
+    two separate ordered scans — the prior correlated-subquery semantics, so the
+    parity assertion against the (possibly-consolidated) production map is
+    non-vacuous."""
+    out = {}
+    for sid in sids:
+        cwd = c.execute(
+            "SELECT cwd FROM conversation_messages "
+            "WHERE session_id=? AND cwd IS NOT NULL "
+            "ORDER BY timestamp_utc DESC, id DESC LIMIT 1", (sid,)).fetchone()
+        branch = c.execute(
+            "SELECT git_branch FROM conversation_messages "
+            "WHERE session_id=? AND git_branch IS NOT NULL "
+            "ORDER BY timestamp_utc DESC, id DESC LIMIT 1", (sid,)).fetchone()
+        out[sid] = (cwd[0] if cwd else None, branch[0] if branch else None)
+    return out
+
+
+def test_session_latest_meta_map_matches_reference_scan():
+    """The production map equals an independent two-scan reference across a mix
+    of sessions (distinct-row latest, all-null, single-row)."""
+    c = _conn()
+    _msg(c, session_id="s1", uuid="r1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         cwd="/a", git_branch="b1")
+    _msg(c, session_id="s1", uuid="r2", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="human",
+         cwd="/b", git_branch=None)
+    _msg(c, session_id="s3", uuid="q1", source_path="c.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-03T00:00:00Z", entry_type="human",
+         cwd="/only", git_branch="main")
+    _msg(c, session_id="s2", uuid="z1", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="human")
+    sids = ["s1", "s2", "s3"]
+    assert cq._session_latest_meta_map(c, sids) == _reference_latest_meta(c, sids)

@@ -653,27 +653,57 @@ def session_cache_rebuild_count(conn, session_id) -> int:
         _lightweight_rebuild_events(conn, session_id))
 
 
+def _turn_costs_for_keys(conn, keys):
+    """{(msg_id, req_id): cost_usd} for the given turn keys, joined ONCE to the
+    deduped session_entries row per (msg_id, req_id) (#217 S1 / U7b — the SINGLE
+    cost-attribution chokepoint both ``_turn_cost_map`` and ``_session_cost_map``
+    delegate to, so the cost-once-per-turn rule is never reimplemented).
+
+    NULL-filters the keys, chunks the OR-of-pairs to stay well under SQLite's
+    variable limit, and computes each cost via the shared pricing helper
+    (honoring a vendor ``cost_usd_raw`` override). Keys absent from
+    session_entries (e.g. ``<synthetic>`` walker-skipped rows) are simply not
+    present in the result -> cost 0 by omission. Parity guard:
+    ``test_session_and_turn_cost_map_share_helper_parity``."""
+    costs = {}
+    norm = [(m, r) for (m, r) in keys if m is not None and r is not None]
+    if not norm:
+        return costs
+    for i in range(0, len(norm), 400):
+        chunk = norm[i:i + 400]
+        cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
+        params = [v for pair in chunk for v in pair]
+        sql = ("SELECT msg_id, req_id, model, input_tokens, output_tokens, "
+               "cache_create_tokens, cache_read_tokens, cost_usd_raw "
+               "FROM session_entries WHERE " + cond)
+        for m, r, model, inp, out, cc, cr, raw in conn.execute(sql, params):
+            costs[(m, r)] = _entry_cost(model, inp, out, cc, cr, raw)
+    return costs
+
+
 def _session_cost_map(conn, session_ids):
-    """{session_id: total_cost_usd} for the given sessions. Joins
-    conversation_messages turn keys to the single deduped session_entries row
-    per (msg_id, req_id), so a turn replayed across files contributes once.
-    (msg_id, req_id) is globally unique in session_entries and maps to exactly
-    one session_id, so per-session sums are clean."""
+    """{session_id: total_cost_usd} for the given sessions. Resolves each
+    session's distinct (msg_id, req_id) turn keys, then attributes cost via the
+    shared ``_turn_costs_for_keys`` helper (cost-once per deduped session_entries
+    row), summing into the owning session. (msg_id, req_id) is globally unique in
+    session_entries and maps to exactly one session_id, so per-session sums are
+    clean and a turn replayed across files contributes once."""
     costs = {sid: 0.0 for sid in session_ids}
     if not session_ids:
         return costs
     placeholders = ",".join("?" for _ in session_ids)
-    sql = (
-        "SELECT cm.session_id, se.model, se.input_tokens, se.output_tokens, "
-        "       se.cache_create_tokens, se.cache_read_tokens, se.cost_usd_raw "
-        "FROM (SELECT DISTINCT session_id, msg_id, req_id "
-        "      FROM conversation_messages "
-        "      WHERE session_id IN (%s) AND msg_id IS NOT NULL AND req_id IS NOT NULL) cm "
-        "JOIN session_entries se ON se.msg_id = cm.msg_id AND se.req_id = cm.req_id"
-        % placeholders
-    )
-    for sid, model, inp, out, cc, cr, raw in conn.execute(sql, list(session_ids)):
-        costs[sid] = costs.get(sid, 0.0) + _entry_cost(model, inp, out, cc, cr, raw)
+    pairs = conn.execute(
+        "SELECT DISTINCT session_id, msg_id, req_id "
+        "FROM conversation_messages "
+        "WHERE session_id IN (%s) AND msg_id IS NOT NULL AND req_id IS NOT NULL"
+        % placeholders,
+        list(session_ids),
+    ).fetchall()
+    if not pairs:
+        return costs
+    key_cost = _turn_costs_for_keys(conn, [(m, r) for _, m, r in pairs])
+    for sid, m, r in pairs:
+        costs[sid] = costs.get(sid, 0.0) + key_cost.get((m, r), 0.0)
     return costs
 
 
@@ -697,23 +727,31 @@ def _session_latest_meta_map(conn, session_ids):
     """{session_id: (cwd, git_branch)} using the most-recent NON-NULL value per
     column — the SAME posture as get_conversation's _latest, so the rail and the
     reader agree on a session whose cwd/branch changed over its lifetime (a plain
-    MAX() picks the lexical max, not the latest). Bounded to the page's sessions
-    via per-session correlated lookups over idx (session_id, timestamp_utc, id),
-    mirroring _session_cost_map / _session_models_map."""
+    MAX() picks the lexical max, not the latest). The latest non-null cwd and the
+    latest non-null git_branch may land on DIFFERENT rows (the newest row can
+    carry one but not the other), so each is resolved independently.
+
+    #217 S1 / U7b: consolidated from the prior TWIN correlated subqueries into a
+    SINGLE windowed scan — two ``FIRST_VALUE`` window functions over one
+    partition pass per column, each ordered ``(<col> IS NULL), timestamp_utc DESC,
+    id DESC`` so the most-recent non-null value sorts first (and an all-null
+    session yields NULL, exactly as the LIMIT-1 subquery did). Guarded by
+    ``test_session_latest_meta_map_parity_*`` against the prior semantics; if the
+    window form could not match it, the old correlated SQL would be kept (it
+    matched cleanly, so the consolidation lands)."""
     meta = {sid: (None, None) for sid in session_ids}
     if not session_ids:
         return meta
     placeholders = ",".join("?" for _ in session_ids)
     sql = (
-        "SELECT s.session_id, "
-        "  (SELECT c.cwd FROM conversation_messages c "
-        "   WHERE c.session_id = s.session_id AND c.cwd IS NOT NULL "
-        "   ORDER BY c.timestamp_utc DESC, c.id DESC LIMIT 1), "
-        "  (SELECT b.git_branch FROM conversation_messages b "
-        "   WHERE b.session_id = s.session_id AND b.git_branch IS NOT NULL "
-        "   ORDER BY b.timestamp_utc DESC, b.id DESC LIMIT 1) "
-        "FROM (SELECT DISTINCT session_id FROM conversation_messages "
-        "      WHERE session_id IN (%s)) s" % placeholders
+        "SELECT DISTINCT session_id, "
+        "  FIRST_VALUE(cwd) OVER ("
+        "    PARTITION BY session_id "
+        "    ORDER BY (cwd IS NULL), timestamp_utc DESC, id DESC), "
+        "  FIRST_VALUE(git_branch) OVER ("
+        "    PARTITION BY session_id "
+        "    ORDER BY (git_branch IS NULL), timestamp_utc DESC, id DESC) "
+        "FROM conversation_messages WHERE session_id IN (%s)" % placeholders
     )
     for sid, cwd, branch in conn.execute(sql, list(session_ids)):
         meta[sid] = (cwd, branch)
@@ -985,22 +1023,13 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
 def _turn_cost_map(conn, turn_keys):
     """{(msg_id, req_id): cost_usd} for the given non-null turn keys, joined ONCE
     to the deduped session_entries row. Keys absent from session_entries (e.g.
-    <synthetic> walker-skipped rows) are simply not present → cost 0 by omission."""
-    costs = {}
-    keys = [(m, r) for (m, r) in turn_keys if m is not None and r is not None]
-    if not keys:
-        return costs
-    # Chunk the OR-of-pairs to stay well under SQLite's variable limit.
-    for i in range(0, len(keys), 400):
-        chunk = keys[i:i + 400]
-        cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
-        params = [v for pair in chunk for v in pair]
-        sql = ("SELECT msg_id, req_id, model, input_tokens, output_tokens, "
-               "cache_create_tokens, cache_read_tokens, cost_usd_raw "
-               "FROM session_entries WHERE " + cond)
-        for m, r, model, inp, out, cc, cr, raw in conn.execute(sql, params):
-            costs[(m, r)] = _entry_cost(model, inp, out, cc, cr, raw)
-    return costs
+    <synthetic> walker-skipped rows) are simply not present → cost 0 by omission.
+
+    Thin wrapper over the shared ``_turn_costs_for_keys`` chokepoint (#217 S1 /
+    U7b) — the search path's ``_attach_costs`` still consumes this name + its
+    float-valued contract, so the public signature is unchanged while the body
+    is single-sourced with ``_session_cost_map``."""
+    return _turn_costs_for_keys(conn, turn_keys)
 
 
 def _turn_usage_map(conn, turn_keys):
