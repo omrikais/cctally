@@ -18,6 +18,7 @@ import type {
   ProjectedMetric,
 } from '../types/envelope';
 import { AXIS_TITLE_LABEL } from '../lib/alertAxis';
+import { ModalHeader } from '../modals/ModalHeader';
 
 // Notifier dispatch backends (Phase B). The union mirrors
 // `AlertsSettingsEnvelope.notifier` (single source of truth) so the dropdown
@@ -472,12 +473,7 @@ export function SettingsOverlay() {
         aria-modal="true"
         aria-labelledby="settings-title"
       >
-        <header className="modal-header">
-          <h2 id="settings-title">Settings</h2>
-          <button className="modal-close" type="button" aria-label="Close" onClick={close}>
-            ×
-          </button>
-        </header>
+        <ModalHeader title="Settings" titleId="settings-title" onClose={close} />
         <div className="modal-body">
           <fieldset className="settings-fs">
             <legend>Display timezone</legend>

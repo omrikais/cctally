@@ -5,6 +5,7 @@ import { useScrollLock } from '../hooks/useScrollLock';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { ModalHeader } from '../modals/ModalHeader';
 
 interface KeyTableProps {
   panelOrder: readonly PanelId[];
@@ -151,17 +152,11 @@ export function HelpOverlay() {
   return (
     <div id="help-overlay" onClick={() => setOpen(false)}>
       <div ref={cardRef} className="help-card" onClick={(e) => e.stopPropagation()}>
-        <div className="help-header">
-          <h2>{isMobile ? 'Help' : 'Keybindings'}</h2>
-          <button
-            className="modal-close"
-            type="button"
-            aria-label="Close"
-            onClick={() => setOpen(false)}
-          >
-            ×
-          </button>
-        </div>
+        <ModalHeader
+          title={isMobile ? 'Help' : 'Keybindings'}
+          className="help-header"
+          onClose={() => setOpen(false)}
+        />
         {isMobile ? (
           <>
             <GestureGuide />

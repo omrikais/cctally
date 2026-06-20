@@ -2,6 +2,7 @@ import { useMemo, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { ModalHeader } from '../modals/ModalHeader';
 import { UpdateIdleModal } from './UpdateIdleModal';
 import { UpdateRunningModal } from './UpdateRunningModal';
 import { UpdateSuccessModal } from './UpdateSuccessModal';
@@ -103,16 +104,7 @@ export function UpdateModal() {
         aria-labelledby="update-modal-title"
       >
         <div className="modal-handle" aria-hidden="true" />
-        <header className="modal-header">
-          <h2 id="update-modal-title">{title}</h2>
-          <button
-            className="modal-close"
-            aria-label="Close"
-            onClick={close}
-          >
-            ×
-          </button>
-        </header>
+        <ModalHeader title={title} titleId="update-modal-title" onClose={close} />
         <div className="modal-body">{body}</div>
       </div>
     </div>

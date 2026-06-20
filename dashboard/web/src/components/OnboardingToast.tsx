@@ -1,6 +1,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { ModalCloseButton } from '../modals/ModalCloseButton';
 
 const AUTO_DISMISS_MS = 8000;
 
@@ -39,14 +40,11 @@ export function OnboardingToast({ suppressed = false }: { suppressed?: boolean }
   return (
     <div className="onboarding-toast" role="status" aria-live="polite" hidden={suppressed}>
       <span className="onboarding-toast-msg">{msg}</span>
-      <button
+      <ModalCloseButton
+        onClose={() => dispatch({ type: action })}
+        label="Dismiss"
         className="onboarding-toast-dismiss"
-        type="button"
-        aria-label="Dismiss"
-        onClick={() => dispatch({ type: action })}
-      >
-        ×
-      </button>
+      />
     </div>
   );
 }

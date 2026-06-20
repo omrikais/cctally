@@ -35,6 +35,8 @@ import {
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { ModalHeader } from '../modals/ModalHeader';
+import { ModalCloseButton } from '../modals/ModalCloseButton';
 import {
   useDoctorReport,
   type DoctorCategory,
@@ -115,28 +117,27 @@ export function DoctorModal(): JSX.Element | null {
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="modal-header">
-          <h2 id="doctor-modal-title">Doctor</h2>
-          <div className="doctor-modal__header-actions">
-            <button
-              type="button"
-              className="doctor-modal__refresh"
-              onClick={() => { void refresh(); }}
-              disabled={loading}
-              aria-label="Refresh doctor report"
-            >
-              {loading ? 'refreshing…' : '↻ refresh'}
-            </button>
-            <button
-              type="button"
-              className="modal-close"
-              aria-label="Close"
-              onClick={close}
-            >
-              ×
-            </button>
-          </div>
-        </header>
+        <ModalHeader
+          title="Doctor"
+          titleId="doctor-modal-title"
+          headerExtras={
+            <div className="doctor-modal__header-actions">
+              <button
+                type="button"
+                className="doctor-modal__refresh"
+                onClick={() => { void refresh(); }}
+                disabled={loading}
+                aria-label="Refresh doctor report"
+              >
+                {loading ? 'refreshing…' : '↻ refresh'}
+              </button>
+              {/* Close stays INSIDE the flex `header-actions` div (8px gap)
+                  rather than ModalHeader's own trailing slot, so the refresh
+                  ↔ close spacing is preserved (#216). */}
+              <ModalCloseButton onClose={close} />
+            </div>
+          }
+        />
         <div className="modal-body">
           {loading && !report && <p>Loading…</p>}
           {error && (
