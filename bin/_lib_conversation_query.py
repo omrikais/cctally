@@ -578,9 +578,11 @@ def _lightweight_rebuild_events(conn, session_id):
                 turn_has_prose[key] = bool(frag_text)
             else:
                 ev = events[ev_idx]
-                # First prose fragment promotes the turn's model/subagent-key
-                # anchor (matches _fold_fragment). subagent_key is uniform across
-                # a turn's fragments (one file), but re-deriving is harmless.
+                # First prose fragment promotes the turn's model anchor. The full
+                # path SEEDS subagent_key and never re-promotes it (only model);
+                # re-deriving subagent_key here is harmless because it is
+                # per-file-invariant across a turn's fragments (one (msg_id,req_id)
+                # = one file), so the two paths key the event identically.
                 if not turn_has_prose.get(key) and frag_text:
                     ev.key = (_subagent_key(source_path), model)
                     ev.model = model

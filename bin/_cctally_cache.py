@@ -1669,9 +1669,10 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids):
     _project_label / _session_cost_map the rail's per-page Python path used), so
     a filtered/displayed value equals what the live rail produced. cost is
     rounded to 6dp to match list_conversations' per-row rounding.
-    cache_rebuild_count is a per-session assemble via the query kernel's
-    single-source-of-truth helper (whole-session property — recompute, never
-    increment).
+    cache_rebuild_count is a per-session lightweight rebuild-count via the
+    query kernel's single-source-of-truth helper (no full assembly — U1; the
+    rule is shared with the reader path) — a whole-session property
+    (recompute, never increment).
 
     No-op when the columns are absent (a pre-migration-015 cache.db being
     re-derived before its 015 ALTER lands), so an early/partial sync never
