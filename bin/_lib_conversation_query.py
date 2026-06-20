@@ -374,62 +374,60 @@ def _cache_read_saved_usd(model, cache_read):
     return full - read
 
 
-def _stamp_cache_failures(items):
-    """Stamp ``item["cache_failure"]`` on each assistant turn that re-creates the
-    bulk of its cached prefix instead of reading it (spec §1). Mutates `items` in
-    place; healthy turns are left WITHOUT the key (absent, not zero — matching the
-    ``tokens?`` "absent, not zero" convention).
+# A normalized cache-failure event. ``compaction`` marks a context-compaction
+# boundary (resets the running-max); otherwise it is an assistant-token event
+# carrying its per-thread/per-model key + the cache_creation/cache_read signal.
+# Both the full-assembly stamp path and the lightweight rebuild-count path build
+# a document-ordered list of these and feed it to the ONE predicate below — the
+# rule is implemented exactly once (U1, #217 S1).
+class _CFEvent:
+    __slots__ = ("compaction", "key", "cc", "cr", "model")
 
-    Walks items in DOCUMENT ORDER (the order `_assemble_session` produces),
-    maintaining a running-max of ``cache_read`` keyed by ``(subagent_key, model)``
-    — ``None`` subagent_key = main session. The key is per-thread AND per-model
-    because Anthropic prompt caches are model-specific: a model switch within a
-    thread legitimately starts a fresh cache (cr ~ 0) and must not read as a loss,
-    and the compound key makes that the first turn under its own key (no prior rm).
-    The per-key running-max is RESET when a context-compaction boundary is crossed
-    (a ``meta`` item whose ``meta_kind == "compaction"``), since compaction
-    legitimately invalidates the prefix and the post-compaction re-prime is not a
-    failure.
+    def __init__(self, *, compaction=False, key=None, cc=0, cr=0, model=None):
+        self.compaction = compaction
+        self.key = key
+        self.cc = cc
+        self.cr = cr
+        self.model = model
 
-    For each assistant item with a ``tokens`` dict — cc = tokens["cache_creation"],
-    cr = tokens["cache_read"], rm = the running-max for this key BEFORE this turn —
-    flag iff rm >= CACHE_FLOOR and cc >= CREATE_FLOOR and cr <= COLLAPSE_FRACTION*rm
-    and cc/(cc+cr) >= RECREATE_FRACTION. The fourth term keeps the rule aligned
-    with the Evidence: it requires that most of THIS turn's context was freshly
-    created, not merely that cache_read dipped. After the check, update
-    ``running_max[key] = max(rm, cr)`` (a failure's small cr never lowers the
-    high-water mark; the next healthy turn re-establishes it).
 
-    Payload (lost-prefix basis — NOT raw cc, which would over-count when the turn
-    also writes genuinely-new cacheable content that was never cached):
-        lost            = min(cc, max(0, rm - cr))
-        tokens_recreated = lost
-        prev_cached      = rm
-        est_wasted_usd   = write(lost) - read(lost)
+def _iter_cache_failures(events):
+    """The single cache-failure rule (spec §1), as a generator over a
+    document-ordered ``_CFEvent`` stream. Yields ``(index, prev_cached, lost,
+    model)`` for each FLAGGED assistant event — ``index`` is the event's position
+    in ``events`` so a caller can map a flag back to its source item.
 
-    Items lacking a ``tokens`` dict (no session_entries row, or non-assistant
-    items other than a compaction meta) are skipped and do NOT move the
-    running-max. Order-dependent by construction; run over document-ordered items.
-    """
+    Maintains a running-max of ``cache_read`` keyed by the event's ``key``
+    (``(subagent_key, model)`` — ``None`` subagent_key = main session). The key
+    is per-thread AND per-model because Anthropic prompt caches are model-
+    specific: a model switch within a thread legitimately starts a fresh cache
+    (cr ~ 0) and must not read as a loss, and the compound key makes that the
+    first event under its own key (no prior rm). The whole map is RESET on a
+    compaction event, since compaction legitimately invalidates the prefix and
+    the post-compaction re-prime is not a failure.
+
+    For each assistant event — cc, cr, and rm (the running-max for this key
+    BEFORE this event) — flag iff rm >= CACHE_FLOOR and cc >= CREATE_FLOOR and
+    cr <= COLLAPSE_FRACTION*rm and cc/(cc+cr) >= RECREATE_FRACTION. The fourth
+    term keeps the rule aligned with the Evidence: it requires that most of THIS
+    event's context was freshly created, not merely that cache_read dipped. After
+    the check, ``running_max[key] = max(rm, cr)`` (a failure's small cr never
+    lowers the high-water mark; the next healthy event re-establishes it).
+
+    ``lost`` is the lost-prefix basis (NOT raw cc, which over-counts when the
+    turn also writes genuinely-new cacheable content): ``min(cc, max(0,
+    rm - cr))``. Order-dependent by construction; run over document-ordered
+    events."""
     running_max = {}   # (subagent_key, model) -> high-water cache_read
-    for it in items:
-        # Context-compaction boundary resets the per-key prefix high-water mark:
-        # the post-compaction re-prime is a legitimate fresh build, not a loss.
-        # Reset the whole map (compaction invalidates every thread's prefix in
-        # this session view; a per-key reset would need a thread tag the meta row
-        # does not reliably carry).
-        if it.get("kind") == "meta" and it.get("meta_kind") == "compaction":
+    for i, ev in enumerate(events):
+        if ev.compaction:
+            # Reset the whole map (compaction invalidates every thread's prefix
+            # in this session view; a per-key reset would need a thread tag the
+            # meta row does not reliably carry).
             running_max.clear()
             continue
-        if it.get("kind") != "assistant":
-            continue
-        tok = it.get("tokens")
-        if not isinstance(tok, dict):
-            continue                      # no session_entries row -> skip, don't move max
-        cc = tok.get("cache_creation", 0) or 0
-        cr = tok.get("cache_read", 0) or 0
-        key = (it.get("subagent_key"), it.get("model"))
-        rm = running_max.get(key, 0)
+        cc, cr = ev.cc, ev.cr
+        rm = running_max.get(ev.key, 0)
         total = cc + cr
         if (rm >= _CACHE_FAILURE_CACHE_FLOOR
                 and cc >= _CACHE_FAILURE_CREATE_FLOOR
@@ -437,36 +435,220 @@ def _stamp_cache_failures(items):
                 and total > 0
                 and cc / total >= _CACHE_FAILURE_RECREATE_FRACTION):
             lost = min(cc, max(0, rm - cr))
-            it["cache_failure"] = {
-                "tokens_recreated": lost,
-                "prev_cached": rm,
-                "est_wasted_usd": _cache_failure_wasted_usd(it.get("model"), lost),
-            }
-        running_max[key] = max(rm, cr)
+            yield (i, rm, lost, ev.model)
+        running_max[ev.key] = max(rm, cr)
+
+
+def _cache_failure_count_over_events(events) -> int:
+    """Count of flagged events in a normalized ``_CFEvent`` stream (the pure
+    predicate the lightweight rebuild-count path consumes). Single source of
+    truth — shares ``_iter_cache_failures`` with the full-assembly stamp."""
+    return sum(1 for _ in _iter_cache_failures(events))
+
+
+def _cache_failure_events_from_items(items):
+    """Build the document-ordered ``_CFEvent`` stream from assembled reader
+    ``items`` plus a parallel ``sources`` list (the source item per event, for
+    stamping). A compaction event per ``meta``/``compaction`` item; an assistant-
+    token event per assistant item carrying a ``tokens`` dict. Items lacking a
+    ``tokens`` dict (no session_entries row, or non-assistant non-compaction
+    items) emit NOTHING and so neither flag nor move the running-max — exactly
+    the pre-U1 skip behavior."""
+    events = []
+    sources = []   # parallel list: the source item per event (for stamping)
+    for it in items:
+        if it.get("kind") == "meta" and it.get("meta_kind") == "compaction":
+            events.append(_CFEvent(compaction=True))
+            sources.append(it)
+            continue
+        if it.get("kind") != "assistant":
+            continue
+        tok = it.get("tokens")
+        if not isinstance(tok, dict):
+            continue                      # no session_entries row -> skip
+        events.append(_CFEvent(
+            key=(it.get("subagent_key"), it.get("model")),
+            cc=tok.get("cache_creation", 0) or 0,
+            cr=tok.get("cache_read", 0) or 0,
+            model=it.get("model")))
+        sources.append(it)
+    return events, sources
+
+
+def _stamp_cache_failures(items):
+    """Stamp ``item["cache_failure"]`` on each assistant turn that re-creates the
+    bulk of its cached prefix instead of reading it (spec §1). Mutates `items` in
+    place; healthy turns are left WITHOUT the key (absent, not zero — matching the
+    ``tokens?`` "absent, not zero" convention).
+
+    Builds a document-ordered ``_CFEvent`` stream from the items (a compaction
+    event per compaction-meta, an assistant-token event per token-bearing
+    assistant turn) and runs the SAME ``_iter_cache_failures`` rule the
+    lightweight rebuild-count path uses (single source of truth — the rule lives
+    in exactly one place; U1). The payload is computed here on the lost-prefix
+    basis (NOT raw cc, which would over-count when the turn also writes
+    genuinely-new cacheable content that was never cached):
+        lost            = min(cc, max(0, rm - cr))
+        tokens_recreated = lost
+        prev_cached      = rm
+        est_wasted_usd   = write(lost) - read(lost)
+    """
+    events, sources = _cache_failure_events_from_items(items)
+    for idx, prev_cached, lost, model in _iter_cache_failures(events):
+        sources[idx]["cache_failure"] = {
+            "tokens_recreated": lost,
+            "prev_cached": prev_cached,
+            "est_wasted_usd": _cache_failure_wasted_usd(model, lost),
+        }
+
+
+def _lightweight_rebuild_events(conn, session_id):
+    """Build the document-ordered ``_CFEvent`` stream for a session WITHOUT a
+    full ``_assemble_session`` (U1, #217 S1). Skips the expensive assembly work
+    (no ``blocks_json`` body parse, no tool-result folding, no meta-classify /
+    ANSI strip, no subagent correlation) but faithfully reproduces the canonical
+    normalization the cache-failure predicate depends on:
+
+      - UUID dedup: canonical row per ``(session_id, uuid)`` = first occurrence
+        in (timestamp_utc, id) order (a replay carries the original uuid);
+      - turn grouping by ``(msg_id, req_id)``: an assistant turn — possibly split
+        across non-consecutive fragments interleaved by a tool_result — emits ONE
+        event at the FIRST fragment's position, with cost-once-per-(msg_id,req_id)
+        token attribution from the deduped session_entries row;
+      - first-prose MODEL promotion: the turn's model is the FIRST prose-bearing
+        fragment's model (the canonical anchor), matching ``_build_turn`` /
+        ``_fold_fragment``; a turn with no prose keeps its seed fragment's model;
+      - seed ``source_path -> subagent_key`` derivation (``_subagent_key``);
+      - compaction-reset detection: an ``entry_type in ('meta','human')`` row
+        whose all-text body is a compaction summary (``_is_compaction_body``)
+        and which is NOT a slash-command invocation — mirroring the assembly
+        meta-classify — emits a compaction event.
+
+    The event ORDER is the turn's first-fragment document position, byte-for-byte
+    the order ``_assemble_session`` walks (which emits each turn item at its first
+    fragment, and each meta/human row at its own position). That preserves the
+    running-max walk the predicate requires.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+        (session_id,)).fetchone()
+    if exists is None:
+        return []
+    # Narrow column set: enough to dedup, group turns, derive the subagent_key,
+    # detect compaction, and join the token row. No blocks_json body parse beyond
+    # the all-text compaction guard (which needs text OR the text-block join).
+    rows = conn.execute(
+        "SELECT id, uuid, entry_type, text, blocks_json, model, "
+        "       msg_id, req_id, source_path "
+        "FROM conversation_messages WHERE session_id=? "
+        "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
+    seen_uuid = set()
+    logical = []
+    for row in rows:
+        u = row[1]
+        if u in seen_uuid:
+            continue            # UUID dedup: keep the first (canonical) occurrence
+        seen_uuid.add(u)
+        logical.append(row)
+
+    # Group assistant turns by (msg_id, req_id) at the first-fragment position;
+    # later same-key fragments fold their model (first-prose promotion) without
+    # adding a second event. A `None`-msg_id assistant row carries no turn key and
+    # no session_entries cost, so it never contributes a token event.
+    events = []
+    sources = []                # parallel: the turn key per assistant event
+    turn_index = {}             # (msg_id, req_id) -> index into events
+    turn_has_prose = {}         # (msg_id, req_id) -> bool (model promoted yet?)
+    turn_keys = []              # ordered list of grouped turn keys (for the token map)
+    for (rid, u, etype, text, blocks, model, msg_id, req_id,
+         source_path) in logical:
+        if etype == "assistant" and msg_id is not None:
+            key = (msg_id, req_id)
+            frag_text = (text or "").strip()
+            ev_idx = turn_index.get(key)
+            if ev_idx is None:
+                ev_idx = len(events)
+                turn_index[key] = ev_idx
+                turn_keys.append(key)
+                ev = _CFEvent(key=(_subagent_key(source_path), model),
+                              model=model)
+                events.append(ev)
+                sources.append(key)
+                # The seed model holds until the first prose fragment promotes it.
+                turn_has_prose[key] = bool(frag_text)
+            else:
+                ev = events[ev_idx]
+                # First prose fragment promotes the turn's model/subagent-key
+                # anchor (matches _fold_fragment). subagent_key is uniform across
+                # a turn's fragments (one file), but re-deriving is harmless.
+                if not turn_has_prose.get(key) and frag_text:
+                    ev.key = (_subagent_key(source_path), model)
+                    ev.model = model
+                    turn_has_prose[key] = True
+        elif etype in ("meta", "human"):
+            # Mirror the assembly meta-classify's compaction branch: an all-text
+            # body that is a compaction summary AND is not a slash-command
+            # invocation. A command invocation (#188) is promoted to a human turn
+            # BEFORE meta-classify, so a body carrying <command-args> never reads
+            # as compaction; compaction bodies have no <command-args>, so in
+            # practice the invocation check is a faithful belt-and-suspenders.
+            try:
+                parsed_blocks = _json.loads(blocks or "[]")
+            except (ValueError, TypeError):
+                parsed_blocks = []
+            body = text or _join_text_blocks(parsed_blocks)
+            all_text = all(b.get("kind") == "text"
+                           for b in (parsed_blocks or []))
+            if (all_text and _is_compaction_body(body)
+                    and _extract_command_invocation(parsed_blocks, body) is None):
+                events.append(_CFEvent(compaction=True))
+                sources.append(None)
+        # tool_result rows and null-msg_id assistant rows carry no token event.
+
+    # Cost-once token attribution: ONE deduped session_entries row per
+    # (msg_id, req_id) — the same map the full path stamps from. An assistant
+    # turn key absent from session_entries carries NO tokens, so its event is
+    # dropped (neither flags nor moves the running-max) — parity with
+    # _cache_failure_events_from_items's `tokens` skip.
+    usage = _turn_usage_map(conn, turn_keys)
+    filtered = []
+    si = 0
+    for ev in events:
+        if ev.compaction:
+            filtered.append(ev)
+            si += 1
+            continue
+        key = sources[si]
+        si += 1
+        tok = usage.get(key)
+        if tok is None:
+            continue            # no session_entries row -> skip (don't move max)
+        ev.cc = tok.get("cache_creation", 0) or 0
+        ev.cr = tok.get("cache_read", 0) or 0
+        filtered.append(ev)
+    return filtered
 
 
 def session_cache_rebuild_count(conn, session_id) -> int:
     """Per-session count of cache-rebuild (cache-failure) turns.
 
-    Single source of truth: assembles the session via the SAME pipeline the
-    reader/outline use and runs the SAME _stamp_cache_failures kernel, then
-    counts flagged items. /outline omits stats.cache_failures when the count is
-    0, so "no flagged items" -> 0 (byte-identical to outline). Stored on the
-    conversation_sessions rollup by _recompute_conversation_sessions; filtered
-    by list_conversations(rebuild_min=...).
+    Single source of truth: builds a document-ordered cache-failure event stream
+    via the LIGHTWEIGHT builder (``_lightweight_rebuild_events`` — no full
+    ``_assemble_session``, so this stays cheap on the flock-held rollup path; U1,
+    #217 S1) and runs it through the SAME ``_cache_failure_count_over_events``
+    predicate the reader's full assembly stamps with. The light builder
+    reproduces the canonical normalization (UUID dedup, turn grouping, first-prose
+    model promotion, seed subagent_key, cost-once token attribution, compaction
+    reset), so the count is byte-identical to the full-assembly count (guarded by
+    ``test_session_cache_rebuild_count_lightweight_matches_full_assembly``).
 
-    _assemble_session already runs _stamp_cache_failures internally before
-    returning, so the items carry the flag on entry; re-running the kernel here
-    is an idempotent recompute (it only ADDS the key on a flagged turn, never
-    clears one, and the predicate is deterministic over the same items) that
-    keeps the helper correct even if assembly ever stops stamping.
+    /outline omits stats.cache_failures when the count is 0, so "no flagged
+    items" -> 0 (byte-identical to outline). Stored on the conversation_sessions
+    rollup by _recompute_conversation_sessions; filtered by
+    list_conversations(rebuild_min=...).
     """
-    asm = _assemble_session(conn, session_id)
-    if asm is None:
-        return 0
-    items = asm["items"]
-    _stamp_cache_failures(items)
-    return sum(1 for it in items if "cache_failure" in it)
+    return _cache_failure_count_over_events(
+        _lightweight_rebuild_events(conn, session_id))
 
 
 def _session_cost_map(conn, session_ids):

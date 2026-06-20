@@ -3198,3 +3198,228 @@ def test_get_conversation_passes_cache_failure_through_on_failing_turn():
     assert cf["prev_cached"] == 130_000
     assert cf["tokens_recreated"] == min(134_000, 130_000 - 0)
     assert cf["est_wasted_usd"] > 0
+
+
+# ---------------------------------------------------------------------------
+# U1 (#217 S1): the lightweight rebuild-count path off the flock-held rollup.
+# `session_cache_rebuild_count` must build an ordered event stream from a narrow
+# query (no block-body parse / fold / meta-classify / subagent correlation) and
+# feed it to the SAME pure cache-failure predicate the full `_assemble_session`
+# path uses — yielding a byte-identical count. The parity fixtures exercise the
+# event-stream normalization edges that distinguish the light path from a naive
+# assistant-row SELECT: compaction resets, duplicate UUIDs, non-consecutive
+# fragments, a model switch, and multi-subagent.
+# ---------------------------------------------------------------------------
+def _full_assembly_rebuild_count(conn, session_id):
+    """The full-assembly cache-failure count: assemble the whole session through
+    the reader pipeline, re-stamp, and count flagged items. This is the
+    known-good the lightweight path must match (it is the pre-U1 behavior of
+    `session_cache_rebuild_count`, computed inline so the parity test never
+    depends on the production function under test)."""
+    asm = cq._assemble_session(conn, session_id)
+    if asm is None:
+        return 0
+    items = asm["items"]
+    cq._stamp_cache_failures(items)
+    return sum(1 for it in items if "cache_failure" in it)
+
+
+def _seed_compaction_row(conn, *, sid, uuid, ts, source_path="a.jsonl",
+                         byte_offset=99):
+    """A compaction-boundary row as the parser emits it: an entry_type='meta'
+    row whose all-text body opens with the compaction sentinel. The assembly
+    path classifies it to meta_kind='compaction' and the cache-failure rule
+    resets its running-max on it."""
+    body = ("This session is being continued from a previous conversation "
+            "that ran out of context. The summary follows.")
+    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path,
+         byte_offset=byte_offset, timestamp_utc=ts, entry_type="meta",
+         text="", blocks_json=_json.dumps([{"kind": "text", "text": body}]))
+
+
+def _seed_rebuild_parity_session(conn):
+    """A single session exercising every event-stream edge in one transcript,
+    each edge engineered to be LOAD-BEARING for the flag count (so removing the
+    corresponding normalization in the lightweight builder flips the count — the
+    non-vacuity guard the parity test relies on):
+
+    FLAG #1 (MAIN, compaction-gated): a healthy prime (rm=130k) then a collapse —
+      but a compaction boundary sits BETWEEN them, so the collapse is measured
+      against the RESET running-max → it must NOT flag. A SECOND prime+collapse
+      AFTER the compaction is the real flag. (Drop compaction-reset detection and
+      the first collapse spuriously flags too → over-count.)
+
+    DEDUP edge: a duplicate-UUID replay of a turn under a DIFFERENT (msg_id,
+      req_id) — the realistic "same logical row re-emitted with a fresh request
+      envelope" replay. The replay's tokens are collapse-shaped on the main key.
+      With UUID dedup it is dropped (one logical row) → no extra flag; WITHOUT
+      dedup it becomes a distinct collapse event → over-count.
+
+    MODEL-PROMOTION edge (FLAG #2): a healthy prime on model HAIKU, then a
+      two-fragment turn whose SEED fragment is model OPUS (no prior cache) and
+      whose PROSE fragment promotes the turn to model HAIKU. The turn's tokens
+      collapse against HAIKU's running-max. With first-prose promotion the event
+      keys on (None, HAIKU) → collapses → FLAG; WITHOUT promotion it keys on
+      (None, OPUS) which has no prior rm → no flag → under-count.
+
+    SUBAGENT edge (FLAG #3): a subagent thread (agent-<hash>.jsonl) that primes
+      then collapses on ITS OWN (agent-hash, OPUS) key. The MAIN OPUS key has NO
+      running-max at that point (the main thread only ever primed HAIKU), so
+      merging the subagent into the main key (subagent_key dropped → (None, OPUS))
+      leaves no prior rm → no flag → under-count. With the subagent_key the
+      collapse is measured against the subagent's own prime → FLAG.
+    """
+    sid = "rb1"
+    a = "a.jsonl"
+    OPUS, HAIKU, SONNET = _MODEL, "claude-haiku-4-5", "claude-sonnet-4-5"
+    # === compaction-gated main flag (#1) ===
+    _msg(conn, session_id=sid, uuid="m_prime1", source_path=a, byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="prime1", model=OPUS, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "prime1"}]))
+    _entry(conn, source_path=a, line_offset=0, model=OPUS,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=1_000, cr=130_000)
+    # compaction BETWEEN the prime and the collapse → resets (None, OPUS) rm.
+    _seed_compaction_row(conn, sid=sid, uuid="cmp", ts="2026-06-01T00:00:01Z")
+    # collapse-shaped turn right after compaction: rm reset → NOT a flag.
+    _msg(conn, session_id=sid, uuid="m_postcmp", source_path=a, byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="postcmp", model=OPUS, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([{"kind": "text", "text": "postcmp"}]))
+    _entry(conn, source_path=a, line_offset=1, model=OPUS,
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=134_000, cr=0)
+    # genuine post-compaction prime then collapse on (None, OPUS) → FLAG #1.
+    _msg(conn, session_id=sid, uuid="m_prime2", source_path=a, byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:03Z", entry_type="assistant",
+         text="prime2", model=OPUS, msg_id="m3", req_id="r3",
+         blocks_json=_json.dumps([{"kind": "text", "text": "prime2"}]))
+    _entry(conn, source_path=a, line_offset=2, model=OPUS,
+           msg_id="m3", req_id="r3", inp=10, out=20, cc=1_000, cr=120_000)
+    _msg(conn, session_id=sid, uuid="m_collapse", source_path=a, byte_offset=3,
+         timestamp_utc="2026-06-01T00:00:04Z", entry_type="assistant",
+         text="collapse", model=OPUS, msg_id="m4", req_id="r4",
+         blocks_json=_json.dumps([{"kind": "text", "text": "collapse"}]))
+    _entry(conn, source_path=a, line_offset=3, model=OPUS,
+           msg_id="m4", req_id="r4", inp=10, out=20, cc=130_000, cr=5_000)
+    # === DEDUP edge: duplicate-UUID replay under a fresh (msg_id, req_id) ===
+    # Same uuid as the real collapse, but a new request envelope. Collapse-shaped
+    # on (None, OPUS). UUID dedup drops it (first occurrence wins); without dedup
+    # it is a second collapse event → over-count.
+    _msg(conn, session_id=sid, uuid="m_collapse", source_path="dup.jsonl",
+         byte_offset=0, timestamp_utc="2026-06-01T00:00:05Z",
+         entry_type="assistant", text="collapse", model=OPUS,
+         msg_id="m4b", req_id="r4b",
+         blocks_json=_json.dumps([{"kind": "text", "text": "collapse"}]))
+    _entry(conn, source_path="dup.jsonl", line_offset=0, model=OPUS,
+           msg_id="m4b", req_id="r4b", inp=10, out=20, cc=130_000, cr=5_000)
+    # === MODEL-PROMOTION edge (FLAG #2) ===
+    # Prime a HAIKU cache on the main thread.
+    _msg(conn, session_id=sid, uuid="m_haiku_prime", source_path=a, byte_offset=4,
+         timestamp_utc="2026-06-01T00:00:06Z", entry_type="assistant",
+         text="haiku prime", model=HAIKU, msg_id="m5", req_id="r5",
+         blocks_json=_json.dumps([{"kind": "text", "text": "haiku prime"}]))
+    _entry(conn, source_path=a, line_offset=4, model=HAIKU,
+           msg_id="m5", req_id="r5", inp=10, out=20, cc=1_000, cr=140_000)
+    # Two-fragment turn: SEED fragment model SONNET (no prose, and SONNET is
+    # never primed anywhere), interleaved tool_result, then PROSE fragment model
+    # HAIKU. The prose fragment promotes the turn to HAIKU, so the collapse keys
+    # on (None, HAIKU) → FLAG (HAIKU has the 140k prime above). Without promotion
+    # it keys on (None, SONNET) which has NO prior running-max → no flag. (SONNET,
+    # not OPUS, precisely because OPUS retains a 120k running-max here — a fresh
+    # model is what makes this edge load-bearing.)
+    _msg(conn, session_id=sid, uuid="m_frag1", source_path=a, byte_offset=5,
+         timestamp_utc="2026-06-01T00:00:07Z", entry_type="assistant",
+         text="", model=SONNET, msg_id="m6", req_id="r6",
+         blocks_json=_json.dumps([{"kind": "tool_use", "id": "tu6",
+                                   "name": "Read", "input_summary": "{}"}]))
+    _seed_tool_result(conn, sid=sid, uuid="tr6",
+                      ts="2026-06-01T00:00:08Z",
+                      blocks=[{"kind": "tool_result", "tool_use_id": "tu6",
+                               "text": "body", "truncated": False,
+                               "is_error": False}])
+    _msg(conn, session_id=sid, uuid="m_frag2", source_path=a, byte_offset=6,
+         timestamp_utc="2026-06-01T00:00:09Z", entry_type="assistant",
+         text="frag2 prose", model=HAIKU, msg_id="m6", req_id="r6",
+         blocks_json=_json.dumps([{"kind": "text", "text": "frag2 prose"}]))
+    _entry(conn, source_path=a, line_offset=6, model=HAIKU,
+           msg_id="m6", req_id="r6", inp=10, out=20, cc=140_000, cr=5_000)
+    # === SUBAGENT edge (FLAG #3 + the non-vacuity over-count guard) ===
+    # The subagent thread primes (120k) then collapses on (agent-hash, SONNET) →
+    # FLAG #3 on its OWN key. Crucially, a MAIN-thread SONNET turn is interleaved
+    # BETWEEN the subagent's prime and collapse, collapse-shaped (cc=140k, cr=0).
+    # On the main (None, SONNET) key that turn has NO prior running-max → no flag.
+    # But if the subagent_key is dropped (the subagent merges into (None, SONNET)),
+    # the subagent's 120k prime becomes the main turn's running-max → it
+    # SPURIOUSLY flags → over-count. So subagent_key is load-bearing: with it the
+    # count is 3; without it the count is 4.
+    ag = "agent-deadbeef.jsonl"
+    _msg(conn, session_id=sid, uuid="sa_prime", source_path=ag, byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:10Z", entry_type="assistant",
+         text="sa prime", model=SONNET, msg_id="m7", req_id="r7", is_sidechain=1,
+         blocks_json=_json.dumps([{"kind": "text", "text": "sa prime"}]))
+    _entry(conn, source_path=ag, line_offset=0, model=SONNET,
+           msg_id="m7", req_id="r7", inp=10, out=20, cc=1_000, cr=120_000)
+    # interleaved MAIN-thread SONNET turn (no prior main-SONNET cache), ordered
+    # strictly BETWEEN the subagent prime (:10) and collapse (:12).
+    _msg(conn, session_id=sid, uuid="m_sonnet", source_path=a, byte_offset=7,
+         timestamp_utc="2026-06-01T00:00:11Z", entry_type="assistant",
+         text="main sonnet", model=SONNET, msg_id="m9", req_id="r9",
+         blocks_json=_json.dumps([{"kind": "text", "text": "main sonnet"}]))
+    _entry(conn, source_path=a, line_offset=7, model=SONNET,
+           msg_id="m9", req_id="r9", inp=10, out=20, cc=140_000, cr=0)
+    _msg(conn, session_id=sid, uuid="sa_collapse", source_path=ag, byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:12Z", entry_type="assistant",
+         text="sa collapse", model=SONNET, msg_id="m8", req_id="r8", is_sidechain=1,
+         blocks_json=_json.dumps([{"kind": "text", "text": "sa collapse"}]))
+    _entry(conn, source_path=ag, line_offset=1, model=SONNET,
+           msg_id="m8", req_id="r8", inp=10, out=20, cc=130_000, cr=4_000)
+    return sid
+
+
+def test_session_cache_rebuild_count_lightweight_matches_full_assembly():
+    c = _conn()
+    sid = _seed_rebuild_parity_session(c)
+    full = _full_assembly_rebuild_count(c, sid)
+    # Exactly three real collapses flag (compaction-gated main #1, model-promoted
+    # #2, subagent #3); the pre-compaction collapse, the duplicate-UUID replay,
+    # and every prime are non-flags. Each flag is load-bearing on one
+    # normalization edge (see _seed_rebuild_parity_session) so the parity is
+    # genuinely non-vacuous.
+    assert full == 3, f"fixture sanity: expected 3 flags, got {full}"
+    light = cq.session_cache_rebuild_count(c, sid)
+    assert light == full
+    # The lightweight path also runs through the SAME pure predicate over its
+    # event stream (single source of truth) — assert the builder + predicate
+    # compose to the same count directly, so a regression in either half shows.
+    events = cq._lightweight_rebuild_events(c, sid)
+    assert cq._cache_failure_count_over_events(events) == full
+
+
+def test_lightweight_rebuild_count_unknown_session_is_zero():
+    c = _conn()
+    assert cq.session_cache_rebuild_count(c, "nope") == 0
+    assert cq._cache_failure_count_over_events(
+        cq._lightweight_rebuild_events(c, "nope")) == 0
+
+
+def test_rollup_fill_does_not_call_assemble_session(monkeypatch):
+    """The flock-held rollup-fill path must NOT run a full `_assemble_session`
+    per session — U1's headline win. Spy the function and assert zero calls when
+    `_fill_conversation_sessions_filter_columns` recomputes the rebuild count."""
+    import _cctally_cache as _cc
+    c = _conn()
+    _seed_rebuild_parity_session(c)
+    # Materialize the structural rollup columns first (the INSERT pass), then
+    # spy assembly across the filter-column fill (which calls the rebuild count).
+    calls = []
+    real_assemble = cq._assemble_session
+    monkeypatch.setattr(
+        cq, "_assemble_session",
+        lambda *a, **k: calls.append(1) or real_assemble(*a, **k))
+    _cc._recompute_conversation_sessions(c)
+    assert calls == [], "rollup fill must not call _assemble_session (U1)"
+    # And the stored count still equals the full-assembly truth.
+    stored = c.execute(
+        "SELECT cache_rebuild_count FROM conversation_sessions "
+        "WHERE session_id='rb1'").fetchone()[0]
+    assert stored == _full_assembly_rebuild_count(c, "rb1") == 3
