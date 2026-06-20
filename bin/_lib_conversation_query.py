@@ -1491,13 +1491,26 @@ def _assemble_session(conn, session_id):
             "subagent_meta": subagent_meta, "header_cost": header_cost}
 
 
-def get_conversation(conn, session_id, *, after=None, limit=500):
+def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
+                     limit=500):
     """Reader payload for one session (spec §3.2). Returns None for an unknown
     session. Dedups logical messages by (session_id, uuid) (canonical = earliest
     timestamp), groups assistant fragments into turn items by (msg_id, req_id),
     joins cost once, anchors a turn on its prose-bearing fragment, and exposes
     every member fragment uuid for jump resolution. Cursor over (timestamp_utc,
-    id); ~500 items/page."""
+    id); ~500 items/page.
+
+    Three mutually-exclusive cursor modes over the fully-assembled ascending
+    `items` list (#217 S2 / U4): `after=X` pages forward (existing), `before=X`
+    pages backward (returns the `limit` items immediately before X), and
+    `tail=1` opens at the bottom (returns the last page in one request). More
+    than one supplied raises ValueError (the handler maps it to 400). The
+    boundary keys are mode-uniform (`has_more = end < N`, `has_prev = start > 0`)
+    so a short `before` head-page still reports `has_more` (P2-8); the existing
+    `after`/no-cursor responses stay byte-stable except the two additive
+    `prev_before`/`has_prev` keys (for them `start + limit < N == end < N`)."""
+    if sum(1 for x in (after is not None, before is not None, bool(tail)) if x) > 1:
+        raise ValueError("after/before/tail are mutually exclusive")
     limit = max(1, min(int(limit), 1000))
     asm = _assemble_session(conn, session_id)
     if asm is None:
@@ -1528,34 +1541,60 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         _la = items[-1]["anchor"]
         last_anchor = {"session_id": session_id, "uuid": _la["uuid"], "id": _la["id"]}
 
-    # Cursor pagination over the item list (anchored to each item's canonical id).
-    # A non-None `after` that matches no item's anchor (stale/deleted cursor)
-    # yields an EMPTY page — never silently re-serves the head (M1).
-    start = 0
-    if after is not None:
-        start = None
+    # Cursor pagination over the item list (anchored to each item's canonical
+    # id). Resolve `start`/`end` per mode, then `page = items[start:end]` and
+    # compute the boundary keys UNIFORMLY (#217 S2 / U4 — P2-8). A non-None
+    # `after`/`before` that matches no item's anchor (stale/deleted cursor)
+    # yields an EMPTY page — never silently re-serves the head/tail (M1).
+    N = len(items)
+
+    def _idx(cur):
         for k, it in enumerate(items):
-            if str(it["anchor"]["id"]) == str(after):
-                start = k + 1
-                break
-        if start is None:
-            return {
-                "session_id": session_id,
-                "title": _title,
-                "project_label": _pl,
-                "git_branch": _latest(logical, 11),
-                "started_utc": logical[0][2],
-                "last_activity_utc": logical[-1][2],
-                "cost_usd": header_cost,
-                "models": sorted({r[6] for r in logical if r[6]}),
-                "last_anchor": last_anchor,
-                "items": [],
-                "subagent_meta": subagent_meta,
-                "page": {"next_after": None, "has_more": False},
-            }
-    page = items[start:start + limit]
-    has_more = start + limit < len(items)
+            if str(it["anchor"]["id"]) == str(cur):
+                return k
+        return None
+
+    def _stale_empty_page():
+        return {
+            "session_id": session_id,
+            "title": _title,
+            "project_label": _pl,
+            "git_branch": _latest(logical, 11),
+            "started_utc": logical[0][2],
+            "last_activity_utc": logical[-1][2],
+            "cost_usd": header_cost,
+            "models": sorted({r[6] for r in logical if r[6]}),
+            "last_anchor": last_anchor,
+            "items": [],
+            "subagent_meta": subagent_meta,
+            "page": {"next_after": None, "has_more": False,
+                     "prev_before": None, "has_prev": False},
+        }
+
+    if tail:
+        end = N
+        start = max(0, N - limit)
+    elif before is not None:
+        b = _idx(before)
+        if b is None:                       # stale cursor → empty page (M1)
+            return _stale_empty_page()
+        end = b
+        start = max(0, end - limit)
+    elif after is not None:
+        a = _idx(after)
+        if a is None:                       # stale cursor → empty page (M1)
+            return _stale_empty_page()
+        start = a + 1
+        end = min(start + limit, N)
+    else:
+        start = 0
+        end = min(limit, N)
+
+    page = items[start:end]
+    has_more = end < N
+    has_prev = start > 0
     next_after = page[-1]["anchor"]["id"] if (page and has_more) else None
+    prev_before = page[0]["anchor"]["id"] if (page and has_prev) else None
 
     # Stamp the session_id into each anchor (spec anchor is (session_id, uuid);
     # the dict literals are built session-agnostic, so fill it here where the
@@ -1587,7 +1626,8 @@ def get_conversation(conn, session_id, *, after=None, limit=500):
         "last_anchor": last_anchor,
         "items": page,
         "subagent_meta": subagent_meta,
-        "page": {"next_after": next_after, "has_more": has_more},
+        "page": {"next_after": next_after, "has_more": has_more,
+                 "prev_before": prev_before, "has_prev": has_prev},
     }
 
 

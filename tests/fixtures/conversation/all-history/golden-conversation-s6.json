@@ -58,7 +58,9 @@
   "models": [],
   "page": {
     "has_more": false,
-    "next_after": null
+    "has_prev": false,
+    "next_after": null,
+    "prev_before": null
   },
   "project_label": "proj",
   "session_id": "s6",

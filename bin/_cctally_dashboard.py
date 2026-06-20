@@ -7614,15 +7614,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """``GET /api/conversation/<session-id>`` — the reader (spec §3.2).
 
         The id is percent-decoded so clients that encode reserved chars
-        round-trip. Unknown id → 404. ``after``/``limit`` page the items.
+        round-trip. Unknown id → 404. ``after``/``before``/``tail``/``limit``
+        page the items; ``after``/``before``/``tail`` are mutually exclusive
+        (>1 supplied → 400). ``tail=1`` opens at the bottom; ``before=<id>``
+        pages backward (#217 S2 / U4).
         """
         if not self._require_transcripts_allowed():
             return
         import urllib.parse as _u
         # ``path`` is already query-stripped by ``do_GET`` (``self.path.split("?")``),
-        # so the cursor params (?after=/?limit=) live ONLY on the raw ``self.path``.
-        # Sibling handlers read ``self.path`` directly — the detail route must too,
-        # or every request re-serves the head and pagination is dead.
+        # so the cursor params (?after=/?before=/?tail=/?limit=) live ONLY on the
+        # raw ``self.path``. Sibling handlers read ``self.path`` directly — the
+        # detail route must too, or every request re-serves the head and
+        # pagination is dead.
         query_str = self.path.partition("?")[2]
         session_id = _u.unquote(path[len("/api/conversation/"):])
         if not session_id:
@@ -7630,10 +7634,21 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
         q = _u.parse_qs(query_str)
         after = _qs_str(q, "after", None)
+        before = _qs_str(q, "before", None)
+        tail = _qs_str(q, "tail", None) in ("1", "true", "yes")
         limit = _qs_int(q, "limit", 500)
+        # Mutual-exclusion 400 (#217 S2 / U4). The kernel ALSO raises ValueError
+        # on >1 cursor as its own invariant, but ``_run_conversation_query``
+        # collapses every kernel exception to a 500, so the 400 must be decided
+        # HERE, before the kernel call — this explicit pre-call check is the
+        # authoritative backstop for the handler path.
+        if sum(1 for x in (after is not None, before is not None, tail) if x) > 1:
+            self.send_error(400, "after/before/tail are mutually exclusive")
+            return
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().get_conversation(
-                conn, session_id, after=after, limit=limit),
+                conn, session_id, after=after, before=before, tail=tail,
+                limit=limit),
             "/api/conversation")
         if not ok:
             return
