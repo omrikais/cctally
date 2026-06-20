@@ -148,6 +148,22 @@ class DoctorState:
     # existing constructors stay valid and a loopback bind is byte-identical
     # whether or not expose is set.
     expose_transcripts: bool = False
+    # Conversation-sessions rollup consistency (#217 S1 / U9). The browse-rail
+    # rollup table `conversation_sessions` should carry one row per distinct
+    # `conversation_messages.session_id`; a quiescent mismatch indicates the
+    # rollup drifted from its source. `conv_sessions_rollup_count` =
+    # COUNT(*) conversation_sessions; `conv_messages_distinct_sessions` =
+    # COUNT(DISTINCT session_id) conversation_messages WHERE session_id IS NOT
+    # NULL. Either is None when cache.db can't be opened / the table is absent
+    # (pre-rollup) — the check degrades to OK. `conv_rollup_sync_in_progress`
+    # is True when a writer holds the cache.db.lock (non-blocking probe) OR any
+    # pending reingest/split/backfill `cache_meta` flag is present — sync_cache
+    # commits `conversation_messages` per file BEFORE the rollup recompute, so a
+    # mid-sync read transiently mismatches and must NOT WARN (Codex P2). All
+    # defaulted (placed last) so existing constructors stay valid.
+    conv_sessions_rollup_count: Optional[int] = None
+    conv_messages_distinct_sessions: Optional[int] = None
+    conv_rollup_sync_in_progress: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -818,6 +834,73 @@ def _check_data_post_credit_milestones(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_data_conversation_sessions_rollup(s: DoctorState) -> CheckResult:
+    """Invariant: the browse-rail rollup ``conversation_sessions`` carries one
+    row per distinct ``conversation_messages.session_id`` (#217 S1 / U9).
+
+    OK when the two counts are equal, when either is ``None`` (pre-rollup or an
+    unreadable cache.db — consistent with the kernel's graceful-degrade posture),
+    OR when a sync/reingest/backfill is in progress. WARN ONLY on a mismatch
+    observed in a QUIESCENT cache.
+
+    False-WARN avoidance (Codex P2): ``sync_cache`` commits
+    ``conversation_messages`` per file *before* the ``conversation_sessions``
+    recompute, and resumable reingest commits per file before its rollup
+    completes — so an unsynchronized read can transiently mismatch. The
+    in-progress signal (``conv_rollup_sync_in_progress``) is set by
+    ``doctor_gather_state`` from a NON-BLOCKING ``cache.db.lock`` flock probe
+    (lock held ⇒ a writer is mid-flight) AND the presence of any pending
+    ``cache_meta`` reingest/split/backfill flag; if either says in-progress, this
+    stays OK. Doctor remains read-only and never blocks on the lock.
+
+    Informational only (no remediation): the next full ``sync_cache`` re-derives
+    the rollup via its incremental DELETE+INSERT.
+    """
+    rollup = s.conv_sessions_rollup_count
+    distinct = s.conv_messages_distinct_sessions
+    if rollup is None or distinct is None:
+        return CheckResult(
+            id="data.conversation_sessions_rollup",
+            title="Conversation rollup",
+            severity="ok",
+            summary="no data",
+            remediation=None,
+            details={"rollup_count": rollup,
+                     "messages_distinct_sessions": distinct},
+        )
+    if s.conv_rollup_sync_in_progress or rollup == distinct:
+        return CheckResult(
+            id="data.conversation_sessions_rollup",
+            title="Conversation rollup",
+            severity="ok",
+            summary=(
+                "sync in progress"
+                if (s.conv_rollup_sync_in_progress and rollup != distinct)
+                else f"{rollup} session(s) tracked"
+            ),
+            remediation=None,
+            details={"rollup_count": rollup,
+                     "messages_distinct_sessions": distinct,
+                     "sync_in_progress": s.conv_rollup_sync_in_progress},
+        )
+    return CheckResult(
+        id="data.conversation_sessions_rollup",
+        title="Conversation rollup",
+        severity="warn",
+        summary=(
+            f"rollup has {rollup} session(s); messages span {distinct} "
+            f"(quiescent mismatch)"
+        ),
+        remediation=(
+            "Run any cctally command (or `cctally cache-sync --rebuild`) to "
+            "re-derive the conversation_sessions rollup."
+        ),
+        details={"rollup_count": rollup,
+                 "messages_distinct_sessions": distinct,
+                 "sync_in_progress": False},
+    )
+
+
 def _check_pricing_coverage(s: DoctorState) -> CheckResult:
     """WARN when recent (30-day) session data contains a model cctally cannot
     price exactly (spec §5.1).
@@ -1120,6 +1203,8 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.codex_cache", "_check_data_codex_cache"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),
+        ("data.conversation_sessions_rollup",
+         "_check_data_conversation_sessions_rollup"),
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),

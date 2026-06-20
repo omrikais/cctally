@@ -117,6 +117,82 @@ def test_gather_install_is_brew_true_when_keg(tmp_path):
     assert st["install_is_brew"] is True
 
 
+# --- U9: conversation_sessions rollup gather (#217 S1) ----------------------
+
+def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
+                       msg_sessions: int, pending_flag: "str | None" = None):
+    """Build a cache.db at <home>/.local/share/cctally/cache.db (via the real
+    _apply_cache_schema) with `rollup_rows` conversation_sessions rows and
+    `msg_sessions` distinct conversation_messages session_ids, optionally arming
+    a `pending_flag` in cache_meta. Mirrors the path the gather reads."""
+    import sqlite3
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    cdir = home / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(cdir / "cache.db"))
+    try:
+        db._apply_cache_schema(conn)
+        for i in range(rollup_rows):
+            conn.execute(
+                "INSERT INTO conversation_sessions(session_id, msg_count) "
+                "VALUES (?, ?)", (f"sess-{i}", 1))
+        for i in range(msg_sessions):
+            conn.execute(
+                "INSERT INTO conversation_messages"
+                "(session_id, uuid, source_path, byte_offset, timestamp_utc, "
+                " entry_type, text, blocks_json, is_sidechain) "
+                "VALUES (?,?,?,?,?,?,?,?,0)",
+                (f"sess-{i}", f"u-{i}", "a.jsonl", i,
+                 "2026-06-01T00:00:00Z", "human", "hi", "[]"))
+        if pending_flag is not None:
+            db._set_cache_meta(conn, pending_flag, "1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_gather_rollup_consistent(tmp_path):
+    """Equal rollup + distinct-message session counts, no pending flag → the
+    three rollup fields populate, equal, and not in progress."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=3, msg_sessions=3)
+    st = _run_gather(tmp_path)
+    assert st["conv_sessions_rollup_count"] == 3
+    assert st["conv_messages_distinct_sessions"] == 3
+    assert st["conv_rollup_sync_in_progress"] is False
+
+
+def test_gather_rollup_mismatch_quiescent(tmp_path):
+    """Unequal counts, no pending flag, lock free → in_progress False (so the
+    kernel WARNs on the genuine drift)."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=2, msg_sessions=4)
+    st = _run_gather(tmp_path)
+    assert st["conv_sessions_rollup_count"] == 2
+    assert st["conv_messages_distinct_sessions"] == 4
+    assert st["conv_rollup_sync_in_progress"] is False
+
+
+def test_gather_rollup_in_progress_via_pending_flag(tmp_path):
+    """A pending reingest/backfill flag → in_progress True even with a count
+    mismatch (the kernel then stays OK)."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=2, msg_sessions=4,
+                       pending_flag="conversation_sessions_backfill_pending")
+    st = _run_gather(tmp_path)
+    assert st["conv_rollup_sync_in_progress"] is True
+
+
+def test_gather_rollup_none_when_cache_absent(tmp_path):
+    """No cache.db → both counts None, in_progress False (kernel degrades OK)."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    st = _run_gather(tmp_path)
+    assert st["conv_sessions_rollup_count"] is None
+    assert st["conv_messages_distinct_sessions"] is None
+    assert st["conv_rollup_sync_in_progress"] is False
+
+
 def test_gather_state_fresh_home_returns_state(tmp_path):
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "projects").mkdir()

@@ -151,7 +151,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 15,
+                            "registry_size": 16,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -186,7 +186,8 @@
                                     "012_create_conversation_ai_titles",
                                     "013_create_conversation_sessions",
                                     "014_conversation_queued_prompt_reingest",
-                                    "015_conversation_sessions_filter_columns"
+                                    "015_conversation_sessions_filter_columns",
+                                    "016_drop_search_aux"
                                 ],
                                 "skipped": []
                             },
@@ -213,7 +214,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/27 applied",
+                    "summary": "0/28 applied",
                     "title": "Migrations"
                 },
                 {
@@ -326,13 +327,17 @@
                             [
                                 "cache.db",
                                 "015_conversation_sessions_filter_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "016_drop_search_aux"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "27 pending",
+                    "summary": "28 pending",
                     "title": "Pending migrations"
                 }
             ],
@@ -391,6 +396,16 @@
                     "severity": "ok",
                     "summary": "no credited weeks",
                     "title": "Post-credit milestones"
+                },
+                {
+                    "details": {
+                        "messages_distinct_sessions": null,
+                        "rollup_count": null
+                    },
+                    "id": "data.conversation_sessions_rollup",
+                    "severity": "ok",
+                    "summary": "no data",
+                    "title": "Conversation rollup"
                 }
             ],
             "id": "data",
@@ -472,7 +487,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 17,
+            "ok": 18,
             "warn": 7
         },
         "severity": "fail"

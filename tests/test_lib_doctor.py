@@ -38,6 +38,10 @@ def test_doctor_state_has_required_fields():
         "pricing_coverage",
         # Conversation viewer (Plan 2, spec §5): LAN transcript opt-in.
         "expose_transcripts",
+        # Conversation-sessions rollup consistency (#217 S1 / U9).
+        "conv_sessions_rollup_count",
+        "conv_messages_distinct_sessions",
+        "conv_rollup_sync_in_progress",
     }
     assert fields == expected, fields ^ expected
 
@@ -113,6 +117,11 @@ def _state(**overrides) -> L.DoctorState:
         # Dev-instance isolation: happy path is the installed (prod) instance.
         dev_mode=False,
         app_dir="/home/u/.local/share/cctally",
+        # Conversation-sessions rollup consistency (#217 S1 / U9): happy path is
+        # an equal, quiescent rollup.
+        conv_sessions_rollup_count=10,
+        conv_messages_distinct_sessions=10,
+        conv_rollup_sync_in_progress=False,
     )
     base.update(overrides)
     return L.DoctorState(**base)
@@ -599,6 +608,51 @@ def test_data_post_credit_milestones_none_state_ok():
     s = _state(credited_weeks=None)
     r = L._check_data_post_credit_milestones(s)
     assert r.severity == "ok"
+
+
+# --- U9: conversation_sessions rollup consistency (#217 S1) -----------------
+
+def test_rollup_check_ok_when_consistent():
+    """Equal rollup count and distinct-session count → OK."""
+    s = _state(conv_sessions_rollup_count=42,
+               conv_messages_distinct_sessions=42,
+               conv_rollup_sync_in_progress=False)
+    r = L._check_data_conversation_sessions_rollup(s)
+    assert r.id == "data.conversation_sessions_rollup"
+    assert r.severity == "ok"
+
+
+def test_rollup_check_warns_on_mismatch_quiescent():
+    """A mismatch observed while NO sync/reingest/backfill is in progress is a
+    real rollup drift → WARN (informational; the next full sync re-derives)."""
+    s = _state(conv_sessions_rollup_count=40,
+               conv_messages_distinct_sessions=42,
+               conv_rollup_sync_in_progress=False)
+    r = L._check_data_conversation_sessions_rollup(s)
+    assert r.severity == "warn"
+    assert "40" in r.summary and "42" in r.summary
+
+
+def test_rollup_check_ok_when_sync_in_progress():
+    """The SAME mismatch is OK while a sync/reingest/backfill is mid-flight
+    (Codex P2 — conversation_messages commits per file before the
+    conversation_sessions recompute, so a mid-sync read transiently mismatches)."""
+    s = _state(conv_sessions_rollup_count=40,
+               conv_messages_distinct_sessions=42,
+               conv_rollup_sync_in_progress=True)
+    r = L._check_data_conversation_sessions_rollup(s)
+    assert r.severity == "ok"
+
+
+def test_rollup_check_ok_when_either_count_none():
+    """Pre-rollup / unreadable cache.db (either count None) → OK, never a false
+    WARN — consistent with the doctor kernel's graceful-degrade posture."""
+    assert L._check_data_conversation_sessions_rollup(
+        _state(conv_sessions_rollup_count=None,
+               conv_messages_distinct_sessions=42)).severity == "ok"
+    assert L._check_data_conversation_sessions_rollup(
+        _state(conv_sessions_rollup_count=42,
+               conv_messages_distinct_sessions=None)).severity == "ok"
 
 
 def test_safety_dashboard_bind_loopback_ok():

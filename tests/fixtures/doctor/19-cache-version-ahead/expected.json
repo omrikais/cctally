@@ -124,19 +124,19 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 15,
+                        "registry_size": 16,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 15 known",
+                    "summary": "version 99 / 16 known",
                     "title": "cache.db"
                 },
                 {
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 15,
+                            "registry_size": 16,
                             "user_version": 99
                         },
                         "stats.db": {
@@ -148,7 +148,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v15) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v16) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -172,7 +172,8 @@
                                     "012_create_conversation_ai_titles",
                                     "013_create_conversation_sessions",
                                     "014_conversation_queued_prompt_reingest",
-                                    "015_conversation_sessions_filter_columns"
+                                    "015_conversation_sessions_filter_columns",
+                                    "016_drop_search_aux"
                                 ],
                                 "skipped": []
                             },
@@ -199,7 +200,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/27 applied",
+                    "summary": "0/28 applied",
                     "title": "Migrations"
                 },
                 {
@@ -312,13 +313,17 @@
                             [
                                 "cache.db",
                                 "015_conversation_sessions_filter_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "016_drop_search_aux"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "27 pending",
+                    "summary": "28 pending",
                     "title": "Pending migrations"
                 }
             ],
@@ -377,6 +382,16 @@
                     "severity": "ok",
                     "summary": "no credited weeks",
                     "title": "Post-credit milestones"
+                },
+                {
+                    "details": {
+                        "messages_distinct_sessions": null,
+                        "rollup_count": null
+                    },
+                    "id": "data.conversation_sessions_rollup",
+                    "severity": "ok",
+                    "summary": "no data",
+                    "title": "Conversation rollup"
                 }
             ],
             "id": "data",
@@ -458,7 +473,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 20,
+            "ok": 21,
             "warn": 5
         },
         "severity": "warn"

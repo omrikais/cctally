@@ -20,8 +20,8 @@ Database
   ✓ stats.db                 version 0 / 12 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/27 applied
-  ⚠ Pending migrations       27 pending
+  ✓ Migrations               0/28 applied
+  ⚠ Pending migrations       28 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ✓ Latest snapshot          2s ago
@@ -29,6 +29,7 @@ Data
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
+  ✓ Conversation rollup      no data
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -40,4 +41,4 @@ Safety
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
 
-Summary: 17 OK · 7 WARN · 1 FAIL
+Summary: 18 OK · 7 WARN · 1 FAIL

@@ -274,6 +274,71 @@ def doctor_gather_state(
     except Exception:
         pass
 
+    # Conversation-sessions rollup consistency (#217 S1 / U9). Two cheap COUNTs
+    # (graceful None on a missing table / unreadable DB) + an in-progress signal
+    # so a transient mid-sync mismatch never WARNs. The in-progress signal is a
+    # NON-BLOCKING cache.db.lock flock probe (a writer mid-walk holds it) OR the
+    # presence of any pending reingest/split/backfill cache_meta flag — doctor
+    # stays read-only and never blocks on the lock.
+    conv_sessions_rollup_count = None
+    conv_messages_distinct_sessions = None
+    conv_rollup_sync_in_progress = False
+    try:
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+            try:
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM conversation_sessions"
+                    ).fetchone()
+                    if row is not None:
+                        conv_sessions_rollup_count = int(row[0])
+                except sqlite3.OperationalError:
+                    pass  # table absent (pre-rollup) — leave None
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(DISTINCT session_id) "
+                        "FROM conversation_messages WHERE session_id IS NOT NULL"
+                    ).fetchone()
+                    if row is not None:
+                        conv_messages_distinct_sessions = int(row[0])
+                except sqlite3.OperationalError:
+                    pass
+                # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
+                # reconciled the rollup. Read the canonical flag set from
+                # _cctally_cache so it stays in lockstep with the sync consumers.
+                try:
+                    import _cctally_cache as _cc_sib  # lazy sibling
+                    flags = tuple(_cc_sib._TARGETED_DECLINE_FLAGS)
+                    placeholders = ",".join("?" for _ in flags)
+                    pend = conn.execute(
+                        f"SELECT 1 FROM cache_meta WHERE key IN ({placeholders}) "
+                        "LIMIT 1", flags).fetchone()
+                    if pend is not None:
+                        conv_rollup_sync_in_progress = True
+                except (sqlite3.OperationalError, Exception):
+                    pass
+            finally:
+                conn.close()
+        # Non-blocking flock probe: if a writer (sync_cache / a reingest) holds
+        # the cache.db.lock, the rollup may be mid-recompute → in progress. We
+        # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
+        # signal. Never blocks (LOCK_NB), so doctor stays read-only + prompt.
+        if not conv_rollup_sync_in_progress:
+            lock_path = _cctally_core.CACHE_LOCK_PATH
+            if lock_path is not None and pathlib.Path(lock_path).exists():
+                import fcntl as _fcntl
+                lock_fh = open(str(lock_path), "w")
+                try:
+                    _fcntl.flock(lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    _fcntl.flock(lock_fh, _fcntl.LOCK_UN)  # acquired ⇒ quiescent
+                except (BlockingIOError, OSError):
+                    conv_rollup_sync_in_progress = True  # held ⇒ writer mid-flight
+                finally:
+                    lock_fh.close()
+    except Exception:
+        pass
+
     claude_jsonl_present = False
     try:
         claude_dir = pathlib.Path.home() / ".claude" / "projects"
@@ -453,6 +518,10 @@ def doctor_gather_state(
         is_dev_checkout=_cctally_core._is_dev_checkout(),
         # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
         pricing_coverage=pricing_coverage,
+        # Conversation-sessions rollup consistency (#217 S1 / U9).
+        conv_sessions_rollup_count=conv_sessions_rollup_count,
+        conv_messages_distinct_sessions=conv_messages_distinct_sessions,
+        conv_rollup_sync_in_progress=conv_rollup_sync_in_progress,
     )
 
 
