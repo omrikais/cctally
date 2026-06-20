@@ -1811,9 +1811,25 @@ def _consume_title_fts(conn) -> None:
         "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
     ).fetchone() is not None
     if not fts_off:
-        conn.execute(
-            "INSERT INTO conversation_title_fts(conversation_title_fts) "
-            "VALUES('rebuild')")
+        # The title FTS may not exist YET even on an FTS5-capable build: a pre-S6
+        # install whose conversation_fts is still the legacy (text) shape makes
+        # _apply_cache_schema early-return at its legacy_present guard BEFORE it
+        # creates conversation_title_fts. When migrations 010 + 018 are both
+        # pending in that open, _consume_search_split swaps only the MESSAGE FTS
+        # (never the title FTS), so a blind 'rebuild' here would raise
+        # "no such table: conversation_title_fts" — fts5_unavailable is NOT set
+        # (FTS5 IS available), so the fts_off guard above does not protect it.
+        # Swallow that OperationalError and RETURN before the flag-clear so the
+        # flag survives: the NEXT open (message FTS now split → legacy_present
+        # False → _apply_cache_schema creates the title FTS) re-runs this consumer
+        # and completes the backfill. Match the message-FTS path's resilience.
+        try:
+            conn.execute(
+                "INSERT INTO conversation_title_fts(conversation_title_fts) "
+                "VALUES('rebuild')")
+        except sqlite3.OperationalError:
+            return   # title FTS not yet created (legacy-shape pre-swap); leave
+                     # the flag set, retry on the next open
     conn.execute(
         "DELETE FROM cache_meta WHERE key='conversation_title_fts_backfill_pending'")
     conn.commit()

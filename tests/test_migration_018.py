@@ -169,6 +169,89 @@ def test_consume_title_fts_no_fts5_just_clears_flag(monkeypatch):
     assert _flag(c) is None
 
 
+# --- CRITICAL: legacy-FTS-shape upgrade with 010 + 018 BOTH pending --------
+
+def _legacy_text_shape_no_title_fts(c):
+    """Tear an already-schema'd cache.db down to the pre-S6 legacy
+    ``conversation_fts(text)`` shape and remove the title FTS entirely — exactly
+    the state ``_apply_cache_schema`` leaves untouched when its ``legacy_present``
+    branch early-returns (BEFORE it would create ``conversation_title_fts``). The
+    base ``conversation_ai_titles`` table survives (it is created above the FTS
+    section, so the early-return never drops it)."""
+    db._drop_conversation_fts_triggers(c)
+    c.execute("DROP TABLE IF EXISTS conversation_fts")
+    c.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+    db._drop_conversation_title_fts_triggers(c)
+    c.execute("DROP TABLE IF EXISTS conversation_title_fts")
+    c.execute("CREATE VIRTUAL TABLE conversation_fts "
+              "USING fts5(text, content='conversation_messages', content_rowid='id')")
+    db._create_conversation_fts_aux_table(c)
+    db._create_conversation_fts_legacy_triggers(c)
+    c.commit()
+
+
+def test_consume_title_fts_legacy_shape_010_018_both_pending(monkeypatch):
+    """CRITICAL regression (code-review repro): on a pre-S6 install whose
+    ``conversation_fts`` is still the legacy ``(text)`` shape, ``_apply_cache_schema``
+    early-returns at ``legacy_present`` BEFORE creating ``conversation_title_fts``.
+    When migrations 010 (search-split) and 018 are BOTH pending in the same open,
+    the full sync runs ``_consume_search_split`` (swaps the MESSAGE FTS only — it
+    never creates the title FTS) and then ``_consume_title_fts``, which used to run
+    ``INSERT INTO conversation_title_fts(...) VALUES('rebuild')`` against a table
+    that does not yet exist → uncaught ``sqlite3.OperationalError: no such table:
+    conversation_title_fts`` propagating out of ``sync_cache`` and hard-failing the
+    first JSONL-reading command / hook-tick / dashboard sync after upgrade.
+
+    The fix makes ``_consume_title_fts`` swallow that OperationalError and ``return``
+    BEFORE the flag-clear, so the flag survives. The next open (which WILL have
+    created the title FTS via ``_apply_cache_schema`` once the message FTS is split
+    so ``legacy_present`` is False) then completes the backfill: the index becomes
+    searchable and the flag clears."""
+    c = _conn()
+    if not db._fts5_available(c):
+        pytest.skip("sqlite build lacks FTS5")
+    _legacy_text_shape_no_title_fts(c)
+    # Both migration-010 and migration-018 flags armed in the SAME open.
+    db._set_cache_meta(c, "conversation_search_split_pending", "1")
+    db._set_cache_meta(c, _FLAG, "1")
+    _upsert_title(c, "s1", "refactor the cache module")
+    c.commit()
+
+    # _apply_cache_schema must early-return at legacy_present and NOT create the
+    # title FTS (this is what makes the consumer's blind 'rebuild' explode).
+    db._apply_cache_schema(c)
+    assert c.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='conversation_title_fts'").fetchone() is None
+
+    # Drive the consumer sequence exactly as sync_cache does (search-split swaps
+    # the MESSAGE FTS only; the title FTS is still absent).
+    cc._consume_search_split(c)
+    assert db._conversation_fts_is_split(c)
+
+    # The fix: this must NOT raise (RED before the try/except, GREEN after) and
+    # must LEAVE the flag set so the next open finishes the backfill.
+    cc._consume_title_fts(c)
+    assert _flag(c) == "1", (
+        "the title-FTS backfill flag must survive a missing-vtable skip so the "
+        "next open completes it")
+
+    # Next open: message FTS is now split, so legacy_present is False and
+    # _apply_cache_schema creates the title FTS. The flag is still set, so the
+    # next consume populates the index and clears the flag.
+    db._apply_cache_schema(c)
+    assert c.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='conversation_title_fts'").fetchone() is not None
+    cc._consume_title_fts(c)
+    assert _flag(c) is None                       # flag finally cleared
+    # The title index is now actually searchable (a 'rebuild' ran, not just a
+    # content-row-count quirk).
+    assert c.execute(
+        "SELECT count(*) FROM conversation_title_fts "
+        "WHERE conversation_title_fts MATCH 'refactor'").fetchone()[0] == 1
+
+
 # --- P1-2: flag joins _TARGETED_DECLINE_FLAGS ONLY -------------------------
 
 def test_title_flag_in_targeted_decline_only_not_reingest():

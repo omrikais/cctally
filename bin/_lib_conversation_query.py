@@ -2110,7 +2110,18 @@ def search_conversations(conn, query, *, limit=50, offset=0,
     if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
         return base
     if kind == "title":
-        out = _search_title(conn, q, limit, offset, fts_available,
+        if fts_available:
+            try:
+                out = _search_title(conn, q, limit, offset, True,
+                                    filt_sql, filt_params)
+                out.update(kind="title", search_depth=depth)
+                return _finish(out)
+            except sqlite3.OperationalError:
+                pass   # title FTS missing/corrupt at query time (the flag is
+                       # derived from fts5_unavailable, not a per-table probe) →
+                       # fall through to the title LIKE scan, mirroring the
+                       # message-FTS path's resilience
+        out = _search_title(conn, q, limit, offset, False,
                             filt_sql, filt_params)
         out.update(kind="title", search_depth=depth)
         return _finish(out)

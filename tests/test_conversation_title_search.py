@@ -134,6 +134,33 @@ def test_kind_title_empty_query_is_empty():
     assert res["hits"] == [] and res["total"] == 0 and res["kind"] == "title"
 
 
+def test_kind_title_missing_vtable_degrades_to_like():
+    """Resilience (code-review P3): ``fts_available`` is derived from the
+    ``fts5_unavailable`` flag (NOT a per-table probe), so on an otherwise
+    FTS5-capable build a missing/corrupt ``conversation_title_fts`` vtable would
+    raise inside ``_search_title`` — the ``kind=title`` branch must catch that
+    ``sqlite3.OperationalError`` and degrade to the title LIKE scan, mirroring the
+    message-FTS path's resilience, instead of bubbling a 500.
+
+    The LIKE degradation still returns the correct session-level title hit (the
+    title content lives in ``conversation_ai_titles``, not the dropped vtable)."""
+    c = _conn()
+    if not db._fts5_available(c):
+        pytest.skip("sqlite build lacks FTS5")
+    _seed_titles(c)
+    # Simulate a missing/corrupt title vtable on an FTS5-capable build: drop the
+    # sync triggers (so the DROP doesn't strand a live trigger) then the vtable.
+    db._drop_conversation_title_fts_triggers(c)
+    c.execute("DROP TABLE IF EXISTS conversation_title_fts")
+    # fts_available=True mirrors the live derivation (fts5_unavailable is NOT set,
+    # so the kernel believes FTS is usable) — the per-table miss is what we test.
+    res = cq.search_conversations(c, "refactor", kind="title", fts_available=True)
+    assert res["kind"] == "title"
+    assert res["mode"] == "like"                   # degraded, not a 500
+    assert {h["session_id"] for h in res["hits"]} == {"s1"}
+    assert res["total"] == 1
+
+
 def test_title_in_search_kinds_not_find_kinds():
     """P1-1 (kernel side): the cross-session search-kind set carries ``title``;
     the find-kind set does NOT (so the shared /find route 400s it, not 500s)."""
