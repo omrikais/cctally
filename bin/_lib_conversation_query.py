@@ -2385,11 +2385,21 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
             "mode": "fts" if fts_available else "like"}
     if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
         return base
+    # U2 (#217 S1): run the match probe BEFORE assembly so a non-empty query that
+    # matches ZERO rows in this session returns early — skipping the full
+    # `_assemble_session` walk a no-result find used to pay. The two functions are
+    # independent (neither consumes the other's output); a non-empty match still
+    # assembles, since the uuid → member_uuids anchor mapping needs the items.
+    # `mode` is taken from the match probe (it may fall through to LIKE on an FTS
+    # error) so the empty-match base carries the actually-used mode, not the
+    # `fts_available` default — byte-identical to the prior post-assembly answer.
+    mode, matched = _find_matched_rows(
+        conn, session_id, q, kind, depth, fts_available)
+    if not matched:
+        return {**base, "mode": mode}
     asm = _assemble_session(conn, session_id)
     if asm is None:
         return None
-    mode, matched = _find_matched_rows(
-        conn, session_id, q, kind, depth, fts_available)
     # matched: {uuid -> set of labels in {"prose", "tool", "thinking"}}
     anchors = []
     for it in asm["items"]:

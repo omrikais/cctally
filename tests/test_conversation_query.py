@@ -2680,6 +2680,54 @@ def test_find_unknown_session_empty_query_returns_none(monkeypatch):
     assert cq.find_in_conversation(c, "nope", "needle") is None
 
 
+def test_find_zero_match_skips_assembly(monkeypatch):
+    """U2 (#217 S1): a NON-EMPTY query that matches ZERO rows in a KNOWN session
+    must return the empty base WITHOUT assembling — the match probe runs first
+    and short-circuits before _assemble_session. (Today the assembly runs before
+    the match, paying a full session walk for a no-result find.)"""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    calls = []
+    real_assemble = cq._assemble_session
+    monkeypatch.setattr(
+        cq, "_assemble_session",
+        lambda *a, **k: calls.append(1) or real_assemble(*a, **k))
+    out = cq.find_in_conversation(c, "s1", "zzznotpresentzzz")
+    assert out is not None
+    assert out["anchors"] == [] and out["total"] == 0
+    assert out["anchors_truncated"] is False
+    assert calls == [], "zero-match find must not assemble the session"
+    # Same for the LIKE fallback path.
+    out_like = cq.find_in_conversation(
+        c, "s1", "zzznotpresentzzz", fts_available=False)
+    assert out_like["anchors"] == [] and out_like["total"] == 0
+    assert calls == []
+
+
+def test_find_nonzero_match_output_unchanged():
+    """U2: a query that DOES match still assembles and produces byte-identical
+    output to the pre-reorder behavior (anchors, badges, totals, mode/depth).
+    Compared field-by-field against the known-good the existing find tests pin."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    out = cq.find_in_conversation(c, "s1", "needle")
+    assert out is not None
+    # Byte-identical to test_find_returns_rendered_turn_anchors_in_document_order.
+    assert out["anchors"] == [
+        {"uuid": "as", "match_kinds": ["tool"]},
+        {"uuid": "h2", "match_kinds": []},
+    ]
+    assert out["total"] == 2
+    assert out["anchors_truncated"] is False
+    assert out["mode"] == "fts"
+    assert out["search_depth"] == "full"
+    assert out["kind"] == "all"
+
+
 def test_find_kind_scoping_and_like_mode():
     c = _conn()
     if not db._fts5_available(c):
