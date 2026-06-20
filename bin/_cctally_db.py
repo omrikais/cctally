@@ -2447,17 +2447,19 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "conversation_messages", "source_tool_use_id", "TEXT")
     # #177 Session 1: enriched data-contract columns. Idempotent column-adds (no
     # marker, no version — exactly like source_tool_use_id); cache migration 007
-    # then re-ingests so the values actually land on historical rows. search_aux
-    # is the parser-populated non-prose blob the conversation_fts_aux index reads.
+    # then re-ingests so the values actually land on historical rows.
     add_column_if_missing(conn, "conversation_messages", "stop_reason", "TEXT")
     add_column_if_missing(conn, "conversation_messages", "attribution_skill", "TEXT")
     add_column_if_missing(conn, "conversation_messages", "attribution_plugin", "TEXT")
-    add_column_if_missing(
-        conn, "conversation_messages", "search_aux", "TEXT NOT NULL DEFAULT ''")
-    # #177 S6: split the non-prose search index into two columns so kind facets
-    # (Tools / Thinking) are exact in SQL. ``search_aux`` above is documented-dead
-    # — the writer stops populating it (always ''); the consolidated multi-column
-    # conversation_fts(text, search_tool, search_thinking) indexes these instead.
+    # #217 S1 / U7a: ``search_aux`` (the pre-#177-S6 non-prose FTS blob, always
+    # '' since the split) is NO LONGER emitted here — a fresh install never
+    # carries it, and cache migration ``016_drop_search_aux`` drops it from an
+    # existing install once the migration-010 search split is consumed. The
+    # legacy ``conversation_fts_aux`` test/fixture standup
+    # (``_create_conversation_fts_aux_table``) adds the column locally itself.
+    # #177 S6: the split non-prose search index — two columns so kind facets
+    # (Tools / Thinking) are exact in SQL. The consolidated multi-column
+    # conversation_fts(text, search_tool, search_thinking) indexes these.
     # Idempotent column-adds (no marker, no version); migration 010 backfills the
     # values onto existing history from blocks_json under the cache.db.lock flock.
     add_column_if_missing(
@@ -2616,6 +2618,19 @@ def _create_conversation_fts_aux_table(conn: sqlite3.Connection) -> None:
     # the column — notably ``sqlite3.Connection.iterdump`` (the dump emits
     # ``SELECT quote(aux) FROM conversation_fts_aux`` → "no such column"). Aligning
     # the names keeps the index dumpable and is the documented FTS5 posture.
+    #
+    # #217 S1 / U7a: the live ``_apply_cache_schema`` no longer emits
+    # ``search_aux`` (migration 016 drops it once the search split is consumed),
+    # so this LEGACY standup adds the column LOCALLY here — it stands up the
+    # pre-S6 aux shape and needs the content-table column to exist by NAME.
+    # Idempotent (duplicate-column tolerated) so a DB that still carries the
+    # column (pre-016 existing install) is a no-op.
+    try:
+        conn.execute(
+            "ALTER TABLE conversation_messages "
+            "ADD COLUMN search_aux TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already present (pre-016 existing install)
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts_aux "
         "USING fts5(search_aux, content='conversation_messages', content_rowid='id')")
@@ -3499,6 +3514,105 @@ def _015_conversation_sessions_filter_columns(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # idempotent: column already present
     _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+    conn.commit()
+
+
+def _conversation_messages_has_column(conn: sqlite3.Connection, column: str) -> bool:
+    """True iff ``conversation_messages`` carries *column*. Tolerates a missing
+    table (a path-less / schema-not-applied connection) -> False."""
+    try:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(conversation_messages)")]
+    except sqlite3.OperationalError:
+        return False
+    return column in cols
+
+
+def _legacy_aux_fts_present(conn: sqlite3.Connection) -> bool:
+    """True iff the pre-#177-S6 ``conversation_fts_aux`` external-content table
+    OR any of its sync triggers (which reference ``search_aux``) still exist.
+
+    While EITHER is live, an ``ALTER TABLE conversation_messages DROP COLUMN
+    search_aux`` FAILS (the trigger/index body references the column). Migration
+    010's state machine (``_consume_search_split`` in sync_cache) owns tearing
+    these down; 016 only WAITS until they are gone. Tolerates a missing
+    ``sqlite_master`` read -> False (no aux shape to block on)."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE (type='table' AND name='conversation_fts_aux') "
+            "   OR (type='trigger' AND name IN "
+            "       ('conv_fts_aux_ai','conv_fts_aux_ad','conv_fts_aux_au')) "
+            "LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
+
+
+@cache_migration("016_drop_search_aux")
+def _016_drop_search_aux(conn: sqlite3.Connection) -> None:
+    """Drop the documented-dead ``conversation_messages.search_aux`` column
+    (#217 S1 / U7a) — it has been ``''`` on every row since #177 S6 split the
+    non-prose search index into ``search_tool``/``search_thinking`` and the live
+    ``conversation_fts`` stopped referencing it.
+
+    THREE guards, in order (the drop is the LAST thing that happens):
+
+      1. Column-presence — idempotent skip-as-applied when ``search_aux`` is
+         already gone. A fresh install never carries it (``_apply_cache_schema``
+         no longer emits it post-#217), so the dispatcher stamps 016 without the
+         column ever existing; an existing install drops it once.
+      2. ``sqlite_version() >= 3.35`` — ``ALTER TABLE … DROP COLUMN`` did not
+         exist before SQLite 3.35. On an older build we SKIP-as-applied, leaving
+         the harmless dead column (never a hard fail; cache.db is re-derivable,
+         and a later open on a newer SQLite still can't re-run a stamped
+         migration — the column simply persists, which is benign).
+      3. Search-split-consumed gate (Codex P1) — DEFER via ``MigrationGateNotMet``
+         (retried next open) when migration 010's
+         ``conversation_search_split_pending`` flag is set OR the legacy
+         ``conversation_fts_aux`` table / its triggers still exist. ``DROP COLUMN``
+         FAILS while a trigger references ``search_aux`` (confirmed in-memory), so
+         016 must wait for ``_consume_search_split`` (sync_cache) to backfill the
+         split columns + swap the FTS shape. 016 does NOT tear the aux table down
+         itself — 010's state machine owns that. On a ``--no-sync``-forever DB the
+         split never consumes and the column persists harmlessly (re-derivable).
+
+    The handler does its own DDL only; the dispatcher central-stamps the marker
+    (#140) on a clean return (the apply path) — it does NOT stamp on the
+    ``MigrationGateNotMet`` defer path, so the migration stays pending and retries.
+    """
+    if not _conversation_messages_has_column(conn, "search_aux"):
+        # Guard 1: already absent (fresh install, or a prior 016 run). The
+        # dispatcher central-stamps on this clean return.
+        return
+    sqlite_version = tuple(
+        int(p) for p in sqlite3.sqlite_version.split(".")[:3]
+    )
+    if sqlite_version < (3, 35, 0):
+        # Guard 2: no DROP COLUMN on this build. Skip-as-applied (stamp on the
+        # clean return) — the dead column stays, harmless.
+        return
+    try:
+        split_pending = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_search_split_pending'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        # No cache_meta table (a bare / path-less connection) -> no pending
+        # flag to honor; the legacy-aux probe below still guards the topology.
+        split_pending = False
+    if split_pending or _legacy_aux_fts_present(conn):
+        # Guard 3: the search split is not yet consumed — the legacy aux FTS
+        # may still reference search_aux, so DROP COLUMN would fail. DEFER; the
+        # next sync's _consume_search_split clears the flag + drops the aux
+        # shape, and a later open then drops the column.
+        raise MigrationGateNotMet(
+            "search_aux drop deferred: migration-010 search split not yet "
+            "consumed (pending flag or legacy conversation_fts_aux still present)"
+        )
+    conn.execute(
+        "ALTER TABLE conversation_messages DROP COLUMN search_aux")
     conn.commit()
 
 

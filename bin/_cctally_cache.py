@@ -185,8 +185,8 @@ _CONV_INSERT_SQL = (
     " timestamp_utc,entry_type,text,blocks_json,model,msg_id,"
     " req_id,cwd,git_branch,is_sidechain,source_tool_use_id,"
     " stop_reason,attribution_skill,attribution_plugin,"
-    " search_tool,search_thinking,search_aux)"
-    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " search_tool,search_thinking)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 # #193: last non-null write wins (ai-title carries no timestamp; see spec S1). NO
@@ -206,19 +206,19 @@ def _conv_row_tuple(m, path_str):
     """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order.
 
     The #177 enrichment fields (stop_reason / attribution_skill /
-    attribution_plugin / search_tool / search_thinking / search_aux) are
-    TAIL-APPENDED after source_tool_use_id — same order as the SQL column list —
-    so both ingest paths (fused per-file walk + backfill_conversation_messages)
-    carry them through this one tuple. #177 S6: ``search_aux`` is always written
-    as ``''`` (documented-dead); the split ``search_tool``/``search_thinking``
-    columns carry the non-prose index."""
+    attribution_plugin / search_tool / search_thinking) are TAIL-APPENDED after
+    source_tool_use_id — same order as the SQL column list — so both ingest paths
+    (fused per-file walk + backfill_conversation_messages) carry them through this
+    one tuple. #217 S1 / U7a: the documented-dead ``search_aux`` column is gone
+    from the live schema (dropped by migration 016); the split
+    ``search_tool``/``search_thinking`` columns carry the non-prose index."""
     return (
         m.session_id, m.uuid, m.parent_uuid, path_str, m.byte_offset,
         m.timestamp_utc, m.entry_type, m.text, m.blocks_json, m.model,
         m.msg_id, m.req_id, m.cwd, m.git_branch, m.is_sidechain,
         m.source_tool_use_id,
         m.stop_reason, m.attribution_skill, m.attribution_plugin,
-        m.search_tool, m.search_thinking, m.search_aux,
+        m.search_tool, m.search_thinking,
     )
 
 

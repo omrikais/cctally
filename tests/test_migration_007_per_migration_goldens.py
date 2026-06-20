@@ -4,10 +4,11 @@
 Loads ``tests/fixtures/migrations/per-migration/007_conversation_reingest_enrichment/pre.sqlite``
 (an existing install at the 006 head: migrations 001-006 applied, a single
 pre-#177 conversation_messages row whose enrichment columns are at their
-default state — ``search_aux=''``, ``stop_reason``/``attribution_*`` NULL — and
-whose blocks_json lacks the #177 keys, no 007 marker, the enrichment flag
-unset), runs the production 007 handler against a copy, and asserts the result
-matches ``post.sqlite``.
+default state — ``stop_reason``/``attribution_*`` NULL — and whose blocks_json
+lacks the #177 keys, no 007 marker, the enrichment flag unset), runs the
+production 007 handler against a copy, and asserts the result matches
+``post.sqlite``. (#217 S1 / U7a: ``search_aux`` was dropped from the live
+schema, so the fixture no longer carries it.)
 
 007 is FLAG-ONLY and uses a DISTINCT flag
 ``conversation_reingest_enrichment_pending`` (NOT the shared
@@ -18,8 +19,8 @@ without the ``cache.db.lock`` flock, racing a concurrent sync, and empty the
 reader on ``--no-sync`` / eager opens), the handler sets the flag and returns;
 the dispatcher central-stamps the migration marker (#140). The actual clear +
 offset-0 re-ingest (which lands structured tool ``input`` + ``input_truncated``,
-the raised result cap + ``full_length``, ``stop_reason``/``attribution_*``, and
-the ``search_aux`` aux-FTS blob on existing history) is deferred to the next
+the raised result cap + ``full_length``, and ``stop_reason``/``attribution_*``
+on existing history) is deferred to the next
 ``sync_cache`` — the same consumption path 003-006 already use, with zero new
 consumption code. THIS file pins the handler's flag contract + the row-unchanged
 + marker-stamp post-state.
@@ -88,18 +89,18 @@ def test_pre_fixture_is_existing_install_at_006_without_enrichment(cctally_modul
     conn = sqlite3.connect(PRE_DB)
     try:
         rows = conn.execute(
-            "SELECT blocks_json, search_aux, stop_reason, attribution_skill, "
+            "SELECT blocks_json, stop_reason, attribution_skill, "
             "       attribution_plugin "
             "FROM conversation_messages"
         ).fetchall()
         assert len(rows) == 1
-        blocks_json, search_aux, stop_reason, attr_skill, attr_plugin = rows[0]
+        blocks_json, stop_reason, attr_skill, attr_plugin = rows[0]
         block = json.loads(blocks_json)[0]
         assert block["kind"] == "tool_use"
         assert "input" not in block, "pre fixture must lack the #177 input key"
         assert "input_truncated" not in block
         # Enrichment columns at default (the deferred re-ingest populates them).
-        assert search_aux == "", "search_aux defaults to '' pre-reingest"
+        # (#217 S1 / U7a: search_aux was dropped from the live schema.)
         assert stop_reason is None
         assert attr_skill is None
         assert attr_plugin is None
@@ -129,13 +130,13 @@ def test_post_fixture_has_flag_marker_and_row_unchanged(cctally_module):
     conn = sqlite3.connect(POST_DB)
     try:
         # Row UNCHANGED (still pre-#177 — the handler does not clear/re-ingest).
+        # (#217 S1 / U7a: search_aux was dropped from the live schema.)
         rows = conn.execute(
-            "SELECT blocks_json, search_aux FROM conversation_messages"
+            "SELECT blocks_json FROM conversation_messages"
         ).fetchall()
         assert len(rows) == 1
         block = json.loads(rows[0][0])[0]
         assert "input" not in block, "handler must not re-ingest inline"
-        assert rows[0][1] == "", "handler must not populate search_aux inline"
         assert conn.execute(
             "SELECT value FROM cache_meta WHERE key=?", (_FLAG,)
         ).fetchone() == ("1",), "handler must set the enrichment pending flag"

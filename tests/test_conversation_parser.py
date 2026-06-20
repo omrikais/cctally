@@ -487,8 +487,8 @@ def test_message_level_fields_land_on_row():
 
 def test_search_columns_include_tool_and_thinking_exclude_prose():
     # #177 S6: the non-prose index split into search_tool (tool input/result) +
-    # search_thinking (thinking). The legacy search_aux column is documented-dead
-    # (always ''). Prose stays in text only.
+    # search_thinking (thinking). Prose stays in text only. (#217 S1 / U7a: the
+    # legacy documented-dead search_aux field was removed from MessageRow.)
     row = lc.parse_message_row(_asst_line([
         {"type": "text", "text": "PROSE_ONLY_TOKEN"},
         {"type": "thinking", "thinking": "THINK_TOKEN"},
@@ -499,7 +499,7 @@ def test_search_columns_include_tool_and_thinking_exclude_prose():
     assert "PROSE_ONLY_TOKEN" not in row.search_tool   # prose excluded
     assert "PROSE_ONLY_TOKEN" not in row.search_thinking
     assert "PROSE_ONLY_TOKEN" in row.text              # prose still indexed via text
-    assert row.search_aux == ""                        # documented-dead
+    assert not hasattr(row, "search_aux")              # #217 S1 / U7a: field removed
 
 def test_search_tool_includes_tool_result_text():
     line = {"type": "user", "uuid": "u3", "sessionId": "s1",
@@ -508,7 +508,6 @@ def test_search_tool_includes_tool_result_text():
     row = lc.parse_message_row(line, 0)
     assert "RESULT_TOKEN" in row.search_tool
     assert row.text == ""                              # tool_result zeroes prose, NOT search_tool
-    assert row.search_aux == ""
 
 def test_search_thinking_caps_thinking_but_block_keeps_full():
     # The thinking search-column entry is capped at _TOOL_RESULT_CAP so the FTS

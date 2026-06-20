@@ -142,7 +142,6 @@ def _insert_message(
     stop_reason: str | None = None,
     attribution_skill: str | None = None,
     attribution_plugin: str | None = None,
-    search_aux: str = "",
 ) -> None:
     """Insert one ``conversation_messages`` row (no shared helper exists).
 
@@ -156,24 +155,25 @@ def _insert_message(
     carries (the transcript's ``sourceToolUseID``); the reader uses it to fold
     the body into its owning Skill tool chip. NULL on every non-skill-body row.
 
-    ``stop_reason`` / ``attribution_skill`` / ``attribution_plugin`` /
-    ``search_aux`` are the #177-enriched message-level columns (tail-appended,
-    matching the production INSERT tuple). The reader surfaces stop_reason /
-    attribution on assistant items; search_aux backs the aux FTS index (no
-    query yet this session). All NULL/'' by default on rows that don't need them.
+    ``stop_reason`` / ``attribution_skill`` / ``attribution_plugin`` are the
+    #177-enriched message-level columns (tail-appended, matching the production
+    INSERT tuple). The reader surfaces stop_reason / attribution on assistant
+    items. All NULL by default on rows that don't need them. (#217 S1 / U7a: the
+    dead ``search_aux`` column was dropped from the live schema, so it is no
+    longer inserted here.)
     """
     conn.execute(
         "INSERT INTO conversation_messages "
         "(session_id, uuid, parent_uuid, source_path, byte_offset, "
         " timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id, "
         " cwd, git_branch, is_sidechain, source_tool_use_id, "
-        " stop_reason, attribution_skill, attribution_plugin, search_aux) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " stop_reason, attribution_skill, attribution_plugin) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id, uuid, parent_uuid, source_path, byte_offset,
             timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id,
             cwd, git_branch, is_sidechain, source_tool_use_id,
-            stop_reason, attribution_skill, attribution_plugin, search_aux,
+            stop_reason, attribution_skill, attribution_plugin,
         ),
     )
 
@@ -297,7 +297,6 @@ def build(scenario: str) -> None:
             ),
             model=MODEL, msg_id="m1", req_id="r1",
             cwd=s1_cwd, git_branch="main",
-            search_aux="/home/u/proj/resets.py\nbrainstorming\nlet me think",
         )
         # id=3 (NEW): the user tool_result row for toolu_s1a. The kernel folds
         # this into the (m1,r1) turn's tool_call.result and joins uuid 'tr1'
@@ -316,7 +315,6 @@ def build(scenario: str) -> None:
                 '"tool_use_id": "toolu_s1a"}]'
             ),
             cwd=s1_cwd, git_branch="main",
-            search_aux="def reset(): ...",
         )
         # The trivial "Launching skill" tool_result for toolu_FX (Skill triple,
         # message 2 of 3). The Phase 4b skill-body fold REPLACES this result with
@@ -643,7 +641,6 @@ def build(scenario: str) -> None:
             stop_reason="tool_use",
             attribution_skill="superpowers:test-driven-development",
             attribution_plugin="superpowers",
-            search_aux="/home/u/proj/resolve.py\nclipped-leaf…",
         )
         # A truncated tool_result for toolu_s5: capped ``text`` (a short stub)
         # with ``full_length`` recording the true pre-clip size, ``truncated``
@@ -661,7 +658,6 @@ def build(scenario: str) -> None:
                 '"tool_use_id": "toolu_s5"}]'
             ),
             cwd=s5_cwd, git_branch="main",
-            search_aux="applied 1 edit (truncated)",
         )
         # ONE session_entries row for (m5,r5) carrying BOTH tokens AND a raw
         # cost override. tokens surface on the turn; cost_usd == the override

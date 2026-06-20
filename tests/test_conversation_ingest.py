@@ -946,22 +946,22 @@ def _asst_tooluse_line(uuid, msg_id, req_id, *, cmd="enrichcmd",
 
 def test_sync_lands_enriched_columns_and_split_fts(isolated):
     """A real sync_cache ingests the enriched fields: stop_reason on the row,
-    search_tool populated from the tool input (search_aux stays '' — documented-
-    dead, #177 S6), blocks_json carrying structured input/input_truncated, and
-    the split FTS indexing the tool content via the search_tool column."""
+    search_tool populated from the tool input, blocks_json carrying structured
+    input/input_truncated, and the split FTS indexing the tool content via the
+    search_tool column. (#217 S1 / U7a: the documented-dead search_aux column was
+    dropped from the live schema, so it is no longer selected here.)"""
     ns, conn, projects, sync = isolated
     (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
     sync(rebuild=True)
 
     row = conn.execute(
-        "SELECT stop_reason, search_tool, search_aux, blocks_json "
+        "SELECT stop_reason, search_tool, blocks_json "
         "FROM conversation_messages WHERE uuid='a1'"
     ).fetchone()
     assert row is not None
     assert row[0] == "tool_use"                 # stop_reason column populated
     assert "enrichcmd" in row[1]                # search_tool carries the tool input
-    assert row[2] == ""                         # search_aux documented-dead
-    blocks = json.loads(row[3])
+    blocks = json.loads(row[2])
     tu = [b for b in blocks if b["kind"] == "tool_use"][0]
     assert tu["input"] == {"command": "enrichcmd"}
     assert tu["input_truncated"] is False

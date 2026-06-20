@@ -214,12 +214,12 @@ class MessageRow:
     attribution_skill: "str | None" = None
     attribution_plugin: "str | None" = None
     # #177 S6: split non-prose search columns, derived by _derive_search_columns
-    # on the FINAL post-augment blocks (see _normalize). ``search_aux`` is kept
-    # physically (legacy column) but NEVER assigned a non-empty value — the
-    # consolidated multi-column FTS reads search_tool/search_thinking instead.
+    # on the FINAL post-augment blocks (see _normalize). The consolidated
+    # multi-column FTS reads search_tool/search_thinking. (#217 S1 / U7a: the
+    # legacy ``search_aux`` field was removed — the column is dropped from the
+    # live schema by migration 016 and the writer never carried a value anyway.)
     search_tool: str = ""
     search_thinking: str = ""
-    search_aux: str = ""   # documented-dead (#177 S6); always "" on new rows
 
 
 def iter_message_rows(fh, path_str):
@@ -462,16 +462,15 @@ def _normalize(obj, t, offset):
         is_sidechain=1 if obj.get("isSidechain") else 0,
         source_tool_use_id=obj.get("sourceToolUseID"),
         # #177: message-level enrichment. stop_reason is assistant-only;
-        # attribution is top-level on the JSONL object. search_aux is kept even
-        # for tool_result/meta rows — only `text` is zeroed for prose FTS;
-        # search_aux is the non-prose index (tool content stays searchable).
+        # attribution is top-level on the JSONL object. The non-prose index is
+        # the split search_tool/search_thinking columns — tool/thinking content
+        # stays searchable even though `text` is zeroed for prose FTS on
+        # tool_result/meta rows.
         stop_reason=msg.get("stop_reason") if is_asst else None,
         attribution_skill=obj.get("attributionSkill"),
         attribution_plugin=obj.get("attributionPlugin"),
         search_tool=search_tool,
         search_thinking=search_thinking,
-        # search_aux stays "" (documented-dead, #177 S6) — the consolidated
-        # multi-column FTS reads search_tool/search_thinking instead.
     )
 
 

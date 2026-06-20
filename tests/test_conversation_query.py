@@ -32,10 +32,11 @@ def _list_conversations(c, **kw):
 
 def _msg(c, **kw):
     # The #177 enrichment columns (stop_reason / attribution_skill /
-    # attribution_plugin / search_tool / search_thinking / search_aux) are
-    # TAIL-APPENDED, matching the production INSERT tuple. #177 S6: search_tool /
-    # search_thinking carry the split non-prose index; search_aux is documented-
-    # dead and defaults to '' (the NOT NULL DEFAULT).
+    # attribution_plugin / search_tool / search_thinking) are TAIL-APPENDED,
+    # matching the production INSERT tuple. #177 S6: search_tool / search_thinking
+    # carry the split non-prose index. (#217 S1 / U7a: the documented-dead
+    # search_aux column was dropped from the live schema by migration 016, so it
+    # is no longer inserted here.)
     cols = ("session_id", "uuid", "parent_uuid", "source_path", "byte_offset",
             "timestamp_utc", "entry_type", "text", "blocks_json", "model",
             "msg_id", "req_id", "cwd", "git_branch", "is_sidechain",
@@ -47,7 +48,6 @@ def _msg(c, **kw):
     row["is_sidechain"] = kw.get("is_sidechain", 0)
     row["search_tool"] = kw.get("search_tool", "")
     row["search_thinking"] = kw.get("search_thinking", "")
-    row["search_aux"] = kw.get("search_aux", "")
     row["id"] = kw.get("id")   # explicit rowid when a test pins it (else autoinc)
     id_col = "id," if row["id"] is not None else ""
     id_val = ":id," if row["id"] is not None else ""
@@ -56,12 +56,12 @@ def _msg(c, **kw):
         f"({id_col}session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
         " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,is_sidechain,"
         " source_tool_use_id,stop_reason,attribution_skill,attribution_plugin,"
-        " search_tool,search_thinking,search_aux)"
+        " search_tool,search_thinking)"
         f" VALUES({id_val}:session_id,:uuid,:parent_uuid,:source_path,:byte_offset,"
         ":timestamp_utc,:entry_type,:text,:blocks_json,:model,:msg_id,:req_id,"
         ":cwd,:git_branch,:is_sidechain,:source_tool_use_id,:stop_reason,"
         ":attribution_skill,:attribution_plugin,"
-        ":search_tool,:search_thinking,:search_aux)", row)
+        ":search_tool,:search_thinking)", row)
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
