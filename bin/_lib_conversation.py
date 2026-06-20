@@ -1034,9 +1034,13 @@ def _bound_input(inp):
     # CLIP, not merely flag. The four per-axis caps above bound any SINGLE leaf /
     # key / node-count / depth, but many sub-leaf-cap leaves can still sum past
     # _INPUT_TOTAL_CAP — and the old code only set truncated=True there, serving
-    # an over-cap payload. _clip_payload_input threads a shared remaining-char
-    # budget through the (already per-axis-bounded) dict so the SERVED payload
-    # satisfies len(json.dumps(bounded)) <= _INPUT_TOTAL_CAP whenever it clips.
+    # an over-cap payload. _clip_payload_input threads a shared remaining-WIRE-char
+    # budget through the (already per-axis-bounded) dict — measured in the SAME
+    # json.dumps(separators=(",",":")) wire form this check uses (and blocks_json
+    # stores) — so the SERVED payload satisfies
+    # len(json.dumps(bounded, separators=(",",":"))) <= _INPUT_TOTAL_CAP whenever it
+    # clips. Non-ASCII leaves escape to \uXXXX (6 wire chars/char), so a plain char
+    # budget would clip ~6x too late on the wire (round-2 P1 fix).
     if len(json.dumps(bounded, separators=(",", ":"))) > _INPUT_TOTAL_CAP:
         bounded, _ = _clip_payload_input(bounded, _INPUT_TOTAL_CAP)
         state["truncated"] = True
@@ -1049,30 +1053,70 @@ def _bound_input(inp):
 # module) share one bound-guaranteeing implementation. The query layer never
 # imports back into the parser's callers, so this is the import-safe home (query
 # depends on the parser, not vice-versa — verified at #217 implementation).
+def _wire_len(s):
+    """Serialized char-length of a string leaf in the WIRE form — the SAME
+    ``json.dumps(separators=(",",":"))`` (default ``ensure_ascii=True``) used both
+    by ``_bound_input``'s total-cap check and the ``blocks_json`` storage at the
+    top of this module. For ASCII this equals ``len(s)``; for non-ASCII each char
+    escapes to ``\\uXXXX`` (6 chars) so the wire cost is larger — measuring against
+    it (not ``len(s)``) is what makes the clip's post-condition hold on the wire.
+    The surrounding quotes are part of the per-leaf structural cost the post-walk
+    backstop absorbs, so this counts only the escaped CONTENT (no quotes)."""
+    # json.dumps wraps the string in quotes; strip them to get the content cost.
+    return len(json.dumps(s, separators=(",", ":"))) - 2
+
+
+def _clip_string_to_wire_budget(s, budget):
+    """Return the longest prefix of ``s`` whose WIRE length is ``<= budget`` (>= 0).
+    ASCII is a fast 1:1 slice; for non-ASCII we walk char-by-char accumulating the
+    per-char wire cost so a 6-chars-per-char escape never overshoots the budget."""
+    if budget <= 0:
+        return ""
+    if s.isascii():
+        return s[:budget]
+    out, used = [], 0
+    for ch in s:
+        c = _wire_len(ch)
+        if used + c > budget:
+            break
+        out.append(ch)
+        used += c
+    return "".join(out)
+
+
 def _clip_payload_input(inp, ceiling):
     """Clip a structured input so the returned dict serializes to ``ceiling`` chars
-    or fewer, and report whether anything was clipped — the input-side analogue of
-    the result-side ceiling. A degenerate multi-MB input (one giant leaf OR many
-    sub-ceiling leaves that sum past the ceiling) is bounded so the HTTP server /
-    browser is protected, while every real payload returns whole.
+    or fewer IN THE WIRE FORM, and report whether anything was clipped — the
+    input-side analogue of the result-side ceiling. A degenerate multi-MB input
+    (one giant leaf OR many sub-ceiling leaves that sum past the ceiling) is bounded
+    so the HTTP server / browser is protected, while every real payload returns
+    whole.
 
-    The guarantee is AGGREGATE, not merely per-leaf: a shared remaining-char budget
-    is threaded through the walk (mirroring ``_bound_input``'s total-size backstop) —
-    each string leaf is clipped against the running budget and the budget is
-    decremented as we go, so once it is exhausted later leaves clip to ''.
-    ``truncated`` is True iff any leaf was clipped (or the post-walk serialized size
-    still exceeds ``ceiling``, the structural-overhead backstop). Post-condition:
-    ``len(json.dumps(clipped, ensure_ascii=False)) <= ceiling`` always."""
+    The guarantee is AGGREGATE, not merely per-leaf: a shared remaining-WIRE-char
+    budget is threaded through the walk (mirroring ``_bound_input``'s total-size
+    backstop) — each string leaf is clipped against the running budget, measured in
+    the wire form, and the budget is decremented by the leaf's wire cost as we go,
+    so once it is exhausted later leaves clip to ''. ``truncated`` is True iff any
+    leaf was clipped (or the post-walk serialized size still exceeds ``ceiling``,
+    the structural-overhead backstop).
+
+    The measurement is the WIRE form ``json.dumps(separators=(",",":"))`` (default
+    ``ensure_ascii=True``) — the SAME serialization ``_bound_input`` checks against
+    and the ``blocks_json`` storage uses — NOT ``ensure_ascii=False``. For non-ASCII
+    payloads each char escapes to ``\\uXXXX`` (6 wire chars), so an ``ensure_ascii=
+    False`` measurement clips ~6x too late on the wire; measuring in the wire form
+    is what makes the post-condition real. Post-condition:
+    ``len(json.dumps(clipped, separators=(",",":"))) <= ceiling`` always."""
     truncated = False
-    remaining = [ceiling]   # boxed so the nested walk can decrement it
+    remaining = [ceiling]   # boxed so the nested walk can decrement it (WIRE chars)
 
     def walk(v):
         nonlocal truncated
         if isinstance(v, str):
-            if len(v) > remaining[0]:
+            if _wire_len(v) > remaining[0]:
                 truncated = True
-                v = v[:remaining[0]]
-            remaining[0] -= len(v)
+                v = _clip_string_to_wire_budget(v, remaining[0])
+            remaining[0] -= _wire_len(v)
             return v
         if isinstance(v, dict):
             return {k: walk(x) for k, x in v.items()}
@@ -1083,8 +1127,10 @@ def _clip_payload_input(inp, ceiling):
     clipped = walk(inp)
     # Backstop: structural JSON overhead (braces/quotes/keys) can push a
     # budget-exact payload a few chars past the ceiling. Hard-clip the largest
-    # remaining string leaf(s) until the whole dict serializes within the ceiling.
-    while len(json.dumps(clipped, ensure_ascii=False)) > ceiling:
+    # remaining string leaf(s) until the whole dict serializes within the ceiling —
+    # measured in the wire form so the loop terminates against the same size the
+    # post-condition guards.
+    while len(json.dumps(clipped, separators=(",", ":"))) > ceiling:
         truncated = True
         if not _shrink_largest_leaf(clipped):
             break   # no string leaf left to shrink (e.g. pure numeric/structural)
@@ -1092,16 +1138,19 @@ def _clip_payload_input(inp, ceiling):
 
 
 def _shrink_largest_leaf(obj):
-    """Halve the longest string leaf reachable in ``obj`` (a dict/list/scalar),
+    """Halve the wire-longest string leaf reachable in ``obj`` (a dict/list/scalar),
     in place, and return True if one was shrunk — the post-walk backstop for the
-    rare structural-overhead overshoot. A leaf already at length 1 is truncated to
+    rare structural-overhead overshoot. "Longest" is measured in the WIRE form (so
+    a non-ASCII leaf, 6 wire chars per char, is correctly preferred over a longer
+    ASCII leaf with fewer wire chars). A leaf already at length 1 is truncated to
     ''. Returns False when no non-empty string leaf exists."""
     best = {"len": 0, "container": None, "key": None}
 
     def scan(v, container, key):
         if isinstance(v, str):
-            if len(v) > best["len"]:
-                best.update(len=len(v), container=container, key=key)
+            wl = _wire_len(v)
+            if wl > best["len"]:
+                best.update(len=wl, container=container, key=key)
         elif isinstance(v, dict):
             for k, x in v.items():
                 scan(x, v, k)

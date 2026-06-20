@@ -572,6 +572,34 @@ def test_bound_input_single_giant_leaf_clips_to_total_cap():
     assert trunc is True
     assert len(json.dumps(obj, separators=(",", ":"))) <= lc._INPUT_TOTAL_CAP
 
+def test_bound_input_clips_non_ascii_to_total_cap():
+    # #217 S1 / U5 round-2 P1: the total-cap clip MUST measure in the SAME
+    # serialization form _bound_input checks against and the blocks_json wire uses
+    # (separators=(",",":"), DEFAULT ensure_ascii=True). The old clip measured in
+    # the ensure_ascii=False form, so for NON-ASCII payloads (each char escapes to
+    # 6 wire chars, \uXXXX) the clip stopped ~5x too early — `truncated=True` while
+    # the SERVED payload serialized far past the cap. ASCII payloads coincided,
+    # which is why the ASCII-only clip tests passed while the invariant was broken.
+    leaf = "é" * 100   # 'é' — each escapes to 'é' (6 chars) in the wire form
+    many = {f"k{i}": leaf for i in range(400)}
+    # sanity: the RAW input is genuinely over the total cap in the WIRE form
+    assert len(json.dumps(many, separators=(",", ":"))) > lc._INPUT_TOTAL_CAP
+    obj, trunc = lc._bound_input(many)
+    assert trunc is True
+    # the load-bearing invariant, measured in the wire form (= the blocks_json
+    # serialization at _lib_conversation.py:456 and _bound_input's own check):
+    assert len(json.dumps(obj, separators=(",", ":"))) <= lc._INPUT_TOTAL_CAP
+
+def test_bound_input_single_giant_non_ascii_leaf_clips_to_total_cap():
+    # A single non-ASCII leaf far past the total cap: the per-leaf clip caps it at
+    # _INPUT_LEAF_CAP CHARACTERS, but in the wire form each non-ASCII char is 6
+    # chars, so a _INPUT_LEAF_CAP-char 'é' leaf serializes to ~6x _INPUT_LEAF_CAP —
+    # WELL past the total cap. Only a wire-form total-cap clip brings it within cap.
+    big = "é" * (lc._INPUT_TOTAL_CAP + 5000)
+    obj, trunc = lc._bound_input({"old_string": big})
+    assert trunc is True
+    assert len(json.dumps(obj, separators=(",", ":"))) <= lc._INPUT_TOTAL_CAP
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # #177 Session 1: enriched tool_use / tool_result blocks, message-level
