@@ -201,3 +201,83 @@ def test_dashboard_initial_snapshot_never_syncs(monkeypatch):
         dash._dashboard_initial_snapshot(
             args, pinned_now=None, display_tz_pref_override=None)
         assert captured["skip_sync"] is True, f"no_sync={no_sync} must still skip_sync"
+
+
+# --- U8-G1: real-server bind-before-sync (#179 regression, #217 S1) ---------
+# A REAL ThreadingHTTPServer on an ephemeral port (mirrors production's
+# _QuietThreadingHTTPServer) proving the HTTP port is bound and ACCEPTING before
+# the heavy sync completes. The existing tests/test_dashboard_reingest_179.py
+# coverage above is monkeypatch-level (asserts _dashboard_initial_snapshot uses
+# skip_sync=True); this exercises the end-to-end ordering against a live socket.
+
+import socketserver  # noqa: E402
+import threading     # noqa: E402
+from http.client import HTTPConnection  # noqa: E402
+
+
+def _make_snapshot(ns):
+    return ns["_empty_dashboard_snapshot"]()
+
+
+def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatch):
+    """The #179 invariant, end-to-end: with the background sync still mid-flight
+    (a run_sync_now blocked on a test-held event), the bound HTTP port must
+    ACCEPT and answer /api/data from the seeded snapshot — proving the bind does
+    not wait on sync_cache. A pre-#179 ordering (sync before bind) would make the
+    port unreachable until the event released."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+
+    HandlerCls = ns["DashboardHTTPHandler"]
+    SnapshotRef = ns["_SnapshotRef"]
+    SSEHub = ns["SSEHub"]
+
+    HandlerCls.snapshot_ref = SnapshotRef(_make_snapshot(ns))
+    HandlerCls.hub = SSEHub()
+    HandlerCls.sync_lock = threading.Lock()
+    HandlerCls.no_sync = False
+    HandlerCls.cctally_host = "127.0.0.1"
+
+    # A "heavy sync" that blocks until the test releases it — stands in for a
+    # long sync_cache / reingest. The background sync thread enters it and parks.
+    sync_entered = threading.Event()
+    release_sync = threading.Event()
+    sync_completed = threading.Event()
+
+    def blocking_sync():
+        sync_entered.set()
+        release_sync.wait(timeout=10)
+        sync_completed.set()
+
+    HandlerCls.run_sync_now = staticmethod(blocking_sync)
+
+    # Background sync thread starts (and parks inside blocking_sync) BEFORE the
+    # bind — the production ordering: _DashboardSyncThread.start() precedes the
+    # ThreadingHTTPServer construction.
+    sync_thread = threading.Thread(target=blocking_sync, daemon=True)
+    sync_thread.start()
+    assert sync_entered.wait(timeout=5), "sync thread did not start"
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
+    srv.daemon_threads = True
+    http_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    http_thread.start()
+    try:
+        port = srv.server_address[1]
+        # The sync is STILL blocked — prove it, then prove the port answers.
+        assert not sync_completed.is_set(), "sync should still be blocked"
+        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/api/data")
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        assert r.status == 200, (r.status, body)
+        # Still blocked at the moment we got served — the bind did not wait.
+        assert not sync_completed.is_set(), (
+            "port answered only after sync completed — bind blocked on sync (#179)"
+        )
+    finally:
+        release_sync.set()
+        srv.shutdown()
+        http_thread.join(timeout=3)
+        sync_thread.join(timeout=3)

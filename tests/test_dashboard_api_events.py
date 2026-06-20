@@ -87,3 +87,61 @@ def test_events_headers_and_first_frame():
     finally:
         srv.shutdown()
         t.join(timeout=2)
+
+
+# --- U8-G5: SSEHub multi-subscriber + cleanup (#217 S1) ---------------------
+# Direct unit coverage of the fan-out hub (bin/_cctally_dashboard.py SSEHub):
+# two subscribers both receive a published frame, and unsubscribe removes
+# exactly that queue while leaving the other intact.
+
+def _drain_nowait(q):
+    """Pop every item currently queued (non-blocking) and return the list."""
+    import queue as _queue
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except _queue.Empty:
+            break
+    return out
+
+
+def test_ssehub_two_subscribers_both_receive_frame():
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    q1 = hub.subscribe()
+    q2 = hub.subscribe()
+    sentinel = {"frame": 1}
+    hub.publish(sentinel)
+    # Both subscribers see the exact published object.
+    assert _drain_nowait(q1) == [sentinel]
+    assert _drain_nowait(q2) == [sentinel]
+
+
+def test_ssehub_unsubscribe_removes_only_that_queue():
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    q1 = hub.subscribe()
+    q2 = hub.subscribe()
+    # Remove q1; q2 must still be live.
+    hub.unsubscribe(q1)
+    frame = {"frame": 2}
+    hub.publish(frame)
+    # q1 is gone -> receives nothing; q2 still receives the frame.
+    assert _drain_nowait(q1) == []
+    assert _drain_nowait(q2) == [frame]
+    # Unsubscribing an already-removed (or never-registered) queue is a no-op.
+    hub.unsubscribe(q1)               # must not raise
+    import queue as _queue
+    hub.unsubscribe(_queue.Queue())   # never subscribed -> no-op, no raise
+
+
+def test_ssehub_subscribe_seeds_last_frame():
+    """A new subscriber is seeded with the last published frame so it renders
+    immediately (the documented subscribe-seeding behavior)."""
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    seed = {"frame": "seed"}
+    hub.publish(seed)              # published BEFORE anyone subscribes
+    q = hub.subscribe()
+    assert _drain_nowait(q) == [seed]
