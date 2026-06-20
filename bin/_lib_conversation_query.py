@@ -2187,13 +2187,23 @@ def _attach_titles(conn, page):
     return page
 
 
-def _like_pattern(q):
-    """Build the LIKE pattern for `q`. Escape the ESCAPE char (\\) FIRST, then
+def _like_escape(q):
+    """Escape the LIKE wildcards/escape-char in ``q`` (no surrounding ``%``),
+    paired with ``ESCAPE '\\'``. The ESCAPE char (``\\``) is escaped FIRST, then
     the wildcards — otherwise a query containing a backslash (incl. a trailing
-    one) mis-escapes the appended '%' and the LIKE silently matches nothing
-    (paired with ESCAPE '\\' in the queries below)."""
-    return ("%" + q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
-            + "%")
+    one) mis-escapes any appended ``%`` and the LIKE silently matches nothing.
+
+    Single source of the escape chain (#217 S2 / I-3 review Minor #3):
+    ``_like_pattern`` (substring) and ``_search_files``'s prefix pattern both build
+    on this so the escaping is defined exactly once."""
+    return q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+
+def _like_pattern(q):
+    """Build the SUBSTRING LIKE pattern for `q` — ``%`` + escaped(q) + ``%`` —
+    paired with ``ESCAPE '\\'`` in the queries below. The escape chain is
+    single-sourced in ``_like_escape``."""
+    return "%" + _like_escape(q) + "%"
 
 
 def _fts_snippets(conn, fts_q, ids, col=0):
@@ -2583,12 +2593,6 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
 _PATH_SEPARATORS = ("/", "\\")
 
 
-def _like_escape(q):
-    """Escape LIKE wildcards/escape-char in ``q`` (no surrounding ``%``), paired
-    with ``ESCAPE '\\'``. Same escaping as ``_like_pattern`` minus the wildcards."""
-    return q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
-
-
 def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
     """#217 S2 / I-3: ``kind=files`` cross-session search over the write-class
     file-touch axis (``conversation_file_touches``). Emits one hit per DISTINCT
@@ -2597,15 +2601,24 @@ def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
     ``match_kinds:["file"]``, snippet = the file path. ``total`` = the distinct
     ``(session_id, file_path)`` count.
 
-    P3-10 (match shape): a PREFIX-looking query (no leading path separator) uses
-    ``file_path LIKE ?||'%'`` so it can ride ``idx_file_touches_path``; a query
-    with a leading separator falls back to the substring scan
-    ``file_path LIKE '%'||?||'%'`` (a documented full scan of the modest table).
-    LIKE is case-insensitive (SQLite default for ASCII). ``idx_file_touches_session``
-    serves the filtered-search session-scope restriction.
+    P3-10 (match shape): a PREFIX-looking query (no leading path separator) binds a
+    literal-prefix pattern (escaped(q) + ``%``) into ``file_path LIKE ? ESCAPE '\\'``
+    and is GENUINELY index-assisted — it rides ``idx_file_touches_path`` as a SEARCH
+    over a key range (verified by EXPLAIN QUERY PLAN in
+    ``test_kind_files_prefix_branch_uses_index_substring_scans``). That assistance
+    depends on ``idx_file_touches_path`` being ``COLLATE NOCASE``: the default
+    ``LIKE`` is case-insensitive, and SQLite only optimizes ``LIKE 'prefix%'`` onto
+    a btree when the index folds the same way (a BINARY index leaves it a full
+    SCAN). The ``ESCAPE '\\'`` clause does NOT defeat the optimization — the literal
+    prefix is still constant. A query with a leading separator binds ``%`` +
+    escaped(q) + ``%`` and is a full SCAN (a leading wildcard can never use the
+    index — the intentional, documented substring fallback over the modest table).
+    LIKE is case-insensitive for ASCII (matching the NOCASE collation exactly).
 
-    Filtered-search: the ``filt_sql`` session-scope restriction (over
-    ``conversation_file_touches.session_id``) applies the same as the message kinds.
+    Filtered-search: the ``filt_sql`` session-scope restriction is a post-match
+    ``ft.session_id IN (<subquery>)`` (the same as the message kinds) — there is NO
+    dedicated session index (the filter is a small IN over the already-narrowed
+    match set, so a ``session_id`` btree earned nothing; dropped per review Minor #2).
     """
     esc = _like_escape(q)
     prefix = not q.startswith(_PATH_SEPARATORS)

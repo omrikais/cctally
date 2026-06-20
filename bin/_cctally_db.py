@@ -2413,10 +2413,16 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             tool        TEXT NOT NULL,
             UNIQUE(message_id, file_path, tool)
         );
+        -- COLLATE NOCASE is load-bearing (#217 S2 / I-3 review Important #1): the
+        -- default ``LIKE`` is case-insensitive, and SQLite only rides a btree index
+        -- for ``file_path LIKE 'prefix%'`` when the index column folds the same way
+        -- (NOCASE) — a BINARY-collated index leaves the prefix probe a full SCAN. So
+        -- the kind=files PREFIX branch (``_search_files``) is genuinely index-assisted
+        -- ONLY with this NOCASE collation. (The substring branch leads with '%' and is
+        -- a documented scan regardless.) NOCASE folds A-Z/a-z the same way the LIKE
+        -- built-in does, so matching semantics are byte-identical to the prior index.
         CREATE INDEX IF NOT EXISTS idx_file_touches_path
-            ON conversation_file_touches(file_path);
-        CREATE INDEX IF NOT EXISTS idx_file_touches_session
-            ON conversation_file_touches(session_id);
+            ON conversation_file_touches(file_path COLLATE NOCASE);
 
         CREATE TABLE IF NOT EXISTS codex_session_files (
             path             TEXT PRIMARY KEY,
@@ -3806,10 +3812,13 @@ def _019_create_conversation_file_touches(conn: sqlite3.Connection) -> None:
     ``kind=files``.
 
     Flag-only arm (mirrors 018's pattern). The ``conversation_file_touches`` table
-    + its two indexes are created by ``_apply_cache_schema`` (runs on every open,
-    fresh + existing installs) — and CRITICALLY before the FTS5 ``legacy_present``
-    early-return, since the table is plain and has NO dependency on the FTS shape
-    (so a legacy-shape upgrade still gets it). This handler does NO DDL: it just
+    + its ``COLLATE NOCASE`` path index (``idx_file_touches_path``) are created by
+    ``_apply_cache_schema`` (runs on every open, fresh + existing installs) — and
+    CRITICALLY before the FTS5 ``legacy_present`` early-return, since the table is
+    plain and has NO dependency on the FTS shape (so a legacy-shape upgrade still
+    gets it). The NOCASE collation is what lets the kind=files PREFIX search ride
+    the index (default LIKE is case-insensitive; a BINARY index can't serve it —
+    review Important #1). This handler does NO DDL: it just
     arms the DISTINCT ``conversation_reingest_file_touches_pending`` flag (the
     "distinct reingest flag per enrichment" rule — its own flag, never the shared
     one) so the next flock-held full sync runs ``_consume_file_touches`` to derive

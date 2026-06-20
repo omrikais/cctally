@@ -61,13 +61,21 @@ def _index_exists(conn, name):
 
 # --- I-3b: schema + table/indexes -----------------------------------------
 
-def test_apply_cache_schema_creates_file_touches_table_and_indexes():
+def test_apply_cache_schema_creates_file_touches_table_and_index():
     c = _conn()
     assert _table_exists(c, "conversation_file_touches")
     cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_file_touches)")]
     assert cols == ["message_id", "session_id", "uuid", "file_path", "tool"]
+    # The kind=files PREFIX search needs the path index COLLATE NOCASE (review
+    # Important #1: a BINARY index can't serve the default case-insensitive LIKE).
     assert _index_exists(c, "idx_file_touches_path")
-    assert _index_exists(c, "idx_file_touches_session")
+    path_ddl = c.execute(
+        "SELECT sql FROM sqlite_master WHERE name='idx_file_touches_path'"
+    ).fetchone()[0]
+    assert "COLLATE NOCASE" in path_ddl.upper(), path_ddl
+    # The session index is dropped (review Minor #2): no query seeks by session_id;
+    # the filtered-search session scope is a small post-match IN, not a btree seek.
+    assert not _index_exists(c, "idx_file_touches_session")
 
 
 def test_file_touches_unique_constraint():

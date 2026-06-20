@@ -329,10 +329,54 @@ def test_kind_files_returns_touching_sessions():
     assert res["total"] == 2
 
 
+def _query_plan(conn, sql, params):
+    """The flattened EXPLAIN QUERY PLAN detail lines for ``sql``."""
+    return " | ".join(
+        r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall())
+
+
+def test_kind_files_prefix_branch_uses_index_substring_scans():
+    """Fix-1 (Important #1) / P3-10 — the prefix LIKE branch must be GENUINELY
+    index-assisted via ``idx_file_touches_path`` (a SEARCH, not a SCAN), and the
+    substring branch must remain a full SCAN (its leading wildcard can't use the
+    index — expected and correct).
+
+    The DEFAULT (case-insensitive) ``LIKE`` only rides a btree index when the
+    index column is ``COLLATE NOCASE``; a BINARY-collated index leaves the prefix
+    branch a full SCAN, so this asserts the NOCASE-index collation (the whole point
+    of the fix). Critically the assertion holds WITH the ``ESCAPE '\\'`` clause the
+    production query carries (a literal-prefix bound param keeps the LIKE
+    optimization armed even after wildcard escaping) — so it proves the real query
+    shape ``_search_files`` runs is index-assisted, not a hand-simplified one.
+
+    Non-vacuity: under the pre-fix BINARY index this test FAILS (the prefix plan
+    reads ``SCAN`` not ``SEARCH ... USING ... INDEX idx_file_touches_path``)."""
+    c = _conn()
+    _seed_search_corpus(c)
+    # The exact WHERE shape _search_files runs: a single pre-built pattern bound
+    # into ``file_path LIKE ? ESCAPE '\'``. Prefix pattern has a literal prefix
+    # ('bin/cctally') before its trailing '%'; substring pattern leads with '%'.
+    base = ("SELECT ft.session_id, ft.file_path FROM conversation_file_touches ft "
+            "WHERE ft.file_path LIKE ? ESCAPE '\\' "
+            "GROUP BY ft.session_id, ft.file_path")
+    prefix_plan = _query_plan(c, base, ("bin/cctally%",))
+    substring_plan = _query_plan(c, base, ("%dashboard%",))
+    # Prefix branch: a SEARCH that rides idx_file_touches_path (NOT a SCAN). The
+    # NOCASE index collation is what arms the default-LIKE optimization.
+    assert "idx_file_touches_path" in prefix_plan, prefix_plan
+    assert "SEARCH" in prefix_plan, prefix_plan
+    assert "SCAN" not in prefix_plan, prefix_plan
+    # Substring branch: a full SCAN (leading wildcard can't use the index). This is
+    # the intentional, documented divergence — assert it stays a scan so a future
+    # change can't silently claim index assistance for the substring case.
+    assert "SEARCH" not in substring_plan, substring_plan
+
+
 def test_kind_files_prefix_vs_substring():
     """P3-10: a prefix-looking query (no leading separator) is index-assisted via
-    LIKE ?||'%'; a leading-separator query falls to the substring scan. Both must
-    return the correct rows."""
+    the ``COLLATE NOCASE`` path index (``file_path LIKE ? ESCAPE '\\'`` over a
+    literal-prefix pattern); a leading-separator query falls to the substring scan.
+    Both must return the correct rows."""
     c = _conn()
     _seed_search_corpus(c)
     # Prefix 'bin/cctally' (no leading separator) -> matches bin/cctally and
