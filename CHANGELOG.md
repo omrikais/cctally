@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard — the Recent Sessions table no longer spills past its panel card at narrow two-column widths (≈1100–1600px).** Its columns (Started · Dur · Model · Project · Cost) sum wider than the card at those widths, so the Cost column used to bleed past the card and the viewport edge; the table now scrolls horizontally inside the card instead, keeping every column full-width (no truncation) with the scrollbar shown only when the table can't fit. Wider layouts (≥~1300px, including the centered ≥1600px cap) are unchanged — the table fits with no scrollbar (#208).
+- **Dashboard — the Daily heatmap no longer clips the digits of larger costs at narrow widths.** A full three-digit cost such as `$212.83` overflowed the day cell's clip box and lost its leading/trailing glyphs (rendering as "212.8"); each cell now sizes its cost text to the cell's width given the value's length, so the whole amount (cents included) always fits — wide cells keep the original 16px size and only cells that would otherwise overflow shrink, fluidly, at any width (#208).
+
 ## [1.52.1] - 2026-06-20
 
 ### Fixed

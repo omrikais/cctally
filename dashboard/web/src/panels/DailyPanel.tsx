@@ -72,7 +72,13 @@ function Cell({
       onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: r.date })}
     >
       <span className="d">{dd}</span>
-      <span className="c">{cellCost}</span>
+      {/* --c-len feeds the cost-cell's auto-fit font-size formula (#208):
+          the cell sizes the text to the largest font that fits its width
+          given the string's length, so "$XXX.XX" no longer clips at narrow
+          2-col widths. */}
+      <span className="c" style={{ ['--c-len' as string]: cellCost.length }}>
+        {cellCost}
+      </span>
     </button>
   );
 }

@@ -737,6 +737,17 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .sess-table tbody td.cost-xs   { color: var(--accent-green); }
 .sess-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 
+/* #208: the Sessions columns (Started · Dur · Model · Project · Cost, all
+   white-space:nowrap) sum past the panel card at narrow 2-col widths
+   (1100–1600px) — the panel has no overflow:hidden, so the Cost column
+   spilled past the card / viewport. Scroll the body horizontally instead
+   (no truncation — every column stays full-width; the scrollbar shows only
+   when the table can't fit). The ID specificity (1,1,0) also governs the
+   collapsed variant below (0,3,0), so both states scroll consistently. The
+   mobile @media reflows the table into per-row cards (width:100%), so this
+   never triggers there. */
+#panel-sessions .panel-body { overflow-x: auto; }
+
 .chip {
   display: inline-block; padding: 1px 8px; border-radius: 4px;
   font-size: 12px; font-weight: 700;
@@ -1860,7 +1871,7 @@ mark.current {
 }
 .panel.sessions-collapsed .panel-body {
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: auto; /* #208: scroll, don't clip, the wide table (see #panel-sessions rule) */
 }
 /* Sticky table header inside the scrollable body so column labels
    stay visible while rows scroll. */
@@ -2180,6 +2191,11 @@ mark.current {
   padding: 6px 9px 7px;
   min-width: 0;
   position: relative;
+  /* #208: make the cell a query container so the cost text (.c) can size
+     itself to the cell's actual inner width — see the `.daily-cell .c`
+     font-size formula. `inline-size` containment is safe here: the cell's
+     width comes from the grid track (minmax(0,1fr)), never its contents. */
+  container-type: inline-size;
   /* Uniform top-left sheen across all cells (Section 2 §"sheen"). */
   background-image: radial-gradient(120% 120% at 0% 0%, rgba(255,255,255,0.07) 0%, transparent 55%);
 }
@@ -2193,6 +2209,17 @@ mark.current {
 }
 .daily-cell .c {
   font-size: 16px;
+  /* #208: at narrow 2-col widths a full "$XXX.XX" (7 chars ≈ 65px at 16px)
+     overflowed the cell's ~40px inner box and the cell's overflow:hidden
+     shaved the leading/trailing glyphs ("$212.83" → "212.8"). Size the
+     font to the largest that fits THIS cell given the string's length:
+     100cqw == the cell's content-box width (padding excluded); the digit
+     advance is ≈0.58em, so a 0.62 divisor leaves ~6% slack. Capped at 16px
+     so wide cells keep the original size, floored so it never disappears.
+     --c-len is the rendered string length, set per-cell in DailyPanel.tsx.
+     The 16px above stays as a fallback for engines without container-query
+     units. */
+  font-size: clamp(7px, calc(100cqw / (var(--c-len, 6) * 0.62)), 16px);
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-family: var(--font-mono);
