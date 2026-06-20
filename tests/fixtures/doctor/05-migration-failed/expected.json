@@ -150,7 +150,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 16,
+                            "registry_size": 17,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -186,7 +186,8 @@
                                     "013_create_conversation_sessions",
                                     "014_conversation_queued_prompt_reingest",
                                     "015_conversation_sessions_filter_columns",
-                                    "016_drop_search_aux"
+                                    "016_drop_search_aux",
+                                    "017_arm_nested_agent_reingest"
                                 ],
                                 "skipped": []
                             },
@@ -334,13 +335,17 @@
                             [
                                 "cache.db",
                                 "016_drop_search_aux"
+                            ],
+                            [
+                                "cache.db",
+                                "017_arm_nested_agent_reingest"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "27 pending",
+                    "summary": "28 pending",
                     "title": "Pending migrations"
                 }
             ],

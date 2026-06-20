@@ -862,6 +862,17 @@ def build(scenario: str) -> None:
                            "prompt": "Audit clipped before its agentId line"},
                  "id": "toolu_trunc2", "preview": "Clipped-agentId audit",
                  "subagent_type": "grounding"},
+                # #217 S1 / U6: a fifth spawn whose >16 KB result's agentId: trailer
+                # landed PAST the 16 KB tool_result clip, but the INGEST stamp
+                # recovered the id from the FULL raw (over the clip). Pre-#217 this
+                # was the toolu_trunc2 flat-card case; with the ingest stamp it now
+                # LINKS via the structured agent_id (the new additive golden delta).
+                {"kind": "tool_use", "name": "Agent",
+                 "input_summary": '{"description":"Stamped-over-cap audit","subagent_type":"grounding"}',
+                 "input": {"description": "Stamped-over-cap audit", "subagent_type": "grounding",
+                           "prompt": "Audit whose agentId landed past the 16 KB clip"},
+                 "id": "toolu_trunc3", "preview": "Stamped-over-cap audit",
+                 "subagent_type": "grounding"},
             ]),
             model=MODEL, msg_id="m8", req_id="r8",
             cwd=s8_cwd, git_branch="main",
@@ -923,6 +934,27 @@ def build(scenario: str) -> None:
             blocks_json=json.dumps([{"kind": "tool_result", "truncated": True,
                 "is_error": False, "tool_use_id": "toolu_trunc2",
                 "text": "partial audit output that was clipped mid-stream before"}]),
+            cwd=s8_cwd, git_branch="main",
+        )
+        # #217 S1 / U6: result for toolu_trunc3 -> dd330005. The TEXT is clipped
+        # past the 16 KB cap (truncated, NO agentId: trailer in the surviving text
+        # — same surface shape as toolu_trunc2's flat-card case), BUT the INGEST
+        # stamp recovered the id + usage from the FULL raw and persisted the
+        # STRUCTURED agent_id/subagent_meta on the block. So the kernel's
+        # b.pop("agent_id") consumer LINKS this grandchild (vs. toolu_trunc2's flat
+        # card). This is the new additive golden delta proving the U6 fix: a >16 KB
+        # grandchild whose agentId landed past the clip now links via the stamp.
+        _insert_message(
+            cache_conn, session_id="s8", uuid="tr_trunc3", parent_uuid="s8a1",
+            source_path=s8_main, byte_offset=7,
+            timestamp_utc="2026-06-08T00:00:07Z",
+            entry_type="tool_result",
+            blocks_json=json.dumps([{"kind": "tool_result", "truncated": True,
+                "is_error": False, "tool_use_id": "toolu_trunc3",
+                "text": "partial audit output clipped before the agentId tail",
+                "agent_id": "dd330005",
+                "subagent_meta": {"total_tokens": 555, "total_tool_use_count": 2,
+                                  "total_duration_ms": 321, "status": "completed"}}]),
             cwd=s8_cwd, git_branch="main",
         )
         # The <task-notification> completing the async subagent. A user line whose

@@ -1039,6 +1039,38 @@ def test_subagent_meta_empty_meta_kind_only():
     assert "totals_derived" not in entry
 
 
+def test_grandchild_over_16kb_links_via_ingest_stamp():
+    # #217 S1 / U6: a nested grandchild result whose agentId: trailer lands PAST
+    # the 16 KB clip is stamped with a STRUCTURED block["agent_id"] at ingest, so
+    # the kernel's structured-id consumer (b.pop("agent_id")) links it — even
+    # though the clipped block["text"] no longer carries the agentId: trailer (the
+    # read-time regex over text would have returned None -> a flat card). This
+    # test seeds the post-ingest shape: clipped text WITHOUT the trailer + the
+    # structured agent_id stamp, and asserts the grandchild links into
+    # subagent_meta rather than degrading to a flat top-level card.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Task", "input_summary": "{}",
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    clipped_text = "F" * 16000   # 16 KB clipped body — NO agentId: trailer in it
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": clipped_text, "truncated": True,
+                 "full_length": 16500, "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "cccc3333",          # the ingest stamp (#217 S1 U6)
+                 "subagent_meta": {"total_tokens": 100, "status": "completed"}}])
+    out = cq.get_conversation(conn, "s1")
+    # the grandchild LINKS — keyed by its agent_id in subagent_meta (not flat).
+    assert "cccc3333" in out["subagent_meta"]
+    entry = out["subagent_meta"]["cccc3333"]
+    assert entry["kind"] == "Explore"
+    assert entry["total_tokens"] == 100
+    assert entry["spawn_tool_use_id"] == "t1"
+    # the parser-only keys are pop-stripped off the rendered blocks.
+    for it in out["items"]:
+        for b in it["blocks"]:
+            assert "agent_id" not in b and "subagent_meta" not in b
+
+
 def test_subagent_meta_happy_path_and_block_keys_stripped():
     # Happy path: spawn + result with full meta. subagent_meta[<agent_id>]
     # carries the kind + every present metric field. The returned items'

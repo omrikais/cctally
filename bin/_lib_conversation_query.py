@@ -277,39 +277,27 @@ def _subagent_key(source_path):
     return stem or None
 
 
-# §4 1a — nested (grandchild) subagent result parse. The new Claude Code format
-# emits a grandchild's spawn result as STRING content (no structured
-# `agent_id`/`subagent_meta`), with a trailing `agentId: <hash> (use SendMessage
-# …)` line and an OPTIONAL `<usage>` totals wrapper. Anchored on the literal
-# `<usage>` wrapper; tolerant of whitespace/newline variants (re.DOTALL).
-_NESTED_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
-_NESTED_USAGE_RE = re.compile(
-    r"<usage>\s*subagent_tokens:\s*(\d+)\s*tool_uses:\s*(\d+)\s*duration_ms:\s*(\d+)\s*</usage>",
-    re.DOTALL,
+# §4 1a / #217 S1 U6 — nested (grandchild) subagent result parse. The new Claude
+# Code format emits a grandchild's spawn result as STRING content (no structured
+# record-level toolUseResult.agentId), with a trailing `agentId: <hash> (use
+# SendMessage …)` line and an OPTIONAL `<usage>` totals wrapper. The regex
+# constants + the parse rule moved DOWN into the parser (_lib_conversation) so
+# the INGEST stamp runs them over the FULL raw before the 16 KB clip (#217 S1
+# U6); re-exported here for the read-time fallback over un-reingested rows.
+from _lib_conversation import (
+    _NESTED_AGENT_ID_RE, _NESTED_USAGE_RE, _nested_agent_stamp_from_text,
 )
 
 
 def _parse_nested_agent_result(text):
-    """Nested (grandchild) subagent result: string-content, no structured
-    `agentId` (spec §4 1a). Parse `agentId` (+ OPTIONAL `<usage>` totals) out of
-    the result text. Returns (agent_id, meta) — meta is {} when `<usage>` is
-    absent/clipped past the 16 KB cap, populated with completed totals when
-    present. Returns None when no `agentId` is present (an ordinary result, or a
-    >16 KB clip past the `agentId:` line itself — degrades to a flat card, no
-    mis-link). Linking on `agentId` ALONE is sufficient (Codex P1-B)."""
-    if not text:
-        return None
-    m = _NESTED_AGENT_ID_RE.search(text)
-    if not m:
-        return None
-    meta = {}
-    u = _NESTED_USAGE_RE.search(text)
-    if u:
-        meta["total_tokens"] = int(u.group(1))
-        meta["total_tool_use_count"] = int(u.group(2))
-        meta["total_duration_ms"] = int(u.group(3))
-        meta["status"] = "completed"
-    return m.group(1), meta
+    """Read-time fallback for nested (grandchild) subagent results on rows that
+    were ingested BEFORE the #217 S1 U6 structured stamp (un-reingested history).
+    Delegates to the parser's single-source rule over the (already-clipped) block
+    text — so a >16 KB result whose `agentId:` trailer was cut survives only via
+    the ingest stamp + the migration-017 offset-0 reingest, never here. Returns
+    (agent_id, meta) or None when no `agentId:` is present. Linking on `agentId`
+    ALONE is sufficient (Codex P1-B)."""
+    return _nested_agent_stamp_from_text(text)
 
 
 def _iso_ms(ts):

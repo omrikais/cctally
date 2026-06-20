@@ -535,6 +535,18 @@ def _blocks_and_text(content):
                          "full_length": len(raw),
                          "is_error": bool(b.get("is_error")),
                          "tool_use_id": b.get("tool_use_id")}
+                # #217 S1 / U6: a nested (grandchild) subagent result carries its
+                # `agentId:` (+ optional <usage>) in the result STRING, not a
+                # record-level toolUseResult. Parse them from the FULL raw HERE,
+                # BEFORE the cap clips the text — so a >16 KB result whose agentId:
+                # trailer lands past the cut still links (the read-time regex over
+                # the clipped text would miss it). Stamp the structured keys the
+                # kernel's id consumer already reads (b.pop("agent_id")); the
+                # read-time regex stays a fallback for un-reingested rows.
+                _nested = _nested_agent_stamp_from_text(raw)
+                if _nested is not None:
+                    block["agent_id"] = _nested[0]
+                    block["subagent_meta"] = _nested[1]
                 # #177 S4: media placeholders for image/document items inside the
                 # tool_result content array (where every MCP screenshot lives) —
                 # ordinals from the shared iter_media_items chokepoint.
@@ -560,6 +572,45 @@ _SUBAGENT_META_KEYS = (
 )
 
 
+# #217 S1 / U6 — nested (grandchild) subagent result parse. The new Claude Code
+# format emits a grandchild's spawn result as STRING content (no structured
+# record-level toolUseResult.agentId), with a trailing `agentId: <hash> (use
+# SendMessage …)` line and an OPTIONAL `<usage>` totals wrapper. These constants
+# live HERE (the parser) so the INGEST stamp runs them against the FULL raw
+# content BEFORE the _TOOL_RESULT_CAP clip — a result whose agentId: trailer
+# lands past the 16 KB cut would otherwise survive only as flat text and the
+# read-time regex (over the clipped text) would miss it. _lib_conversation_query
+# re-exports both for its read-time fallback over un-reingested rows.
+_NESTED_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
+_NESTED_USAGE_RE = re.compile(
+    r"<usage>\s*subagent_tokens:\s*(\d+)\s*tool_uses:\s*(\d+)\s*duration_ms:\s*(\d+)\s*</usage>",
+    re.DOTALL,
+)
+
+
+def _nested_agent_stamp_from_text(raw):
+    """(agent_id, subagent_meta) parsed from a tool_result's FULL string content,
+    or None when no `agentId:` line is present (an ordinary result, NOT a spawn
+    grandchild). subagent_meta carries the completed `<usage>` totals when the
+    wrapper is present + well-formed, else {} — linking on agentId ALONE is
+    sufficient, so a missing/clipped/malformed usage degrades usage to {}, never
+    the whole link. Keys mirror the snake_case shape _attach_subagent_result /
+    the query kernel's structured-id consumer expect (Codex P1-B)."""
+    if not raw:
+        return None
+    m = _NESTED_AGENT_ID_RE.search(raw)
+    if not m:
+        return None
+    meta = {}
+    u = _NESTED_USAGE_RE.search(raw)
+    if u:
+        meta["total_tokens"] = int(u.group(1))
+        meta["total_tool_use_count"] = int(u.group(2))
+        meta["total_duration_ms"] = int(u.group(3))
+        meta["status"] = "completed"
+    return m.group(1), meta
+
+
 def _attach_subagent_result(blocks, obj):
     """Attach the record-level ``toolUseResult`` agentId + meta (#166) onto the
     tool_result block, but ONLY when the record carries exactly one tool_result
@@ -579,6 +630,9 @@ def _attach_subagent_result(blocks, obj):
     if len(results) != 1:
         return
     block = results[0]
+    # The record-level toolUseResult is the AUTHORITATIVE source — it overwrites
+    # any nested-text stamp (#217 S1 / U6) for the same id (the two shapes do not
+    # co-occur in real data, so this is only a deterministic-precedence guard).
     block["agent_id"] = agent_id
     meta = {}
     for src, dst in _SUBAGENT_META_KEYS:

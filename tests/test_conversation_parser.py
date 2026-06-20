@@ -286,6 +286,77 @@ def test_tool_result_captures_agent_id_and_snake_meta():
     assert tr["subagent_meta"] == {"total_tokens": 23285, "total_duration_ms": 10668,
                                    "total_tool_use_count": 1, "status": "completed"}
 
+# ─── #217 S1 / U6: nested (grandchild) subagent result — agentId in the result
+# STRING content (no record-level toolUseResult). The id (+ optional <usage>) is
+# parsed from the FULL raw content at INGEST, before the _TOOL_RESULT_CAP clip,
+# and stamped as structured block["agent_id"]/["subagent_meta"] — so a result
+# whose agentId: trailer lands PAST the 16 KB cut still links (vs. degrading to a
+# flat card when only the read-time regex over the clipped text was available).
+
+def test_nested_grandchild_agent_id_stamped_from_string_content():
+    # A grandchild spawn result as STRING content with a trailing agentId + usage.
+    body = ("subagent done\n"
+            "agentId: bbbb2222 (use SendMessage to continue)\n"
+            "<usage>subagent_tokens: 4242 tool_uses: 7 duration_ms: 9001</usage>")
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": body,
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert tr["agent_id"] == "bbbb2222"
+    assert tr["subagent_meta"] == {"total_tokens": 4242, "total_tool_use_count": 7,
+                                   "total_duration_ms": 9001, "status": "completed"}
+
+def test_nested_grandchild_over_16kb_agent_id_past_clip_still_stamped():
+    # The load-bearing #217 S1 / U6 case: the agentId: trailer lands PAST the
+    # 16 KB _TOOL_RESULT_CAP. The clipped block["text"] no longer contains it, so
+    # the read-time regex (over text) would yield None and the grandchild would
+    # degrade to a flat card. The INGEST stamp (over the full raw content) must
+    # still recover the id so the link survives.
+    filler = "F" * (lc._TOOL_RESULT_CAP + 500)   # pushes the trailer past the cut
+    body = (filler + "\nagentId: cccc3333 (use SendMessage to continue)\n"
+            "<usage>subagent_tokens: 100 tool_uses: 1 duration_ms: 5</usage>")
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": body,
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    # text is clipped (the trailer is gone from it) but the structured stamp survives.
+    assert len(tr["text"]) == lc._TOOL_RESULT_CAP and tr["truncated"] is True
+    assert "agentId" not in tr["text"]
+    assert tr["agent_id"] == "cccc3333"
+    assert tr["subagent_meta"]["total_tokens"] == 100
+
+def test_nested_grandchild_usage_absent_but_id_present_stamps_empty_meta():
+    # The agentId: line is present but the result carries NO well-formed <usage>
+    # block (the source itself emitted only the id, or its usage trailer was cut
+    # off mid-emit so the regex can't match). The id still stamps; subagent_meta
+    # degrades to {} — never lose the whole link just because usage is missing.
+    body = ("agentId: dddd4444 (use SendMessage to continue)\n"
+            "<usage>subagent_tokens: 9 tool_uses:")   # truncated <usage> — won't match
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": body,
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert tr["agent_id"] == "dddd4444"
+    assert tr["subagent_meta"] == {}   # id survives, malformed/absent usage degrades to {}
+
+def test_ordinary_tool_result_string_does_not_stamp_agent_id():
+    # A plain result with no agentId: trailer must NOT acquire an agent_id key
+    # (the stamp is gated on the regex matching the agentId line).
+    fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
+                 "message": {"role": "user",
+                             "content": [{"type": "tool_result",
+                                          "content": "just a normal result body",
+                                          "tool_use_id": "tu1"}]}})
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    tr = [b for b in json.loads(r.blocks_json) if b["kind"] == "tool_result"][0]
+    assert "agent_id" not in tr and "subagent_meta" not in tr
+
 def test_tool_result_without_tooluseresult_has_no_agent_id():
     fh = _jsonl({"type": "user", "uuid": "u1", "sessionId": "s1", "timestamp": "t",
                  "message": {"role": "user",
@@ -425,6 +496,55 @@ def test_bound_input_nested_lists_and_dicts():
 def test_bound_input_non_dict_returns_none():
     assert lc._bound_input("just a string") == (None, False)
     assert lc._bound_input(None) == (None, False)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #217 S1 / U8-G4: the LCS edit-stat over-budget guard. _diff_stat returns None
+# (no edit_stat stamped) when len(old_tokens) * len(new_tokens) exceeds
+# _EDIT_STAT_LCS_CELL_BUDGET, so a pathological Edit on two huge multi-line sides
+# can't peg a CPU on the O(n*m) LCS DP. Untested before #217 S1.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _line_token_count(s):
+    return len(lc._line_tokens(s))
+
+def test_diff_stat_within_budget_returns_stat():
+    # A small Edit is well under the cell budget -> a real {add, del} stat.
+    st = lc._diff_stat("alpha\nbeta\n", "alpha\ngamma\n")
+    assert st is not None
+    assert set(st) == {"add", "del"}
+
+def test_diff_stat_over_budget_returns_none():
+    # Build two sides whose token-count PRODUCT exceeds _EDIT_STAT_LCS_CELL_BUDGET
+    # (4_000_000 cells). Each side is many short lines; the product of the two line
+    # counts blows the budget, so _diff_stat must short-circuit to None (no LCS DP,
+    # no edit_stat) rather than allocate/scan a multi-million-cell table.
+    budget = lc._EDIT_STAT_LCS_CELL_BUDGET
+    side_lines = int(budget ** 0.5) + 50   # so side_lines**2 > budget
+    old = "\n".join(f"o{i}" for i in range(side_lines))
+    new = "\n".join(f"n{i}" for i in range(side_lines))
+    assert _line_token_count(old) * _line_token_count(new) > budget   # genuinely over
+    assert lc._diff_stat(old, new) is None
+
+def test_edit_stat_for_edit_over_budget_omits_stamp():
+    # End-to-end through _edit_stat_for: a single Edit whose old/new product is
+    # over the LCS budget yields no stat (None) -> _normalize stamps no edit_stat.
+    budget = lc._EDIT_STAT_LCS_CELL_BUDGET
+    side_lines = int(budget ** 0.5) + 50
+    old = "\n".join(f"o{i}" for i in range(side_lines))
+    new = "\n".join(f"n{i}" for i in range(side_lines))
+    assert lc._edit_stat_for("Edit", {"old_string": old, "new_string": new}) is None
+
+def test_multiedit_one_over_budget_edit_omits_whole_stamp():
+    # MultiEdit sums per-edit stats, but ONE over-budget edit drops the WHOLE
+    # stamp (the header would otherwise undercount the omitted edit).
+    budget = lc._EDIT_STAT_LCS_CELL_BUDGET
+    side_lines = int(budget ** 0.5) + 50
+    big_old = "\n".join(f"o{i}" for i in range(side_lines))
+    big_new = "\n".join(f"n{i}" for i in range(side_lines))
+    edits = [{"old_string": "a", "new_string": "b"},        # tiny, in-budget
+             {"old_string": big_old, "new_string": big_new}]  # over-budget
+    assert lc._edit_stat_for("MultiEdit", {"edits": edits}) is None
 
 def test_bound_input_truly_clips_past_total_cap():
     # #217 S1 / U5 (data-contract honesty): the total-cap backstop must actually

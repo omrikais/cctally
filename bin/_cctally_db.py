@@ -3617,6 +3617,32 @@ def _016_drop_search_aux(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("017_arm_nested_agent_reingest")
+def _017_arm_nested_agent_reingest(conn: sqlite3.Connection) -> None:
+    """Flag-only re-ingest so existing nested-subagent (grandchild) results whose
+    ``agentId:`` trailer landed PAST the 16 KB ``_TOOL_RESULT_CAP`` clip re-link
+    on existing history (#217 S1 / U6). The parser now stamps a structured
+    ``block["agent_id"]`` (+ usage) at INGEST — over the FULL raw, before the clip
+    — so the offset-0 re-parse re-derives the link with zero new consumption code
+    (the kernel's existing ``b.pop("agent_id")`` consumer picks it up). Until
+    consumed, old rows fall back to the read-time regex over the (clipped) text —
+    today's behavior, no worse.
+
+    Sets the DISTINCT ``conversation_reingest_nested_agent_pending`` flag (NOT the
+    shared ``conversation_reingest_pending``, which also gates migration 005's
+    read-time human-fallback in the query kernel — re-arming it could misclassify
+    a genuine human prompt during the pre-reingest window). Consumption rides the
+    #179 RESUMABLE per-file reingest (``_resumable_reingest_conversation_messages``)
+    — the flag is wired into ``_TARGETED_DECLINE_FLAGS`` + ``_REINGEST_FLAG_KEYS``
+    + the resumable-reingest flag SELECT + the two cleanup DELETE lists in
+    ``_cctally_cache.py`` (all five sites; missing one either never triggers or
+    re-arms forever). Central stamp via the dispatcher (#140); a fresh install
+    stamps it WITHOUT running (empty table -> the flag, if ever set, is a harmless
+    no-op). Mirrors 014/009/007."""
+    _set_cache_meta(conn, "conversation_reingest_nested_agent_pending", "1")
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

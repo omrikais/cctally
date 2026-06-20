@@ -281,3 +281,98 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
         srv.shutdown()
         http_thread.join(timeout=3)
         sync_thread.join(timeout=3)
+
+
+# --- #217 S1 / U6: migration-017 nested-agent reingest end-to-end -------------
+# A >16 KB nested-subagent grandchild result whose `agentId:` trailer lands past
+# the 16 KB tool_result clip. After the ingest-time structured agent_id stamp +
+# the migration-017 offset-0 reingest, the grandchild RE-LINKS on existing
+# history (vs. degrading to a flat top-level card pre-fix).
+
+NESTED_FLAG = "conversation_reingest_nested_agent_pending"
+
+
+def _spawn_and_grandchild_lines():
+    """An assistant spawn (Task tool_use) + a user grandchild tool_result whose
+    string content carries an agentId: trailer PAST the 16 KB cap."""
+    spawn = json.dumps({
+        "type": "assistant", "uuid": "a-spawn", "sessionId": "s1",
+        "requestId": "r1", "timestamp": "2026-06-01T00:00:00Z",
+        "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-7",
+                    "content": [{"type": "tool_use", "name": "Task", "id": "tu-g",
+                                 "input": {"description": "deep audit",
+                                           "subagent_type": "Explore"}}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}}}) + "\n"
+    filler = "F" * 16500   # pushes the agentId: trailer past the 16 KB cap
+    body = (filler + "\nagentId: eeee5555 (use SendMessage to continue)\n"
+            "<usage>subagent_tokens: 321 tool_uses: 4 duration_ms: 88</usage>")
+    result = json.dumps({
+        "type": "user", "uuid": "u-result", "sessionId": "s1",
+        "timestamp": "2026-06-01T00:01:00Z",
+        "message": {"role": "user",
+                    "content": [{"type": "tool_result", "content": body,
+                                 "tool_use_id": "tu-g"}]}}) + "\n"
+    return spawn + result
+
+
+def _grandchild_links(ns):
+    """True iff session s1's grandchild eeee5555 links into subagent_meta."""
+    import _lib_conversation_query as cq
+    conn = ns["open_cache_db"]()
+    try:
+        out = cq.get_conversation(conn, "s1")
+    finally:
+        conn.close()
+    return out is not None and "eeee5555" in (out.get("subagent_meta") or {})
+
+
+def test_017_flag_consumed_by_sync_and_shared_flag_untouched(tmp_path, monkeypatch):
+    """sync_cache consumes the DISTINCT nested-agent reingest flag (clears it via
+    the offset-0 backfill) and never arms/clears the SHARED flag in its place."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_cache as cache_mod
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / "s1.jsonl").write_text(_spawn_and_grandchild_lines())
+
+    conn = ns["open_cache_db"]()
+    cache_mod.sync_cache(conn)                          # initial ingest
+    # Arm ONLY the distinct 017 flag (simulating migration 017 having run).
+    _set_meta(conn, NESTED_FLAG, "1")
+    conn.close()
+
+    conn = ns["open_cache_db"]()
+    cache_mod.sync_cache(conn)                          # consumes the flag
+    assert _get_meta(conn, NESTED_FLAG) is None, "sync must clear the 017 flag"
+    assert _get_meta(conn, SHARED_FLAG) is None, \
+        "sync must NOT arm/leave the shared conversation_reingest_pending flag"
+    conn.close()
+
+
+def test_017_grandchild_over_16kb_relinks_after_reingest(tmp_path, monkeypatch):
+    """The load-bearing end-to-end #217 S1 / U6 case: a >16 KB grandchild links
+    after ingest (the structured stamp runs over the full raw), and STILL links
+    after a forced offset-0 reingest (the migration-017 backfill path)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_cache as cache_mod
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / "s1.jsonl").write_text(_spawn_and_grandchild_lines())
+
+    conn = ns["open_cache_db"]()
+    cache_mod.sync_cache(conn)
+    conn.close()
+    assert _grandchild_links(ns), "grandchild must link after the initial ingest stamp"
+
+    # Force the migration-017 reingest path: arm the flag, re-sync, confirm the
+    # offset-0 re-parse re-derives the structured agent_id and the link survives.
+    conn = ns["open_cache_db"]()
+    _set_meta(conn, NESTED_FLAG, "1")
+    cache_mod.sync_cache(conn)
+    assert _get_meta(conn, NESTED_FLAG) is None
+    conn.close()
+    assert _grandchild_links(ns), "grandchild must STILL link after the 017 reingest"

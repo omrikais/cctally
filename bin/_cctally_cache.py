@@ -595,6 +595,7 @@ _TARGETED_DECLINE_FLAGS = (
     "conversation_promote_command_args_pending",
     "conversation_sessions_backfill_pending",
     "conversation_queued_prompt_reingest_pending",   # migration 014
+    "conversation_reingest_nested_agent_pending",    # migration 017
 )
 
 
@@ -731,7 +732,11 @@ def sync_cache(
             # while-busy user prompts persisted as queued_command attachments); the
             # same offset-0 walk re-derives them through the current parser, so drop
             # that flag here too — MISSING this site re-arms the flag on every
-            # cache-sync --rebuild.
+            # cache-sync --rebuild. #217 S1 migration 017 sets the DISTINCT
+            # conversation_reingest_nested_agent_pending flag (to land the
+            # ingest-time structured agent_id stamp on >16 KB nested-subagent
+            # grandchildren); the same offset-0 walk re-derives it through the
+            # current parser, so drop that flag here as well.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
@@ -739,6 +744,7 @@ def sync_cache(
                 " 'conversation_reingest_enrichment_pending',"
                 " 'conversation_media_reingest_pending',"
                 " 'conversation_queued_prompt_reingest_pending',"
+                " 'conversation_reingest_nested_agent_pending',"
                 " 'conversation_reingest_cursor',"
                 " 'conversation_reingest_cursor_gen')")
             # #177 S6: a rebuild repopulates search_tool/search_thinking via the
@@ -885,9 +891,14 @@ def sync_cache(
             # for a distinct flag. Migration 014 uses ANOTHER distinct flag
             # ``conversation_queued_prompt_reingest_pending`` to land queued-while-
             # busy user prompts (queued_command attachments the parser now promotes
-            # to HUMAN); same offset-0 re-parse, same distinct-flag reason. We
-            # trigger the SAME clear + offset-0 backfill on ANY of these flags and
-            # clear them ALL atomically here under the held flock.
+            # to HUMAN); same offset-0 re-parse, same distinct-flag reason. #217 S1
+            # migration 017 uses ANOTHER distinct flag
+            # ``conversation_reingest_nested_agent_pending`` to land the ingest-time
+            # structured agent_id stamp on >16 KB nested-subagent grandchildren
+            # (whose agentId: trailer was clipped past the 16 KB cap); same offset-0
+            # re-parse, same distinct-flag reason. We trigger the SAME clear +
+            # offset-0 backfill on ANY of these flags and clear them ALL atomically
+            # here under the held flock.
             try:
                 _reingest = conn.execute(
                     "SELECT 1 FROM cache_meta WHERE key IN "
@@ -895,7 +906,8 @@ def sync_cache(
                     " 'conversation_source_tool_use_reingest_pending',"
                     " 'conversation_reingest_enrichment_pending',"
                     " 'conversation_media_reingest_pending',"
-                    " 'conversation_queued_prompt_reingest_pending')"
+                    " 'conversation_queued_prompt_reingest_pending',"
+                    " 'conversation_reingest_nested_agent_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -1486,6 +1498,7 @@ _REINGEST_FLAG_KEYS = (
     "conversation_reingest_enrichment_pending",
     "conversation_media_reingest_pending",   # #177 S4 (migration 009)
     "conversation_queued_prompt_reingest_pending",   # migration 014
+    "conversation_reingest_nested_agent_pending",    # #217 S1 (migration 017)
 )
 
 
@@ -1568,6 +1581,7 @@ def _resumable_reingest_conversation_messages(conn):
         " 'conversation_reingest_enrichment_pending',"
         " 'conversation_media_reingest_pending',"
         " 'conversation_queued_prompt_reingest_pending',"
+        " 'conversation_reingest_nested_agent_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
     conn.commit()
