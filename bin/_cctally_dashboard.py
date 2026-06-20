@@ -5291,12 +5291,13 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
 # in the handler, not via try/except around the kernel).
 #
 # P1-1 (load-bearing kind-validation SPLIT): the cross-session search route
-# accepts ``title`` (and is ready for ``files`` in I-3); the in-conversation
-# ``/find`` route does NOT — its kernel (``find_in_conversation``) indexes
-# ``_FIND_KIND_COLUMNS[kind]``, which has no ``title``/``files`` entry, so
-# accepting them there would be a 500 KeyError. Two distinct tuples keep
-# ``/find?kind=title`` a clean 400.
-_CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title")
+# accepts ``title`` and ``files``; the in-conversation ``/find`` route does NOT —
+# its kernel (``find_in_conversation``) indexes ``_FIND_KIND_COLUMNS[kind]``,
+# which has no ``title``/``files`` entry, so accepting them there would be a 500
+# KeyError. Two distinct tuples keep ``/find?kind=title`` and ``/find?kind=files``
+# a clean 400.
+_CONV_SEARCH_KINDS = (
+    "all", "prompts", "assistant", "tools", "thinking", "title", "files")
 _CONV_FIND_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 

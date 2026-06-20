@@ -2391,6 +2391,33 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent
             ON conversation_sessions(last_activity_utc DESC, session_id DESC);
 
+        -- #217 S2 / I-3: file-path search axis. One row per WRITE-class file
+        -- touch (Edit/MultiEdit/Write/NotebookEdit) inside a conversation message,
+        -- derived from blocks_json by _derive_file_touches. message_id =
+        -- conversation_messages.id (the turn anchor). Derived/re-derivable state:
+        -- _fill_file_touches accumulates via INSERT OR IGNORE, the destructive
+        -- message paths delete it (clear_conversation_messages / per-source
+        -- reingest), and migration 019 arms a one-time history backfill.
+        --
+        -- CRITICAL: this is a PLAIN table with NO dependency on the FTS shape, and
+        -- it is created HERE — inside the unconditional executescript, BEFORE the
+        -- FTS5 ``legacy_present`` early-return below — so it ALWAYS exists
+        -- regardless of FTS topology. (The I-2 title-FTS bug created its vtable
+        -- AFTER that early-return, so its consumer crashed on a legacy-shape +
+        -- both-pending upgrade; the file-touches table must not repeat that class.)
+        CREATE TABLE IF NOT EXISTS conversation_file_touches (
+            message_id  INTEGER NOT NULL,
+            session_id  TEXT NOT NULL,
+            uuid        TEXT,
+            file_path   TEXT NOT NULL,
+            tool        TEXT NOT NULL,
+            UNIQUE(message_id, file_path, tool)
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_touches_path
+            ON conversation_file_touches(file_path);
+        CREATE INDEX IF NOT EXISTS idx_file_touches_session
+            ON conversation_file_touches(session_id);
+
         CREATE TABLE IF NOT EXISTS codex_session_files (
             path             TEXT PRIMARY KEY,
             size_bytes       INTEGER NOT NULL,
@@ -2825,6 +2852,19 @@ def _drop_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
             pass
 
 
+def _clear_conversation_file_touches(conn: sqlite3.Connection) -> None:
+    """#217 S2 / I-3 (P1-4): drop ALL file-touch rows on a full
+    clear/rebuild/truncation. ``conversation_file_touches`` is derived state keyed
+    by ``conversation_messages.id``, and a full clear recycles those rowids — so a
+    surviving touch row would point at a future, unrelated message. Tolerates a
+    missing table defensively (belt-and-suspenders; ``_apply_cache_schema`` always
+    creates it before the FTS branch, so it should exist on any schema'd conn)."""
+    try:
+        conn.execute("DELETE FROM conversation_file_touches")
+    except sqlite3.OperationalError:
+        pass   # table not yet created (pre-schema conn); nothing to clear
+
+
 def clear_conversation_messages(conn: sqlite3.Connection) -> None:
     """Full-clear ``conversation_messages`` + its FTS index WITHOUT firing the
     per-row delete trigger O(rows) (#138).
@@ -2864,10 +2904,12 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
 
     if fts_unavailable:
         conn.execute("DELETE FROM conversation_messages")
+        _clear_conversation_file_touches(conn)
         return
 
     _drop_conversation_fts_triggers(conn)
     conn.execute("DELETE FROM conversation_messages")
+    _clear_conversation_file_touches(conn)
     conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')")
     # #177 S6: the consolidated split table is the only FTS vtable on a swapped /
     # fresh DB. A pre-swap legacy install still carries conversation_fts_aux, so
@@ -3754,6 +3796,36 @@ def _018_create_conversation_title_fts(conn: sqlite3.Connection) -> None:
     walk fills the title FTS via the AI trigger as titles ingest, and the consumed
     backfill 'rebuild' no-ops). Mirrors 012's flag-only arm."""
     _set_cache_meta(conn, "conversation_title_fts_backfill_pending", "1")
+    conn.commit()
+
+
+@cache_migration("019_create_conversation_file_touches")
+def _019_create_conversation_file_touches(conn: sqlite3.Connection) -> None:
+    """#217 S2 / I-3: arm the file-path search axis backfill so existing history's
+    WRITE-class file touches (Edit/MultiEdit/Write/NotebookEdit) are searchable via
+    ``kind=files``.
+
+    Flag-only arm (mirrors 018's pattern). The ``conversation_file_touches`` table
+    + its two indexes are created by ``_apply_cache_schema`` (runs on every open,
+    fresh + existing installs) — and CRITICALLY before the FTS5 ``legacy_present``
+    early-return, since the table is plain and has NO dependency on the FTS shape
+    (so a legacy-shape upgrade still gets it). This handler does NO DDL: it just
+    arms the DISTINCT ``conversation_reingest_file_touches_pending`` flag (the
+    "distinct reingest flag per enrichment" rule — its own flag, never the shared
+    one) so the next flock-held full sync runs ``_consume_file_touches`` to derive
+    touches from existing ``blocks_json`` history.
+
+    The flag joins ``_TARGETED_DECLINE_FLAGS`` ONLY — NEVER ``_REINGEST_FLAG_KEYS``
+    (P1-2): that set means "run ``_resumable_reingest_conversation_messages``" (a
+    full message delete/reinsert + rowid churn) which a file-touches backfill must
+    not trigger; the backfill derives from the already-present ``blocks_json`` and
+    INSERT-OR-IGNOREs into a separate table without touching conversation_messages.
+
+    No data work here -> the dispatcher's central stamp (#140) marks a complete
+    handler; a fresh install stamps WITHOUT a populated history (its incremental
+    walk fills touches per ingested tick via _fill_file_touches, and the consumed
+    backfill no-ops). Mirrors 018's flag-only arm."""
+    _set_cache_meta(conn, "conversation_reingest_file_touches_pending", "1")
     conn.commit()
 
 

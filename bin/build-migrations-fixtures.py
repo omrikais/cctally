@@ -3141,6 +3141,123 @@ def build_per_migration_018_create_conversation_title_fts(scenario_dir: Path) ->
     _build_post(pre, post)
 
 
+def build_per_migration_019_create_conversation_file_touches(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``019_create_conversation_file_touches``
+    (#217 S2 / I-3 — file-path search axis over conversation_file_touches).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``)
+        with ``schema_migrations`` carrying cache migrations 001-018 (an existing
+        install at the 018 head) but NOT 019, and no
+        ``conversation_reingest_file_touches_pending`` flag — the existing-install
+        shape before the file-path axis is armed.
+      * ``post.sqlite`` — same DB after running the production 019 handler. 019 is
+        flag-only: it sets
+        ``cache_meta['conversation_reingest_file_touches_pending']='1'`` (so the
+        next flock-held full sync runs ``_consume_file_touches`` to derive
+        conversation_file_touches from existing blocks_json history) and the
+        dispatcher central-stamps the 019 marker (#140). The handler does NO data
+        work and NEVER arms any reingest flag (P1-2: the file-touch flag joins
+        ``_TARGETED_DECLINE_FLAGS`` only).
+
+    Loaded by ``tests/test_cache_migration_019_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 018-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the file-path axis).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+        "010_conversation_search_split",
+        "011_conversation_promote_command_args",
+        "012_create_conversation_ai_titles",
+        "013_create_conversation_sessions",
+        "014_conversation_queued_prompt_reingest",
+        "015_conversation_sessions_filter_columns",
+        "016_drop_search_aux",
+        "017_arm_nested_agent_reingest",
+        "018_create_conversation_title_fts",
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _cctally, db = _load_cctally()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-06-20T12:00:00Z"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _cctally, db = _load_cctally()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "019_create_conversation_file_touches":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("019_create_conversation_file_touches not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Flag-only handler: sets conversation_reingest_file_touches_pending. Then
+            # stamp the marker centrally (#140) with a PINNED timestamp so the
+            # committed golden is rebuild-deterministic.
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("019_create_conversation_file_touches", "2026-06-20T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -3207,6 +3324,9 @@ def main() -> int:
     )
     build_per_migration_018_create_conversation_title_fts(
         FIXTURES_ROOT / "per-migration" / "018_create_conversation_title_fts"
+    )
+    build_per_migration_019_create_conversation_file_touches(
+        FIXTURES_ROOT / "per-migration" / "019_create_conversation_file_touches"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

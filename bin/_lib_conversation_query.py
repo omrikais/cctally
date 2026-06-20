@@ -2060,7 +2060,10 @@ def search_conversations(conn, query, *, limit=50, offset=0,
     #217 S2 / E7: ``title`` searches the external-content title FTS over
     conversation_ai_titles → one SESSION-level hit per matching session, anchored
     to that session's first turn, ``match_kinds:["title"]``, snippet = the matched
-    title. Every hit gains ``match_kinds`` (sorted badges; prose never badges).
+    title. #217 S2 / I-3: ``files`` searches ``conversation_file_touches`` (the
+    write-class file-touch axis) → one hit per DISTINCT ``(session_id, file_path)``,
+    anchored to that group's MOST-RECENT touch, ``match_kinds:["file"]``, snippet =
+    the file path. Every hit gains ``match_kinds`` (sorted badges; prose never badges).
     The response carries additive ``kind`` + ``search_depth`` so the client can
     degrade the Tools/Thinking facets during the one-time column split
     (``search_depth == 'prose-only'`` short-circuits those two kinds to empty).
@@ -2124,6 +2127,10 @@ def search_conversations(conn, query, *, limit=50, offset=0,
         out = _search_title(conn, q, limit, offset, False,
                             filt_sql, filt_params)
         out.update(kind="title", search_depth=depth)
+        return _finish(out)
+    if kind == "files":
+        out = _search_files(conn, q, limit, offset, filt_sql, filt_params)
+        out.update(kind="files", search_depth=depth)
         return _finish(out)
     if fts_available:
         try:
@@ -2569,6 +2576,74 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
             "total": total}
 
 
+# #217 S2 / I-3: a path query "looks like a prefix" when it carries no leading
+# path separator — ``bin/cctally`` is a prefix probe, ``/dashboard`` (or a query
+# that intentionally starts mid-path) forces the substring scan. The set is the
+# common path separators (POSIX + Windows).
+_PATH_SEPARATORS = ("/", "\\")
+
+
+def _like_escape(q):
+    """Escape LIKE wildcards/escape-char in ``q`` (no surrounding ``%``), paired
+    with ``ESCAPE '\\'``. Same escaping as ``_like_pattern`` minus the wildcards."""
+    return q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+
+def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
+    """#217 S2 / I-3: ``kind=files`` cross-session search over the write-class
+    file-touch axis (``conversation_file_touches``). Emits one hit per DISTINCT
+    ``(session_id, file_path)``, anchored to that group's MOST-RECENT touch
+    (``MAX(message_id)`` → that message's ``(uuid, ts, cwd, msg_id, req_id)``),
+    ``match_kinds:["file"]``, snippet = the file path. ``total`` = the distinct
+    ``(session_id, file_path)`` count.
+
+    P3-10 (match shape): a PREFIX-looking query (no leading path separator) uses
+    ``file_path LIKE ?||'%'`` so it can ride ``idx_file_touches_path``; a query
+    with a leading separator falls back to the substring scan
+    ``file_path LIKE '%'||?||'%'`` (a documented full scan of the modest table).
+    LIKE is case-insensitive (SQLite default for ASCII). ``idx_file_touches_session``
+    serves the filtered-search session-scope restriction.
+
+    Filtered-search: the ``filt_sql`` session-scope restriction (over
+    ``conversation_file_touches.session_id``) applies the same as the message kinds.
+    """
+    esc = _like_escape(q)
+    prefix = not q.startswith(_PATH_SEPARATORS)
+    pat = (esc + "%") if prefix else ("%" + esc + "%")
+    fpred = f" AND ft.session_id IN ({filt_sql})" if filt_sql else ""
+    fargs = tuple(filt_params)
+
+    # The anchor per (session_id, file_path) group is its MAX(message_id). Compute
+    # the groups (filtered + matched), then join to conversation_messages on the
+    # anchor id for the turn's render/cost metadata.
+    total = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT ft.session_id, ft.file_path "
+        "  FROM conversation_file_touches ft "
+        f"  WHERE ft.file_path LIKE ? ESCAPE '\\'{fpred} "
+        "  GROUP BY ft.session_id, ft.file_path)",
+        (pat, *fargs)).fetchone()[0]
+    rows = conn.execute(
+        "WITH g AS ("
+        "  SELECT ft.session_id AS sid, ft.file_path AS fp, "
+        "         MAX(ft.message_id) AS aid "
+        "  FROM conversation_file_touches ft "
+        f"  WHERE ft.file_path LIKE ? ESCAPE '\\'{fpred} "
+        "  GROUP BY ft.session_id, ft.file_path) "
+        "SELECT g.sid, g.fp, cm.uuid, cm.timestamp_utc, cm.cwd, "
+        "       cm.msg_id, cm.req_id "
+        "FROM g JOIN conversation_messages cm ON cm.id = g.aid "
+        "ORDER BY cm.timestamp_utc DESC, g.sid DESC, g.fp DESC "
+        "LIMIT ? OFFSET ?",
+        (pat, *fargs, limit, offset)).fetchall()
+
+    hits = [_row_to_hit(uuid_, sid, ts, cwd, fp, mid, rqd, match_kinds=["file"])
+            for (sid, fp, uuid_, ts, cwd, mid, rqd) in rows]
+    return {"query": q, "mode": "like",
+            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "total": total}
+
+
 def _like_badges(conn, like, groups):
     """{(sid, uuid) -> sorted [badges]} via per-column LIKE probes across all
     physical rows of each page group (LIKE degraded mode; spec F7)."""
@@ -2601,7 +2676,7 @@ def _like_badges(conn, like, groups):
 # `_FIND_KIND_COLUMNS[kind]`, which has no entry for `title`/`files`, so accepting
 # them there would KeyError → 500. Keeping the two enums distinct makes
 # `/find?kind=title` a clean 400, never a 500.
-_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title")
+_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title", "files")
 _FIND_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 _KIND_COLUMN = {"prompts": "text", "assistant": "text",
                 "tools": "search_tool", "thinking": "search_thinking"}

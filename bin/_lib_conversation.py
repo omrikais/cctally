@@ -1222,6 +1222,38 @@ def _aux_strings(v):
             yield from _aux_strings(vv)
 
 
+# #217 S2 / I-3: the WRITE-class file tools — the only tools that actually mutate
+# a file on disk. Read / Bash / Grep / Glob are deliberately EXCLUDED: a file
+# "touch" for the file-path search axis means an edit/create, not a read or a
+# shell that merely names a path. The axis answers "which sessions modified this
+# file."
+_FILE_TOUCH_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+
+
+def _derive_file_touches(blocks):
+    """Yield ``(file_path, tool)`` for every WRITE-class tool_use block (#217 S2 /
+    I-3). Reads the same bounded ``input.file_path`` the renderer reads (file paths
+    are well under the leaf cap, so they survive _bound_input intact).
+
+    Tolerates BOTH block shapes: the STORED ``blocks_json`` form keys the kind on
+    ``kind`` (the _normalize output that _fill_file_touches reparses), while raw
+    API content blocks key it on ``type``. We accept either so the same chokepoint
+    derives touches from the persisted rows AND from a raw-shape unit fixture."""
+    out = []
+    for b in (blocks or []):
+        if not isinstance(b, dict):
+            continue
+        if (b.get("kind") or b.get("type")) != "tool_use":
+            continue
+        if b.get("name") not in _FILE_TOUCH_TOOLS:
+            continue
+        inp = b.get("input")
+        fp = inp.get("file_path") if isinstance(inp, dict) else None
+        if isinstance(fp, str) and fp:
+            out.append((fp, b["name"]))
+    return out
+
+
 _PREVIEW_FIELDS = {
     "Read": "file_path", "Write": "file_path", "Edit": "file_path",
     "MultiEdit": "file_path", "NotebookEdit": "file_path",

@@ -597,6 +597,7 @@ _TARGETED_DECLINE_FLAGS = (
     "conversation_queued_prompt_reingest_pending",   # migration 014
     "conversation_reingest_nested_agent_pending",    # migration 017
     "conversation_title_fts_backfill_pending",       # migration 018 (P1-2: HERE ONLY)
+    "conversation_reingest_file_touches_pending",    # migration 019 (P1-2: HERE ONLY)
 )
 
 
@@ -951,6 +952,13 @@ def sync_cache(
             # no-op on a no-FTS5 build (P1-6). Touches ONLY the title index, never
             # conversation_messages (P1-2).
             _consume_title_fts(conn)
+
+            # #217 S2 / I-3: consume the migration-019 file-touches backfill under
+            # the SAME held flock. Derives conversation_file_touches from existing
+            # blocks_json history (cursor-resumable; idempotent via INSERT OR
+            # IGNORE). Touches ONLY conversation_file_touches, never
+            # conversation_messages (P1-2).
+            _consume_file_touches(conn)
 
         if targeted:
             paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
@@ -1314,6 +1322,16 @@ def sync_cache(
                 # (parallel to the cost path's lifecycle).
                 if conv_rows:
                     conn.executemany(_CONV_INSERT_SQL, conv_rows)
+                    # #217 S2 / I-3: derive this tick's file touches, scoped to the
+                    # just-ingested rows' PHYSICAL keys (cr[3]=source_path,
+                    # cr[4]=byte_offset per _conv_row_tuple). Cheap (proportional to
+                    # new bytes); decoupled from the INSERT OR IGNORE rowcount —
+                    # _fill_file_touches reads conversation_messages by physical key,
+                    # so an already-present (rowcount-0) row still gets its touches.
+                    # Lands in the SAME per-file write transaction as the message
+                    # rows, so they commit atomically.
+                    _fill_file_touches(
+                        conn, scope=[(cr[3], cr[4]) for cr in conv_rows])
                 # #193: ai-title upserts for this file, in file order (last wins).
                 # Committed atomically with the session_files cursor below.
                 if ai_rows:
@@ -1572,10 +1590,25 @@ def _resumable_reingest_conversation_messages(conn):
             conn.commit()
             continue
         try:
+            # #217 S2 / I-3 (P1-4): conversation_file_touches is derived state
+            # keyed by conversation_messages.id, and this per-source reingest
+            # DELETEs + re-inserts the file's message rows (bumping autoincrement
+            # ids). Delete the file's touches BEFORE the message delete (resolving
+            # the ids while they still exist), then refill from the reinserted rows
+            # AFTER — all in this one atomic transaction, so a crash leaves no stale
+            # or duplicate anchors.
+            conn.execute(
+                "DELETE FROM conversation_file_touches WHERE message_id IN "
+                "(SELECT id FROM conversation_messages WHERE source_path=?)",
+                (path_str,))
             conn.execute("DELETE FROM conversation_messages WHERE source_path=?",
                          (path_str,))
             if rows:
                 conn.executemany(_CONV_INSERT_SQL, rows)
+                # Refill scoped to this file's just-reinserted physical keys
+                # (col 3=source_path, col 4=byte_offset per _conv_row_tuple).
+                _fill_file_touches(
+                    conn, scope=[(r[3], r[4]) for r in rows])
             _set_cache_meta(conn, "conversation_reingest_cursor", path_str)
             conn.commit()
         except BaseException:
@@ -1832,6 +1865,100 @@ def _consume_title_fts(conn) -> None:
                      # the flag set, retry on the next open
     conn.execute(
         "DELETE FROM cache_meta WHERE key='conversation_title_fts_backfill_pending'")
+    conn.commit()
+
+
+_FILE_TOUCH_INSERT_SQL = (
+    "INSERT OR IGNORE INTO conversation_file_touches"
+    "(message_id, session_id, uuid, file_path, tool) VALUES(?,?,?,?,?)")
+
+
+def _fill_file_touches(conn, scope=None) -> None:
+    """#217 S2 / I-3: derive ``conversation_file_touches`` rows from
+    ``conversation_messages.blocks_json`` for the in-scope message rows.
+
+    ``scope`` is an iterable of ``(source_path, byte_offset)`` physical keys, or
+    ``None`` for ALL rows (the backfill). We read FROM ``conversation_messages``
+    (the source of truth) and resolve ``message_id`` from the row's own ``id``.
+
+    P1-3 (load-bearing): scope by the PHYSICAL key ``(source_path, byte_offset)``,
+    NEVER by ``uuid``. ``conversation_messages.uuid`` is NOT unique (only
+    ``(source_path, byte_offset)`` is; the uuid index is ``(session_id, uuid)``),
+    and resume/replay rows legitimately share a ``(session_id, uuid)`` — a
+    ``WHERE uuid=?`` fill would touch unrelated physical rows.
+
+    Decoupled from the message-insert rowcount ("dedup must not gate side
+    effects"): a no-op INSERT OR IGNORE of an already-present message row (rowcount
+    0) still has its touches derived here, because we read the row by physical key
+    rather than from the insert's lastrowid/rowcount.
+
+    Cheap at steady state: scoped to the rows ingested this tick (proportional to
+    new bytes), never re-parsing the whole session per tick. ``INSERT OR IGNORE``
+    on ``UNIQUE(message_id, file_path, tool)`` makes it idempotent, and a row's
+    ``blocks_json`` is immutable, so accumulate-via-IGNORE needs no per-tick DELETE.
+    The caller owns the commit (this helper never commits)."""
+    def _emit(rows):
+        for mid, sid, uuid_, bj in rows:
+            if not sid:
+                continue   # a touch row's session_id is NOT NULL; skip null-session rows
+            try:
+                blocks = json.loads(bj) if bj else []
+            except (TypeError, ValueError):
+                blocks = []
+            for fp, tool in _lib_conversation._derive_file_touches(blocks):
+                conn.execute(_FILE_TOUCH_INSERT_SQL, (mid, sid, uuid_, fp, tool))
+
+    if scope is None:
+        # Backfill: cursor-resumable 500-row batches keyed on the message rowid.
+        # Resume from the stored cursor so an interrupt skips already-derived
+        # batches (the fill is also idempotent via INSERT OR IGNORE, so a restart
+        # from 0 would be correct but redundant).
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='conversation_file_touches_cursor'").fetchone()
+        last_id = int(row[0]) if row and row[0] is not None else 0
+        while True:
+            batch = conn.execute(
+                "SELECT id, session_id, uuid, blocks_json FROM conversation_messages "
+                "WHERE id > ? ORDER BY id LIMIT 500",
+                (last_id,)).fetchall()
+            if not batch:
+                break
+            _emit(batch)
+            last_id = batch[-1][0]
+            _cctally_db_sib._set_cache_meta(
+                conn, "conversation_file_touches_cursor", str(last_id))
+            conn.commit()
+        return
+    for sp, off in scope:
+        rows = conn.execute(
+            "SELECT id, session_id, uuid, blocks_json FROM conversation_messages "
+            "WHERE source_path=? AND byte_offset=?", (sp, off)).fetchall()
+        _emit(rows)
+
+
+def _consume_file_touches(conn) -> None:
+    """#217 S2 / I-3: flock-held consumer for
+    ``conversation_reingest_file_touches_pending`` (set by cache migration 019).
+    Derives ``conversation_file_touches`` from ALL existing ``blocks_json`` history
+    via ``_fill_file_touches(conn, scope=None)`` (cursor-resumable, 500-row
+    batches), then clears the flag + cursor.
+
+    Touches ONLY ``conversation_file_touches`` (never ``conversation_messages`` —
+    P1-2: this is NOT a message reingest). The fill is idempotent (INSERT OR
+    IGNORE on the UNIQUE key), so an interrupted backfill resumes cleanly on the
+    next locked sync. A fresh install never sets the flag, so this is a cheap
+    no-op there."""
+    if conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='conversation_reingest_file_touches_pending'"
+    ).fetchone() is None:
+        return
+    _fill_file_touches(conn, scope=None)
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN "
+        "('conversation_reingest_file_touches_pending',"
+        " 'conversation_file_touches_cursor')")
     conn.commit()
 
 
