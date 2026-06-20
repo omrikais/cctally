@@ -3538,12 +3538,13 @@ def _legacy_aux_fts_present(conn: sqlite3.Connection) -> bool:
     these down; 016 only WAITS until they are gone. Tolerates a missing
     ``sqlite_master`` read -> False (no aux shape to block on)."""
     try:
+        _trig_ph = ",".join("?" for _ in _CONV_FTS_AUX_TRIGGER_NAMES)
         row = conn.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE (type='table' AND name='conversation_fts_aux') "
-            "   OR (type='trigger' AND name IN "
-            "       ('conv_fts_aux_ai','conv_fts_aux_ad','conv_fts_aux_au')) "
-            "LIMIT 1"
+            f"   OR (type='trigger' AND name IN ({_trig_ph})) "
+            "LIMIT 1",
+            _CONV_FTS_AUX_TRIGGER_NAMES,
         ).fetchone()
     except sqlite3.OperationalError:
         return False

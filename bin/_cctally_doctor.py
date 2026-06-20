@@ -316,7 +316,7 @@ def doctor_gather_state(
                         "LIMIT 1", flags).fetchone()
                     if pend is not None:
                         conv_rollup_sync_in_progress = True
-                except (sqlite3.OperationalError, Exception):
+                except Exception:
                     pass
             finally:
                 conn.close()
