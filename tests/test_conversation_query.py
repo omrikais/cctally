@@ -674,6 +674,108 @@ def test_search_snippet_generation_bounded_to_page_fts(monkeypatch):
     assert seen["max"] <= 3     # each snippet batch bounded to the page
 
 
+def _seed_tool_only_hits(c, n, *, term="needle"):
+    """n distinct logical assistant hits, each matching `term` ONLY in
+    search_tool (so all are badged 'tool' with NO prose match — the pre-fix code
+    issues one rowid=? prose probe per badged hit)."""
+    for i in range(n):
+        _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"f{i}.jsonl",
+             byte_offset=0, timestamp_utc=f"2026-06-01T00:00:{i:02d}Z",
+             entry_type="assistant", text="", model=_MODEL,
+             msg_id=f"m{i}", req_id=f"r{i}",
+             search_tool=f"row {i} ran the {term} command", cwd="/home/u/proj")
+
+
+class _ExecCountingConn:
+    """A thin proxy over a sqlite3.Connection that records every `.execute` SQL
+    string (sqlite3.Connection.execute is read-only, so it can't be monkeypatched
+    in place). Forwards every other attribute to the wrapped connection."""
+    def __init__(self, conn):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "sqls", [])
+
+    def execute(self, sql, *a, **k):
+        self.sqls.append(" ".join(str(sql).split()))
+        return self._conn.execute(sql, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _count_fts_query_shapes(conn, fn):
+    """Run `fn(proxy)` with the connection's `.execute` recorded, then classify
+    the FTS5 round-trips that U3 batches:
+
+      - corpus_match: a ``conversation_fts MATCH`` query JOINing
+        conversation_messages with NO ``rowid`` restriction — the corpus-wide
+        scan (the COUNT, the page CTE, and the pre-fix third
+        ``_all_matched_rids_by_group`` scan all have this shape; we count them
+        and assert U3 removed exactly the third).
+      - single_rowid_match: a ``conversation_fts.rowid = ?`` probe — the pre-fix
+        per-hit ``_prefer_snippet_columns`` prose probe (collapsed to one IN-list
+        MATCH by U3, so this count must drop to 0).
+    """
+    proxy = _ExecCountingConn(conn)
+    fn(proxy)
+    sqls = proxy.sqls
+    # A corpus-wide MATCH has NO row-set restriction bound to a PARAMETER —
+    # i.e. none of `rowid IN (?…)`, `cm.id IN (?…)`, or `rowid = ?`. (The JOIN's
+    # `ON cm.id = conversation_fts.rowid` is structural, NOT a row restriction,
+    # so it must not count.) Only the COUNT, the page CTE, and the pre-fix third
+    # rids-by-group scan are truly corpus-wide.
+    def _bounded(s):
+        return ("rowid IN (" in s or ".id IN (" in s
+                or "conversation_fts.rowid = ?" in s)
+    corpus_match = sum(
+        1 for s in sqls
+        if "conversation_fts MATCH" in s
+        and "conversation_messages" in s
+        and not _bounded(s))
+    single_rowid_match = sum(
+        1 for s in sqls
+        if "conversation_fts MATCH" in s and "conversation_fts.rowid = ?" in s)
+    return {"corpus_match": corpus_match,
+            "single_rowid_match": single_rowid_match, "all": sqls}
+
+
+def test_search_query_count_batched(monkeypatch):
+    """U3 (#217 S1): a search page build must NOT run a third full-corpus FTS
+    MATCH to recover the page groups' rows, and must NOT issue a per-hit prose
+    probe. Pre-fix: COUNT + page-CTE + the third corpus scan = 3 corpus MATCHes,
+    plus one rowid=? prose probe per badged hit. Post-fix: 2 corpus MATCHes
+    (COUNT + page CTE) and ONE bounded IN-list prose probe (not per-hit)."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_tool_only_hits(c, 6, term="needle")
+    stats = _count_fts_query_shapes(
+        c, lambda px: cq.search_conversations(px, "needle", kind="all",
+                                              limit=200, offset=0))
+    # The third corpus-wide MATCH (the rids-by-group scan) is gone: only the
+    # COUNT and the page CTE remain corpus-wide.
+    assert stats["corpus_match"] <= 2, stats["all"]
+    # The per-hit prose probe loop collapsed: at most ONE single-rowid MATCH
+    # survives (and U3 replaces it with an IN-list, so ideally zero).
+    assert stats["single_rowid_match"] == 0, stats["all"]
+
+
+def test_search_query_count_batched_byte_identical_results():
+    """U3: the batched path returns byte-identical hits/badges to a baseline the
+    existing badge/snippet units pin — re-asserted here for the tool-only corpus
+    the query-count test exercises (all badged 'tool', drawn from the tool
+    snippet column)."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_tool_only_hits(c, 6, term="needle")
+    out = cq.search_conversations(c, "needle", kind="all", limit=200, offset=0)
+    assert out["total"] == 6
+    assert {h["uuid"] for h in out["hits"]} == {f"u{i}" for i in range(6)}
+    for h in out["hits"]:
+        assert h["match_kinds"] == ["tool"]           # badged off search_tool
+        assert "needle" in h["snippet"].lower()       # snippet from the tool col
+
+
 # ---------------------------------------------------------------------------
 # #155: subagent_key derivation + reader passthrough
 # ---------------------------------------------------------------------------
@@ -2445,6 +2547,30 @@ def test_search_badges_aggregate_across_group_rows():
     assert len(out["hits"]) == 1
     assert out["hits"][0]["uuid"] == "G"
     assert out["hits"][0]["match_kinds"] == ["tool"]   # aggregated off the 2nd row
+
+
+def test_search_badge_facet_scope_carries_entry_type_predicate():
+    """U3 facet-scope (Codex P2): the bounded rids-by-group lookup must carry the
+    SAME entry_type predicate the page query used. A group (s1, G) has a HUMAN
+    physical row matching prose AND an ASSISTANT physical row of the same
+    (session_id, uuid) carrying a tool match. Under kind='prompts' (entry_type =
+    human) the human row is the hit; the assistant row's tool badge must NOT leak
+    into the prompts facet — the lookup's et_pred excludes it. Without the
+    predicate the row set would include the assistant row and badge ['tool']."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _msg(c, id=1, session_id="s1", uuid="G", source_path="g1.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="needle prompt", cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="G", source_path="g2.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mG", req_id="rG",
+         search_tool="needle in tool", cwd="/home/u/proj")
+    out = cq.search_conversations(c, "needle", kind="prompts")
+    assert [h["uuid"] for h in out["hits"]] == ["G"]
+    # facet-scoped: the prompts hit must NOT inherit the assistant row's tool badge.
+    assert out["hits"][0]["match_kinds"] == []
 
 
 def test_search_prompts_vs_assistant_entry_type_predicate():

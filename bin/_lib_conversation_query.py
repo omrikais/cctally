@@ -2177,43 +2177,81 @@ def _search_fts(conn, q, limit, offset, kind, depth):
 
 
 def _all_matched_rids_by_group(conn, match_expr, et_pred, et_args, groups):
-    """{(sid, uuid) -> [rids]} for the page groups: ALL matched physical rows of
-    each group (not just the rank-survivor), so badges aggregate completely."""
+    """{(sid, uuid) -> [rids]} for the page groups: ALL physical rows of each
+    page group (a SUPERSET of the FTS-matched subset), so badges aggregate
+    completely. ``_match_kinds`` re-runs a per-column MATCH restricted to these
+    rids, so returning every physical row of the ≤200 page groups stays correct
+    for the column facets (the per-column MATCH filters).
+
+    U3 (#217 S1): a BOUNDED base-table lookup of the page groups' rows — NOT a
+    third full-corpus ``conversation_fts MATCH``. We stop scanning the corpus a
+    third time per request. ``match_expr`` is now unused (the per-column MATCH in
+    ``_match_kinds`` carries the term expression); it is kept in the signature so
+    the legacy/FTS call sites are unchanged.
+
+    Facet-scope fix (Codex P2): carry the SAME ``et_pred``/``et_args`` the page
+    query used (``kind=prompts``/``assistant`` filter ``cm.entry_type``), so a
+    same-group physical row OUTSIDE the facet can never contribute a badge. The
+    ``(session_id, uuid)`` match is NULL-safe (``IS``), since a pre-006 row may
+    carry a NULL uuid that a plain ``IN`` row-value would silently drop."""
     if not groups:
         return {}
     rids_by_group = {g: [] for g in groups}
-    rows = conn.execute(
-        "SELECT cm.id, cm.session_id, cm.uuid FROM conversation_fts "
-        "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        f"WHERE conversation_fts MATCH ?{et_pred}",
-        (match_expr, *et_args),
-    ).fetchall()
-    for rid, sid, uuid in rows:
-        g = (sid, uuid)
-        if g in rids_by_group:
-            rids_by_group[g].append(rid)
+    # Chunk the OR-of-pairs to stay well under SQLite's variable limit (≤200
+    # page groups, 2 params each → one or two chunks in practice).
+    for i in range(0, len(groups), 300):
+        chunk = groups[i:i + 300]
+        cond = " OR ".join(
+            "(cm.session_id IS ? AND cm.uuid IS ?)" for _ in chunk)
+        params = [v for g in chunk for v in g]
+        rows = conn.execute(
+            "SELECT cm.id, cm.session_id, cm.uuid FROM conversation_messages cm "
+            f"WHERE ({cond}){et_pred}",
+            (*params, *et_args),
+        ).fetchall()
+        for rid, sid, uuid in rows:
+            g = (sid, uuid)
+            if g in rids_by_group:
+                rids_by_group[g].append(rid)
     return rids_by_group
 
 
 def _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips):
     """Replace a hit's prose snippet with its matched column's snippet when the
-    prose column did NOT match (prose → tool → thinking preference). Probes
-    which column matched the survivor rowid, then re-snippets that column."""
+    prose column did NOT match (prose → tool → thinking preference). Probes which
+    of the badged survivors match prose, then re-snippets the non-prose ones from
+    their preferred column.
+
+    U3 (#217 S1): the per-hit ``rowid = ?`` prose probe (one query per badged
+    page hit, up to ~200 at limit=200) is collapsed into ONE bounded
+    ``rowid IN (…) AND MATCH text:(…)`` returning the prose-matching set;
+    subtracting gives the non-prose survivors routed to the already-batched
+    tool/thinking snippet calls."""
+    # The badged survivors are the only candidates (a hit with no badges keeps
+    # its col-0 prose snippet). Collect their survivor rowids.
+    badged = [(rid, sid, uuid)
+              for (rid, sid, uuid, ts, cwd, mid, rqd) in page
+              if badges.get((sid, uuid))]
+    if not badged:
+        return snips
+    badged_rids = [rid for (rid, _s, _u) in badged]
+    # ONE bounded probe: which badged survivors ALSO match prose? Keep their
+    # col-0 snippet; the rest fall through to their preferred column.
+    prose_hits = set()
+    for i in range(0, len(badged_rids), 300):
+        chunk = badged_rids[i:i + 300]
+        ph = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            "SELECT conversation_fts.rowid FROM conversation_fts "
+            f"WHERE conversation_fts MATCH ? AND conversation_fts.rowid IN ({ph})",
+            (f"{{text}}: ({fts_q})", *chunk)).fetchall()
+        prose_hits.update(r[0] for r in rows)
     by_col = {}   # snippet column index -> [rids needing it]
-    for (rid, sid, uuid, ts, cwd, mid, rqd) in page:
-        grp = (sid, uuid)
-        kinds = badges.get(grp, [])
-        if not kinds:
-            continue   # prose hit (or unbadged) — keep col-0 snippet
-        # Does THIS survivor row match prose? If so keep col 0.
-        prose_hit = conn.execute(
-            "SELECT 1 FROM conversation_fts "
-            "WHERE conversation_fts MATCH ? AND conversation_fts.rowid = ?",
-            (f"{{text}}: ({fts_q})", rid)).fetchone()
-        if prose_hit:
-            continue
+    for (rid, sid, uuid) in badged:
+        if rid in prose_hits:
+            continue   # prose matched the survivor → keep col 0
         for label, col in _SNIPPET_COL_PREFERENCE:
-            if label in kinds:
+            if label in badges.get((sid, uuid), []):
                 by_col.setdefault(col, []).append(rid)
                 break
     for col, rids in by_col.items():
