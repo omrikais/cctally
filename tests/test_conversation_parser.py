@@ -426,6 +426,32 @@ def test_bound_input_non_dict_returns_none():
     assert lc._bound_input("just a string") == (None, False)
     assert lc._bound_input(None) == (None, False)
 
+def test_bound_input_truly_clips_past_total_cap():
+    # #217 S1 / U5 (data-contract honesty): the total-cap backstop must actually
+    # CLIP, not merely flag. Many leaves EACH below _INPUT_LEAF_CAP but TOGETHER
+    # serializing well past _INPUT_TOTAL_CAP previously returned truncated=True
+    # while STILL serving the over-cap payload. The bound is now real: the
+    # returned dict serializes to <= _INPUT_TOTAL_CAP whenever truncated is True.
+    leaf = "L" * (lc._INPUT_LEAF_CAP - 100)   # each leaf is UNDER the per-leaf cap
+    n = (lc._INPUT_TOTAL_CAP // len(leaf)) + 5   # but their sum blows the total cap
+    many = {f"k{i}": leaf for i in range(n)}
+    # sanity: the RAW input is genuinely over the total cap (the test is non-trivial)
+    assert len(json.dumps(many, separators=(",", ":"))) > lc._INPUT_TOTAL_CAP
+    obj, trunc = lc._bound_input(many)
+    assert trunc is True
+    # the load-bearing invariant: the SERVED payload is within the total cap.
+    assert len(json.dumps(obj, separators=(",", ":"))) <= lc._INPUT_TOTAL_CAP
+
+def test_bound_input_single_giant_leaf_clips_to_total_cap():
+    # A single string leaf far past the total cap: the served payload must
+    # serialize within _INPUT_TOTAL_CAP (the per-leaf clip alone caps it at
+    # _INPUT_LEAF_CAP < _INPUT_TOTAL_CAP, so this stays within cap by leaf-clip;
+    # the assertion still holds and guards the post-clip invariant).
+    big = "Z" * (lc._INPUT_TOTAL_CAP + 5000)
+    obj, trunc = lc._bound_input({"old_string": big})
+    assert trunc is True
+    assert len(json.dumps(obj, separators=(",", ":"))) <= lc._INPUT_TOTAL_CAP
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # #177 Session 1: enriched tool_use / tool_result blocks, message-level

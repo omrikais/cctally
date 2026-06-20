@@ -2096,6 +2096,48 @@ def test_read_full_payload_result_with_bash_stderr(tmp_path):
     assert got["is_error"] is True
     assert got["stderr"] == "boom"
     assert got["truncated"] is False
+    # #217 S1 / U5: a short (sub-ceiling) stderr reports stderr_truncated False —
+    # the contract is now HONEST about the per-stream stderr bound, not just text.
+    assert got["stderr_truncated"] is False
+
+
+def test_read_full_payload_emits_stderr_truncated(tmp_path):
+    # #217 S1 / U5 (data-contract honesty): the `text` stream and the Bash
+    # `stderr` stream are each bounded to _FULL_PAYLOAD_CEILING INDEPENDENTLY, so
+    # `truncated` (which describes only `text`) cannot tell the client whether
+    # `stderr` was clipped. A stderr longer than the ceiling must surface
+    # stderr_truncated=True (and the served stderr is clipped to the ceiling),
+    # while `truncated` (the text stream) stays False because the text is short.
+    big_err = "E" * (cq._FULL_PAYLOAD_CEILING + 123)
+    line = _json.dumps({
+        "toolUseResult": {"stdout": "ok\n", "stderr": big_err, "interrupted": False},
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_se",
+             "content": [{"type": "text", "text": "short"}], "is_error": True},
+        ]}}).encode() + b"\n"
+    p = tmp_path / "se.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_se", "result")
+    assert got["which"] == "result"
+    assert got["text"] == "short"
+    assert got["truncated"] is False              # the TEXT stream is short
+    assert len(got["stderr"]) == cq._FULL_PAYLOAD_CEILING   # stderr per-stream bound
+    assert got["stderr_truncated"] is True        # the STDERR stream was clipped
+
+
+def test_read_full_payload_no_stderr_omits_stderr_truncated(tmp_path):
+    # A result with NO stderr stream must NOT carry an stderr_truncated key (the
+    # flag is emitted only when stderr is present, mirroring `stderr` itself).
+    line = _json.dumps({"message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_ne",
+         "content": [{"type": "text", "text": "out"}]}]}}).encode() + b"\n"
+    p = tmp_path / "ne.jsonl"
+    with open(p, "wb") as fh:
+        fh.write(line)
+    got = cq.read_full_payload(str(p), 0, "toolu_ne", "result")
+    assert "stderr" not in got
+    assert "stderr_truncated" not in got
 
 
 def test_read_full_payload_seeks_to_byte_offset(tmp_path):

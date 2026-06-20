@@ -26,6 +26,11 @@ from _lib_pricing import _calculate_entry_cost
 # content block the same way the parser does at ingest — reuse the parser's
 # _stringify so the full (un-capped) result text matches the cached/capped one.
 from _lib_conversation import _stringify
+# #217 S1 / U5: the payload-clip helpers moved DOWN into the parser module (low
+# in the dependency graph) so _bound_input's total-cap backstop and this module's
+# read_full_payload share one bound-guaranteeing implementation. Imported here
+# (query depends on the parser, never the reverse — verified at #217).
+from _lib_conversation import _clip_payload_input, _shrink_largest_leaf
 # #177 S4: the media-route reader walks a content array with the SAME ordinal
 # generator the ingest placeholders used, so "media item N" addresses one item.
 from _lib_conversation import iter_media_items
@@ -2608,74 +2613,6 @@ def locate_tool_payload(conn, session_id, tool_use_id, which):
     return None
 
 
-def _clip_payload_input(inp, ceiling):
-    """Clip a structured input so the returned dict serializes to ``ceiling`` chars
-    or fewer, and report whether anything was clipped — the input-side analogue of
-    the result-side ceiling. A degenerate multi-MB input (one giant leaf OR many
-    sub-ceiling leaves that sum past the ceiling) is bounded so the HTTP server /
-    browser is protected, while every real payload returns whole.
-
-    The guarantee is AGGREGATE, not merely per-leaf: a shared remaining-char budget
-    is threaded through the walk (mirroring ``_bound_input``'s total-size backstop) —
-    each string leaf is clipped against the running budget and the budget is
-    decremented as we go, so once it is exhausted later leaves clip to ''.
-    ``truncated`` is True iff any leaf was clipped (or the post-walk serialized size
-    still exceeds ``ceiling``, the structural-overhead backstop). Post-condition:
-    ``len(json.dumps(clipped, ensure_ascii=False)) <= ceiling`` always."""
-    truncated = False
-    remaining = [ceiling]   # boxed so the nested walk can decrement it
-
-    def walk(v):
-        nonlocal truncated
-        if isinstance(v, str):
-            if len(v) > remaining[0]:
-                truncated = True
-                v = v[:remaining[0]]
-            remaining[0] -= len(v)
-            return v
-        if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
-        if isinstance(v, list):
-            return [walk(x) for x in v]
-        return v
-
-    clipped = walk(inp)
-    # Backstop: structural JSON overhead (braces/quotes/keys) can push a
-    # budget-exact payload a few chars past the ceiling. Hard-clip the largest
-    # remaining string leaf(s) until the whole dict serializes within the ceiling.
-    while len(_json.dumps(clipped, ensure_ascii=False)) > ceiling:
-        truncated = True
-        if not _shrink_largest_leaf(clipped):
-            break   # no string leaf left to shrink (e.g. pure numeric/structural)
-    return clipped, truncated
-
-
-def _shrink_largest_leaf(obj):
-    """Halve the longest string leaf reachable in ``obj`` (a dict/list/scalar),
-    in place, and return True if one was shrunk — the post-walk backstop for the
-    rare structural-overhead overshoot. A leaf already at length 1 is truncated to
-    ''. Returns False when no non-empty string leaf exists."""
-    best = {"len": 0, "container": None, "key": None}
-
-    def scan(v, container, key):
-        if isinstance(v, str):
-            if len(v) > best["len"]:
-                best.update(len=len(v), container=container, key=key)
-        elif isinstance(v, dict):
-            for k, x in v.items():
-                scan(x, v, k)
-        elif isinstance(v, list):
-            for i, x in enumerate(v):
-                scan(x, v, i)
-
-    scan(obj, None, None)
-    if best["container"] is None or best["len"] == 0:
-        return False
-    s = best["container"][best["key"]]
-    best["container"][best["key"]] = s[: len(s) // 2]
-    return True
-
-
 def read_full_payload(source_path, byte_offset, tool_use_id, which):
     """Re-read the raw JSONL line at ``(source_path, byte_offset)`` and return the
     FULL (un-capped) payload for ``tool_use_id``:
@@ -2732,6 +2669,12 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
             if (isinstance(tur, dict) and isinstance(tur.get("stderr"), str)
                     and tur.get("stderr")):
                 resp["stderr"] = tur["stderr"][:_FULL_PAYLOAD_CEILING]   # per-stream bound (see above)
+                # #217 S1 / U5 (data-contract honesty): `truncated` describes ONLY
+                # the `text` stream, but `stderr` is bounded INDEPENDENTLY against
+                # the same ceiling — so the client cannot tell from `truncated`
+                # alone whether stderr was clipped. Emit a dedicated per-stream
+                # flag whenever stderr is present (mirrors `stderr` itself).
+                resp["stderr_truncated"] = len(tur["stderr"]) > _FULL_PAYLOAD_CEILING
             return resp
     return None
 

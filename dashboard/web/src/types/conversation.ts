@@ -411,6 +411,12 @@ export type FullPayload =
       truncated: boolean;
       is_error: boolean; // read_full_payload ALWAYS emits this on the result branch
       stderr?: string | null;
+      // #217 S1 / U5 (data-contract honesty): `truncated` describes ONLY the
+      // `text` stream; the Bash `stderr` stream is bounded INDEPENDENTLY against
+      // the same ceiling, so this dedicated flag reports whether stderr itself was
+      // clipped. Emitted only when `stderr` is present. Forward-compat: no UI
+      // consumer is wired yet (a later frontend session surfaces it).
+      stderr_truncated?: boolean;
     }
   | {
       which: 'input';

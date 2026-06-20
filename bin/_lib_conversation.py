@@ -976,9 +976,91 @@ def _bound_input(inp):
         return v
 
     bounded = walk(inp, 0)
+    # #217 S1 / U5 (data-contract honesty): the total-cap backstop must actually
+    # CLIP, not merely flag. The four per-axis caps above bound any SINGLE leaf /
+    # key / node-count / depth, but many sub-leaf-cap leaves can still sum past
+    # _INPUT_TOTAL_CAP — and the old code only set truncated=True there, serving
+    # an over-cap payload. _clip_payload_input threads a shared remaining-char
+    # budget through the (already per-axis-bounded) dict so the SERVED payload
+    # satisfies len(json.dumps(bounded)) <= _INPUT_TOTAL_CAP whenever it clips.
     if len(json.dumps(bounded, separators=(",", ":"))) > _INPUT_TOTAL_CAP:
+        bounded, _ = _clip_payload_input(bounded, _INPUT_TOTAL_CAP)
         state["truncated"] = True
     return (bounded, state["truncated"])
+
+
+# #217 S1 / U5: the payload-clip helpers live HERE (the parser/ingest module, low
+# in the dependency graph) so BOTH _bound_input's total-cap backstop (above) and
+# read_full_payload's on-demand input clip (the query kernel, which imports this
+# module) share one bound-guaranteeing implementation. The query layer never
+# imports back into the parser's callers, so this is the import-safe home (query
+# depends on the parser, not vice-versa — verified at #217 implementation).
+def _clip_payload_input(inp, ceiling):
+    """Clip a structured input so the returned dict serializes to ``ceiling`` chars
+    or fewer, and report whether anything was clipped — the input-side analogue of
+    the result-side ceiling. A degenerate multi-MB input (one giant leaf OR many
+    sub-ceiling leaves that sum past the ceiling) is bounded so the HTTP server /
+    browser is protected, while every real payload returns whole.
+
+    The guarantee is AGGREGATE, not merely per-leaf: a shared remaining-char budget
+    is threaded through the walk (mirroring ``_bound_input``'s total-size backstop) —
+    each string leaf is clipped against the running budget and the budget is
+    decremented as we go, so once it is exhausted later leaves clip to ''.
+    ``truncated`` is True iff any leaf was clipped (or the post-walk serialized size
+    still exceeds ``ceiling``, the structural-overhead backstop). Post-condition:
+    ``len(json.dumps(clipped, ensure_ascii=False)) <= ceiling`` always."""
+    truncated = False
+    remaining = [ceiling]   # boxed so the nested walk can decrement it
+
+    def walk(v):
+        nonlocal truncated
+        if isinstance(v, str):
+            if len(v) > remaining[0]:
+                truncated = True
+                v = v[:remaining[0]]
+            remaining[0] -= len(v)
+            return v
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+
+    clipped = walk(inp)
+    # Backstop: structural JSON overhead (braces/quotes/keys) can push a
+    # budget-exact payload a few chars past the ceiling. Hard-clip the largest
+    # remaining string leaf(s) until the whole dict serializes within the ceiling.
+    while len(json.dumps(clipped, ensure_ascii=False)) > ceiling:
+        truncated = True
+        if not _shrink_largest_leaf(clipped):
+            break   # no string leaf left to shrink (e.g. pure numeric/structural)
+    return clipped, truncated
+
+
+def _shrink_largest_leaf(obj):
+    """Halve the longest string leaf reachable in ``obj`` (a dict/list/scalar),
+    in place, and return True if one was shrunk — the post-walk backstop for the
+    rare structural-overhead overshoot. A leaf already at length 1 is truncated to
+    ''. Returns False when no non-empty string leaf exists."""
+    best = {"len": 0, "container": None, "key": None}
+
+    def scan(v, container, key):
+        if isinstance(v, str):
+            if len(v) > best["len"]:
+                best.update(len=len(v), container=container, key=key)
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                scan(x, v, k)
+        elif isinstance(v, list):
+            for i, x in enumerate(v):
+                scan(x, v, i)
+
+    scan(obj, None, None)
+    if best["container"] is None or best["len"] == 0:
+        return False
+    s = best["container"][best["key"]]
+    best["container"][best["key"]] = s[: len(s) // 2]
+    return True
 
 
 def _derive_search_columns(blocks):
