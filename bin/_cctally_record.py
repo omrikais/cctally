@@ -2217,6 +2217,15 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
     `at` either way."""
     to_pct = _normalize_percent(to_pct)
     from_pct = _normalize_percent(from_pct)
+    # Defensive None-guard (issue #212 N3). `_normalize_percent` returns None
+    # for a None input. The CLI never reaches here with None (`--to` is
+    # required + type=float; `--from` always resolves to a float or the caller
+    # errors out first), but this is a public pure helper called directly by
+    # tests and any future non-CLI caller — surface a None as a clear ValueError
+    # (caller -> exit 2) instead of a TypeError from the `0.0 <= None` compare
+    # immediately below.
+    if to_pct is None or from_pct is None:
+        raise ValueError("--to/--from must be numeric")
     if not (0.0 <= to_pct <= 100.0) or not (0.0 <= from_pct <= 100.0):
         raise ValueError("--to/--from must be in [0, 100]")
     if to_pct >= from_pct:
@@ -2666,6 +2675,22 @@ def cmd_record_credit(args) -> int:
             eprint("record-credit: --json requires --yes or --dry-run")
             return 2
 
+        # Fully-applied refuse (M2; state classified at step 2a). A credit
+        # already fully recorded for this week (floor row + command-owned
+        # snapshot) is refused by default. Hoisted ABOVE the interactive
+        # confirm prompt so a TTY user is refused immediately, rather than
+        # being shown the preview, prompted, answering y, and only THEN refused
+        # (issue #212 N2). `--force` is intentionally NOT refused here — it
+        # takes the clear + re-record path at step 4a; a half-applied credit
+        # (is_completion) falls through to finish idempotently. This fires
+        # regardless of --yes/TTY so the precondition failure is uniform; the
+        # earlier --dry-run path still previews (writes nothing) and returns 0.
+        if existing is not None and not is_force and not is_completion:
+            eprint(f"record-credit: a credit is already recorded for this "
+                   f"week (effective={existing[1]}, pre_credit={existing[2]}); "
+                   f"pass --force to re-record")
+            return 2
+
         # No --yes: prompt (TTY) or refuse (non-TTY).
         if not is_yes:
             if not sys.stdin.isatty():
@@ -2682,23 +2707,18 @@ def cmd_record_credit(args) -> int:
                 print("aborted — nothing written")
                 return 0
 
-        # 4a. Existing-floor handling (M2; state classified at step 2a).
-        #     _apply_credit commits the floor row + cleanup BEFORE the synthetic
-        #     snapshot, so a crash in between leaves a half-applied credit
-        #     (floor row, no command-owned snapshot). `existing` /
-        #     `is_completion` were resolved up front (above) keyed on
-        #     week_start_date / weekly_credit_floors.
+        # 4a. Existing-floor handling (M2; state classified at step 2a). The
+        #     fully-applied refuse was hoisted above the confirm prompt (#212
+        #     N2), so only two cases remain here: `--force` clears the prior
+        #     floor + re-records at a fresh effective; a half-applied credit
+        #     (floor row, no command-owned snapshot — a crash between
+        #     _apply_credit's floor commit and the synthetic snapshot) falls
+        #     through to a completion (the plan reuses the existing effective
+        #     and the apply steps are idempotent). `existing`/`is_completion`
+        #     were resolved up front keyed on week_start_date /
+        #     weekly_credit_floors.
         forced = False
-        if existing is not None and not is_force:
-            if not is_completion:
-                # Fully applied -> refuse by default.
-                eprint(f"record-credit: a credit is already recorded for this "
-                       f"week (effective={existing[1]}, pre_credit={existing[2]}); "
-                       f"pass --force to re-record")
-                return 2
-            # else: half-applied -> fall through (completion path; the plan
-            # reuses the existing effective and the apply steps are idempotent).
-        elif existing is not None and is_force:
+        if existing is not None and is_force:
             _force_clear_credit(conn, plan.week_start_date)
             forced = True
 

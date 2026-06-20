@@ -168,6 +168,18 @@ def test_build_plan_rejects_out_of_range(ns):
         _plan(ns, from_pct=120.0)
 
 
+def test_build_plan_rejects_none_pct(ns):
+    """Defensive None-guard (#212 N3): a None --to/--from raises a clear
+    ValueError (caller -> exit 2), NOT a TypeError from the `0.0 <= None`
+    range compare. Unreachable via the CLI (--to required+float; --from
+    resolves to a float first) but reachable by this pure helper's direct
+    callers."""
+    with pytest.raises(ValueError, match="numeric"):
+        _plan(ns, to_pct=None)
+    with pytest.raises(ValueError, match="numeric"):
+        _plan(ns, from_pct=None)
+
+
 def test_build_plan_rejects_future_at(ns):
     with pytest.raises(ValueError, match="future"):
         _plan(ns, at_dt=NOW + dt.timedelta(hours=1))
@@ -536,6 +548,31 @@ def test_s4_fully_applied_refused(ns, monkeypatch):
     assert _apply_once(ns) == 0
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))  # again, no force
     assert rc == 2                                    # refused
+
+
+def test_s4_fully_applied_refused_before_prompt(ns, monkeypatch, capsys):
+    """#212 N2: an interactive (TTY) rerun on a fully-applied week is refused
+    (exit 2) WITHOUT first printing the preview or invoking the confirm prompt.
+    `input` is stubbed to return "y" — so were the refuse still ordered AFTER
+    the prompt, this would proceed/apply instead of refusing. The refuse fires
+    first, input() is never reached, and stdout stays empty."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    assert _apply_once(ns) == 0
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompted = {"hit": False}
+
+    def _fake_input(*a, **k):
+        prompted["hit"] = True
+        return "y"
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+    capsys.readouterr()                       # drain _apply_once's "applied" line
+    rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=False))
+    cap = capsys.readouterr()
+    assert rc == 2
+    assert prompted["hit"] is False           # never prompted
+    assert "already recorded" in cap.err
+    assert cap.out.strip() == ""              # no preview printed
 
 
 def test_s9_force_scope_keeps_real_history(ns, monkeypatch):
