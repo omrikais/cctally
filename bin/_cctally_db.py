@@ -2517,22 +2517,40 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             # (clear_conversation_messages, which drops + recreates the trigger
             # set) can never drift.
             _create_conversation_fts_triggers(conn)
+            # #217 S2 / E7: the external-content title FTS rides the SAME
+            # FTS5-available envelope (P1-6). It is independent of the message
+            # FTS (external-content over conversation_ai_titles, not
+            # conversation_messages), so a failed message-FTS create above never
+            # reaches here; but a failed title-FTS create must drop both message
+            # and title triggers and mark unavailable, so the shared except below
+            # owns the cleanup. Idempotent (IF NOT EXISTS).
+            conn.execute(_CONV_TITLE_FTS_DDL)
+            _create_conversation_title_fts_triggers(conn)
             if recovering:
                 # Repopulate the freshly-(re)created index from the base table
                 # so pre-recovery history is searchable. Cheap no-op when
                 # conversation_messages is empty.
                 conn.execute(
                     "INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+                # The title FTS is external-content over conversation_ai_titles,
+                # so a prior FTS5-unavailable run that ingested titles without the
+                # AI trigger left the title index stale too — rebuild it the same
+                # way (cheap no-op when conversation_ai_titles is empty).
+                conn.execute(
+                    "INSERT INTO conversation_title_fts(conversation_title_fts) "
+                    "VALUES('rebuild')")
             conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
         except sqlite3.OperationalError:
             # partial create cleanup, then mark unavailable. _drop drops the
-            # split trigger set (and any legacy aux trigger names, harmlessly),
-            # and we drop both possible vtables, so a failed create can't leave a
-            # live trigger over a missing table.
+            # split trigger set (and any legacy aux trigger names, harmlessly)
+            # plus the title trigger set, and we drop all three possible vtables,
+            # so a failed create can't leave a live trigger over a missing table.
             _drop_conversation_fts_triggers(conn)
+            _drop_conversation_title_fts_triggers(conn)
             try:
                 conn.execute("DROP TABLE IF EXISTS conversation_fts")
                 conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
+                conn.execute("DROP TABLE IF EXISTS conversation_title_fts")
             except sqlite3.OperationalError:
                 pass
             _set_cache_meta(conn, "fts5_unavailable", "1")
@@ -2547,6 +2565,14 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         # itself can't be DROPped without the fts5 module, but with no triggers
         # nothing writes to it.)
         _drop_conversation_fts_triggers(conn)
+        # #217 S2 / E7 (P1-6): same hazard for the title FTS — a prior
+        # FTS5-capable run may have left conv_title_fts_* triggers that now
+        # reference an unusable conversation_title_fts. They fire inside the
+        # SAME per-file ingest transaction (the conversation_ai_titles upsert),
+        # so an orphan title trigger would roll back the cost ingest too. Drop
+        # them under the LIKE fallback; kind=title degrades to a LIKE scan over
+        # conversation_ai_titles.
+        _drop_conversation_title_fts_triggers(conn)
         _set_cache_meta(conn, "fts5_unavailable", "1")
     # The FTS branch above issues DML (DELETE/INSERT on cache_meta) which opens
     # an implicit transaction under sqlite3's legacy autocommit mode. Close it
@@ -2735,6 +2761,64 @@ def _drop_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
     call site drops both sets so a failed aux create can't strand a live aux
     trigger over a missing conversation_fts_aux."""
     for name in _CONV_FTS_TRIGGER_NAMES + _CONV_FTS_AUX_TRIGGER_NAMES:
+        try:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        except sqlite3.OperationalError:
+            pass
+
+
+# #217 S2 / E7: external-content FTS5 over the per-session AI title
+# (conversation_ai_titles). The single column name MUST match the content table
+# column (``ai_title``) BY NAME (external-content FTS5 resolves columns through
+# the content table by name — same rule the message FTS follows). Fresh installs
+# create this directly inside ``_apply_cache_schema``'s FTS5-available branch;
+# migration 018 creates it for existing installs. The content-table ``rowid`` is
+# STABLE across title updates (``_AI_TITLE_UPSERT_SQL`` is ``ON CONFLICT(session_id)
+# DO UPDATE``, not delete+reinsert), so the AU trigger covers the update path and
+# the external-content choice is sound.
+_CONV_TITLE_FTS_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_title_fts USING fts5("
+    "ai_title, content='conversation_ai_titles', content_rowid='rowid')"
+)
+
+# Title-FTS sync triggers (external-content FTS5). Mirror the message-FTS
+# conv_fts_ai/ad/au idiom: AD/AU carry the OLD rowid via the ``'delete'``
+# command. Defined ONCE here so every create/drop site stays in lockstep.
+_CONV_TITLE_FTS_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS conv_title_fts_ai "
+    "AFTER INSERT ON conversation_ai_titles "
+    "BEGIN INSERT INTO conversation_title_fts(rowid, ai_title) "
+    "VALUES (new.rowid, new.ai_title); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_title_fts_ad "
+    "AFTER DELETE ON conversation_ai_titles "
+    "BEGIN INSERT INTO conversation_title_fts(conversation_title_fts, rowid, ai_title) "
+    "VALUES('delete', old.rowid, old.ai_title); END",
+    "CREATE TRIGGER IF NOT EXISTS conv_title_fts_au "
+    "AFTER UPDATE OF ai_title ON conversation_ai_titles "
+    "BEGIN INSERT INTO conversation_title_fts(conversation_title_fts, rowid, ai_title) "
+    "VALUES('delete', old.rowid, old.ai_title); "
+    "INSERT INTO conversation_title_fts(rowid, ai_title) "
+    "VALUES (new.rowid, new.ai_title); END",
+)
+_CONV_TITLE_FTS_TRIGGER_NAMES = (
+    "conv_title_fts_au", "conv_title_fts_ad", "conv_title_fts_ai")
+
+
+def _create_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Create the #217 S2 title-FTS sync trigger set — idempotent (each is
+    ``IF NOT EXISTS``). The caller must have already created
+    ``conversation_title_fts`` (the triggers reference it)."""
+    for stmt in _CONV_TITLE_FTS_TRIGGER_DDL:
+        conn.execute(stmt)
+
+
+def _drop_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Drop the title-FTS sync trigger set — idempotent (``IF EXISTS``). Swallows
+    ``OperationalError`` per statement so an absent set (FTS5-unavailable build)
+    is tolerated. P1-6: dropping these on a no-FTS5 build is what keeps a
+    ``conversation_ai_titles`` upsert from firing a trigger against the missing
+    vtable and rolling back the shared per-file ingest transaction."""
+    for name in _CONV_TITLE_FTS_TRIGGER_NAMES:
         try:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         except sqlite3.OperationalError:
@@ -3640,6 +3724,36 @@ def _017_arm_nested_agent_reingest(conn: sqlite3.Connection) -> None:
     stamps it WITHOUT running (empty table -> the flag, if ever set, is a harmless
     no-op). Mirrors 014/009/007."""
     _set_cache_meta(conn, "conversation_reingest_nested_agent_pending", "1")
+    conn.commit()
+
+
+@cache_migration("018_create_conversation_title_fts")
+def _018_create_conversation_title_fts(conn: sqlite3.Connection) -> None:
+    """#217 S2 / E7: arm the external-content title FTS over
+    ``conversation_ai_titles`` so AI titles are findable via ``kind=title``.
+
+    Flag-only arm. The ``conversation_title_fts`` virtual table + its
+    conv_title_fts_ai/ad/au sync triggers are created by ``_apply_cache_schema``
+    (runs on every open, fresh + existing installs) inside the SAME FTS5-available
+    envelope as the message FTS (P1-6) — so on a no-FTS5 build the table+triggers
+    are simply absent and a title upsert never rolls back the ingest. This handler
+    does NO DDL (mirrors 012's flag-only pattern): it just arms the DISTINCT
+    ``conversation_title_fts_backfill_pending`` flag (the "distinct reingest flag
+    per enrichment" rule — its own flag, never the shared one) so the next
+    flock-held full sync runs ``_consume_title_fts`` (an FTS5 ``'rebuild'``, P1-7)
+    to populate the index from existing history.
+
+    The flag joins ``_TARGETED_DECLINE_FLAGS`` ONLY — NEVER ``_REINGEST_FLAG_KEYS``
+    (P1-2): that set means "run ``_resumable_reingest_conversation_messages``" (a
+    full message delete/reinsert + rowid churn) which a title-FTS backfill must
+    not trigger; the title index is external-content over conversation_ai_titles
+    and a ``'rebuild'`` repopulates it without touching conversation_messages.
+
+    No data work here -> the dispatcher's central stamp (#140) marks a complete
+    handler; a fresh install stamps WITHOUT a populated history (its incremental
+    walk fills the title FTS via the AI trigger as titles ingest, and the consumed
+    backfill 'rebuild' no-ops). Mirrors 012's flag-only arm."""
+    _set_cache_meta(conn, "conversation_title_fts_backfill_pending", "1")
     conn.commit()
 
 

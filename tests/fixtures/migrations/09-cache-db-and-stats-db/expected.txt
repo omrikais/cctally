@@ -14,7 +14,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
   ✓ 013_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 18 / 18 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 19 / 19 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -32,7 +32,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 18 / 18 known
   ✓ 015_conversation_sessions_filter_columns       applied <REDACTED>
   ✓ 016_drop_search_aux                            applied <REDACTED>
   ✓ 017_arm_nested_agent_reingest                  applied <REDACTED>
-  ✓ 018_test_cache_migration                       applied <REDACTED>
+  ✓ 018_create_conversation_title_fts              applied <REDACTED>
+  ✓ 019_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit
@@ -56,7 +57,7 @@ stats.db:
     013_test_failure_injection
   schema_migrations_skipped:
 cache.db:
-  user_version: 18
+  user_version: 19
   schema_migrations:
     001_dedup_highest_wins
     002_conversation_messages_backfill
@@ -75,7 +76,8 @@ cache.db:
     015_conversation_sessions_filter_columns
     016_drop_search_aux
     017_arm_nested_agent_reingest
-    018_test_cache_migration
+    018_create_conversation_title_fts
+    019_test_cache_migration
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>

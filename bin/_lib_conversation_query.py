@@ -878,6 +878,47 @@ def _live_having(filters):
     return (" HAVING " + " AND ".join(having)) if having else "", params
 
 
+def _resolve_search_session_filter(conn, filters):
+    """Resolve the filtered-search session-scope restriction (#217 S2 /
+    Filtered-search). Returns ``(subquery_sql, params, degraded)`` where
+    ``subquery_sql`` is a complete ``"SELECT session_id FROM ... "`` the caller
+    wraps as ``" AND <col> IN (<subquery_sql>)"``, or ``""`` (no restriction) when
+    no axis is set.
+
+    Mirrors the browse dual-branch parity (``list_conversations``):
+
+      * Rollup AUTHORITATIVE (``conversation_sessions_backfill_pending`` clear):
+        every axis is a stored column on the rollup, so restrict to
+        ``SELECT session_id FROM conversation_sessions <_rollup_where(filters)>``
+        (the SAME ``_rollup_where`` the browse rail uses, verbatim). ``degraded``
+        is False.
+      * Rollup PENDING (live fallback) AND a rollup-only axis
+        (project/cost/rebuild) is requested (P1-5): drop the rollup-only axes,
+        set ``degraded`` True, and express ONLY the date axis via a LIVE session
+        prefilter over ``conversation_messages`` keyed on
+        ``MAX(timestamp_utc)`` — the SAME session-activity semantics as
+        ``_live_having``/``_list_session_rows_live``. We restrict by session
+        ACTIVITY, never by a matched row's own timestamp (a session whose match is
+        old but whose activity is in-window must stay).
+      * Rollup pending but ONLY date axis requested: the rollup is not needed
+        (date is expressible live), so use the live prefilter and ``degraded``
+        stays False (no rollup-only axis was dropped — byte-stable with browse).
+    """
+    any_axis = any(filters[k] is not None for k in _FILTER_KEYS)
+    if not any_axis:
+        return "", [], False
+    if _rollup_authoritative(conn):
+        where, params = _rollup_where(filters)
+        return "SELECT session_id FROM conversation_sessions" + where, params, False
+    # Live fallback: only the date axis is expressible over raw messages.
+    degraded = any(filters[k] is not None for k in _ROLLUP_ONLY_FILTER_KEYS)
+    having, hparams = _live_having(filters)
+    sub = (
+        "SELECT session_id FROM conversation_messages "
+        "WHERE session_id IS NOT NULL GROUP BY session_id" + having)
+    return sub, hparams, degraded
+
+
 def _list_session_rows_rollup(conn, order, limit, offset, filters=None):
     """FAST path: read the pre-aggregated rail rows straight from the
     conversation_sessions rollup (spec §3). No GROUP BY, no temp B-tree for the
@@ -1508,7 +1549,8 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     boundary keys are mode-uniform (`has_more = end < N`, `has_prev = start > 0`)
     so a short `before` head-page still reports `has_more` (P2-8); the existing
     `after`/no-cursor responses stay byte-stable except the two additive
-    `prev_before`/`has_prev` keys (for them `start + limit < N == end < N`)."""
+    `prev_before`/`has_prev` keys (for them `start + limit < N == end < N`, under
+    `end = min(start+limit, N)`)."""
     if sum(1 for x in (after is not None, before is not None, bool(tail)) if x) > 1:
         raise ValueError("after/before/tail are mutually exclusive")
     limit = max(1, min(int(limit), 1000))
@@ -2004,7 +2046,9 @@ def _search_depth(conn) -> str:
 
 
 def search_conversations(conn, query, *, limit=50, offset=0,
-                         kind="all", fts_available=None) -> dict:
+                         kind="all", fts_available=None,
+                         date_from=None, date_to=None, projects=None,
+                         cost_min=None, cost_max=None, rebuild_min=None) -> dict:
     """Cross-session search (spec §3.3). Uses FTS5 when available (bm25 rank +
     snippet); else a LIKE scan with a manual snippet. Hits deduped by
     (session_id, uuid); each carries the turn's cost. `fts_available` overrides
@@ -2013,11 +2057,24 @@ def search_conversations(conn, query, *, limit=50, offset=0,
     #177 S6: ``kind`` (one of ``_SEARCH_KINDS``) scopes the search to a column
     family — ``all`` is unfiltered, ``prompts``/``assistant`` filter the prose
     column + entry_type, ``tools``/``thinking`` filter the split index columns.
-    Every hit gains ``match_kinds`` (sorted ``['tool', 'thinking']`` badges;
-    prose never badges). The response carries additive ``kind`` + ``search_depth``
-    so the client can degrade the Tools/Thinking facets during the one-time
-    column split (``search_depth == 'prose-only'`` short-circuits those two
-    kinds to empty). An unknown ``kind`` raises ``ValueError`` (route → 400)."""
+    #217 S2 / E7: ``title`` searches the external-content title FTS over
+    conversation_ai_titles → one SESSION-level hit per matching session, anchored
+    to that session's first turn, ``match_kinds:["title"]``, snippet = the matched
+    title. Every hit gains ``match_kinds`` (sorted badges; prose never badges).
+    The response carries additive ``kind`` + ``search_depth`` so the client can
+    degrade the Tools/Thinking facets during the one-time column split
+    (``search_depth == 'prose-only'`` short-circuits those two kinds to empty).
+    An unknown ``kind`` raises ``ValueError`` (route → 400).
+
+    #217 S2 / Filtered-search: the browse filters (``date_from``/``date_to``/
+    ``projects``/``cost_min``/``cost_max``/``rebuild_min``) restrict the search to
+    matching sessions, applied uniformly across EVERY kind as a session-scope
+    ``session_id IN (...)`` predicate (``_resolve_search_session_filter`` reuses
+    ``_rollup_where`` verbatim). When the rollup backfill is pending and a
+    rollup-only axis is requested, only the date axis applies (via a live
+    ``MAX(timestamp_utc)`` prefilter, P1-5) and the response carries additive
+    ``filter_degraded: True`` — exactly mirroring browse. A no-filter request
+    produces byte-stable existing output (no ``filter_degraded`` key)."""
     if kind not in _SEARCH_KINDS:
         raise ValueError(f"unknown kind: {kind}")
     q = (query or "").strip()
@@ -2029,20 +2086,45 @@ def search_conversations(conn, query, *, limit=50, offset=0,
     mode = "fts" if fts_available else "like"
     base = {"query": q, "mode": mode, "hits": [], "total": 0,
             "kind": kind, "search_depth": depth}
+    # Resolve the filtered-search session-scope restriction ONCE (reused by every
+    # kind). ``filt_sql`` is "" when no axis is set, so the no-filter path stays
+    # byte-stable; ``degraded`` flags the dropped rollup-only axes (P1-5).
+    filters = {
+        "date_from": date_from, "date_to": date_to,
+        "projects": list(projects) if projects else None,
+        "cost_min": cost_min, "cost_max": cost_max, "rebuild_min": rebuild_min,
+    }
+    filt_sql, filt_params, degraded = _resolve_search_session_filter(conn, filters)
+    if degraded:
+        base["filter_degraded"] = True
+
+    def _finish(out):
+        # Stamp the additive degraded flag onto whatever the search path returns,
+        # without disturbing the no-filter byte-stable shape.
+        if degraded:
+            out["filter_degraded"] = True
+        return out
+
     # Prose-only interim: the split columns are not yet indexed, so tools /
     # thinking can't match — short-circuit them to empty (spec §1 interim).
     if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
         return base
+    if kind == "title":
+        out = _search_title(conn, q, limit, offset, fts_available,
+                            filt_sql, filt_params)
+        out.update(kind="title", search_depth=depth)
+        return _finish(out)
     if fts_available:
         try:
-            out = _search_fts(conn, q, limit, offset, kind, depth)
+            out = _search_fts(conn, q, limit, offset, kind, depth,
+                             filt_sql, filt_params)
             out.update(kind=kind, search_depth=depth)
-            return out
+            return _finish(out)
         except sqlite3.OperationalError:
             pass   # corrupt/missing FTS at query time → fall through to LIKE
-    out = _search_like(conn, q, limit, offset, kind, depth)
+    out = _search_like(conn, q, limit, offset, kind, depth, filt_sql, filt_params)
     out.update(kind=kind, mode="like", search_depth=depth)
-    return out
+    return _finish(out)
 
 
 def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id, match_kinds=None):
@@ -2161,7 +2243,8 @@ def _match_kinds(conn, fts_q, rids_by_group):
             for grp, rids in rids_by_group.items()}
 
 
-def _search_fts(conn, q, limit, offset, kind, depth):
+def _search_fts(conn, q, limit, offset, kind, depth,
+                filt_sql="", filt_params=()):
     # All of dedup + paging + total live in SQL (#149) so Python never holds
     # more than one page of hits/snippets, regardless of corpus match count.
     #
@@ -2178,6 +2261,11 @@ def _search_fts(conn, q, limit, offset, kind, depth):
     entry_type = _KIND_ENTRY_TYPE.get(kind)
     et_pred = " AND cm.entry_type = ?" if entry_type is not None else ""
     et_args = (entry_type,) if entry_type is not None else ()
+    # #217 S2 / Filtered-search: session-scope restriction (empty when no filter,
+    # so the no-filter path stays byte-stable). cm.session_id is the FTS join's
+    # message column.
+    fpred = f" AND cm.session_id IN ({filt_sql})" if filt_sql else ""
+    fargs = tuple(filt_params)
     # Exact post-dedup logical total — counted in C with no snippet generation
     # and no Python row materialization.
     total = conn.execute(
@@ -2185,8 +2273,8 @@ def _search_fts(conn, q, limit, offset, kind, depth):
         "  SELECT DISTINCT cm.session_id, cm.uuid "
         "  FROM conversation_fts "
         "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        f"  WHERE conversation_fts MATCH ?{et_pred})",
-        (match_expr, *et_args),
+        f"  WHERE conversation_fts MATCH ?{et_pred}{fpred})",
+        (match_expr, *et_args, *fargs),
     ).fetchone()[0]
     # One row per logical (session_id, uuid): ROW_NUMBER()=1 keeps the SAME row
     # the old Python dedup kept as its FIRST occurrence (order: bm25, ts DESC,
@@ -2210,7 +2298,7 @@ def _search_fts(conn, q, limit, offset, kind, depth):
         f"         {bm25_expr} AS rank "
         "  FROM conversation_fts "
         "  JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        f"  WHERE conversation_fts MATCH ?{et_pred}), "
+        f"  WHERE conversation_fts MATCH ?{et_pred}{fpred}), "
         "ranked AS ("
         "  SELECT *, ROW_NUMBER() OVER ("
         "             PARTITION BY sid, uuid ORDER BY rank, ts DESC, rid DESC"
@@ -2218,7 +2306,7 @@ def _search_fts(conn, q, limit, offset, kind, depth):
         "  FROM matched) "
         "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
         "ORDER BY rank, ts DESC, rid DESC LIMIT ? OFFSET ?",
-        (match_expr, *et_args, limit, offset),
+        (match_expr, *et_args, *fargs, limit, offset),
     ).fetchall()
     page_groups = {(sid, uuid): rid for (rid, sid, uuid, ts, cwd, mid, rqd) in page}
     if legacy:
@@ -2326,7 +2414,8 @@ def _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips):
     return snips
 
 
-def _search_like(conn, q, limit, offset, kind, depth):
+def _search_like(conn, q, limit, offset, kind, depth,
+                 filt_sql="", filt_params=()):
     # SQL-bounded mirror of _search_fts for the no-FTS5 fallback (#149); the
     # COUNT + page each scan the table once (the degraded path already lacks an
     # index for the substring match). #177 S6: kind → column list (single-
@@ -2346,11 +2435,14 @@ def _search_like(conn, q, limit, offset, kind, depth):
     entry_type = _KIND_ENTRY_TYPE.get(kind)
     et_pred = " AND entry_type = ?" if entry_type is not None else ""
     et_args = (entry_type,) if entry_type is not None else ()
+    # #217 S2 / Filtered-search: session-scope restriction (empty when no filter).
+    fpred = f" AND session_id IN ({filt_sql})" if filt_sql else ""
+    fargs = tuple(filt_params)
     total = conn.execute(
         "SELECT COUNT(*) FROM ("
         "  SELECT DISTINCT session_id, uuid FROM conversation_messages "
-        f"  WHERE {col_pred}{et_pred})",
-        (*like_args, *et_args),
+        f"  WHERE {col_pred}{et_pred}{fpred})",
+        (*like_args, *et_args, *fargs),
     ).fetchone()[0]
     page = conn.execute(
         "WITH ranked AS ("
@@ -2361,10 +2453,10 @@ def _search_like(conn, q, limit, offset, kind, depth):
         "           ORDER BY timestamp_utc DESC, id DESC"
         "         ) AS rn "
         "  FROM conversation_messages "
-        f"  WHERE {col_pred}{et_pred}) "
+        f"  WHERE {col_pred}{et_pred}{fpred}) "
         "SELECT rid, sid, uuid, ts, cwd, mid, rqd FROM ranked WHERE rn = 1 "
         "ORDER BY ts DESC, rid DESC LIMIT ? OFFSET ?",
-        (*like_args, *et_args, limit, offset),
+        (*like_args, *et_args, *fargs, limit, offset),
     ).fetchall()
     texts = _texts_for_ids(conn, [r[0] for r in page])
     if legacy:
@@ -2377,6 +2469,91 @@ def _search_like(conn, q, limit, offset, kind, depth):
                         match_kinds=badges.get((sid, uuid), []))
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
     return {"query": q, "mode": "like",
+            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "total": total}
+
+
+def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_params=()):
+    """#217 S2 / E7: ``kind=title`` cross-session search over the per-session AI
+    title (conversation_ai_titles). Emits ONE SESSION-level hit per matching
+    session, anchored to that session's FIRST turn (the earliest
+    ``(timestamp_utc, id)`` conversation_messages row), ``match_kinds:["title"]``,
+    snippet = the matched title.
+
+    FTS5 available: ``MATCH ai_title`` over the external-content
+    ``conversation_title_fts``, mapping each hit rowid →
+    ``conversation_ai_titles.session_id``; the snippet comes from FTS ``snippet()``.
+    Else: a LIKE scan over ``conversation_ai_titles`` with the whole title as the
+    snippet (degraded; no marked span).
+
+    P2-9 (load-bearing): a session's title counts toward ``total`` and the page
+    ONLY when it has an anchorable first turn. Both the COUNT and the page JOIN
+    the SAME first-message anchor (``INNER JOIN`` against the per-session
+    first-turn CTE), so a title row whose session has no surviving message rows is
+    excluded from both — no lying count.
+
+    Filtered-search: the ``filt_sql`` session-scope restriction (over
+    conversation_ai_titles.session_id) applies the same as the message kinds.
+    """
+    fpred = f" AND t.session_id IN ({filt_sql})" if filt_sql else ""
+    fargs = tuple(filt_params)
+    # First-turn anchor per session: earliest (timestamp_utc, id) row. Rides
+    # idx_conv_session_ts. One row per session_id.
+    anchor_cte = (
+        "anchor AS ("
+        "  SELECT session_id, aid, auuid, ats, acwd, amid, arqd FROM ("
+        "    SELECT session_id, id AS aid, uuid AS auuid, timestamp_utc AS ats, "
+        "           cwd AS acwd, msg_id AS amid, req_id AS arqd, "
+        "           ROW_NUMBER() OVER (PARTITION BY session_id "
+        "                              ORDER BY timestamp_utc, id) AS rn "
+        "    FROM conversation_messages WHERE session_id IS NOT NULL"
+        "  ) WHERE rn = 1)")
+
+    if fts_available:
+        # matched titles: rowid → session_id + snippet, INNER-joined to the
+        # anchor so only anchorable sessions survive (P2-9).
+        fts_q = _fts_query(q, prefix_last=True)
+        total = conn.execute(
+            "WITH " + anchor_cte + " "
+            "SELECT COUNT(*) FROM conversation_title_fts f "
+            "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
+            "JOIN anchor a ON a.session_id = t.session_id "
+            f"WHERE f.conversation_title_fts MATCH ?{fpred}",
+            (fts_q, *fargs)).fetchone()[0]
+        rows = conn.execute(
+            "WITH " + anchor_cte + " "
+            "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
+            "       snippet(conversation_title_fts, 0, '[', ']', ' … ', 12) AS snip "
+            "FROM conversation_title_fts f "
+            "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
+            "JOIN anchor a ON a.session_id = t.session_id "
+            f"WHERE f.conversation_title_fts MATCH ?{fpred} "
+            "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
+            (fts_q, *fargs, limit, offset)).fetchall()
+        mode = "fts"
+    else:
+        like = _like_pattern(q)
+        total = conn.execute(
+            "WITH " + anchor_cte + " "
+            "SELECT COUNT(*) FROM conversation_ai_titles t "
+            "JOIN anchor a ON a.session_id = t.session_id "
+            f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred}",
+            (like, *fargs)).fetchone()[0]
+        rows = conn.execute(
+            "WITH " + anchor_cte + " "
+            "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
+            "       t.ai_title AS snip "
+            "FROM conversation_ai_titles t "
+            "JOIN anchor a ON a.session_id = t.session_id "
+            f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred} "
+            "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
+            (like, *fargs, limit, offset)).fetchall()
+        mode = "like"
+
+    hits = [_row_to_hit(auuid, sid, ats, acwd, snip, amid, arqd,
+                        match_kinds=["title"])
+            for (sid, auuid, ats, acwd, amid, arqd, snip) in rows]
+    return {"query": q, "mode": mode,
             "hits": _attach_titles(conn, _attach_costs(conn, hits)),
             "total": total}
 
@@ -2402,9 +2579,19 @@ def _like_badges(conn, like, groups):
 
 # #177 S6: kind facets. `all` is the unfiltered MATCH; `prompts`/`assistant`
 # filter the prose column AND the entry_type; `tools`/`thinking` filter the
-# split index columns. Validated in search_conversations / find_in_conversation
-# (an unknown kind raises ValueError → the route maps it to a 400).
-_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
+# split index columns. #217 S2 / E7: `title` is a CROSS-SESSION-SEARCH-ONLY kind
+# (external-content title FTS over conversation_ai_titles, session-level hits).
+# Validated in search_conversations (an unknown kind raises ValueError → the
+# route maps it to a 400).
+#
+# P1-1 (load-bearing kind-validation SPLIT): `_SEARCH_KINDS` (cross-session
+# search) carries `title` (and is ready for `files` in I-3); `_FIND_KINDS` (the
+# in-conversation /find route) does NOT — `find_in_conversation` indexes
+# `_FIND_KIND_COLUMNS[kind]`, which has no entry for `title`/`files`, so accepting
+# them there would KeyError → 500. Keeping the two enums distinct makes
+# `/find?kind=title` a clean 400, never a 500.
+_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title")
+_FIND_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 _KIND_COLUMN = {"prompts": "text", "assistant": "text",
                 "tools": "search_tool", "thinking": "search_thinking"}
 _KIND_ENTRY_TYPE = {"prompts": "human", "assistant": "assistant"}
@@ -2467,8 +2654,12 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
     rendered-turn anchors PRE-cap; the list caps at ``cap`` with
     ``anchors_truncated``. Returns None for an unknown session; an unknown
     ``kind`` raises ValueError (route → 400). Empty/whitespace query → empty;
-    prose-only depth + tools/thinking kinds → empty (the split index is pending)."""
-    if kind not in _SEARCH_KINDS:
+    prose-only depth + tools/thinking kinds → empty (the split index is pending).
+
+    P1-1: validates against ``_FIND_KINDS`` (NOT ``_SEARCH_KINDS``), so the
+    cross-session-only ``title``/``files`` kinds raise ValueError here (the route
+    → 400) rather than reaching ``_FIND_KIND_COLUMNS[kind]`` and KeyError → 500."""
+    if kind not in _FIND_KINDS:
         raise ValueError(f"unknown kind: {kind}")
     # Cheap existence probe (one indexed SELECT) BEFORE the full assembly, so an
     # empty/prose-only-blocked query opening the find bar pays nothing — yet the

@@ -596,6 +596,7 @@ _TARGETED_DECLINE_FLAGS = (
     "conversation_sessions_backfill_pending",
     "conversation_queued_prompt_reingest_pending",   # migration 014
     "conversation_reingest_nested_agent_pending",    # migration 017
+    "conversation_title_fts_backfill_pending",       # migration 018 (P1-2: HERE ONLY)
 )
 
 
@@ -942,6 +943,14 @@ def sync_cache(
             # legacy META command rows carrying a real <command-args> prompt to
             # HUMAN(text=args); the split-FTS UPDATE triggers re-index the args.
             _consume_promote_command_args(conn)
+
+            # #217 S2 / E7: consume the migration-018 title-FTS backfill under the
+            # SAME held flock. An FTS5 'rebuild' re-derives the external-content
+            # title index from conversation_ai_titles (P1-7) — idempotent under
+            # the 012-then-018 both-pending ordering, and a cheap clear-only
+            # no-op on a no-FTS5 build (P1-6). Touches ONLY the title index, never
+            # conversation_messages (P1-2).
+            _consume_title_fts(conn)
 
         if targeted:
             paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
@@ -1770,6 +1779,43 @@ def _consume_search_split(conn) -> None:
     conn.execute(
         "DELETE FROM cache_meta WHERE key IN "
         "('conversation_search_split_pending','conversation_search_split_cursor')")
+    conn.commit()
+
+
+def _consume_title_fts(conn) -> None:
+    """#217 S2 / E7: flock-held consumer for ``conversation_title_fts_backfill_pending``
+    (set by cache migration 018). Populates the external-content title FTS over
+    ``conversation_ai_titles`` from existing history.
+
+    Uses the FTS5 ``'rebuild'`` command (the established consumer idiom —
+    ``_apply_cache_schema``'s recovery rebuild + ``_consume_search_split`` —
+    NOT blind row inserts, P1-7): ``'rebuild'`` re-derives the whole index from
+    the content table and is IDEMPOTENT even if migration 012's
+    ``ai_titles_backfill_pending`` ran first and already populated the index via
+    the conv_title_fts_ai trigger (the 012-then-018 both-pending upgrade
+    ordering) — re-running yields the same rows, no duplicates or conflict.
+
+    FTS5-unavailable (``fts5_unavailable`` set, P1-6): there is no usable vtable
+    to rebuild and a ``'rebuild'`` would error on the absent fts5 module, so just
+    clear the flag — ``kind=title`` degrades to a LIKE scan over
+    conversation_ai_titles. Touches ONLY the title index (never
+    conversation_messages — P1-2: this is NOT a message reingest); the flag is
+    dropped LAST so a crash mid-rebuild re-runs cleanly on the next sync. A fresh
+    install never sets the flag, so this is a cheap no-op there."""
+    if conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='conversation_title_fts_backfill_pending'"
+    ).fetchone() is None:
+        return
+    fts_off = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+    ).fetchone() is not None
+    if not fts_off:
+        conn.execute(
+            "INSERT INTO conversation_title_fts(conversation_title_fts) "
+            "VALUES('rebuild')")
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key='conversation_title_fts_backfill_pending'")
     conn.commit()
 
 

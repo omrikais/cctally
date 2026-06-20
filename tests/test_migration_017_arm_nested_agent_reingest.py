@@ -70,12 +70,14 @@ def _fresh_cache_db(cctally_module, path):
 
 
 def test_017_registered_and_contiguous(cctally_module):
-    """017 is registered as the head of the cache registry (016 was the prior
-    head), so the import-time contiguity assertion (NNN == len(registry)) held."""
+    """017 is registered at its contiguous position in the cache registry (its
+    ``017`` numeric prefix matches its 1-based index), so the import-time
+    contiguity assertion held. (017 was the registry head when it landed; #217 S2
+    appended 018, so this no longer asserts 017 is *last* — only that it sits at
+    index 17.)"""
     names = [m.name for m in cctally_module._CACHE_MIGRATIONS]
     assert _MIGRATION in names
-    assert names[-1] == _MIGRATION, "017 must be the registry head (after 016)"
-    assert names.index(_MIGRATION) + 1 == len(names)
+    assert names.index(_MIGRATION) + 1 == 17, "017 must sit at registry index 17"
 
 
 def test_017_arms_nested_agent_reingest_flag(cctally_module, tmp_path):

@@ -15,7 +15,7 @@ Auth
       → Log into Claude Code to populate the OAuth token
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       29 pending
+  ⚠ Pending migrations       30 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing

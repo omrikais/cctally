@@ -5283,10 +5283,21 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
     return vals[0] if vals else default
 
 
-# #177 S6: valid kind facets for the conversation search / find routes. Kept in
-# lockstep with ``_lib_conversation_query._SEARCH_KINDS`` (the kernel re-raises
-# ValueError on an unknown kind; the handlers reject with a 400 before the call).
-_CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
+# #177 S6 / #217 S2: valid kind facets for the conversation routes. Kept in
+# lockstep with the kernel (``_lib_conversation_query._SEARCH_KINDS`` /
+# ``_FIND_KINDS``; the kernel re-raises ValueError on an unknown kind, and the
+# handlers reject with a 400 BEFORE the call — ``_run_conversation_query``
+# collapses every kernel exception to a 500, so a per-route 4xx must be decided
+# in the handler, not via try/except around the kernel).
+#
+# P1-1 (load-bearing kind-validation SPLIT): the cross-session search route
+# accepts ``title`` (and is ready for ``files`` in I-3); the in-conversation
+# ``/find`` route does NOT — its kernel (``find_in_conversation``) indexes
+# ``_FIND_KIND_COLUMNS[kind]``, which has no ``title``/``files`` entry, so
+# accepting them there would be a 500 KeyError. Two distinct tuples keep
+# ``/find?kind=title`` a clean 400.
+_CONV_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title")
+_CONV_FIND_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 
 class _BadConversationFilter(Exception):
@@ -7450,15 +7461,21 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """Lazy-load the pure conversation query kernel (Plan 2, §3)."""
         return sys.modules["cctally"]._load_sibling("_lib_conversation_query")
 
-    def _parse_search_kind(self, q):
-        """Read + validate the ``kind`` facet shared by the conversation search
-        and find routes (#177 S6). Returns the kind on success, or ``None`` after
-        having ALREADY sent a 400 — callers just ``return`` on ``None``. Kept in
-        lockstep with the kernel's ``_SEARCH_KINDS`` via ``_CONV_SEARCH_KINDS``
-        (the kernel module is resolved lazily per-request, so the handler keeps a
-        literal tuple rather than reaching across that import edge for a nit)."""
+    def _parse_search_kind(self, q, valid=_CONV_SEARCH_KINDS):
+        """Read + validate the ``kind`` facet for a conversation route (#177 S6 /
+        #217 S2). Returns the kind on success, or ``None`` after having ALREADY
+        sent a 400 — callers just ``return`` on ``None``.
+
+        ``valid`` is the per-route kind set (P1-1 split): the cross-session search
+        route passes ``_CONV_SEARCH_KINDS`` (includes ``title``), the
+        in-conversation ``/find`` route passes ``_CONV_FIND_KINDS`` (excludes
+        ``title``/``files``), so ``/find?kind=title`` is a 400 here — never a 500
+        KeyError downstream in ``find_in_conversation``. Kept in lockstep with the
+        kernel's ``_SEARCH_KINDS`` / ``_FIND_KINDS`` (the kernel module is
+        resolved lazily per-request, so the handler keeps literal tuples rather
+        than reaching across that import edge for a nit)."""
         kind = _qs_str(q, "kind", "all")
-        if kind not in _CONV_SEARCH_KINDS:
+        if kind not in valid:
             self._respond_json(400, {"error": f"unknown kind: {kind}"})
             return None
         return kind
@@ -7769,6 +7786,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         FTS/LIKE search (spec §3.3). Matched BEFORE the ``<id>`` reader in
         ``do_GET``. ``kind`` (#177 S6) is validated to ``_CONV_SEARCH_KINDS``
         (else 400) before the kernel call.
+
+        #217 S2 / Filtered-search: the browse filters (date/project/cost/rebuild)
+        are parsed by the SAME ``_parse_conversation_filters`` the browse rail uses
+        (malformed → 400 already sent) and threaded into the kernel, applied as a
+        session-scope restriction across every kind. The 400s (bad kind, bad
+        filter) are decided HERE, before the kernel call — ``_run_conversation_query``
+        collapses kernel exceptions to a 500.
         """
         if not self._require_transcripts_allowed():
             return
@@ -7780,9 +7804,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         kind = self._parse_search_kind(q)
         if kind is None:
             return
+        filters = self._parse_conversation_filters(q)
+        if filters is None:
+            return  # a 400 has already been sent
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().search_conversations(
-                conn, query, limit=limit, offset=offset, kind=kind),
+                conn, query, limit=limit, offset=offset, kind=kind, **filters),
             "/api/conversation/search")
         if not ok:
             return
@@ -7854,6 +7881,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         find → document-ordered rendered-turn anchors (#177 S6). Same fail-closed
         privacy gate as the sibling routes; unknown id → 404; an invalid ``kind``
         → 400. Matched BEFORE the ``<id>`` reader catch-all in ``do_GET``.
+
+        P1-1: validates against ``_CONV_FIND_KINDS`` (NOT the search set), so the
+        cross-session-only ``kind=title``/``files`` return 400 here, never a 500.
         """
         if not self._require_transcripts_allowed():
             return
@@ -7864,7 +7894,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
         q = _u.parse_qs(self.path.partition("?")[2])
         query = _qs_str(q, "q", "")
-        kind = self._parse_search_kind(q)
+        kind = self._parse_search_kind(q, valid=_CONV_FIND_KINDS)
         if kind is None:
             return
         ok, body = self._run_conversation_query(
