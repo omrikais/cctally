@@ -7759,7 +7759,14 @@ mark.current {
      still anchors (an absolute element is a positioned ancestor for its own
      pseudo). */
   #root .conv-tool-io > .conv-copy-btn { position: absolute; }
-  #root .conv-copy-btn::before {
+  /* #217 S5 (F1/F5) — the diff Download-.patch and terminal Copy-full corner
+     buttons are the same tiny-glyph case as .conv-copy-btn; give them the same
+     invisible 44×44 ::before hit area so they meet the #205 mobile floor. */
+  #root .conv-diff-patch-btn,
+  #root .conv-term-copyfull { position: relative; }
+  #root .conv-copy-btn::before,
+  #root .conv-diff-patch-btn::before,
+  #root .conv-term-copyfull::before {
     content: "";
     position: absolute;
     top: 50%;
@@ -7769,8 +7776,11 @@ mark.current {
     transform: translate(-50%, -50%);
   }
   /* The per-turn actions row places Permalink + Copy adjacent; widen the gap so
-     the two 44px hit zones don't overlap into an ambiguous tap target. */
-  #root .conv-item-actions { gap: 24px; }
+     the two 44px hit zones don't overlap into an ambiguous tap target. The diff
+     and terminal corner rows pair Copy + Download/Copy-full the same way. */
+  #root .conv-item-actions,
+  #root .conv-diff-copy,
+  #root .conv-term-copy { gap: 24px; }
 }
 
 /* ===== #177 S2 — decision & planning tool cards ===== */

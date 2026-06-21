@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useCopy } from './useCopy';
 
 // #217 S5 §4 (F1/F5) — the reader-header "Export ▾" menu. Lists the four
@@ -65,7 +65,23 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
   const [busy, setBusy] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const restoreRef = useRef<Element | null>(null);
+  // Belt-and-suspenders (mirrors useCopy): doCopy/doDownload setBusy in a
+  // `finally` after an awaited fetch; if the reader unmounts mid-fetch, skip the
+  // post-await setState to avoid a setState-on-unmounted-component.
+  const mountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
   const { copy } = useCopy();
+
+  // The reader is not keyed by session, so an open menu would otherwise persist
+  // across a session switch; close it when the conversation changes.
+  useEffect(() => {
+    setOpen(false);
+  }, [sessionId]);
 
   const close = useCallback(() => {
     setOpen(false);
@@ -92,7 +108,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
       } catch {
         /* swallow — a failed export leaves the clipboard untouched */
       } finally {
-        setBusy((b) => (b === key ? null : b));
+        if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
     [sessionId, copy],
@@ -108,7 +124,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
       } catch {
         /* swallow */
       } finally {
-        setBusy((b) => (b === key ? null : b));
+        if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
     [sessionId, title],
