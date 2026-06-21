@@ -155,7 +155,10 @@ describe('ConversationRail', () => {
     expect(document.querySelector('[role="radiogroup"]')).toBeNull();
   });
 
-  it('renders five single-select kind chips while a needle is active', () => {
+  it('renders the single-select kind chips while a needle is active', () => {
+    // #217 S4 / I-3.2 — the row grew from 5 content kinds to 7 with the two
+    // structural facets (Title/Files); a dedicated test below asserts the 7-count
+    // + the two new chips. Here we only assert the radiogroup + default selection.
     searchHits = [hit({})];
     searchTotal = 1;
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
@@ -164,7 +167,7 @@ describe('ConversationRail', () => {
     expect(group).toBeTruthy();
     expect(group.getAttribute('aria-label')).toBe('Search kind');
     const radios = group.querySelectorAll('[role="radio"]');
-    expect(radios.length).toBe(5);
+    expect(radios.length).toBe(7);
     // 'All' is selected by default.
     const all = screen.getByRole('radio', { name: 'All' });
     expect(all.getAttribute('aria-checked')).toBe('true');
@@ -194,6 +197,61 @@ describe('ConversationRail', () => {
     expect((screen.getByRole('radio', { name: 'All' }) as HTMLButtonElement).disabled).toBe(false);
     expect((screen.getByRole('radio', { name: 'Prompts' }) as HTMLButtonElement).disabled).toBe(false);
     expect((screen.getByRole('radio', { name: 'Assistant' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // ---- #217 S4 / I-3.2: Title + Files facet chips (5 → 7) ----
+
+  it('renders seven kind chips including Title and Files', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const group = document.querySelector('[role="radiogroup"]')!;
+    const radios = group.querySelectorAll('[role="radio"]');
+    expect(radios.length).toBe(7);
+    expect(screen.getByRole('radio', { name: 'Title' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'Files' })).toBeTruthy();
+  });
+
+  it('selecting Title / Files dispatches the kind', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    render(<ConversationRail />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Title' }));
+    expect(getState().conversationSearchKind).toBe('title');
+    fireEvent.click(screen.getByRole('radio', { name: 'Files' }));
+    expect(getState().conversationSearchKind).toBe('files');
+  });
+
+  it('Title and Files are NOT disabled under prose-only (needsSplit:false)', () => {
+    // title → conversation_title_fts/LIKE, files → LIKE — neither rides the split
+    // index, so the prose-only interim must NOT grey them out (unlike Tools/Thinking).
+    searchHits = [hit({})];
+    searchTotal = 1;
+    searchDepth = 'prose-only';
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    render(<ConversationRail />);
+    expect((screen.getByRole('radio', { name: 'Title' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('radio', { name: 'Files' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('groups Title/Files after a separator distinct from the content kinds', () => {
+    // 5f — the two structural facets are visually grouped after a subtle
+    // separator. We assert the separator element exists between the content kinds
+    // and the structural facets within the chip row.
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    render(<ConversationRail />);
+    const group = document.querySelector('[role="radiogroup"]')!;
+    const sep = group.querySelector('.conv-rail-chips-sep');
+    expect(sep).toBeTruthy();
+    // The separator precedes the Title chip and follows the Thinking chip in DOM order.
+    const title = screen.getByRole('radio', { name: 'Title' });
+    const thinking = screen.getByRole('radio', { name: 'Thinking' });
+    expect(thinking.compareDocumentPosition(sep!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(sep!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   // ---- #177 S6: count line ----
@@ -300,6 +358,79 @@ describe('ConversationRail', () => {
     // …and they share the title row as siblings.
     expect(badges.parentElement).toBe(clamped.parentElement);
     expect((badges.parentElement as HTMLElement).classList.contains('conv-rail-row-title')).toBe(true);
+  });
+
+  // ---- #217 S4 / I-3.3: Title + File hit rendering ----
+
+  it('renders a title hit with a "title" badge and the matched-title snippet', () => {
+    // kind=title → session-level hit, snippet = the matched title (FTS [..]
+    // markers), match_kinds:["title"]. The badge map renders "title".
+    searchHits = [hit({
+      uuid: 'first-turn',
+      title: 'how does the lock work',
+      snippet: 'how does the [lock] work',
+      match_kinds: ['title'],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'lock' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'title' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    const badges = [...row.querySelectorAll('.conv-rail-kindb')].map((b) => b.textContent);
+    expect(badges).toEqual(['title']);
+    // The snippet renders the matched title (with the [..] highlight stripped to a mark).
+    const snippet = row.querySelector('.conv-rail-row-snippet')!;
+    expect(snippet.textContent).toContain('how does the lock work');
+  });
+
+  it('renders a file hit with the path prominently + a "file" badge + secondary title', () => {
+    // kind=files → file-path-prominent: the path is the primary line (file
+    // styling), the session title is secondary, snippet = the plain path,
+    // match_kinds:["file"], badge "file".
+    searchHits = [hit({
+      uuid: 'touch-anchor',
+      title: 'the session about caching',
+      snippet: 'bin/_lib_conversation_query.py',
+      match_kinds: ['file'],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'conversation_query' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'files' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    // The path is the prominent primary line, with file styling.
+    const path = row.querySelector('.conv-rail-row-filepath')!;
+    expect(path).toBeTruthy();
+    expect(path.textContent).toContain('bin/_lib_conversation_query.py');
+    // The session title is rendered secondary.
+    const secondary = row.querySelector('.conv-rail-row-filetitle')!;
+    expect(secondary).toBeTruthy();
+    expect(secondary.textContent).toContain('the session about caching');
+    // The "file" badge renders.
+    const badges = [...row.querySelectorAll('.conv-rail-kindb')].map((b) => b.textContent);
+    expect(badges).toEqual(['file']);
+  });
+
+  it('a title hit click navigates to the session first-turn anchor (hit.uuid)', () => {
+    searchHits = [hit({ session_id: 's7', uuid: 'first-turn', match_kinds: ['title'] })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'lock' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'title' });
+    render(<ConversationRail />);
+    fireEvent.click(document.querySelector('.conv-rail-row--hit') as HTMLButtonElement);
+    expect(getState().selectedConversationId).toBe('s7');
+    expect(getState().conversationJump).toEqual({ session_id: 's7', uuid: 'first-turn' });
+  });
+
+  it('a file hit click navigates to the most-recent-touch anchor (hit.uuid)', () => {
+    searchHits = [hit({ session_id: 's9', uuid: 'touch-anchor', match_kinds: ['file'] })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'query' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'files' });
+    render(<ConversationRail />);
+    fireEvent.click(document.querySelector('.conv-rail-row--hit') as HTMLButtonElement);
+    expect(getState().selectedConversationId).toBe('s9');
+    expect(getState().conversationJump).toEqual({ session_id: 's9', uuid: 'touch-anchor' });
   });
 
   // ---- #177 S6: load-more button ----

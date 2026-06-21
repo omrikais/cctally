@@ -355,9 +355,15 @@ export interface ConversationDetail {
   last_anchor?: { session_id: string; uuid: string; id: number } | null;
 }
 
-// #177 S6 — kind facet for the rail search chips + the find bar. Maps 1:1 to
-// the backend `kind` param (all | prompts | assistant | tools | thinking).
-export type SearchKind = 'all' | 'prompts' | 'assistant' | 'tools' | 'thinking';
+// #177 S6 — kind facet for the rail search chips. Maps 1:1 to the backend
+// `_SEARCH_KINDS` param. #217 S4 / I-3.1 — the two cross-session STRUCTURAL
+// facets `title` (session-title search) and `files` (file-path search) join the
+// five content kinds (7 total, matching `_SEARCH_KINDS` in
+// bin/_lib_conversation_query.py). The find bar's `_CONV_FIND_KINDS` stays the
+// five content kinds — title/files are search-only (the find bar searches within
+// one open conversation, not session titles / file paths).
+export type SearchKind =
+  | 'all' | 'prompts' | 'assistant' | 'tools' | 'thinking' | 'title' | 'files';
 
 export interface SearchHit {
   session_id: string;
@@ -369,8 +375,9 @@ export interface SearchHit {
   cost_usd: number;
   // #177 S6 — non-prose match badges (sorted lowercase; server omits prose).
   // Always present on the wire (defaults to []); optional here for back-compat
-  // with fixtures predating the field.
-  match_kinds?: ('tool' | 'thinking')[];
+  // with fixtures predating the field. #217 S4 / I-3.1 — the cross-session facets
+  // add `title` (a kind=title hit) and `file` (a kind=files hit).
+  match_kinds?: ('tool' | 'thinking' | 'title' | 'file')[];
 }
 
 export interface ConversationSearchResult {

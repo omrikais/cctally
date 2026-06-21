@@ -22,13 +22,38 @@ const SORT_OPTIONS: { key: RailSortKey; label: string }[] = [
 // Assistant · Tools · Thinking). `Tools`/`Thinking` query the split index
 // columns and disable while the one-time column split is still backfilling
 // (searchDepth === 'prose-only').
-const KIND_CHIPS: { kind: SearchKind; label: string; needsSplit: boolean }[] = [
-  { kind: 'all', label: 'All', needsSplit: false },
-  { kind: 'prompts', label: 'Prompts', needsSplit: false },
-  { kind: 'assistant', label: 'Assistant', needsSplit: false },
-  { kind: 'tools', label: 'Tools', needsSplit: true },
-  { kind: 'thinking', label: 'Thinking', needsSplit: true },
+//
+// #217 S4 / I-3.2 — the two cross-session STRUCTURAL facets (Title / Files) join
+// the row, visually grouped after a subtle separator so they read as distinct
+// from the content kinds. Neither rides the split index (title →
+// conversation_title_fts/LIKE, files → LIKE over conversation_file_touches), so
+// both are `needsSplit:false` — NOT gated by `search_depth: prose-only`. `group`
+// drives the in-row separator (§5f): the divider renders where it changes from
+// 'content' to 'structural'.
+const KIND_CHIPS: {
+  kind: SearchKind;
+  label: string;
+  needsSplit: boolean;
+  group: 'content' | 'structural';
+}[] = [
+  { kind: 'all', label: 'All', needsSplit: false, group: 'content' },
+  { kind: 'prompts', label: 'Prompts', needsSplit: false, group: 'content' },
+  { kind: 'assistant', label: 'Assistant', needsSplit: false, group: 'content' },
+  { kind: 'tools', label: 'Tools', needsSplit: true, group: 'content' },
+  { kind: 'thinking', label: 'Thinking', needsSplit: true, group: 'content' },
+  { kind: 'title', label: 'Title', needsSplit: false, group: 'structural' },
+  { kind: 'files', label: 'Files', needsSplit: false, group: 'structural' },
 ];
+
+// #217 S4 / I-3.3 — match-kind badge labels. `tool`/`thinking` (#177 S6) keep
+// their identity labels; the cross-session facets add `title`→"title",
+// `file`→"file". Any unmapped value falls back to itself.
+const MATCH_KIND_LABELS: Record<string, string> = {
+  tool: 'tool',
+  thinking: 'thinking',
+  title: 'title',
+  file: 'file',
+};
 
 // Human label for a stored datePreset KEY (the popover stores the key; the chip
 // shows the label). Falls back to the from→to range for a raw range (preset key
@@ -316,25 +341,34 @@ function BrowseRow({ row, ctx, active }: { row: ConversationSummary; ctx: RailCt
 
 // #177 S6 — single-select kind chip row, shown only while a needle is active.
 // `Tools`/`Thinking` disable while the split index is still backfilling.
+// #217 S4 / I-3.2 — a subtle separator divides the content kinds (All …
+// Thinking) from the two structural facets (Title / Files); the row still wraps
+// to a second line on narrow widths (#205) and every chip keeps the ≥44px touch
+// target via `.conv-rail-chip`.
 function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }) {
+  let prevGroup: 'content' | 'structural' | null = null;
   return (
     <div className="conv-rail-chips" role="radiogroup" aria-label="Search kind">
       {KIND_CHIPS.map((c) => {
         const disabled = c.needsSplit && proseOnly;
         const checked = kind === c.kind;
+        const needsSep = prevGroup !== null && c.group !== prevGroup;
+        prevGroup = c.group;
         return (
-          <button
-            key={c.kind}
-            type="button"
-            role="radio"
-            aria-checked={checked}
-            disabled={disabled}
-            title={disabled ? 'indexing…' : undefined}
-            className={`conv-rail-chip${checked ? ' is-on' : ''}`}
-            onClick={() => dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: c.kind })}
-          >
-            {c.label}
-          </button>
+          <Fragment key={c.kind}>
+            {needsSep && <span className="conv-rail-chips-sep" aria-hidden="true" />}
+            <button
+              type="button"
+              role="radio"
+              aria-checked={checked}
+              disabled={disabled}
+              title={disabled ? 'indexing…' : undefined}
+              className={`conv-rail-chip${checked ? ' is-on' : ''}`}
+              onClick={() => dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: c.kind })}
+            >
+              {c.label}
+            </button>
+          </Fragment>
         );
       })}
     </div>
@@ -397,10 +431,17 @@ function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; c
 
 function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
   const badges = hit.match_kinds ?? [];
+  // #217 S4 / I-3.3 — a kind=files hit (`match_kinds` includes 'file') renders
+  // the FILE PATH prominently (primary line, file styling) with the session
+  // title secondary; its snippet IS the plain path. Every other hit keeps the
+  // #177 S6 title-prominent layout. Click navigates to `hit.uuid` for both —
+  // the first-turn anchor for a title hit, the most-recent-touch anchor for a
+  // file hit — same as content hits.
+  const isFileHit = badges.includes('file');
   return (
     <button
       type="button"
-      className="conv-rail-row conv-rail-row--hit"
+      className={`conv-rail-row conv-rail-row--hit${isFileHit ? ' conv-rail-row--filehit' : ''}`}
       onClick={() =>
         dispatch({
           type: 'OPEN_CONVERSATION',
@@ -409,19 +450,26 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
         })
       }
     >
-      {/* #177 S6 — title row is a flex line: the 2-line-clamped title TEXT as a
-          min-width:0 child, the badge group trailing and flex-shrink:0 OUTSIDE
-          the clamp box so a long title can never clip it off as a third line. */}
-      <div className="conv-rail-row-title conv-rail-row-title--hit">
-        <span className="conv-rail-row-title-text">{hit.title}</span>
-        {badges.length > 0 && (
-          <span className="conv-rail-kindbs">
-            {badges.map((b) => (
-              <span key={b} className="conv-rail-kindb">{b}</span>
-            ))}
-          </span>
-        )}
-      </div>
+      {isFileHit ? (
+        // File hit: the path leads (file styling), the session title trails as a
+        // muted secondary line, the badge group rides top-right OUTSIDE the
+        // clamp box (same flex discipline as the title row).
+        <>
+          <div className="conv-rail-row-title conv-rail-row-title--hit">
+            <span className="conv-rail-row-filepath conv-rail-row-title-text">{hit.snippet}</span>
+            {badges.length > 0 && <KindBadges badges={badges} />}
+          </div>
+          <div className="conv-rail-row-filetitle">{hit.title}</div>
+        </>
+      ) : (
+        // #177 S6 — title row is a flex line: the 2-line-clamped title TEXT as a
+        // min-width:0 child, the badge group trailing and flex-shrink:0 OUTSIDE
+        // the clamp box so a long title can never clip it off as a third line.
+        <div className="conv-rail-row-title conv-rail-row-title--hit">
+          <span className="conv-rail-row-title-text">{hit.title}</span>
+          {badges.length > 0 && <KindBadges badges={badges} />}
+        </div>
+      )}
       <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
         <span className="conv-rail-row-when">{fmt.startedShort(hit.ts, ctx, { noSuffix: true })}</span>
@@ -429,5 +477,18 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
       </div>
       <div className="conv-rail-row-snippet">{renderSnippet(hit.snippet)}</div>
     </button>
+  );
+}
+
+// #217 S4 / I-3.3 — the match-kind badge group, factored out so the title and
+// file-hit layouts share one renderer. Labels route through MATCH_KIND_LABELS
+// (title→"title", file→"file"; tool/thinking identity).
+function KindBadges({ badges }: { badges: NonNullable<SearchHit['match_kinds']> }) {
+  return (
+    <span className="conv-rail-kindbs">
+      {badges.map((b) => (
+        <span key={b} className="conv-rail-kindb">{MATCH_KIND_LABELS[b] ?? b}</span>
+      ))}
+    </span>
   );
 }

@@ -5749,6 +5749,17 @@ mark.current {
   border-color: var(--accent-blue);
 }
 .conv-rail-chip:disabled { opacity: 0.4; cursor: default; }
+/* #217 S4 / I-3.2 — subtle in-row separator dividing the content kinds (All …
+   Thinking) from the two structural facets (Title / Files). A thin vertical rule
+   with a touch of horizontal breathing room; it shrinks to 0 height alongside
+   the wrapping chips on a narrow rail. */
+.conv-rail-chips-sep {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 1px;
+  margin: 1px 4px;
+  background: var(--border-soft);
+}
 .conv-rail-count {
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -5793,6 +5804,23 @@ mark.current {
   border-radius: 3px;
   padding: 1px 4px;
   line-height: 1.4;
+}
+/* #217 S4 / I-3.3 — file-path search hit. The PATH leads (monospace, full color,
+   2-line clamp via the shared .conv-rail-row-title-text), the session title
+   trails muted as a secondary line — the inverse emphasis of a content hit. */
+.conv-rail-row-filepath {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  word-break: break-all;   /* let a long path wrap mid-segment, not overflow */
+}
+.conv-rail-row-filetitle {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- filters spec §4: browse-list filters (button, popover, chips) ---- */
