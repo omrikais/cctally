@@ -70,7 +70,10 @@ describe('useConversationFind', () => {
     );
     rerender({ q: 'second' });
     await settle();
-    expect(result.current.error).toBe('Find failed.');
+    // #217 S4 / I-1 fixup — the generic-failure string is rendered verbatim by
+    // FindBar (no re-derivation), so it must match the UI wording: lowercase
+    // 'find failed', not the prior 'Find failed.' (which FindBar discarded).
+    expect(result.current.error).toBe('find failed');
     expect(result.current.anchors).toEqual([]);
     expect(result.current.total).toBe(0);
     expect(result.current.truncated).toBe(false);

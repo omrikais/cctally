@@ -94,7 +94,9 @@ export function useConversationFind(
         // pattern. `fetchJson` throws HttpError(status) and discards the body
         // (Codex P2), so the actionable message is reconstructed client-side
         // rather than read from the server's `{"error":"invalid regex…"}`.
-        setError(e instanceof HttpError && e.status === 400 ? 'invalid regex' : 'Find failed.');
+        // Both strings are rendered verbatim by FindBar (role="alert"), so they
+        // must match the UI wording exactly — keep them lowercase + un-punctuated.
+        setError(e instanceof HttpError && e.status === 400 ? 'invalid regex' : 'find failed');
         setFetching(false);
       });
     return () => ctl.abort();

@@ -189,12 +189,12 @@ export function FindBar({
       )}
       {mode === 'like' && !error && <span className="conv-findbar-hint">basic search</span>}
       {/* #217 S4 — an invalid-regex 400 surfaces as a role="alert" hint
-          (announced); reuses the hint styling. Other failures keep the M4
-          "find failed" wording. */}
+          (announced); reuses the hint styling. The hook already maps every
+          failure to its user-facing wording ('invalid regex' / 'find failed'),
+          so render it verbatim rather than re-deriving — otherwise the hook's
+          generic string would be dead. */}
       {error && (
-        <span className="conv-findbar-hint" role="alert">
-          {error === 'invalid regex' ? 'invalid regex' : 'find failed'}
-        </span>
+        <span className="conv-findbar-hint" role="alert">{error}</span>
       )}
       {loading && <span className="conv-findbar-spin" aria-hidden="true" />}
       <button

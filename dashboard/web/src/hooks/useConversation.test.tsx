@@ -138,6 +138,33 @@ describe('useConversation', () => {
     expect(result.current.tailRevision).toBeGreaterThan(rev1);
   });
 
+  it('does NOT bump tailRevision on an EMPTY poll (returned.length === 0 → genuine no-op) so an idle find bar stays quiet (#217 S4 / I-1 fixup)', async () => {
+    // Page 1: it1+it2 fully paged.
+    mockOnce(detail([it1, it2], null, { cost_usd: 1 }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const rev0 = result.current.tailRevision;
+
+    // A snapshot tick fires pollTail, but THIS conversation didn't grow: the
+    // overlap-window fetch returns ZERO items (`returned.length === 0`), so
+    // `merged === items` — nothing in the find corpus changed. tailRevision MUST
+    // stay put, else an idle conversation with the find bar open refetches /find
+    // every ~5s tick for nothing. (Header refresh still applies; it is not gated.)
+    mockOnce(detail([], null, { cost_usd: 1 }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    // Let any (erroneous) state update settle before asserting no bump.
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.detail?.items).toHaveLength(2);              // unchanged
+    expect(result.current.tailRevision).toBe(rev0);                    // NO bump on a no-op poll
+
+    // Sanity: a subsequent NON-empty poll still bumps (proves the gate isn't
+    // wedged off — the no-op suppression is path-specific, not global).
+    mockOnce(detail([it1, it2, it3], null, { cost_usd: 2 }));
+    await act(async () => { bumpTick(rerender, 't2'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+    expect(result.current.tailRevision).toBeGreaterThan(rev0);
+  });
+
   it('refreshes last_anchor when a live tail append adds a new final turn (jump-to-latest staleness)', async () => {
     // REGRESSION (jump-to-latest stale anchor): the "Latest ↓" control jumps to
     // detail.last_anchor. pollTail's partial merge refreshed items/cost/models/

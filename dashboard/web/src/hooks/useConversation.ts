@@ -404,9 +404,14 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         const returned = body.items;
         let merged: ConversationItem[];
         let appended = 0;
+        // Did this poll actually change the find corpus? An empty tail response
+        // (returned.length === 0 → merged === items) is a genuine no-op; only a
+        // non-empty response can append/replace/fold (#217 S4 / I-1.6).
+        let corpusChanged = false;
         if (returned.length === 0) {
           merged = items;
         } else {
+          corpusChanged = true;
           const byId = new Map(returned.map((r) => [r.anchor.id, r] as const));
           const prevIds = new Set(items.map((it) => it.anchor.id));
           const head = items.slice(0, splitIdx);                        // outside window — untouched
@@ -433,12 +438,15 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
           page: prev.page,                                             // stays fully-paged at the bottom; top edge preserved
         } : prev));
-        // #217 S4 / I-1.6 — a successful merge bumps the monotonic revision so a
-        // mounted find bar re-runs its query against the grown corpus. Bumped
-        // even when `merged` length is unchanged (an in-place overlap-window
-        // replace/delete still changes the find corpus) — the explicit reason it
-        // is NOT keyed off items.length (Codex P1).
-        setTailRevision((r) => r + 1);
+        // #217 S4 / I-1.6 — a merge that touched the corpus bumps the monotonic
+        // revision so a mounted find bar re-runs its query against the grown
+        // corpus. Bumped even when `merged` length is unchanged (an in-place
+        // overlap-window replace/delete still changes the find corpus) — the
+        // explicit reason it is NOT keyed off items.length (Codex P1). But an
+        // EMPTY tail response (`returned.length === 0`, merged === items) is a
+        // genuine no-op and must NOT bump, else an idle conversation with the
+        // find bar open refetches /find every ~5s snapshot tick for nothing.
+        if (corpusChanged) setTailRevision((r) => r + 1);
         if (appended === 0 || body.page.next_after == null) break;
       }
     } finally {

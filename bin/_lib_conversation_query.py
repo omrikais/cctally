@@ -2925,7 +2925,15 @@ def _find_matched_scan(conn, session_id, q, kind, regex, case):
     ``_assemble_session`` items, which drop the ``search_tool``/``search_thinking``
     columns. Honors ``_KIND_ENTRY_TYPE`` exactly like ``_find_matched_like``.
     Each scanned value is clipped to ``_FIND_SCAN_TEXT_CAP`` before the predicate
-    so one huge tool result can't pin the regex engine."""
+    so one huge tool result can't pin the regex engine.
+
+    Precondition: ``regex or case``. ``find_in_conversation`` only enters the
+    physical-row scan when ``scan = bool(regex or case)`` (#217 S4 / I-1.1), so a
+    plain case-insensitive-substring scan is never requested here — the FTS/LIKE
+    path (``_find_matched_rows``) owns that case. The two regex/case predicates
+    below are therefore exhaustive; the assert documents (and enforces) that
+    rather than carrying an unreachable third branch."""
+    assert regex or case, "_find_matched_scan requires regex or case"
     cols = _find_kind_columns(kind, "full")
     if not cols:
         return {}
@@ -2935,12 +2943,8 @@ def _find_matched_scan(conn, session_id, q, kind, regex, case):
     if regex:
         rx = re.compile(q, 0 if case else re.IGNORECASE)
         pred = lambda text: rx.search(text) is not None
-    elif case:
+    else:  # case-sensitive substring (case=True, regex=False)
         pred = lambda text: q in text
-    else:  # case-insensitive substring (not reached via the public API today,
-        # which only scans when regex or case is set — kept for completeness).
-        ql = q.lower()
-        pred = lambda text: ql in text.lower()
     out = {}
     col_list = ", ".join(c for c, _ in cols)
     rows = conn.execute(

@@ -3164,6 +3164,33 @@ def test_find_case_scan_honors_kind_entry_type():
     assert [a["uuid"] for a in asst["anchors"]] == ["as"]
 
 
+def test_find_scan_clips_per_row_text_at_cap():
+    """The per-row scan clips each searchable value to ``_FIND_SCAN_TEXT_CAP``
+    (#217 S4 / I-1 fixup) so one huge tool result can't pin the regex engine — a
+    needle that lives PAST the cap is NOT matched, while a needle BEFORE the cap
+    IS. Both the regex and the case-sensitive substring predicates scan the
+    clipped slice, so the contract holds for either."""
+    cap = cq._FIND_SCAN_TEXT_CAP
+    c = _conn()
+    # Row 1: needle sits AT/PAST the cap boundary — beyond the scanned slice.
+    # `cap` filler chars push the first occurrence of NEEDLE to index `cap`, so
+    # `text[:cap]` ends exactly before it → never matched.
+    _msg(c, id=1, session_id="s1", uuid="past", source_path="f.jsonl",
+         byte_offset=0, timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text=("a" * cap) + "NEEDLE", cwd="/home/u/proj")
+    # Row 2: needle sits BEFORE the cap (index 5) → inside the scanned slice.
+    _msg(c, id=2, session_id="s1", uuid="before", source_path="f.jsonl",
+         byte_offset=1, timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="hello NEEDLE " + ("b" * cap), cwd="/home/u/proj")
+    # case-sensitive substring scan: only the before-cap row matches.
+    cs = cq.find_in_conversation(c, "s1", "NEEDLE", kind="all", case=True)
+    assert [a["uuid"] for a in cs["anchors"]] == ["before"]
+    # regex scan: same — the clip applies before the predicate either way.
+    rx = cq.find_in_conversation(c, "s1", "NEEDLE", kind="all", regex=True,
+                                 case=True)
+    assert [a["uuid"] for a in rx["anchors"]] == ["before"]
+
+
 # ---- #191: read-time recovery of already-ingested injected user lines ----
 import json as _json191
 
