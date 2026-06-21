@@ -1024,19 +1024,23 @@ export function dispatch(action: Action): void {
       state = { ...state, convFiltersOpen: action.open };
       break;
     case 'SET_CONV_CURRENT_TURN':
+      // No-op same-uuid ticks FIRST (the scroll-sync observer re-fires the same
+      // topmost-visible uuid repeatedly): skip both the emit AND the persistence
+      // so an unchanged position never hits localStorage (Codex P2 throttle —
+      // dedupe-then-throttle). The position for this uuid was already written on
+      // the tick that first set it.
+      if (state.convCurrentTurnUuid === action.uuid) break;
       // #217 S3 E1 — persist the reading position for the CURRENTLY-OPEN session
       // on the throttled scroll-sync write (persist-before-reset, Codex P2): a
       // genuine switch resets convCurrentTurnUuid in the OPEN_CONVERSATION /
       // SELECT_CONVERSATION reducers, so persisting "on switch" would save a
       // just-cleared null. Only a real uuid (not the cross-session null reset)
-      // for an actually-selected session is recorded. Runs even when the
-      // in-memory value is unchanged-but-non-null is unnecessary (the no-op
-      // guard below skips the emit, but the position was already written on the
-      // prior write).
+      // for an actually-selected session is recorded. recordReadingPos throttles
+      // per session, so rapid distinct-uuid ticks don't hammer synchronous
+      // localStorage.
       if (action.uuid != null && state.selectedConversationId != null) {
         recordReadingPos(state.selectedConversationId, action.uuid);
       }
-      if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick
       state = { ...state, convCurrentTurnUuid: action.uuid };
       break;
     case 'SET_CONV_PINNED_TURN':

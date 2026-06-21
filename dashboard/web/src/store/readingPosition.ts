@@ -16,6 +16,21 @@ export const READING_POS_KEY = 'cctally.conv.readingPos';
 // than a handful of conversations, and 50 anchors are a few KB at most.
 export const READING_POS_CAP = 50;
 
+// #217 S3 E1 (P2) — leading-edge throttle. The scroll-sync IntersectionObserver
+// fires on every visible-turn change, and the reducer dispatches a
+// SET_CONV_CURRENT_TURN per fire, so a fast scroll would hammer synchronous
+// localStorage on every tick. We persist at most once per session per window:
+// the FIRST write of a burst lands immediately (so the latest-position-before-a-
+// switch invariant — Codex P2 — still holds; a single write per session always
+// goes through), and subsequent same-session writes inside the window are
+// dropped. The throttle clock is the call's own `ts` (defaulting to Date.now()),
+// so deterministic tests passing explicit, well-separated `ts` values are never
+// suppressed. Keyed PER SESSION so distinct conversations never throttle each
+// other. `__resetReadingPosThrottle` clears the in-memory clock for tests.
+export const READING_POS_THROTTLE_MS = 1000;
+const _lastWriteTs = new Map<string, number>();
+export function __resetReadingPosThrottle(): void { _lastWriteTs.clear(); }
+
 function readMap(): ReadingPosMap {
   try {
     const raw = localStorage.getItem(READING_POS_KEY);
@@ -59,6 +74,13 @@ function evictLru(map: ReadingPosMap, cap: number): ReadingPosMap {
 // fires often).
 export function recordReadingPos(sessionId: string, uuid: string, ts: number = Date.now()): void {
   if (!sessionId || !uuid) return;
+  // Leading-edge per-session throttle: drop a same-session write inside the
+  // window (the first write of a burst already landed). The latest position
+  // still survives a switch because a switch is preceded by at least one write
+  // (Codex P2), and distinct sessions never throttle each other.
+  const prev = _lastWriteTs.get(sessionId);
+  if (prev !== undefined && ts - prev < READING_POS_THROTTLE_MS) return;
+  _lastWriteTs.set(sessionId, ts);
   const map = readMap();
   map[sessionId] = { uuid, ts };
   writeMap(evictLru(map, READING_POS_CAP));
@@ -73,7 +95,9 @@ export function loadReadingPos(sessionId: string): ReadingPos | null {
   return map[sessionId] ?? null;
 }
 
-// Test/maintenance helper — clear the entire map.
+// Test/maintenance helper — clear the entire map (and the throttle clock so a
+// later record in the same test/tick is not suppressed by a stale window).
 export function clearReadingPositions(): void {
   try { localStorage.removeItem(READING_POS_KEY); } catch { /* ignore */ }
+  __resetReadingPosThrottle();
 }

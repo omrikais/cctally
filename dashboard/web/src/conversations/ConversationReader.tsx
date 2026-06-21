@@ -238,18 +238,27 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // Scroll-anchored reverse paging: snapshot the body's scroll metrics BEFORE
   // the prepend (the "before" height is unrecoverable post-update, Codex P2),
   // then the layout effect below re-pins the viewport. A guard against
-  // overlapping loadPrevs (the captured metrics must not be overwritten mid-flight).
+  // overlapping loadPrevs (the captured metrics must not be overwritten
+  // mid-flight).
+  //
+  // P3 fix — the layout effect is the SOLE clearer of prependPendingRef on a
+  // SUCCESSFUL prepend. The old `.finally` compared the body's scrollHeight, but
+  // `.finally` runs in the resolve microtask BEFORE React commits the prepend, so
+  // the DOM height is still the OLD value: the comparison falsely read "no
+  // growth" and could clear the snapshot out from under the (post-commit)
+  // scroll-anchor effect → a viewport jump. We now drive the decision off the
+  // hook's `loadPrev()` boolean (did it prepend ≥1 item — computed off the
+  // synchronous detail mirror, no DOM/commit race). On a genuine no-op (stale
+  // cursor / error → nothing prepended) NO new commit fires, so the layout effect
+  // never runs to clear the snapshot; we clear it here in that case ONLY. On a
+  // successful prepend we leave the snapshot for the layout effect to consume.
   const doLoadPrev = useCallback(() => {
     const b = bodyRef.current;
     if (!b || prependPendingRef.current) return;
     prependPendingRef.current = { prevScrollHeight: b.scrollHeight, prevScrollTop: b.scrollTop };
-    void loadPrev().finally(() => {
-      // If the fetch produced no prepend (no-op / error), drop the snapshot so a
-      // later real prepend isn't anchored against stale metrics. The layout
-      // effect clears it on a successful prepend; this finally covers the no-op.
-      if (prependPendingRef.current && bodyRef.current
-          && bodyRef.current.scrollHeight === prependPendingRef.current.prevScrollHeight) {
-        prependPendingRef.current = null;
+    void loadPrev().then((prepended) => {
+      if (!prepended && prependPendingRef.current) {
+        prependPendingRef.current = null;  // no-op: free the snapshot for the next loadPrev
       }
     });
   }, [loadPrev]);
@@ -375,6 +384,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const b = bodyRef.current;
     const items = detail?.items ?? [];
     const len = items.length;
+    // P1 fix — a reverse-page PREPEND must NOT be mistaken for a live append. A
+    // prepend grows items.length too, and on a tail open (hasMore === false) it
+    // satisfies the live discriminator below, so `tail = items.slice(prevLen)`
+    // would read the OLD back-of-window turns as "new" and bump the "↓ N new"
+    // pill by the prior window size (and could wrongly scroll-to-bottom). This
+    // effect runs BEFORE the scroll-anchor layout effect that clears
+    // `prependPendingRef`, so the snapshot set by doLoadPrev is still present
+    // here for exactly one commit — the unambiguous "this growth is a prepend"
+    // signal. Bail (just advancing the prev-trackers) so the scroll-anchor effect
+    // owns the prepend.
+    if (prependPendingRef.current) {
+      prevLenRef.current = len;
+      prevHasMoreRef.current = hasMore;
+      return;
+    }
     const prevLen = prevLenRef.current;
     const added = len - prevLen;
     // Live append (not the final pagination page): already fully paged before
@@ -565,10 +589,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // newest turn and parks atBottom so live-tail sticks; 'top' (a single-page
   // session) scrolls to the start so it reads from the beginning. An anchor /
   // restore open leaves openScrollIntent null — the jump pipeline drives that
-  // scroll instead. Reduced-motion-safe (instant). Runs once per resolved intent.
+  // scroll instead. Reduced-motion-safe (instant).
+  //
+  // P0 fix — fire EXACTLY ONCE per open. The effect is keyed on items.length so
+  // it lands the moment the first non-empty page renders, but `openScrollIntent`
+  // is set ONCE (the hook resets it only on session change), so without a guard
+  // every reverse-page prepend / live append would re-run it and yank the reader
+  // back to the bottom (re-clamping scrollTop + re-arming atBottomRef), defeating
+  // reverse pagination, the scroll-anchor, and the "stick only when at bottom"
+  // contract. `appliedIntentRef` is a one-shot latch: apply on the first commit
+  // where the intent is resolved AND content exists, then bail on every later
+  // commit. It is reset to false on session switch (the effect below), so the
+  // NEXT open re-applies its own intent.
+  const appliedIntentRef = useRef(false);
   useLayoutEffect(() => {
     const b = bodyRef.current;
     if (!b || openScrollIntent == null) return;
+    if (appliedIntentRef.current) return;          // already applied this open
+    if (!(detail?.items.length)) return;            // wait for the first content page
+    appliedIntentRef.current = true;
     if (openScrollIntent === 'bottom') {
       b.scrollTop = b.scrollHeight;
       atBottomRef.current = true;
@@ -584,15 +623,31 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // effect drives it); a saved reading position has NO store jump, so once the
   // first page resolves under a 'restore' intent the reader dispatches a
   // same-session OPEN_CONVERSATION jump to the saved uuid, reusing the full jump
-  // pipeline (loadToTarget + scroll + flash + pin). Fires ONCE per session open
-  // (restoredSessionRef guards re-fires on paged growth); an unresolvable saved
-  // uuid falls through the jump effect's exhaustion clear → the tail open stands.
-  const restoredSessionRef = useRef<string | null>(null);
+  // pipeline (loadToTarget + scroll + flash + pin). An unresolvable saved uuid
+  // falls through the jump effect's exhaustion clear → the tail open stands.
+  //
+  // P2 fix — A→B→A re-open must re-restore. The reader is mounted PERSISTENTLY
+  // (ConversationsView reuses one instance, no key={sessionId}), so a per-open
+  // one-shot latch keyed on `sessionId` VALUE breaks: open A (latch := 'a'),
+  // switch to B as a non-restore (tail) open — the early `return` above leaves
+  // the latch at 'a' — then return to A, and `latch === 'a'` wrongly skips the
+  // restore. The latch must therefore be keyed on the OPEN INSTANCE, not the id:
+  // `lastOpenSessionRef` records the session this effect last SAW (set on EVERY
+  // run, restore or not), and a mismatch means a genuinely new open → clear the
+  // restored latch so the new open can fire its own restore. This re-arms on
+  // return to A even though B never restored.
+  const restoredRef = useRef(false);
+  const lastOpenSessionRef = useRef<string | null>(null);
   useEffect(() => {
+    // New open (the session changed since the last run) → re-arm the latch.
+    if (lastOpenSessionRef.current !== sessionId) {
+      lastOpenSessionRef.current = sessionId;
+      restoredRef.current = false;
+    }
     if (openIntent?.kind !== 'restore') return;
     if (!detail || detail.session_id !== sessionId) return;
-    if (restoredSessionRef.current === sessionId) return;  // already restored this open
-    restoredSessionRef.current = sessionId;
+    if (restoredRef.current) return;  // already restored this open (paged-growth re-fire guard)
+    restoredRef.current = true;
     dispatch({
       type: 'OPEN_CONVERSATION',
       sessionId,
@@ -886,6 +941,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // keeps the prior default (true → live appends stick). The openScrollIntent
     // layout effect re-confirms this once the first page resolves.
     atBottomRef.current = openIntent?.kind === 'anchor' || openIntent?.kind === 'restore' ? false : true;
+    // P0 fix — re-arm the open-scroll-intent one-shot for the NEW open so its own
+    // 'top'/'bottom' verdict applies once when the first page resolves. Safe to
+    // reset here (a regular effect): the new session's first page hasn't fetched
+    // yet, so the layout effect that consumes the latch only runs in a LATER
+    // commit, after this reset.
+    appliedIntentRef.current = false;
     setJumpTopVisible(false);
     jumpTopTargetRef.current = null;
     // #188 S4/C2 — the reused reader must not carry a prior conversation's

@@ -43,7 +43,10 @@ export interface UseConversation {
   // anchor (the jump pipeline drives the scroll then).
   openScrollIntent: 'top' | 'bottom' | null;
   loadMore: () => Promise<void>;
-  loadPrev: () => Promise<void>;
+  // Resolves to whether the reverse page actually PREPENDED ≥1 item (false for a
+  // no-op: null cursor, stale cursor → empty page, or a fetch error). The reader
+  // uses this to clear its scroll-anchor snapshot only on a genuine no-op.
+  loadPrev: () => Promise<boolean>;
   loadToTarget: (uuid: string) => Promise<void>;
   jumpToLatest: () => Promise<void>;
 }
@@ -236,7 +239,15 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     }
   }, [setDetailSynced]);
 
-  const loadPrev = useCallback(async () => { await fetchPrev(); }, [fetchPrev]);
+  // Returns whether the reverse page actually prepended ≥1 item. The synchronous
+  // detailRef mirror is updated inside fetchPrev's setDetailSynced BEFORE this
+  // await resolves, so the count delta is race-free (no DOM / commit dependency).
+  const loadPrev = useCallback(async (): Promise<boolean> => {
+    const before = detailRef.current?.items.length ?? 0;
+    await fetchPrev();
+    const after = detailRef.current?.items.length ?? 0;
+    return after > before;
+  }, [fetchPrev]);
 
   // ── Unified jump pager (replaces loadUntil + loadToEnd) ─────────────────────
   // Resolve the target uuid to its OWNING outline turn (Codex P1 — a deep-link /

@@ -684,7 +684,8 @@ describe('ConversationReader', () => {
 
   // ── jump-to-latest control (spec §5) ──────────────────────────────────
   // Parent-level integration (per the modal-level-integration-test lesson):
-  // exercise the REAL useConversation hook (loadToEnd paging) + the store jump
+  // exercise the REAL useConversation hook (#217 S3 E2 ?tail=1 jump-to-latest
+  // reset, which replaced the old loadToEnd forward drain) + the store jump
   // pipeline, asserting the dispatched jump lands on last_anchor — not just that
   // a child callback fired.
 
@@ -2211,6 +2212,160 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'session' }); });
     await act(async () => { fireEvent.keyDown(document, { key: 'a' }); await Promise.resolve(); });
     expect(getState().conversationJump).toBeNull();
+    clearReadingPositions();
+  });
+
+  // ── A controllable IntersectionObserver that captures every observed element
+  //    + its callback so a sentinel can be fired into view deterministically
+  //    (JSDOM has no real IO; the default test stub is a no-op). ───────────────
+  function installCapturingIO() {
+    const observed: { el: Element; cb: IntersectionObserverCallback; obs: IntersectionObserver }[] = [];
+    class CapturingIO {
+      cb: IntersectionObserverCallback;
+      constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
+      observe(el: Element): void { observed.push({ el, cb: this.cb, obs: this as unknown as IntersectionObserver }); }
+      unobserve(): void {}
+      disconnect(): void {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+    }
+    (globalThis as unknown as { IntersectionObserver: typeof CapturingIO }).IntersectionObserver = CapturingIO;
+    return observed;
+  }
+
+  // #217 S3 E2 — P0 regression at the REF/STATE level (the load-bearing one).
+  // After a tail open lands 'bottom', the user scrolls UP (atBottomRef := false).
+  // A reverse-page prepend must NOT re-force atBottomRef = true. We observe the
+  // ref through its only public consequence: a subsequent live append shows the
+  // "↓ N new" pill IFF atBottomRef === false. With the P0 bug the prepend
+  // re-fires the open-intent effect (atBottomRef := true), so the live append
+  // sticks-to-bottom and the pill never appears — RED. (Revert the one-shot guard
+  // to reproduce.)
+  it('P0: a reverse prepend does NOT re-arm atBottomRef (a later live append still raises the pill)', async () => {
+    const observed = installCapturingIO();
+    // tail open at the bottom; bottom edge fully paged (has_more:false) so the
+    // live-tail poll path is eligible.
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    // The user scrolls UP, away from the bottom → atBottomRef becomes false.
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+
+    // Reverse-page prepend (t1,t2 above t3,t4). Its envelope carries a bottom
+    // edge for the already-loaded items — the prepend must ignore it AND must not
+    // re-arm atBottomRef.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
+    await act(async () => {
+      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // Keep the viewport scrolled up, then drive a live append. Because
+    // atBottomRef is still false (the prepend did not re-arm it), the append
+    // surfaces the "↓ N new" pill instead of sticking to bottom.
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    // Live-tail overlap response: the running window (t1..t4) + a new turn t5.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' }),
+      makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' }), makeItem({ uuid: 't5' }),
+    ], null));
+    await act(async () => {
+      bumpSnapshot('tick-1');
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    const pill = await screen.findByRole('button', { name: /new/i });
+    expect(pill.textContent).toMatch(/1 new/);
+  });
+
+  // #217 S3 E2 — P1 regression: a reverse prepend must NOT be miscounted as a
+  // live append. The stick-to-bottom layout effect's live discriminator
+  // (added>0 && prevHasMoreRef===false && prevLen>0) is TRUE on a tail open's
+  // first reverse prepend, and `tail = items.slice(prevLen)` then reads the OLD
+  // (back) turns as "new", bumping the "↓ N new" pill by the prior window size.
+  // The fix is an early guard keyed on prependPendingRef. We scroll UP (so a real
+  // live append WOULD raise the pill), fire a prepend, and assert the pill stays
+  // hidden (the prepend contributed 0). Remove the prependPendingRef guard to
+  // reproduce RED (the pill would read "↓ 2 new").
+  it('P1: a reverse prepend does NOT bump the "↓ N new" pill', async () => {
+    const observed = installCapturingIO();
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    // Scroll UP so a real live append would surface the pill (atBottomRef false).
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+
+    // Reverse-page prepend of TWO turns (t1,t2). A miscount would read "2 new".
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
+    await act(async () => {
+      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // The prepend is reverse paging, not new live content → the pill stays hidden.
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+  });
+
+  // #217 S3 E1 — P2 regression: A→B→A reopen restores the reading position on the
+  // RETURN visit. The restore latch must re-arm on a session switch (the reader
+  // is mounted persistently — no key={sessionId}). The masking subtlety: B is a
+  // NON-restore (tail) open — no saved position — so the restore effect early-
+  // returns for B WITHOUT touching the latch. With a value-keyed latch
+  // (`latch === sessionId`) the ref stays 'a' across B, so returning to A wrongly
+  // skips the restore. The fix re-arms the latch on every genuinely-new open, so
+  // A's restore fires again on return even though B never restored.
+  it('P2: A→B→A reopen re-fires the reading-position restore on the return visit', async () => {
+    // The makeItem/detail helpers hardcode session_id 's', and the jump effect
+    // gates on detail.session_id === sessionId, so a per-session detail must
+    // carry the matching session_id (and items their matching anchor.session_id).
+    const sItem = (sid: string, uuid: string) => makeItem({
+      uuid, member_uuids: [uuid], anchor: { session_id: sid, uuid, id: _idFor(uuid) },
+    } as never);
+    const sDetail = (sid: string, items: ConversationItem[]) => ({
+      ...edged(items, { prev_before: 3, has_prev: true }),
+      session_id: sid,
+    });
+    clearReadingPositions();
+    recordReadingPos('a', 'a-saved', 1000);
+    // B has NO saved reading position → it opens at the tail (a NON-restore open).
+    // This is the case that masks/unmasks the bug: B never sets the latch.
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const outlineA = outlineFor([oTurn({ uuid: 'a-saved', kind: 'human' }), oTurn({ uuid: 'a-last', kind: 'human' })]);
+    const outlineB = outlineFor([oTurn({ uuid: 'b-1', kind: 'human' }), oTurn({ uuid: 'b-2', kind: 'human' })]);
+
+    // Open A (restore slot 2 → loadToTarget(a-saved) + flash + pin).
+    mockFetchOnce(sDetail('a', [sItem('a', 'a-saved'), sItem('a', 'a-last')]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+    const { container, rerender } = render(<ConversationReader sessionId="a" outline={outlineA} />);
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('a-saved'));
+
+    // Switch to B (genuine switch, NON-restore tail open). No restore, no pin.
+    mockFetchOnce(sDetail('b', [sItem('b', 'b-1'), sItem('b', 'b-2')]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'b' });
+    rerender(<ConversationReader sessionId="b" outline={outlineB} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="b-1"]')).not.toBeNull());
+    await waitFor(() => expect(getState().convPinnedUuid).toBeNull()); // B did not restore
+
+    // Return to A. With the bug (value-keyed latch never re-armed because B never
+    // touched it), the restore is skipped and the pin stays null. Fixed: the
+    // latch re-arms on the new open, the restore re-fires, and the pin lands back
+    // on 'a-saved'.
+    mockFetchOnce(sDetail('a', [sItem('a', 'a-saved'), sItem('a', 'a-last')]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+    rerender(<ConversationReader sessionId="a" outline={outlineA} />);
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('a-saved'));
+    expect(container.querySelector('[data-uuid="a-saved"]')!.classList.contains('conv-item--jumped')).toBe(true);
     clearReadingPositions();
   });
 });

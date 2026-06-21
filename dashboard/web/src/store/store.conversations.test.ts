@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
 import { clearReadingPositions, loadReadingPos } from './readingPosition';
 
@@ -358,6 +358,38 @@ describe('reading-position persistence wiring (#217 S3 E1)', () => {
     // SET_CONV_CURRENT_TURN-less path, but a stray null write must not clobber.
     dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: null });
     expect(loadReadingPos('sessA')?.uuid).toBe('turn-7');
+  });
+
+  it('a same-uuid repeat tick does NOT re-write localStorage (no-op-guard dedupe, Codex P2)', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessA' });
+    // Spy on the live localStorage INSTANCE (the test harness installs a
+    // MemoryStorage shim — Storage.prototype is not on its call path).
+    const setSpy = vi.spyOn(localStorage, 'setItem');
+    // The scroll-sync observer re-fires the SAME topmost-visible uuid every tick.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    const afterFirst = setSpy.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0); // the FIRST write landed
+    // A run of same-uuid repeat ticks must hit the no-op guard BEFORE
+    // recordReadingPos, so no further localStorage writes happen.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    expect(setSpy.mock.calls.length).toBe(afterFirst); // unchanged — no re-writes
+    expect(loadReadingPos('sessA')?.uuid).toBe('turn-7');
+    setSpy.mockRestore();
+  });
+
+  it('throttles rapid distinct-uuid ticks to the same session (Codex P2)', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessA' });
+    const setSpy = vi.spyOn(localStorage, 'setItem');
+    // A fast scroll dispatches DISTINCT uuids within the throttle window
+    // (Date.now() barely advances across these synchronous dispatches). The
+    // FIRST lands; the rest are throttled, so localStorage is written once.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-1' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-2' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-3' });
+    expect(setSpy.mock.calls.length).toBe(1); // only the leading-edge write
+    setSpy.mockRestore();
   });
 
   it('persist-before-reset: a switch resets convCurrentTurnUuid but the saved position survives', () => {
