@@ -99,7 +99,7 @@ describe('DiffCard', () => {
     expect(container.textContent).toMatch(/wrote 2 lines/);
   });
 
-  it('renders the collapsed result · cat -n sub-panel when a result is present', () => {
+  it('renders the collapsed result sub-panel when a result is present', () => {
     const call = base({
       result: { text: '   1\tline one\n   2\tline two', truncated: false, is_error: false },
     });
@@ -110,6 +110,26 @@ describe('DiffCard', () => {
     expect((sub as HTMLDetailsElement).open).toBe(false);
     // cat -n form → LineNumberedCode gutter.
     expect(sub?.querySelector('.cb-gutter')).toBeTruthy();
+  });
+
+  // #217 S3 E10#5 — the result disclosure preview is DERIVED from the actual
+  // result snippet (its line count), not the hardcoded "cat -n snippet" string.
+  it('the result disclosure label is derived from the result line count', () => {
+    const call = base({
+      result: { text: '   1\tline one\n   2\tline two\n   3\tline three', truncated: false, is_error: false },
+    });
+    const { container } = renderCard(call);
+    const preview = container.querySelector('.conv-diff-result .conv-chip-preview')!;
+    expect(preview.textContent).not.toContain('cat -n snippet');
+    expect(preview.textContent).toMatch(/3 lines/);
+  });
+
+  it('the result disclosure label uses singular for a one-line snippet', () => {
+    const call = base({
+      result: { text: '   1\tonly line', truncated: false, is_error: false },
+    });
+    const { container } = renderCard(call);
+    expect(container.querySelector('.conv-diff-result .conv-chip-preview')!.textContent).toMatch(/1 line\b/);
   });
 
   it('no result → no sub-panel', () => {

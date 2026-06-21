@@ -10,7 +10,7 @@ import { FindBar } from './FindBar';
 import { HighlightContext } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
-import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon } from './ConvIcons';
+import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers } from './insertTimeMarkers';
@@ -1497,7 +1497,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
             {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
               const labels: Record<FocusMode, string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
-              const errCount = outline?.stats.error_count ?? 0;
+              // #217 S3 E10#2 — the badge is the error-TURN count (== the jump
+              // cluster chip == what clicking the Errors filter navigates to),
+              // NOT stats.error_count (the server's total error-EVENT count, which
+              // double-counts a turn with multiple error tools). The Stats card
+              // keeps the reconciliation phrasing "N errors in M turns".
+              const errCount = targetLists.error.length;
               return (
                 <button
                   key={m}
@@ -1538,7 +1543,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             aria-label="Find in conversation"
             title="Find in conversation (/)"
             onClick={toggleFind}
-          >🔍 Find</button>
+          ><SearchIcon /> Find</button>
           {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
               the EFFECTIVE open flag (mobile sheet flag on mobile, persisted pref
               on desktop). On mobile it opens the slide-over sheet (#205 S1). */}
@@ -1599,6 +1604,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   type="button"
                   className="conv-hidden-run"
                   data-conv-marker=""
+                  // #217 S3 E10#1 — the `· N hidden ·` pill is icon-like prose;
+                  // name the action for screen readers (the glyph run alone is
+                  // opaque). Click drops back to `all` and jumps to the first
+                  // hidden turn.
+                  aria-label={`Show ${g.count} hidden ${g.count === 1 ? 'turn' : 'turns'}`}
                   onClick={() => {
                     dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
                     dispatch({

@@ -513,6 +513,37 @@ describe('Conversations workspace integration', () => {
     expect(document.activeElement).toBe(document.querySelector('.conv-rail-search-input'));
   });
 
+  // #217 S3 E10#8 — reach the rail search from INSIDE an open reader without
+  // pressing Esc first. `/` is reader-aware (opens the in-conversation find bar
+  // when a reader is open), so a separate key (`f`) focuses the rail search input
+  // regardless of whether a reader is open. Gated on the shared guards + the #156
+  // conversations-view scope.
+  it('13b: "f" focuses the rail search input even with a reader open (no Esc needed)', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-head')).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.conv-rail-search-input')).not.toBeNull());
+
+    expect(getState().selectedConversationId).toBe('sess-1');
+    act(() => { fireEvent.keyDown(document, { key: 'f' }); });
+    // It focuses the rail search input WITHOUT opening the in-conversation find.
+    expect(getState().convFindOpen).toBe(false);
+    expect(document.activeElement).toBe(document.querySelector('.conv-rail-search-input'));
+  });
+
+  it('13c: "f" is inert while a modal is open (guard)', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-rail-search-input')).not.toBeNull());
+    const railInput = document.querySelector('.conv-rail-search-input');
+    act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'forecast' }); });
+    act(() => { fireEvent.keyDown(document, { key: 'f' }); });
+    // Guard suppresses it: focus did NOT move to the rail input.
+    expect(document.activeElement).not.toBe(railInput);
+  });
+
   it('14: "/" is inert while a modal is open (guard)', async () => {
     updateSnapshot(baseEnvelope(true));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });

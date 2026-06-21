@@ -148,6 +148,66 @@ describe('BashCard', () => {
   });
 });
 
+describe('BashCard collapse heuristic (#217 S3 E9)', () => {
+  // A long output (> the line threshold) renders the <details> CLOSED by default
+  // so a 200-line `ls` doesn't bury the next turn. We assert on the `open`
+  // attribute/state — never by click-toggling a <button> nested in <summary>
+  // (vacuous in JSDOM/Chromium per the button-in-summary gotcha).
+  const longOutput = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join('\n');
+
+  it('long output (> threshold) renders <details> collapsed (not open)', () => {
+    const { container } = renderCard(
+      base({
+        stderr: undefined,
+        result: { text: longOutput(40), truncated: false, is_error: false },
+      }),
+    );
+    const d = container.querySelector('details.conv-term') as HTMLDetailsElement;
+    expect(d.open).toBe(false);
+  });
+
+  it('short output (≤ threshold) stays open', () => {
+    const { container } = renderCard(
+      base({
+        stderr: undefined,
+        result: { text: longOutput(3), truncated: false, is_error: false },
+      }),
+    );
+    const d = container.querySelector('details.conv-term') as HTMLDetailsElement;
+    expect(d.open).toBe(true);
+  });
+
+  it('collapsed long output shows a "show N lines" summary hint', () => {
+    const { container } = renderCard(
+      base({
+        stderr: undefined,
+        result: { text: longOutput(40), truncated: false, is_error: false },
+      }),
+    );
+    const hint = container.querySelector('.conv-term-collapsed-hint');
+    expect(hint?.textContent).toMatch(/show\s+40\s+lines/i);
+  });
+
+  it('a request-only card (no result) stays open — nothing to collapse', () => {
+    const { container } = renderCard(base({ result: null, stderr: undefined }));
+    const d = container.querySelector('details.conv-term') as HTMLDetailsElement;
+    expect(d.open).toBe(true);
+  });
+
+  it('counts the rendered output (stdout + stderr) lines, not the raw command', () => {
+    // 30-line stdout split from a trailing stderr suffix → over threshold even
+    // though the command itself is one line.
+    const stdout = Array.from({ length: 25 }, (_, i) => `o${i}`).join('\n');
+    const stderr = Array.from({ length: 5 }, (_, i) => `e${i}`).join('\n');
+    const text = stdout + '\n' + stderr;
+    const { container } = renderCard(
+      base({ stderr, result: { text, truncated: false, is_error: true } }),
+    );
+    const d = container.querySelector('details.conv-term') as HTMLDetailsElement;
+    expect(d.open).toBe(false);
+  });
+});
+
 describe('BashCard dimmed line (#193)', () => {
   it('shows input.description when present', () => {
     const { container } = renderCard(

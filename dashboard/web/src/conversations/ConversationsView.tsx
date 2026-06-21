@@ -137,6 +137,22 @@ const CONVERSATIONS_BINDINGS = [
     },
   },
   {
+    // #217 S3 E10#8 — reach the rail search from INSIDE an open reader without
+    // pressing Esc first. `/` is reader-aware (opens the in-conversation find
+    // bar when a reader is open), so `f` is the dedicated "focus the conversation
+    // list search" key: it focuses `.conv-rail-search input` regardless of
+    // whether a reader is open. `f` is a free slot in the conversations view —
+    // the dashboard's `f` (Sessions filter) is scope:'sessions' → 'dashboard',
+    // and the reader keymap's taken set (j k [ ] g o e E u U b B p P c C v n N
+    // End a L m M) does not include it. Gated on the shared `inView` guard (no
+    // open modal / input mode / filter popover) + the #156 conversations scope.
+    key: 'f', scope: 'global' as const, view: 'conversations' as const, when: inView,
+    action: () => {
+      const el = document.querySelector<HTMLInputElement>('.conv-rail-search input');
+      el?.focus(); el?.select();
+    },
+  },
+  {
     key: 'Escape', scope: 'global' as const, view: 'conversations' as const,
     when: () => !getState().openModal,
     action: () => {

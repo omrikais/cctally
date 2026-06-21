@@ -42,6 +42,9 @@ export interface UseConversations {
   error: string | null;
   hasMore: boolean;
   loadMore: () => Promise<void>;
+  // #217 S3 E10#7 — true while a loadMore() page fetch is in flight, so the rail
+  // Load-more button can disable + show a loading state (matching SearchList).
+  loadingMore: boolean;
   // filters spec §1 dual-branch parity — true when a project/cost/rebuild filter
   // was requested but the rollup was non-authoritative (the live fallback can only
   // filter by date). The rail surfaces a muted note.
@@ -66,7 +69,13 @@ export function useConversations(): UseConversations {
   filtersRef.current = filters;
   const env = useSnapshot();
   const generatedAt = env?.generated_at ?? '';
+  // Sync in-flight guard (loadingMoreRef) gates re-entrancy + the page-1
+  // revalidation suppression; the loadingMore STATE drives the rail's Load-more
+  // disabled/loading affordance (#217 S3 E10#7). Two surfaces: the ref must flip
+  // synchronously inside loadMore (so a refocus tick can't double-fetch), the
+  // state can lag a render (it only paints a button).
   const loadingMoreRef = useRef(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   // Mirror rows.length through a ref so loadFirstPage can read the page-1
   // suppression predicate WITHOUT closing over rows.length — that would
   // recreate the callback on every row update and could re-trigger the tick
@@ -147,6 +156,7 @@ export function useConversations(): UseConversations {
     // its own finally re-clears the flag harmlessly.
     filterGenRef.current += 1;
     loadingMoreRef.current = false;
+    setLoadingMore(false);
     setRows([]);
     setNextOffset(0);
     rowsLenRef.current = 0;
@@ -180,6 +190,7 @@ export function useConversations(): UseConversations {
   const loadMore = useCallback(async () => {
     if (nextOffset == null || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
+    setLoadingMore(true);
     // Snapshot the filter generation; if a filter change bumps it while this
     // request is in flight, the response is stale (old filter / old cursor) and
     // must be discarded — the reset effect already issued a fresh page-1 load.
@@ -194,8 +205,9 @@ export function useConversations(): UseConversations {
       /* keep what we have; a transient blip shouldn't wipe the list */
     } finally {
       loadingMoreRef.current = false;
+      setLoadingMore(false);
     }
   }, [nextOffset]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore, filterDegraded, retry };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, retry };
 }

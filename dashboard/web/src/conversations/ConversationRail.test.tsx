@@ -22,11 +22,18 @@ const loadMoreSpy = vi.fn();
 // can be exercised. Default error null preserves every existing browse test.
 let browseError: string | null = null;
 const retrySpy = vi.fn();
+// #217 S3 E10#7 — overridable browse-list paging surface so the Load-more
+// disabled/loading state can be exercised. Defaults preserve every existing
+// browse test (no Load-more button).
+let browseHasMore = false;
+let browseLoadingMore = false;
+const browseLoadMoreSpy = vi.fn();
 
 vi.mock('../hooks/useConversations', () => ({
   useConversations: () => ({
-    rows: browseRows, loading: false, error: browseError, hasMore: false,
-    loadMore: () => Promise.resolve(), filterDegraded, retry: retrySpy,
+    rows: browseRows, loading: false, error: browseError, hasMore: browseHasMore,
+    loadMore: browseLoadMoreSpy, loadingMore: browseLoadingMore,
+    filterDegraded, retry: retrySpy,
   }),
 }));
 // Stub the popover so the rail render doesn't reach useConversationFacets' live
@@ -88,6 +95,9 @@ beforeEach(() => {
   loadMoreSpy.mockReset();
   browseError = null;
   retrySpy.mockClear();
+  browseHasMore = false;
+  browseLoadingMore = false;
+  browseLoadMoreSpy.mockReset();
 });
 afterEach(() => {
   _resetForTests();
@@ -316,6 +326,27 @@ describe('ConversationRail', () => {
     searchTotal = 10;
     searchLoadingMore = true;
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
+    render(<ConversationRail />);
+    expect((document.querySelector('.conv-rail-more') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // #217 S3 E10#7 — the BROWSE list's Load-more gets the same disabled/loading
+  // affordance the search list already has (decision d — no sentinel-ization).
+  it('browse Load-more is enabled and clickable while idle', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    browseHasMore = true;
+    render(<ConversationRail />);
+    const more = document.querySelector('.conv-rail-more') as HTMLButtonElement;
+    expect(more).toBeTruthy();
+    expect(more.disabled).toBe(false);
+    fireEvent.click(more);
+    expect(browseLoadMoreSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('browse Load-more is disabled while a page is loading', () => {
+    browseRows = [summary({ session_id: 'a' })];
+    browseHasMore = true;
+    browseLoadingMore = true;
     render(<ConversationRail />);
     expect((document.querySelector('.conv-rail-more') as HTMLButtonElement).disabled).toBe(true);
   });

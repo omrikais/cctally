@@ -72,4 +72,27 @@ describe('WebSearchCard', () => {
     expect(d.tagName.toLowerCase()).toBe('details');
     expect(d.open).toBe(true);
   });
+
+  // #217 S3 E10#9 — a green "ok" count chip on an errored search reads as
+  // success. On result.is_error the count chip drops the --ok class and takes
+  // the neutral/error style; the `· error` span still renders.
+  it('the count chip is green (--ok) on a successful search', () => {
+    const { container } = render(
+      <WebSearchCard call={call({ web_search: { query: 'q', links: links(3) }, result: { text: '', truncated: false, is_error: false } })} />,
+    );
+    const status = container.querySelector('.conv-web-status')!;
+    expect(status.classList.contains('conv-web-status--ok')).toBe(true);
+    expect(status.classList.contains('conv-web-status--err')).toBe(false);
+  });
+
+  it('the count chip drops --ok and takes the error style when result.is_error', () => {
+    const { container } = render(
+      <WebSearchCard call={call({ web_search: { query: 'q', links: links(3) }, result: { text: 'boom', truncated: false, is_error: true } })} />,
+    );
+    const status = container.querySelector('.conv-web-status')!;
+    expect(status.classList.contains('conv-web-status--ok')).toBe(false);
+    expect(status.classList.contains('conv-web-status--err')).toBe(true);
+    // The `· error` span still renders alongside the count.
+    expect(container.querySelector('.conv-chip-status')!.textContent).toContain('error');
+  });
 });

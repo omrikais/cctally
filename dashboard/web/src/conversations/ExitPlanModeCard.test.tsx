@@ -67,3 +67,46 @@ describe('ExitPlanModeCard', () => {
     expect(screen.queryByRole('button', { name: /show full plan/i })).toBeNull();
   });
 });
+
+// #217 S3 E10#6 — hardened (still client-side) approve/reject/responded
+// detection. The pre-hardening regex matched the bare substrings `approv` /
+// `reject` ANYWHERE in result.text, so a free-text user RESPONSE that merely
+// mentioned those words was mis-badged. The table below proves the canonical
+// Claude Code strings still classify AND that the previously-misclassified
+// free-text vector now falls through to a neutral `Responded`.
+describe('ExitPlanModeCard — outcome detection table (#217 S3 E10#6)', () => {
+  const result = (text: string, is_error = false) => ({ text, truncated: false, is_error });
+  // The badge label rendered for a given result.text.
+  const badgeOf = (text: string, is_error = false): string => {
+    render(<ExitPlanModeCard call={base({ result: result(text, is_error) })} />);
+    if (screen.queryByText('Approved')) return 'Approved';
+    if (screen.queryByText('Rejected')) return 'Rejected';
+    if (screen.queryByText('Responded')) return 'Responded';
+    return 'none';
+  };
+
+  it('canonical approval string → Approved', () => {
+    expect(badgeOf('User has approved your plan. You can now start coding.')).toBe('Approved');
+  });
+
+  it('canonical rejection string → Rejected', () => {
+    expect(badgeOf("The user doesn't want to proceed with this tool use.")).toBe('Rejected');
+  });
+
+  it('is_error always short-circuits to Rejected', () => {
+    expect(badgeOf('anything at all', true)).toBe('Rejected');
+  });
+
+  // The smoking-gun vector: a genuine free-text user response that contains the
+  // word "reject" (or "approve") as prose. Pre-hardening this was mis-badged
+  // Rejected/Approved; it must now be neutral Responded.
+  it('free-text response mentioning "rejected" in prose → Responded (was mis-badged Rejected)', () => {
+    expect(
+      badgeOf("I rejected that earlier idea, but let's keep this one — go ahead and refactor utils.ts."),
+    ).toBe('Responded');
+  });
+
+  it('free-text response mentioning "approve" in prose → Responded (was mis-badged Approved)', () => {
+    expect(badgeOf('Can you get my manager to approve the new endpoint name first?')).toBe('Responded');
+  });
+});

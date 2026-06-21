@@ -33,7 +33,10 @@ export function WebSearchCard({ call }: { call: Call }) {
         <span className="conv-chip-name">WebSearch</span>
         <span className="conv-web-domain">“{query}”</span>
         {links != null && (
-          <span className="conv-web-status conv-web-status--ok">
+          // #217 S3 E10#9 — a green "ok" count chip on an errored search reads as
+          // success. Drop --ok and take the neutral/error style when the result
+          // carries is_error; the `· error` span below still renders.
+          <span className={`conv-web-status ${call.result?.is_error ? 'conv-web-status--err' : 'conv-web-status--ok'}`}>
             {links.length}
             {call.web_search?.links_truncated ? '+' : ''} results
           </span>

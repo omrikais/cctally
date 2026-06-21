@@ -70,14 +70,35 @@ export function BashCard({ call }: { call: Call }) {
     <span className="conv-term-badge conv-term-badge--int">■ interrupted</span>
   ) : null;
 
+  // #217 S3 E9 — collapse heuristic. A long terminal output buries the next turn
+  // when always-open, so a card whose RENDERED output (stdout + stderr) exceeds a
+  // fixed line threshold opens COLLAPSED with a "show N lines" hint; short output
+  // stays open. Counted on the rendered streams (not the raw command/payload).
+  // No config key (Q4). The [/] collapse-all and per-card click still override
+  // (they set `.open` imperatively on the DOM element, above whatever React
+  // renders). A request-only card (no result → nothing to collapse) stays open.
+  const COLLAPSE_LINE_THRESHOLD = 20;
+  const outputLineCount =
+    result == null
+      ? 0
+      : (stdout.length > 0 ? stdout.split('\n').length : 0) +
+        (stderr != null && stderr.length > 0 ? stderr.split('\n').length : 0);
+  const collapseLong = outputLineCount > COLLAPSE_LINE_THRESHOLD;
+
   return (
-    <details className="conv-chip conv-chip--tool conv-term" open>
+    <details className="conv-chip conv-chip--tool conv-term" open={!collapseLong}>
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         <TerminalIcon />
         <span className="conv-chip-name">Bash</span>
         <span className="conv-chip-preview">{descriptionOf(call) ?? call.preview}</span>
         {badge}
+        {/* #217 S3 E9 — collapsed-by-default hint; the disclosure arrow already
+            affords expansion, this names the hidden line count. Hidden once the
+            user (or collapse-all) opens the card via the [open] sibling rule. */}
+        {collapseLong && (
+          <span className="conv-term-collapsed-hint">show {outputLineCount} lines</span>
+        )}
       </summary>
       <div className="conv-term-body">
         <div className="conv-term-copy">

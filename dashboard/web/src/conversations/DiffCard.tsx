@@ -36,6 +36,17 @@ function filePathOf(inp: EditInput): string {
   return typeof inp.file_path === 'string' ? inp.file_path : '';
 }
 
+// #217 S3 E10#5 — derive the result-disclosure preview from the actual snippet.
+// The Edit/Write/MultiEdit result is a `cat -n` numbered view of the file after
+// the change; "N lines" names its size, which is far more useful than a fixed
+// "cat -n snippet" string. An empty result degrades to a bare "result" hint.
+function resultPreview(text: string): string {
+  const trimmed = text.replace(/\n+$/, '');
+  if (trimmed.length === 0) return 'snippet';
+  const n = trimmed.split('\n').length;
+  return `${n} line${n === 1 ? '' : 's'}`;
+}
+
 // Split a path into (parentDir, basename) for the header. A bare filename has no
 // parent dir.
 function splitPath(path: string): { dir: string; base: string } {
@@ -233,7 +244,11 @@ export function DiffCard({ call }: { call: Call }) {
             <summary>
               <span className="conv-chev" aria-hidden="true" />
               <span className="conv-chip-name">result</span>
-              <span className="conv-chip-preview">cat -n snippet</span>
+              {/* #217 S3 E10#5 — derive the disclosure label from the ACTUAL
+                  result snippet (its line count) instead of the hardcoded
+                  "cat -n snippet" string. The result is the post-edit cat -n
+                  view; naming its size is the useful, accurate preview. */}
+              <span className="conv-chip-preview">{resultPreview(call.result.text)}</span>
             </summary>
             <div className="conv-chip-body conv-tool-io">
               <CopyButton text={call.result.text} />

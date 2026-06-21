@@ -182,7 +182,7 @@ export function ConversationRail() {
 interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
-  const { rows, loading, error, hasMore, loadMore, filterDegraded, retry } = useConversations();
+  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, retry } = useConversations();
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   // filters spec §1 dual-branch parity — a one-line muted note when the
   // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
@@ -242,8 +242,16 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
         );
       })}
       {hasMore && (
-        <button type="button" className="conv-rail-more" onClick={() => void loadMore()}>
-          Load more
+        // #217 S3 E10#7 — match SearchList's disabled-while-loading affordance
+        // (decision d; no sentinel-ization). The button greys + shows a loading
+        // label while a page is in flight so a second click can't re-fire.
+        <button
+          type="button"
+          className="conv-rail-more"
+          disabled={loadingMore}
+          onClick={() => void loadMore()}
+        >
+          {loadingMore ? 'Loading…' : 'Load more'}
         </button>
       )}
     </div>

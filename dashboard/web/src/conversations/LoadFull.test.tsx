@@ -47,6 +47,27 @@ describe('LoadFull', () => {
     expect(container.querySelector('.conv-loadfull-err')?.textContent).toMatch(/source no longer available/);
   });
 
+  // #217 S3 E10#4 — a11y/disabled affordance (NOT a double-fetch fix; that is
+  // already prevented by useFullPayload's inFlightRef/doneRef guards). When there
+  // is no open session, load() no-ops, so the idle button must render `disabled`
+  // rather than looking actionable.
+  it('the idle button is disabled when there is no open session (load would no-op)', () => {
+    const onLoaded = vi.fn();
+    const { getByRole } = render(
+      <TranscriptContext.Provider value={{ sessionId: null }}>
+        <LoadFull toolUseId="t1" which="result" fullLength={null} label="load full output" onLoaded={onLoaded} />
+      </TranscriptContext.Provider>,
+    );
+    const btn = getByRole('button', { name: /load full output/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it('the idle button is enabled when a session is open', () => {
+    const { getByRole } = renderAffordance();
+    const btn = getByRole('button', { name: /load full output/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
   it('renders a reduced-motion-safe spinner element while loading', async () => {
     let resolveFetch: (v: unknown) => void = () => {};
     const fetchMock = vi.fn().mockReturnValue(new Promise((res) => { resolveFetch = res; }));

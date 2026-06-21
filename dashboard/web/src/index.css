@@ -5350,10 +5350,13 @@ mark.current {
 .conv-outline-entry--subnested {
   padding-left: calc(22px + (var(--conv-outline-depth, 2) - 1) * 16px);
 }
-/* #217 S3 F8 — compaction landmark: a muted/blue cue distinct from the spine. */
+/* #217 S3 F8 — compaction landmark: a muted/blue cue distinct from the spine.
+   The leading glyph (.conv-outline-entry-compaction-glyph) sits inside the
+   outer .conv-outline-entry-glyph wrapper, so coloring the wrapper blue is
+   enough — the inner span inherits via currentColor (the redundant inner
+   selector was dropped, #218/#219 I-2 P3 cosmetic). */
 .conv-outline-entry--compaction { color: var(--text-dim); }
-.conv-outline-entry--compaction .conv-outline-entry-glyph,
-.conv-outline-entry-compaction-glyph { color: var(--accent-blue); }
+.conv-outline-entry--compaction .conv-outline-entry-glyph { color: var(--accent-blue); }
 /* #217 S3 E6(a) — per-subagent cost chip on a subagent entry (display-only). */
 .conv-outline-entry-cost {
   flex: 0 0 auto;
@@ -6879,6 +6882,17 @@ mark.current {
 }
 .conv-term-badge--err { color: var(--accent-red); }
 .conv-term-badge--int { color: var(--accent-amber); }
+/* #217 S3 E9 — "show N lines" hint on a collapsed-by-default Bash card. The
+   hint only makes sense while collapsed, so hide it once the card opens (the
+   disclosure arrow then affords re-collapse). */
+.conv-term-collapsed-hint {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+.conv-term[open] > summary .conv-term-collapsed-hint { display: none; }
 
 /* ANSI SGR foreground spans (parseAnsi). Mapped onto the in-tree palette — no
    new hexes — so the terminal stays native to the reader's colors. */

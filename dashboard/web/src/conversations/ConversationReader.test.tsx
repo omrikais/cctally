@@ -1425,9 +1425,19 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
   });
 
   it('the segmented control renders a labeled radiogroup with four modes + an error badge', async () => {
+    // #217 S3 E10#2 — the badge counts error TURNS (== the jump chip), so build
+    // three turns each carrying an error tool. (stats.error_count is set to a
+    // DIFFERENT value to prove the badge no longer reads from it.)
     const { container } = await renderWithOutline(
       [makeItem({ uuid: 'h1' })],
-      baseOutline([oTurn({ uuid: 'h1', kind: 'human' })], 3),
+      baseOutline(
+        [
+          oTurn({ uuid: 'a1', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }] }),
+          oTurn({ uuid: 'a2', kind: 'assistant', tools: [{ name: 'Read', is_error: true }] }),
+          oTurn({ uuid: 'a3', kind: 'assistant', tools: [{ name: 'Edit', is_error: true }] }),
+        ],
+        99, // server error_count is intentionally NOT 3
+      ),
     );
     const seg = container.querySelector('[role="radiogroup"][aria-label="Focus mode"]')!;
     expect(seg).not.toBeNull();
@@ -1435,8 +1445,41 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     expect(radios).toHaveLength(4);
     // All is active by default.
     expect(seg.querySelector('[aria-checked="true"]')!.textContent).toContain('All');
-    // Errors carries the count badge.
+    // Errors carries the error-TURN count badge (3), not stats.error_count (99).
     expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('3');
+  });
+
+  // #217 S3 E10#2 — the Errors badge shows the error-TURN count (== the jump
+  // cluster chip == what clicking the filter navigates), NOT the server's total
+  // error-EVENT count (stats.error_count). Here the server reports 5 error events
+  // but they all live on ONE turn, so the badge must read 1.
+  it('the Errors badge reflects the error-turn count, not the server error_count', async () => {
+    const { container } = await renderWithOutline(
+      [makeItem({ uuid: 'h1' }), makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0 } as never)],
+      baseOutline(
+        [
+          oTurn({ uuid: 'h1', kind: 'human' }),
+          // ONE error turn carrying TWO error tools (and more events counted
+          // server-side) — the turn count is 1 regardless of event multiplicity.
+          oTurn({ uuid: 'a1', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }, { name: 'Read', is_error: true }] }),
+        ],
+        5, // server total error events
+      ),
+    );
+    // Badge == error-turn count (1), NOT the server total (5).
+    expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('1');
+  });
+
+  // #217 S3 E10#3 — the Find control leads with a ConvIcons SVG glyph, matching
+  // every other reader control, instead of the inline 🔍 emoji.
+  it('the Find toggle renders an SVG icon, not the 🔍 emoji', async () => {
+    const { container } = await renderWithOutline(
+      [makeItem({ uuid: 'h1' })],
+      baseOutline([oTurn({ uuid: 'h1', kind: 'human' })]),
+    );
+    const find = container.querySelector('.conv-find-toggle')!;
+    expect(find.querySelector('svg.conv-ico')).not.toBeNull();
+    expect(find.textContent).not.toContain('🔍');
   });
 
   it('v cycles the focus mode all → chat → prompts → errors → all', async () => {
@@ -1469,6 +1512,26 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     expect(marker.textContent).toContain('1 hidden');
     // The marker carries data-conv-marker so j/k never land on it.
     expect((marker as HTMLElement).dataset.convMarker).toBe('');
+  });
+
+  // #217 S3 E10#1 — the `· N hidden ·` pill is icon-like prose; give it an
+  // aria-label so a screen reader announces the action, not just the glyph run.
+  it('the hidden-run pill carries an aria-label naming the count', async () => {
+    const { container } = await renderWithOutline(
+      [
+        makeItem({ uuid: 'h1', kind: 'human', text: 'hi' }),
+        makeItem({ uuid: 'a1', kind: 'assistant', text: '', model: 'm', cost_usd: 0 } as never),
+        makeItem({ uuid: 'h2', kind: 'human', text: 'bye' }),
+      ],
+      baseOutline([
+        oTurn({ uuid: 'h1', kind: 'human' }),
+        oTurn({ uuid: 'a1', kind: 'assistant' }),
+        oTurn({ uuid: 'h2', kind: 'human' }),
+      ]),
+    );
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    const marker = await waitFor(() => container.querySelector('.conv-hidden-run')!);
+    expect(marker.getAttribute('aria-label')).toMatch(/1 hidden turn/i);
   });
 
   it('clicking a hidden-run marker resets to all and jumps to the first hidden turn', async () => {

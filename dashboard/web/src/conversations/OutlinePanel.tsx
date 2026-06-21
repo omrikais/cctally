@@ -427,7 +427,6 @@ export function OutlinePanel({
               // landmark, ≥2 = a nested sub-subagent. A CSS var drives the
               // left-pad per level so a deeper child reads as indented under its
               // parent; data-depth lets tests assert the level without pixels.
-              const cost = e.subagentKey != null ? subagentCosts[e.subagentKey] : undefined;
               return (
                 <li key={e.entryId}>
                   <button
@@ -457,13 +456,15 @@ export function OutlinePanel({
                     <span className="conv-outline-entry-label">{e.label}</span>
                     {/* #217 S3 E6(a) — per-subagent cost, display-only. Shown on a
                         subagent entry when the server emitted a cost for its
-                        bucket (covers empty-subagent_meta buckets too). */}
-                    {e.type === 'subagent' && cost != null && (
+                        bucket (covers empty-subagent_meta buckets too). The cost
+                        lookup is inlined here (#218/#219 I-2 P3 cosmetic): it was
+                        computed for every entry but only used in this branch. */}
+                    {e.type === 'subagent' && e.subagentKey != null && subagentCosts[e.subagentKey] != null && (
                       <span
                         className="conv-outline-entry-cost"
-                        title={`Subagent cost (display-only): ${fmt.usd2(cost)}`}
+                        title={`Subagent cost (display-only): ${fmt.usd2(subagentCosts[e.subagentKey])}`}
                       >
-                        {fmt.usd2(cost)}
+                        {fmt.usd2(subagentCosts[e.subagentKey])}
                       </span>
                     )}
                     {e.thinkingCount > 0 && (

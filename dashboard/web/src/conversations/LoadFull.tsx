@@ -58,9 +58,18 @@ export function LoadFull({
   }
 
   const showing = fullLength != null ? `showing capped view of ${fullLength} chars · ` : '';
+  // #217 S3 E10#4 — a11y/disabled affordance. Double-fetch is already prevented
+  // by useFullPayload (inFlightRef/doneRef). The remaining gap is that the idle
+  // button looked actionable even when load() would no-op (no open session id),
+  // so disable it in that case rather than leaving a dead-click button.
   return (
     <div className="conv-loadfull">
-      <button type="button" className="conv-loadfull-btn" onClick={() => state.load()}>
+      <button
+        type="button"
+        className="conv-loadfull-btn"
+        disabled={!sessionId}
+        onClick={() => state.load()}
+      >
         {showing}
         {label}
       </button>
