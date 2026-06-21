@@ -2664,10 +2664,6 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
             "total": total}
 
 
-# #217 S2 / I-3: a path query "looks like a prefix" when it carries no leading
-# path separator — ``bin/cctally`` is a prefix probe, ``/dashboard`` (or a query
-# that intentionally starts mid-path) forces the substring scan. The set is the
-# common path separators (POSIX + Windows).
 def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
     """#217 S2 / I-3: ``kind=files`` cross-session search over the write-class
     file-touch axis (``conversation_file_touches``). Emits one hit per DISTINCT

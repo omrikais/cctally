@@ -2413,14 +2413,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             tool        TEXT NOT NULL,
             UNIQUE(message_id, file_path, tool)
         );
-        -- COLLATE NOCASE is load-bearing (#217 S2 / I-3 review Important #1): the
-        -- default ``LIKE`` is case-insensitive, and SQLite only rides a btree index
-        -- for ``file_path LIKE 'prefix%'`` when the index column folds the same way
-        -- (NOCASE) — a BINARY-collated index leaves the prefix probe a full SCAN. So
-        -- the kind=files PREFIX branch (``_search_files``) is genuinely index-assisted
-        -- ONLY with this NOCASE collation. (The substring branch leads with '%' and is
-        -- a documented scan regardless.) NOCASE folds A-Z/a-z the same way the LIKE
-        -- built-in does, so matching semantics are byte-identical to the prior index.
+        -- COLLATE NOCASE keeps the index's case-folding identical to the default
+        -- (case-insensitive) ``LIKE`` (#217 S2 / I-3 review Important #1): NOCASE folds
+        -- A-Z/a-z the same way the LIKE built-in does, so matching semantics are
+        -- byte-identical to a BINARY index. (#223: ``_search_files`` now substring-
+        -- matches EVERY query (``file_path LIKE '%q%'``) — a deliberate scan over the
+        -- modest touch table — so this index no longer drives a prefix probe; it is
+        -- retained as-is with no schema change. NOCASE was originally load-bearing so a
+        -- ``LIKE 'prefix%'`` could ride the btree, which SQLite only does when the index
+        -- column folds the same way.)
         CREATE INDEX IF NOT EXISTS idx_file_touches_path
             ON conversation_file_touches(file_path COLLATE NOCASE);
 
