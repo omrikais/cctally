@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConversationRail } from './ConversationRail';
+import { ConversationRail, MATCH_KIND_LABELS } from './ConversationRail';
 import { _resetForTests, dispatch, getState } from '../store/store';
 import { clearRailPrefs } from '../store/conversationRailPrefs';
 import type { ConversationSummary, SearchHit } from '../types/conversation';
@@ -416,6 +416,18 @@ describe('ConversationRail', () => {
     const pathOccurrences =
       row.textContent!.split('bin/_lib_conversation_query.py').length - 1;
     expect(pathOccurrences).toBe(1);
+  });
+
+  it('MATCH_KIND_LABELS has an explicit entry for every badge kind', () => {
+    // #223 item 3 — direct map coverage. The rendered-badge tests pass via
+    // KindBadges' `?? b` fallback whether or not the entries exist; this reads
+    // the map directly so a missing/stray entry fails loud. The four keys mirror
+    // SearchHit['match_kinds'] ('tool' | 'thinking' | 'title' | 'file'); a new
+    // match kind must add its label here too (the `satisfies` type enforces that
+    // at build time, this catches stray/regressed entries at test time).
+    expect(Object.keys(MATCH_KIND_LABELS).sort()).toEqual(['file', 'thinking', 'title', 'tool']);
+    expect(MATCH_KIND_LABELS.title).toBe('title');
+    expect(MATCH_KIND_LABELS.file).toBe('file');
   });
 
   it('a prose hit STILL renders its snippet row (the file-hit suppression is file-only)', () => {

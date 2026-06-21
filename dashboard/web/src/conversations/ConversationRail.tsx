@@ -45,15 +45,16 @@ const KIND_CHIPS: {
   { kind: 'files', label: 'Files', needsSplit: false, group: 'structural' },
 ];
 
-// #217 S4 / I-3.3 — match-kind badge labels. `tool`/`thinking` (#177 S6) keep
-// their identity labels; the cross-session facets add `title`→"title",
-// `file`→"file". Any unmapped value falls back to itself.
-const MATCH_KIND_LABELS: Record<string, string> = {
+// #217 S4 / I-3.3 / #223 — match-kind badge labels. Exported + `satisfies`-typed
+// against the SearchHit['match_kinds'] union so a NEW union member without a
+// label entry fails `tsc` (a runtime test alone can't catch that). Any unmapped
+// value still falls back to itself in KindBadges.
+export const MATCH_KIND_LABELS = {
   tool: 'tool',
   thinking: 'thinking',
   title: 'title',
   file: 'file',
-};
+} satisfies Record<NonNullable<SearchHit['match_kinds']>[number], string>;
 
 // Human label for a stored datePreset KEY (the popover stores the key; the chip
 // shows the label). Falls back to the from→to range for a raw range (preset key
