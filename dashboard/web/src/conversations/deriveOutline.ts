@@ -50,9 +50,19 @@ export interface OutlineEntry {
   // entryId (already unique) and the bucket root uuid as the jump anchor.
   entryId: string;
   uuid: string;                       // jump target (anchor uuid / bucket root)
-  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache';
+  // #217 S3 F8 — 'compaction' added (a compaction-summary turn, meta_kind
+  // 'compaction'); it joins the existing landmark family.
+  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache' | 'compaction';
   label: string;
-  depth: 0 | 1;                       // 0 = prompt / pre-prompt landmark; 1 = section landmark
+  // 0 = prompt / pre-prompt landmark; 1 = section landmark. #217 S3 E6(c) — a
+  // NESTED subagent (one whose parent is ANOTHER subagent bucket) renders one
+  // level deeper than its parent, so depth can exceed 1 in the tree case; a
+  // session with no subagent→subagent nesting stays 0|1 (degenerate-to-flat).
+  depth: number;
+  // #217 S3 E6(c) — tree linkage: the entryId of the parent SUBAGENT bucket when
+  // this entry is a nested sub-subagent; ABSENT on every flat (top-level) entry
+  // so the no-nesting output is byte-identical to the pre-change flat shape.
+  parentEntryId?: string;
   error: boolean;
   plan: boolean;                      // ExitPlanMode present
   question: boolean;                  // AskUserQuestion present
@@ -99,6 +109,22 @@ export function deriveOutline(
     }
   }
 
+  // #217 S3 E6(c) — the tree. A subagent bucket whose `parent_subagent_key`
+  // points at ANOTHER bucket that EXISTS here nests under that parent (mirroring
+  // the reader's groupSidechains recursion); any bucket whose parent is null /
+  // absent / unresolved (no matching bucket) is TOP-LEVEL and emits at its own
+  // document position, exactly as before. This split is what makes the tree
+  // degenerate to the flat list byte-for-byte when nothing genuinely nests.
+  const childrenOf = new Map<string, string[]>();   // parent key → child keys (doc order of first member)
+  const isNested = new Set<string>();               // buckets that nest under another bucket
+  for (const k of buckets.keys()) {
+    const pk = subagentMeta?.[k]?.parent_subagent_key;
+    if (pk != null && pk !== k && buckets.has(pk)) {
+      (childrenOf.get(pk) ?? childrenOf.set(pk, []).get(pk)!).push(k);
+      isNested.add(k);
+    }
+  }
+
   const entries: OutlineEntry[] = [];
   const sectionByUuid = new Map<string, string>();
   const emittedBucket = new Set<string>();
@@ -120,19 +146,25 @@ export function deriveOutline(
     for (const u of t.member_uuids) sectionByUuid.set(u, sectionUuid);
   };
 
-  const emitBucket = (k: string) => {
+  // Emit one subagent bucket entry at `entryDepth`, mapping its members to the
+  // current section, then RECURSE into its child buckets one level deeper
+  // (depth-first, document order). `parentEntryId` is the parent bucket's
+  // entryId (undefined for a top-level bucket → no key written, so the flat
+  // shape is byte-identical). The default `entryDepth = depth()` + no parent
+  // reproduces the pre-change call for every top-level bucket.
+  const emitBucket = (k: string, entryDepth: number = depth(), parentEntryId?: string) => {
     const b = buckets.get(k)!;
     const anyErr = b.some((t) => t.tools?.some((x) => x.is_error));
     // cache-failure-markers spec §4 — a flagged subagent turn flags the BUCKET
     // row (trailing ⚡) rather than nesting a row inside it (keeps the rail
     // shallow). Use the FIRST flagged member's payload for the row's cacheInfo.
     const cfMember = markersEnabled ? b.find((t) => t.cache_failure) : undefined;
-    entries.push({
+    const entry: OutlineEntry = {
       entryId: `sc:${k}`, uuid: b[0].uuid, type: 'subagent',
       // #193 (Codex P2-4): mirror the thread header — prefer the spawning Task
       // description, fall back to `subagent · <kind>` when none is plumbed.
       label: subagentMeta?.[k]?.description ?? `subagent · ${subagentMeta?.[k]?.kind ?? 'agent'}`,
-      depth: depth(), error: anyErr, plan: false, question: false, thinkingCount: 0,
+      depth: entryDepth, error: anyErr, plan: false, question: false, thinkingCount: 0,
       cache: cfMember ? true : undefined,
       cacheInfo: cfMember?.cache_failure
         ? { tokens_recreated: cfMember.cache_failure.tokens_recreated, est_wasted_usd: cfMember.cache_failure.est_wasted_usd }
@@ -140,18 +172,31 @@ export function deriveOutline(
       toolCount: b.reduce((n, t) => n + (t.tools?.length ?? 0), 0),
       subagentKey: k, subagentKind: subagentMeta?.[k]?.kind,
       turnIndex: indexOf.get(b[0].uuid) ?? 0,
-    });
+    };
+    // #217 S3 E6(c) — only a genuinely-nested bucket carries parentEntryId, so
+    // the flat case writes no key (byte-stable degenerate).
+    if (parentEntryId !== undefined) entry.parentEntryId = parentEntryId;
+    entries.push(entry);
     emittedBucket.add(k);
     // Every bucket member's uuids map to the enclosing section prompt (so a
     // scroll landing on any sidechain fragment resolves to the section).
     if (sectionUuid != null) for (const t of b) for (const u of t.member_uuids) sectionByUuid.set(u, sectionUuid);
+    // #217 S3 E6(c) — recurse into child buckets one level deeper, right after
+    // their parent, so the tree reads parent→children contiguously.
+    for (const ck of childrenOf.get(k) ?? []) {
+      if (!emittedBucket.has(ck)) emitBucket(ck, entryDepth + 1, entry.entryId);
+    }
   };
 
   for (const t of turns) {
     // Subagent member turns are handled by the bucket; place the bucket landmark
-    // at the FIRST member's document position, then map all member uuids.
+    // at the FIRST member's document position, then map all member uuids. #217 S3
+    // E6(c) — a NESTED bucket is NOT placed here; it is emitted (indented) by its
+    // parent's recursion in emitBucket, so we skip it in the main document walk.
     if (t.subagent_key != null) {
-      if (!emittedBucket.has(t.subagent_key)) emitBucket(t.subagent_key);
+      if (!isNested.has(t.subagent_key) && !emittedBucket.has(t.subagent_key)) {
+        emitBucket(t.subagent_key);
+      }
       continue;
     }
 
@@ -178,9 +223,21 @@ export function deriveOutline(
     }
 
     if (t.kind === 'meta') {
-      // command meta (and skill/context) → no rail row. Still map members so a
-      // scroll landing on it resolves to the enclosing section.
+      // #217 S3 F8 — a COMPACTION meta turn (parser stamp meta_kind
+      // 'compaction', #191) becomes a navigable 'compaction' landmark at its
+      // document position (depth 0 before the first prompt, else depth 1). The
+      // turn already renders in the reader — this is landmark + jump only. Every
+      // OTHER meta (command/skill/context/notification) emits NO rail row, as
+      // before; members are still mapped so a scroll landing resolves the section.
       mapMembers(t);
+      if (t.meta_kind === 'compaction') {
+        entries.push({
+          entryId: t.uuid, uuid: t.uuid, type: 'compaction',
+          label: t.label || 'compaction',
+          depth: depth(), error: false, plan: false, question: false,
+          thinkingCount: 0, toolCount: 0, turnIndex: indexOf.get(t.uuid) ?? 0,
+        });
+      }
       continue;
     }
 

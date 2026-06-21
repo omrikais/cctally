@@ -298,21 +298,30 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     expect(errChip.textContent?.toLowerCase()).toContain('error turns');
   });
 
-  it('clicking a cluster chip jumps to the next target; shift-click goes previous', () => {
+  // #217 S3 E8 (chip primary-click — folded in from I-1's deferral, spec §3
+  // surface 2): the chip PRIMARY click now jumps to the MOST-RECENT occurrence
+  // (targets.<kind>.at(-1)) — a direct action, not stepping. SHIFT-click keeps
+  // the existing previous-stepping. (The reader's u/U,e/E keys keep stepping;
+  // a/L keys are the keyboard twins of this jump-to-last.)
+  it('chip PRIMARY click jumps to the most-recent occurrence; shift-click steps previous', () => {
     const o = outline({
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'one' }),
         turn({ uuid: 'a1', kind: 'assistant', label: 'work' }),
         turn({ uuid: 'h2', kind: 'human', label: 'two' }),
+        turn({ uuid: 'h3', kind: 'human', label: 'three' }),
       ],
     });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const promptBtn = container.querySelector<HTMLButtonElement>('[data-jump-kind="prompt"]')!;
+    // Primary click → the LAST prompt (h3), regardless of cursor position.
     fireEvent.click(promptBtn);
-    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
-    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h2' });
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h3' });
+    // Shift-click → previous STEP from the cursor (now h3) → h2. act() so the
+    // cursor prop flushes into JumpCluster before the click reads it.
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h3' }); });
     fireEvent.click(promptBtn, { shiftKey: true });
-    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h2' });
   });
 
   it('the cluster is absent when no jump targets exist', () => {
@@ -394,7 +403,10 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
   // which sits ABOVE the centered target), so the second forward click re-found
   // the SAME prompt. With the pin driving the cursor, the second click reads the
   // cursor at the landed index and steps strictly forward.
-  it('two consecutive forward prompt jumps land on DISTINCT landmarks (closes #187)', () => {
+  // #188 S2 (#187) — the SHIFT-click stepping path still prefers the pin over the
+  // lagging scroll cursor. (Primary click is now jump-to-last — #217 S3 E8 —, so
+  // the #187 step-disambiguation concern now lives on the shift-click step.)
+  it('shift-click prompt steps from the PIN, not the lagging scroll cursor (closes #187)', () => {
     const o = outline({
       turns: [
         turn({ uuid: 'h1', kind: 'human', label: 'one' }),
@@ -407,20 +419,18 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const promptBtn = container.querySelector<HTMLButtonElement>('[data-jump-kind="prompt"]')!;
 
-    // Model the bug precisely: a previous forward jump LANDED on h2 (centered),
-    // but the scroll-sync observer reports the topmost-VISIBLE turn h1 — the one
-    // ABOVE the centered target. The pin records the real landing (h2); the
-    // scroll cursor lags one prompt behind at h1.
+    // A previous jump LANDED on h2 (pin), but the scroll-sync observer reports
+    // the topmost-VISIBLE turn h3 (BELOW the centered target). The pin records
+    // the real landing (h2); the scroll cursor lags ahead at h3.
     act(() => {
       dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h2' });
-      dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' });
+      dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h3' });
     });
 
-    // Forward jump: the pin (h2) wins over the scroll cursor (h1), so the cursor
-    // resolves to h2's index and steps strictly forward to h3 — NOT back to h2.
-    // Pre-fix (cursor = currentUuid = h1) this re-found h2, the #187 symptom.
-    fireEvent.click(promptBtn);
-    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h3' });
+    // Backward step: the pin (h2) wins over the scroll cursor (h3), so the cursor
+    // resolves to h2's index and steps strictly backward to h1 — NOT to h2.
+    fireEvent.click(promptBtn, { shiftKey: true });
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'h1' });
   });
 
   // ---- cache-failure-markers spec §4 — stats row + jump chip + opt-out ----
@@ -520,5 +530,126 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     expect(container.querySelector('.conv-outline-entry-tools')).toBeNull();
     expect(container.textContent).not.toMatch(/· 2 tools/);
+  });
+
+  // ---- #217 S3 F8 — compaction landmark chip + jump --------------------
+  it('renders a compaction jump chip (data-jump-kind="compaction") when a compaction turn exists', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'long' }),
+        turn({ uuid: 'cx', kind: 'meta', label: 'compacted', meta_kind: 'compaction' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const chip = container.querySelector('[data-jump-kind="compaction"]');
+    expect(chip).toBeTruthy();
+    expect(chip!.textContent?.toLowerCase()).toContain('compaction');
+  });
+
+  it('clicking the compaction chip jumps to the compaction turn', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'long' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'work' }),
+        turn({ uuid: 'cx', kind: 'meta', label: 'compacted', meta_kind: 'compaction' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const chip = container.querySelector<HTMLButtonElement>('[data-jump-kind="compaction"]')!;
+    fireEvent.click(chip);
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'cx' });
+  });
+
+  it('renders a compaction OUTLINE entry (navigable) for a compaction turn', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'long' }),
+        turn({ uuid: 'cx', kind: 'meta', label: 'Conversation compacted', meta_kind: 'compaction' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const entry = container.querySelector('.conv-outline-entry--compaction');
+    expect(entry).toBeTruthy();
+    expect(entry!.textContent).toContain('Conversation compacted');
+  });
+
+  it('no compaction chip when there is no compaction turn', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    expect(container.querySelector('[data-jump-kind="compaction"]')).toBeNull();
+  });
+
+  // ---- #217 S3 E6(a) — per-subagent cost render -------------------------
+  it('renders subagent cost from outline.subagent_costs on the subagent entry', () => {
+    const o = outline({
+      subagent_meta: { sk1: { kind: 'explore' } },
+      subagent_costs: { sk1: 0.4231 },
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+        turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'sk1', parent_uuid: 'x', is_sidechain: true }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const sub = container.querySelector('.conv-outline-entry--subagent')!;
+    expect(sub).toBeTruthy();
+    // fmt.usd2(0.4231) → "$0.42".
+    expect(sub.textContent).toContain('$0.42');
+  });
+
+  it('renders cost for a subagent bucket whose subagent_meta is EMPTY (the s7 case)', () => {
+    const o = outline({
+      subagent_meta: {},               // no meta for the bucket
+      subagent_costs: { ghostkey: 0.8 },
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+        turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'ghostkey', parent_uuid: 'x', is_sidechain: true }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const sub = container.querySelector('.conv-outline-entry--subagent')!;
+    expect(sub).toBeTruthy();
+    expect(sub.textContent).toContain('$0.80');
+  });
+
+  it('renders no cost affordance when subagent_costs lacks the bucket', () => {
+    const o = outline({
+      subagent_meta: { sk1: { kind: 'explore' } },
+      subagent_costs: {},              // no cost for sk1
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'dispatch' }),
+        turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'sk1', parent_uuid: 'x', is_sidechain: true }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const sub = container.querySelector('.conv-outline-entry--subagent')!;
+    expect(sub.querySelector('.conv-outline-entry-cost')).toBeNull();
+  });
+
+  // ---- #217 S3 E6(c) — tree (nested subagents render indented) ----------
+  it('a nested subagent renders indented (deeper depth class) beneath its parent bucket', () => {
+    const o = outline({
+      subagent_meta: {
+        C: { kind: 'code-reviewer', parent_subagent_key: null },
+        G: { kind: 'grounding', parent_subagent_key: 'C' },
+      },
+      subagent_costs: { C: 0.1, G: 0.05 },
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'audit' }),
+        turn({ uuid: 'c1', kind: 'assistant', label: 'review', subagent_key: 'C', parent_uuid: null, is_sidechain: true }),
+        turn({ uuid: 'g1', kind: 'assistant', label: 'ground', subagent_key: 'G', parent_uuid: null, is_sidechain: true }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const subs = Array.from(container.querySelectorAll('.conv-outline-entry--subagent'));
+    expect(subs).toHaveLength(2);
+    // The nested child (G) carries the depth-2 nesting modifier; its parent (C)
+    // sits at depth 1 (the single-level --nested class).
+    const cEntry = subs.find((e) => e.textContent?.includes('code-reviewer'))!;
+    const gEntry = subs.find((e) => e.textContent?.includes('grounding'))!;
+    expect(cEntry.className).toContain('conv-outline-entry--nested');
+    // The grandchild indents deeper than its parent (a data attribute drives the
+    // indent so we can assert the level without pixel math).
+    const cDepth = Number(cEntry.getAttribute('data-depth'));
+    const gDepth = Number(gEntry.getAttribute('data-depth'));
+    expect(gDepth).toBe(cDepth + 1);
   });
 });

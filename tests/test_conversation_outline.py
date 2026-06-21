@@ -478,3 +478,110 @@ def test_outline_rebuilds_null_ts_sorts_last_on_tie():
     assert rb[0]["est_wasted_usd"] == rb[1]["est_wasted_usd"]    # tie
     assert rb[0]["uuid"] == "fa" and rb[0]["ts"] is not None     # ts-set first
     assert rb[1]["uuid"] == "fb" and rb[1]["ts"] is None         # null-ts last
+
+
+# ---------------------------------------------------------------------------
+# #217 S3 E6(a) — per-subagent cost map (`subagent_costs`).
+#
+# Display-only, read-time outline enrichment: a top-level `subagent_costs`
+# dict mapping every subagent_key present in the session (INCLUDING buckets
+# whose `subagent_meta` is empty — the s7 case) to a float cost, summed
+# cost-once over the assembled items (the same cost-once-per-turn discipline
+# as the items themselves carry). It lives in a SEPARATE top-level map, NOT
+# inside `subagent_meta`, so the outline↔reader `subagent_meta` parity assert
+# (bin/cctally-conversation-test:779) stays byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+def test_outline_subagent_costs_keystone_cost_once():
+    # The s5 fixture's sole subagent (sc1, source /agents/agent-abc.jsonl →
+    # subagent_key "abc") carries cost row (m2,r2): inp=10,out=20,cr=0. Its
+    # subagent_costs entry must equal that turn's independently-computed cost,
+    # summed cost-once (the item already carries the cost-once-per-turn value).
+    c = _conn()
+    _seed_rich(c)
+    out = cq.get_conversation_outline(c, "s5")
+    sc = out["subagent_costs"]
+    assert "abc" in sc
+    # Independent: the cost helper over the subagent turn's exact usage row.
+    expected = round(cq._entry_cost(_MODEL, 10, 20, 0, 0, None), 6)
+    assert expected > 0
+    assert abs(sc["abc"] - expected) < 1e-9
+    # The main-session cost is NOT in the map (None subagent_key is excluded).
+    assert None not in sc
+    assert "None" not in sc
+
+
+def test_outline_subagent_costs_covers_empty_meta_bucket():
+    # A subagent whose `subagent_meta` is ABSENT (the s7 case: a sidechain turn
+    # with no spawn/result meta plumbed) must STILL get a subagent_costs entry —
+    # deriveOutline emits a row for it, so the cost must be present to render.
+    c = _conn()
+    # main human + assistant (cost), and a sidechain subagent with NO meta but a
+    # real cost row (mirrors s7's `dddd4444` bucket).
+    _msg(c, session_id="emc", uuid="h1", source_path="m.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="go")
+    _msg(c, session_id="emc", uuid="a1", source_path="m.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "ok"}]))
+    _entry(c, source_path="m.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=100, out=200, cc=0, cr=0)
+    # sidechain subagent (agent-xyz → key "xyz"), parent points at a main member,
+    # with its own cost row but NO subagent_meta (no spawn tool_use linkage).
+    _msg(c, session_id="emc", uuid="sc1", parent_uuid="a1",
+         source_path="/agents/agent-xyz.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="sub", model=_MODEL, msg_id="m2", req_id="r2", is_sidechain=1,
+         blocks_json=_json.dumps([{"kind": "text", "text": "sub"}]))
+    _entry(c, source_path="/agents/agent-xyz.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=50, out=60, cc=0, cr=0)
+    out = cq.get_conversation_outline(c, "emc")
+    # The bucket has NO subagent_meta entry...
+    assert "xyz" not in (out["subagent_meta"] or {})
+    # ...but its cost is still covered.
+    assert "xyz" in out["subagent_costs"]
+    expected = round(cq._entry_cost(_MODEL, 50, 60, 0, 0, None), 6)
+    assert abs(out["subagent_costs"]["xyz"] - expected) < 1e-9
+
+
+def test_outline_subagent_costs_absent_without_subagents():
+    # A session with NO subagents emits an empty map (not absent), so the client
+    # can read `subagent_costs[key]` uniformly.
+    c = _conn()
+    _msg(c, session_id="ns", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi")
+    _msg(c, session_id="ns", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="x", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "x"}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=0, cr=0)
+    out = cq.get_conversation_outline(c, "ns")
+    assert out["subagent_costs"] == {}
+
+
+def test_outline_subagent_costs_sum_matches_bucket_total():
+    # Two cost-bearing turns in ONE subagent bucket sum cost-once into a single
+    # subagent_costs value (no double-count across the bucket's turns).
+    c = _conn()
+    _msg(c, session_id="ms", uuid="h1", source_path="m.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="go")
+    # subagent turn A
+    _msg(c, session_id="ms", uuid="sa", parent_uuid="h1",
+         source_path="/agents/agent-q.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="A", model=_MODEL, msg_id="ma", req_id="ra", is_sidechain=1,
+         blocks_json=_json.dumps([{"kind": "text", "text": "A"}]))
+    _entry(c, source_path="/agents/agent-q.jsonl", line_offset=0, model=_MODEL,
+           msg_id="ma", req_id="ra", inp=100, out=200, cc=0, cr=0)
+    # subagent turn B (same agent file → same bucket "q")
+    _msg(c, session_id="ms", uuid="sb", parent_uuid="h1",
+         source_path="/agents/agent-q.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="B", model=_MODEL, msg_id="mb", req_id="rb", is_sidechain=1,
+         blocks_json=_json.dumps([{"kind": "text", "text": "B"}]))
+    _entry(c, source_path="/agents/agent-q.jsonl", line_offset=1, model=_MODEL,
+           msg_id="mb", req_id="rb", inp=300, out=400, cc=0, cr=0)
+    out = cq.get_conversation_outline(c, "ms")
+    a = round(cq._entry_cost(_MODEL, 100, 200, 0, 0, None), 6)
+    b = round(cq._entry_cost(_MODEL, 300, 400, 0, 0, None), 6)
+    assert abs(out["subagent_costs"]["q"] - (a + b)) < 1e-9

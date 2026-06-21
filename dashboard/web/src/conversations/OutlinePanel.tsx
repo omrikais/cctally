@@ -59,19 +59,12 @@ function JumpCluster({
   // even if flagged turns exist (the opt-out hides ALL marker surfaces).
   markersEnabled: boolean;
 }) {
-  const { indexByUuid, ...targets } = lists;
+  const { indexByUuid, memberIndex: _memberIndex, ...targets } = lists;
 
-  const jump = (kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
-    const cursorUuid = pinned ?? currentUuid;
-    const cursor = cursorUuid != null && indexByUuid.has(cursorUuid) ? indexByUuid.get(cursorUuid)! : -1;
-    const targetIdx = nextTarget(targets[kind], cursor, dir);
-    if (targetIdx == null) {
-      if (!reduced) {
-        btn.classList.add('conv-pulse-disabled');
-        window.setTimeout(() => btn.classList.remove('conv-pulse-disabled'), 300);
-      }
-      return;
-    }
+  // Dispatch the OPEN_CONVERSATION jump for a resolved target turn index, after
+  // the focus-mode-unhide check. Shared by both the primary-click jump-to-last
+  // and the shift-click step (and the miss-pulse on an empty step).
+  const jumpToIndex = (targetIdx: number) => {
     const turn = turns[targetIdx];
     // Reset to `all` IF the current focus mode would hide the target turn (never
     // a silent jump behind a focus filter); mirrors the entry-click path.
@@ -79,6 +72,33 @@ function JumpCluster({
       dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
     }
     dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: turn.uuid } });
+  };
+
+  const missPulse = (btn: HTMLElement) => {
+    if (!reduced) {
+      btn.classList.add('conv-pulse-disabled');
+      window.setTimeout(() => btn.classList.remove('conv-pulse-disabled'), 300);
+    }
+  };
+
+  // #217 S3 E8 — the chip PRIMARY click jumps to the MOST-RECENT occurrence
+  // (targets.<kind>.at(-1)) — the keyboard `a`/`L` keys' twin. A direct landing,
+  // not a step. Empty family → a graceful no-op (no pulse).
+  const jumpToLast = (kind: JumpKind) => {
+    const targetIdx = targets[kind].at(-1);
+    if (targetIdx == null) return;
+    jumpToIndex(targetIdx);
+  };
+
+  // The existing next/prev STEPPING (shift-click → previous; the reader's
+  // e/E,u/U,b/B,p/P,c/C keys mirror this), cursor-relative with the pin
+  // preferred over the lagging scroll cursor (#187).
+  const jump = (kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
+    const cursorUuid = pinned ?? currentUuid;
+    const cursor = cursorUuid != null && indexByUuid.has(cursorUuid) ? indexByUuid.get(cursorUuid)! : -1;
+    const targetIdx = nextTarget(targets[kind], cursor, dir);
+    if (targetIdx == null) { missPulse(btn); return; }
+    jumpToIndex(targetIdx);
   };
 
   // `label` is the visible chip text; `aria` keeps the descriptive screen-reader
@@ -91,6 +111,8 @@ function JumpCluster({
     { kind: 'plan', glyph: '⊞', label: 'plans', aria: 'plan / question', key: 'p' },
     // cache-failure-markers spec §4 — amber ⚡ cache-rebuilds jump chip, `c` key.
     { kind: 'cache', glyph: '⚡', label: 'cache rebuilds', aria: 'cache rebuild', key: 'c' },
+    // #217 S3 F8 — compaction landmark jump chip, `m` key (compaction summary).
+    { kind: 'compaction', glyph: '⊟', label: 'compaction', aria: 'compaction', key: 'm' },
   ];
   // A def is shown when it has targets AND (for cache) markers are on — the
   // opt-out suppresses the chip even when flagged turns exist.
@@ -108,9 +130,13 @@ function JumpCluster({
             type="button"
             className="conv-jump-cluster-btn"
             data-jump-kind={d.kind}
-            title={`Next ${d.aria} (${d.key}) · shift-click for previous`}
-            aria-label={`Next ${d.aria}, ${targets[d.kind].length} total`}
-            onClick={(ev) => jump(d.kind, ev.shiftKey ? -1 : 1, ev.currentTarget)}
+            // #217 S3 E8 — primary click jumps to the LATEST occurrence;
+            // shift-click steps to the previous one (the reader keys mirror both).
+            title={`Latest ${d.aria} (${d.key}) · shift-click for previous`}
+            aria-label={`Latest ${d.aria}, ${targets[d.kind].length} total`}
+            onClick={(ev) =>
+              ev.shiftKey ? jump(d.kind, -1, ev.currentTarget) : jumpToLast(d.kind)
+            }
           >
             <span className="conv-jump-cluster-glyph" aria-hidden="true">{d.glyph}</span>
             <span className="conv-jump-cluster-text">{d.label}</span>
@@ -149,6 +175,9 @@ function entryGlyph(e: OutlineEntry) {
     // types that merely COINCIDE keep their own leading glyph (error/plan win);
     // the trailing ⚡ suffix below carries the cache flag on those rows.
     case 'cache': return <span className="conv-outline-entry-cache-glyph">⚡</span>;
+    // #217 S3 F8 — compaction landmark leads with a distinct glyph (the
+    // .conv-outline-entry--compaction rule styles the row).
+    case 'compaction': return <span className="conv-outline-entry-compaction-glyph" aria-hidden="true">⊟</span>;
     default: return <ToolGenericIcon />;
   }
 }
@@ -297,6 +326,11 @@ export function OutlinePanel({
     [outline, markersEnabled],
   );
 
+  // #217 S3 E6(a) — the display-only per-subagent cost map (subagent_key → USD).
+  // Rendered on each subagent entry's row; covers buckets with empty
+  // subagent_meta too (the server emits a cost for every bucket).
+  const subagentCosts = outline?.subagent_costs ?? {};
+
   // #186 §4.3 — lift the shared jump-target builder so the stats card's "N error
   // turns", the error chip count, and the navigation stops are provably one
   // source. `lists.error.length` is the error-TURN count (13), distinct from the
@@ -389,6 +423,11 @@ export function OutlinePanel({
                   ? e.uuid === pinned
                   : currentUuid != null &&
                     (e.uuid === currentUuid || (e.type === 'human' && e.uuid === currentSection));
+              // #217 S3 E6(c) — tree indentation. depth 0 = spine, 1 = section
+              // landmark, ≥2 = a nested sub-subagent. A CSS var drives the
+              // left-pad per level so a deeper child reads as indented under its
+              // parent; data-depth lets tests assert the level without pixels.
+              const cost = e.subagentKey != null ? subagentCosts[e.subagentKey] : undefined;
               return (
                 <li key={e.entryId}>
                   <button
@@ -397,6 +436,8 @@ export function OutlinePanel({
                       'conv-outline-entry',
                       `conv-outline-entry--${e.type}`,
                       e.depth ? 'conv-outline-entry--nested' : '',
+                      // ≥2 = a tree child; drives the extra-indent rule.
+                      e.depth >= 2 ? 'conv-outline-entry--subnested' : '',
                       e.error ? 'conv-outline-entry--error' : '',
                       // cache-failure-markers spec §4 — flagged rows (standalone
                       // OR coinciding) take the cache modifier for the amber cue.
@@ -404,6 +445,8 @@ export function OutlinePanel({
                     ]
                       .filter(Boolean)
                       .join(' ')}
+                    data-depth={e.depth}
+                    style={e.depth >= 2 ? ({ ['--conv-outline-depth' as string]: String(e.depth) }) : undefined}
                     aria-current={isCurrent ? 'true' : undefined}
                     onClick={() => jumpTo(e.uuid)}
                     title={e.label}
@@ -412,6 +455,17 @@ export function OutlinePanel({
                       {entryGlyph(e)}
                     </span>
                     <span className="conv-outline-entry-label">{e.label}</span>
+                    {/* #217 S3 E6(a) — per-subagent cost, display-only. Shown on a
+                        subagent entry when the server emitted a cost for its
+                        bucket (covers empty-subagent_meta buckets too). */}
+                    {e.type === 'subagent' && cost != null && (
+                      <span
+                        className="conv-outline-entry-cost"
+                        title={`Subagent cost (display-only): ${fmt.usd2(cost)}`}
+                      >
+                        {fmt.usd2(cost)}
+                      </span>
+                    )}
                     {e.thinkingCount > 0 && (
                       <span
                         className="conv-outline-entry-thinking"

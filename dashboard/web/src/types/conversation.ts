@@ -147,6 +147,12 @@ export interface OutlineStats {
 export interface ConversationOutline {
   session_id: string;
   subagent_meta?: Record<string, SubagentMeta>;
+  // #217 S3 E6(a) — display-only per-subagent cost map (subagent_key → USD),
+  // summed cost-once on the server. Kept SEPARATE from subagent_meta so the
+  // outline↔reader subagent_meta parity stays byte-for-byte; covers every
+  // subagent bucket including ones with empty subagent_meta. Optional for
+  // back-compat with a payload from an older server.
+  subagent_costs?: Record<string, number>;
   stats: OutlineStats;
   turns: OutlineTurn[];
 }

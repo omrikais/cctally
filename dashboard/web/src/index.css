@@ -5097,26 +5097,70 @@ mark.current {
   margin-bottom: 16px;
 }
 /* #177 S5 §3 — when the outline panel is open, the two-column grid grows a
-   third column on the reader's right. Closed → back to two columns (the panel
-   is simply not rendered). */
+   resize divider + a third column on the reader's right. Closed → back to two
+   columns (the panel + divider are simply not rendered).
+   #217 S3 E6(b) — the 3rd content track is `var(--conv-outline-width, 290px)`
+   clamped to the original [230, 480] band (the JS clamps too; clamp() here keeps
+   the layout sane if the var is ever out of band). The divider is a thin 6px
+   track BETWEEN the reader (1fr) and the outline column. */
 .conv-view--outline {
-  grid-template-columns: minmax(280px, 340px) 1fr minmax(230px, 290px);
+  grid-template-columns:
+    minmax(280px, 340px)
+    1fr
+    6px
+    clamp(230px, var(--conv-outline-width, 290px), 480px);
 }
 /* #184 — intermediate desktop breakpoint. Between the mobile cutover (640px,
    where the outline rides as a slide-over sheet) and ~1100px, three columns
    squeeze the reader toward its grid minimum. In that band revert
    `.conv-view--outline` to the two-column template and drop the outline column
-   entirely — the store `convOutlineOpen` flag stays set (the toggle's pressed
-   state is preserved), the column simply doesn't render at this width. CSS-only:
-   JSDOM doesn't evaluate @media, so this is verified in the Playwright pass, not
-   a unit test. The mobile (<=640px) sheet behavior below is untouched. */
+   (and the divider) entirely — the store `convOutlineOpen` flag stays set (the
+   toggle's pressed state is preserved), the column simply doesn't render at this
+   width. CSS-only: JSDOM doesn't evaluate @media, so this is verified in the
+   Playwright pass, not a unit test. The mobile (<=640px) sheet behavior below is
+   untouched. */
 @media (min-width: 641px) and (max-width: 1100px) {
   .conv-view--outline {
     grid-template-columns: minmax(280px, 340px) 1fr;
   }
-  .conv-view--outline > .conv-outline {
+  .conv-view--outline > .conv-outline,
+  .conv-view--outline > .conv-outline-resizer {
     display: none;
   }
+}
+
+/* #217 S3 E6(b) — the outline resize divider. A thin vertical grab handle that
+   occupies the 6px divider track; a wider invisible hit area via padding makes
+   it easy to grab. Hidden by the mobile sheet rules below (the outline becomes a
+   slide-over, not a column). Reduced-motion-safe: no transition to suppress. */
+.conv-outline-resizer {
+  align-self: stretch;
+  width: 6px;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  /* Keyboard focus affordance. */
+  border-radius: 3px;
+}
+.conv-outline-resizer:hover,
+.conv-outline-resizer:focus-visible {
+  background: var(--border-soft);
+  outline: none;
+}
+.conv-outline-resizer:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-blue);
+}
+.conv-outline-resizer-grip {
+  width: 2px;
+  height: 28px;
+  border-radius: 2px;
+  background: var(--border-soft);
+}
+.conv-outline-resizer:hover .conv-outline-resizer-grip,
+.conv-outline-resizer:focus-visible .conv-outline-resizer-grip {
+  background: var(--text-dim);
 }
 
 /* ---- Outline sidebar + stats overview (#177 S5 §3) ---------------- */
@@ -5300,6 +5344,24 @@ mark.current {
 /* Landmark rows are indented + demoted under their prompt; no italic (the old
    thinking-child italic is retired — thinking is now a badge). */
 .conv-outline-entry--nested { padding-left: 22px; }
+/* #217 S3 E6(c) — a nested sub-subagent (depth ≥ 2) indents one extra level per
+   depth beyond the section landmark, so the tree reads under its parent. The
+   --conv-outline-depth custom property (set per entry) drives the extra pad. */
+.conv-outline-entry--subnested {
+  padding-left: calc(22px + (var(--conv-outline-depth, 2) - 1) * 16px);
+}
+/* #217 S3 F8 — compaction landmark: a muted/blue cue distinct from the spine. */
+.conv-outline-entry--compaction { color: var(--text-dim); }
+.conv-outline-entry--compaction .conv-outline-entry-glyph,
+.conv-outline-entry-compaction-glyph { color: var(--accent-blue); }
+/* #217 S3 E6(a) — per-subagent cost chip on a subagent entry (display-only). */
+.conv-outline-entry-cost {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--accent-green);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
 .conv-outline-entry[aria-current="true"] {
   background: var(--panel-bg-2);
   border-color: var(--accent-blue);

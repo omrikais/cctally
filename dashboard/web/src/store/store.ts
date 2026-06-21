@@ -2,6 +2,7 @@ import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
 import type { ConversationFilters, ConversationJump, SearchKind } from '../types/conversation';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { recordReadingPos } from './readingPosition';
+import { clampOutlineWidth, loadOutlineWidth, saveOutlineWidth } from './outlineWidth';
 import {
   applySessionFilter,
   computeSearchMatches,
@@ -299,6 +300,11 @@ export interface UIState {
   // transcript. Reset to false on a genuine conversation switch; toggled only
   // by the reader's ☰ / `o` on mobile.
   convOutlineMobileOpen: boolean;
+  // #217 S3 E6(b) — the resizable outline column WIDTH (px), persisted to
+  // localStorage `cctally.conv.outlineWidth` (clamped [MIN, MAX]; default 290 =
+  // today's track ceiling so an un-resized panel is byte-identical). Drives the
+  // 3rd grid track of `.conv-view--outline` via a CSS custom property.
+  convOutlineWidth: number;
   convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
   convCurrentTurnUuid: string | null;
   // #188 S2 — the EXPLICIT-selection pin (always a real uuid; the bucket-root
@@ -553,6 +559,8 @@ function loadInitial(): UIState {
     conversationJump: null,
     convOutlineOpen,
     convOutlineMobileOpen: false,
+    // #217 S3 E6(b) — seed the persisted outline width (clamped; default 290).
+    convOutlineWidth: loadOutlineWidth(),
     convFocusMode: 'all',
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
@@ -717,6 +725,8 @@ export type Action =
   // consumer); SET_CONV_CURRENT_TURN is the scroll-sync cursor written by the
   // reader's IntersectionObserver.
   | { type: 'TOGGLE_CONV_OUTLINE' }
+  // #217 S3 E6(b) — set + persist the resizable outline column width (clamped).
+  | { type: 'SET_CONV_OUTLINE_WIDTH'; px: number }
   // #205 S1 — the ☰ button + `o` key on mobile flip the ephemeral mobile flag
   // (no persistence); the ✕ button + backdrop force it closed.
   | { type: 'TOGGLE_CONV_OUTLINE_MOBILE' }
@@ -992,6 +1002,16 @@ export function dispatch(action: Action): void {
         // toggle; the pref just won't survive a reload.
       }
       state = { ...state, convOutlineOpen: next };
+      break;
+    }
+    case 'SET_CONV_OUTLINE_WIDTH': {
+      // #217 S3 E6(b) — clamp + persist the outline width. No-op (no re-render)
+      // when the clamped value is unchanged, so a held arrow at the clamp edge
+      // or an identical pointer-move doesn't churn the store.
+      const px = clampOutlineWidth(action.px);
+      if (px === state.convOutlineWidth) break;
+      saveOutlineWidth(px);
+      state = { ...state, convOutlineWidth: px };
       break;
     }
     case 'TOGGLE_CONV_OUTLINE_MOBILE':

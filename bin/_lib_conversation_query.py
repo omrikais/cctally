@@ -1730,6 +1730,23 @@ def get_conversation_outline(conn, session_id):
     cf_wasted = 0.0
     cf_rebuilds = []      # per-rebuild list (worst-first), spec §1
     cache_saved = 0.0     # session cache-value-saved, spec §1
+    # #217 S3 E6(a) — per-subagent cost, summed COST-ONCE over the assembled
+    # items (each item already carries the cost-once-per-turn `cost_usd`, so a
+    # plain per-subagent_key sum never double-counts across folded fragments —
+    # the same discipline `cache_saved` above uses). DISPLAY-ONLY (never a
+    # reconciled / budget / snapshot figure, like `cache_saved_usd`). Emitted as
+    # a SEPARATE top-level `subagent_costs` map — NOT inside `subagent_meta` —
+    # so the outline↔reader `subagent_meta` parity assert stays byte-for-byte
+    # unchanged AND every bucket is covered, including a subagent whose
+    # `subagent_meta` is absent (the s7 case: deriveOutline emits a row for it,
+    # so its cost must be present to render). Every non-null subagent_key bucket
+    # seeds at 0.0 so a zero-cost bucket still appears.
+    subagent_costs = {}   # subagent_key -> cost (cost-once)
+    for it in items:
+        sk = it.get("subagent_key")
+        if sk is not None:
+            subagent_costs.setdefault(sk, 0.0)
+            subagent_costs[sk] += it.get("cost_usd") or 0.0
     for it in items:
         kind = it["kind"]
         turn_counts["total"] += 1
@@ -1817,6 +1834,9 @@ def get_conversation_outline(conn, session_id):
     stats["cache_saved_usd"] = cache_saved
     return {"session_id": session_id,
             "subagent_meta": asm["subagent_meta"],
+            # #217 S3 E6(a) — display-only per-subagent cost (cost-once). 6dp,
+            # matching the per-item / header cost display precision.
+            "subagent_costs": {k: round(v, 6) for k, v in subagent_costs.items()},
             "stats": stats,
             "turns": turns}
 

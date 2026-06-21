@@ -41,7 +41,8 @@ export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean 
 // #184 — jump-target kinds the cluster + reader keys navigate. Sorted-ascending
 // index lists in outline-skeleton space, one per landmark family.
 // cache-failure-markers spec §4 — 'cache' added: the flagged-turn jump family.
-export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan' | 'cache';
+// #217 S3 F8 — 'compaction' added: the compaction-landmark jump family.
+export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan' | 'cache' | 'compaction';
 
 // The tools whose presence marks a turn as a plan / question landmark.
 export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
@@ -65,6 +66,8 @@ export interface OutlineTargets {
   subagent: number[];
   plan: number[];
   cache: number[];
+  // #217 S3 F8 — turns the parser stamped meta_kind 'compaction' (#191).
+  compaction: number[];
   // Every turn's OWN uuid → its skeleton index (cursor resolution).
   indexByUuid: Map<string, number>;
   // #217 S3 E2 (Codex P1) — every MEMBER (folded-fragment) uuid → its owning
@@ -82,6 +85,7 @@ export function buildOutlineTargets(turns: OutlineTurn[]): OutlineTargets {
   const subagent: number[] = [];
   const plan: number[] = [];
   const cache: number[] = [];
+  const compaction: number[] = [];
   const indexByUuid = new Map<string, number>();
   const memberIndex = new Map<string, number>();
   const seenSub = new Set<string>();
@@ -101,8 +105,10 @@ export function buildOutlineTargets(turns: OutlineTurn[]): OutlineTargets {
     }
     if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
     if (t.cache_failure) cache.push(i);
+    // #217 S3 F8 — compaction-summary turns (parser stamp, #191).
+    if (t.kind === 'meta' && t.meta_kind === 'compaction') compaction.push(i);
   });
-  return { error, prompt, subagent, plan, cache, indexByUuid, memberIndex };
+  return { error, prompt, subagent, plan, cache, compaction, indexByUuid, memberIndex };
 }
 
 // #217 S3 E2 (Codex P1) — resolve a (possibly folded-fragment) uuid to its

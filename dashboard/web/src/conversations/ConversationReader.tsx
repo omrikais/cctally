@@ -1409,6 +1409,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           when: () => guard() && markersEnabledRef.current,
           action: () => jumpNextRef.current('cache', -1),
         },
+        // #217 S3 F8 — `m`/`M` step to the next/prev compaction landmark (the
+        // compaction-summary turns, #191). Mirrors the c/C cache pattern; `m`/`M`
+        // are free single-char slots (no collision with the taken conversations-
+        // view set j k [ ] g o e E u U b B p P c C v n N End a L). Gated by the
+        // shared guard + the #156 conversations-view scope like every jump key.
+        mk('m', () => jumpNextRef.current('compaction', 1)),
+        mk('M', () => jumpNextRef.current('compaction', -1)),
         mk('v', () => cycleFocusMode()),
         // #217 S3 E8 — direct jump to the LAST (most-recent) prompt / error,
         // distinct from u/U,e/E STEPPING. `a` = last user prompt ("ask"); `L`

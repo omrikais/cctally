@@ -206,10 +206,13 @@ describe('deriveOutline (#186 §3 section walk)', () => {
     expect(entries.map((e) => [e.uuid, e.depth])).toEqual([['a1', 0]]);
   });
 
-  it('§5: a nested (grandchild) subagent still emits a FLAT outline entry (placement-agnostic)', () => {
-    // The reader nests G inside C's render node, but deriveOutline buckets over
-    // the whole list so BOTH C and G appear as flat depth-1 subagent landmarks
-    // (the outline is a flat jump index over the recursive reader).
+  it('§5 / E6(c): a nested (grandchild) subagent NESTS under its parent bucket (tree)', () => {
+    // #217 S3 E6(c) — the tree outline. A subagent whose parent_subagent_key
+    // points at ANOTHER subagent bucket nests indented BENEATH that parent (the
+    // reader's groupSidechains nesting, mirrored), rather than appearing flat at
+    // its own document position. Both C and G still emit subagent entries; G now
+    // renders immediately AFTER C, one level deeper, with parentEntryId === C's
+    // entryId.
     const meta: Record<string, SubagentMeta> = {
       C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
       G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
@@ -221,8 +224,16 @@ describe('deriveOutline (#186 §3 section walk)', () => {
     ], meta);
     const subs = entries.filter((e) => e.type === 'subagent');
     expect(subs.map((e) => e.subagentKey).sort()).toEqual(['C', 'G']);
-    // The grandchild entry's jump anchor is its own bucket root (g1).
-    expect(subs.find((e) => e.subagentKey === 'G')!.uuid).toBe('g1');
+    const cEntry = subs.find((e) => e.subagentKey === 'C')!;
+    const gEntry = subs.find((e) => e.subagentKey === 'G')!;
+    // The grandchild entry's jump anchor is still its own bucket root (g1).
+    expect(gEntry.uuid).toBe('g1');
+    // Tree: G nests one level deeper than C and renders immediately after it.
+    expect(gEntry.depth).toBe(cEntry.depth + 1);
+    expect(gEntry.parentEntryId).toBe(cEntry.entryId);
+    const cIdx = entries.indexOf(cEntry);
+    const gIdx = entries.indexOf(gEntry);
+    expect(gIdx).toBe(cIdx + 1);          // child immediately follows its parent
   });
 
   it('entryId is unique across a rich mixed fixture', () => {
@@ -350,5 +361,93 @@ describe('deriveOutline (#186 §3 section walk)', () => {
       turn({ uuid: 's1', kind: 'assistant', label: 'raw prompt', subagent_key: 'abc', parent_uuid: 'x' }),
     ], noDesc);
     expect(e2.find((e) => e.type === 'subagent')?.label).toBe('subagent · general-purpose');
+  });
+});
+
+// #217 S3 F8 — compaction landmark. A turn the parser stamped
+// meta_kind === 'compaction' (#191) becomes a dedicated 'compaction' outline
+// entry — a navigable landmark (the turn itself already renders in the reader).
+describe('deriveOutline — compaction landmark (#217 S3 F8)', () => {
+  it('a meta_kind:compaction turn → a compaction entry under the section', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'long session' }),
+      turn({ uuid: 'cx', kind: 'meta', label: 'Conversation compacted', meta_kind: 'compaction' }),
+    ], undefined);
+    const cx = entries.find((e) => e.type === 'compaction');
+    expect(cx).toBeTruthy();
+    expect(cx).toMatchObject({ uuid: 'cx', type: 'compaction', depth: 1 });
+  });
+
+  it('a meta_kind:command turn does NOT become a compaction entry (only compaction)', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
+    ], undefined);
+    expect(entries.some((e) => e.type === 'compaction')).toBe(false);
+    // (and the command meta still emits no row, unchanged)
+    expect(entries.map((e) => e.uuid)).toEqual(['h1']);
+  });
+
+  it('a pre-prompt compaction emits at depth 0', () => {
+    const { entries } = deriveOutline([
+      turn({ uuid: 'cx', kind: 'meta', label: 'compacted', meta_kind: 'compaction' }),
+      turn({ uuid: 'h1', kind: 'human', label: 'after' }),
+    ], undefined);
+    const cx = entries.find((e) => e.type === 'compaction')!;
+    expect(cx.depth).toBe(0);
+  });
+});
+
+// #217 S3 E6(c) — the tree outline degenerates to the pre-change FLAT output
+// whenever there is no genuine subagent→subagent nesting. This is the load-
+// bearing byte-stability guard: any session whose subagents are all main-
+// parented (parent_subagent_key null / absent / unresolved) must produce an
+// entries array byte-identical to today's flat list — no new fields, no depth
+// shift, no reorder.
+describe('deriveOutline — tree degenerates to flat (#217 S3 E6(c))', () => {
+  // A representative mixed flat session: prompt, heading, two MAIN-parented
+  // subagents (no parent_subagent_key), generic prose, a second prompt, a
+  // command meta, an error turn. None of the subagents nest under each other.
+  const meta: Record<string, SubagentMeta> = {
+    sk1: { kind: 'explore' },
+    sk2: { kind: 'general-purpose', parent_subagent_key: null },
+  };
+  const buildTurns = (): OutlineTurn[] => [
+    turn({ uuid: 'h1', kind: 'human', label: 'dispatch', member_uuids: ['h1', 'pm'] }),
+    turn({ uuid: 'a1', kind: 'assistant', label: '## Plan', thinking: ['t-a', 't-b'] }),
+    turn({ uuid: 's1', kind: 'assistant', label: 'sub a', subagent_key: 'sk2', parent_uuid: 'pm' }),
+    turn({ uuid: 'a2', kind: 'assistant', label: 'reply' }),
+    turn({ uuid: 's2', kind: 'assistant', label: 'sub b', subagent_key: 'sk1', parent_uuid: 'unresolved' }),
+    turn({ uuid: 'h2', kind: 'human', label: 'next' }),
+    turn({ uuid: 'm1', kind: 'meta', label: '/commit', meta_kind: 'command' }),
+    turn({ uuid: 'e1', kind: 'assistant', label: '', tools: [{ name: 'Bash', is_error: true }] }),
+  ];
+
+  it('no subagent→subagent nesting → entries byte-identical to the flat shape', () => {
+    const { entries } = deriveOutline(buildTurns(), meta);
+    // The exact pre-change flat shape (depth 0/1, no parentEntryId on any entry).
+    expect(entries.map((e) => ({ entryId: e.entryId, uuid: e.uuid, type: e.type, depth: e.depth }))).toEqual([
+      { entryId: 'h1', uuid: 'h1', type: 'human', depth: 0 },
+      { entryId: 'a1', uuid: 'a1', type: 'heading', depth: 1 },
+      { entryId: 'sc:sk2', uuid: 's1', type: 'subagent', depth: 1 },
+      { entryId: 'sc:sk1', uuid: 's2', type: 'subagent', depth: 1 },
+      { entryId: 'h2', uuid: 'h2', type: 'human', depth: 0 },
+      { entryId: 'e1', uuid: 'e1', type: 'error', depth: 1 },
+    ]);
+    // No flat entry carries a parentEntryId (tree linkage is absent on flat).
+    expect(entries.every((e) => e.parentEntryId === undefined)).toBe(true);
+  });
+
+  it('a subagent whose parent_subagent_key points at a NON-existent bucket stays flat (unresolved → top-level)', () => {
+    const m: Record<string, SubagentMeta> = {
+      X: { kind: 'agent', parent_subagent_key: 'ghost' },   // ghost has no bucket
+    };
+    const { entries } = deriveOutline([
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({ uuid: 'x1', kind: 'assistant', label: 'sub', subagent_key: 'X', parent_uuid: null }),
+    ], m);
+    const sub = entries.find((e) => e.type === 'subagent')!;
+    expect(sub.depth).toBe(1);                 // not nested
+    expect(sub.parentEntryId).toBeUndefined();
   });
 });

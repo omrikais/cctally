@@ -91,6 +91,26 @@ describe('buildOutlineTargets', () => {
     const t = buildOutlineTargets([turn({ uuid: 'a' }), turn({ uuid: 'b' })]);
     expect(t.cache).toEqual([]);
   });
+
+  // #217 S3 F8 — compaction landmark jump family. A meta_kind:'compaction' turn
+  // collects into `compaction`, navigable like the other landmark lists.
+  it('collects meta_kind:compaction turn indices into `compaction`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'h', kind: 'human' }),
+      turn({ uuid: 'cx1', kind: 'meta', meta_kind: 'compaction' }),
+      turn({ uuid: 'a', kind: 'assistant' }),
+      turn({ uuid: 'cx2', kind: 'meta', meta_kind: 'compaction' }),
+    ]);
+    expect(t.compaction).toEqual([1, 3]);
+  });
+
+  it('a non-compaction meta turn does NOT collect into `compaction`', () => {
+    const t = buildOutlineTargets([
+      turn({ uuid: 'h', kind: 'human' }),
+      turn({ uuid: 'm', kind: 'meta', meta_kind: 'command' }),
+    ]);
+    expect(t.compaction).toEqual([]);
+  });
 });
 
 // #217 S3 E2 (Codex P1) — `loadToTarget` must resolve a deep-link / search uuid

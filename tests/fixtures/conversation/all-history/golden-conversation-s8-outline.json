@@ -27,6 +27,12 @@
       "total": 13
     }
   },
+  "subagent_costs": {
+    "a55c0003": 0.0215,
+    "ace20002": 0.00375,
+    "b0c40004": 0.00725,
+    "cc110001": 0.005
+  },
   "subagent_meta": {
     "a55c0003": {
       "description": "Background audit",

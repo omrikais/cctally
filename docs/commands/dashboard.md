@@ -110,6 +110,7 @@ the UI with either input.
 | `u` / `U` | Reader: jump to next / previous prompt |
 | `b` / `B` | Reader: jump to next / previous subagent thread |
 | `p` / `P` | Reader: jump to next / previous plan/question turn |
+| `m` / `M` | Reader: jump to next / previous **compaction** landmark |
 | `j` / `k` | Reader: move the focused-turn cursor down / up |
 | `a` | Reader: jump directly to the **last** (most-recent) prompt |
 | `L` | Reader: jump directly to the **last** (most-recent) error turn |
@@ -297,7 +298,17 @@ The reader now opens a long conversation **at the bottom** — the newest turns 
 
 **Reading-position memory.** The reader remembers where you were in each conversation: when you switch away and come back later, it restores you to the turn you were last reading (anchored to that turn, not a pixel offset, so it survives a different window size or a grown transcript). A deep-link or jump target always wins over the saved position; if the saved turn no longer exists, the reader falls back to opening at the bottom (or the top for a single-page session). The memory is a small bounded list (the ~50 most-recently-read conversations) kept in your browser's local storage.
 
-**Direct jumps to the last prompt / last error.** Beyond the `e`/`E` and `u`/`U` step-to-next-or-previous keys, two keys jump **directly to the most-recent occurrence**: `a` lands on the last prompt and `L` lands on the last error turn — handy for "take me to where I last asked something" or "show me the latest failure" without stepping. Both are no-ops when the conversation has none, and both are suppressed while a filter input or modal is focused.
+**Direct jumps to the last prompt / last error.** Beyond the `e`/`E` and `u`/`U` step-to-next-or-previous keys, two keys jump **directly to the most-recent occurrence**: `a` lands on the last prompt and `L` lands on the last error turn — handy for "take me to where I last asked something" or "show me the latest failure" without stepping. Both are no-ops when the conversation has none, and both are suppressed while a filter input or modal is focused. The outline's **"Jump to" chips** follow the same model: a **primary click jumps to the latest occurrence** of that landmark family, and **shift-click steps to the previous** one (the chip arrows / reader step-keys are unchanged).
+
+### Outline upgrades & compaction landmark (#217 S3)
+
+**Per-subagent cost.** Each subagent thread in the outline now shows its **cost** beside the thread label — a display-only, summed-cost-once figure (never a reconciled/budget number, like the cache-saved figure). Every subagent bucket carries one, including older threads whose spawn metadata was never captured.
+
+**Resizable outline column.** A thin vertical **resize divider** sits between the reading column and the outline. Drag it to widen or narrow the outline (the column is on the right, so dragging left widens it); it's also **keyboard-resizable** when focused — `←`/`→` step the width, `Home`/`End` jump to the widest/narrowest — and carries a labeled `separator` role with `aria-valuenow`/`min`/`max` for screen readers. The width is clamped to a sensible band and **persisted** in your browser's local storage, so it survives reloads. On a narrow desktop the outline collapses to a slide-over sheet (as before) and the divider is hidden.
+
+**Tree outline (nested subagents).** When a subagent spawns its own sub-subagents, the outline now **nests** those children indented beneath their parent thread — a small tree mirroring how the reader nests them — instead of listing every thread flat. A session with no subagent-inside-subagent nesting looks exactly as before (the tree degenerates to the flat list).
+
+**Compaction landmark + jump.** A conversation **compaction** (the auto-summarize point) now shows as a dedicated outline landmark with its own "Jump to" chip, and `m`/`M` step to the next/previous compaction in the reader — so a long, compacted session is easy to navigate around the summary boundary.
 
 ### Jump to latest
 

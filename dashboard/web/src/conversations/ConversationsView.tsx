@@ -8,6 +8,7 @@ import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
 import { ConversationReader } from './ConversationReader';
 import { OutlinePanel } from './OutlinePanel';
+import { OutlineResizer } from '../components/OutlineResizer';
 import { ChatIcon } from './ConvIcons';
 
 // Two-pane Conversations workspace (spec §4). Mounted by App.tsx only
@@ -17,6 +18,9 @@ import { ChatIcon } from './ConvIcons';
 export function ConversationsView() {
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
+  // #217 S3 E6(b) — the persisted outline column width, driven into the grid as a
+  // CSS custom property on the desktop shell only.
+  const outlineWidth = useSyncExternalStore(subscribeStore, () => getState().convOutlineWidth);
   // #205 S1 — the ephemeral mobile outline-sheet flag (default closed, not
   // persisted). The mobile slide-over gates on this so it never auto-buries the
   // transcript on open; the desktop column below keeps gating on convOutlineOpen.
@@ -80,8 +84,14 @@ export function ConversationsView() {
       </div>
     );
   }
+  const outlineVisible = outlineOpen && selected != null;
   return (
-    <div className={['conv-view', outlineOpen && selected != null ? 'conv-view--outline' : ''].filter(Boolean).join(' ')}>
+    <div
+      className={['conv-view', outlineVisible ? 'conv-view--outline' : ''].filter(Boolean).join(' ')}
+      // #217 S3 E6(b) — the persisted outline width feeds the 3rd grid track via
+      // this custom property (only meaningful when the outline column shows).
+      style={outlineVisible ? ({ ['--conv-outline-width' as string]: `${outlineWidth}px` }) : undefined}
+    >
       <ConversationRail />
       {selected != null
         ? <ConversationReader sessionId={selected} outline={outline} />
@@ -90,8 +100,14 @@ export function ConversationsView() {
               <div className="conv-state-title">Select a conversation</div>
               <div className="conv-state-hint">Choose one from the list to start reading.</div></div>
           </div>}
-      {outlineOpen && selected != null && (
-        <OutlinePanel sessionId={selected} outline={outline} />
+      {outlineVisible && (
+        <>
+          {/* #217 S3 E6(b) — the resize divider sits BETWEEN the reader body and
+              the outline column (it computes width off the outline's right edge,
+              which is its next sibling). */}
+          <OutlineResizer />
+          <OutlinePanel sessionId={selected!} outline={outline} />
+        </>
       )}
     </div>
   );
