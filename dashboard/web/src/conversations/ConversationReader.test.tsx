@@ -100,6 +100,13 @@ afterEach(() => {
   _resetForTests();
   clearReadingPositions();
   vi.restoreAllMocks();
+  // Belt-and-suspenders over `test.unstubGlobals: true` (vite.config.ts):
+  // `stubMobileMedia` installs `matchMedia` via vi.stubGlobal, which
+  // restoreAllMocks does NOT undo — only unstubAllGlobals does. Without it a
+  // mobile test leaves matchMedia stubbed-as-mobile for every later test in the
+  // file, so `useIsMobile()` stays true and outline/layout assertions flake
+  // under reordering (#221).
+  vi.unstubAllGlobals();
 });
 
 describe('ConversationReader', () => {
@@ -520,13 +527,18 @@ describe('ConversationReader', () => {
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'g1' } });
     const { container } = render(<ConversationReader sessionId="s" />);
 
-    // Both the parent (C, data-uuid c1) and the grandchild (G, data-uuid g1) cards open.
+    // Both the parent (C, data-uuid c1) and the grandchild (G, data-uuid g1) cards
+    // open. The grandchild is nested inside the parent's body, so its card only
+    // mounts once the parent's force-open commit renders — one commit AFTER the
+    // parent opens. Await BOTH in the same waitFor (a synchronous grandchild
+    // check races that trailing commit and flakes under test reordering/load).
     await waitFor(() => {
       const parent = container.querySelector('details.conv-sidechain[data-uuid="c1"]') as HTMLDetailsElement | null;
+      const grandchild = container.querySelector('details.conv-sidechain[data-uuid="g1"]') as HTMLDetailsElement | null;
       expect(parent?.open).toBe(true);
+      expect(grandchild?.open).toBe(true);
     });
     const grandchild = container.querySelector('details.conv-sidechain[data-uuid="g1"]') as HTMLDetailsElement | null;
-    expect(grandchild?.open).toBe(true);
     // The grandchild card is nested (rendered inside the parent's body).
     expect(grandchild!.classList.contains('conv-sidechain--nested')).toBe(true);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
@@ -1893,9 +1905,17 @@ describe('ConversationReader scroll-sync producer (#177 S5 §3 / #184)', () => {
     vi.spyOn(elH2, 'getBoundingClientRect').mockReturnValue({ top: 40 } as DOMRect);
 
     // The scroll-sync observer is the one that observed the rendered turn
-    // elements (the lazy-load observer observes the sentinel, not these).
-    const obs = observers.find((o) => o.targets.includes(elH1) || o.targets.includes(elH2));
-    expect(obs).toBeDefined();
+    // elements (the lazy-load observer observes the sentinel, not these). It
+    // registers in an effect keyed on the rendered set, so its observe() can lag
+    // the turn render by a tick under test reordering — wait for it rather than
+    // grabbing it synchronously (a bare find() flaked ~1/40 under shuffle). The
+    // turn nodes are memoized + keyed, so elH1/elH2 identity is stable across
+    // polls and the rect spies above stay attached to the observed elements.
+    let obs: CapturedObs | undefined;
+    await waitFor(() => {
+      obs = observers.find((o) => o.targets.includes(elH1) || o.targets.includes(elH2));
+      expect(obs).toBeDefined();
+    });
 
     act(() => {
       obs!.cb(

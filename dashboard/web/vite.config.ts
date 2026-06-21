@@ -118,5 +118,12 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./__tests__/setup.ts'],
+    // Auto-undo `vi.stubGlobal(...)` between tests. Without this, a stub like
+    // `stubMobileMedia`'s `matchMedia` (vi.stubGlobal, which restoreAllMocks
+    // does NOT undo) leaks into every later test in the file, so `useIsMobile()`
+    // stays stuck and layout/outline assertions flake under test reordering
+    // (#221). Every stubGlobal call in the suite lives inside a beforeEach/it,
+    // so re-stubbing per test is unaffected by this auto-unstub.
+    unstubGlobals: true,
   },
 });
