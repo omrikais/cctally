@@ -1,7 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render } from '@testing-library/react';
 import { OutlineResizer } from './OutlineResizer';
 import { _resetForTests, getState } from '../store/store';
+import {
+  installGlobalKeydown,
+  uninstallGlobalKeydown,
+  registerKeymap,
+  _resetForTests as _resetKeymapForTests,
+} from '../store/keymap';
 import {
   OUTLINE_WIDTH_KEY,
   OUTLINE_WIDTH_MIN,
@@ -80,5 +86,38 @@ describe('OutlineResizer (#217 S3 E6(b))', () => {
     expect(getState().convOutlineWidth).toBe(OUTLINE_WIDTH_MAX);
     fireEvent.keyDown(sep, { key: 'End' });
     expect(getState().convOutlineWidth).toBe(OUTLINE_WIDTH_MIN);
+  });
+
+  // Cross-branch review P3 — a HANDLED resizer key must NOT also reach the
+  // document-level global keymap (a double-fire). The reader binds `End` to
+  // jump-to-latest at scope 'global'; pressing `End` while the resizer is focused
+  // must resize the outline only. The fix is ev.stopPropagation() on every handled
+  // key. NON-VACUITY: removing that stopPropagation lets the keydown bubble to the
+  // document handler → globalEnd fires → RED.
+  it('P3: handled keys (End/Home/arrows) do NOT bubble to the global keymap', () => {
+    _resetKeymapForTests();
+    installGlobalKeydown();
+    try {
+      const globalEnd = vi.fn();
+      const globalHome = vi.fn();
+      const globalArrow = vi.fn();
+      registerKeymap([
+        { key: 'End', scope: 'global', view: 'any', when: () => true, action: globalEnd },
+        { key: 'Home', scope: 'global', view: 'any', when: () => true, action: globalHome },
+        { key: 'ArrowLeft', scope: 'global', view: 'any', when: () => true, action: globalArrow },
+      ]);
+      const { container } = render(<OutlineResizer />);
+      const sep = container.querySelector('[role="separator"]')!;
+      fireEvent.keyDown(sep, { key: 'End' });
+      fireEvent.keyDown(sep, { key: 'Home' });
+      fireEvent.keyDown(sep, { key: 'ArrowLeft' });
+      // The resizer handled each (width moved), but none reached the global keymap.
+      expect(globalEnd).not.toHaveBeenCalled();
+      expect(globalHome).not.toHaveBeenCalled();
+      expect(globalArrow).not.toHaveBeenCalled();
+    } finally {
+      uninstallGlobalKeydown();
+      _resetKeymapForTests();
+    }
   });
 });

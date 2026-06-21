@@ -95,6 +95,32 @@ describe('<HelpOverlay /> Conversations key group (G3)', () => {
     const kbds = screen.getAllByText((_, el) => el?.tagName === 'KBD').map((k) => k.textContent);
     expect(kbds).toEqual(expect.arrayContaining(['j', 'k', '[', ']', 'g']));
   });
+
+  // Cross-branch review P2 — the four user-facing reader/navigation keys added in
+  // #217 S3 (`a` jump-to-last-prompt, `L` jump-to-last-error, `m`/`M` next/prev
+  // compaction, `f` focus the conversation-list search) MUST appear in the
+  // conversations help group. The D1 coverage test deliberately excludes
+  // view:'conversations' bindings (some reader keys — e.g. n/N find steppers, End
+  // jump-to-latest — are intentionally not in the table), so a full sweep would
+  // false-positive; this explicit assertion is the targeted guard that keeps these
+  // four from silently drifting out of the help again. NON-VACUITY: deleting any
+  // of the four rows from ConversationsKeyTable turns this RED.
+  it('documents the #217 S3 reader/nav keys a / L / m / f in the conversations group', () => {
+    render(<HelpOverlay />);
+    openHelp();
+    act(() => { dispatch({ type: 'SET_VIEW', view: 'conversations' }); });
+    const convTable = document.querySelector('#help-overlay table.help-conversations');
+    expect(convTable).not.toBeNull();
+    const convKbds = Array.from(convTable!.querySelectorAll('kbd')).map((k) => k.textContent);
+    for (const k of ['a', 'L', 'm', 'M', 'f']) {
+      expect(convKbds).toContain(k);
+    }
+    // Descriptions are present (and worded for the direct-jump / list-search keys).
+    expect(screen.getByText(/jump to last prompt/i)).toBeInTheDocument();
+    expect(screen.getByText(/jump to last error/i)).toBeInTheDocument();
+    expect(screen.getByText(/next \/ prev compaction/i)).toBeInTheDocument();
+    expect(screen.getByText(/focus the conversation-list search/i)).toBeInTheDocument();
+  });
 });
 
 describe('<HelpOverlay /> Esc layering is deterministic (#156)', () => {

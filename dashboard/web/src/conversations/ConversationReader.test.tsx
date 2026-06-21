@@ -2380,6 +2380,67 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
+  // Cross-branch review P1 — a JUMP to an early target prepends INSIDE the hook
+  // (loadToTarget's backward branch → fetchPrev), so it NEVER sets the
+  // reader-owned prependPendingRef the older P1 guard keyed on. On a tail-opened
+  // multi-page session (has_more:false) that prepend satisfies the live
+  // discriminator (added>0 && prevHasMoreRef===false && prevLen>0), so
+  // `tail = items.slice(prevLen)` reads the OLD back-of-window turns (t3,t4) as
+  // "new" → the "↓ N new" pill bumps by the prior window size, and if atBottomRef
+  // were still true the viewport would scroll-flash to bottom mid-jump. The fix
+  // detects a prepend by a TOP-EDGE ADVANCE (the first item's anchor uuid changed),
+  // which catches the hook-driven prepend the prependPendingRef-only guard misses.
+  // NON-VACUITY: with the first-item-id discriminator reverted (back to the
+  // prependPendingRef-only guard) this jump path is NOT recognised as a prepend,
+  // the pill reads "↓ 2 new" (the t3,t4 back-of-window turns) → RED.
+  it('P1 (cross-branch): a JUMP-driven backward prepend does NOT bump the "↓ N new" pill', async () => {
+    // The jump pipeline scrolls the target into view — stub scrollIntoView and
+    // capture scrollTo so we can assert the viewport was NOT forced to bottom.
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const scrollToSpy = spyScrollTo();
+    // Full-session outline (t1..t4 in order) so loadToTarget can decide the
+    // nearest-edge DIRECTION — without it the hook falls back to a forward drain
+    // and never exercises the backward (prepend) branch this P1 lives in.
+    const outline = outlineFor([
+      oTurn({ uuid: 't1', kind: 'human' }), oTurn({ uuid: 't2', kind: 'human' }),
+      oTurn({ uuid: 't3', kind: 'human' }), oTurn({ uuid: 't4', kind: 'human' }),
+    ]);
+    // Tail open: window holds t3,t4; bottom fully paged (has_more:false) so the
+    // live discriminator is eligible; top edge armed (prev_before:3, has_prev).
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t3"]')).not.toBeNull());
+
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    // User scrolls UP, away from the bottom → atBottomRef becomes false (so a real
+    // live append WOULD raise the pill; this isolates the prepend miscount).
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    scrollToSpy.mockClear();
+
+    // The before-page returned by loadToTarget's backward fetchPrev: t1,t2 above
+    // the window, top edge exhausted (has_prev:false). The envelope carries a
+    // bottom edge for the already-loaded items — the prepend must ignore it.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    // Jump to the EARLY target t1 (above the loaded window) → loadToTarget takes
+    // the backward branch and prepends INSIDE the hook (no prependPendingRef).
+    await act(async () => {
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 't1' } });
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // The prepend is jump-driven reverse paging, not new live content → no pill.
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+    // And the stick-to-bottom path must NOT have force-scrolled the body to the
+    // bottom (b.scrollTo({ top: scrollHeight }) with no behavior) mid-jump.
+    expect(scrollToSpy.mock.calls.some((c) => {
+      const arg = c[0] as { top?: number; behavior?: string } | undefined;
+      return arg != null && arg.behavior === undefined && arg.top === 1000;
+    })).toBe(false);
+  });
+
   // #217 S3 E1 — P2 regression: A→B→A reopen restores the reading position on the
   // RETURN visit. The restore latch must re-arm on a session switch (the reader
   // is mounted persistently — no key={sessionId}). The masking subtlety: B is a

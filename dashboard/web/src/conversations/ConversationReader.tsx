@@ -167,9 +167,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // above the viewport, so we capture the PRE-prepend height/scrollTop here (in
   // loadPrev) and re-apply the delta in a layout effect after the render commits,
   // keeping the viewport pinned to the same turn. `prependPendingRef` carries the
-  // captured metrics across the async fetch + render; `prevItemsLenRef` lets the
-  // anchoring layout effect tell a prepend (length grew, top edge advanced) from
-  // an append.
+  // captured metrics across the async fetch + render so the scroll-anchor effect
+  // can re-pin the viewport on the TOP-SENTINEL prepend path. (The stick-to-bottom
+  // effect tells a prepend from an append via a top-edge advance — see
+  // `prevFirstIdRef` below — which also covers jump-driven hook prepends that
+  // never set `prependPendingRef`.)
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const prependPendingRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -306,6 +308,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const atBottomRef = useRef(true);
   const prevLenRef = useRef(0);
   const prevHasMoreRef = useRef(false);
+  // P1 (cross-branch review) — track the FIRST item's stable anchor uuid so the
+  // stick-to-bottom effect can recognise a PREPEND by a top-edge advance (the
+  // first-item id changed) regardless of which code path prepended. This is more
+  // robust than `prependPendingRef` alone: that ref is set only by the top-sentinel
+  // path (doLoadPrev), but a JUMP to an early target prepends INSIDE the hook
+  // (loadToTarget → fetchPrev) where the reader-owned ref can never be set, so a
+  // tail-opened (hasMore===false) session would mis-read the old back-of-window
+  // turns as "↓ N new". A first-item-id advance catches EVERY prepend source.
+  const prevFirstIdRef = useRef<string | null>(null);
   const [newCount, setNewCount] = useState(0);
 
   // #188 S4/C2 — count only VISIBLE live appends in the "↓ N new" pill (Bug 5).
@@ -384,19 +395,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const b = bodyRef.current;
     const items = detail?.items ?? [];
     const len = items.length;
-    // P1 fix — a reverse-page PREPEND must NOT be mistaken for a live append. A
-    // prepend grows items.length too, and on a tail open (hasMore === false) it
-    // satisfies the live discriminator below, so `tail = items.slice(prevLen)`
-    // would read the OLD back-of-window turns as "new" and bump the "↓ N new"
-    // pill by the prior window size (and could wrongly scroll-to-bottom). This
-    // effect runs BEFORE the scroll-anchor layout effect that clears
-    // `prependPendingRef`, so the snapshot set by doLoadPrev is still present
-    // here for exactly one commit — the unambiguous "this growth is a prepend"
-    // signal. Bail (just advancing the prev-trackers) so the scroll-anchor effect
-    // owns the prepend.
-    if (prependPendingRef.current) {
+    const firstId = items[0]?.anchor.uuid ?? null;
+    // P1 fix (cross-branch review) — a reverse-page PREPEND must NOT be mistaken
+    // for a live append. A prepend grows items.length too, and on a tail open
+    // (hasMore === false) it satisfies the live discriminator below, so
+    // `tail = items.slice(prevLen)` would read the OLD back-of-window turns as
+    // "new" and bump the "↓ N new" pill by the prior window size (and could
+    // wrongly scroll-to-bottom). We detect a prepend by a TOP-EDGE ADVANCE: the
+    // first item's stable anchor uuid changed while content exists. This is
+    // direction- and source-agnostic — it catches the top-sentinel path
+    // (doLoadPrev, which also sets prependPendingRef) AND a jump to an early
+    // target whose backward branch prepends INSIDE the hook
+    // (loadToTarget → fetchPrev), where prependPendingRef can never be set. Bail
+    // (just advancing the prev-trackers) so the scroll-anchor effect owns the
+    // prepend; the prependPendingRef snapshot it relies on is left intact.
+    const prepended = firstId != null && prevFirstIdRef.current != null && firstId !== prevFirstIdRef.current;
+    if (prepended) {
       prevLenRef.current = len;
       prevHasMoreRef.current = hasMore;
+      prevFirstIdRef.current = firstId;
       return;
     }
     const prevLen = prevLenRef.current;
@@ -442,6 +459,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     prevLenRef.current = len;
     prevHasMoreRef.current = hasMore;
+    prevFirstIdRef.current = firstId;
   }, [detail?.items.length, hasMore]);
 
   const jumpToNew = useCallback(() => {
@@ -957,6 +975,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // count (Bug 5 + #188 B6's per-session reset rationale).
     openKeysRef.current.clear();
     knownSubagentKeysRef.current.clear();
+    // P1 (cross-branch review) — drop the prior conversation's first-item id so
+    // the new session's opening page is treated as a fresh seed (null prev), not
+    // a prepend (which would otherwise bail-and-reseed harmlessly anyway, but an
+    // explicit null keeps the discriminator's intent legible).
+    prevFirstIdRef.current = null;
   }, [sessionId, openIntent]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must

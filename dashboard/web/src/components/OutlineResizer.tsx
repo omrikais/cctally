@@ -37,13 +37,19 @@ export function OutlineResizer() {
 
   // Keyboard resize. Left/Right step by OUTLINE_WIDTH_STEP; Home/End jump to the
   // band extremes. All other keys pass through.
+  //
+  // Cross-branch review P3 — each HANDLED key also stopPropagation()s so the
+  // document-level global keymap doesn't ALSO fire. Without it, pressing `End`
+  // while the resizer is focused resizes the outline AND triggers the global
+  // `End` (jump-to-latest) — a double-fire. Unhandled keys fall through the
+  // default case untouched and still reach the global keymap.
   const onKeyDown = useCallback((ev: React.KeyboardEvent) => {
     const cur = getState().convOutlineWidth;
     switch (ev.key) {
-      case 'ArrowLeft':  ev.preventDefault(); setWidth(cur + OUTLINE_WIDTH_STEP); break;
-      case 'ArrowRight': ev.preventDefault(); setWidth(cur - OUTLINE_WIDTH_STEP); break;
-      case 'Home':       ev.preventDefault(); setWidth(OUTLINE_WIDTH_MAX); break;   // widest
-      case 'End':        ev.preventDefault(); setWidth(OUTLINE_WIDTH_MIN); break;   // narrowest
+      case 'ArrowLeft':  ev.preventDefault(); ev.stopPropagation(); setWidth(cur + OUTLINE_WIDTH_STEP); break;
+      case 'ArrowRight': ev.preventDefault(); ev.stopPropagation(); setWidth(cur - OUTLINE_WIDTH_STEP); break;
+      case 'Home':       ev.preventDefault(); ev.stopPropagation(); setWidth(OUTLINE_WIDTH_MAX); break;   // widest
+      case 'End':        ev.preventDefault(); ev.stopPropagation(); setWidth(OUTLINE_WIDTH_MIN); break;   // narrowest
       default: break;
     }
   }, [setWidth]);

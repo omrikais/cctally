@@ -93,9 +93,13 @@ function ConversationsKeyTable() {
         <tr><td><kbd>b</kbd> / <kbd>B</kbd></td><td>next / prev subagent</td></tr>
         <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>next / prev plan / question</td></tr>
         <tr><td><kbd>c</kbd> / <kbd>C</kbd></td><td>next / prev cache rebuild</td></tr>
+        <tr><td><kbd>m</kbd> / <kbd>M</kbd></td><td>next / prev compaction</td></tr>
+        <tr><td><kbd>a</kbd></td><td>jump to last prompt</td></tr>
+        <tr><td><kbd>L</kbd></td><td>jump to last error</td></tr>
         <tr><td><kbd>o</kbd></td><td>toggle outline</td></tr>
         <tr><td><kbd>v</kbd></td><td>cycle focus mode</td></tr>
-        <tr><td><kbd>/</kbd></td><td>search conversations</td></tr>
+        <tr><td><kbd>/</kbd></td><td>find in conversation</td></tr>
+        <tr><td><kbd>f</kbd></td><td>focus the conversation-list search</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>close</td></tr>
       </tbody>
     </table>
