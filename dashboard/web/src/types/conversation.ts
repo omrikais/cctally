@@ -261,10 +261,26 @@ export interface ConversationsPage {
   conversations: ConversationSummary[];
   // `filter_degraded` (filters spec §1 dual-branch parity) is present ONLY when a
   // project/cost/rebuild filter was requested but the rollup was non-authoritative
-  // (the live `GROUP BY` fallback can only filter by date). The rail surfaces it as
-  // a muted note; absent on the normal authoritative path.
-  page: { next_offset: number | null; has_more: boolean; filter_degraded?: boolean };
+  // (the live `GROUP BY` fallback can only filter by date). `sort_degraded` (#217
+  // S4 / I-2.1) is present ONLY when a `cost`/`project` sort was requested under
+  // the same non-authoritative window (the live fallback has no such column, so
+  // the page fell back to `recent` order — keyed to the REQUESTED sort, never an
+  // unknown sort). The rail surfaces each as a muted note; absent on the normal
+  // authoritative path.
+  page: {
+    next_offset: number | null;
+    has_more: boolean;
+    filter_degraded?: boolean;
+    sort_degraded?: boolean;
+  };
 }
+
+// #217 S4 / I-2 — rail sort keys, 1:1 with the backend `_SORTS` table
+// (bin/_lib_conversation_query.py). `recent` (default) / `oldest` ride stored
+// columns on every branch; `cost`/`messages`/`project` are rollup-column sorts
+// (`messages` has live parity, `cost`/`project` degrade to `recent` + the
+// page's `sort_degraded` flag in the brief non-authoritative window).
+export type RailSortKey = 'recent' | 'oldest' | 'cost' | 'messages' | 'project';
 
 // Browse-list filters (filters spec §4). Session-only client state — never
 // persisted across reload. `datePreset` is a chip-LABEL only ('this-month' /
@@ -367,6 +383,12 @@ export interface ConversationSearchResult {
   // this install (tools/thinking facets return empty there), else 'full'.
   kind?: SearchKind;
   search_depth?: 'prose-only' | 'full';
+  // #217 S4 / I-2.5 — present ONLY when a project/cost/rebuild filter was
+  // requested under the non-authoritative window (the live fallback can only
+  // filter by date). NOTE: unlike the browse page's `filter_degraded` (nested
+  // under `page`), the SEARCH response carries this flag TOP-LEVEL. The rail
+  // surfaces it as a "some filters unavailable while indexing" note.
+  filter_degraded?: boolean;
 }
 
 export interface ConversationJump {

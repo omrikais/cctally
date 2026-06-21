@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
+import { clearRailPrefs } from '../store/conversationRailPrefs';
 import type { Envelope } from '../types/envelope';
 
 // Minimal display-only envelope: the popover only reads the `display` block (via
@@ -22,6 +23,9 @@ vi.mock('../hooks/useConversationFacets', () => ({
 }));
 
 beforeEach(() => {
+  // #217 S4 / I-2.2 — filters now persist; clear before reset so a prior test's
+  // costMin/costMax edit can't bleed into loadInitial.
+  clearRailPrefs();
   _resetForTests();
   facetProjects = [{ project_label: 'projA', count: 4 }, { project_label: 'projB', count: 1 }];
   vi.useFakeTimers();
@@ -29,6 +33,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.runOnlyPendingTimers();
   vi.useRealTimers();
+  clearRailPrefs();
   _resetForTests();
   vi.restoreAllMocks();
 });

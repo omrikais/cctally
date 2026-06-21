@@ -5860,13 +5860,47 @@ mark.current {
 .conv-rail-filters-clearall:hover { color: var(--accent-blue); }
 
 /* Muted dual-branch-degraded note (project/cost/rebuild filters not yet live). */
-.conv-rail-filters-degraded {
+.conv-rail-filters-degraded,
+/* #217 S4 / I-2.3 — the parallel sort-degraded note (cost/project fell back to
+   recent order while the rollup indexes), and I-2.5's search-mode filter note. */
+.conv-rail-sort-degraded,
+.conv-rail-search-filters-degraded {
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.4;
   padding: 6px 8px;
 }
+
+/* #217 S4 / I-2.4 — the rail sort control (a labeled <select> in the search bar
+   header). Sized to content; reuses the filters-button's muted-chrome look. */
+.conv-rail-sort {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.conv-rail-sort-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-rail-sort-select {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 0 6px;
+  height: 100%;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-rail-sort-select:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-rail-sort-select:focus-visible { outline: none; border-color: var(--accent-blue); }
 
 /* The popover: drops below the search bar inside the rail (no portal). */
 .conv-rail-filters {

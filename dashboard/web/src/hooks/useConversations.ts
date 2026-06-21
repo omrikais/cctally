@@ -2,24 +2,8 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import { fetchJson, isAbortError } from '../lib/fetchJson';
 import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
-import type { ConversationFilters, ConversationSummary, ConversationsPage } from '../types/conversation';
-
-// Serialize the active filters into the /api/conversations query string (filters
-// spec §4 / §2). Each axis appends a parameterized predicate server-side; absent
-// axes are simply omitted. `projects` repeats (?projects=a&projects=b) so the
-// server reads the multi-select as an IN(...). Returns '' (NOT '&…') when no axis
-// is active so the base URL stays byte-identical to the unfiltered path.
-function filterParams(f: ConversationFilters): string {
-  const p = new URLSearchParams();
-  if (f.dateFrom) p.set('date_from', f.dateFrom);
-  if (f.dateTo) p.set('date_to', f.dateTo);
-  for (const proj of f.projects) p.append('projects', proj);
-  if (f.costMin != null) p.set('cost_min', String(f.costMin));
-  if (f.costMax != null) p.set('cost_max', String(f.costMax));
-  if (f.rebuildMin != null) p.set('rebuild_min', String(f.rebuildMin));
-  const s = p.toString();
-  return s ? `&${s}` : '';
-}
+import { filterParams } from './conversationFilterParams';
+import type { ConversationSummary, ConversationsPage } from '../types/conversation';
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
 // FIRST page on every SSE tick (the list shifts as new sessions ingest)
@@ -28,7 +12,10 @@ function filterParams(f: ConversationFilters): string {
 // beyond PAGE accumulated, or a loadMore is in flight), the tick reload
 // is suppressed so it can't clobber the accumulated tail or rewind the
 // cursor; a fresh page-1 load only happens on remount. loadMore()
-// appends. Sort is fixed to 'recent' in v1.
+// appends. #217 S4 / I-2.3 — the sort key is read from the store
+// (`conversationRailSort`) via a ref and threaded into the `sort` param; a
+// sort OR filter change resets the offset and invalidates in-flight appends
+// via ONE combined `{filters, sort}` generation token.
 //
 // Visibility-gating (spec §4): the per-tick page-1 revalidation is skipped
 // while the tab is hidden (a backgrounded reader idle for hours otherwise
@@ -49,6 +36,10 @@ export interface UseConversations {
   // was requested but the rollup was non-authoritative (the live fallback can only
   // filter by date). The rail surfaces a muted note.
   filterDegraded: boolean;
+  // #217 S4 / I-2.3 — true when a cost/project sort was requested under the
+  // non-authoritative window (the live fallback fell back to recent order). The
+  // rail surfaces a "sort unavailable while indexing" note.
+  sortDegraded: boolean;
   // #205 S3 (F8) — user-initiated re-load of page 1 after a failed fetch.
   retry: () => void;
 }
@@ -61,12 +52,19 @@ export function useConversations(): UseConversations {
   const [error, setError] = useState<string | null>(null);
   const [nextOffset, setNextOffset] = useState<number | null>(0);
   const [filterDegraded, setFilterDegraded] = useState(false);
+  const [sortDegraded, setSortDegraded] = useState(false);
   // Active browse filters from the store (filters spec §4). A `filtersRef` mirror
   // lets the ref-stable loadFirstPage / loadMore read the LATEST filters without
   // closing over them (which would churn the []-dep callbacks and the tick effect).
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const filtersRef = useRef(filters);
   filtersRef.current = filters;
+  // #217 S4 / I-2.3 — the active rail sort key, mirrored through a ref the same
+  // way as filters so the ref-stable loadFirstPage / loadMore read the LATEST
+  // sort without closing over it.
+  const sort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
+  const sortRef = useRef(sort);
+  sortRef.current = sort;
   const env = useSnapshot();
   const generatedAt = env?.generated_at ?? '';
   // Sync in-flight guard (loadingMoreRef) gates re-entrancy + the page-1
@@ -86,13 +84,14 @@ export function useConversations(): UseConversations {
   // starting a new one, so a refocus burst (the visibilitychange listener +
   // the [generatedAt] tick effect) collapses to a single completing fetch.
   const ctlRef = useRef<AbortController | null>(null);
-  // Filter generation token, bumped on every filter change (the [filterKey]
-  // reset effect). loadMore captures it at start and bails out of its setRows /
-  // setNextOffset if it changed by the time the response resolves — otherwise an
-  // in-flight loadMore would append OLD-filter rows (with the OLD cursor) onto the
-  // list the reset effect just emptied (FINDING 2). ctlRef can't cover loadMore
-  // because loadMore deliberately omits the abort signal (a transient blip must
-  // not wipe the accumulated tail).
+  // Combined {filters, sort} generation token, bumped on every filter OR sort
+  // change (the [queryKey] reset effect — #217 S4 / I-2.3). loadMore captures it
+  // at start and bails out of its setRows / setNextOffset if it changed by the
+  // time the response resolves — otherwise an in-flight loadMore would append
+  // OLD-order/OLD-filter rows (with the OLD cursor) onto the list the reset
+  // effect just emptied (FINDING 2). ctlRef can't cover loadMore because loadMore
+  // deliberately omits the abort signal (a transient blip must not wipe the
+  // accumulated tail).
   const filterGenRef = useRef(0);
 
   // Stable page-1 (re)load. Reads suppression state through refs so it is NOT
@@ -106,11 +105,12 @@ export function useConversations(): UseConversations {
     ctlRef.current?.abort();
     const ctl = new AbortController();
     ctlRef.current = ctl;
-    fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`, ctl.signal)
+    fetchJson<ConversationsPage>(`/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`, ctl.signal)
       .then((body) => {
         setRows(body.conversations);
         setNextOffset(body.page.next_offset);
         setFilterDegraded(body.page.filter_degraded === true);
+        setSortDegraded(body.page.sort_degraded === true);
         setError(null);
         setLoading(false);
       })
@@ -132,22 +132,24 @@ export function useConversations(): UseConversations {
     loadFirstPage();
   }, [loadFirstPage]);
 
-  // Filter-change reset (filters spec §4): a filter change wipes the accumulated
-  // tail, rewinds the cursor to offset 0, and refetches page 1 with the new
-  // params. Keyed on a stable JSON key so a no-op SET (same values) doesn't
-  // refetch. The MOUNT run is skipped (mountFilterKeyRef) — the [generatedAt]
-  // mount/tick effect below already issues the initial page-1 load; double-firing
-  // here would re-fetch page 1 and, mid-paging, clobber the accumulated tail.
-  const filterKey = JSON.stringify(filters);
-  const mountFilterKeyRef = useRef<string | null>(null);
+  // Filter/sort-change reset (filters spec §4 / #217 S4 / I-2.3): a filter OR
+  // sort change wipes the accumulated tail, rewinds the cursor to offset 0, and
+  // refetches page 1 with the new params. Keyed on a stable JSON key of BOTH
+  // filters AND sort so a no-op SET (same values) doesn't refetch but EITHER axis
+  // changing does. The MOUNT run is skipped (mountQueryKeyRef) — the
+  // [generatedAt] mount/tick effect below already issues the initial page-1 load;
+  // double-firing here would re-fetch page 1 and, mid-paging, clobber the
+  // accumulated tail.
+  const queryKey = JSON.stringify({ filters, sort });
+  const mountQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (mountFilterKeyRef.current === null) {
+    if (mountQueryKeyRef.current === null) {
       // First commit: the mount/tick effect owns the initial load.
-      mountFilterKeyRef.current = filterKey;
+      mountQueryKeyRef.current = queryKey;
       return;
     }
-    if (mountFilterKeyRef.current === filterKey) return; // no-op SET (same values)
-    mountFilterKeyRef.current = filterKey;
+    if (mountQueryKeyRef.current === queryKey) return; // no-op SET (same values)
+    mountQueryKeyRef.current = queryKey;
     // Invalidate any in-flight loadMore so its (old-filter) result can't append
     // stale rows onto the list we're about to empty (FINDING 2). Also drop the
     // loadingMore flag: a still-in-flight loadMore would otherwise make
@@ -162,7 +164,7 @@ export function useConversations(): UseConversations {
     rowsLenRef.current = 0;
     loadFirstPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterKey]);
+  }, [queryKey]);
 
   // First-page (re)load on mount + every SSE tick — but never while hidden.
   // Keyed on [generatedAt, loadFirstPage]; loadFirstPage is ref-stable so the
@@ -191,16 +193,18 @@ export function useConversations(): UseConversations {
     if (nextOffset == null || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
-    // Snapshot the filter generation; if a filter change bumps it while this
-    // request is in flight, the response is stale (old filter / old cursor) and
-    // must be discarded — the reset effect already issued a fresh page-1 load.
+    // Snapshot the {filters, sort} generation; if a filter OR sort change bumps
+    // it while this request is in flight, the response is stale (old order/filter
+    // / old cursor) and must be discarded — the reset effect already issued a
+    // fresh page-1 load.
     const gen = filterGenRef.current;
     try {
-      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=recent&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
-      if (filterGenRef.current !== gen) return; // filter changed mid-flight — drop stale rows
+      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
+      if (filterGenRef.current !== gen) return; // filter/sort changed mid-flight — drop stale rows
       setRows((prev) => [...prev, ...body.conversations]);
       setNextOffset(body.page.next_offset);
       setFilterDegraded(body.page.filter_degraded === true);
+      setSortDegraded(body.page.sort_degraded === true);
     } catch {
       /* keep what we have; a transient blip shouldn't wipe the list */
     } finally {
@@ -209,5 +213,5 @@ export function useConversations(): UseConversations {
     }
   }, [nextOffset]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, retry };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry };
 }

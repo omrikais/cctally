@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { getState, subscribeStore } from '../store/store';
 import { useDebouncedValue } from './useDebouncedValue';
+import { filterParams } from './conversationFilterParams';
 import type { ConversationSearchResult, SearchHit, SearchKind } from '../types/conversation';
 
 // Debounced cross-session search. Empty/whitespace needle -> no fetch, empty
@@ -17,6 +19,13 @@ import type { ConversationSearchResult, SearchHit, SearchKind } from '../types/c
 // `searchDepth` is the interim-index signal ('prose-only' while the one-time
 // column split is still backfilling, else 'full') so the rail can degrade the
 // Tools/Thinking chips.
+//
+// #217 S4 / I-2.5 — the SHARED `conversationFilters` state (the same set the
+// browse rail uses) auto-applies to search: the six filter params thread into
+// the URL, and a filter change is folded into the `url` callback's deps so it
+// joins the reset/abort key (offset → 0, in-flight loadMore aborted via ctlRef)
+// exactly like a needle/kind change. `filterDegraded` surfaces the response's
+// TOP-LEVEL `filter_degraded` flag (distinct from browse's under-`page`).
 export interface UseConversationSearch {
   hits: SearchHit[];
   mode: 'fts' | 'like' | null;
@@ -24,6 +33,7 @@ export interface UseConversationSearch {
   loading: boolean;
   loadingMore: boolean;
   searchDepth: 'prose-only' | 'full' | null;
+  filterDegraded: boolean;
   error: string | null;
   loadMore: () => void;
 }
@@ -38,10 +48,20 @@ export function useConversationSearch(
   const [mode, setMode] = useState<'fts' | 'like' | null>(null);
   const [total, setTotal] = useState(0);
   const [searchDepth, setSearchDepth] = useState<'prose-only' | 'full' | null>(null);
+  const [filterDegraded, setFilterDegraded] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const q = query.trim();
+  // #217 S4 / I-2.5 — the shared browse filters (auto-applied to search). A
+  // stable JSON key folds into the `url` callback's deps so a filter change
+  // re-keys the page-0 effect (reset/abort) the same way a needle/kind change
+  // does. `filtersRef` lets loadMore read the LATEST filters without re-creating
+  // the callback on every filter edit.
+  const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
+  const filterKey = JSON.stringify(filters);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
   const debouncedQ = useDebouncedValue(q, DEBOUNCE_MS, '');
   // ONE controller ref shared by the offset-0 fetch AND loadMore: any
   // needle/kind change (or a fresh page-0 fetch) aborts whatever it points at,
@@ -58,17 +78,20 @@ export function useConversationSearch(
 
   const url = useCallback(
     (offset: number) =>
-      `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}`,
-    [debouncedQ, kind],
+      `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}${filterParams(filtersRef.current)}`,
+    // filterKey is in the deps so a filter change re-creates `url` → re-fires the
+    // keyed page-0 effect (reset/abort), even though the body reads filtersRef.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [debouncedQ, kind, filterKey],
   );
 
   // Reset on an empty needle, and abort any in-flight fetch the instant the raw
-  // needle OR kind changes — so a prior response can never commit late over the
-  // newer query's state.
+  // needle OR kind OR filter set changes — so a prior response can never commit
+  // late over the newer query's state.
   useEffect(() => {
-    if (!q) { setHits([]); setMode(null); setTotal(0); setSearchDepth(null); setError(null); }
+    if (!q) { setHits([]); setMode(null); setTotal(0); setSearchDepth(null); setFilterDegraded(false); setError(null); }
     return () => { ctlRef.current?.abort(); };
-  }, [q, kind]);
+  }, [q, kind, filterKey]);
 
   // Page-0 fetch, keyed on the settled needle + the kind facet. REPLACES hits.
   useEffect(() => {
@@ -87,6 +110,7 @@ export function useConversationSearch(
         setMode(body.mode);
         setTotal(body.total);
         setSearchDepth(body.search_depth ?? 'full');
+        setFilterDegraded(body.filter_degraded === true);
         setError(null);
         setFetching(false);
       })
@@ -112,6 +136,7 @@ export function useConversationSearch(
         setTotal(body.total);
         setMode(body.mode);
         setSearchDepth(body.search_depth ?? 'full');
+        setFilterDegraded(body.filter_degraded === true);
         setLoadingMore(false);
       })
       .catch((e) => {
@@ -128,5 +153,5 @@ export function useConversationSearch(
   // (debouncedQ never changes, so no fetch re-fires to clear an imperative flag).
   const loading = q !== '' && (q !== debouncedQ || fetching);
 
-  return { hits, mode, total, loading, loadingMore, searchDepth, error, loadMore };
+  return { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore };
 }

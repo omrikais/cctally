@@ -121,6 +121,145 @@ def test_list_conversations_pagination():
 
 
 # ---------------------------------------------------------------------------
+# #217 S4 / I-2.1: rail sort keys (cost / messages / project) + sort_degraded
+# ---------------------------------------------------------------------------
+
+def _seed_sortable(c):
+    """Three sessions with DISTINCT cost / msg_count / project_label (incl. one
+    NULL-cwd and one '' / no-cwd) so the cost/messages/project orderings (and
+    the NULL/'' label-last rule) are all exercised, plus a session_entries row
+    per assistant turn so cost_usd is genuinely non-zero and distinct.
+
+      sP: 1 msg, project "alpha",  small cost
+      sQ: 3 msgs, project "zeta",  big cost
+      sR: 2 msgs, NO cwd (project '' sentinel), mid cost
+      sS: 1 msg,  cwd=None (project_label NULL), zero cost
+    """
+    # sP — project alpha, one assistant turn, small cost.
+    _msg(c, session_id="sP", uuid="p1", source_path="p.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="alpha turn", model=_MODEL, msg_id="mp", req_id="rp",
+         cwd="/home/u/alpha")
+    _entry(c, source_path="p.jsonl", line_offset=0, model=_MODEL,
+           msg_id="mp", req_id="rp", inp=100, out=50)
+    # sQ — project zeta, three turns, the BIGGEST cost.
+    for i in range(3):
+        _msg(c, session_id="sQ", uuid=f"q{i}", source_path="q.jsonl",
+             byte_offset=i, timestamp_utc=f"2026-06-02T00:00:0{i}Z",
+             entry_type="assistant", text="zeta turn", model=_MODEL,
+             msg_id=f"mq{i}", req_id=f"rq{i}", cwd="/home/u/zeta")
+        _entry(c, source_path="q.jsonl", line_offset=i, model=_MODEL,
+               msg_id=f"mq{i}", req_id=f"rq{i}", inp=5000, out=5000)
+    # sR — NO cwd at all (project_label resolves to '' sentinel), mid cost.
+    for i in range(2):
+        _msg(c, session_id="sR", uuid=f"r{i}", source_path="r.jsonl",
+             byte_offset=i, timestamp_utc=f"2026-06-03T00:00:0{i}Z",
+             entry_type="assistant", text="rho turn", model=_MODEL,
+             msg_id=f"mr{i}", req_id=f"rr{i}")
+        _entry(c, source_path="r.jsonl", line_offset=i, model=_MODEL,
+               msg_id=f"mr{i}", req_id=f"rr{i}", inp=1000, out=500)
+    # sS — single human row, cwd=None (project_label NULL), zero cost.
+    _msg(c, session_id="sS", uuid="s1", source_path="s.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-04T00:00:00Z", entry_type="human", text="hi")
+
+
+def test_list_conversations_sort_cost_desc():
+    c = _conn()
+    _seed_sortable(c)
+    rows = _list_conversations(c, sort="cost", limit=50)["conversations"]
+    costs = [r["cost_usd"] for r in rows]
+    assert costs == sorted(costs, reverse=True), costs
+    # sQ (biggest cost) first; sS (zero cost) last.
+    assert rows[0]["session_id"] == "sQ"
+    assert rows[-1]["session_id"] == "sS"
+
+
+def test_list_conversations_sort_messages_desc():
+    c = _conn()
+    _seed_sortable(c)
+    rows = _list_conversations(c, sort="messages", limit=50)["conversations"]
+    counts = [r["msg_count"] for r in rows]
+    assert counts == sorted(counts, reverse=True), counts
+    assert rows[0]["session_id"] == "sQ"   # 3 msgs
+
+
+def test_list_conversations_sort_project_null_empty_last():
+    c = _conn()
+    _seed_sortable(c)
+    rows = _list_conversations(c, sort="project", limit=50)["conversations"]
+    labels = [r["project_label"] for r in rows]
+    # Real labels ascending FIRST, then NULL/'' (both render '') LAST.
+    assert labels[0] == "alpha"
+    assert labels[1] == "zeta"
+    # The two empty-label sessions (sR '' sentinel, sS NULL) sort last.
+    assert all(lbl == "" for lbl in labels[2:]), labels
+    assert {rows[2]["session_id"], rows[3]["session_id"]} == {"sR", "sS"}
+
+
+def test_list_conversations_sort_messages_live_parity():
+    """With the rollup backfill PENDING (live branch), sort=messages still
+    orders by COUNT(*) DESC and matches the rollup order; no sort_degraded."""
+    c = _conn()
+    _seed_sortable(c)
+    # Authoritative rollup reference.
+    cc._recompute_conversation_sessions(c)
+    ref = cq.list_conversations(c, sort="messages", limit=50)
+    ref_ids = [r["session_id"] for r in ref["conversations"]]
+    assert "sort_degraded" not in ref["page"]
+    # Now force the live branch: empty the rollup + arm the pending flag.
+    c.execute("DELETE FROM conversation_sessions")
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('conversation_sessions_backfill_pending','1')")
+    live = cq.list_conversations(c, sort="messages", limit=50)
+    assert [r["session_id"] for r in live["conversations"]] == ref_ids
+    assert "sort_degraded" not in live["page"]
+
+
+def test_list_conversations_sort_cost_project_degrade_under_live():
+    """Under the pending (live) branch, cost/project fall back to recent order
+    AND the page carries sort_degraded=True. recent/messages never carry it; an
+    unknown sort falls back to recent with NO sort_degraded key (byte-stable)."""
+    c = _conn()
+    _seed_sortable(c)
+    # Authoritative recent order = the fallback order for degraded sorts.
+    cc._recompute_conversation_sessions(c)
+    recent_ids = [r["session_id"]
+                  for r in cq.list_conversations(c, sort="recent", limit=50)
+                  ["conversations"]]
+    # Force the live branch.
+    c.execute("DELETE FROM conversation_sessions")
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('conversation_sessions_backfill_pending','1')")
+
+    for s in ("cost", "project"):
+        res = cq.list_conversations(c, sort=s, limit=50)
+        assert res["page"].get("sort_degraded") is True, s
+        assert [r["session_id"] for r in res["conversations"]] == recent_ids, s
+
+    # recent + messages never carry the key under the live branch.
+    for s in ("recent", "messages"):
+        assert "sort_degraded" not in cq.list_conversations(
+            c, sort=s, limit=50)["page"], s
+
+    # An UNKNOWN sort also falls back to recent but must NOT add the key
+    # (byte-stability — the requested-sort keying guard).
+    bogus = cq.list_conversations(c, sort="bogus", limit=50)
+    assert "sort_degraded" not in bogus["page"]
+    assert [r["session_id"] for r in bogus["conversations"]] == recent_ids
+
+
+def test_list_conversations_sort_degraded_absent_when_authoritative():
+    """When the rollup is authoritative, cost/project run on the rollup branch
+    and never carry sort_degraded."""
+    c = _conn()
+    _seed_sortable(c)
+    cc._recompute_conversation_sessions(c)
+    for s in ("recent", "oldest", "cost", "messages", "project"):
+        assert "sort_degraded" not in cq.list_conversations(
+            c, sort=s, limit=50)["page"], s
+
+
+# ---------------------------------------------------------------------------
 # Task 5: reader (get_conversation)
 # ---------------------------------------------------------------------------
 import json as _json

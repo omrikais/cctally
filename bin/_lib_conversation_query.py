@@ -778,16 +778,38 @@ def session_source_paths(conn, session_id):
 _SORTS = {
     "recent": "last_activity_utc DESC, session_id DESC",
     "oldest": "started_utc ASC, session_id ASC",
+    # #217 S4 / I-2.1: stored-column rollup sorts. Each tie-broken by
+    # session_id for stable pagination. ``project`` uses an explicit CASE so a
+    # NULL label (not-yet-filled row) or '' (the no-cwd _project_label(None)
+    # sentinel) sorts LAST — a plain COLLATE NOCASE ASC would put them first.
+    "cost": "cost_usd DESC, session_id DESC",
+    "messages": "msg_count DESC, session_id DESC",
+    "project": ("CASE WHEN project_label IS NULL OR project_label = '' "
+                "THEN 1 ELSE 0 END, project_label COLLATE NOCASE ASC, "
+                "session_id ASC"),
 }
 
 # The matching ORDER BY for the live GROUP BY fallback: the rollup's
 # last_activity_utc IS MAX(timestamp_utc) and started_utc IS MIN(timestamp_utc),
 # so the two branches paginate in byte-identical order (the load-bearing
 # invariant). Keep this table in lockstep with _SORTS.
+#
+# ``messages`` has FULL live parity (COUNT(*) DESC over the raw messages == the
+# rollup's stored msg_count). ``cost`` and ``project`` have NO raw-message
+# column, so they are INTENTIONALLY ABSENT here — list_conversations resolves
+# them to the ``recent`` live ordering and flags page.sort_degraded (a brief,
+# self-correcting non-authoritative window). #217 S4 / I-2.1.
 _SORTS_LIVE = {
     "recent": "MAX(timestamp_utc) DESC, session_id DESC",
     "oldest": "MIN(timestamp_utc) ASC, session_id ASC",
+    "messages": "COUNT(*) DESC, session_id DESC",
 }
+# The rollup-only sorts — expressible on the rollup branch but NOT in the live
+# GROUP BY fallback. A request for one of these under the live branch falls back
+# to the recent ordering AND sets page.sort_degraded (keyed to the REQUESTED
+# sort, never the effective order — an unknown sort also falls back to recent
+# but must stay byte-stable, so it is excluded here).
+_DEGRADABLE_SORTS = frozenset(("cost", "project"))
 
 
 def _rollup_authoritative(conn) -> bool:
@@ -1012,6 +1034,7 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         "rebuild_min": rebuild_min,
     }
     degraded = False
+    sort_degraded = False
     if _rollup_authoritative(conn):
         order = _SORTS.get(sort, _SORTS["recent"])
         rows = _list_session_rows_rollup(conn, order, limit, offset, filters)
@@ -1019,6 +1042,10 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         order = _SORTS_LIVE.get(sort, _SORTS_LIVE["recent"])
         degraded = any(
             filters[k] is not None for k in _ROLLUP_ONLY_FILTER_KEYS)
+        # sort_degraded is keyed to the REQUESTED sort, not the effective order:
+        # an unknown sort ALSO falls back to recent here (via _SORTS_LIVE.get),
+        # but must stay byte-stable, so only the known rollup-only sorts flag it.
+        sort_degraded = sort in _DEGRADABLE_SORTS
         rows = _list_session_rows_live(conn, order, limit, offset, filters)
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -1050,6 +1077,10 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         # The rail surfaces this: project/cost/rebuild filters apply once the
         # rollup finishes indexing; only the date axis held this page.
         page["filter_degraded"] = True
+    if sort_degraded:
+        # The rail surfaces this: cost/project ordering becomes available once
+        # the rollup finishes indexing; this page fell back to recent order.
+        page["sort_degraded"] = True
     return {
         "conversations": conversations,
         "page": page,

@@ -7,7 +7,16 @@ import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { fmt } from '../lib/fmt';
-import type { ConversationFilters, ConversationSummary, SearchHit, SearchKind } from '../types/conversation';
+import type { ConversationFilters, ConversationSummary, RailSortKey, SearchHit, SearchKind } from '../types/conversation';
+
+// #217 S4 / I-2.4 — rail sort options, 1:1 with the backend `_SORTS` keys.
+const SORT_OPTIONS: { key: RailSortKey; label: string }[] = [
+  { key: 'recent', label: 'Recent' },
+  { key: 'oldest', label: 'Oldest' },
+  { key: 'cost', label: 'Cost' },
+  { key: 'messages', label: 'Messages' },
+  { key: 'project', label: 'Project' },
+];
 
 // #177 S6 — kind chip facets. Order matches the Q7 mock (All · Prompts ·
 // Assistant · Tools · Thinking). `Tools`/`Thinking` query the split index
@@ -107,6 +116,7 @@ export function ConversationRail() {
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
   const filtersOpen = useSyncExternalStore(subscribeStore, () => getState().convFiltersOpen);
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
+  const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const inputRef = useRef<HTMLInputElement>(null);
@@ -134,21 +144,39 @@ export function ConversationRail() {
               }
             }}
           />
-          {/* Filters apply to browse only; disabled (with a hint) while a needle
-              is active (filters spec §4 search-mode coexistence). */}
+          {/* #217 S4 / I-2.5 — filters apply to BOTH browse and search (the
+              shared-filter decision), so the button stays enabled in search mode
+              and the popover/chips render in both modes. */}
           <button
             type="button"
             className={`conv-rail-filters-btn${filtersOpen ? ' is-on' : ''}`}
-            disabled={isSearching}
             aria-expanded={filtersOpen}
-            title={isSearching ? 'Filters apply to browse' : 'Filter conversations'}
+            title="Filter conversations"
             onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
           >
             Filters ▾
           </button>
+          {/* #217 S4 / I-2.4 — rail sort control. Always visible; the active key
+              threads into the browse `sort` param via useConversations. */}
+          <label className="conv-rail-sort">
+            <span className="conv-rail-sort-label">Sort</span>
+            <select
+              className="conv-rail-sort-select"
+              aria-label="Sort conversations"
+              value={railSort}
+              onChange={(e) => dispatch({
+                type: 'SET_CONVERSATION_RAIL_SORT',
+                sort: e.target.value as RailSortKey,
+              })}
+            >
+              {SORT_OPTIONS.map((o) => (
+                <option key={o.key} value={o.key}>{o.label}</option>
+              ))}
+            </select>
+          </label>
         </div>
-        {filtersOpen && !isSearching && <ConversationFiltersPopover />}
-        {!isSearching && chips.length > 0 && (
+        {filtersOpen && <ConversationFiltersPopover />}
+        {chips.length > 0 && (
           <div className="conv-rail-filters-active">
             {chips.map((c) => (
               <button
@@ -182,14 +210,23 @@ export function ConversationRail() {
 interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
-  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, retry } = useConversations();
+  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry } = useConversations();
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   // filters spec §1 dual-branch parity — a one-line muted note when the
   // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
-  // above the list so it shows even on a degraded empty result.
-  const degradedNote = filterDegraded
-    ? <div className="conv-rail-filters-degraded">Project/cost/rebuild filters apply once indexing finishes.</div>
-    : null;
+  // above the list so it shows even on a degraded empty result. #217 S4 / I-2.3 —
+  // the parallel sort_degraded note for a cost/project sort that fell back to
+  // recent order in the same non-authoritative window.
+  const degradedNote = (
+    <>
+      {filterDegraded && (
+        <div className="conv-rail-filters-degraded">Project/cost/rebuild filters apply once indexing finishes.</div>
+      )}
+      {sortDegraded && (
+        <div className="conv-rail-sort-degraded">Cost/Project sort unavailable while indexing — showing recent order.</div>
+      )}
+    </>
+  );
   if (error) return (
     <div className="conv-rail-list">{degradedNote}
       <div className="conv-rail-empty">
@@ -305,7 +342,7 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
 }
 
 function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; ctx: RailCtx }) {
-  const { hits, mode, total, loading, loadingMore, searchDepth, error, loadMore } =
+  const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore } =
     useConversationSearch(needle, kind);
   const proseOnly = searchDepth === 'prose-only';
   const remaining = total - hits.length;
@@ -326,6 +363,12 @@ function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; c
   return (
     <div className="conv-rail-list">
       <KindChips kind={kind} proseOnly={proseOnly} />
+      {/* #217 S4 / I-2.5 — shared-filter parity: a one-line note when a
+          project/cost/rebuild filter couldn't apply to the search (rollup
+          non-authoritative). The search response carries this TOP-LEVEL. */}
+      {filterDegraded && (
+        <div className="conv-rail-search-filters-degraded">Some filters unavailable while indexing.</div>
+      )}
       {error
         ? <div className="conv-rail-empty">{error}</div>
         : loading && hits.length === 0

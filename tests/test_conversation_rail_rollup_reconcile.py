@@ -38,7 +38,16 @@ _MODEL = "claude-opus-4-8"
 # test_conversation_rail_rollup_reconcile.py. _dump() asserts this list covers
 # exactly cq._SORTS.keys(), so a key added to the module but not here fails loud.
 _COMBOS = [(50, 0), (5, 0), (5, 5), (2, 3)]
-_SORTS = ["recent", "oldest"]
+# Every key in cq._SORTS must appear here (the _dump desync guard asserts the
+# set equality). Only the sorts with FULL live parity reconcile byte-for-byte
+# rollup-vs-live; cost/project are rollup-only (no raw-message column) and
+# DEGRADE to recent + page.sort_degraded under the live branch, so they are
+# reconciled via the degrade-path assertion (_assert_degrade_path), not parity.
+_SORTS = ["recent", "oldest", "cost", "messages", "project"]
+# The sorts that paginate byte-identically across both branches.
+_PARITY_SORTS = ["recent", "oldest", "messages"]
+# The sorts that have no live-branch column and degrade to recent.
+_DEGRADE_SORTS = ["cost", "project"]
 
 
 def _bin_on_path(ns):
@@ -131,20 +140,39 @@ def _cq(ns):
 
 
 def _dump(cq, conn):
-    """All (sort, limit, offset) outputs as a JSON-canonical dict, so equality
-    is the byte-identity the spec requires."""
+    """The PARITY (sort, limit, offset) outputs as a JSON-canonical dict, so
+    equality is the byte-identity the spec requires. Only _PARITY_SORTS appear
+    here — cost/project have no live-branch column and degrade to recent under
+    the live fallback, so they cannot be byte-reconciled (they are covered by
+    _assert_degrade_path instead)."""
     # Desync guard: the hardcoded _SORTS must cover exactly the read path's sort
-    # keys, so a third sort added to cq._SORTS (and cq._SORTS_LIVE) but not
-    # exercised here fails loud instead of silently going unreconciled.
+    # keys, so a sort added to cq._SORTS (and cq._SORTS_LIVE) but not exercised
+    # here fails loud instead of silently going unreconciled.
     assert set(_SORTS) == set(cq._SORTS.keys()), (
         f"_SORTS {_SORTS} out of sync with cq._SORTS {list(cq._SORTS.keys())}"
     )
     out = {}
-    for s in _SORTS:
+    for s in _PARITY_SORTS:
         for (limit, offset) in _COMBOS:
             res = cq.list_conversations(conn, sort=s, limit=limit, offset=offset)
             out[f"{s}-{limit}-{offset}"] = json.dumps(res, sort_keys=True)
     return out
+
+
+def _assert_degrade_path(cq, conn):
+    """Under the LIVE branch (flag set), the rollup-only sorts (cost/project)
+    fall back to the recent ORDER and carry page.sort_degraded=True; the parity
+    sorts never carry the flag. Caller must have armed the pending flag."""
+    recent_ids = [r["session_id"] for r in
+                  cq.list_conversations(conn, sort="recent", limit=50, offset=0)
+                  ["conversations"]]
+    for s in _DEGRADE_SORTS:
+        res = cq.list_conversations(conn, sort=s, limit=50, offset=0)
+        assert res["page"].get("sort_degraded") is True, (s, res["page"])
+        assert [r["session_id"] for r in res["conversations"]] == recent_ids, s
+    for s in _PARITY_SORTS:
+        assert "sort_degraded" not in cq.list_conversations(
+            conn, sort=s, limit=50, offset=0)["page"], s
 
 
 def test_rollup_read_matches_live_aggregate(tmp_path, monkeypatch):
@@ -224,6 +252,8 @@ def test_fallback_branch_matches_live_aggregate(tmp_path, monkeypatch):
         first = json.loads(fallback["recent-50-0"])
         assert len(first["conversations"]) == 4
         assert fallback == reference, "fallback read diverged from rollup read"
+        # The rollup-only sorts degrade to recent + page.sort_degraded here.
+        _assert_degrade_path(cq, conn)
     finally:
         conn.close()
 

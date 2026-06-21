@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversations } from './useConversations';
 import { _resetForTests, dispatch } from '../store/store';
+import { clearRailPrefs } from '../store/conversationRailPrefs';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick
 // signal the first-page effect keys on) deterministically between renders.
@@ -25,8 +26,8 @@ function mockFetchOnce(body: unknown, status = 200) {
   } as Response);
 }
 
-beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; _resetForTests(); });
-afterEach(() => { vi.restoreAllMocks(); _resetForTests(); });
+beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; clearRailPrefs(); _resetForTests(); });
+afterEach(() => { vi.restoreAllMocks(); clearRailPrefs(); _resetForTests(); });
 
 // A full first page (exactly PAGE=50 rows) with more to come. Generated
 // programmatically so the accumulated tail is unambiguously > PAGE.
@@ -212,6 +213,57 @@ describe('useConversations', () => {
     mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false, filter_degraded: true } });
     const { result } = renderHook(() => useConversations());
     await waitFor(() => expect(result.current.filterDegraded).toBe(true));
+  });
+
+  // #217 S4 / I-2.3 — rail sort wiring + combined {filters,sort} generation.
+  it('threads the active rail sort into the request URL (not hardcoded recent)', async () => {
+    act(() => dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'cost' }));
+    mockFetchOnce(page1);
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('sort=cost');
+  });
+
+  it('resets to offset 0 and refetches when the sort changes', async () => {
+    mockFetchOnce(page1);
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false } });
+    act(() => dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'messages' }));
+    await waitFor(() => expect(result.current.rows).toHaveLength(0));
+    const lastCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0];
+    expect(lastCall).toContain('sort=messages');
+    expect(lastCall).toContain('offset=0');
+  });
+
+  it('ignores an in-flight loadMore result once the sort has changed', async () => {
+    mockFetchOnce(page1);   // mount page-1 load
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    // Arm loadMore with a controllable fetch (still in flight).
+    let resolveLoadMore!: (b: unknown) => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolveLoadMore = (b) => res({ ok: true, status: 200, json: async () => b } as Response); }),
+    );
+    let loadMorePromise!: Promise<void>;
+    act(() => { loadMorePromise = result.current.loadMore(); });
+
+    // Sort changes mid-flight → reset effect fires a fresh page-1 load.
+    mockFetchOnce({ conversations: [{ session_id: 'fresh', project_label: 'np', git_branch: null, started_utc: '2026-03-01T00:00:00Z', last_activity_utc: '2026-03-01T01:00:00Z', msg_count: 2, cost_usd: 0.5, models: ['opus'] }], page: { next_offset: 9, has_more: true } });
+    act(() => dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'cost' }));
+    await waitFor(() => expect(result.current.rows.map((r) => r.session_id)).toEqual(['fresh']));
+
+    // Resolve the STALE in-flight loadMore — its result must be discarded.
+    await act(async () => { resolveLoadMore(page2); await loadMorePromise; });
+    expect(result.current.rows.map((r) => r.session_id)).toEqual(['fresh']);
+    expect(result.current.hasMore).toBe(true);
+  });
+
+  it('surfaces sort_degraded from the page body', async () => {
+    mockFetchOnce({ conversations: [], page: { next_offset: null, has_more: false, sort_degraded: true } });
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.sortDegraded).toBe(true));
   });
 
   it('recovers from a failed first load via retry() (#205 S3 F8)', async () => {

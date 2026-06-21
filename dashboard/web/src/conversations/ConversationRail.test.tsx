@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationRail } from './ConversationRail';
 import { _resetForTests, dispatch, getState } from '../store/store';
+import { clearRailPrefs } from '../store/conversationRailPrefs';
 import type { ConversationSummary, SearchHit } from '../types/conversation';
 
 // Mirror the hook-test mocking convention (useConversations.test.tsx etc.):
@@ -17,6 +18,9 @@ let searchMode: 'fts' | 'like' = 'fts';
 let searchDepth: 'prose-only' | 'full' = 'full';
 let searchLoadingMore = false;
 let filterDegraded = false;
+// #217 S4 / I-2 — browse sort_degraded + search top-level filter_degraded.
+let sortDegraded = false;
+let searchFilterDegraded = false;
 const loadMoreSpy = vi.fn();
 // #205 S3 (F8) — overridable error + retry spy so the error-branch Retry button
 // can be exercised. Default error null preserves every existing browse test.
@@ -33,7 +37,7 @@ vi.mock('../hooks/useConversations', () => ({
   useConversations: () => ({
     rows: browseRows, loading: false, error: browseError, hasMore: browseHasMore,
     loadMore: browseLoadMoreSpy, loadingMore: browseLoadingMore,
-    filterDegraded, retry: retrySpy,
+    filterDegraded, sortDegraded, retry: retrySpy,
   }),
 }));
 // Stub the popover so the rail render doesn't reach useConversationFacets' live
@@ -46,6 +50,7 @@ vi.mock('../hooks/useConversationSearch', () => ({
   useConversationSearch: () => ({
     hits: searchHits, mode: searchMode, total: searchTotal,
     loading: false, loadingMore: searchLoadingMore, searchDepth,
+    filterDegraded: searchFilterDegraded,
     error: null, loadMore: loadMoreSpy,
   }),
 }));
@@ -84,6 +89,10 @@ function hit(over: Partial<SearchHit>): SearchHit {
 }
 
 beforeEach(() => {
+  // #217 S4 / I-2.2 — the railPrefs blob now persists filters+sort to
+  // localStorage; clear it BEFORE _resetForTests so loadInitial re-seeds clean
+  // (a prior test's SET_CONVERSATION_FILTERS would otherwise bleed across).
+  clearRailPrefs();
   _resetForTests();
   browseRows = [];
   searchHits = [];
@@ -92,6 +101,8 @@ beforeEach(() => {
   searchDepth = 'full';
   searchLoadingMore = false;
   filterDegraded = false;
+  sortDegraded = false;
+  searchFilterDegraded = false;
   loadMoreSpy.mockReset();
   browseError = null;
   retrySpy.mockClear();
@@ -100,6 +111,7 @@ beforeEach(() => {
   browseLoadMoreSpy.mockReset();
 });
 afterEach(() => {
+  clearRailPrefs();
   _resetForTests();
   vi.restoreAllMocks();
 });
@@ -405,15 +417,16 @@ describe('ConversationRail', () => {
     expect(getState().conversationFilters.projects).toEqual(['projB']);
   });
 
-  it('disables Filters while searching and hides chips', () => {
+  it('keeps Filters enabled while searching and KEEPS chips visible (#217 S4 / I-2.5)', () => {
+    // Filters now apply to BOTH browse and search (the shared-filter decision),
+    // so the button stays enabled and the active chips stay rendered in search
+    // mode — the prior browse-only behavior is REVERSED.
     render(<ConversationRail />);
     act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 1 } }));
-    // A chip is visible while browsing.
-    expect(screen.queryByText(/≥1/)).toBeTruthy();
+    expect(screen.queryByText(/≥1/)).toBeTruthy();         // chip visible while browsing
     act(() => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'hello' }));
-    expect(screen.getByRole('button', { name: /filters/i })).toBeDisabled();
-    // Chips hide while searching.
-    expect(screen.queryByText(/≥1/)).toBeNull();
+    expect((screen.getByRole('button', { name: /filters/i }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/≥1/)).toBeTruthy();         // chip STILL visible while searching
   });
 
   it('buckets browse rows by last activity, not start', () => {
@@ -477,5 +490,75 @@ describe('ConversationRail browse-list error state (#205 S3 F8)', () => {
     expect(btn).toBeTruthy();
     fireEvent.click(btn);
     expect(retrySpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ConversationRail sort control (#217 S4 / I-2.4)', () => {
+  it('renders a sort <select> with the five rail sort options', () => {
+    render(<ConversationRail />);
+    const sel = screen.getByLabelText(/sort conversations/i) as HTMLSelectElement;
+    expect(sel).toBeTruthy();
+    const values = Array.from(sel.options).map((o) => o.value);
+    expect(values).toEqual(['recent', 'oldest', 'cost', 'messages', 'project']);
+  });
+
+  it('changing the sort dispatches SET_CONVERSATION_RAIL_SORT', () => {
+    render(<ConversationRail />);
+    const sel = screen.getByLabelText(/sort conversations/i) as HTMLSelectElement;
+    fireEvent.change(sel, { target: { value: 'cost' } });
+    expect(getState().conversationRailSort).toBe('cost');
+  });
+
+  it('reflects the current conversationRailSort in the select value', () => {
+    act(() => dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' }));
+    render(<ConversationRail />);
+    const sel = screen.getByLabelText(/sort conversations/i) as HTMLSelectElement;
+    expect(sel.value).toBe('project');
+  });
+
+  it('shows a "sort unavailable while indexing" hint when sortDegraded', () => {
+    sortDegraded = true;
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-sort-degraded')).toBeTruthy();
+    expect(document.querySelector('.conv-rail-sort-degraded')!.textContent)
+      .toMatch(/indexing/i);
+  });
+
+  it('does NOT show the sort hint when not degraded', () => {
+    sortDegraded = false;
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-sort-degraded')).toBeNull();
+  });
+});
+
+describe('ConversationRail filtered search (#217 S4 / I-2.5)', () => {
+  it('keeps the Filters button enabled while a needle is active', () => {
+    searchHits = [hit({})];
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const btn = screen.getByRole('button', { name: /filters/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(btn.title).toBe('Filter conversations');
+  });
+
+  it('renders the Filters popover + active chips in search mode', () => {
+    searchHits = [hit({})];
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+    dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projA'] } });
+    render(<ConversationRail />);
+    expect(screen.getByTestId('filters-popover')).toBeTruthy();
+    // The active-filter chip row renders in search mode too.
+    expect(document.querySelector('.conv-rail-filters-active')).toBeTruthy();
+  });
+
+  it('surfaces the search filter_degraded hint', () => {
+    searchHits = [hit({})];
+    searchFilterDegraded = true;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const note = document.querySelector('.conv-rail-search-filters-degraded');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toMatch(/filters/i);
   });
 });

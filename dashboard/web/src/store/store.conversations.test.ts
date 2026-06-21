@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
 import { clearReadingPositions, loadReadingPos } from './readingPosition';
+import { clearRailPrefs } from './conversationRailPrefs';
 
-afterEach(() => _resetForTests());
+// #217 S4 / I-2.2 — filters/sort now persist to localStorage; clear before each
+// reset so a prior test's SET_CONVERSATION_FILTERS never bleeds into loadInitial.
+beforeEach(() => { clearRailPrefs(); _resetForTests(); });
+afterEach(() => { clearRailPrefs(); _resetForTests(); });
 
 describe('conversation view state', () => {
   it('defaults to dashboard view with no selection/search/jump', () => {
@@ -134,17 +138,18 @@ describe('conversation view state', () => {
     expect(getState().conversationSearchKind).toBe('assistant');
   });
 
-  // Cross-branch review fix: an active search needle unmounts the Filters
-  // popover ({filtersOpen && !isSearching && …}) but the reader hotkey guards
-  // (`End`/`j`/`k` + ConversationsView `inView`) gate on `convFiltersOpen`, so a
-  // left-true flag would silently dead the reader keys with no visible popover.
-  // A non-empty needle must clear `convFiltersOpen` so the popover-mount
-  // condition and both guards share one source of truth.
-  it('a non-empty SET_CONVERSATION_SEARCH clears an open Filters popover flag', () => {
+  // #217 S4 / I-2.5 — filtered search (shared filters). Filters now apply to
+  // BOTH browse and search, so the popover must be able to stay/open during a
+  // search. The prior cross-branch fix force-closed `convFiltersOpen` on a
+  // non-empty needle; that is REVERSED here — a non-empty needle no longer
+  // touches the popover flag (the rail renders the popover in both modes, and
+  // the reader nav guards correctly gate on `convFiltersOpen` regardless of
+  // mode, since an open filter popover always means "typing in a filter").
+  it('a non-empty SET_CONVERSATION_SEARCH keeps an open Filters popover open', () => {
     dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
     expect(getState().convFiltersOpen).toBe(true);
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
-    expect(getState().convFiltersOpen).toBe(false);
+    expect(getState().convFiltersOpen).toBe(true);
   });
 
   it('an empty SET_CONVERSATION_SEARCH does not force convFiltersOpen open', () => {

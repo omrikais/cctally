@@ -1,7 +1,8 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
-import type { ConversationFilters, ConversationJump, SearchKind } from '../types/conversation';
+import type { ConversationFilters, ConversationJump, RailSortKey, SearchKind } from '../types/conversation';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { recordReadingPos } from './readingPosition';
+import { loadRailPrefs, saveRailPrefs } from './conversationRailPrefs';
 import { clampOutlineWidth, loadOutlineWidth, saveOutlineWidth } from './outlineWidth';
 import {
   applySessionFilter,
@@ -320,13 +321,21 @@ export interface UIState {
   // session switch. Never persists.
   convFindOpen: boolean;
   // Browse-list filters (filters spec §4). `conversationFilters` is the active
-  // filter set threaded into the /api/conversations query string; `convFiltersOpen`
-  // is the Filters popover's open flag. Session-only (never persisted across reload)
-  // — a reload always lands unfiltered. `convFiltersOpen` is also a named-key guard:
-  // the reader's `End`/jump binding (Task 4) gates on it so typing in a filter input
-  // never fires reader navigation.
+  // filter set threaded into the /api/conversations AND /api/conversation/search
+  // query strings (#217 S4 / I-2.5 — filters now apply to BOTH browse and
+  // search); `convFiltersOpen` is the Filters popover's open flag. #217 S4 / I-2.2
+  // flipped the prior session-only behavior: the filters AND the rail sort now
+  // PERSIST across reload as one `cctally.conv.railPrefs` blob (seeded in
+  // loadInitial, written on SET/CLEAR + SET_CONVERSATION_RAIL_SORT).
+  // `convFiltersOpen` is also a named-key guard: the reader's `End`/jump binding
+  // (Task 4) gates on it so typing in a filter input never fires reader
+  // navigation.
   conversationFilters: ConversationFilters;
   convFiltersOpen: boolean;
+  // #217 S4 / I-2 — the rail sort key (Recent/Oldest/Cost/Messages/Project),
+  // threaded into the /api/conversations `sort` param. Persisted alongside the
+  // filters in the railPrefs blob; default 'recent'.
+  conversationRailSort: RailSortKey;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -550,6 +559,10 @@ function loadInitial(): UIState {
   } catch {
     convOutlineOpen = true;
   }
+  // #217 S4 / I-2.2 — seed the persisted rail discovery prefs (filters + sort).
+  // loadRailPrefs is itself try/catch-guarded and falls back to EMPTY_FILTERS +
+  // 'recent' on a corrupt/absent blob, so this never throws during init.
+  const railPrefs = loadRailPrefs();
   return {
     snapshot: null,
     view: 'dashboard',
@@ -565,8 +578,9 @@ function loadInitial(): UIState {
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
     convFindOpen: false,
-    conversationFilters: EMPTY_FILTERS,
+    conversationFilters: railPrefs.filters,
     convFiltersOpen: false,
+    conversationRailSort: railPrefs.sort,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -745,11 +759,13 @@ export type Action =
   // Browse-list filters (filters spec §4). SET merges a partial patch (live-apply
   // of one axis at a time); CLEAR resets to EMPTY_FILTERS; TOGGLE flips the popover
   // open flag; SET_CONV_FILTERS_OPEN sets it explicitly (the popover's "Done"
-  // closes it). All session-only — none persist to localStorage.
+  // closes it). #217 S4 / I-2.2 — SET/CLEAR now PERSIST the railPrefs blob.
   | { type: 'SET_CONVERSATION_FILTERS'; patch: Partial<ConversationFilters> }
   | { type: 'CLEAR_CONVERSATION_FILTERS' }
   | { type: 'TOGGLE_CONV_FILTERS' }
   | { type: 'SET_CONV_FILTERS_OPEN'; open: boolean }
+  // #217 S4 / I-2 — the persisted rail sort key.
+  | { type: 'SET_CONVERSATION_RAIL_SORT'; sort: RailSortKey }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -971,20 +987,19 @@ export function dispatch(action: Action): void {
       // #177 S6 — clearing the needle snaps the kind facet back to 'all' so
       // re-opening search starts on the default facet (a non-empty edit leaves
       // the active facet alone — the user keeps Tools/Thinking across keystrokes).
-      // Cross-branch review fix — a non-empty needle also force-closes the
-      // Filters popover flag. The rail unmounts the popover while searching
-      // ({filtersOpen && !isSearching && …}), but the reader hotkey guards
-      // (`End`/`j`/`k` + ConversationsView `inView`) gate on `convFiltersOpen`,
-      // so a left-true flag would silently suppress reader keys with no visible
-      // popover. Clearing it keeps the popover-mount condition and both guards on
-      // one source of truth. The empty (clear) path leaves it untouched — it
-      // never re-opens the popover.
+      // #217 S4 / I-2.5 — filters now apply to BOTH browse and search, so a
+      // non-empty needle MUST NOT force-close `convFiltersOpen` (the prior
+      // cross-branch behavior): the rail renders the Filters popover in search
+      // mode too, and the reader nav guards still gate correctly on
+      // `convFiltersOpen` regardless of mode (an open filter popover always means
+      // "typing in a filter"). The search needle no longer touches the popover
+      // flag at all; only the empty (clear) path resets the kind facet.
       state = {
         ...state,
         conversationSearch: action.text,
         ...(action.text === ''
           ? { conversationSearchKind: 'all' as const }
-          : { convFiltersOpen: false }),
+          : {}),
       };
       break;
     case 'SET_CONVERSATION_SEARCH_KIND':
@@ -1031,10 +1046,15 @@ export function dispatch(action: Action): void {
     case 'CLOSE_CONV_FIND':
       state = { ...state, convFindOpen: false };
       break;
-    case 'SET_CONVERSATION_FILTERS':
-      state = { ...state, conversationFilters: { ...state.conversationFilters, ...action.patch } };
+    case 'SET_CONVERSATION_FILTERS': {
+      // #217 S4 / I-2.2 — persist the filters+sort blob on every filter edit.
+      const conversationFilters = { ...state.conversationFilters, ...action.patch };
+      saveRailPrefs({ filters: conversationFilters, sort: state.conversationRailSort });
+      state = { ...state, conversationFilters };
       break;
+    }
     case 'CLEAR_CONVERSATION_FILTERS':
+      saveRailPrefs({ filters: EMPTY_FILTERS, sort: state.conversationRailSort });
       state = { ...state, conversationFilters: EMPTY_FILTERS };
       break;
     case 'TOGGLE_CONV_FILTERS':
@@ -1042,6 +1062,11 @@ export function dispatch(action: Action): void {
       break;
     case 'SET_CONV_FILTERS_OPEN':
       state = { ...state, convFiltersOpen: action.open };
+      break;
+    case 'SET_CONVERSATION_RAIL_SORT':
+      // #217 S4 / I-2 — persist the filters+sort blob on a sort change too.
+      saveRailPrefs({ filters: state.conversationFilters, sort: action.sort });
+      state = { ...state, conversationRailSort: action.sort };
       break;
     case 'SET_CONV_CURRENT_TURN':
       // No-op same-uuid ticks FIRST (the scroll-sync observer re-fires the same

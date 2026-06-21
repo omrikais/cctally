@@ -1,6 +1,8 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversationSearch } from './useConversationSearch';
+import { _resetForTests, dispatch } from '../store/store';
+import { clearRailPrefs } from '../store/conversationRailPrefs';
 import type { SearchKind } from '../types/conversation';
 
 const result1 = {
@@ -13,8 +15,8 @@ function mockFetchOnce(body: unknown) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, status: 200, json: async () => body } as Response);
 }
 
-beforeEach(() => { globalThis.fetch = vi.fn(); vi.useFakeTimers(); });
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+beforeEach(() => { globalThis.fetch = vi.fn(); vi.useFakeTimers(); clearRailPrefs(); _resetForTests(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); clearRailPrefs(); _resetForTests(); });
 
 describe('useConversationSearch', () => {
   it('does not fetch for an empty query', () => {
@@ -273,5 +275,53 @@ describe('useConversationSearch', () => {
 
     expect(result.current.loading).toBe(false);              // NOT stuck true
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);  // no redundant re-fetch
+  });
+
+  // ---- #217 S4 / I-2.5: shared filters auto-apply to search ----
+
+  it('threads the shared conversationFilters into the search URL', async () => {
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projX'], costMin: 2 } }));
+    mockFetchOnce(result1);
+    renderHook(() => useConversationSearch('flock', 'all'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(url).toContain('projects=projX');
+    expect(url).toContain('cost_min=2');
+  });
+
+  it('a filter change resets offset 0 and refetches, REPLACING hits', async () => {
+    const first = {
+      query: 'npm', mode: 'fts', kind: 'all', search_depth: 'full',
+      hits: [{ session_id: 'a', uuid: 'u1', project_label: 'p', ts: '2026-01-01T00:00:00Z', snippet: 'a', cost_usd: 0.1 }],
+      total: 1,
+    };
+    const filtered = {
+      query: 'npm', mode: 'fts', kind: 'all', search_depth: 'full',
+      hits: [{ session_id: 'b', uuid: 'u2', project_label: 'q', ts: '2026-01-02T00:00:00Z', snippet: 'b', cost_usd: 0.2 }],
+      total: 1,
+    };
+    mockFetchOnce(first);
+    const { result } = renderHook(() => useConversationSearch('npm', 'all'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.hits.map((h) => h.session_id)).toEqual(['a']);
+
+    mockFetchOnce(filtered);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { rebuildMin: 3 } }));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.hits.map((h) => h.session_id)).toEqual(['b']);  // REPLACED
+    const lastUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(lastUrl).toContain('rebuild_min=3');
+    expect(lastUrl).toContain('offset=0');
+  });
+
+  it('surfaces top-level filter_degraded from the search response', async () => {
+    mockFetchOnce({ ...result1, filter_degraded: true });
+    const { result } = renderHook(() => useConversationSearch('flock', 'all'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.filterDegraded).toBe(true);
   });
 });

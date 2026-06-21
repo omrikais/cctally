@@ -1,8 +1,11 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
 import { EMPTY_FILTERS } from '../types/conversation';
+import { clearRailPrefs } from './conversationRailPrefs';
 
-beforeEach(() => _resetForTests());
+// #217 S4 / I-2.2 — clear the persisted railPrefs blob before each reset so a
+// prior test's filter edit can't bleed into loadInitial.
+beforeEach(() => { clearRailPrefs(); _resetForTests(); });
 
 describe('conversationFilters', () => {
   it('starts empty and closed', () => {
