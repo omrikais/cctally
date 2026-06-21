@@ -329,6 +329,29 @@ def test_kind_files_returns_touching_sessions():
     assert res["total"] == 2
 
 
+def test_kind_files_total_excludes_orphan_anchor():
+    """#219 S2.1: ``total`` must INNER-JOIN the same MAX(message_id) anchor the
+    page joins, so a touch whose anchor message row is absent is excluded from
+    BOTH the count and the page — never a 'lying count' (page-reachable < total).
+    This is the file-axis analogue of the P2-9 guard in ``_search_title``.
+
+    The lifecycle never leaves such an orphan in a quiescent cache (touches are
+    deleted atomically with their message), so we inject one directly.
+
+    Non-vacuity: with the pre-fix unjoined COUNT, ``total`` counts the orphan
+    group (1) while the page INNER-JOINs it away (0 hits) — total != len(hits)."""
+    c = _conn()
+    _seed_search_corpus(c)
+    # An orphan touch: MAX(message_id)=999999 has NO conversation_messages row.
+    c.execute(
+        "INSERT INTO conversation_file_touches"
+        "(message_id, session_id, uuid, file_path, tool) VALUES(?,?,?,?,?)",
+        (999999, "sorphan", "uorphan", "orphanonly/lying.txt", "Edit"))
+    res = cq.search_conversations(c, "orphanonly/lying.txt", kind="files")
+    assert res["hits"] == []
+    assert res["total"] == len(res["hits"]) == 0, res["total"]
+
+
 def _query_plan(conn, sql, params):
     """The flattened EXPLAIN QUERY PLAN detail lines for ``sql``."""
     return " | ".join(

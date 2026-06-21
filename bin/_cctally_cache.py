@@ -738,7 +738,16 @@ def sync_cache(
             # conversation_reingest_nested_agent_pending flag (to land the
             # ingest-time structured agent_id stamp on >16 KB nested-subagent
             # grandchildren); the same offset-0 walk re-derives it through the
-            # current parser, so drop that flag here as well.
+            # current parser, so drop that flag here as well. #217 S2 migrations
+            # 018/019 set conversation_title_fts_backfill_pending (title FTS) and
+            # conversation_reingest_file_touches_pending (+ its
+            # conversation_file_touches_cursor); the offset-0 walk re-derives both
+            # the title FTS and the file-touch axis, so drop them too (#219 S2.3).
+            # NOTE: unlike the flags above, dropping the 018/019 keys here is
+            # COSMETIC — their consumers run on the just-wiped (empty) tables and
+            # self-clear before the offset-0 walk repopulates, so leaving them
+            # caused no redundant expensive pass and no re-arming. We add them for
+            # consistency with the documented convention only.
             conn.execute(
                 "DELETE FROM cache_meta WHERE key IN "
                 "('conversation_reingest_pending',"
@@ -747,6 +756,9 @@ def sync_cache(
                 " 'conversation_media_reingest_pending',"
                 " 'conversation_queued_prompt_reingest_pending',"
                 " 'conversation_reingest_nested_agent_pending',"
+                " 'conversation_title_fts_backfill_pending',"
+                " 'conversation_reingest_file_touches_pending',"
+                " 'conversation_file_touches_cursor',"
                 " 'conversation_reingest_cursor',"
                 " 'conversation_reingest_cursor_gen')")
             # #177 S6: a rebuild repopulates search_tool/search_thinking via the

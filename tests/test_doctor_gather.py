@@ -184,6 +184,32 @@ def test_gather_rollup_in_progress_via_pending_flag(tmp_path):
     assert st["conv_rollup_sync_in_progress"] is True
 
 
+def test_gather_rollup_in_progress_via_held_lock(tmp_path):
+    """#218 I-C.4: the NON-BLOCKING cache.db.lock flock probe — a writer holding
+    the lock (no pending flag) → in_progress True via the flock branch, NOT the
+    pending-flag branch. This is the mirror image of
+    test_gather_rollup_mismatch_quiescent: the SAME seed (rollup != msgs, no
+    flag) is in_progress False when the lock is FREE, so a held lock is the only
+    thing that flips it True — isolating the LOCK_EX|LOCK_NB probe (the branch
+    with the theoretical fd/lock-leak risk).
+
+    The lock is held from THIS (parent) process; the gather runs in a subprocess,
+    so its probe opens a fresh fd and the cross-process flock conflict is the
+    signal. The gather never blocks (LOCK_NB)."""
+    import fcntl
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=2, msg_sessions=4)  # no pending flag
+    lock_path = tmp_path / ".local" / "share" / "cctally" / "cache.db.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)   # a writer mid-walk holds it
+        st = _run_gather(tmp_path)
+        assert st["conv_rollup_sync_in_progress"] is True
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
 def test_gather_rollup_none_when_cache_absent(tmp_path):
     """No cache.db → both counts None, in_progress False (kernel degrades OK)."""
     (tmp_path / ".claude" / "projects").mkdir(parents=True)

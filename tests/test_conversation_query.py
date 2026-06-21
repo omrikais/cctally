@@ -1039,6 +1039,51 @@ def test_subagent_meta_empty_meta_kind_only():
     assert "totals_derived" not in entry
 
 
+def test_coincidental_nonspawn_agent_id_does_not_corrupt_parent_linkage():
+    """#218 I-B.5: a NON-spawn tool_result whose structured agent_id COLLIDES
+    with a real spawn's child hash must not hijack that spawn's parent linkage.
+
+    The structured-agent_id populate runs mid-harvest (before spawn_kind is
+    complete) so it can't self-gate; the post-harvest prune drops any agent_link
+    entry whose owning tool_use is not a spawn, mirroring the nested fallback's
+    spawn gate. Here a real spawn `t1` (item a1) links child 'X', and a LATER
+    non-spawn tool_use `t2` (item a2) coincidentally carries the same agent_id
+    'X'. The parent-linkage loop is gated on `_aid in subagent_meta`, NOT spawn
+    ownership, so without the prune `t2` overwrites the spawn's linkage with the
+    wrong owner.
+
+    Non-vacuity: pre-fix the linkage points at the non-spawn owner (a2 / t2)."""
+    conn = _conn()
+    # Real spawn t1 in main item a1; its child result carries structured agent 'X'.
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        ts="2026-06-01T00:00:00Z", byte_offset=0,
+        blocks=[{"kind": "tool_use", "name": "Task", "input_summary": "{}",
+                 "id": "t1", "preview": "audit", "subagent_type": "Explore"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1", ts="2026-06-01T00:00:01Z",
+        source_path="a.jsonl",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "X", "subagent_meta": {}}])
+    # A LATER NON-spawn tool_use t2 in a DIFFERENT main item a2 (a Read, no
+    # subagent_type); its result coincidentally carries the SAME structured 'X'.
+    _seed_assistant(conn, sid="s1", uuid="a2", msg_id="m2", req_id="r2",
+        ts="2026-06-01T00:00:02Z", byte_offset=2,
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "id": "t2", "preview": "/x.py"}])
+    _seed_tool_result(conn, sid="s1", uuid="u2", ts="2026-06-01T00:00:03Z",
+        source_path="b.jsonl",
+        blocks=[{"kind": "tool_result", "text": "agentId: X", "truncated": False,
+                 "is_error": False, "tool_use_id": "t2", "agent_id": "X"}])
+    out = cq.get_conversation(conn, "s1")
+    # Exactly one keyed entry ('X'), anchored to the SPAWN (a1 / t1) — the
+    # coincidental non-spawn owner (a2 / t2) is dropped by the prune.
+    assert "X" in out["subagent_meta"]
+    entry = out["subagent_meta"]["X"]
+    assert entry["kind"] == "Explore"
+    assert entry["spawn_tool_use_id"] == "t1"
+    assert entry["spawn_uuid"] == "a1"
+
+
 def test_grandchild_over_16kb_links_via_ingest_stamp():
     # #217 S1 / U6: a nested grandchild result whose agentId: trailer lands PAST
     # the 16 KB clip is stamped with a STRUCTURED block["agent_id"] at ingest, so
@@ -3649,6 +3694,47 @@ def test_lightweight_rebuild_count_unknown_session_is_zero():
     assert cq.session_cache_rebuild_count(c, "nope") == 0
     assert cq._cache_failure_count_over_events(
         cq._lightweight_rebuild_events(c, "nope")) == 0
+
+
+def test_lightweight_rebuild_seeds_subagent_key_from_first_fragment():
+    """#218 I-A.1: on first-prose promotion the lightweight builder keeps the
+    SEED fragment's subagent_key (re-promoting ONLY the model), matching the full
+    `_build_turn` path — it must NOT re-derive subagent_key from the PROSE
+    fragment's source_path.
+
+    Real data never splits one (msg_id, req_id) turn across two files, so this
+    engineers that split: a no-prose SEED fragment on the MAIN file
+    (`_subagent_key` -> None) and a later PROSE fragment on an `agent-*.jsonl`
+    file (`_subagent_key` -> 'beef'). The seeded key must survive promotion, so
+    the event keys on (None, <promoted model>).
+
+    Non-vacuity: the pre-fix re-derivation keys the event on ('beef', model) —
+    this assertion FAILS until the builder keeps the seed key."""
+    c = _conn()
+    sid = "ka1"
+    # SEED fragment: main file, NO prose (tool_use only) -> subagent_key None,
+    # seed model OPUS, turn not yet prose-promoted.
+    _msg(c, session_id=sid, uuid="f1", source_path="main.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="", model=_MODEL, msg_id="mm", req_id="rr",
+         blocks_json=_json.dumps([{"kind": "tool_use", "id": "tu",
+                                   "name": "Read", "input_summary": "{}"}]))
+    # PROSE fragment under the SAME (msg_id, req_id) but on an agent-*.jsonl file
+    # (subagent_key 'beef') — the engineered cross-file split. Promotes prose and
+    # the model (to HAIKU).
+    _msg(c, session_id=sid, uuid="f2", source_path="agent-beef.jsonl",
+         byte_offset=1, timestamp_utc="2026-06-01T00:00:01Z",
+         entry_type="assistant", text="prose", model="claude-haiku-4-5",
+         msg_id="mm", req_id="rr",
+         blocks_json=_json.dumps([{"kind": "text", "text": "prose"}]))
+    # session_entries row for the turn key so the event is not dropped as
+    # no-token (the cost-once attribution drops keyless turns).
+    _entry(c, source_path="main.jsonl", line_offset=0, model="claude-haiku-4-5",
+           msg_id="mm", req_id="rr", inp=10, out=20, cc=1_000, cr=1_000)
+    events = cq._lightweight_rebuild_events(c, sid)
+    assert len(events) == 1, events
+    # Seed subagent_key (None) holds; only the model is promoted to HAIKU.
+    assert events[0].key == (None, "claude-haiku-4-5"), events[0].key
 
 
 def test_rollup_fill_does_not_call_assemble_session(monkeypatch):

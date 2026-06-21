@@ -572,12 +572,14 @@ def _lightweight_rebuild_events(conn, session_id):
             else:
                 ev = events[ev_idx]
                 # First prose fragment promotes the turn's model anchor. The full
-                # path SEEDS subagent_key and never re-promotes it (only model);
-                # re-deriving subagent_key here is harmless because it is
-                # per-file-invariant across a turn's fragments (one (msg_id,req_id)
-                # = one file), so the two paths key the event identically.
+                # path (`_build_turn`) SEEDS subagent_key from the first fragment
+                # and re-promotes ONLY the model; mirror that here by keeping the
+                # seeded `ev.key[0]` and re-promoting just the model (#218 I-A.1).
+                # subagent_key is per-file-invariant across a turn's fragments (one
+                # (msg_id,req_id) = one file), so this matches in all real data and
+                # is exact structural parity for the engineered cross-file split.
                 if not turn_has_prose.get(key) and frag_text:
-                    ev.key = (_subagent_key(source_path), model)
+                    ev.key = (ev.key[0], model)
                     ev.model = model
                     turn_has_prose[key] = True
         elif etype in ("meta", "human"):
@@ -1243,6 +1245,14 @@ def _assemble_session(conn, session_id):
                 tlist_ = b.pop("task_list", None)
                 if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
                     task_link[b["tool_use_id"]] = {"task_id": tid_, "task_list": tlist_}
+    # §4 symmetry (#218 I-B.5): the structured-agent_id populate above runs
+    # mid-loop, before spawn_kind is complete, so it cannot self-gate on spawn
+    # ownership. Re-validate here now that spawn_kind is final — drop any
+    # agent_link entry whose owning tool_use is NOT a spawn, mirroring the nested
+    # fallback's `_tuid in spawn_kind` gate so BOTH link paths only ever carry
+    # spawn-owned results. Inert today (every agent_link consumer is itself
+    # spawn-gated); this protects a future, un-gated agent_link consumer.
+    agent_link = {t: v for t, v in agent_link.items() if t in spawn_kind}
     # §4 1a — nested grandchild results: gate the text-parse on the owning
     # tool_use being a spawn (in spawn_kind), so an ordinary tool result that
     # merely mentions "agentId" never matches.
@@ -2187,6 +2197,23 @@ def _attach_titles(conn, page):
     return page
 
 
+def _session_filter_pred(col, filt_sql):
+    """The session-scope filter fragment shared by the four ``_search_*``
+    subroutines (#219 S2.2): ``" AND <col> IN (<filt_sql>)"`` when a browse filter
+    is active, else ``""`` (the no-filter fast path). ``col`` is the caller's
+    table-qualified session_id column (``cm.session_id`` / ``t.session_id`` /
+    ``ft.session_id`` / bare ``session_id``)."""
+    return f" AND {col} IN ({filt_sql})" if filt_sql else ""
+
+
+def _attach_search_meta(conn, hits):
+    """The shared search-hit enrichment tail (#219 S2.2): per-turn cost then
+    per-session title/label. Every ``_search_*`` subroutine returns
+    ``_attach_titles(conn, _attach_costs(conn, hits))`` — centralized here so the
+    two-step order has one definition."""
+    return _attach_titles(conn, _attach_costs(conn, hits))
+
+
 def _like_escape(q):
     """Escape the LIKE wildcards/escape-char in ``q`` (no surrounding ``%``),
     paired with ``ESCAPE '\\'``. The ESCAPE char (``\\``) is escaped FIRST, then
@@ -2292,7 +2319,7 @@ def _search_fts(conn, q, limit, offset, kind, depth,
     # #217 S2 / Filtered-search: session-scope restriction (empty when no filter,
     # so the no-filter path stays byte-stable). cm.session_id is the FTS join's
     # message column.
-    fpred = f" AND cm.session_id IN ({filt_sql})" if filt_sql else ""
+    fpred = _session_filter_pred("cm.session_id", filt_sql)
     fargs = tuple(filt_params)
     # Exact post-dedup logical total — counted in C with no snippet generation
     # and no Python row materialization.
@@ -2341,7 +2368,7 @@ def _search_fts(conn, q, limit, offset, kind, depth,
         badges = {grp: [] for grp in page_groups}
     else:
         rids_by_group = _all_matched_rids_by_group(
-            conn, match_expr, et_pred, et_args, list(page_groups))
+            conn, et_pred, et_args, list(page_groups))
         badges = _match_kinds(conn, fts_q, rids_by_group)
     snips = _fts_snippets(conn, match_expr, [r[0] for r in page], col=0)
     # For hits badged tool/thinking but with no prose match, draw the snippet
@@ -2352,11 +2379,11 @@ def _search_fts(conn, q, limit, offset, kind, depth,
                         match_kinds=badges.get((sid, uuid), []))
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
     return {"query": q, "mode": "fts",
-            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "hits": _attach_search_meta(conn, hits),
             "total": total}
 
 
-def _all_matched_rids_by_group(conn, match_expr, et_pred, et_args, groups):
+def _all_matched_rids_by_group(conn, et_pred, et_args, groups):
     """{(sid, uuid) -> [rids]} for the page groups: ALL physical rows of each
     page group (a SUPERSET of the FTS-matched subset), so badges aggregate
     completely. ``_match_kinds`` re-runs a per-column MATCH restricted to these
@@ -2365,9 +2392,9 @@ def _all_matched_rids_by_group(conn, match_expr, et_pred, et_args, groups):
 
     U3 (#217 S1): a BOUNDED base-table lookup of the page groups' rows — NOT a
     third full-corpus ``conversation_fts MATCH``. We stop scanning the corpus a
-    third time per request. ``match_expr`` is now unused (the per-column MATCH in
-    ``_match_kinds`` carries the term expression); it is kept in the signature so
-    the legacy/FTS call sites are unchanged.
+    third time per request. The term expression is carried by the per-column
+    MATCH in ``_match_kinds``, so this lookup needs no match expression — the
+    formerly-vestigial ``match_expr`` param was dropped (#218 I-A.2).
 
     Facet-scope fix (Codex P2): carry the SAME ``et_pred``/``et_args`` the page
     query used (``kind=prompts``/``assistant`` filter ``cm.entry_type``), so a
@@ -2464,7 +2491,7 @@ def _search_like(conn, q, limit, offset, kind, depth,
     et_pred = " AND entry_type = ?" if entry_type is not None else ""
     et_args = (entry_type,) if entry_type is not None else ()
     # #217 S2 / Filtered-search: session-scope restriction (empty when no filter).
-    fpred = f" AND session_id IN ({filt_sql})" if filt_sql else ""
+    fpred = _session_filter_pred("session_id", filt_sql)
     fargs = tuple(filt_params)
     total = conn.execute(
         "SELECT COUNT(*) FROM ("
@@ -2497,7 +2524,7 @@ def _search_like(conn, q, limit, offset, kind, depth,
                         match_kinds=badges.get((sid, uuid), []))
             for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
     return {"query": q, "mode": "like",
-            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "hits": _attach_search_meta(conn, hits),
             "total": total}
 
 
@@ -2523,7 +2550,7 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
     Filtered-search: the ``filt_sql`` session-scope restriction (over
     conversation_ai_titles.session_id) applies the same as the message kinds.
     """
-    fpred = f" AND t.session_id IN ({filt_sql})" if filt_sql else ""
+    fpred = _session_filter_pred("t.session_id", filt_sql)
     fargs = tuple(filt_params)
     # First-turn anchor per session: earliest (timestamp_utc, id) row. Rides
     # idx_conv_session_ts. One row per session_id.
@@ -2582,7 +2609,7 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
                         match_kinds=["title"])
             for (sid, auuid, ats, acwd, amid, arqd, snip) in rows]
     return {"query": q, "mode": mode,
-            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "hits": _attach_search_meta(conn, hits),
             "total": total}
 
 
@@ -2623,18 +2650,26 @@ def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
     esc = _like_escape(q)
     prefix = not q.startswith(_PATH_SEPARATORS)
     pat = (esc + "%") if prefix else ("%" + esc + "%")
-    fpred = f" AND ft.session_id IN ({filt_sql})" if filt_sql else ""
+    fpred = _session_filter_pred("ft.session_id", filt_sql)
     fargs = tuple(filt_params)
 
     # The anchor per (session_id, file_path) group is its MAX(message_id). Compute
     # the groups (filtered + matched), then join to conversation_messages on the
     # anchor id for the turn's render/cost metadata.
+    #
+    # P2-9 (#219 S2.1): the COUNT INNER-JOINs the SAME anchor the page joins, so a
+    # group whose MAX(message_id) anchor is absent from conversation_messages is
+    # excluded from BOTH (never a lying count where total > page-reachable). Inert
+    # in a quiescent cache (touches are deleted with their message), but it keeps
+    # `total` provably equal to the page-reachable set — matching `_search_title`.
     total = conn.execute(
-        "SELECT COUNT(*) FROM ("
-        "  SELECT ft.session_id, ft.file_path "
+        "WITH g AS ("
+        "  SELECT ft.session_id AS sid, ft.file_path AS fp, "
+        "         MAX(ft.message_id) AS aid "
         "  FROM conversation_file_touches ft "
         f"  WHERE ft.file_path LIKE ? ESCAPE '\\'{fpred} "
-        "  GROUP BY ft.session_id, ft.file_path)",
+        "  GROUP BY ft.session_id, ft.file_path) "
+        "SELECT COUNT(*) FROM g JOIN conversation_messages cm ON cm.id = g.aid",
         (pat, *fargs)).fetchone()[0]
     rows = conn.execute(
         "WITH g AS ("
@@ -2653,7 +2688,7 @@ def _search_files(conn, q, limit, offset, filt_sql="", filt_params=()):
     hits = [_row_to_hit(uuid_, sid, ts, cwd, fp, mid, rqd, match_kinds=["file"])
             for (sid, fp, uuid_, ts, cwd, mid, rqd) in rows]
     return {"query": q, "mode": "like",
-            "hits": _attach_titles(conn, _attach_costs(conn, hits)),
+            "hits": _attach_search_meta(conn, hits),
             "total": total}
 
 

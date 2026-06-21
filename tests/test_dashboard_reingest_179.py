@@ -210,6 +210,7 @@ def test_dashboard_initial_snapshot_never_syncs(monkeypatch):
 # coverage above is monkeypatch-level (asserts _dashboard_initial_snapshot uses
 # skip_sync=True); this exercises the end-to-end ordering against a live socket.
 
+import argparse     # noqa: E402
 import socketserver  # noqa: E402
 import threading     # noqa: E402
 from http.client import HTTPConnection  # noqa: E402
@@ -281,6 +282,95 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
         srv.shutdown()
         http_thread.join(timeout=3)
         sync_thread.join(timeout=3)
+
+
+# --- #218 I-C.3: real cmd_dashboard bind-before-sync, at the production call site
+# The test above proves the invariant against a HAND-BUILT ThreadingTCPServer.
+# This drives the PRODUCTION cmd_dashboard far enough to construct its OWN real
+# HTTP server (the bind) and proves that bind is reached while the background
+# _DashboardSyncThread's sync is blocked mid-flight — the #179 ordering at the
+# real call site. We stop AT the bind (a sentinel raised from the server ctor) so
+# serve_forever / the browser open / the signal wait never run.
+
+
+class _BindReached(Exception):
+    """Raised from the patched server ctor right after the real bind to
+    short-circuit cmd_dashboard before serve_forever."""
+
+
+def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, monkeypatch):
+    """The #179 invariant END-TO-END through cmd_dashboard: with the background
+    _DashboardSyncThread's sync provably blocked (parked in a patched
+    _make_run_sync_now), cmd_dashboard must still reach and complete the real
+    ThreadingHTTPServer bind — proving the bind does not wait on the first
+    background sync.
+
+    Regression guard: a pre-#179 ordering that gated the bind on the first
+    background sync would hang the worker on the blocked sync, so the bind event
+    would never fire within the join timeout."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    import _cctally_dashboard as dash   # same module object load_script loaded
+
+    # Background sync seam: park the _DashboardSyncThread's sync indefinitely so
+    # it is provably mid-flight (and can NEVER complete) for the whole run.
+    sync_entered = threading.Event()
+    park_forever = threading.Event()   # never set → the bg sync daemon parks
+
+    def fake_make_run_sync_now(*a, **k):
+        def _blocking(*aa, **kk):
+            sync_entered.set()
+            park_forever.wait()        # park (no spin); daemon dies at exit
+        return _blocking
+    monkeypatch.setattr(dash, "_make_run_sync_now", fake_make_run_sync_now)
+
+    # Neutralize the update-check thread (no network / side effects).
+    class _NoopThread(threading.Thread):
+        def __init__(self, *a, **k):
+            super().__init__(daemon=True)
+
+        def run(self):
+            pass
+    monkeypatch.setattr(dash, "_DashboardUpdateCheckThread", _NoopThread)
+
+    # Record the REAL bind, then stop cmd_dashboard before serve_forever.
+    bound: dict = {}
+    _RealServer = dash._QuietThreadingHTTPServer
+
+    class _RecordingServer(_RealServer):
+        def __init__(self, addr, handler):
+            super().__init__(addr, handler)         # the REAL bind happens here
+            bound["port"] = self.server_address[1]
+            self.server_close()                     # release the listening socket
+            raise _BindReached
+    monkeypatch.setattr(dash, "_QuietThreadingHTTPServer", _RecordingServer)
+
+    args = argparse.Namespace(host="127.0.0.1", port=0, no_browser=True,
+                              no_sync=False, sync_interval=1000, tz=None)
+
+    rc: dict = {}
+
+    def run_it():
+        try:
+            rc["ret"] = dash.cmd_dashboard(args)
+        except _BindReached:
+            rc["bind_reached"] = True
+        except BaseException as exc:                # surface anything unexpected
+            rc["err"] = repr(exc)
+    worker = threading.Thread(target=run_it, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive(), f"cmd_dashboard hung before the bind; rc={rc}"
+    assert rc.get("err") is None, rc["err"]
+    # The real HTTP bind was reached even though the background sync can never
+    # complete (park_forever is never set) — bind is not gated on sync (#179).
+    assert rc.get("bind_reached") is True, rc
+    assert bound.get("port", 0) > 0, rc
+    # Non-vacuity: the background sync seam was genuinely exercised and parked, so
+    # the "blocked sync" premise is real (not a sync that was skipped entirely).
+    assert sync_entered.wait(timeout=2), "background sync seam was never exercised"
 
 
 # --- #217 S1 / U6: migration-017 nested-agent reingest end-to-end -------------
