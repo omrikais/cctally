@@ -409,6 +409,49 @@ describe('ConversationRail', () => {
     // The "file" badge renders.
     const badges = [...row.querySelectorAll('.conv-rail-kindb')].map((b) => b.textContent);
     expect(badges).toEqual(['file']);
+    // #217 S4 QA fix — the bottom snippet row is SUPPRESSED for a file hit: its
+    // snippet IS the path, already shown on the filepath line, so it must not
+    // render twice. Assert no .conv-rail-row-snippet AND the path appears once.
+    expect(row.querySelector('.conv-rail-row-snippet')).toBeNull();
+    const pathOccurrences =
+      row.textContent!.split('bin/_lib_conversation_query.py').length - 1;
+    expect(pathOccurrences).toBe(1);
+  });
+
+  it('a prose hit STILL renders its snippet row (the file-hit suppression is file-only)', () => {
+    // A content (prose) hit keeps the #177 S6 layout: a title-prominent line PLUS
+    // the matched-prose snippet row. The file-hit snippet suppression must NOT
+    // touch it. Non-vacuity guard for the Finding-2 fix.
+    searchHits = [hit({
+      uuid: 'prose-hit',
+      title: 'how does the lock work',
+      snippet: 'the [flock] serializes writers',
+      match_kinds: [],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    // No file styling, and the snippet row IS present.
+    expect(row.querySelector('.conv-rail-row-filepath')).toBeNull();
+    const snippet = row.querySelector('.conv-rail-row-snippet');
+    expect(snippet).not.toBeNull();
+    expect(snippet!.textContent).toContain('flock serializes writers');
+  });
+
+  it('a title hit STILL renders its snippet row (file-hit suppression does not touch it)', () => {
+    searchHits = [hit({
+      uuid: 'first-turn',
+      title: 'how does the lock work',
+      snippet: 'how does the [lock] work',
+      match_kinds: ['title'],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'lock' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'title' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    expect(row.querySelector('.conv-rail-row-snippet')).not.toBeNull();
   });
 
   it('a title hit click navigates to the session first-turn anchor (hit.uuid)', () => {

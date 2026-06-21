@@ -103,6 +103,44 @@ describe('FindBar', () => {
     expect(getState().convFindOpen).toBe(false);
   });
 
+  // #217 S4 QA fix — Escape handled at the bar CONTAINER, so it closes find from
+  // a focused BUTTON too (not only the input). The bug: Escape on a bar button
+  // (Close / regex / case / prev / next) bubbled PAST the bar to the document
+  // keydown listener and tore down the whole reader. The bar-level handler now
+  // closes ONLY find and stopPropagation()s, regardless of which control held
+  // focus. (The propagation half — that the reader is NOT torn down — is proven
+  // at the integration level in ConversationsView.test.tsx scenario 15b.)
+  it('Escape while focus is on a bar BUTTON closes find and stops propagation', () => {
+    dispatch({ type: 'OPEN_CONV_FIND' });
+    const onClose = vi.fn();
+    // A document-level listener stands in for the ConversationsView global Esc
+    // (the keymap dispatcher listens on `document`). The bar's stopPropagation
+    // must keep the button's Escape from reaching it — proving the reader is not
+    // torn down. The integration counterpart is ConversationsView.test 15b.
+    const docEsc = vi.fn();
+    const docListener = (e: KeyboardEvent) => { if (e.key === 'Escape') docEsc(); };
+    document.addEventListener('keydown', docListener);
+    try {
+      render(<FindBar sessionId="s1" onClose={onClose} onTermsChange={() => {}} />);
+      // Each bar control closes find when it holds focus and Escape is pressed,
+      // and the document listener never sees it.
+      for (const name of [/close find/i, /regular expression/i, /case-sensitive/i]) {
+        dispatch({ type: 'OPEN_CONV_FIND' });
+        onClose.mockClear();
+        docEsc.mockClear();
+        const btn = screen.getByRole('button', { name }) as HTMLButtonElement;
+        btn.focus();
+        act(() => { fireEvent.keyDown(btn, { key: 'Escape' }); });
+        expect(onClose).toHaveBeenCalledTimes(1);
+        expect(getState().convFindOpen).toBe(false);
+        // stopPropagation kept the Escape from bubbling to the document listener.
+        expect(docEsc).not.toHaveBeenCalled();
+      }
+    } finally {
+      document.removeEventListener('keydown', docListener);
+    }
+  });
+
   it('shows the · first 500 note when truncated', async () => {
     const anchors = Array.from({ length: 5 }, (_, i) => ({ uuid: `u${i}`, match_kinds: [] as ('tool' | 'thinking')[] }));
     mockFind({ anchors, total: 700, anchors_truncated: true });

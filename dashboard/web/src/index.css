@@ -6304,6 +6304,11 @@ mark.current {
   gap: 12px;
   padding-left: 22px;   /* gutter the spine + markers live in */
 }
+/* #217 S4 QA fix — the thread carries tabIndex={-1} purely so onFindClose can
+   restore focus here when the find bar closes (a focus-management container, not
+   a visible focus target). Suppress the focus ring so the programmatic restore
+   doesn't flash an outline around the whole transcript. */
+.conv-reader-thread:focus { outline: none; }
 .conv-reader-thread::before {
   content: "";
   position: absolute;

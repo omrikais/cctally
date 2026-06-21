@@ -114,20 +114,31 @@ export function FindBar({
   const toggleCase = () => setCaseSensitive((c) => { const v = !c; saveFindCase(v); return v; });
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    // Enter / Escape are NAMED keys, so the global keydown dispatcher does NOT
-    // swallow them while the input is focused (only length-1 keys are). Without
-    // stopPropagation, the ConversationsView global Escape would ALSO fire and
-    // exit the workspace, and a global Enter binding could double-handle. The
-    // input owns these keys, so stop them from reaching the document listener.
+    // Enter is a NAMED key, so the global keydown dispatcher does NOT swallow it
+    // while the input is focused (only length-1 keys are). Without
+    // stopPropagation a global Enter binding could double-handle, so the input
+    // owns Enter/Shift+Enter (next/prev) and stops it from reaching the document
+    // listener. Escape is handled at the bar-container level (`onBarKeyDown`),
+    // not here, so it behaves identically from the input AND from any bar button
+    // — see that handler's note.
     if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); step(e.shiftKey ? -1 : 1); }
-    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
   };
 
-  // #217 S4 / I-1.4 — focus trap. Tab/Shift+Tab cycle within the bar's
-  // controls so keyboard focus can't escape to the page chrome while find is
-  // open; Escape (handled above on the input) is the documented exit. Computed
-  // from the bar's live tabbable controls so it adapts to disabled nav buttons.
+  // #217 S4 / I-1.4 — focus trap + the bar-level Escape close. Both are handled
+  // at the bar CONTAINER (not on the input) so a key pressed while focus is on
+  // ANY control — the input OR a button (Close, regex/case toggles, prev/next)
+  // — behaves the same. React events bubble through the React tree, so an Escape
+  // on a bar button reaches this container handler. Without owning Escape here,
+  // an Escape on a focused button would bubble PAST the bar to the document
+  // keydown listener, firing the ConversationsView global Escape and tearing
+  // down the whole reader (URL → '/') — the #217 S4 QA bug. So:
+  //   - Tab/Shift+Tab cycle within the bar's tabbable controls (focus trap),
+  //     computed from the live control set so it adapts to disabled nav buttons.
+  //   - Escape closes ONLY the find bar (CLOSE_CONV_FIND + restore thread focus
+  //     via onClose) and stopPropagation() keeps it from reaching the document
+  //     listener, regardless of which control held focus.
   const onBarKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); return; }
     if (e.key !== 'Tab') return;
     const bar = barRef.current;
     if (!bar) return;

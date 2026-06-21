@@ -1602,7 +1602,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         {hasPrev && <div ref={topSentinelRef} className="conv-load-sentinel conv-load-sentinel--top">Loading earlier…</div>}
         <HighlightContext.Provider value={findTerms}>
         <TranscriptContext.Provider value={transcriptCtx}>
-        <div className="conv-reader-thread" ref={threadRef}>
+        {/* #217 S4 QA fix — tabIndex={-1} makes the thread programmatically
+            focusable so onFindClose's `threadRef.current.focus()` actually
+            restores focus here (a plain <div> isn't focusable, so the restore
+            silently landed on <body>). -1 keeps it OUT of the Tab order (j/k
+            nav runs through the document-level keymap, not thread focus). */}
+        <div className="conv-reader-thread" ref={threadRef} tabIndex={-1}>
           {nodes.map((g, idx) => {
             // #177 S5 §6 — an inter-turn gap/day marker. Real DOM text
             // (screen-reader visible), role="separator", data-conv-marker so j/k

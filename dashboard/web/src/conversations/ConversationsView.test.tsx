@@ -574,6 +574,44 @@ describe('Conversations workspace integration', () => {
     expect(getState().view).toBe('conversations');
   });
 
+  // #217 S4 QA fix — Esc while focus is on a find-bar BUTTON (not the input)
+  // must behave like Esc in the input: close ONLY the find bar and stay in the
+  // reader. Before the fix, Esc on a focused bar button bubbled past the bar to
+  // the document keydown listener, firing the view-level global Esc → SET_VIEW
+  // 'dashboard' (selectedConversationId cleared, reader torn down). The bar-level
+  // Esc handler + stopPropagation now blocks that leak; onClose restores focus to
+  // the thread (not <body>).
+  it('15b: Esc on a find-bar BUTTON closes find, keeps the reader open, and restores thread focus', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-reader-head')).not.toBeNull());
+    // The thread must be reachable so onClose can restore focus to it.
+    await waitFor(() => expect(document.querySelector('.conv-reader-thread')).not.toBeNull());
+
+    act(() => { fireEvent.keyDown(document, { key: '/' }); });
+    const closeBtn = await waitFor(() => {
+      const el = document.querySelector<HTMLButtonElement>('.conv-findbar-close');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    // Move focus to the bar's Close button — the QA repro focuses a bar control,
+    // not the input.
+    act(() => { closeBtn.focus(); });
+    expect(document.activeElement).toBe(closeBtn);
+
+    // Esc on the focused button: closes find, but the reader stays mounted and we
+    // remain in the conversations view (no global-Esc leak).
+    fireEvent.keyDown(closeBtn, { key: 'Escape' });
+    expect(getState().convFindOpen).toBe(false);
+    expect(getState().view).toBe('conversations');
+    expect(getState().selectedConversationId).toBe('sess-1');
+    // Focus is restored to the thread, not dropped to <body>.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(document.querySelector('.conv-reader-thread')),
+    );
+  });
+
   it('8: an SSE tick carrying transcriptsEnabled keeps the switcher; a tick omitting it hides it (SSE envelopes must carry the gate)', () => {
     // Bootstrap (the /api/data shape): switcher shown.
     updateSnapshot(baseEnvelope(true, '2026-05-13T10:00:00Z'));
