@@ -358,71 +358,72 @@ def _query_plan(conn, sql, params):
         r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall())
 
 
-def test_kind_files_prefix_branch_uses_index_substring_scans():
-    """Fix-1 (Important #1) / P3-10 — the prefix LIKE branch must be GENUINELY
-    index-assisted via ``idx_file_touches_path`` (a SEARCH, not a SCAN), and the
-    substring branch must remain a full SCAN (its leading wildcard can't use the
-    index — expected and correct).
+def test_kind_files_matcher_is_substring_scan():
+    """#223 item 1 — the production Files matcher binds a SUBSTRING pattern
+    (%q%) for every query, so EXPLAIN QUERY PLAN is a SCAN (a leading wildcard
+    can never use idx_file_touches_path). This documents the deliberate choice
+    to scan the modest touch table in exchange for basename/fragment matching.
 
-    The DEFAULT (case-insensitive) ``LIKE`` only rides a btree index when the
-    index column is ``COLLATE NOCASE``; a BINARY-collated index leaves the prefix
-    branch a full SCAN, so this asserts the NOCASE-index collation (the whole point
-    of the fix). Critically the assertion holds WITH the ``ESCAPE '\\'`` clause the
-    production query carries (a literal-prefix bound param keeps the LIKE
-    optimization armed even after wildcard escaping) — so it proves the real query
-    shape ``_search_files`` runs is index-assisted, not a hand-simplified one.
-
-    Non-vacuity: under the pre-fix BINARY index this test FAILS (the prefix plan
-    reads ``SCAN`` not ``SEARCH ... USING ... INDEX idx_file_touches_path``)."""
+    Non-vacuity: a literal-prefix pattern WOULD ride the NOCASE index as a
+    SEARCH — proving the assertion is about the substring pattern, not SQLite
+    being unable to use the index at all."""
     c = _conn()
     _seed_search_corpus(c)
-    # The exact WHERE shape _search_files runs: a single pre-built pattern bound
-    # into ``file_path LIKE ? ESCAPE '\'``. Prefix pattern has a literal prefix
-    # ('bin/cctally') before its trailing '%'; substring pattern leads with '%'.
-    base = ("SELECT ft.session_id, ft.file_path FROM conversation_file_touches ft "
+    base = ("SELECT ft.session_id FROM conversation_file_touches ft "
             "WHERE ft.file_path LIKE ? ESCAPE '\\' "
             "GROUP BY ft.session_id, ft.file_path")
-    prefix_plan = _query_plan(c, base, ("bin/cctally%",))
-    substring_plan = _query_plan(c, base, ("%dashboard%",))
-    # Prefix branch: a SEARCH that rides idx_file_touches_path (NOT a SCAN). The
-    # NOCASE index collation is what arms the default-LIKE optimization.
-    assert "idx_file_touches_path" in prefix_plan, prefix_plan
-    assert "SEARCH" in prefix_plan, prefix_plan
-    assert "SCAN" not in prefix_plan, prefix_plan
-    # Substring branch: a full SCAN (leading wildcard can't use the index). This is
-    # the intentional, documented divergence — assert it stays a scan so a future
-    # change can't silently claim index assistance for the substring case.
+    substring_plan = _query_plan(c, base, ("%cctally%",))
+    assert "SCAN" in substring_plan, substring_plan
     assert "SEARCH" not in substring_plan, substring_plan
+    # Control: a literal-prefix pattern is still index-assisted, so the SCAN
+    # above is genuinely a property of the substring pattern the matcher uses.
+    prefix_plan = _query_plan(c, base, ("cctally%",))
+    assert "idx_file_touches_path" in prefix_plan, prefix_plan
 
 
-def test_kind_files_prefix_vs_substring():
-    """P3-10: a prefix-looking query (no leading separator) is index-assisted via
-    the ``COLLATE NOCASE`` path index (``file_path LIKE ? ESCAPE '\\'`` over a
-    literal-prefix pattern); a leading-separator query falls to the substring scan.
-    Both must return the correct rows."""
+def test_kind_files_basename_match():
+    """#223 item 1 — a bare basename (no leading path separator, not a path
+    prefix) matches via substring. The old prefix branch returned nothing for
+    a non-prefix basename."""
     c = _conn()
     _seed_search_corpus(c)
-    # Prefix 'bin/cctally' (no leading separator) -> matches bin/cctally and
-    # bin/cctally-dashboard.py via LIKE ?||'%', but NOT docs/commands/dashboard.md.
-    pref = cq.search_conversations(c, "bin/cctally", kind="files")
-    assert {h["snippet"] for h in pref["hits"]} == {
-        "bin/cctally", "bin/cctally-dashboard.py"}
-    # A bare 'dashboard' query takes the PREFIX branch (no leading separator), so it
-    # only matches paths STARTING with 'dashboard' — there are none. This proves the
-    # prefix branch is genuinely a prefix probe, not a substring scan.
-    pref_dash = cq.search_conversations(c, "dashboard", kind="files")
-    assert pref_dash["hits"] == [] and pref_dash["total"] == 0
-    # A leading-separator query '/dashboard' forces the SUBSTRING scan
-    # (LIKE '%'||?||'%'), matching the mid-path '/dashboard' in
-    # docs/commands/dashboard.md (and NOT bin/cctally-dashboard.py, whose
-    # 'dashboard' is preceded by '-', not '/').
-    sub = cq.search_conversations(c, "/dashboard", kind="files")
-    assert {h["snippet"] for h in sub["hits"]} == {"docs/commands/dashboard.md"}
-    # A leading-separator substring shared by two paths returns both, proving the
-    # substring branch is not a prefix probe ('/cctally' is inside both bin paths).
-    sub2 = cq.search_conversations(c, "/cctally", kind="files")
-    assert {h["snippet"] for h in sub2["hits"]} == {
-        "bin/cctally", "bin/cctally-dashboard.py"}
+    res = cq.search_conversations(c, "dashboard.md", kind="files")
+    got = {(h["session_id"], h["snippet"]) for h in res["hits"]}
+    assert got == {("sc", "docs/commands/dashboard.md")}
+    assert res["total"] == 1
+
+
+def test_kind_files_fragment_match():
+    """#223 item 1 — a mid-path fragment matches every path that contains it
+    anywhere (substring), still anchored to each group's most-recent touch.
+    The old prefix branch (cctally%) matched nothing because no path STARTS
+    with 'cctally'."""
+    c = _conn()
+    _seed_search_corpus(c)
+    res = cq.search_conversations(c, "cctally", kind="files")
+    got = {(h["session_id"], h["snippet"]) for h in res["hits"]}
+    assert got == {("sa", "bin/cctally"), ("sb", "bin/cctally-dashboard.py")}
+    sa_hit = [h for h in res["hits"] if h["session_id"] == "sa"][0]
+    assert sa_hit["uuid"] == "ua2"
+    assert res["total"] == 2
+
+
+def test_kind_files_substring_everywhere():
+    """#223 item 1 — the Files facet does substring matching for EVERY query
+    (no prefix special-case). A no-separator query matches mid-path
+    occurrences the old prefix branch excluded; a leading-separator query is
+    the same substring match."""
+    c = _conn()
+    _seed_search_corpus(c)
+    # 'dashboard' (no leading separator) now matches BOTH bin/cctally-dashboard.py
+    # and docs/commands/dashboard.md (mid-path) — the old prefix branch matched
+    # NEITHER (no path starts with 'dashboard').
+    res = cq.search_conversations(c, "dashboard", kind="files")
+    got = {h["session_id"] for h in res["hits"]}
+    assert got == {"sb", "sc"}
+    # A leading-separator fragment shared by both bin paths still matches both.
+    res2 = cq.search_conversations(c, "/cctally", kind="files")
+    assert {h["session_id"] for h in res2["hits"]} == {"sa", "sb"}
 
 
 def test_kind_files_case_insensitive():

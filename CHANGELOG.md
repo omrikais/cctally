@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Dashboard conversation search — the Files facet now matches a file-path substring instead of a path prefix.** Searching the Files facet for a bare basename (`package.json`) or a mid-path fragment (`cctally`) now returns the sessions that touched a matching path, instead of requiring a leading path prefix; the match is a case-insensitive substring over the (modest) touched-file table. (#223)
+
 ## [1.53.0] - 2026-06-21
 
 ### Added
