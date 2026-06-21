@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildOutlineTargets, nextTarget, outlineTurnVisible } from './outlineNavigation';
+import { buildOutlineTargets, nextTarget, outlineTurnVisible, resolveTurnIndex } from './outlineNavigation';
 import type { OutlineTurn } from '../types/conversation';
 
 function turn(over: Partial<OutlineTurn>): OutlineTurn {
@@ -90,6 +90,41 @@ describe('buildOutlineTargets', () => {
   it('cache list is empty when no turn is flagged', () => {
     const t = buildOutlineTargets([turn({ uuid: 'a' }), turn({ uuid: 'b' })]);
     expect(t.cache).toEqual([]);
+  });
+});
+
+// #217 S3 E2 (Codex P1) — `loadToTarget` must resolve a deep-link / search uuid
+// to its OWNING outline turn before deciding a nearest-edge direction, because
+// the target can be a FOLDED FRAGMENT's uuid (present in a turn's member_uuids,
+// not its own `uuid`). `buildOutlineTargets` therefore also builds a member-uuid
+// → owning-turn-index map; `resolveTurnIndex` checks the own-uuid map first then
+// the member map.
+describe('resolveTurnIndex — member (folded-fragment) uuid resolution (#217 S3 E2)', () => {
+  it('resolves a member (folded-fragment) uuid to its owning turn index', () => {
+    const turns = [
+      { uuid: 't0', kind: 'human', member_uuids: ['t0'] },
+      { uuid: 't1', kind: 'assistant', member_uuids: ['t1', 'fragA', 'fragB'] },
+    ] as unknown as OutlineTurn[];
+    const t = buildOutlineTargets(turns);
+    // member uuid → owning turn index
+    expect(resolveTurnIndex(t, 'fragB')).toBe(1);
+    expect(resolveTurnIndex(t, 'fragA')).toBe(1);
+    // own uuid still resolves (indexByUuid wins).
+    expect(resolveTurnIndex(t, 't0')).toBe(0);
+    expect(resolveTurnIndex(t, 't1')).toBe(1);
+    // an unknown uuid resolves to undefined (graceful no-op jump).
+    expect(resolveTurnIndex(t, 'missing')).toBeUndefined();
+  });
+
+  it('own uuid takes precedence over a member-map collision', () => {
+    // A pathological transcript where turn 1 lists turn 0's uuid as a member.
+    // resolveTurnIndex must prefer the OWN-uuid map (index 0), not the member map.
+    const turns = [
+      turn({ uuid: 'shared', kind: 'human', member_uuids: ['shared'] }),
+      turn({ uuid: 't1', kind: 'assistant', member_uuids: ['t1', 'shared'] }),
+    ];
+    const t = buildOutlineTargets(turns);
+    expect(resolveTurnIndex(t, 'shared')).toBe(0);
   });
 });
 

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
+import { clearReadingPositions, loadReadingPos } from './readingPosition';
 
 afterEach(() => _resetForTests());
 
@@ -324,6 +325,55 @@ describe('conversation outline / focus-mode state', () => {
     const s = getState();
     expect(s.convFocusMode).toBe('all');
     expect(s.convCurrentTurnUuid).toBeNull();
+  });
+});
+
+// #217 S3 E1 — anchor-based reading-position memory. SET_CONV_CURRENT_TURN (the
+// throttled scroll-sync output) persists `{uuid, ts}` for the CURRENTLY-OPEN
+// session to the localStorage LRU map (persist-before-reset, Codex P2). A genuine
+// conversation switch resets convCurrentTurnUuid in the reducer, so persisting
+// "on switch" would save a just-cleared value — the persistence must hook the
+// throttled write, not the switch.
+describe('reading-position persistence wiring (#217 S3 E1)', () => {
+  beforeEach(() => { _resetForTests(); clearReadingPositions(); });
+  afterEach(() => { clearReadingPositions(); });
+
+  it('SET_CONV_CURRENT_TURN persists the uuid for the open session', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessA' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    expect(loadReadingPos('sessA')?.uuid).toBe('turn-7');
+  });
+
+  it('does NOT persist when no conversation is selected', () => {
+    // SET_CONV_CURRENT_TURN with no open session has no session to key on.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'orphan' });
+    // Nothing keyed under any session; the map stays empty.
+    expect(loadReadingPos('sessA')).toBeNull();
+  });
+
+  it('a null SET_CONV_CURRENT_TURN does not overwrite a saved position', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessA' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-7' });
+    // The cross-session reducer resets convCurrentTurnUuid to null via a
+    // SET_CONV_CURRENT_TURN-less path, but a stray null write must not clobber.
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: null });
+    expect(loadReadingPos('sessA')?.uuid).toBe('turn-7');
+  });
+
+  it('persist-before-reset: a switch resets convCurrentTurnUuid but the saved position survives', () => {
+    // Read a turn in sessA (persisted), then SWITCH to sessB. The switch reducer
+    // clears convCurrentTurnUuid IN MEMORY — but the on-disk position for sessA
+    // (written on the throttled SET_CONV_CURRENT_TURN BEFORE the switch) must
+    // remain so re-opening sessA later restores it. This is the Codex P2 case:
+    // persisting "on switch" would have lost it.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessA' });
+    dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'turn-A' });
+    // Switch to a different session — the reducer resets the in-memory cursor.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sessB' });
+    expect(getState().convCurrentTurnUuid).toBeNull(); // in-memory reset by the switch
+    expect(loadReadingPos('sessA')?.uuid).toBe('turn-A'); // on-disk position survives
+    // And sessB has no saved position yet.
+    expect(loadReadingPos('sessB')).toBeNull();
   });
 });
 

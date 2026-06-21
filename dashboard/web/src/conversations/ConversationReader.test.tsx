@@ -9,6 +9,7 @@ import {
   _resetForTests as _resetKeymapForTests,
 } from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
+import { clearReadingPositions, recordReadingPos } from '../store/readingPosition';
 import { stubMobileMedia } from '../test-utils/mobileMedia';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
@@ -87,12 +88,17 @@ beforeEach(() => {
   _resetKeymapForTests();
   globalThis.fetch = vi.fn();
   installIntersectionObserverStub();
+  // #217 S3 E1 — the store now persists reading positions to localStorage on
+  // SET_CONV_CURRENT_TURN; clear them per-test so a prior test's saved anchor
+  // can't redirect a later session's open-precedence.
+  clearReadingPositions();
   _idByUuid.clear();
   _nextItemId = 1;
 });
 afterEach(() => {
   uninstallGlobalKeydown();
   _resetForTests();
+  clearReadingPositions();
   vi.restoreAllMocks();
 });
 
@@ -690,10 +696,11 @@ describe('ConversationReader', () => {
     return { ...detail(items, next_after), last_anchor: la };
   }
 
-  it('Jump to latest pages to the end then dispatches a jump to last_anchor (spec §5)', async () => {
-    // Page 1 holds h1 with MORE to come; last_anchor points at a turn that lands
-    // only on page 2. The control must loadToEnd (page in page 2) THEN jump to
-    // last_anchor.uuid — proving it reuses the existing flash/pin jump pipeline.
+  it('Jump to latest RESETS to the tail page then dispatches a jump to last_anchor (#217 S3 E2)', async () => {
+    // Page 1 (the tail open) holds h1 with MORE above it; last_anchor points at
+    // the conversation's final turn. The control must RESET the window via ?tail=1
+    // (one request, not a forward drain) THEN jump to last_anchor.uuid — reusing
+    // the existing flash/pin jump pipeline.
     mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'h1' })], 2, 'last-uuid'));
     const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
 
@@ -702,13 +709,15 @@ describe('ConversationReader', () => {
     // The control is present (last_anchor non-null).
     const btn = screen.getByRole('button', { name: /jump to latest/i });
 
-    // Page 2 (the loadToEnd drain) carries the final turn; it exhausts the cursor.
-    mockFetchOnce(detail([makeItem({ uuid: 'last-uuid' })], null));
+    // The ?tail=1 reset returns the final turn in one page (it exhausts the bottom).
+    mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'last-uuid' })], null, 'last-uuid'));
     await act(async () => { fireEvent.click(btn); for (let i = 0; i < 8; i++) await Promise.resolve(); });
 
-    // loadToEnd paged in page 2 (a second fetch with the after= cursor ran).
+    // The jump-to-latest fetch was a ?tail=1 RESET — NOT an ?after= forward drain.
     await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')).not.toBeNull());
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('after='))).toBe(true);
+    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    expect(String(calls.at(-1)![0])).toContain('tail=1');
+    expect(calls.some((c) => String(c[0]).includes('after='))).toBe(false);
     // The jump landed on the final anchor: scrolled, flashed, then cleared.
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     expect(container.querySelector('[data-uuid="last-uuid"]')!.classList.contains('conv-item--jumped')).toBe(true);
@@ -2005,5 +2014,203 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
     await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
     const meta = container.querySelector('.conv-reader-meta')!.textContent!;
     expect(meta).toContain('claude-haiku-4-5-20251001');
+  });
+});
+
+// #217 S3 E2 — open precedence + the top sentinel (bidirectional pager) +
+// E1 reading-position restore + E8 last-prompt/last-error jumps. Parent-level
+// integration: drive the REAL hook + store pipeline, asserting on content /
+// cursor state — NOT pixel scrollTop or SSE frame counts (the JSDOM limits).
+describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)', () => {
+  // A detail with explicit edge keys (the bidirectional page envelope).
+  function edged(
+    items: ConversationItem[],
+    edges: { next_after?: number | null; has_more?: boolean; prev_before?: number | null; has_prev?: boolean },
+    lastUuid: string | null = null,
+  ) {
+    const base = detail(items, edges.next_after ?? null);
+    return {
+      ...base,
+      page: {
+        next_after: edges.next_after ?? null,
+        has_more: edges.has_more ?? (edges.next_after != null),
+        prev_before: edges.prev_before ?? null,
+        has_prev: edges.has_prev ?? false,
+      },
+      last_anchor: lastUuid == null ? null : { session_id: 's', uuid: lastUuid, id: _idFor(lastUuid) },
+    };
+  }
+  function outlineFor(turns: OutlineTurn[], errorCount = 0): ConversationOutline {
+    return {
+      session_id: 's',
+      stats: {
+        turns: { total: turns.length, human: 0, assistant: 0, tool_result: 0, meta: 0 },
+        tool_counts: {}, error_count: errorCount, models: {}, duration_seconds: null,
+        tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+        cache_saved_usd: 0,
+      },
+      turns,
+    };
+  }
+
+  it('a multi-page session opens at the BOTTOM via ?tail=1 (no head-fetch first)', async () => {
+    // tail page: last window, has_prev:true (more above) ⇒ land at the bottom.
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
+    // The FIRST request was ?tail=1 — not the legacy head page.
+    expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])).toContain('tail=1');
+    // The top sentinel is present (more reverse pages); the bottom one is not.
+    expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull();
+  });
+
+  it('a single-page session opens (?tail=1 → has_prev:false) with NO top sentinel', async () => {
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { prev_before: null, has_prev: false }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t2"]')).not.toBeNull());
+    expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])).toContain('tail=1');
+    // Single page: everything is loaded, so no reverse paging → no top sentinel.
+    expect(container.querySelector('.conv-load-sentinel--top')).toBeNull();
+  });
+
+  it('the top sentinel triggers loadPrev → a ?before= prepend (controllable IO)', async () => {
+    // A controllable IntersectionObserver so we can fire the TOP sentinel into
+    // view deterministically (JSDOM has no real IO; the default stub is a no-op).
+    // Records every observed element + its callback so we can pick the top
+    // sentinel by className and simulate an intersection.
+    const observed: { el: Element; cb: IntersectionObserverCallback; obs: IntersectionObserver }[] = [];
+    class CapturingIO {
+      cb: IntersectionObserverCallback;
+      constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
+      observe(el: Element): void { observed.push({ el, cb: this.cb, obs: this as unknown as IntersectionObserver }); }
+      unobserve(): void {}
+      disconnect(): void {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+    }
+    (globalThis as unknown as { IntersectionObserver: typeof CapturingIO }).IntersectionObserver = CapturingIO;
+
+    // tail open with a top edge armed (prev_before 3).
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+
+    // The before-page (the earlier window). Its envelope carries a bottom edge
+    // for the already-loaded items — the prepend must ignore it.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+
+    // Fire the top sentinel into view (find the observation whose element is the
+    // top sentinel, then invoke its callback with isIntersecting).
+    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
+    expect(topEntry).toBeTruthy();
+    await act(async () => {
+      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+    // The reverse fetch went to ?before=3 (the tail page's top cursor).
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('before=3'))).toBe(true);
+    // The window now holds the prepended items in order (t1,t2,t3,t4).
+    const order = Array.from(container.querySelectorAll('[data-uuid]')).map((e) => e.getAttribute('data-uuid'));
+    expect(order.filter((u) => /^t[1-4]$/.test(u ?? ''))).toEqual(['t1', 't2', 't3', 't4']);
+  });
+
+  it('open precedence slot 1: a deep-link anchor overrides a saved reading position', async () => {
+    // A saved reading position for the session exists, AND a deep-link jump is set
+    // — the deep-link wins (it pages to the anchor). We assert the jump uuid is
+    // honored (the anchor's turn is reached + flashed), not the saved one.
+    clearReadingPositions();
+    recordReadingPos('s', 'saved-turn', 1000);
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    // Open at the tail (first fetch) for the anchor intent; the anchor target is
+    // already in the tail window so loadToTarget is a no-op + the jump scrolls it.
+    mockFetchOnce(edged([makeItem({ uuid: 'anchor-turn', member_uuids: ['anchor-turn'] } as never), makeItem({ uuid: 'last' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'anchor-turn' } });
+    const outline = outlineFor([oTurn({ uuid: 'anchor-turn', kind: 'human' }), oTurn({ uuid: 'last', kind: 'human' })]);
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="anchor-turn"]')).not.toBeNull());
+    // The deep-link target flashed (the anchor won precedence).
+    await waitFor(() => expect(container.querySelector('[data-uuid="anchor-turn"]')!.classList.contains('conv-item--jumped')).toBe(true));
+    clearReadingPositions();
+  });
+
+  it('open precedence slot 2: a saved reading position is restored when there is no deep-link', async () => {
+    // No deep-link jump; a saved reading position exists → the reader restores it
+    // (loadToTarget(savedUuid) + flash). The first fetch is still ?tail=1 (the
+    // natural resting place), then loadToTarget walks to the saved turn (already
+    // in the tail window here) and the restore jump flashes it.
+    clearReadingPositions();
+    recordReadingPos('s', 'saved-turn', 1000);
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    mockFetchOnce(edged([makeItem({ uuid: 'saved-turn', member_uuids: ['saved-turn'] } as never), makeItem({ uuid: 'last' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const outline = outlineFor([oTurn({ uuid: 'saved-turn', kind: 'human' }), oTurn({ uuid: 'last', kind: 'human' })]);
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="saved-turn"]')).not.toBeNull());
+    // The restore dispatched a jump → the saved turn landed + flashed + pinned.
+    // The transient jump clears post-land, so assert on the persistent pin/flash.
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('saved-turn'));
+    expect(container.querySelector('[data-uuid="saved-turn"]')!.classList.contains('conv-item--jumped')).toBe(true);
+    clearReadingPositions();
+  });
+
+  it('E8: pressing `a` jumps to the LAST prompt; `L` jumps to the LAST error', async () => {
+    clearReadingPositions();
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    // A session with two prompts (h1,h3) and two errors (a2,a4). The outline
+    // drives the target lists; the items are all loaded (single page).
+    const turns = [
+      oTurn({ uuid: 'h1', kind: 'human' }),
+      oTurn({ uuid: 'a2', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }] }),
+      oTurn({ uuid: 'h3', kind: 'human' }),
+      oTurn({ uuid: 'a4', kind: 'assistant', tools: [{ name: 'Bash', is_error: true }] }),
+    ];
+    mockFetchOnce(edged([
+      makeItem({ uuid: 'h1', kind: 'human', text: 'one' }),
+      makeItem({ uuid: 'a2', kind: 'assistant', text: 'oops', model: 'm', cost_usd: 0 } as never),
+      makeItem({ uuid: 'h3', kind: 'human', text: 'two' }),
+      makeItem({ uuid: 'a4', kind: 'assistant', text: 'boom', model: 'm', cost_usd: 0 } as never),
+    ], { prev_before: null, has_prev: false }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" outline={outlineFor(turns, 2)} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="a4"]')).not.toBeNull());
+
+    // `a` → the LAST prompt (h3, the most-recent human turn). The jump pipeline
+    // lands + PINS the target then clears the transient jump, so assert on the
+    // landing pin (which persists) — not the jump (already cleared post-land).
+    await act(async () => { fireEvent.keyDown(document, { key: 'a' }); for (let i = 0; i < 8; i++) await Promise.resolve(); });
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('h3'));
+    expect(container.querySelector('[data-uuid="h3"]')!.classList.contains('conv-item--jumped')).toBe(true);
+
+    // `L` → the LAST error (a4, the most-recent error turn).
+    await act(async () => { fireEvent.keyDown(document, { key: 'L' }); for (let i = 0; i < 8; i++) await Promise.resolve(); });
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('a4'));
+    clearReadingPositions();
+  });
+
+  it('E8: `a`/`L` are inert while a modal is open (shared guard) and a no-op when the family is empty', async () => {
+    clearReadingPositions();
+    // An outline with NO prompts and NO errors → both jumps are no-ops.
+    const turns = [oTurn({ uuid: 'a1', kind: 'assistant', label: 'plain' })];
+    mockFetchOnce(edged([makeItem({ uuid: 'a1', kind: 'assistant', text: 'plain', model: 'm', cost_usd: 0 } as never)], { prev_before: null, has_prev: false }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" outline={outlineFor(turns)} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="a1"]')).not.toBeNull());
+
+    // Empty families → no jump dispatched.
+    await act(async () => { fireEvent.keyDown(document, { key: 'a' }); fireEvent.keyDown(document, { key: 'L' }); await Promise.resolve(); });
+    expect(getState().conversationJump).toBeNull();
+
+    // Modal open → the keys are inert (the shared guard). Even with targets this
+    // would not fire; here it asserts the guard path explicitly.
+    act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'session' }); });
+    await act(async () => { fireEvent.keyDown(document, { key: 'a' }); await Promise.resolve(); });
+    expect(getState().conversationJump).toBeNull();
+    clearReadingPositions();
   });
 });

@@ -5,7 +5,7 @@ import type { ConversationFindResult, FindAnchor } from '../types/conversation';
 
 // #177 S6 — in-conversation find. A debounced, session-scoped fetch to
 // /api/conversation/<id>/find returning the full ordered rendered-turn anchor
-// list (find walks it via the reader's loadUntil(uuid) + jump machinery).
+// list (find walks it via the reader's loadToTarget(uuid) + jump machinery).
 // Mirrors useConversationSearch's debounce/abort skeleton (200ms, seeded ''
 // so the first keystroke still debounces, ONE shared AbortController so a
 // newer needle aborts the older in-flight fetch and a late prior response can

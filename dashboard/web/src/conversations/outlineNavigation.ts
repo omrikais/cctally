@@ -59,18 +59,40 @@ export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
 //               filters the chip; the reader's `c` key no-ops) so the navigation
 //               and the gating stay self-consistent with deriveOutline.
 //   - indexByUuid: every turn's uuid → its skeleton index, for cursor resolution.
-export function buildOutlineTargets(
-  turns: OutlineTurn[],
-): { error: number[]; prompt: number[]; subagent: number[]; plan: number[]; cache: number[]; indexByUuid: Map<string, number> } {
+export interface OutlineTargets {
+  error: number[];
+  prompt: number[];
+  subagent: number[];
+  plan: number[];
+  cache: number[];
+  // Every turn's OWN uuid → its skeleton index (cursor resolution).
+  indexByUuid: Map<string, number>;
+  // #217 S3 E2 (Codex P1) — every MEMBER (folded-fragment) uuid → its owning
+  // turn's skeleton index, so `loadToTarget` can normalize a deep-link / search
+  // uuid that is a folded fragment to its owning turn before deciding direction.
+  // Populated from each turn's `member_uuids`; on a member-uuid collision across
+  // turns the FIRST occurrence wins (document order). The own-uuid map is
+  // authoritative — `resolveTurnIndex` checks it first.
+  memberIndex: Map<string, number>;
+}
+
+export function buildOutlineTargets(turns: OutlineTurn[]): OutlineTargets {
   const error: number[] = [];
   const prompt: number[] = [];
   const subagent: number[] = [];
   const plan: number[] = [];
   const cache: number[] = [];
   const indexByUuid = new Map<string, number>();
+  const memberIndex = new Map<string, number>();
   const seenSub = new Set<string>();
   turns.forEach((t, i) => {
     indexByUuid.set(t.uuid, i);
+    // Map each member fragment uuid (falling back to the turn's own uuid for a
+    // turn with an empty/missing member list) to this turn — first-occurrence
+    // wins so a duplicate member uuid never re-points a later turn.
+    for (const u of (t.member_uuids?.length ? t.member_uuids : [t.uuid])) {
+      if (!memberIndex.has(u)) memberIndex.set(u, i);
+    }
     if (t.tools?.some((x) => x.is_error)) error.push(i);
     if (t.kind === 'human') prompt.push(i);
     if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
@@ -80,7 +102,20 @@ export function buildOutlineTargets(
     if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
     if (t.cache_failure) cache.push(i);
   });
-  return { error, prompt, subagent, plan, cache, indexByUuid };
+  return { error, prompt, subagent, plan, cache, indexByUuid, memberIndex };
+}
+
+// #217 S3 E2 (Codex P1) — resolve a (possibly folded-fragment) uuid to its
+// owning outline-turn skeleton index. The OWN-uuid map (`indexByUuid`) is
+// authoritative (a turn that lists another turn's uuid as a member must not
+// shadow the real owner); the member map is the fallback for a uuid that is only
+// a folded fragment. `undefined` when the uuid belongs to no outline turn (a
+// graceful no-op jump). `loadToTarget` calls this before choosing a nearest-edge
+// paging direction.
+export function resolveTurnIndex(targets: OutlineTargets, uuid: string): number | undefined {
+  const own = targets.indexByUuid.get(uuid);
+  if (own !== undefined) return own;
+  return targets.memberIndex.get(uuid);
 }
 
 // #177 S5 §4 — jump-to-next cursor math, shared by the reader's e/u/b/p keys and

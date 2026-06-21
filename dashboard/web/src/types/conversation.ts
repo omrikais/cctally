@@ -315,7 +315,15 @@ export interface ConversationDetail {
   cost_usd: number;
   models: string[];
   items: ConversationItem[];
-  page: { next_after: number | null; has_more: boolean };
+  // #217 S3 E2 — the bidirectional windowed pager. `next_after`/`has_more`
+  // describe the BOTTOM edge (forward paging + the live-tail gate); the two
+  // additive `prev_before`/`has_prev` keys describe the TOP edge (reverse
+  // paging). `has_prev = start > 0`; `prev_before` = the id of the page's FIRST
+  // item when `has_prev`, else null (the cursor for the next `?before=`). Optional
+  // here for back-compat with fixtures/responses predating the keys (a missing
+  // `has_prev` reads as a single-page / no-top-edge open). See
+  // bin/_lib_conversation_query.py::get_conversation.
+  page: { next_after: number | null; has_more: boolean; prev_before?: number | null; has_prev?: boolean };
   subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
   // jump-to-latest spec §3 — the conversation's final RENDERED turn (the last
   // grouped/deduped item, not the last raw JSONL row). Constructed explicitly by
@@ -425,3 +433,24 @@ export type FullPayload =
       full_length: number;
       truncated: boolean;
     };
+
+// #217 S3 E1 — anchor-based reading-position memory. The persistence module
+// records the CURRENT TURN uuid (the scroll-sync `convCurrentTurnUuid`) per
+// session, NOT a pixel offset (with open-at-bottom the loaded item-set + viewport
+// differ between visits, so a pixel offset is meaningless). Stored as a bounded
+// LRU map (~50 sessions, oldest `ts` evicted) under a namespaced localStorage key.
+export interface ReadingPos {
+  uuid: string;
+  ts: number; // epoch ms — the LRU recency key
+}
+export type ReadingPosMap = Record<string, ReadingPos>; // keyed by session_id
+
+// #217 S3 E2 — the reader's open intent, computed by precedence BEFORE the hook
+// fetches so the FIRST request is already correct (no head-fetch-then-redirect
+// flash, Codex P1). Precedence: a deep-link/jump anchor (slot 1) > a restored
+// E1 reading-position uuid (slot 2) > anchorless tail open (slot 3). A null
+// intent (no session) defers the fetch.
+export type OpenIntent =
+  | { kind: 'anchor'; uuid: string }   // deep-link / jump target
+  | { kind: 'restore'; uuid: string }  // saved reading position
+  | { kind: 'tail' };                  // open at the bottom (newest)

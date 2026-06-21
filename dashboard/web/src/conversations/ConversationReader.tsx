@@ -18,7 +18,8 @@ import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigat
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import type { ConversationItem, ConversationOutline, SubagentMeta } from '../types/conversation';
+import { loadReadingPos } from '../store/readingPosition';
+import type { ConversationItem, ConversationOutline, OpenIntent, SubagentMeta } from '../types/conversation';
 
 // #186 — belt-and-suspenders title-only skip predicate. Mirrors the server
 // `_CMD_FAMILY_RE` / `_looks_like_command_plumbing` (bin/_lib_conversation_query.py):
@@ -107,7 +108,26 @@ function findTopLevelNodeFor(
 // (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
 // below is independent of it (it observes the reader's own rendered turns).
 export function ConversationReader({ sessionId, mobileBack, outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
-  const { detail, loading, error, hasMore, loadMore, loadUntil, loadToEnd } = useConversation(sessionId);
+  // #217 S3 E2 — compute the open intent ONCE per session open so the hook's
+  // FIRST request is precedence-correct (Codex P1; no head-fetch-then-redirect).
+  // Precedence: (1) a deep-link / jump anchor for THIS session wins; (2) else a
+  // restored E1 reading-position uuid; (3) else open at the bottom (?tail=1).
+  // Computed synchronously at session-change time, reading the store's jump (an
+  // OPEN_CONVERSATION deep-link sets selectedConversationId + conversationJump in
+  // one dispatch, so it's already present) and the saved reading position. Keyed
+  // on sessionId only so an in-session jump (which re-dispatches OPEN_CONVERSATION
+  // with the same id) doesn't re-trigger the initial fetch — the live `jump`
+  // effect below drives in-session jumps.
+  const openIntent = useMemo<OpenIntent | null>(() => {
+    if (!sessionId) return null;
+    const j = getState().conversationJump;
+    if (j && j.session_id === sessionId) return { kind: 'anchor', uuid: j.uuid };
+    const saved = loadReadingPos(sessionId);
+    if (saved) return { kind: 'restore', uuid: saved.uuid };
+    return { kind: 'tail' };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #205 S1 — the ephemeral mobile outline flag + the effective open-state. On
@@ -142,6 +162,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const findStepRef = useRef<((delta: number) => void) | null>(null);
   const reduced = useReducedMotion();
   const sentinelRef = useRef<HTMLDivElement>(null);
+  // #217 S3 E2 — the TOP sentinel (mirror of the bottom one) → loadPrev on
+  // scroll-up. Plus scroll-anchoring bookkeeping: a prepend grows scrollHeight
+  // above the viewport, so we capture the PRE-prepend height/scrollTop here (in
+  // loadPrev) and re-apply the delta in a layout effect after the render commits,
+  // keeping the viewport pinned to the same turn. `prependPendingRef` carries the
+  // captured metrics across the async fetch + render; `prevItemsLenRef` lets the
+  // anchoring layout effect tell a prepend (length grew, top edge advanced) from
+  // an append.
+  const topSentinelRef = useRef<HTMLDivElement>(null);
+  const prependPendingRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   // #188 S3/B6 — a SEPARATE map holding each subagent card's <details> element,
   // keyed by the bucket-root uuid. Registered UNCONDITIONALLY (open and closed),
@@ -202,6 +232,29 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   hasMoreRef.current = hasMore;
   const loadMoreRef = useRef(loadMore);
   loadMoreRef.current = loadMore;
+  // #217 S3 E2 — top-edge mirrors for the stable top-sentinel observer closure.
+  const hasPrevRef = useRef(hasPrev);
+  hasPrevRef.current = hasPrev;
+  // Scroll-anchored reverse paging: snapshot the body's scroll metrics BEFORE
+  // the prepend (the "before" height is unrecoverable post-update, Codex P2),
+  // then the layout effect below re-pins the viewport. A guard against
+  // overlapping loadPrevs (the captured metrics must not be overwritten mid-flight).
+  const doLoadPrev = useCallback(() => {
+    const b = bodyRef.current;
+    if (!b || prependPendingRef.current) return;
+    prependPendingRef.current = { prevScrollHeight: b.scrollHeight, prevScrollTop: b.scrollTop };
+    void loadPrev().finally(() => {
+      // If the fetch produced no prepend (no-op / error), drop the snapshot so a
+      // later real prepend isn't anchored against stale metrics. The layout
+      // effect clears it on a successful prepend; this finally covers the no-op.
+      if (prependPendingRef.current && bodyRef.current
+          && bodyRef.current.scrollHeight === prependPendingRef.current.prevScrollHeight) {
+        prependPendingRef.current = null;
+      }
+    });
+  }, [loadPrev]);
+  const doLoadPrevRef = useRef(doLoadPrev);
+  doLoadPrevRef.current = doLoadPrev;
   const reducedRef = useRef(reduced);
   reducedRef.current = reduced;
   // #205 S1 — live mirror so the stable toggleOutline closure (shared by the ☰
@@ -271,7 +324,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpTopTargetRef = useRef<HTMLElement | null>(null);
 
   // jump-to-latest (spec §5) — the "Latest ↓" control's loading affordance. Set
-  // true while loadToEnd() drains every page (a long conversation can take a
+  // true while jumpToLatest() resets to the tail page (a brief beat on a huge
   // beat), so the button shows a spinner glyph + disables to prevent re-entry.
   const [jumpingLatest, setJumpingLatest] = useState(false);
 
@@ -375,20 +428,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
 
-  // jump-to-latest (spec §5) — page the conversation to its END (uncapped
-  // loadToEnd, unlike the 20-capped loadUntil) so the final turn is loaded, then
-  // dispatch the SAME OPEN_CONVERSATION jump the outline/find use. The existing
-  // jump effect runs loadUntil(last_anchor.uuid) (already satisfied), scrolls it
-  // into view, flashes + pins it, and parks atBottom so live appends stick.
-  // No-op when last_anchor is null (a genuinely empty conversation); the control
-  // is hidden in that case too. Construct the jump anchor explicitly from
-  // last_anchor's session_id + uuid (matching the jumpNext dispatch shape).
+  // jump-to-latest (spec §5; #217 S3 E2 rework) — reset the window to the TAIL
+  // page in ONE request (the hook's jumpToLatest = ?tail=1), so it's instant on a
+  // huge session instead of draining every forward page. Then park atBottom (the
+  // live-append stick-to-bottom path) and dispatch the SAME OPEN_CONVERSATION jump
+  // the outline/find use so the final turn flashes + pins (the jump effect runs
+  // loadToTarget(last_anchor.uuid), already in-window after the tail reset,
+  // scrolls + flashes). No-op when last_anchor is null (a genuinely empty
+  // conversation); the control is hidden then too.
   const jumpToLatest = useCallback(async () => {
     const la = detail?.last_anchor;
     if (!la) return;
     setJumpingLatest(true);
     try {
-      await loadToEnd();
+      await hookJumpToLatest();
+      atBottomRef.current = true;  // land at the bottom so live appends stick
       dispatch({
         type: 'OPEN_CONVERSATION',
         sessionId: la.session_id,
@@ -397,7 +451,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     } finally {
       setJumpingLatest(false);
     }
-  }, [detail?.last_anchor, loadToEnd]);
+  }, [detail?.last_anchor, hookJumpToLatest]);
   // Live mirror so the stable `End` keymap closure calls the latest handler
   // without re-registering the `[]`-dep keymap array (the jumpNextRef pattern).
   const jumpToLatestRef = useRef(jumpToLatest);
@@ -478,6 +532,75 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     return () => obs.disconnect();
   }, [hasMore, loadMore]);
 
+  // #217 S3 E2 — reverse paging: a TOP sentinel mirrors the bottom one. When it
+  // scrolls into view (the user scrolled up to the head of the loaded window)
+  // and there are more reverse pages, prepend the previous page. Scroll-anchoring
+  // (the layout effect below) keeps the viewport pinned to the same turn.
+  useEffect(() => {
+    if (!topSentinelRef.current || !hasPrev) return;
+    const obs = new IntersectionObserver((es) => { if (es[0].isIntersecting) doLoadPrevRef.current(); });
+    obs.observe(topSentinelRef.current);
+    return () => obs.disconnect();
+  }, [hasPrev]);
+
+  // #217 S3 E2 — scroll-anchoring on a prepend. After loadPrev grows the thread
+  // ABOVE the viewport, re-pin scrollTop by the scrollHeight delta so the turn
+  // the user was reading stays put (the classic reverse-infinite-scroll problem).
+  // useLayoutEffect so the correction lands before paint (no visible jump). Keyed
+  // on items.length: a prepend grew it AND left a captured snapshot in
+  // prependPendingRef (set by doLoadPrev). An append (bottom-stick effect's
+  // domain) leaves no snapshot, so this no-ops there.
+  useLayoutEffect(() => {
+    const snap = prependPendingRef.current;
+    const b = bodyRef.current;
+    if (!snap || !b) return;
+    const delta = b.scrollHeight - snap.prevScrollHeight;
+    if (delta > 0) b.scrollTop = snap.prevScrollTop + delta;
+    prependPendingRef.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.items.length]);
+
+  // #217 S3 E2 — open-scroll-intent: once the FIRST page resolves, land per the
+  // hook's precedence verdict. 'bottom' (a multi-page tail open) scrolls to the
+  // newest turn and parks atBottom so live-tail sticks; 'top' (a single-page
+  // session) scrolls to the start so it reads from the beginning. An anchor /
+  // restore open leaves openScrollIntent null — the jump pipeline drives that
+  // scroll instead. Reduced-motion-safe (instant). Runs once per resolved intent.
+  useLayoutEffect(() => {
+    const b = bodyRef.current;
+    if (!b || openScrollIntent == null) return;
+    if (openScrollIntent === 'bottom') {
+      b.scrollTop = b.scrollHeight;
+      atBottomRef.current = true;
+    } else {
+      b.scrollTop = 0;
+      atBottomRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openScrollIntent, detail?.items.length]);
+
+  // #217 S3 E1 — restore the saved reading position (open-precedence slot 2). A
+  // deep-link anchor (slot 1) already lives in the store as a jump (the jump
+  // effect drives it); a saved reading position has NO store jump, so once the
+  // first page resolves under a 'restore' intent the reader dispatches a
+  // same-session OPEN_CONVERSATION jump to the saved uuid, reusing the full jump
+  // pipeline (loadToTarget + scroll + flash + pin). Fires ONCE per session open
+  // (restoredSessionRef guards re-fires on paged growth); an unresolvable saved
+  // uuid falls through the jump effect's exhaustion clear → the tail open stands.
+  const restoredSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (openIntent?.kind !== 'restore') return;
+    if (!detail || detail.session_id !== sessionId) return;
+    if (restoredSessionRef.current === sessionId) return;  // already restored this open
+    restoredSessionRef.current = sessionId;
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      sessionId,
+      jump: { session_id: sessionId, uuid: openIntent.uuid },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openIntent, sessionId, detail?.session_id]);
+
   // #177 S5 §3 — scroll-sync. A deduped IntersectionObserver over the reader's
   // rendered turns writes the topmost-visible anchor uuid to the store, where
   // the OutlinePanel reads it to highlight + auto-scroll the current entry.
@@ -549,7 +672,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     let cancelled = false;
     void (async () => {
-      await loadUntil(jump.uuid);
+      await loadToTarget(jump.uuid);
       if (cancelled) return;
       // #188 B7 — resolve the target element: an inner member ref (itemRefs)
       // OR, for a collapsed subagent whose members are ref-less, the card's
@@ -691,7 +814,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // target's ref. focusMode re-fires it once the mode-hidden fallback resets to
     // `all` — the hidden target's node renders + its ref attaches in that commit,
     // and this re-fire scrolls via the branch above. No infinite loop:
-    // loadUntil/fetchNext serialize via loadingMoreRef, hasMore transitions a
+    // loadToTarget/fetchNext serialize via loadingMoreRef, hasMore transitions a
     // bounded number of times, the forcedOpenKeys path either resolves (clears) or
     // settles to a stable set (every chain key present), and the focusMode reset
     // is one-way (non-`all` → `all`) so the mode-hidden branch can fire at most
@@ -757,7 +880,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // next conversation starts with the button hidden.
   useEffect(() => {
     setNewCount(0);
-    atBottomRef.current = true;
+    // #217 S3 E2 — the open-precedence fold: an anchor/restore open lands the
+    // user on a SPECIFIC turn (not the tail), so it must NOT force atBottom (else
+    // a live append would yank the viewport to the bottom). A tail / legacy open
+    // keeps the prior default (true → live appends stick). The openScrollIntent
+    // layout effect re-confirms this once the first page resolves.
+    atBottomRef.current = openIntent?.kind === 'anchor' || openIntent?.kind === 'restore' ? false : true;
     setJumpTopVisible(false);
     jumpTopTargetRef.current = null;
     // #188 S4/C2 — the reused reader must not carry a prior conversation's
@@ -768,7 +896,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // count (Bug 5 + #188 B6's per-session reset rationale).
     openKeysRef.current.clear();
     knownSubagentKeysRef.current.clear();
-  }, [sessionId]);
+  }, [sessionId, openIntent]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
@@ -812,7 +940,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // when reduced-motion is on, when the group was already painted (seenRef),
   // or when it OWNS the active jump target. The jump-target suppression MUST
   // be render-time (Codex P2): refs attach at commit BEFORE the jump effect
-  // runs loadUntil/scroll/flash, so the rise/no-rise choice is made while
+  // runs loadToTarget/scroll/flash, so the rise/no-rise choice is made while
   // rendering; the target then takes `conv-item--jumped` (the flash) WITHOUT
   // `conv-rise`, and the two never run on one element.
   const riseFor = useCallback(
@@ -1103,6 +1231,34 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpNextRef = useRef(jumpNext);
   jumpNextRef.current = jumpNext;
 
+  // #217 S3 E8 — direct jump to the LAST (most-recent) occurrence of a landmark
+  // family (prompt / error), distinct from the e/E,u/U next/prev STEPPING. Lands
+  // on targets.<kind>.at(-1) rather than walking backward from the latest turn.
+  // Reuses the same OPEN_CONVERSATION jump pipeline (loadToTarget via the jump
+  // effect + flash + pin) and the same focus-mode-unhide check as jumpNext.
+  // Empty list → a graceful no-op (no pulse — this is a direct action, not a step).
+  const jumpToLast = useCallback((kind: JumpKind) => {
+    const turns = outlineRef.current?.turns ?? [];
+    if (turns.length === 0) return;
+    const list = targetListsRef.current[kind];
+    const targetIdx = list.at(-1);
+    if (targetIdx == null) return;  // no occurrence → no-op
+    const turn = turns[targetIdx];
+    const mode = focusModeRef.current;
+    if (mode !== 'all') {
+      const node = findTopLevelNodeFor(groupsRef.current, turn.uuid, { subagent_meta: subagentMetaRef.current });
+      const targetHidden = node == null || !nodeVisible(node, mode);
+      if (targetHidden) dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+    }
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      sessionId: sessionIdRef.current,
+      jump: { session_id: sessionIdRef.current, uuid: turn.uuid },
+    });
+  }, []);
+  const jumpToLastRef = useRef(jumpToLast);
+  jumpToLastRef.current = jumpToLast;
+
   // #177 S6 — the find bar reports its DEBOUNCED needle here; split into
   // highlight terms (whitespace-split, empties dropped) for the prose marks.
   // Stable identity so FindBar's onTermsChange effect doesn't re-fire per render.
@@ -1193,8 +1349,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           action: () => jumpNextRef.current('cache', -1),
         },
         mk('v', () => cycleFocusMode()),
+        // #217 S3 E8 — direct jump to the LAST (most-recent) prompt / error,
+        // distinct from u/U,e/E STEPPING. `a` = last user prompt ("ask"); `L`
+        // = last error. Both are free single-char slots (no collision with the
+        // taken conversations-view set j k [ ] g o e E u U b B p P c C v n N End).
+        // Gated on the shared guard (no open modal / input mode / filter popover)
+        // + the #156 conversations-view scope, like every other jump key. A
+        // graceful no-op when the family is empty.
+        mk('a', () => jumpToLastRef.current('prompt')),
+        mk('L', () => jumpToLastRef.current('error')),
         // jump-to-latest spec §5 — `End` runs the same handler as the "Latest ↓"
-        // control: page to the end, jump+flash the final turn. `guard` already
+        // control: reset to the tail, jump+flash the final turn. `guard` already
         // excludes the open filter popover (Codex P2 #7) so it never fires while
         // a filter input is focused. The handler no-ops when last_anchor is null.
         mk('End', () => { void jumpToLatestRef.current(); }),
@@ -1284,7 +1449,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           </div>
           {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
               last_anchor is null (a genuinely empty conversation). Disabled with
-              a spinner glyph while loadToEnd() drains the pages. Bound to `End`. */}
+              a spinner glyph while jumpToLatest() resets to the tail. Bound to `End`. */}
           {detail.last_anchor && (
             <button
               type="button"
@@ -1331,6 +1496,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         />
       )}
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
+        {/* #217 S3 E2 — TOP sentinel (mirror of the bottom one). When it scrolls
+            into view at the head of the loaded window, loadPrev prepends the
+            previous page (scroll-anchored). Rendered only while there are more
+            reverse pages. */}
+        {hasPrev && <div ref={topSentinelRef} className="conv-load-sentinel conv-load-sentinel--top">Loading earlier…</div>}
         <HighlightContext.Provider value={findTerms}>
         <TranscriptContext.Provider value={transcriptCtx}>
         <div className="conv-reader-thread" ref={threadRef}>

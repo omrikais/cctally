@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversation } from './useConversation';
+import type { OutlineTurn } from '../types/conversation';
 
 // Minimal EventSource mock (copied from __tests__/sse.test.ts). The live-tail
 // effect opens one of these per conversation and fires pollTail() on the `tail`
@@ -379,35 +380,47 @@ describe('useConversation', () => {
     expect(result.current.loading).toBe(false);
   });
 
-  it('loadUntil pages until the target uuid is loaded', async () => {
+  // #217 S3 E2 — loadToTarget (replaces loadUntil + loadToEnd) forward-paging.
+  // Outline turns for direction resolution (u1 at index 0, u2 at index 1).
+  const fwdOutline = [
+    { uuid: 'u1', kind: 'human', member_uuids: ['u1'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+    { uuid: 'u2', kind: 'assistant', member_uuids: ['u2', 'u2b'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+  ] as OutlineTurn[];
+
+  it('loadToTarget pages forward until the target uuid is loaded (replaces loadUntil)', async () => {
     mockOnce(detail([it1], 2));
-    const { result } = renderHook(() => useConversation('s'));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns: fwdOutline }));
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
-    mockOnce(detail([it2], null));         // u2b is a member of it2
-    await act(async () => { await result.current.loadUntil('u2b'); });
+    mockOnce(detail([it2], null));         // u2b is a member of it2 (outline turn u2, index 1, below)
+    await act(async () => { await result.current.loadToTarget('u2b'); });
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
   });
 
-  it('loadUntil terminates at exhaustion when the target never appears', async () => {
-    // Page 1 has a cursor; page 2 exhausts (next_after null). The target
-    // uuid is in NEITHER page. loadUntil must resolve (not hang) and stop
-    // paging once next_after goes null — never spinning the 20-iter cap.
+  it('loadToTarget terminates at exhaustion when the target never appears in the window', async () => {
+    // The target IS an outline turn (so direction resolves) but its page never
+    // arrives before the forward cursor exhausts — loadToTarget must resolve, not
+    // hang, once next_after goes null.
+    const exhaustOutline = [
+      ...fwdOutline,
+      { uuid: 'u9', kind: 'human', member_uuids: ['u9'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+    ] as OutlineTurn[];
     mockOnce(detail([it1], 2));            // page 1, more to come
-    const { result } = renderHook(() => useConversation('s'));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns: exhaustOutline }));
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
-    mockOnce(detail([it2], null));         // page 2, exhausted
-    await act(async () => { await result.current.loadUntil('does-not-exist'); });
-    // Exactly 2 fetches total: the page-1 effect + one loadUntil page that
-    // exhausted the cursor. The cap-bounded loop cannot fetch 20 times.
+    mockOnce(detail([it2], null));         // page 2 exhausts; u9 never arrives
+    await act(async () => { await result.current.loadToTarget('u9'); });
+    // Exactly 2 fetches: the page-1 effect + one forward page that exhausted.
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
 
-  it('loadToEnd pages past the 20-page loadUntil cap (jump-to-latest spec §5, Codex P1 #2)', async () => {
+  it('loadToTarget drains an unbounded number of forward pages (no 20-page cap; jump-to-latest spec §5)', async () => {
     // A conversation whose pages exceed the old 20-cap: page 1 + 25 subsequent
-    // pages, each carrying ONE item. Every page but the last signals more
-    // (next_after != null); the last exhausts (null). loadUntil's hard cap of
-    // 20 iterations would stop at ~20 pages, leaving the final anchor
-    // unreachable — loadToEnd must drain ALL pages so the last item lands.
+    // pages, each carrying ONE item. loadToTarget(last) must drain ALL pages so
+    // the final turn lands — no cap (paging strictly advances toward the target).
+    const longOutline = Array.from({ length: 26 }, (_, i) => ({
+      uuid: `u${i + 1}`, kind: 'human', member_uuids: [`u${i + 1}`],
+      subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '',
+    })) as OutlineTurn[];
     const page = (id: number, more: boolean) => {
       const item = {
         kind: 'human', anchor: { session_id: 'sess-long', uuid: `u${id}`, id },
@@ -416,62 +429,13 @@ describe('useConversation', () => {
       return detail([item], more ? id + 1 : null, { session_id: 'sess-long' });
     };
     mockOnce(page(1, true));                       // page 1 (effect-loaded)
-    const { result } = renderHook(() => useConversation('sess-long'));
+    const { result } = renderHook(() => useConversation('sess-long', { outlineTurns: longOutline }));
     await waitFor(() => expect(result.current.detail).not.toBeNull());
-    // Queue the 25 subsequent pages (ids 2..26); only the last (26) exhausts.
     for (let id = 2; id <= 26; id++) mockOnce(page(id, id < 26));
-    await act(async () => { await result.current.loadToEnd(); });
-    // ALL 26 pages loaded (> the 20-page cap) and the cursor is fully drained.
+    await act(async () => { await result.current.loadToTarget('u26'); });
     expect(result.current.detail!.items.length).toBe(26);
     expect(result.current.hasMore).toBe(false);
     expect(result.current.detail!.items.at(-1)!.anchor.id).toBe(26);
-  });
-
-  it('loadToEnd waits out an overlapping in-flight load instead of bailing as exhausted', async () => {
-    // Cross-branch review fix: fetchNext returns false immediately when a load is
-    // already in flight (loadingMoreRef set). loadToEnd's loop treated that early
-    // false as terminal, so a jump-to-latest firing mid-load would page nothing
-    // and leave the final anchor unreachable. The fix distinguishes "no more
-    // pages" (cursor null) from "a load is already running" (cursor non-null +
-    // loadingMoreRef set): in the latter case loadToEnd awaits the in-flight
-    // settle and continues.
-    const page = (id: number, more: boolean) => {
-      const item = {
-        kind: 'human', anchor: { session_id: 'sess-race', uuid: `u${id}`, id },
-        member_uuids: [`u${id}`], ts: 't', text: `m${id}`, blocks: [], is_sidechain: false,
-      };
-      return detail([item], more ? id + 1 : null, { session_id: 'sess-race' });
-    };
-    mockOnce(page(1, true));                       // page 1 (effect-loaded)
-    const { result } = renderHook(() => useConversation('sess-race'));
-    await waitFor(() => expect(result.current.detail).not.toBeNull());
-
-    // Arm a controllable page 2 for the OVERLAPPING loadMore — it resolves only
-    // when we say so, so loadingMoreRef stays set across the loadToEnd kickoff.
-    let resolveInflight!: () => void;
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      () => new Promise((res) => { resolveInflight = () => res({ ok: true, status: 200, json: async () => page(2, true) } as Response); }),
-    );
-    // Queue pages 3 and 4 (4 exhausts) for loadToEnd to drain after the overlap.
-    mockOnce(page(3, true));
-    mockOnce(page(4, false));
-
-    await act(async () => {
-      // Kick off the in-flight loadMore WITHOUT awaiting it — loadingMoreRef is set.
-      const inflight = result.current.loadMore();
-      // loadToEnd fires while loadMore is in flight (the jump-to-latest race).
-      const toEnd = result.current.loadToEnd();
-      // Release the in-flight load so loadToEnd's wait can proceed.
-      resolveInflight();
-      await inflight;
-      await toEnd;
-    });
-
-    // Despite the overlap, loadToEnd drained every page (2,3,4 appended to 1) and
-    // the cursor is fully exhausted — it did NOT conclude "exhausted" at page 1.
-    expect(result.current.detail!.items.length).toBe(4);
-    expect(result.current.detail!.items.at(-1)!.anchor.id).toBe(4);
-    expect(result.current.hasMore).toBe(false);
   });
 
   it('never exposes the previous session\'s detail under the new sid on switch (#183 stale-media 404)', async () => {
@@ -623,5 +587,226 @@ describe('useConversation live-tail EventSource', () => {
     await waitFor(() =>
       expect(MockEventSource.instances.every((e) => !e.url.includes('/events'))).toBe(true),
     );
+  });
+});
+
+// #217 S3 E2 — the bidirectional windowed pager: open-at-bottom (?tail=1),
+// reverse paging (loadPrev → ?before=), a unified loadToTarget(uuid) with
+// nearest-edge direction + member-uuid resolution, and jump-to-latest = ?tail=1.
+// The hook now takes an `openIntent` (so the FIRST fetch is precedence-correct,
+// Codex P1) and `outlineTurns` (for loadToTarget's direction decision).
+describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => {
+  // A detail with explicit top + bottom edge keys.
+  function pageDetail(
+    items: unknown[],
+    edges: { next_after?: number | null; has_more?: boolean; prev_before?: number | null; has_prev?: boolean },
+    over: Record<string, unknown> = {},
+  ) {
+    return {
+      session_id: 's', project_label: 'p', git_branch: null,
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 3, models: ['opus'], items,
+      page: {
+        next_after: edges.next_after ?? null,
+        has_more: edges.has_more ?? (edges.next_after != null),
+        prev_before: edges.prev_before ?? null,
+        has_prev: edges.has_prev ?? false,
+      },
+      ...over,
+    };
+  }
+  // Outline turns the hook uses for loadToTarget direction decisions. Each turn's
+  // own uuid + member uuids (it2 folds 'u2b').
+  const outlineTurns: OutlineTurn[] = [
+    { uuid: 'u1', kind: 'human', member_uuids: ['u1'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+    { uuid: 'u2', kind: 'assistant', member_uuids: ['u2', 'u2b'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+    { uuid: 'u3', kind: 'assistant', member_uuids: ['u3'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+    { uuid: 'u4', kind: 'human', member_uuids: ['u4'], subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '' },
+  ];
+
+  function lastUrl(): string {
+    return String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0]);
+  }
+
+  it('open-at-bottom: a multi-page session fetches ?tail=1 and lands on the tail window (bottom edge)', async () => {
+    // tail page: the LAST window. has_prev:true (multi-page) so the top edge is
+    // armed; the bottom edge has nothing more (it IS the tail).
+    mockOnce(pageDetail([it3, it4], { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    // FIRST request is ?tail=1 (no head-fetch first).
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('tail=1');
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain('after=');
+    // Bottom edge: nothing more (live-tail eligible). Top edge: armed.
+    expect(result.current.hasMore).toBe(false);
+    expect(result.current.hasPrev).toBe(true);
+    expect(result.current.prevBefore).toBe(3);
+    // Multi-page (has_prev) ⇒ land at the bottom.
+    expect(result.current.openScrollIntent).toBe('bottom');
+  });
+
+  it('open-at-bottom: a single-page session (?tail=1 → has_prev:false) keeps all items and reports "top"', async () => {
+    mockOnce(pageDetail([it1, it2, it3], { next_after: null, has_more: false, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('tail=1');
+    expect(result.current.hasMore).toBe(false);
+    expect(result.current.hasPrev).toBe(false);
+    // Single page (everything fits) ⇒ read from the start.
+    expect(result.current.openScrollIntent).toBe('top');
+  });
+
+  it('loadPrev prepends and never disturbs the bottom edge / live-tail gate (Codex P1)', async () => {
+    // tail open: window = [it3, it4]; top edge armed (prev_before 3), bottom edge done.
+    mockOnce(pageDetail([it3, it4], { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.hasMore).toBe(false);
+
+    // The before-page response carries a NON-NULL next_after / has_more:true for
+    // the items AFTER it (already loaded). Storing it wholesale would flip the
+    // reader to "not at tail" and kill live-tail. loadPrev must update ONLY the
+    // top edge.
+    mockOnce(pageDetail([it1, it2], { next_after: 99, has_more: true, prev_before: 1, has_prev: true }));
+    await act(async () => { await result.current.loadPrev(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+
+    // ?before=<prev_before of the tail page> = before=3.
+    expect(lastUrl()).toContain('before=3');
+    // Prepended in order: [it1, it2, it3, it4].
+    expect(result.current.detail?.items.map((i: { anchor: { id: number } }) => i.anchor.id)).toEqual([1, 2, 3, 4]);
+    // Bottom edge UNTOUCHED despite the before-page's next_after:99 / has_more:true.
+    expect(result.current.hasMore).toBe(false);
+    // Top edge advanced to the before-page's prev_before.
+    expect(result.current.prevBefore).toBe(1);
+    expect(result.current.hasPrev).toBe(true);
+  });
+
+  it('loadPrev stops at the top edge when has_prev is false', async () => {
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    // The before-page reaches the head: has_prev:false, prev_before:null.
+    mockOnce(pageDetail([it1, it2], { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadPrev(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    expect(result.current.hasPrev).toBe(false);
+    // A further loadPrev is a no-op (no cursor) — no new fetch.
+    const before = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    await act(async () => { await result.current.loadPrev(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+  });
+
+  it('loadToTarget pages HEAD-WARD (before) for an early target from a tail window', async () => {
+    // Open at the tail with only the last 2 items loaded ([it3,it4]); the target
+    // is u1 (outline index 0 — earliest), above the window → page via ?before=.
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    mockOnce(pageDetail([it1, it2], { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadToTarget('u1'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    // The direction was HEAD-WARD: a ?before= request, never ?after=.
+    expect(lastUrl()).toContain('before=3');
+    expect(result.current.detail?.items.some((i: { anchor: { uuid: string } }) => i.anchor.uuid === 'u1')).toBe(true);
+  });
+
+  it('loadToTarget resolves a MEMBER (folded-fragment) uuid to its owning turn (Codex P1)', async () => {
+    // u2b is a folded fragment of turn u2 (outline index 1). It is NOT an outline
+    // turn's own uuid — only resolvable via member_uuids. Targeting it from the
+    // tail must still page head-ward toward turn u2.
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    mockOnce(pageDetail([it1, it2], { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadToTarget('u2b'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    expect(lastUrl()).toContain('before=');
+    // The owning turn u2 is now loaded (its member u2b is reachable).
+    expect(result.current.detail?.items.some((i: { member_uuids: string[] }) => i.member_uuids.includes('u2b'))).toBe(true);
+  });
+
+  it('loadToTarget is a no-op when the target is already in the window', async () => {
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const before = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    // u3 is already loaded → no paging.
+    await act(async () => { await result.current.loadToTarget('u3'); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+  });
+
+  it('loadToTarget is a graceful no-op when the uuid resolves to no outline turn', async () => {
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const before = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    await act(async () => { await result.current.loadToTarget('not-in-outline'); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+  });
+
+  it('loadToTarget pages FORWARD (after) for a late target below the window', async () => {
+    // Open at the HEAD (anchor intent on u1) with a forward cursor; the target u4
+    // is below the window → page via ?after=.
+    mockOnce(pageDetail([it1, it2], { next_after: 2, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'anchor', uuid: 'u1' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    mockOnce(pageDetail([it3, it4], { next_after: null, has_more: false, prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadToTarget('u4'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    expect(lastUrl()).toContain('after=2');
+    expect(lastUrl()).not.toContain('before=');
+  });
+
+  it('jump-to-latest issues ?tail=1 (a reset, not a forward drain)', async () => {
+    // Open at the head, partially paged (bottom edge has more).
+    mockOnce(pageDetail([it1, it2], { next_after: 2, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'anchor', uuid: 'u1' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    // jumpToLatest replaces the window with the tail page in ONE request.
+    mockOnce(pageDetail([it3, it4], { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
+    await act(async () => { await result.current.jumpToLatest(); });
+    await waitFor(() => expect(result.current.detail?.items.map((i: { anchor: { id: number } }) => i.anchor.id)).toEqual([3, 4]));
+    // It was a ?tail=1 reset — NOT an ?after= forward drain.
+    expect(lastUrl()).toContain('tail=1');
+    expect(lastUrl()).not.toContain('after=');
+    // Landed at the bottom with live-tail eligible.
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it('preserves the overlap-race disambiguation across edges (a loadToTarget mid-load awaits the in-flight load)', async () => {
+    // Port of the loadToEnd overlap-race test to the unified pager. A forward
+    // loadMore is in flight (loadingMoreRef set) when loadToTarget(lateUuid)
+    // fires; loadToTarget must await the in-flight settle, not mistake the early
+    // `false` for end-of-conversation.
+    mockOnce(pageDetail([it1], { next_after: 1, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns, openIntent: { kind: 'anchor', uuid: 'u1' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    // Arm a controllable page for the OVERLAPPING loadMore (resolves on command).
+    let resolveInflight!: () => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolveInflight = () => res({ ok: true, status: 200, json: async () => pageDetail([it2], { next_after: 2, has_more: true }) } as Response); }),
+    );
+    // Queue the pages loadToTarget will drain after the overlap (it3 then it4 exhausts).
+    mockOnce(pageDetail([it3], { next_after: 3, has_more: true }));
+    mockOnce(pageDetail([it4], { next_after: null, has_more: false }));
+
+    await act(async () => {
+      const inflight = result.current.loadMore();          // loadingMoreRef set, not awaited
+      const toTarget = result.current.loadToTarget('u4');  // fires mid-load (the race)
+      resolveInflight();
+      await inflight;
+      await toTarget;
+    });
+
+    // loadToTarget drained every forward page (2,3,4 appended to 1) despite the
+    // overlap — it did NOT conclude "exhausted" at page 1.
+    expect(result.current.detail?.items.map((i: { anchor: { id: number } }) => i.anchor.id)).toEqual([1, 2, 3, 4]);
+    expect(result.current.hasMore).toBe(false);
   });
 });

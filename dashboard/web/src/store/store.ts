@@ -1,6 +1,7 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
 import type { ConversationFilters, ConversationJump, SearchKind } from '../types/conversation';
 import { EMPTY_FILTERS } from '../types/conversation';
+import { recordReadingPos } from './readingPosition';
 import {
   applySessionFilter,
   computeSearchMatches,
@@ -1023,6 +1024,18 @@ export function dispatch(action: Action): void {
       state = { ...state, convFiltersOpen: action.open };
       break;
     case 'SET_CONV_CURRENT_TURN':
+      // #217 S3 E1 — persist the reading position for the CURRENTLY-OPEN session
+      // on the throttled scroll-sync write (persist-before-reset, Codex P2): a
+      // genuine switch resets convCurrentTurnUuid in the OPEN_CONVERSATION /
+      // SELECT_CONVERSATION reducers, so persisting "on switch" would save a
+      // just-cleared null. Only a real uuid (not the cross-session null reset)
+      // for an actually-selected session is recorded. Runs even when the
+      // in-memory value is unchanged-but-non-null is unnecessary (the no-op
+      // guard below skips the emit, but the position was already written on the
+      // prior write).
+      if (action.uuid != null && state.selectedConversationId != null) {
+        recordReadingPos(state.selectedConversationId, action.uuid);
+      }
       if (state.convCurrentTurnUuid === action.uuid) break; // no-op: avoid a needless emit on each observer tick
       state = { ...state, convCurrentTurnUuid: action.uuid };
       break;

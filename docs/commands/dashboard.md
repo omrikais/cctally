@@ -111,7 +111,9 @@ the UI with either input.
 | `b` / `B` | Reader: jump to next / previous subagent thread |
 | `p` / `P` | Reader: jump to next / previous plan/question turn |
 | `j` / `k` | Reader: move the focused-turn cursor down / up |
-| `End` | Reader: jump to the conversation's latest turn (pages forward to the end, then lands and flashes it) — suppressed while a filter input or modal is focused |
+| `a` | Reader: jump directly to the **last** (most-recent) prompt |
+| `L` | Reader: jump directly to the **last** (most-recent) error turn |
+| `End` | Reader: jump to the conversation's latest turn (resets to the tail page in one request, then lands and flashes it) — suppressed while a filter input or modal is focused |
 
 Every keybind has a clickable equivalent: footer pills are real buttons, the
 sync chip posts to `/api/sync`, panel bodies and session rows open their
@@ -289,9 +291,17 @@ The Browse rail narrows the conversation list by four axes through a compact **`
 
 Filters apply to **Browse only**: when a full-text search needle is active the rail switches to search results and the Filters button is disabled (filters stay set and re-apply when the search box clears). Filter state is session-only — it resets on reload. While the conversation cache is still building its per-session rollup on a brand-new or `--no-sync` dashboard, the project/cost/rebuild axes show a brief muted "Project/cost/rebuild filters apply once indexing finishes." note and only the date axis applies; this self-corrects after the first full sync.
 
+### Open-at-bottom & reverse pagination (#217 S3)
+
+The reader now opens a long conversation **at the bottom** — the newest turns — rather than at the top, so a session you return to lands where the action is. On open it fetches the last page in one request (`?tail=1`) and lands on the newest turn with live-tail engaged; a short conversation that fits a single page opens at the top instead, so it reads from the start. From there the window pages **both directions**: scrolling down appends older→newer pages (as before), and scrolling up **prepends** earlier pages via a reverse cursor, anchored so the turn you were reading stays fixed under the viewport instead of jumping. The two edges are independent — a backward (scroll-up) page never disturbs the live-tail "follow the bottom" state, so a reader opened at the tail keeps following the live session even after you scroll up to read history.
+
+**Reading-position memory.** The reader remembers where you were in each conversation: when you switch away and come back later, it restores you to the turn you were last reading (anchored to that turn, not a pixel offset, so it survives a different window size or a grown transcript). A deep-link or jump target always wins over the saved position; if the saved turn no longer exists, the reader falls back to opening at the bottom (or the top for a single-page session). The memory is a small bounded list (the ~50 most-recently-read conversations) kept in your browser's local storage.
+
+**Direct jumps to the last prompt / last error.** Beyond the `e`/`E` and `u`/`U` step-to-next-or-previous keys, two keys jump **directly to the most-recent occurrence**: `a` lands on the last prompt and `L` lands on the last error turn — handy for "take me to where I last asked something" or "show me the latest failure" without stepping. Both are no-ops when the conversation has none, and both are suppressed while a filter input or modal is focused.
+
 ### Jump to latest
 
-The reader header carries a **`Latest ↓`** action (titled "Jump to latest", and the `End` key) that takes you straight to the conversation's most recent turn. It reuses the same jump pipeline as an outline click — paging the detail forward to the end (with a loading state on long conversations), then scrolling the final turn into view with the usual flash. Unlike the outline jumps, jump-to-latest pages **all the way to the end** with no page cap, so it reaches the last turn even in very long conversations. Landing at the bottom parks you in the stick-to-bottom position, so a live session's subsequent appends keep following automatically — jump-to-latest and the live-tail "↓ N new" pill are complementary. The control is hidden for an empty conversation, and the `End` key is suppressed while a filter input or a modal is focused.
+The reader header carries a **`Latest ↓`** action (titled "Jump to latest", and the `End` key) that takes you straight to the conversation's most recent turn. It **resets the window to the tail page in a single request** (instant even on a very long session — no forward drain), then scrolls the final turn into view with the usual flash. Landing at the bottom parks you in the stick-to-bottom position, so a live session's subsequent appends keep following automatically — jump-to-latest and the live-tail "↓ N new" pill are complementary. The control is hidden for an empty conversation, and the `End` key is suppressed while a filter input or a modal is focused.
 
 ### Reader pagination (#217 S2)
 
