@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Dashboard conversation viewer — transcript export & per-card extraction.** The reader header gains an `Export ▾` menu with four Markdown scopes — Whole transcript, Prompts only, Chat only, and Replay recipe (a numbered list of your prompts) — each offering Copy (clipboard) and Download (`.md`); the export is computed server-side over the whole assembled session (new `GET /api/conversation/<id>/export` route behind the same fail-closed transcript gate), so it's complete even for a long transcript you've only partially paged in, and truncated tool data is marked `… [truncated]` rather than shown as complete. A diff card additionally offers a `.patch` download (a real `diff --git`/`@@` unified diff — Write yields an applyable add-patch, Edit/MultiEdit are snippet-relative best-effort), and a Bash card offers a `copy full` action (`$ cmd` + stdout + stderr, with a truncation marker when clipped). (#217)
+
 ### Changed
 - **Dashboard conversation search — the Files facet now matches a file-path substring instead of a path prefix.** Searching the Files facet for a bare basename (`package.json`) or a mid-path fragment (`cctally`) now returns the sessions that touched a matching path, instead of requiring a leading path prefix; the match is a case-insensitive substring over the (modest) touched-file table. (#223)
 - **Dashboard conversation find bar — regex matches are now underlined in the transcript.** In regex find mode the in-prose highlight is no longer suppressed: matches get a best-effort inline underline (per rendered text segment, case-toggle-aware), alongside the existing match count and jump-to-match. Invalid or pathological patterns degrade to no underline (the match count still drives navigation). (#223)

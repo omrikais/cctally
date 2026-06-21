@@ -7,6 +7,7 @@ import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { FindBar } from './FindBar';
+import { ExportMenu } from './ExportMenu';
 import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
@@ -1549,6 +1550,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               );
             })}
           </div>
+          {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
+              its own Esc/outside-click close; fetches the new /export route. */}
+          <ExportMenu sessionId={sessionId} title={detail.title} />
           {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
               last_anchor is null (a genuinely empty conversation). Disabled with
               a spinner glyph while jumpToLatest() resets to the tail. Bound to `End`. */}

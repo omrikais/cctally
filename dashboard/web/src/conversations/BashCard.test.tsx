@@ -229,3 +229,44 @@ describe('BashCard dimmed line (#193)', () => {
     expect(absent.container.querySelector('.conv-chip-preview')!.textContent).toBe('ls -la');
   });
 });
+
+// #217 S5 §4 / I-1.4 — a second copy action copies the full session output:
+// `$ <command>` + stdout + a stderr block + a `… [truncated]` marker when the
+// result is truncated (Codex P2-3 — no auto load-full).
+describe('BashCard full-session copy (#217 S5)', () => {
+  it('copies command + stdout (+ stderr) with a truncation marker when truncated', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const call = base({
+      input: { command: 'make build' },
+      result: { text: 'compiling…\nboom', truncated: true, is_error: true },
+      stderr: 'boom',
+    });
+    const { getByRole } = renderCard(call);
+    fireEvent.click(getByRole('button', { name: /copy full/i }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const copied = writeText.mock.calls[0][0] as string;
+    expect(copied).toContain('$ make build');
+    expect(copied).toContain('compiling…');
+    expect(copied).toContain('boom');
+    expect(copied).toContain('[truncated]');
+  });
+
+  it('omits the truncation marker when the result is complete', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const call = base({
+      input: { command: 'echo hi' },
+      result: { text: 'hi', truncated: false, is_error: false },
+      stderr: null,
+    });
+    const { getByRole } = renderCard(call);
+    fireEvent.click(getByRole('button', { name: /copy full/i }));
+    const copied = writeText.mock.calls[0][0] as string;
+    expect(copied).toContain('$ echo hi');
+    expect(copied).toContain('hi');
+    expect(copied).not.toContain('[truncated]');
+  });
+});
+
+void act;

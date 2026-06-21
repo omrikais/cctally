@@ -5483,6 +5483,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # Live-tail SSE for the open reader (spec §2). Matched BEFORE the
             # <id> reader catch-all.
             self._handle_get_conversation_events(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/export"):
+            # #217 S5: whole-session Markdown export (F1/F5). Matched BEFORE the
+            # <id> reader catch-all (same precedence as /outline).
+            self._handle_get_conversation_export(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7876,6 +7880,51 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "conversation not found")
             return
         self._respond_json(200, body)
+
+    _CONV_EXPORT_SCOPES = ("all", "prompts", "chat", "recipe")
+
+    def _handle_get_conversation_export(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/export?scope=<all|prompts|chat|recipe>``
+        — whole-session Markdown (issue #217 S5 F1/F5).
+
+        Same fail-closed transcript privacy gate as ``/outline`` / ``/payload``
+        / ``/find`` — ``_require_transcripts_allowed()`` ONLY. **No
+        ``_check_origin_csrf``** (Codex P0-1): the sibling transcript GETs gate
+        on this predicate alone; ``_check_origin_csrf`` rejects a missing
+        ``Origin`` and would make export STRICTER than its sibling reader routes.
+
+        ``scope`` is validated HERE, BEFORE the kernel (the
+        ``_run_conversation_query``-collapses-kernel-exceptions-to-500 gotcha —
+        an invalid scope is a clean 400, never a 500). Unknown session → 404.
+        Emits ``text/markdown; charset=utf-8`` (the client builds the download
+        Blob/filename, so no ``Content-Disposition`` is needed)."""
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/export")])
+        q = _u.parse_qs(self.path.partition("?")[2])
+        scope = _qs_str(q, "scope", "all")
+        if scope not in self._CONV_EXPORT_SCOPES:
+            self._respond_json(400, {"error": f"unknown scope: {scope}"})
+            return
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().get_conversation_export(
+                conn, session_id, scope),
+            "/api/conversation/export")
+        if not ok:
+            return
+        if body is None:
+            self.send_error(404, "conversation not found")
+            return
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_get_conversation_find(self, path: str) -> None:
         """``GET /api/conversation/<sid>/find?q=...&kind=...`` — in-conversation

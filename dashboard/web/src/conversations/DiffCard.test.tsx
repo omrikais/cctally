@@ -261,3 +261,56 @@ describe('DiffCard truncated header stat (#198)', () => {
     expect(hdr).not.toMatch(/\+5/);
   });
 });
+
+// #217 S5 §4 / I-1.4 — DiffCard gains a Download-as-.patch action that builds a
+// REAL unified diff (diff --git / --- / +++ / @@) from the hunks + file_path
+// (Codex P1-6). A Write yields an add-patch against /dev/null.
+describe('DiffCard .patch download', () => {
+  // Capture the text handed to the Blob constructor (the patch payload). Stub
+  // Blob (jsdom's Blob.text() is flaky) + URL + the anchor click so the download
+  // path runs without touching the real DOM download machinery.
+  function captureDownload() {
+    let captured = '';
+    const click = vi.fn();
+    class FakeBlob {
+      constructor(parts: BlobPart[]) {
+        captured = parts.map((p) => String(p)).join('');
+      }
+    }
+    vi.stubGlobal('Blob', FakeBlob);
+    vi.stubGlobal('URL', { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
+    const proto = HTMLAnchorElement.prototype as unknown as { click: () => void };
+    vi.spyOn(proto, 'click').mockImplementation(click);
+    return { getText: () => captured, click };
+  }
+
+  it('downloads a .patch with diff --git + hunk headers from an Edit', () => {
+    const cap = captureDownload();
+    const call = base({
+      input: { file_path: 'bin/foo.py', old_string: 'return x', new_string: 'return x + 1' },
+    });
+    const { getByRole } = renderCard(call);
+    fireEvent.click(getByRole('button', { name: /patch/i }));
+    expect(cap.click).toHaveBeenCalled();
+    const text = cap.getText();
+    expect(text).toContain('diff --git a/bin/foo.py b/bin/foo.py');
+    expect(text).toContain('--- a/bin/foo.py');
+    expect(text).toContain('+++ b/bin/foo.py');
+    expect(text).toMatch(/@@ -\d+(,\d+)? \+\d+(,\d+)? @@/);
+    expect(text).toContain('-return x');
+    expect(text).toContain('+return x + 1');
+  });
+
+  it('a Write builds an add-patch against /dev/null', () => {
+    const cap = captureDownload();
+    const call = base({ name: 'Write', input: { file_path: 'new.py', content: 'a\nb' } });
+    const { getByRole } = renderCard(call);
+    fireEvent.click(getByRole('button', { name: /patch/i }));
+    const text = cap.getText();
+    expect(text).toContain('diff --git a/new.py b/new.py');
+    expect(text).toContain('--- /dev/null');
+    expect(text).toContain('+++ b/new.py');
+    expect(text).toContain('+a');
+    expect(text).toContain('+b');
+  });
+});

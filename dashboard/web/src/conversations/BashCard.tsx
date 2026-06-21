@@ -5,6 +5,7 @@ import { CopyButton } from './CopyButton';
 import { AnsiText } from './parseAnsi';
 import { LoadFull } from './LoadFull';
 import { highlightBody } from './CodeBlock';
+import { useCopy } from './useCopy';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -43,7 +44,24 @@ function splitStreams(text: string, stderr: string | null | undefined): { stdout
 // chevron + icon + name + preview) so collapse-all [/] and j/k nav match. The
 // card assumes a valid command input — the presence guard lives in
 // specialToolRenderer (Codex P1.2).
+// #217 S5 §4 / I-1.4 — the full-session copy text: `$ <command>` + stdout + a
+// stderr block + a `… [truncated]` marker when the result is truncated and NOT
+// loaded full (Codex P2-3 — copies the bounded text, never auto load-fulls).
+function fullSessionText(
+  command: string,
+  stdout: string,
+  stderr: string | null,
+  truncated: boolean,
+): string {
+  const parts = [`$ ${command}`];
+  if (stdout) parts.push(stdout.replace(/\n+$/, ''));
+  if (stderr) parts.push(stderr.replace(/\n+$/, ''));
+  if (truncated) parts.push('… [truncated]');
+  return parts.join('\n');
+}
+
 export function BashCard({ call }: { call: Call }) {
+  const { copied: copiedFull, copy: copyFull } = useCopy();
   // The full output loaded on demand when result.truncated (#178); supersedes
   // the bounded result.text for rendering. The load-full result payload carries
   // a discrete `stderr` field, so we capture it alongside `text` and re-split
@@ -103,6 +121,27 @@ export function BashCard({ call }: { call: Call }) {
       <div className="conv-term-body">
         <div className="conv-term-copy">
           <CopyButton text={command} />
+          {/* #217 S5 §4 — copy the full session output ($ cmd + stdout + stderr
+              + a [truncated] marker when the result is clipped and not loaded). */}
+          <button
+            type="button"
+            className="conv-term-copyfull"
+            aria-label={copiedFull ? 'Copied full session' : 'Copy full session'}
+            title="Copy full session ($ cmd + output)"
+            onClick={(e) => {
+              e.stopPropagation();
+              copyFull(
+                fullSessionText(
+                  command,
+                  stdout,
+                  stderr,
+                  result?.truncated === true && full == null,
+                ),
+              );
+            }}
+          >
+            {copiedFull ? '✓ full' : 'copy full'}
+          </button>
         </div>
         <pre className="conv-term-cmd conv-code--hl">
           <span className="conv-term-prompt" aria-hidden="true">

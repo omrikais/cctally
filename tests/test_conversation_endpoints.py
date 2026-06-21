@@ -189,6 +189,24 @@ def _get(port, path, *, host=None):
     return status, body
 
 
+def _get_ct(port, path, *, host=None):
+    """GET helper returning ``(status, content_type, body)`` — for routes whose
+    Content-Type matters (e.g. the export route's ``text/markdown``)."""
+    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    if host is None:
+        c.request("GET", path)
+    else:
+        c.putrequest("GET", path, skip_host=True)
+        c.putheader("Host", host)
+        c.endheaders()
+    r = c.getresponse()
+    body = r.read()
+    status = r.status
+    ct = r.headers.get("Content-Type")
+    c.close()
+    return status, ct, body
+
+
 def test_gate_blocks_lan_hostname(tmp_path, monkeypatch):
     """expose=False, loopback bind: a request arriving with a LAN *hostname*
     Host header is rejected with 403 (anti-DNS-rebinding)."""
@@ -303,6 +321,47 @@ def test_conversation_outline_route(tmp_path, monkeypatch):
         status, _ = _get(port, "/api/conversation/s1/outline",
                          host="machine.local:8789")
         assert status == 403
+    finally:
+        srv.shutdown()
+
+
+def test_conversation_export_route(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/export?scope=<all|prompts|chat|recipe>`` (#217 S5
+    F1/F5): loopback 200 ``text/markdown`` with a non-empty body for a valid
+    scope; unknown scope → 400 (validated in the handler, NOT a 500); unknown
+    session → 404; LAN hostname + expose=False → 403 (the same fail-closed gate
+    as the sibling reader routes — Codex P0-1, no ``_check_origin_csrf``).
+    """
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Happy path: 200, text/markdown, non-empty body, for every scope.
+        for scope in ("all", "prompts", "chat", "recipe"):
+            status, ct, body = _get_ct(
+                port, f"/api/conversation/s1/export?scope={scope}")
+            assert status == 200, (scope, status, body)
+            assert ct is not None and ct.startswith("text/markdown"), (scope, ct)
+            assert body, (scope, "empty body")
+
+        # Default scope (no query string) → 200 (defaults to `all`).
+        status, ct, body = _get_ct(port, "/api/conversation/s1/export")
+        assert status == 200 and ct.startswith("text/markdown"), (status, ct)
+
+        # Unknown scope → 400 (handler-level validation, BEFORE the kernel).
+        status, _, _ = _get_ct(port, "/api/conversation/s1/export?scope=bogus")
+        assert status == 400, status
+
+        # Unknown session → 404.
+        status, _, _ = _get_ct(
+            port, "/api/conversation/does-not-exist/export?scope=all")
+        assert status == 404, status
+
+        # Privacy gate reused verbatim: LAN hostname + expose=False → 403.
+        status, _, _ = _get_ct(port, "/api/conversation/s1/export?scope=all",
+                               host="machine.local:8789")
+        assert status == 403, status
     finally:
         srv.shutdown()
 

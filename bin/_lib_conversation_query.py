@@ -1872,6 +1872,31 @@ def get_conversation_outline(conn, session_id):
             "turns": turns}
 
 
+def get_conversation_export(conn, session_id, scope):
+    """Whole-session Markdown export for one scope (#217 S5, F1/F5).
+
+    Runs the SAME full ``_assemble_session`` the reader/outline use, then hands
+    the assembled ``items`` (+ ``subagent_meta``) to the pure
+    ``export_session_markdown`` serializer (`_lib_conversation_export.py`), so
+    the renderer stays I/O-free and golden-testable. Returns the Markdown string,
+    or ``None`` for an unknown session (the handler's 404 sentinel). ``scope`` is
+    pre-validated by the handler (an unknown scope never reaches here)."""
+    from _lib_conversation_export import export_session_markdown
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
+    items = asm["items"]
+    subagent_meta = asm["subagent_meta"]
+    logical = asm["logical"]
+    # Title via the SAME fallback chain the reader header uses (#193):
+    # ai-title → first human prompt → project label → session_id.
+    _pl = _project_label(_latest(logical, 10))
+    title = (_session_titles_map(conn, [session_id]).get(session_id)
+             or _pl or session_id)
+    return export_session_markdown(items, scope, subagent_meta=subagent_meta,
+                                   title=title, session_id=session_id)
+
+
 _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")
 
 

@@ -5428,6 +5428,82 @@ mark.current {
 .conv-jump-latest:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-jump-latest:disabled { opacity: 0.6; cursor: progress; }
 
+/* ---- Export menu (#217 S5 §4 — F1/F5) ---------------------------- */
+/* A reader-header popover listing the four Markdown export scopes, each with a
+   Copy + a Download action. Chrome mirrors .conv-outline-toggle / .conv-jump-
+   latest so the controls read as one set. The menu animation is gated on
+   prefers-reduced-motion: no-preference (reduced-motion users get no fade). */
+.conv-export { position: relative; display: inline-flex; }
+.conv-export-toggle {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-export-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-export-toggle[aria-expanded="true"] {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+.conv-export-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 220px;
+  padding: 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .conv-export-menu { animation: conv-export-fade 120ms ease-out; }
+}
+@keyframes conv-export-fade {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: none; }
+}
+.conv-export-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+}
+.conv-export-row-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.conv-export-action {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.conv-export-action:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-export-action:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+  color: var(--text);
+}
+.conv-export-action:disabled { opacity: 0.6; cursor: progress; }
+
 /* ---- Focus-mode segmented control (#177 S5 §5) -------------------- */
 .conv-focus-seg {
   display: inline-flex;
@@ -6878,7 +6954,31 @@ mark.current {
   padding: 8px 10px;
   border-top: 1px solid var(--border-soft);
 }
-.conv-diff-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-diff-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: 4px; align-items: center; }
+/* #217 S5 §4 — Download-.patch button beside the diff Copy. */
+.conv-diff-patch-btn,
+.conv-term-copyfull {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.conv-diff-patch-btn:hover,
+.conv-term-copyfull:hover {
+  color: var(--text);
+  border-color: var(--border-soft);
+  background: var(--panel-bg-2);
+}
+.conv-diff-patch-btn:focus-visible,
+.conv-term-copyfull:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 1px;
+}
 .conv-diff-divider {
   margin: 8px 0 4px;
   font-family: var(--font-mono);
@@ -6933,7 +7033,7 @@ mark.current {
   flex-direction: column;
   gap: 6px;
 }
-.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: 4px; align-items: center; }
 .conv-term-cmd {
   margin: 0;
   font-family: var(--font-mono);
@@ -7565,6 +7665,10 @@ mark.current {
     font-size: 11px;
     min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
+  /* #217 S5 §4 — export controls honor the same tap-target floor. */
+  #root .conv-export-toggle { min-height: 44px; }
+  #root .conv-export-menu { min-width: min(280px, 90vw); }
+  #root .conv-export-action { min-height: 44px; }
   /* #205 S1 (F2) — the mobile outline slide-over gets a titled header with a
      visible ✕. The sheet stacks this fixed header over the scrolling panel. */
   #root .conv-outline-sheet-head {

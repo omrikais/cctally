@@ -55,6 +55,71 @@ function splitPath(path: string): { dir: string; base: string } {
   return { dir: path.slice(0, slash + 1), base: path.slice(slash + 1) };
 }
 
+// #217 S5 §4 / I-1.4 — build a REAL unified diff (`diff --git`/`---`/`+++`/`@@`)
+// from the rendered hunks + file_path (Codex P1-6). A Write yields an applyable
+// add-patch against /dev/null; Edit/MultiEdit hunk line numbers are
+// snippet-relative (not whole-file offsets), so those patches are a best-effort
+// shareable representation — they may not cleanly `git apply` (documented in
+// docs/commands/dashboard.md, not the UI).
+function hunkHeader(rows: Hunk): string {
+  // old/new start = the first row carrying that side's number (snippet-relative);
+  // length = count of rows touching that side (context counts for both).
+  let oldStart: number | null = null;
+  let newStart: number | null = null;
+  let oldLen = 0;
+  let newLen = 0;
+  for (const r of rows) {
+    if (r.type !== 'add') {
+      if (oldStart === null && r.oldNo != null) oldStart = r.oldNo;
+      oldLen++;
+    }
+    if (r.type !== 'del') {
+      if (newStart === null && r.newNo != null) newStart = r.newNo;
+      newLen++;
+    }
+  }
+  return `@@ -${oldStart ?? (oldLen ? 1 : 0)},${oldLen} +${newStart ?? (newLen ? 1 : 0)},${newLen} @@`;
+}
+
+function toPatch(filePath: string, hunks: Hunk[], isWrite: boolean): string {
+  const path = filePath || 'file';
+  const aPath = isWrite ? '/dev/null' : `a/${path}`;
+  const bPath = `b/${path}`;
+  const lines: string[] = [
+    `diff --git a/${path} b/${path}`,
+    `--- ${aPath}`,
+    `+++ ${bPath}`,
+  ];
+  for (const rows of hunks) {
+    if (rows.length === 0) continue;
+    lines.push(hunkHeader(rows));
+    for (const r of rows) {
+      const sign = r.type === 'add' ? '+' : r.type === 'del' ? '-' : ' ';
+      lines.push(sign + r.text);
+    }
+  }
+  return lines.join('\n') + '\n';
+}
+
+function basename(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash < 0 ? path : path.slice(slash + 1);
+}
+
+function downloadPatch(filePath: string, hunks: Hunk[], isWrite: boolean): void {
+  const text = toPatch(filePath, hunks, isWrite);
+  const blob = new Blob([text], { type: 'text/x-patch;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${basename(filePath) || 'patch'}.patch`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 // +N / −M across every hunk (added/removed row counts).
 function statOf(hunks: Hunk[]): { add: number; del: number } {
   let add = 0;
@@ -217,6 +282,20 @@ export function DiffCard({ call }: { call: Call }) {
       <div className="conv-diff-body">
         <div className="conv-diff-copy">
           <CopyButton text={copyText} />
+          {/* #217 S5 §4 — download a real unified .patch built from the hunks +
+              file_path. Snippet-relative for Edit/MultiEdit (best-effort). */}
+          <button
+            type="button"
+            className="conv-diff-patch-btn"
+            aria-label="Download .patch"
+            title="Download .patch"
+            onClick={(e) => {
+              e.stopPropagation();
+              downloadPatch(filePath, hunks, kind === 'write');
+            }}
+          >
+            .patch
+          </button>
         </div>
         {hunks.map((rows, hi) => (
           <div key={hi}>
