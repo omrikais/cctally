@@ -5371,6 +5371,136 @@ mark.current {
   color: var(--text);
 }
 
+/* #217 S5 F2 — the [Outline] [Files] tab toggle, between the stats card and the
+   list. A two-button segmented control matching the outline chrome. */
+.conv-outline-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  padding: 6px 6px 0;
+}
+.conv-outline-tab {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-outline-tab:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-outline-tab:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-outline-tab[aria-selected="true"] {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+  background: var(--panel-bg-2);
+}
+.conv-outline-tab-count {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+/* #217 S5 F2 — the Files tab panel: scrolls inside the outline column like the
+   landmark list. */
+.conv-outline-files {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+.conv-files-empty {
+  padding: 14px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-style: italic;
+}
+.conv-files-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.conv-files-item { margin: 0; padding: 0; }
+.conv-files-file {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  border-radius: 5px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+.conv-files-file:hover { background: var(--panel-bg-2); color: var(--text); }
+.conv-files-file:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-files-disclosure {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  color: var(--text-faint);
+}
+.conv-files-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-files-dir { color: var(--text-faint); }
+.conv-files-base { color: var(--text); font-weight: 700; }
+.conv-files-stat {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 5px;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+}
+.conv-files-stat-add { color: var(--accent-green); }
+.conv-files-stat-del { color: var(--accent-red); }
+.conv-files-count {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+.conv-files-touches {
+  list-style: none;
+  margin: 2px 0 4px;
+  padding: 0 0 0 19px;
+}
+.conv-files-touches li { margin: 0; padding: 0; }
+.conv-files-touch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  border-radius: 4px;
+  padding: 4px 7px;
+  cursor: pointer;
+}
+.conv-files-touch:hover { background: var(--panel-bg-2); color: var(--text); }
+.conv-files-touch:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-files-touch-op { color: var(--text); }
+.conv-files-touch-sep { color: var(--text-faint); }
+.conv-files-touch-jump { margin-left: auto; color: var(--text-faint); }
+
 /* Reader-head outline toggle button. Lives in the flex .conv-reader-controls
    row now (#177 S5) — the Task-3 `float: right` is dropped. */
 .conv-outline-toggle {
@@ -5544,6 +5674,82 @@ mark.current {
   color: #fff;
   font-size: 9.5px;
   font-weight: 700;
+}
+
+/* ---- Focus "▾ More" menu (#217 S5 E4) ---------------------------- */
+.conv-focus-more { position: relative; display: inline-flex; }
+.conv-focus-more-toggle {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-focus-more-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-focus-more-toggle:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+  color: var(--text);
+}
+.conv-focus-more-toggle--on {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+  background: var(--panel-bg-2);
+  font-weight: 700;
+}
+.conv-focus-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  min-width: 170px;
+  padding: 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .conv-focus-more-menu { animation: conv-export-fade 120ms ease-out; }
+}
+.conv-focus-more-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.conv-focus-more-item:hover { background: var(--panel-bg-2); color: var(--text); }
+.conv-focus-more-item:focus-visible {
+  outline: none;
+  border-color: var(--accent-blue);
+  color: var(--text);
+}
+.conv-focus-more-item--on { color: var(--accent-blue); font-weight: 700; }
+.conv-focus-more-submenu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 2px 10px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border-soft);
 }
 
 /* ---- Hidden-run marker (#177 S5 §5) ------------------------------- */
@@ -7669,6 +7875,9 @@ mark.current {
   #root .conv-export-toggle { min-height: 44px; }
   #root .conv-export-menu { min-width: min(280px, 90vw); }
   #root .conv-export-action { min-height: 44px; }
+  /* #217 S5 E4 — the focus "▾ More" menu controls honor the same floor. */
+  #root .conv-focus-more-toggle { min-height: 44px; }
+  #root .conv-focus-more-item { min-height: 44px; }
   /* #205 S1 (F2) — the mobile outline slide-over gets a titled header with a
      visible ✕. The sheet stacks this fixed header over the scrolling panel. */
   #root .conv-outline-sheet-head {
@@ -7739,6 +7948,10 @@ mark.current {
   /* §4E session outline */
   #root .conv-outline-entry { min-height: 44px; }
   #root .conv-jump-cluster-btn { min-height: 44px; min-width: 44px; }
+  /* #217 S5 F2 — Files tab toggle + file/touch rows (≥44px touch targets). */
+  #root .conv-outline-tab { min-height: 44px; }
+  #root .conv-files-file { min-height: 44px; }
+  #root .conv-files-touch { min-height: 44px; }
 
   /* §4F transcript body controls */
   #root .conv-jump-top { width: 44px; height: 44px; }   /* round FAB; 34→44 */

@@ -1,4 +1,20 @@
 {
+  "files": [
+    {
+      "add": 412,
+      "del": 87,
+      "path": "/home/u/proj/resolve.py",
+      "touches": [
+        {
+          "add": 412,
+          "del": 87,
+          "op": "edit",
+          "tool_use_id": "toolu_s5",
+          "uuid": "s5a1"
+        }
+      ]
+    }
+  ],
   "session_id": "s5",
   "stats": {
     "cache_saved_usd": 0.0,

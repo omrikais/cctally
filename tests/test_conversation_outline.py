@@ -585,3 +585,183 @@ def test_outline_subagent_costs_sum_matches_bucket_total():
     a = round(cq._entry_cost(_MODEL, 100, 200, 0, 0, None), 6)
     b = round(cq._entry_cost(_MODEL, 300, 400, 0, 0, None), 6)
     assert abs(out["subagent_costs"]["q"] - (a + b)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# #217 S5 F2 — outline `files` aggregation (Edit / MultiEdit / Write only;
+# NOT NotebookEdit — the deliberate narrower set vs `_FILE_TOUCH_TOOLS`,
+# Codex P2-4). Per-path summed +N/-M with a document-ordered `touches[]`;
+# nullable stats when neither the stamped `edit_stat` nor a recompute are
+# available (Codex P1-7 — the touch is STILL listed).
+# ---------------------------------------------------------------------------
+def _tool_call(name, inp, *, tid, edit_stat=None):
+    b = {"kind": "tool_use", "name": name, "input_summary": "{}",
+         "input": inp, "id": tid, "preview": ""}
+    if edit_stat is not None:
+        b["edit_stat"] = edit_stat
+    return b
+
+
+def test_outline_files_aggregates_by_path_summed():
+    # Two Edits to foo.py (computed from old/new) + one Write to bar.py.
+    c = _conn()
+    _msg(c, session_id="fa", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="edit")
+    _msg(c, session_id="fa", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "ok"},
+             # foo.py edit #1: old 1 line -> new 3 lines => add 3, del 1.
+             _tool_call("Edit", {"file_path": "/repo/foo.py",
+                                 "old_string": "a", "new_string": "x\ny\nz"}, tid="t1"),
+             # bar.py write: 2-line content => add 2, del 0.
+             _tool_call("Write", {"file_path": "/repo/bar.py",
+                                  "content": "one\ntwo\n"}, tid="t2")]))
+    _msg(c, session_id="fa", uuid="a2", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-12T14:00:02Z", entry_type="assistant",
+         text="more", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "more"},
+             # foo.py edit #2: old 2 lines -> new 1 line => add 1, del 2.
+             _tool_call("Edit", {"file_path": "/repo/foo.py",
+                                 "old_string": "p\nq", "new_string": "r"}, tid="t3")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    _entry(c, source_path="a.jsonl", line_offset=2, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "fa")
+    files = {f["path"]: f for f in out["files"]}
+    # foo.py: edit1 (add 3, del 1) + edit2 (add 1, del 2) => add 4, del 3.
+    assert files["/repo/foo.py"]["add"] == 4
+    assert files["/repo/foo.py"]["del"] == 3
+    assert len(files["/repo/foo.py"]["touches"]) == 2
+    # bar.py: Write => del 0.
+    assert files["/repo/bar.py"]["add"] == 2
+    assert files["/repo/bar.py"]["del"] == 0
+    assert len(files["/repo/bar.py"]["touches"]) == 1
+    # Document order: foo.py touched first (turn a1) -> appears before bar.py.
+    assert [f["path"] for f in out["files"]] == ["/repo/foo.py", "/repo/bar.py"]
+    # Per-touch shape carries the jump anchor + tool_use_id + op + signed stat.
+    t = files["/repo/foo.py"]["touches"][0]
+    assert t["uuid"] == "a1" and t["tool_use_id"] == "t1" and t["op"] == "edit"
+    assert t["add"] == 3 and t["del"] == 1
+
+
+def test_outline_files_multiedit_sums():
+    c = _conn()
+    _msg(c, session_id="me", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="multi")
+    _msg(c, session_id="me", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _tool_call("MultiEdit", {"file_path": "/repo/baz.py", "edits": [
+                 {"old_string": "a", "new_string": "x\ny"},   # add 2, del 1
+                 {"old_string": "b\nc", "new_string": "z"}]}, tid="t1")]))  # add 1, del 2
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "me")
+    f = {x["path"]: x for x in out["files"]}["/repo/baz.py"]
+    assert f["add"] == 3 and f["del"] == 3
+    assert f["touches"][0]["op"] == "multiedit"
+
+
+def test_outline_files_uses_stamped_edit_stat_when_truncated():
+    # A truncated edit input carries a stamped edit_stat (the recompute path
+    # can't run on the bounded copy); the aggregation must use it.
+    c = _conn()
+    _msg(c, session_id="tr", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="big edit")
+    _msg(c, session_id="tr", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             # input clipped so old/new can't be recounted; edit_stat is stamped.
+             {"kind": "tool_use", "name": "Edit", "input_summary": "{}",
+              "input": {"file_path": "/repo/huge.py", "old_string": "<clipped>"},
+              "input_truncated": True, "edit_stat": {"add": 99, "del": 12},
+              "id": "t1", "preview": ""}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "tr")
+    f = {x["path"]: x for x in out["files"]}["/repo/huge.py"]
+    assert f["add"] == 99 and f["del"] == 12
+    assert f["touches"][0]["add"] == 99 and f["touches"][0]["del"] == 12
+
+
+def test_outline_files_nullable_stat_when_unknown():
+    # An edit whose stat is neither stamped nor recomputable is STILL listed,
+    # with add/del = None (Codex P1-7). A MultiEdit whose `edits` is NOT a list
+    # (clipped to the bounding elision) makes `_edit_stat_for` return None.
+    c = _conn()
+    _msg(c, session_id="un", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="edit")
+    _msg(c, session_id="un", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             {"kind": "tool_use", "name": "MultiEdit", "input_summary": "{}",
+              "input": {"file_path": "/repo/unknown.py", "edits": "…"},
+              "input_truncated": True, "id": "t1", "preview": ""}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "un")
+    f = out["files"][0]
+    t = f["touches"][0]
+    assert t["add"] is None and t["del"] is None
+    assert t["uuid"] == "a1"                      # still listed
+    # Every touch unknown -> file totals are null too.
+    assert f["add"] is None and f["del"] is None
+
+
+def test_outline_files_mixed_known_and_unknown_sums_known():
+    # One known + one unknown touch on the same path: totals sum only the known.
+    c = _conn()
+    _msg(c, session_id="mx", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="edit")
+    _msg(c, session_id="mx", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _tool_call("Edit", {"file_path": "/repo/m.py",
+                                 "old_string": "a", "new_string": "x\ny"}, tid="t1"),
+             {"kind": "tool_use", "name": "MultiEdit", "input_summary": "{}",
+              "input": {"file_path": "/repo/m.py", "edits": "…"},
+              "input_truncated": True, "id": "t2", "preview": ""}]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "mx")
+    f = {x["path"]: x for x in out["files"]}["/repo/m.py"]
+    # Known touch: add 2, del 1; unknown touch contributes nothing.
+    assert f["add"] == 2 and f["del"] == 1
+    assert len(f["touches"]) == 2
+
+
+def test_outline_files_excludes_non_edit_tools():
+    # Read + Bash + NotebookEdit contribute nothing -> empty files list.
+    c = _conn()
+    _msg(c, session_id="nx", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="look")
+    _msg(c, session_id="nx", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _tool_call("Read", {"file_path": "/repo/r.py"}, tid="t1"),
+             _tool_call("Bash", {"command": "ls"}, tid="t2"),
+             # NotebookEdit is in _FILE_TOUCH_TOOLS but NOT the export set (P2-4).
+             _tool_call("NotebookEdit", {"file_path": "/repo/n.ipynb",
+                                         "new_source": "x"}, tid="t3")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "nx")
+    assert out["files"] == []
+
+
+def test_outline_files_present_key_always():
+    # The `files` key is always present (possibly []), so the client reads it
+    # uniformly.
+    c = _conn()
+    _seed_rich(c)
+    out = cq.get_conversation_outline(c, "s5")
+    assert "files" in out and out["files"] == []

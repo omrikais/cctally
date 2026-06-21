@@ -653,3 +653,49 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     expect(gDepth).toBe(cDepth + 1);
   });
 });
+
+// #217 S5 F2 — the [Outline] [Files] tab toggle inside the outline panel.
+describe('OutlinePanel — Files tab (#217 S5 F2)', () => {
+  const filesOutline = () =>
+    outline({
+      files: [
+        {
+          path: 'bin/resolve.py',
+          add: 412,
+          del: 87,
+          touches: [{ uuid: 'a1', tool_use_id: 't1', op: 'edit', add: 412, del: 87 }],
+        },
+      ],
+    });
+
+  it('starts on the Outline tab; the list is shown, not the files panel', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={filesOutline()} />);
+    expect(getState().convOutlineTab).toBe('outline');
+    expect(container.querySelector('.conv-outline-list')).toBeTruthy();
+    expect(container.querySelector('.conv-outline-files')).toBeNull();
+  });
+
+  it('shows the files count badge on the Files tab', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={filesOutline()} />);
+    const filesTab = screen.getByRole('tab', { name: /files/i });
+    expect(filesTab.querySelector('.conv-outline-tab-count')?.textContent).toBe('1');
+    expect(container).toBeTruthy();
+  });
+
+  it('switches to the Files tab and renders the file rows', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={filesOutline()} />);
+    fireEvent.click(screen.getByRole('tab', { name: /files/i }));
+    expect(getState().convOutlineTab).toBe('files');
+    expect(container.querySelector('.conv-outline-files')).toBeTruthy();
+    expect(container.querySelector('.conv-outline-list')).toBeNull();
+    expect(screen.getByText('resolve.py')).toBeInTheDocument();
+  });
+
+  it('a touch-row click jumps to the touch anchor via OPEN_CONVERSATION', () => {
+    render(<OutlinePanel sessionId="s1" outline={filesOutline()} />);
+    fireEvent.click(screen.getByRole('tab', { name: /files/i }));
+    fireEvent.click(screen.getByRole('button', { name: /resolve\.py/i }));
+    fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
+  });
+});

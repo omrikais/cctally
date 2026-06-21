@@ -8,6 +8,7 @@ import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } fro
 import { isSystemMarker } from './systemMarkers';
 import { FindBar } from './FindBar';
 import { ExportMenu } from './ExportMenu';
+import { FocusMoreMenu, type FocusSubagentOption } from './FocusMoreMenu';
 import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
@@ -507,6 +508,23 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     () => groupSidechains(detail?.items ?? [], detail?.subagent_meta),
     [detail?.items, detail?.subagent_meta],
   );
+  // #217 S5 E4 — the TOP-LEVEL subagent keys present in the loaded groups, with
+  // labels from subagent_meta (kind, then the spawning description) and a key
+  // fallback when meta is empty (buckets exist even without meta — Codex P1-4).
+  // Feeds the focus "▾ More" menu's Subagent submenu. Top-level only, since
+  // `subagent:<key>` filters at the top-level node (Codex P1-3).
+  const subagentOptions = useMemo<FocusSubagentOption[]>(() => {
+    const meta = detail?.subagent_meta ?? {};
+    const out: FocusSubagentOption[] = [];
+    const seen = new Set<string>();
+    for (const g of groups) {
+      if (g.kind !== 'subagent' || seen.has(g.subagentKey)) continue;
+      seen.add(g.subagentKey);
+      const m = meta[g.subagentKey];
+      out.push({ key: g.subagentKey, label: (m?.kind || m?.description || '').trim() });
+    }
+    return out;
+  }, [groups, detail?.subagent_meta]);
   // §5 (Codex P1-C) — the spawn-chip suppression set: every spawn `tool_use_id`
   // the kernel linked to a subagent. A `tool_call` with this id is suppressed in
   // favor of its nested card. tool_use_id granularity (one item can hold several
@@ -1526,7 +1544,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               Errors carries a count badge from the outline stats when > 0. */}
           <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
             {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
-              const labels: Record<FocusMode, string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
+              // #217 S5 E4 — only the four PRIMARY modes live in the segmented
+              // control (edits/bash/subagent ride the FocusMoreMenu), so the
+              // label map is keyed to that narrowed union, not the full FocusMode.
+              const labels: Record<'all' | 'chat' | 'prompts' | 'errors', string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
               // #217 S3 E10#2 — the badge is the error-TURN count (== the jump
               // cluster chip == what clicking the Errors filter navigates to),
               // NOT stats.error_count (the server's total error-EVENT count, which
@@ -1550,6 +1571,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               );
             })}
           </div>
+          {/* #217 S5 E4 — the focus "▾ More" menu: Edits / Bash / per-Subagent.
+              Single-select on the same axis (a More-mode shows the four primary
+              segmented buttons unselected + the ▾ trigger labelled active). */}
+          <FocusMoreMenu
+            focusMode={focusMode}
+            subagents={subagentOptions}
+            onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
+          />
           {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
               its own Esc/outside-click close; fetches the new /export route. */}
           <ExportMenu sessionId={sessionId} title={detail.title} />

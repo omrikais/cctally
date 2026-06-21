@@ -144,6 +144,25 @@ export interface OutlineStats {
   // cache reads). Display-only — never a reconciled figure.
   cache_saved_usd: number;
 }
+// #217 S5 F2 — one Edit/MultiEdit/Write call against a file (a "touch"). `add`/
+// `del` are integers when the stat is known (stamped edit_stat or recomputed),
+// else null — the touch is STILL listed (Codex P1-7). `tool_use_id` is carried
+// for a future precise-diff scroll; `uuid` is the turn anchor (the jump target).
+export interface OutlineFileTouch {
+  uuid: string;
+  tool_use_id: string | null;
+  op: 'edit' | 'multiedit' | 'write';
+  add: number | null;
+  del: number | null;
+}
+// #217 S5 F2 — one modified file: per-path summed +N/-M over its touches
+// (null when every touch's stat is unknown), in first-touch document order.
+export interface OutlineFile {
+  path: string;
+  add: number | null;
+  del: number | null;
+  touches: OutlineFileTouch[];
+}
 export interface ConversationOutline {
   session_id: string;
   subagent_meta?: Record<string, SubagentMeta>;
@@ -154,6 +173,9 @@ export interface ConversationOutline {
   // back-compat with a payload from an older server.
   subagent_costs?: Record<string, number>;
   stats: OutlineStats;
+  // #217 S5 F2 — whole-session files-touched aggregation. Always present from a
+  // current server (possibly []); optional for back-compat with an older one.
+  files?: OutlineFile[];
   turns: OutlineTurn[];
 }
 

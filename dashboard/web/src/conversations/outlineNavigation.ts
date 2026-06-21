@@ -22,8 +22,23 @@ import type { OutlineTurn } from '../types/conversation';
 //               turns are suppressed.
 // A sidechain turn matches nodeVisible's subagent/tool_result_run rule: visible
 // only in `errors` AND only when it carries an error.
+// #217 S5 E4 — the three "▾ More" modes mirror nodeVisible over the
+// OutlineTurn skeleton (Codex P1-5 twin): `edits`/`bash` match turn.tools by
+// (lower-cased) name; `subagent:<key>` matches turn.subagent_key. Kept lower-
+// cased here to match applyFocusMode's EDIT_TOOLS/BASH_TOOLS sets.
+const TWIN_EDIT_TOOLS = new Set(['edit', 'multiedit', 'write']);
+
 export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean {
   if (mode === 'all') return true;
+  // subagent:<key> — a turn is visible iff it carries the matching key (covers
+  // both sidechain subagent turns and a main-thread turn stamped with the key).
+  if (mode.startsWith('subagent:')) {
+    return turn.subagent_key === mode.slice('subagent:'.length);
+  }
+  const turnHasTool = (names: Set<string>) =>
+    (turn.tools ?? []).some((x) => !!x.name && names.has(x.name.toLowerCase()));
+  if (mode === 'edits') return turnHasTool(TWIN_EDIT_TOOLS);
+  if (mode === 'bash') return turnHasTool(new Set(['bash']));
   const hasError = (turn.tools ?? []).some((x) => x.is_error);
   // Sidechain turns ride inside subagent / tool_result_run nodes: visible only
   // in errors-mode, and only when the turn itself carries an error.

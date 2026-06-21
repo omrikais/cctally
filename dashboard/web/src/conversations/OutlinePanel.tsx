@@ -9,6 +9,7 @@ import {
   type JumpKind,
 } from './outlineNavigation';
 import type { FocusMode } from './applyFocusMode';
+import { FilesTab } from './FilesTab';
 import { fmt } from '../lib/fmt';
 import {
   ChatIcon,
@@ -313,6 +314,8 @@ export function OutlinePanel({
   // today's scroll-sync behavior.
   const pinned = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
+  // #217 S5 F2 — the [Outline] [Files] tab selection (transient per-session).
+  const outlineTab = useSyncExternalStore(subscribeStore, () => getState().convOutlineTab);
   // cache-failure-markers spec §4 — the opt-out, threaded into deriveOutline
   // (skips cache curation entirely when off) and into the stats row + jump chip.
   const markersEnabled = useSyncExternalStore(subscribeStore, () =>
@@ -410,6 +413,36 @@ export function OutlinePanel({
               markersEnabled={markersEnabled}
             />
           </div>
+          {/* #217 S5 F2 — [Outline] [Files] tab toggle. The Files count rides on
+              the tab so an empty-files session still shows a "0" affordance. */}
+          <div className="conv-outline-tabs" role="tablist" aria-label="Outline view">
+            <button
+              type="button"
+              role="tab"
+              className="conv-outline-tab"
+              aria-selected={outlineTab === 'outline'}
+              onClick={() => dispatch({ type: 'SET_CONV_OUTLINE_TAB', tab: 'outline' })}
+            >
+              Outline
+            </button>
+            <button
+              type="button"
+              role="tab"
+              className="conv-outline-tab"
+              aria-selected={outlineTab === 'files'}
+              onClick={() => dispatch({ type: 'SET_CONV_OUTLINE_TAB', tab: 'files' })}
+            >
+              Files
+              <span className="conv-outline-tab-count" aria-hidden="true">
+                {(outline.files ?? []).length}
+              </span>
+            </button>
+          </div>
+          {outlineTab === 'files' ? (
+            <div className="conv-outline-files" role="tabpanel">
+              <FilesTab files={outline.files ?? []} onJump={jumpTo} />
+            </div>
+          ) : (
           <ol className="conv-outline-list" ref={listRef}>
             {entries.map((e) => {
               // #188 S2 — the explicit pin wins: when set, aria-current is the
@@ -496,6 +529,7 @@ export function OutlinePanel({
               );
             })}
           </ol>
+          )}
         </>
       )}
     </nav>

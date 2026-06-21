@@ -216,6 +216,38 @@ describe('outlineTurnVisible', () => {
       expect(outlineTurnVisible(okSide, 'chat')).toBe(false);
     });
   });
+
+  // #217 S5 E4 — the twin must mirror nodeVisible for the three More modes, else
+  // an outline/files jump lands behind the active filter (Codex P1-5).
+  describe('edits mode (twin)', () => {
+    it('shows turns carrying an Edit/MultiEdit/Write tool', () => {
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Edit', is_error: false }] }), 'edits')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'MultiEdit', is_error: false }] }), 'edits')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Write', is_error: false }] }), 'edits')).toBe(true);
+    });
+    it('hides Bash / Read / prose-only turns', () => {
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Bash', is_error: false }] }), 'edits')).toBe(false);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Read', is_error: false }] }), 'edits')).toBe(false);
+      expect(outlineTurnVisible(turn({ kind: 'human', label: 'hi' }), 'edits')).toBe(false);
+    });
+  });
+
+  describe('bash mode (twin)', () => {
+    it('shows Bash turns and hides edit turns', () => {
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Bash', is_error: false }] }), 'bash')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'Edit', is_error: false }] }), 'bash')).toBe(false);
+      expect(outlineTurnVisible(turn({ kind: 'human', label: 'hi' }), 'bash')).toBe(false);
+    });
+  });
+
+  describe('subagent:<key> mode (twin)', () => {
+    it('shows only turns whose subagent_key matches', () => {
+      expect(outlineTurnVisible(turn({ subagent_key: 'k1', is_sidechain: true }), 'subagent:k1')).toBe(true);
+      expect(outlineTurnVisible(turn({ subagent_key: 'k2', is_sidechain: true }), 'subagent:k1')).toBe(false);
+      // a main-thread turn (subagent_key null) never matches a subagent filter.
+      expect(outlineTurnVisible(turn({ subagent_key: null }), 'subagent:k1')).toBe(false);
+    });
+  });
 });
 
 describe('nextTarget — forward (dir=1)', () => {

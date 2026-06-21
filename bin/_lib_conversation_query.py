@@ -287,6 +287,64 @@ def _subagent_key(source_path):
 from _lib_conversation import (
     _NESTED_AGENT_ID_RE, _NESTED_USAGE_RE, _nested_agent_stamp_from_text,
 )
+# #217 S5 F2 — the true per-edit +N/-M stat, recomputed at outline-build time for
+# non-truncated edits (the stamped `block["edit_stat"]` only exists on truncated
+# inputs, where the bounded copy can't be recounted; Codex P1-7).
+from _lib_conversation import _edit_stat_for
+
+# #217 S5 F2 — the files-touched aggregation is DELIBERATELY scoped to the three
+# named edit tools, NOT `_lib_conversation._FILE_TOUCH_TOOLS` (which also includes
+# NotebookEdit — rare; out of scope, Codex P2-4). Lower-cased for case-insensitive
+# block-name matching.
+_EXPORT_EDIT_TOOLS = {"edit", "multiedit", "write"}
+
+
+def _collect_files(items):
+    """Whole-session files-touched aggregation (#217 S5 F2, spec §2).
+
+    For every Edit / MultiEdit / Write ``tool_call`` block (NOT NotebookEdit —
+    the narrower set is deliberate, Codex P2-4) carrying a string ``file_path``,
+    emit one ``touch`` per call and a per-path running ``+N/-M`` sum, preserving
+    first-touch document order. The signed stat is the stamped ``edit_stat`` when
+    present (truncated inputs), else a recompute via ``_edit_stat_for``; when
+    NEITHER is available the touch is STILL listed with ``add``/``del`` = ``None``
+    and the file total sums only the known values (``None`` only when every touch
+    is unknown — Codex P1-7). Pure over the assembled ``items``.
+    """
+    order, agg = [], {}
+    for it in items:
+        anchor_uuid = it["anchor"]["uuid"]
+        for b in it.get("blocks", []):
+            if b.get("kind") not in ("tool_call", "tool_use"):
+                continue
+            nm = (b.get("name") or "").lower()
+            if nm not in _EXPORT_EDIT_TOOLS:
+                continue
+            inp = b.get("input")
+            path = inp.get("file_path") if isinstance(inp, dict) else None
+            if not isinstance(path, str) or not path:
+                continue
+            st = b.get("edit_stat")
+            if st is None:
+                st = _edit_stat_for(b.get("name"), inp)
+            add = st.get("add") if isinstance(st, dict) else None
+            dele = st.get("del") if isinstance(st, dict) else None
+            if path not in agg:
+                agg[path] = {"path": path, "add": None, "del": None, "touches": []}
+                order.append(path)
+            entry = agg[path]
+            entry["touches"].append({
+                "uuid": anchor_uuid,
+                "tool_use_id": b.get("tool_use_id") or b.get("id"),
+                "op": nm,
+                "add": add,
+                "del": dele,
+            })
+            if add is not None:
+                entry["add"] = (entry["add"] or 0) + add
+            if dele is not None:
+                entry["del"] = (entry["del"] or 0) + dele
+    return [agg[p] for p in order]
 
 
 def _parse_nested_agent_result(text):
@@ -1869,6 +1927,9 @@ def get_conversation_outline(conn, session_id):
             # matching the per-item / header cost display precision.
             "subagent_costs": {k: round(v, 6) for k, v in subagent_costs.items()},
             "stats": stats,
+            # #217 S5 F2 — whole-session files-touched aggregation (always
+            # present, possibly []; additive — existing consumers are byte-stable).
+            "files": _collect_files(items),
             "turns": turns}
 
 

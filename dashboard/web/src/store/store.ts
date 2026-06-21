@@ -1,5 +1,6 @@
 import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
 import type { ConversationFilters, ConversationJump, RailSortKey, SearchKind } from '../types/conversation';
+import type { FocusMode } from '../conversations/applyFocusMode';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { recordReadingPos } from './readingPosition';
 import { loadRailPrefs, saveRailPrefs } from './conversationRailPrefs';
@@ -306,7 +307,13 @@ export interface UIState {
   // today's track ceiling so an un-resized panel is byte-identical). Drives the
   // 3rd grid track of `.conv-view--outline` via a CSS custom property.
   convOutlineWidth: number;
-  convFocusMode: 'all' | 'chat' | 'prompts' | 'errors';
+  // #217 S5 E4 — the focus axis now spans the four primary modes PLUS the "▾
+  // More" modes (`edits`/`bash`/`subagent:<key>`); the slice stays one string
+  // (single-select). Transient per-session — reset to 'all' on a genuine switch.
+  convFocusMode: FocusMode;
+  // #217 S5 F2 — the outline panel's [Outline] [Files] tab selection. Transient
+  // per-session — reset to 'outline' on a genuine switch (mirrors convFocusMode).
+  convOutlineTab: 'outline' | 'files';
   convCurrentTurnUuid: string | null;
   // #188 S2 — the EXPLICIT-selection pin (always a real uuid; the bucket-root
   // uuid for a subagent). Set by the jump effect when a jump lands; cleared by
@@ -575,6 +582,7 @@ function loadInitial(): UIState {
     // #217 S3 E6(b) — seed the persisted outline width (clamped; default 290).
     convOutlineWidth: loadOutlineWidth(),
     convFocusMode: 'all',
+    convOutlineTab: 'outline',
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
     convFindOpen: false,
@@ -746,6 +754,8 @@ export type Action =
   | { type: 'TOGGLE_CONV_OUTLINE_MOBILE' }
   | { type: 'CLOSE_CONV_OUTLINE_MOBILE' }
   | { type: 'SET_CONV_FOCUS_MODE'; mode: UIState['convFocusMode'] }
+  // #217 S5 F2 — select the outline panel's [Outline] [Files] tab (transient).
+  | { type: 'SET_CONV_OUTLINE_TAB'; tab: UIState['convOutlineTab'] }
   | { type: 'SET_CONV_CURRENT_TURN'; uuid: string | null }
   // #188 S2 — the explicit-selection pin. SET_CONV_PINNED_TURN is dispatched by
   // the reader's jump effect when a jump lands; CLEAR_CONV_PIN by explicit user
@@ -956,7 +966,7 @@ export function dispatch(action: Action): void {
         // sheet so the new conversation's transcript is never auto-buried; a
         // same-session OPEN_CONVERSATION (in-session jump) leaves it open.
         ...(switched
-          ? { convFocusMode: 'all' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false }
+          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false }
           : {}),
       };
       break;
@@ -976,8 +986,9 @@ export function dispatch(action: Action): void {
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
-        // is NOT touched).
+        // is NOT touched). #217 S5 — convOutlineTab resets alongside.
         convFocusMode: 'all',
+        convOutlineTab: 'outline',
         convCurrentTurnUuid: null,
         // #188 S2 — drop the explicit pin on a select too.
         convPinnedUuid: null,
@@ -1039,6 +1050,9 @@ export function dispatch(action: Action): void {
       break;
     case 'SET_CONV_FOCUS_MODE':
       state = { ...state, convFocusMode: action.mode };
+      break;
+    case 'SET_CONV_OUTLINE_TAB':
+      state = { ...state, convOutlineTab: action.tab };
       break;
     case 'OPEN_CONV_FIND':
       state = { ...state, convFindOpen: true };

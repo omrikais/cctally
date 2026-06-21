@@ -245,3 +245,94 @@ describe('nodeUuid', () => {
     expect(nodeUuid({ kind: 'hidden_run', count: 3, firstUuid: 'x' })).toBe('x');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #217 S5 E4 — the "▾ More" focus modes: edits / bash / subagent:<key>.
+// Single-select on the same axis as the four primary modes. `edits` = a turn
+// (or a subagent descendant) carrying an Edit/MultiEdit/Write tool_call; `bash`
+// = same for Bash; `subagent:<key>` = TOP-LEVEL nodes with that subagent_key
+// (Codex P1-3 — no nested-grandchild isolation).
+// ---------------------------------------------------------------------------
+const editBlock = (name = 'Edit'): ConversationBlock => ({
+  kind: 'tool_call',
+  name,
+  input_summary: '{}',
+  preview: 'x',
+  tool_use_id: 't',
+  result: { text: 'ok', truncated: false, is_error: false },
+});
+const bashBlock = (): ConversationBlock => ({
+  kind: 'tool_call',
+  name: 'Bash',
+  input_summary: '{}',
+  preview: 'ls',
+  tool_use_id: 't',
+  result: { text: 'ok', truncated: false, is_error: false },
+});
+
+const editAssistant = itemNode(
+  item({ uuid: 'ed', kind: 'assistant', text: 'edit', blocks: [editBlock()] } as never),
+);
+const multiEditAssistant = itemNode(
+  item({ uuid: 'me', kind: 'assistant', text: 'me', blocks: [editBlock('MultiEdit')] } as never),
+);
+const writeAssistant = itemNode(
+  item({ uuid: 'wr', kind: 'assistant', text: 'wr', blocks: [editBlock('Write')] } as never),
+);
+const bashAssistant = itemNode(
+  item({ uuid: 'ba', kind: 'assistant', text: 'bash', blocks: [bashBlock()] } as never),
+);
+const readAssistant = itemNode(
+  item({ uuid: 'rd', kind: 'assistant', text: 'read', blocks: [okToolBlock()] } as never),
+);
+
+const subagentWithEdit: RenderNode = {
+  kind: 'subagent',
+  subagentKey: 'se',
+  nested: false,
+  depth: 0,
+  spawnAnchorUuid: null,
+  children: [],
+  items: [item({ uuid: 'sue', is_sidechain: true, subagent_key: 'se', blocks: [editBlock()] } as never)],
+};
+
+describe('applyFocusMode — edits mode', () => {
+  it('keeps Edit / MultiEdit / Write turns; suppresses Bash / Read / prose', () => {
+    const nodes = [human, proseAssistant, editAssistant, multiEditAssistant, writeAssistant, bashAssistant, readAssistant];
+    expect(kept(nodes, 'edits')).toEqual(['ed', 'me', 'wr']);
+  });
+
+  it('keeps a subagent whose descendant has an edit tool', () => {
+    expect(kept([subagentWithEdit, subagentOk], 'edits')).toEqual(['sue']);
+  });
+
+  it('suppresses orphan tool_result / tool_result_run nodes', () => {
+    expect(kept([orphan, trrOk], 'edits')).toEqual([]);
+  });
+});
+
+describe('applyFocusMode — bash mode', () => {
+  it('keeps Bash turns only', () => {
+    const nodes = [human, bashAssistant, editAssistant, readAssistant];
+    expect(kept(nodes, 'bash')).toEqual(['ba']);
+  });
+});
+
+describe('applyFocusMode — subagent:<key> mode', () => {
+  it('keeps only top-level nodes with the matching subagent_key', () => {
+    // subagentOk has key 'k1', subagentErr has 'k2'.
+    expect(kept([human, subagentOk, subagentErr], 'subagent:k1')).toEqual(['sa1']);
+    expect(kept([human, subagentOk, subagentErr], 'subagent:k2')).toEqual(['se1']);
+  });
+
+  it('keeps a main-thread item that carries the matching subagent_key', () => {
+    const subItem = itemNode(
+      item({ uuid: 'si', kind: 'assistant', subagent_key: 'kx', text: 'x', blocks: [{ kind: 'text', text: 'x' }] } as never),
+    );
+    expect(kept([human, subItem], 'subagent:kx')).toEqual(['si']);
+  });
+
+  it('hides a subagent whose key does not match (no nested-grandchild isolation)', () => {
+    expect(kept([subagentOk], 'subagent:nope')).toEqual([]);
+  });
+});
