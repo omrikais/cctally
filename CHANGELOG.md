@@ -7,6 +7,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - **Dashboard conversation search — the Files facet now matches a file-path substring instead of a path prefix.** Searching the Files facet for a bare basename (`package.json`) or a mid-path fragment (`cctally`) now returns the sessions that touched a matching path, instead of requiring a leading path prefix; the match is a case-insensitive substring over the (modest) touched-file table. (#223)
+- **Dashboard conversation find bar — regex matches are now underlined in the transcript.** In regex find mode the in-prose highlight is no longer suppressed: matches get a best-effort inline underline (per rendered text segment, case-toggle-aware), alongside the existing match count and jump-to-match. Invalid or pathological patterns degrade to no underline (the match count still drives navigation). (#223)
 
 ## [1.53.0] - 2026-06-21
 

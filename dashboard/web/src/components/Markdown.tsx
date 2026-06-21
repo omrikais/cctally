@@ -7,6 +7,12 @@ import type { Element, Root, RootContent, Text } from 'hast';
 import { CodeBlock, isRegistered } from '../conversations/CodeBlock';
 import { HighlightContext } from '../conversations/HighlightContext';
 
+// #223 — mirror the server find-scan caps in bin/_lib_conversation_query.py
+// (_FIND_REGEX_MAX_LEN / _FIND_SCAN_TEXT_CAP). Best-effort ReDoS/perf guards for
+// the per-text-node regex walk; TS can't import the Python constants.
+const FIND_REGEX_MAX_LEN = 1000;
+const FIND_SCAN_TEXT_CAP = 200_000;
+
 // Prose-first markdown for conversation messages. remark-gfm for
 // tables/strikethrough/task-lists; NO rehype-raw, so raw HTML stays
 // escaped (spec §4 security posture). Links open in a new tab with a
@@ -80,12 +86,35 @@ function splitByTerms(value: string, terms: string[], caseSensitive: boolean): {
   return any ? out : null;
 }
 
-// #177 S6 — inline rehype plugin (no new dependency). Walks the hast tree
-// wrapping case-insensitive term matches in <mark>, skipping `code`/`pre`
-// subtrees (Q5 boundary: no marks in code blocks / inline code / refractor
-// token streams). The plugin is only added to the pipeline when terms are
-// non-empty (HighlightContext provides them), so the common path pays nothing.
-function rehypeMarkTerms(terms: string[], caseSensitive: boolean) {
+// #223 — regex variant of splitByTerms. Applies a GLOBAL regex per text node,
+// yielding alternating literal/hit segments. Zero-width matches (e.g. `x*`,
+// lookaheads) advance lastIndex by one and emit no mark, so the loop terminates
+// and no empty <mark> is produced. A node longer than FIND_SCAN_TEXT_CAP is
+// left untouched (returns null). Returns null when no non-empty match.
+function splitByRegex(value: string, re: RegExp): { s: string; hit: boolean }[] | null {
+  if (value.length > FIND_SCAN_TEXT_CAP) return null;
+  re.lastIndex = 0;
+  const out: { s: string; hit: boolean }[] = [];
+  let last = 0;
+  let any = false;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(value)) !== null) {
+    if (m[0].length === 0) { re.lastIndex += 1; continue; }
+    if (m.index > last) out.push({ s: value.slice(last, m.index), hit: false });
+    out.push({ s: m[0], hit: true });
+    last = m.index + m[0].length;
+    any = true;
+  }
+  if (!any) return null;
+  if (last < value.length) out.push({ s: value.slice(last), hit: false });
+  return out;
+}
+
+// #177 S6 / #223 — shared rehype tree-walk. Wraps a per-text-node split fn's
+// `hit` segments in <mark>, skipping `code`/`pre` subtrees (no marks in code
+// blocks / inline code). Added to the pipeline only when there is something to
+// match, so the common path pays nothing.
+function makeMarkPlugin(split: (value: string) => { s: string; hit: boolean }[] | null) {
   const SKIP = new Set(['code', 'pre']);
   const walkChildren = (children: RootContent[], inSkip: boolean): RootContent[] => {
     const next: RootContent[] = [];
@@ -95,7 +124,7 @@ function rehypeMarkTerms(terms: string[], caseSensitive: boolean) {
         child.children = walkChildren(child.children, childSkip) as Element['children'];
         next.push(child);
       } else if (child.type === 'text' && !inSkip && child.value) {
-        const parts = splitByTerms(child.value, terms, caseSensitive);
+        const parts = split(child.value);
         if (parts) {
           for (const p of parts) {
             if (p.hit) {
@@ -121,21 +150,40 @@ function rehypeMarkTerms(terms: string[], caseSensitive: boolean) {
   };
 }
 
+function rehypeMarkTerms(terms: string[], caseSensitive: boolean) {
+  return makeMarkPlugin((value) => splitByTerms(value, terms, caseSensitive));
+}
+
+// #223 — best-effort regex highlight. An over-cap source or an invalid pattern
+// becomes a no-op transformer (no marks, no throw) — the server already 400s an
+// invalid regex and the find bar shows the alert.
+function rehypeMarkRegex(source: string, caseSensitive: boolean) {
+  if (source.length > FIND_REGEX_MAX_LEN) return (_tree: Root) => {};
+  let re: RegExp;
+  try {
+    re = new RegExp(source, caseSensitive ? 'g' : 'gi');
+  } catch {
+    return (_tree: Root) => {};
+  }
+  return makeMarkPlugin((value) => splitByRegex(value, re));
+}
+
 export function Markdown({ children }: { children: string }) {
   const highlight = useContext(HighlightContext);
-  // Memoize the rehype-plugin array on the JOINED terms + the case flag so the
-  // renderer (and every memoized message item below it) only re-runs the walk
-  // when the debounced needle or the case toggle actually changes. Null / empty
-  // terms → no plugin (the zero-overhead passthrough).
-  const terms = highlight?.terms ?? [];
+  // Primitive memo keys so the walk (and every memoized message item) re-runs
+  // only when the matcher actually changes.
+  const kind = highlight?.kind ?? null;
   const caseSensitive = highlight?.caseSensitive ?? false;
-  const termsKey = terms.length ? terms.join(' ') : '';
-  const rehypePlugins = useMemo(
-    () => (termsKey
-      ? [[rehypeMarkTerms, termsKey.split(' '), caseSensitive] as [typeof rehypeMarkTerms, string[], boolean]]
-      : []),
-    [termsKey, caseSensitive],
-  );
+  const key = highlight
+    ? (highlight.kind === 'terms' ? highlight.terms.join(' ') : highlight.source)
+    : '';
+  const rehypePlugins = useMemo(() => {
+    if (!key) return [];
+    if (kind === 'terms') {
+      return [[rehypeMarkTerms, key.split(' '), caseSensitive] as [typeof rehypeMarkTerms, string[], boolean]];
+    }
+    return [[rehypeMarkRegex, key, caseSensitive] as [typeof rehypeMarkRegex, string, boolean]];
+  }, [kind, key, caseSensitive]);
   return (
     <div className="md">
       <ReactMarkdown

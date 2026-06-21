@@ -1343,14 +1343,18 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpToLastRef = useRef(jumpToLast);
   jumpToLastRef.current = jumpToLast;
 
-  // #177 S6 / #217 S4 — the find bar reports its DEBOUNCED needle + the case
-  // flag here; split into highlight terms (whitespace-split, empties dropped)
-  // for the prose marks. The bar passes '' in regex mode so marks are
-  // suppressed there (decision b). Stable identity so FindBar's onTermsChange
-  // effect doesn't re-fire per render.
-  const onFindTermsChange = useCallback((terms: string, caseSensitive: boolean) => {
-    const split = terms.split(/\s+/).filter(Boolean);
-    setFindTerms(split.length ? { terms: split, caseSensitive } : null);
+  // #177 S6 / #217 S4 / #223 — the find bar reports its DEBOUNCED needle + the
+  // case + regex flags here; build the highlight context value. Terms mode
+  // whitespace-splits; regex mode passes the source for best-effort inline
+  // highlighting (supersedes S4 decision b). Stable identity so FindBar's
+  // onTermsChange effect doesn't re-fire per render.
+  const onFindTermsChange = useCallback((needle: string, caseSensitive: boolean, regex: boolean) => {
+    if (regex) {
+      setFindTerms(needle ? { kind: 'regex', source: needle, caseSensitive } : null);
+      return;
+    }
+    const split = needle.split(/\s+/).filter(Boolean);
+    setFindTerms(split.length ? { kind: 'terms', terms: split, caseSensitive } : null);
   }, []);
 
   // #177 S6 — close-restore: return keyboard focus to the thread so j/k resume.

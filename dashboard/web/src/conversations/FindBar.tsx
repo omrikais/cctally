@@ -9,8 +9,10 @@ import { loadFindRegex, saveFindRegex, loadFindCase, saveFindCase } from '../sto
 // useConversationFind, and walks the returned rendered-turn anchors via
 // OPEN_CONVERSATION jumps (same-session, so the reader pages-to + scrolls + the
 // store leaves find open). `onTermsChange` reports the DEBOUNCED needle + the
-// case flag up so the reader can feed prose <mark> highlighting (case-aware;
-// suppressed in regex mode). `onClose` is the reader's focus-restore callback.
+// case + regex flags up so the reader can feed prose <mark> highlighting
+// (case-aware; #223 — regex mode now reports its source for best-effort inline
+// highlighting too, superseding S4 decision b). `onClose` is the reader's
+// focus-restore callback.
 //
 // #217 S4 / I-1 power features: `.*` regex + `Aa` case toggles (persisted via
 // findPrefs), a focus trap (Tab/Shift+Tab cycle within the bar; Esc closes), an
@@ -28,9 +30,10 @@ export function FindBar({
 }: {
   sessionId: string;
   onClose: () => void;
-  // (terms, caseSensitive) — terms is '' in regex mode (decision b: no inline
-  // underline in regex mode; the match count + jump still work fully).
-  onTermsChange: (terms: string, caseSensitive: boolean) => void;
+  // (needle, caseSensitive, regex) — the reader builds the HighlightTerms value.
+  // #223 supersedes S4 decision b: regex mode now reports its source for
+  // best-effort inline highlighting (was forced to '' to suppress marks).
+  onTermsChange: (needle: string, caseSensitive: boolean, regex: boolean) => void;
   // The reader holds this so its n/N bindings (active while the bar is open +
   // the input is blurred) can step the same cursor. Assigned to the live `step`
   // closure each render; null when no bar is mounted.
@@ -52,13 +55,13 @@ export function FindBar({
   // Auto-focus on mount (the bar mounts on open).
   useEffect(() => { inputRef.current?.focus(); }, []);
 
-  // Report the debounced needle + case flag up for the prose-mark context
-  // (mirrors the hook's own 200ms debounce so marks land in lockstep). In regex
-  // mode report '' so no inline underline renders (decision b) — the accurate
-  // regex-aware highlight is a flagged follow-up.
+  // Report the debounced needle + case + regex flags up for the prose-mark
+  // context (mirrors the hook's own 200ms debounce so marks land in lockstep).
+  // #223 supersedes S4 decision b: regex mode now reports its source so the
+  // reader can drive best-effort inline highlighting (was forced to '').
   const debouncedNeedle = useDebouncedValue(needle.trim(), 200, '');
   useEffect(() => {
-    onTermsChange(regex ? '' : debouncedNeedle, caseSensitive);
+    onTermsChange(debouncedNeedle, caseSensitive, regex);
   }, [debouncedNeedle, regex, caseSensitive, onTermsChange]);
 
   // #217 S4 / I-1.6 — preserve the selected match BY UUID across a refresh

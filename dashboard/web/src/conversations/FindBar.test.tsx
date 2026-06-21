@@ -178,7 +178,7 @@ describe('FindBar', () => {
     render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={onTermsChange} />);
     const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
     await typeNeedle(input, 'cache.db');
-    expect(onTermsChange).toHaveBeenLastCalledWith('cache.db', false);
+    expect(onTermsChange).toHaveBeenLastCalledWith('cache.db', false, false);
   });
 
   // --- #217 S4 / I-1.4 — regex + case toggles, persistence, a11y ---
@@ -234,17 +234,23 @@ describe('FindBar', () => {
     const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
     act(() => { fireEvent.click(screen.getByRole('button', { name: /case-sensitive/i })); });
     await typeNeedle(input, 'Foo');
-    expect(onTermsChange).toHaveBeenLastCalledWith('Foo', true);
+    expect(onTermsChange).toHaveBeenLastCalledWith('Foo', true, false);
   });
 
-  it('suppresses prose marks in regex mode (reports empty terms — decision b)', async () => {
+  it('reports the regex source up (not "") when regex mode is on (#223)', async () => {
+    // #223 supersedes S4 decision b — regex mode no longer reports '' to suppress
+    // inline marks; it reports the source so the reader drives best-effort
+    // highlighting. The LAST call is (needle, caseSensitive, true), needle !== ''.
     mockFind({ anchors: [{ uuid: 'u1', match_kinds: [] }], total: 1, mode: 'regex' });
     const onTermsChange = vi.fn();
     render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={onTermsChange} />);
     const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
     act(() => { fireEvent.click(screen.getByRole('button', { name: /regular expression/i })); });
     await typeNeedle(input, 'f.o');
-    expect(onTermsChange).toHaveBeenLastCalledWith('', false);
+    const last = onTermsChange.mock.calls.at(-1);
+    expect(last?.[0]).toBe('f.o');
+    expect(last?.[0]).not.toBe('');
+    expect(last?.[2]).toBe(true);
   });
 
   it('renders the invalid-regex hint with role="alert"', async () => {

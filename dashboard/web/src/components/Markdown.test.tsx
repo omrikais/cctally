@@ -48,7 +48,15 @@ describe('Markdown', () => {
 
   function renderWithTerms(terms: string[] | null, md: string, caseSensitive = false) {
     return render(
-      <HighlightContext.Provider value={terms ? { terms, caseSensitive } : null}>
+      <HighlightContext.Provider value={terms ? { kind: 'terms', terms, caseSensitive } : null}>
+        <Markdown>{md}</Markdown>
+      </HighlightContext.Provider>,
+    );
+  }
+
+  function renderWithRegex(source: string | null, md: string, caseSensitive = false) {
+    return render(
+      <HighlightContext.Provider value={source ? { kind: 'regex', source, caseSensitive } : null}>
         <Markdown>{md}</Markdown>
       </HighlightContext.Provider>,
     );
@@ -102,5 +110,67 @@ describe('Markdown', () => {
   it('empty term list is a passthrough (no marks)', () => {
     const { container } = renderWithTerms([], 'the flock serializes writers');
     expect(container.querySelector('mark')).toBeNull();
+  });
+
+  // ---- #223 item 2: best-effort regex <mark> highlighting ----
+  it('wraps regex matches in <mark> in prose', () => {
+    const { container } = renderWithRegex('ca.he', 'the cache layer');
+    const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(marks).toEqual(['cache']);
+  });
+
+  it('regex is case-insensitive by default and case-sensitive when flagged', () => {
+    const ci = renderWithRegex('cache', 'CACHE and cache');
+    expect(Array.from(ci.container.querySelectorAll('mark')).map((m) => m.textContent)).toEqual(['CACHE', 'cache']);
+    const cs = renderWithRegex('cache', 'CACHE and cache', true);
+    expect(Array.from(cs.container.querySelectorAll('mark')).map((m) => m.textContent)).toEqual(['cache']);
+  });
+
+  it('marks multiple regex matches in one text node', () => {
+    const { container } = renderWithRegex('\\d+', 'a1 b22 c333');
+    expect(Array.from(container.querySelectorAll('mark')).map((m) => m.textContent)).toEqual(['1', '22', '333']);
+  });
+
+  it('invalid regex → no marks and no throw', () => {
+    expect(() => renderWithRegex('(', 'whatever (text')).not.toThrow();
+    const { container } = renderWithRegex('(', 'whatever (text');
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('zero-width regex → no hang, no empty <mark>', () => {
+    const { container } = renderWithRegex('x*', 'abc');
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('does NOT mark regex inside inline code', () => {
+    const { container } = renderWithRegex('cache', 'use the `cache` call');
+    expect(container.querySelector('code')).not.toBeNull();
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('does NOT mark regex inside a fenced code block', () => {
+    const { container } = renderWithRegex('cache', '```\ncache here\n```');
+    expect(container.querySelector('pre')).not.toBeNull();
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('over-cap regex source → no marks (no-op)', () => {
+    const longSource = 'a'.repeat(1001); // > FIND_REGEX_MAX_LEN (1000)
+    const { container } = renderWithRegex(longSource, 'a'.repeat(1001));
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  it('over-cap text node → that node unmarked', () => {
+    const big = 'x' + 'y'.repeat(200_001); // > FIND_SCAN_TEXT_CAP (200_000)
+    const { container } = renderWithRegex('x', big);
+    expect(container.querySelector('mark')).toBeNull();
+  });
+
+  // ---- #223 item 2: term-overlap regression (locks splitByTerms longest-first
+  // before the makeMarkPlugin refactor) ----
+  it('prefers the longer of two overlapping terms', () => {
+    const { container } = renderWithTerms(['cache', 'cache.db'], 'open cache.db now');
+    const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(marks).toEqual(['cache.db']);
   });
 });
