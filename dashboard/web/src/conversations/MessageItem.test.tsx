@@ -644,6 +644,58 @@ describe('MessageItem (message-text copy, G2)', () => {
     expect(container.querySelector('.conv-item--assistant')).toBeNull();
     expect(container.querySelector('.conv-item--meta')).not.toBeNull();
   });
+
+  // #217 S5 F6 — a context body carrying an unfenced git diff routes the diff
+  // region through UnifiedDiffView (real diff rows), while the prose lead stays
+  // Markdown. A context body with NO `diff --git` marker stays pure prose.
+  it('routes an injected git-context diff body through UnifiedDiffView', () => {
+    const body =
+      '- Unstaged changes: diff --git a/CLAUDE.md b/CLAUDE.md\n' +
+      'index a..b 100644\n' +
+      '--- a/CLAUDE.md\n' +
+      '+++ b/CLAUDE.md\n' +
+      '@@ -1,2 +1,3 @@\n' +
+      ' ctx\n' +
+      '+added\n' +
+      '-removed\n';
+    const metaDiff: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'mD', id: 13 },
+      member_uuids: ['mD'],
+      ts: 't',
+      text: body,
+      blocks: [{ kind: 'text', text: body }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      meta_kind: 'context',
+      skill_name: null,
+    };
+    const { container } = render(<MessageItem item={metaDiff} />);
+    expect(container.querySelector('.conv-ctx-diff')).not.toBeNull();
+    expect(container.querySelector('.conv-diff-row--add')).not.toBeNull();
+    expect(container.querySelector('.conv-diff-row--del')).not.toBeNull();
+    expect(container.textContent).toContain('CLAUDE.md');
+  });
+
+  it('a context body with no diff marker renders as pure prose (no diff view)', () => {
+    const metaProse: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'mP', id: 14 },
+      member_uuids: ['mP'],
+      ts: 't',
+      text: '## Git Context\n- branch: main\n- a bullet\n+ another bullet',
+      blocks: [{ kind: 'text', text: '## Git Context' }],
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      meta_kind: 'context',
+      skill_name: null,
+    };
+    const { container } = render(<MessageItem item={metaProse} />);
+    expect(container.querySelector('.conv-ctx-diff')).toBeNull();
+    expect(container.querySelector('.conv-diff-row--add')).toBeNull();
+  });
 });
 
 describe('MessageItem (#174 permalink on tool-result & system-marker chips)', () => {

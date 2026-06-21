@@ -44,6 +44,7 @@
   },
   "subagent_costs": {},
   "subagent_meta": {},
+  "task_completion": null,
   "turns": [
     {
       "is_sidechain": false,

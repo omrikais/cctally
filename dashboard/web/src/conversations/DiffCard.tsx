@@ -4,20 +4,15 @@ import { PencilIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { LineNumberedCode } from './LineNumberedCode';
 import { LoadFull } from './LoadFull';
-import { highlightBody } from './CodeBlock';
 import { fileLangForCall } from './toolLang';
+import { HunkEl, type Hunk } from './diffPrimitives';
 import {
   computeDiff,
   computeWrite,
   computeMultiEdit,
-  type DiffRow,
 } from './computeDiff';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
-
-// One rendered diff body: a set of rows (Edit/Write) is a single hunk; MultiEdit
-// is N hunks rendered under `edit k of n` dividers.
-type Hunk = DiffRow[];
 
 interface EditInput {
   file_path?: unknown;
@@ -151,56 +146,9 @@ function buildHunks(call: Call, override: EditInput | null): { hunks: Hunk[]; ki
   return { hunks: [computeDiff(oldStr, newStr)], kind: 'edit' };
 }
 
-// One diff row. Context lines route through highlightBody (full syntax color);
-// changed lines render the tint + intra-line word-emphasis as PLAIN text (no
-// per-token color — spec §4.1 / Codex P2.6). The gutter shows relative old/new
-// running numbers (absolute file offsets aren't derivable from old/new strings).
-function DiffRowEl({ row, lang }: { row: DiffRow; lang: string }) {
-  const sign = row.type === 'add' ? '+' : row.type === 'del' ? '−' : ' ';
-  let content: React.ReactNode;
-  if (row.type === 'context') {
-    // Full syntax highlighting on unchanged lines.
-    content = highlightBody(row.text, lang);
-  } else if (row.segments) {
-    // Changed line with word-diff: brighten the emphasized segments, plain text.
-    content = row.segments.map((s, i) =>
-      s.emph ? (
-        <span key={i} className="conv-diff-word">
-          {s.text}
-        </span>
-      ) : (
-        <span key={i}>{s.text}</span>
-      ),
-    );
-  } else {
-    // Changed line with no word pairing (unpaired add/del) — plain text.
-    content = row.text;
-  }
-  return (
-    <div className={`conv-diff-row conv-diff-row--${row.type}`}>
-      <span className="conv-diff-gutter" aria-hidden="true">
-        {row.oldNo ?? ''}
-      </span>
-      <span className="conv-diff-gutter" aria-hidden="true">
-        {row.newNo ?? ''}
-      </span>
-      <span className="conv-diff-sign" aria-hidden="true">
-        {sign}
-      </span>
-      <span className="conv-diff-text">{content}</span>
-    </div>
-  );
-}
-
-function HunkEl({ rows, lang }: { rows: Hunk; lang: string }) {
-  return (
-    <div className="conv-diff-hunk">
-      {rows.map((r, i) => (
-        <DiffRowEl key={i} row={r} lang={lang} />
-      ))}
-    </div>
-  );
-}
+// DiffRowEl / HunkEl moved to ./diffPrimitives (shared with UnifiedDiffView,
+// #217 S5 F6). The git-context diff renders byte-identical rows via the same
+// primitives.
 
 // Unified word-diff card for the Edit / MultiEdit / Write family (#177 S3, spec
 // §4.1). Collapsed-disclosure chrome mirrors the other Session-2/3 cards

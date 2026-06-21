@@ -1,4 +1,4 @@
-import type { CacheFailure, OutlineTurn, SubagentMeta } from '../types/conversation';
+import type { CacheFailure, OutlineTaskCompletion, OutlineTurn, SubagentMeta } from '../types/conversation';
 import { fmt } from '../lib/fmt';
 
 // cache-failure-markers spec §4 — the standalone cache-landmark label:
@@ -51,8 +51,10 @@ export interface OutlineEntry {
   entryId: string;
   uuid: string;                       // jump target (anchor uuid / bucket root)
   // #217 S3 F8 — 'compaction' added (a compaction-summary turn, meta_kind
-  // 'compaction'); it joins the existing landmark family.
-  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache' | 'compaction';
+  // 'compaction'); it joins the existing landmark family. #217 S5 F7 —
+  // 'completion' (a "✓ Session complete (N tasks)" landmark at the final
+  // main-thread task snapshot, emitted only when all_done).
+  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache' | 'compaction' | 'completion';
   label: string;
   // 0 = prompt / pre-prompt landmark; 1 = section landmark. #217 S3 E6(c) — a
   // NESTED subagent (one whose parent is ANOTHER subagent bucket) renders one
@@ -98,6 +100,10 @@ export function deriveOutline(
   // off, cache curation is skipped ENTIRELY (no standalone rows, no flags, no
   // suffixes) so the outline counts + navigation stay self-consistent.
   markersEnabled = true,
+  // #217 S5 F7 (Codex P1-8) — the server's main-thread task-completion. A
+  // `completion` landmark is emitted at `anchor_uuid` ONLY when `all_done`;
+  // null/absent (no main-thread tasks, or an older payload) → no landmark.
+  taskCompletion?: OutlineTaskCompletion | null,
 ): DerivedOutline {
   // 1. Bucket sidechains by subagent_key over the WHOLE list (mirror
   //    groupSidechains resolution; placement differs below).
@@ -301,6 +307,23 @@ export function deriveOutline(
   // Defensive sweep: any bucket the main walk never reached (mirrors
   // groupSidechains' final sweep — guarantees no sidechain is silently dropped).
   for (const k of buckets.keys()) if (!emittedBucket.has(k)) emitBucket(k);
+
+  // #217 S5 F7 — a terminal "✓ Session complete (N tasks)" landmark, emitted
+  // ONLY when the main thread's final task snapshot is fully done (Q5). It jumps
+  // to `anchor_uuid` (the turn carrying that snapshot). Placed last (the session
+  // closing marker) at the enclosing section's depth.
+  if (taskCompletion?.all_done) {
+    const n = taskCompletion.total;
+    entries.push({
+      entryId: `completion:${taskCompletion.anchor_uuid}`,
+      uuid: taskCompletion.anchor_uuid,
+      type: 'completion',
+      label: `✓ Session complete (${n} task${n === 1 ? '' : 's'})`,
+      depth: depth(), error: false, plan: false, question: false,
+      thinkingCount: 0, toolCount: 0,
+      turnIndex: indexOf.get(taskCompletion.anchor_uuid) ?? turns.length,
+    });
+  }
 
   return { entries, sectionByUuid };
 }

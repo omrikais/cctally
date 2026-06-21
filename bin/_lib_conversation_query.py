@@ -347,6 +347,45 @@ def _collect_files(items):
     return [agg[p] for p in order]
 
 
+def _task_completion(items):
+    """Whole-session task-completion detection (#217 S5 F7, spec §3).
+
+    Scan the assembled ``items`` in document order, MAIN THREAD ONLY
+    (``subagent_key is None`` AND not ``is_sidechain`` — Codex P1-1, because
+    ``_fold_task_runs`` keeps task state PER subagent thread, so a global
+    last-snapshot could describe a subagent's checklist rather than the
+    session's). Take the LAST main-thread block carrying a folded
+    ``task_snapshot`` (the Task* family, stamped by ``_fold_task_runs``) or a
+    legacy ``TodoWrite`` (``name == "TodoWrite"``, ``input.todos``). Returns
+    ``{all_done, total, completed, anchor_uuid}`` or ``None`` when the
+    main thread has no tasks. Pure over the assembled ``items``.
+    """
+    final = None
+    final_uuid = None
+    for it in items:
+        if it.get("subagent_key") is not None or it.get("is_sidechain"):
+            continue
+        for b in it.get("blocks", []):
+            if b.get("kind") not in ("tool_call", "tool_use"):
+                continue
+            snap = b.get("task_snapshot")
+            if snap is None and b.get("name") == "TodoWrite":
+                inp = b.get("input")
+                snap = inp.get("todos") if isinstance(inp, dict) else None
+            if isinstance(snap, list):
+                final = snap
+                final_uuid = it["anchor"]["uuid"]
+    if not final:
+        return None
+    total = len(final)
+    completed = sum(1 for t in final
+                    if isinstance(t, dict) and t.get("status") == "completed")
+    return {"all_done": total > 0 and completed == total,
+            "total": total,
+            "completed": completed,
+            "anchor_uuid": final_uuid}
+
+
 def _parse_nested_agent_result(text):
     """Read-time fallback for nested (grandchild) subagent results on rows that
     were ingested BEFORE the #217 S1 U6 structured stamp (un-reingested history).
@@ -1930,6 +1969,9 @@ def get_conversation_outline(conn, session_id):
             # #217 S5 F2 — whole-session files-touched aggregation (always
             # present, possibly []; additive — existing consumers are byte-stable).
             "files": _collect_files(items),
+            # #217 S5 F7 — main-thread task-completion (always present; None when
+            # the main thread has no tasks; additive — byte-stable for consumers).
+            "task_completion": _task_completion(items),
             "turns": turns}
 
 

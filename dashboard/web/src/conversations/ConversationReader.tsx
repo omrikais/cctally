@@ -1362,6 +1362,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpToLastRef = useRef(jumpToLast);
   jumpToLastRef.current = jumpToLast;
 
+  // #217 S5 F7 — the header completion chip jumps to the final main-thread task
+  // snapshot turn, reusing the same OPEN_CONVERSATION jump pipeline the outline
+  // landmarks use (loadToTarget + scroll + flash + pin via the jump effect).
+  const jumpToCompletion = useCallback((uuid: string) => {
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      sessionId: sessionIdRef.current,
+      jump: { session_id: sessionIdRef.current, uuid },
+    });
+  }, []);
+
   // #177 S6 / #217 S4 / #223 — the find bar reports its DEBOUNCED needle + the
   // case + regex flags here; build the highlight context value. Terms mode
   // whitespace-splits; regex mode passes the source for best-effort inline
@@ -1537,6 +1548,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           </div>
         </div>
         <div className="conv-reader-controls">
+          {/* #217 S5 F7 — task-completion chip. Always visible (regardless of
+              scroll position) when the main thread's final task snapshot is fully
+              done; clicking jumps to the snapshot turn. Hidden otherwise.
+              Reduced-motion handled in CSS; ≥44px touch target (#205 mobile). */}
+          {outline?.task_completion?.all_done && (
+            <button
+              type="button"
+              className="conv-complete-chip"
+              aria-label={`Session complete: ${outline.task_completion.total} tasks done — jump to the final checklist`}
+              title="Jump to the final task checklist"
+              onClick={() => jumpToCompletion(outline.task_completion!.anchor_uuid)}
+            >
+              ✓ Complete · {outline.task_completion.total}
+            </button>
+          )}
           {/* #177 S5 §5 — focus-mode segmented control. A labeled radiogroup;
               each button's aria-checked reflects the active mode (the valid
               selected-state attribute for role="radio" — #184 dropped the

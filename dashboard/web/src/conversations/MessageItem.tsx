@@ -8,7 +8,30 @@ import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { useFmtCtx, useMarkersEnabled } from './TranscriptContext';
+import { segmentContextBody, parseUnifiedDiff } from './contextDiff';
+import { UnifiedDiffView } from './UnifiedDiffView';
 import type { ConversationItem } from '../types/conversation';
+
+// #217 S5 F6 — an injected `meta_kind:'context'` body sometimes carries an
+// UNFENCED git diff (e.g. `- Unstaged changes: diff --git a/CLAUDE.md …`). Split
+// the body into prose + diff segments (conservative `diff --git` anchor) and
+// render prose as Markdown (unchanged) and diff segments as a UnifiedDiffView.
+// A body with no `diff --git` marker is a single prose segment → all Markdown,
+// exactly as before.
+function ContextBody({ text }: { text: string }) {
+  const segments = segmentContextBody(text);
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.kind === 'diff' ? (
+          <UnifiedDiffView key={i} files={parseUnifiedDiff(seg.text)} />
+        ) : (
+          <Markdown key={i}>{seg.text}</Markdown>
+        ),
+      )}
+    </>
+  );
+}
 
 // First non-blank line of a meta body, trimmed + capped — the context pill's
 // collapsed one-line preview (skill/command pills don't need it).
@@ -216,6 +239,13 @@ function MessageItemImpl(
           </summary>
           {mk === 'command' ? (
             <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
+          ) : mk === 'context' ? (
+            // #217 S5 F6 — render the injected context body as prose + any
+            // unfenced git diff (ContextBody splits + routes diff segments
+            // through UnifiedDiffView). No `diff --git` marker → all prose.
+            <div className="conv-meta-body">
+              <ContextBody text={item.text} />
+            </div>
           ) : (
             <div className="conv-meta-body">
               <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />

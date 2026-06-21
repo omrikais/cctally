@@ -179,6 +179,8 @@ function entryGlyph(e: OutlineEntry) {
     // #217 S3 F8 — compaction landmark leads with a distinct glyph (the
     // .conv-outline-entry--compaction rule styles the row).
     case 'compaction': return <span className="conv-outline-entry-compaction-glyph" aria-hidden="true">⊟</span>;
+    // #217 S5 F7 — the terminal "session complete" landmark leads with a check.
+    case 'completion': return <span className="conv-outline-entry-completion-glyph" aria-hidden="true">✓</span>;
     default: return <ToolGenericIcon />;
   }
 }
@@ -324,7 +326,8 @@ export function OutlinePanel({
   const reduced = useReducedMotion();
 
   const { entries, sectionByUuid } = useMemo(
-    () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled)
+    () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled,
+                                   outline.task_completion)
                    : { entries: [], sectionByUuid: new Map<string, string>() }),
     [outline, markersEnabled],
   );

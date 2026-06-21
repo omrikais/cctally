@@ -92,6 +92,7 @@
       "total_tool_use_count": 2
     }
   },
+  "task_completion": null,
   "turns": [
     {
       "is_sidechain": false,

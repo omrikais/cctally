@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { deriveOutline } from './deriveOutline';
-import type { OutlineTurn, SubagentMeta } from '../types/conversation';
+import type { OutlineTaskCompletion, OutlineTurn, SubagentMeta } from '../types/conversation';
 
 // Minimal OutlineTurn factory — every field the curation reads, sane defaults.
 function turn(over: Partial<OutlineTurn> & { uuid: string; kind: OutlineTurn['kind'] }): OutlineTurn {
@@ -449,5 +449,35 @@ describe('deriveOutline — tree degenerates to flat (#217 S3 E6(c))', () => {
     const sub = entries.find((e) => e.type === 'subagent')!;
     expect(sub.depth).toBe(1);                 // not nested
     expect(sub.parentEntryId).toBeUndefined();
+  });
+});
+
+// #217 S5 F7 — deriveOutline gains a `task_completion` arg (Codex P1-8) and emits
+// a `completion` landmark at `anchor_uuid` ONLY when `all_done`.
+describe('deriveOutline task-completion landmark (#217 S5 F7)', () => {
+  const turns: OutlineTurn[] = [
+    turn({ uuid: 'h1', kind: 'human', label: 'do work' }),
+    turn({ uuid: 'a1', kind: 'assistant', label: 'done' }),
+  ];
+
+  it('emits a completion landmark only when all_done', () => {
+    const tc: OutlineTaskCompletion = { all_done: true, total: 7, completed: 7, anchor_uuid: 'a1' };
+    const { entries } = deriveOutline(turns, undefined, true, tc);
+    const comp = entries.find((e) => e.type === 'completion');
+    expect(comp).toBeDefined();
+    expect(comp!.uuid).toBe('a1');
+    expect(comp!.label).toMatch(/7 tasks/);
+    expect(comp!.label).toMatch(/complete/i);
+  });
+
+  it('does NOT emit a completion landmark when not all_done', () => {
+    const tc: OutlineTaskCompletion = { all_done: false, total: 7, completed: 3, anchor_uuid: 'a1' };
+    const { entries } = deriveOutline(turns, undefined, true, tc);
+    expect(entries.some((e) => e.type === 'completion')).toBe(false);
+  });
+
+  it('does NOT emit when task_completion is null/absent (back-compat)', () => {
+    expect(deriveOutline(turns, undefined, true, null).entries.some((e) => e.type === 'completion')).toBe(false);
+    expect(deriveOutline(turns, undefined).entries.some((e) => e.type === 'completion')).toBe(false);
   });
 });

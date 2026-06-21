@@ -131,6 +131,43 @@ describe('ConversationReader', () => {
     expect(groups[1].querySelector('summary')!.textContent).toContain('Audit B');
   });
 
+  // #217 S5 F7 — the header completion chip shows ONLY when task_completion is
+  // all_done, and clicking it jumps to the anchor (reuses the OPEN_CONVERSATION
+  // jump pipeline, asserted via getState().conversationJump).
+  it('shows the ✓ Complete chip when all_done and jumps on click', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'a1', kind: 'assistant' })]));
+    const outline = {
+      session_id: 's',
+      stats: {} as never,
+      turns: [
+        { uuid: 'h1', kind: 'human', ts: 't', label: 'go', member_uuids: ['h1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+        { uuid: 'a1', kind: 'assistant', ts: 't', label: 'done', member_uuids: ['a1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+      ] as OutlineTurn[],
+      task_completion: { all_done: true, total: 5, completed: 5, anchor_uuid: 'a1' },
+    } as ConversationOutline;
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+    const chip = screen.getByRole('button', { name: /complete/i });
+    expect(chip.textContent).toMatch(/5/);
+    act(() => { fireEvent.click(chip); });
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+  });
+
+  it('hides the completion chip when not all_done', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })]));
+    const outline = {
+      session_id: 's',
+      stats: {} as never,
+      turns: [
+        { uuid: 'h1', kind: 'human', ts: 't', label: 'go', member_uuids: ['h1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+      ] as OutlineTurn[],
+      task_completion: { all_done: false, total: 5, completed: 2, anchor_uuid: 'h1' },
+    } as ConversationOutline;
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+    expect(screen.queryByRole('button', { name: /complete/i })).toBeNull();
+  });
+
   it('threads subagent_meta from the detail payload into the subagent card (#166)', async () => {
     // A main human + one subagent thread keyed "aaaa1111", with a top-level
     // subagent_meta map. The reader must hand the matching entry to the

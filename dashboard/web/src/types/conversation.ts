@@ -163,6 +163,17 @@ export interface OutlineFile {
   del: number | null;
   touches: OutlineFileTouch[];
 }
+// #217 S5 F7 — main-thread task-completion. The server emits this whenever the
+// MAIN thread carried any task snapshot (Task* / legacy TodoWrite); the client
+// renders the chip + outline landmark ONLY when `all_done`. `anchor_uuid` is the
+// turn carrying the final snapshot (the jump target). `null` (not the object)
+// when the session has no main-thread tasks.
+export interface OutlineTaskCompletion {
+  all_done: boolean;
+  total: number;
+  completed: number;
+  anchor_uuid: string;
+}
 export interface ConversationOutline {
   session_id: string;
   subagent_meta?: Record<string, SubagentMeta>;
@@ -176,6 +187,9 @@ export interface ConversationOutline {
   // #217 S5 F2 — whole-session files-touched aggregation. Always present from a
   // current server (possibly []); optional for back-compat with an older one.
   files?: OutlineFile[];
+  // #217 S5 F7 — main-thread task-completion (null when no main-thread tasks).
+  // Present from a current server; optional for back-compat with an older one.
+  task_completion?: OutlineTaskCompletion | null;
   turns: OutlineTurn[];
 }
 

@@ -49,6 +49,7 @@
     "dddd4444": 0.79985
   },
   "subagent_meta": {},
+  "task_completion": null,
   "turns": [
     {
       "is_sidechain": false,

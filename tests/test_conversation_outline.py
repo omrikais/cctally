@@ -765,3 +765,149 @@ def test_outline_files_present_key_always():
     _seed_rich(c)
     out = cq.get_conversation_outline(c, "s5")
     assert "files" in out and out["files"] == []
+
+
+# ---------------------------------------------------------------------------
+# #217 S5 F7 — outline `task_completion` detection. The LAST main-thread task
+# snapshot (Task* `task_snapshot` stamped by `_fold_task_runs`, OR legacy
+# TodoWrite `input.todos`), scanned in document order, MAIN THREAD ONLY
+# (`subagent_key is None`, not `is_sidechain` — Codex P1-1, because
+# `_fold_task_runs` keeps task state PER subagent thread). Emits
+# {all_done, total, completed, anchor_uuid} or None (no tasks).
+# ---------------------------------------------------------------------------
+def _todowrite(todos, *, tid):
+    # A legacy TodoWrite tool_call carrying its full `todos` list on `input`.
+    return {"kind": "tool_use", "name": "TodoWrite", "input_summary": "{}",
+            "input": {"todos": todos}, "id": tid, "preview": ""}
+
+
+def _task_snap_block(snapshot, *, name="TaskUpdate", tid):
+    # A Task* tool_call pre-stamped with the folded `task_snapshot` (mirrors
+    # what `_fold_task_runs` writes onto the first Task* call of a run).
+    return {"kind": "tool_use", "name": name, "input_summary": "{}",
+            "input": {}, "id": tid, "preview": "", "task_snapshot": snapshot}
+
+
+def test_outline_task_completion_all_done():
+    # Last main-thread snapshot is fully completed -> all_done True; totals match.
+    c = _conn()
+    _msg(c, session_id="td", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="do work")
+    _msg(c, session_id="td", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="working", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "working"},
+             _todowrite([{"content": "step a", "status": "completed"},
+                         {"content": "step b", "status": "completed"}], tid="t1")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    out = cq.get_conversation_outline(c, "td")
+    tc = out["task_completion"]
+    assert tc["all_done"] is True
+    assert tc["total"] == 2 and tc["completed"] == 2
+    assert tc["total"] == tc["completed"]
+    assert tc["anchor_uuid"] == "a1"
+
+
+def test_outline_task_completion_not_done():
+    # Last snapshot has an incomplete item -> all_done False (still emitted).
+    c = _conn()
+    _msg(c, session_id="tp", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="do work")
+    _msg(c, session_id="tp", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="working", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _todowrite([{"content": "step a", "status": "completed"},
+                         {"content": "step b", "status": "in_progress"},
+                         {"content": "step c", "status": "pending"}], tid="t1")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    tc = cq.get_conversation_outline(c, "tp")["task_completion"]
+    assert tc["all_done"] is False
+    assert tc["total"] == 3 and tc["completed"] == 1
+
+
+def test_outline_task_completion_takes_last_snapshot():
+    # An EARLIER all-done snapshot followed by a LATER partial one -> the LAST
+    # (document order) wins, so all_done False at the later anchor.
+    c = _conn()
+    _msg(c, session_id="tl", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="go")
+    _msg(c, session_id="tl", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="first", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _todowrite([{"content": "x", "status": "completed"}], tid="t1")]))
+    _msg(c, session_id="tl", uuid="a2", source_path="a.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-12T14:00:02Z", entry_type="assistant",
+         text="second", model=_MODEL, msg_id="m2", req_id="r2",
+         blocks_json=_json.dumps([
+             _todowrite([{"content": "x", "status": "completed"},
+                         {"content": "y", "status": "pending"}], tid="t2")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    _entry(c, source_path="a.jsonl", line_offset=2, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20)
+    tc = cq.get_conversation_outline(c, "tl")["task_completion"]
+    assert tc["anchor_uuid"] == "a2"
+    assert tc["all_done"] is False and tc["total"] == 2 and tc["completed"] == 1
+
+
+def test_outline_task_completion_task_snapshot_family():
+    # The Task* family carries a stamped `task_snapshot` (not TodoWrite) — it is
+    # detected identically.
+    c = _conn()
+    _msg(c, session_id="ts", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-12T14:00:00Z", entry_type="human", text="go")
+    _msg(c, session_id="ts", uuid="a1", source_path="a.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-12T14:00:01Z", entry_type="assistant",
+         text="done", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             _task_snap_block([{"content": "a", "status": "completed"},
+                               {"content": "b", "status": "completed"}], tid="t1")]))
+    _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    tc = cq.get_conversation_outline(c, "ts")["task_completion"]
+    assert tc["all_done"] is True and tc["total"] == 2 and tc["anchor_uuid"] == "a1"
+
+
+def test_outline_task_completion_ignores_subagent_only():
+    # A session where ONLY a subagent (sidechain, non-null subagent_key) carries
+    # a task snapshot -> main-thread detection -> None (Codex P1-1).
+    c = _conn()
+    _msg(c, session_id="so", uuid="h1", source_path="m.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="go")
+    _msg(c, session_id="so", uuid="a1", source_path="m.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="ok", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([{"kind": "text", "text": "ok"}]))
+    _entry(c, source_path="m.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=10, out=20)
+    # subagent (sidechain) turn carrying a completed task snapshot.
+    _msg(c, session_id="so", uuid="sc1", parent_uuid="a1",
+         source_path="/agents/agent-sub.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="sub", model=_MODEL, msg_id="m2", req_id="r2", is_sidechain=1,
+         blocks_json=_json.dumps([
+             _todowrite([{"content": "sub task", "status": "completed"}], tid="t1")]))
+    _entry(c, source_path="/agents/agent-sub.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m2", req_id="r2", inp=10, out=20)
+    assert cq.get_conversation_outline(c, "so")["task_completion"] is None
+
+
+def test_outline_task_completion_none_when_no_tasks():
+    # No task snapshot anywhere -> None.
+    c = _conn()
+    _seed_rich(c)
+    assert cq.get_conversation_outline(c, "s5")["task_completion"] is None
+
+
+def test_outline_task_completion_present_key_always():
+    # The `task_completion` key is always present (None when no tasks), so the
+    # client reads it uniformly.
+    c = _conn()
+    _seed_rich(c)
+    out = cq.get_conversation_outline(c, "s5")
+    assert "task_completion" in out and out["task_completion"] is None

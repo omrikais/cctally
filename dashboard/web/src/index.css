@@ -5357,6 +5357,9 @@ mark.current {
    selector was dropped, #218/#219 I-2 P3 cosmetic). */
 .conv-outline-entry--compaction { color: var(--text-dim); }
 .conv-outline-entry--compaction .conv-outline-entry-glyph { color: var(--accent-blue); }
+/* #217 S5 F7 — completion landmark: a green ✓ cue (the terminal "session
+   complete" marker). Same wrapper-coloring pattern as compaction. */
+.conv-outline-entry--completion .conv-outline-entry-glyph { color: var(--accent-green); }
 /* #217 S3 E6(a) — per-subagent cost chip on a subagent entry (display-only). */
 .conv-outline-entry-cost {
   flex: 0 0 auto;
@@ -5633,6 +5636,29 @@ mark.current {
   color: var(--text);
 }
 .conv-export-action:disabled { opacity: 0.6; cursor: progress; }
+
+/* ---- Task-completion chip (#217 S5 F7) --------------------------- */
+/* Always-visible (regardless of scroll) reader-header chip shown when the main
+   thread's final task snapshot is fully done; clicking jumps to that turn.
+   Green-tinted "done" affordance distinct from the neutral control chrome. */
+.conv-complete-chip {
+  appearance: none;
+  border: 1px solid var(--accent-green, #3fb950);
+  background: color-mix(in srgb, var(--accent-green, #3fb950) 14%, var(--panel-bg));
+  color: var(--accent-green, #3fb950);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.conv-complete-chip:hover { filter: brightness(1.12); }
+.conv-complete-chip:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent-green, #3fb950);
+}
 
 /* ---- Focus-mode segmented control (#177 S5 §5) -------------------- */
 .conv-focus-seg {
@@ -7230,6 +7256,23 @@ mark.current {
 /* Result sub-panel beneath the diff (collapsed; the real cat -n numbers). */
 .conv-diff-result { margin-top: 8px; }
 
+/* ---- Git-context diff (#217 S5 F6 — UnifiedDiffView) -------------- */
+/* An injected meta:context body's unfenced git diff, rendered through the SAME
+   row primitives as the edit DiffCard (diffPrimitives.HunkEl). One block per
+   file: a path header (basename bold + dir muted) + a +N/−M stat, then the
+   hunks. The header reuses the card's flex layout (the .conv-diff-base/-dir/
+   -stat classes are global; only the .conv-diff-hdr flex is card-scoped). */
+.conv-ctx-diff { margin: 6px 0; display: flex; flex-direction: column; gap: 10px; }
+.conv-ctx-diff-file { display: flex; flex-direction: column; gap: 4px; }
+.conv-ctx-diff .conv-diff-hdr {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11.5px;
+}
+.conv-ctx-diff .conv-diff-hunk { margin-top: 0; }
+
 /* ---- Bash terminal card (#177 S3, spec §4.2) ---------------------- */
 .conv-term-body {
   position: relative;
@@ -7924,6 +7967,8 @@ mark.current {
   #root .conv-jump-latest,
   #root .conv-find-toggle,
   #root .conv-outline-toggle { flex: 1; min-height: 44px; }
+  /* #217 S5 F7 — completion chip floors to the 44px touch target. */
+  #root .conv-complete-chip { min-height: 44px; }
 
   /* §4B find bar */
   #root .conv-findbar-nav,
