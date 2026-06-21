@@ -401,7 +401,9 @@ export interface ConversationFindResult {
   anchors: FindAnchor[];
   total: number;
   anchors_truncated: boolean;
-  mode: 'fts' | 'like';
+  // #217 S4 — `regex` joins the union when the find ran a regex scan
+  // (`like` for a case-only scan, `fts` for the default FTS/LIKE fast path).
+  mode: 'fts' | 'like' | 'regex';
   search_depth: 'prose-only' | 'full';
 }
 

@@ -46,20 +46,24 @@ function PreBlock({ node, children }: ComponentPropsWithoutRef<'pre'> & ExtraPro
   return <pre className="conv-code">{children}</pre>;
 }
 
-// #177 S6 — split a text-node value on case-insensitive term matches, yielding
+// #177 S6 / #217 S4 — split a text-node value on term matches, yielding
 // alternating literal/hit segments. Longest terms first so a multi-term query
-// like ["cache", "cache.db"] prefers the longer overlap. Returns null when the
-// value contains no match (the walker then leaves the node untouched — no churn).
-function splitByTerms(value: string, terms: string[]): { s: string; hit: boolean }[] | null {
-  const lowerVal = value.toLowerCase();
-  const lowered = [...terms].map((t) => t.toLowerCase()).sort((a, b) => b.length - a.length);
+// like ["cache", "cache.db"] prefers the longer overlap. Case-INsensitive by
+// default; `caseSensitive` (the find bar's `Aa` toggle) makes the comparison
+// exact-case so the inline underline tracks the find results. Returns null when
+// the value contains no match (the walker then leaves the node untouched).
+function splitByTerms(value: string, terms: string[], caseSensitive: boolean): { s: string; hit: boolean }[] | null {
+  const cmpVal = caseSensitive ? value : value.toLowerCase();
+  const cmpTerms = [...terms]
+    .map((t) => (caseSensitive ? t : t.toLowerCase()))
+    .sort((a, b) => b.length - a.length);
   const out: { s: string; hit: boolean }[] = [];
   let i = 0;
   let any = false;
   while (i < value.length) {
     let matched = 0;
-    for (const t of lowered) {
-      if (t && lowerVal.startsWith(t, i)) { matched = t.length; break; }
+    for (const t of cmpTerms) {
+      if (t && cmpVal.startsWith(t, i)) { matched = t.length; break; }
     }
     if (matched > 0) {
       out.push({ s: value.slice(i, i + matched), hit: true });
@@ -81,7 +85,7 @@ function splitByTerms(value: string, terms: string[]): { s: string; hit: boolean
 // subtrees (Q5 boundary: no marks in code blocks / inline code / refractor
 // token streams). The plugin is only added to the pipeline when terms are
 // non-empty (HighlightContext provides them), so the common path pays nothing.
-function rehypeMarkTerms(terms: string[]) {
+function rehypeMarkTerms(terms: string[], caseSensitive: boolean) {
   const SKIP = new Set(['code', 'pre']);
   const walkChildren = (children: RootContent[], inSkip: boolean): RootContent[] => {
     const next: RootContent[] = [];
@@ -91,7 +95,7 @@ function rehypeMarkTerms(terms: string[]) {
         child.children = walkChildren(child.children, childSkip) as Element['children'];
         next.push(child);
       } else if (child.type === 'text' && !inSkip && child.value) {
-        const parts = splitByTerms(child.value, terms);
+        const parts = splitByTerms(child.value, terms, caseSensitive);
         if (parts) {
           for (const p of parts) {
             if (p.hit) {
@@ -118,15 +122,19 @@ function rehypeMarkTerms(terms: string[]) {
 }
 
 export function Markdown({ children }: { children: string }) {
-  const highlightTerms = useContext(HighlightContext);
-  // Memoize the rehype-plugin array on the JOINED terms so the renderer (and
-  // every memoized message item below it) only re-runs the walk when the
-  // debounced needle actually changes. Null / empty terms → no plugin (the
-  // zero-overhead passthrough).
-  const termsKey = highlightTerms && highlightTerms.length ? highlightTerms.join(' ') : '';
+  const highlight = useContext(HighlightContext);
+  // Memoize the rehype-plugin array on the JOINED terms + the case flag so the
+  // renderer (and every memoized message item below it) only re-runs the walk
+  // when the debounced needle or the case toggle actually changes. Null / empty
+  // terms → no plugin (the zero-overhead passthrough).
+  const terms = highlight?.terms ?? [];
+  const caseSensitive = highlight?.caseSensitive ?? false;
+  const termsKey = terms.length ? terms.join(' ') : '';
   const rehypePlugins = useMemo(
-    () => (termsKey ? [[rehypeMarkTerms, termsKey.split(' ')] as [typeof rehypeMarkTerms, string[]]] : []),
-    [termsKey],
+    () => (termsKey
+      ? [[rehypeMarkTerms, termsKey.split(' '), caseSensitive] as [typeof rehypeMarkTerms, string[], boolean]]
+      : []),
+    [termsKey, caseSensitive],
   );
   return (
     <div className="md">

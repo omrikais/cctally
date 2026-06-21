@@ -346,6 +346,49 @@ def test_conversation_find_route(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_conversation_find_regex_case_params(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/find`` (#217 S4 / I-1.2): ``regex``/``case``
+    truthy params thread into the kernel and surface ``mode``; an invalid regex
+    is PRE-VALIDATED in the handler → 400 (NOT a 500, which the generic
+    ``_run_conversation_query`` envelope would otherwise produce);
+    ``kind=title``/``kind=files`` still → 400."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # regex=1: a regex pattern matches s1's prose; mode == "regex".
+        status, body = _get(port, "/api/conversation/s1/find?q=tok.n&regex=1")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert out["mode"] == "regex" and out["search_depth"] == "full"
+        assert out["total"] >= 1
+
+        # case=1 (no regex): case-sensitive substring; mode == "like".
+        status, body = _get(port, "/api/conversation/s1/find?q=token&case=1")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert out["mode"] == "like" and out["search_depth"] == "full"
+
+        # Invalid regex → 400 with an error body (pre-validated, NOT 500).
+        status, body = _get(
+            port, "/api/conversation/s1/find?q=%28&regex=1")  # q="(" unbalanced
+        assert status == 400, (status, body)
+        err = json.loads(body)
+        assert "error" in err and "invalid regex" in err["error"]
+
+        # An invalid regex WITHOUT the regex flag is a literal substring → 200.
+        status, _ = _get(port, "/api/conversation/s1/find?q=%28")
+        assert status == 200
+
+        # kind=title / kind=files still → 400 (find excludes the search facets).
+        for k in ("title", "files"):
+            status, _ = _get(port, f"/api/conversation/s1/find?q=token&kind={k}")
+            assert status == 400, (k, status)
+    finally:
+        srv.shutdown()
+
+
 def test_conversation_search_kind_param(tmp_path, monkeypatch):
     """``/api/conversation/search?kind=...`` (#177 S6): a valid kind → 200 with
     the additive ``kind``/``search_depth`` fields; an invalid kind → 400."""

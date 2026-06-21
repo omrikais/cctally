@@ -86,4 +86,71 @@ describe('useConversationFind', () => {
     expect(result.current.anchors).toEqual([]);
     expect(result.current.total).toBe(0);
   });
+
+  // --- #217 S4 / I-1.3 — regex / case params + invalid-regex 400 mapping ---
+
+  it('appends &regex=1 when regex is set', async () => {
+    mockFetchOnce({ ...result1, mode: 'regex' });
+    renderHook(() => useConversationFind('s1', 'f.o', { regex: true }));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(url).toContain('regex=1');
+    expect(url).not.toContain('case=1');
+  });
+
+  it('appends &case=1 when case is set', async () => {
+    mockFetchOnce({ ...result1, mode: 'like' });
+    renderHook(() => useConversationFind('s1', 'Foo', { case: true }));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(url).toContain('case=1');
+    expect(url).not.toContain('regex=1');
+  });
+
+  it('maps an HttpError(400) to an "invalid regex" error and clears anchors', async () => {
+    mockFetchOnce(result1);                       // first: a valid result
+    const { result, rerender } = renderHook(
+      ({ regex }) => useConversationFind('s1', '(', { regex }),
+      { initialProps: { regex: false } });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.anchors).toHaveLength(2);
+    // Now flip regex on → the server 400s an unbalanced "(" → HttpError(400).
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      { ok: false, status: 400, json: async () => ({}) } as Response);
+    rerender({ regex: true });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.error).toBe('invalid regex');
+    expect(result.current.anchors).toEqual([]);
+    expect(result.current.total).toBe(0);
+  });
+
+  it('surfaces a regex mode value from the response', async () => {
+    mockFetchOnce({ ...result1, mode: 'regex' });
+    const { result } = renderHook(() => useConversationFind('s1', 'f.o', { regex: true }));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.mode).toBe('regex');
+  });
+
+  // --- #217 S4 / I-1.6 — tail-driven refetch ---
+
+  it('refetches when tailRevision changes (live-tail growth)', async () => {
+    mockFetchOnce(result1);
+    const { rerender } = renderHook(
+      ({ rev }) => useConversationFind('s1', 'needle', { tailRevision: rev }),
+      { initialProps: { rev: 0 } });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    // A tail bump (same needle) triggers a fresh fetch (debounced).
+    mockFetchOnce({ ...result1, total: 3 });
+    rerender({ rev: 1 });
+    await act(async () => { vi.advanceTimersByTime(300); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
 });

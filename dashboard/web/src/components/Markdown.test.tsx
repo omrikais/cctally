@@ -46,9 +46,9 @@ describe('Markdown', () => {
 
   // ---- #177 S6: find-term <mark> highlighting via HighlightContext ----
 
-  function renderWithTerms(terms: string[] | null, md: string) {
+  function renderWithTerms(terms: string[] | null, md: string, caseSensitive = false) {
     return render(
-      <HighlightContext.Provider value={terms}>
+      <HighlightContext.Provider value={terms ? { terms, caseSensitive } : null}>
         <Markdown>{md}</Markdown>
       </HighlightContext.Provider>,
     );
@@ -61,10 +61,17 @@ describe('Markdown', () => {
     expect(marks[0].textContent).toBe('flock');
   });
 
-  it('is case-insensitive', () => {
+  it('is case-insensitive by default', () => {
     const { container } = renderWithTerms(['flock'], 'The FLOCK and the Flock');
     const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
     expect(marks).toEqual(['FLOCK', 'Flock']);
+  });
+
+  it('honors the case-sensitive flag (#217 S4)', () => {
+    // Only the exact-case "Flock" is marked; "FLOCK" is not.
+    const { container } = renderWithTerms(['Flock'], 'The FLOCK and the Flock', true);
+    const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(marks).toEqual(['Flock']);
   });
 
   it('marks every term in a multi-term query', () => {

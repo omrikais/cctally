@@ -6066,10 +6066,36 @@ mark.current {
 .conv-findbar-nav:disabled { opacity: 0.4; cursor: default; }
 .conv-findbar-nav:focus-visible,
 .conv-findbar-close:focus-visible { outline: none; border-color: var(--accent-blue); }
+/* #217 S4 — the .* (regex) and Aa (case) toggles. Compact monospace pills with
+   an aria-pressed active state (the accent fill marks the toggle as on). */
+.conv-findbar-toggle {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 5px;
+  cursor: pointer;
+}
+.conv-findbar-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-findbar-toggle:focus-visible { outline: none; border-color: var(--accent-blue); }
+.conv-findbar-toggle[aria-pressed='true'] {
+  color: var(--bg-base);
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
 /* Narrow viewports: shrink the input so the pill still floats without overflow. */
 @media (max-width: 640px) {
   .conv-findbar { gap: 4px; padding: 4px 5px; }
   .conv-findbar-input { width: 110px; min-width: 70px; }
+}
+/* Touch targets: the toggles inherit the same ≥44px floor as the input on
+   coarse pointers (mirrors the #205 mobile pass). */
+@media (max-width: 640px) {
+  #root .conv-findbar-toggle { min-height: 44px; min-width: 40px; font-size: 13px; }
 }
 
 /* ---- Reader pane -------------------------------------------------- */

@@ -22,6 +22,7 @@ async function typeNeedle(input: HTMLInputElement, value: string) {
 
 beforeEach(() => {
   _resetForTests();
+  try { localStorage.clear(); } catch { /* jsdom always has it */ }
   globalThis.fetch = vi.fn();
   vi.useFakeTimers();
 });
@@ -139,6 +140,123 @@ describe('FindBar', () => {
     render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={onTermsChange} />);
     const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
     await typeNeedle(input, 'cache.db');
-    expect(onTermsChange).toHaveBeenLastCalledWith('cache.db');
+    expect(onTermsChange).toHaveBeenLastCalledWith('cache.db', false);
+  });
+
+  // --- #217 S4 / I-1.4 — regex + case toggles, persistence, a11y ---
+
+  it('renders a regex (.*) toggle and a case (Aa) toggle with aria-pressed', () => {
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const rx = screen.getByRole('button', { name: /regular expression/i });
+    const aa = screen.getByRole('button', { name: /case-sensitive/i });
+    expect(rx.getAttribute('aria-pressed')).toBe('false');
+    expect(aa.getAttribute('aria-pressed')).toBe('false');
+    expect(rx.textContent).toContain('.*');
+    expect(aa.textContent).toContain('Aa');
+  });
+
+  it('clicking the regex toggle flips aria-pressed, persists, and appends &regex=1', async () => {
+    mockFind({ anchors: [{ uuid: 'u1', match_kinds: [] }], total: 1, mode: 'regex' });
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    const rx = screen.getByRole('button', { name: /regular expression/i });
+    act(() => { fireEvent.click(rx); });
+    expect(rx.getAttribute('aria-pressed')).toBe('true');
+    expect(localStorage.getItem('cctally.conv.find.regex')).toBe('1');
+    await typeNeedle(input, 'f.o');
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(url).toContain('regex=1');
+  });
+
+  it('clicking the case toggle flips aria-pressed, persists, and appends &case=1', async () => {
+    mockFind({ anchors: [{ uuid: 'u1', match_kinds: [] }], total: 1, mode: 'like' });
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    const aa = screen.getByRole('button', { name: /case-sensitive/i });
+    act(() => { fireEvent.click(aa); });
+    expect(aa.getAttribute('aria-pressed')).toBe('true');
+    expect(localStorage.getItem('cctally.conv.find.case')).toBe('1');
+    await typeNeedle(input, 'Foo');
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(url).toContain('case=1');
+  });
+
+  it('seeds the toggle state from localStorage on mount', () => {
+    localStorage.setItem('cctally.conv.find.regex', '1');
+    localStorage.setItem('cctally.conv.find.case', '1');
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    expect(screen.getByRole('button', { name: /regular expression/i }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: /case-sensitive/i }).getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('reports the case flag up via onTermsChange (case-aware marks)', async () => {
+    mockFind({ anchors: [], total: 0 });
+    const onTermsChange = vi.fn();
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={onTermsChange} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /case-sensitive/i })); });
+    await typeNeedle(input, 'Foo');
+    expect(onTermsChange).toHaveBeenLastCalledWith('Foo', true);
+  });
+
+  it('suppresses prose marks in regex mode (reports empty terms — decision b)', async () => {
+    mockFind({ anchors: [{ uuid: 'u1', match_kinds: [] }], total: 1, mode: 'regex' });
+    const onTermsChange = vi.fn();
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={onTermsChange} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /regular expression/i })); });
+    await typeNeedle(input, 'f.o');
+    expect(onTermsChange).toHaveBeenLastCalledWith('', false);
+  });
+
+  it('renders the invalid-regex hint with role="alert"', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { ok: false, status: 400, json: async () => ({}) } as Response);
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /regular expression/i })); });
+    await typeNeedle(input, '(');
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent!.toLowerCase()).toContain('invalid regex');
+  });
+
+  // --- #217 S4 / I-1.4 — focus trap ---
+
+  it('Tab from the last control (close) wraps to the input; Shift+Tab from the input wraps to close', () => {
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    const close = screen.getByRole('button', { name: /close find/i }) as HTMLButtonElement;
+    // Tab from the close button wraps to the input.
+    close.focus();
+    act(() => { fireEvent.keyDown(close, { key: 'Tab' }); });
+    expect(document.activeElement).toBe(input);
+    // Shift+Tab from the input wraps to the close button.
+    input.focus();
+    act(() => { fireEvent.keyDown(input, { key: 'Tab', shiftKey: true }); });
+    expect(document.activeElement).toBe(close);
+  });
+
+  // --- #217 S4 / I-1.6 — cursor preserved by uuid across a refresh ---
+
+  it('preserves the selected match by uuid across a tail refresh; resets to 0 only when it vanishes', async () => {
+    mockFind({ anchors: [{ uuid: 'a', match_kinds: [] }, { uuid: 'b', match_kinds: [] }, { uuid: 'c', match_kinds: [] }], total: 3 });
+    const { rerender } = render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} tailRevision={0} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    await typeNeedle(input, 'needle');
+    // Select b (cursor 1).
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /next match/i })); });
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('2 / 3');
+    // A tail refresh appends d → [a,b,c,d]; cursor stays on b (2 / 4).
+    mockFind({ anchors: [{ uuid: 'a', match_kinds: [] }, { uuid: 'b', match_kinds: [] }, { uuid: 'c', match_kinds: [] }, { uuid: 'd', match_kinds: [] }], total: 4 });
+    rerender(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} tailRevision={1} />);
+    await act(async () => { vi.advanceTimersByTime(300); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('2 / 4');
+    // Another refresh drops b → [a,c,d]; cursor resets to 0 (1 / 3).
+    mockFind({ anchors: [{ uuid: 'a', match_kinds: [] }, { uuid: 'c', match_kinds: [] }, { uuid: 'd', match_kinds: [] }], total: 3 });
+    rerender(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} tailRevision={2} />);
+    await act(async () => { vi.advanceTimersByTime(300); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('1 / 3');
   });
 });

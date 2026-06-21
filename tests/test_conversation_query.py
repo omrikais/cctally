@@ -3005,6 +3005,165 @@ def test_find_prose_only_mode_blocks_tool_thinking():
     assert blocked["anchors"] == [] and blocked["total"] == 0
 
 
+# --- 2c-bis: find_in_conversation regex / case scan (#217 S4 / I-1.1) -------
+# These exercise the physical-row Python-scan branch that bypasses FTS/LIKE
+# when ``regex`` or ``case`` is set. The default path (both false) stays the
+# untouched FTS/LIKE fast path — byte-stable (test_find_no_regex_no_case_*).
+
+def test_find_no_regex_no_case_byte_stable():
+    """Default args change nothing: the (regex=False, case=False) call is
+    byte-identical to the no-kwargs call (the existing FTS/LIKE path)."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    base = cq.find_in_conversation(c, "s1", "needle", kind="all")
+    same = cq.find_in_conversation(c, "s1", "needle", kind="all",
+                                   regex=False, case=False)
+    assert same == base
+
+
+def test_find_case_sensitive_substring():
+    """``case=True`` is a case-sensitive substring scan over the physical rows;
+    only the exact-case turn matches and ``mode == 'like'``."""
+    c = _conn()
+    _msg(c, id=1, session_id="s1", uuid="u1", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="The Foo report", cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="u2", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="the foo report", cwd="/home/u/proj")
+    out = cq.find_in_conversation(c, "s1", "Foo", kind="all", case=True)
+    assert [a["uuid"] for a in out["anchors"]] == ["u1"]
+    assert out["mode"] == "like"
+    assert out["search_depth"] == "full"
+    # case-insensitive default (no kwargs) finds both.
+    base = cq.find_in_conversation(c, "s1", "foo", kind="all")
+    assert {a["uuid"] for a in base["anchors"]} == {"u1", "u2"}
+
+
+def test_find_regex_match_and_mode():
+    """A regex pattern (``f.o``) returns the expected anchors with
+    ``mode == 'regex'`` and ``search_depth == 'full'``."""
+    c = _conn()
+    _msg(c, id=1, session_id="s1", uuid="u1", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="the foo report", cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="u2", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="human",
+         text="bar baz", cwd="/home/u/proj")
+    out = cq.find_in_conversation(c, "s1", r"f.o", kind="all", regex=True)
+    assert [a["uuid"] for a in out["anchors"]] == ["u1"]
+    assert out["mode"] == "regex"
+    assert out["search_depth"] == "full"
+    # regex is case-insensitive by default; case=True makes it case-sensitive.
+    cap = cq.find_in_conversation(c, "s1", r"F.O", kind="all", regex=True)
+    assert [a["uuid"] for a in cap["anchors"]] == ["u1"]
+    sens = cq.find_in_conversation(c, "s1", r"F.O", kind="all",
+                                   regex=True, case=True)
+    assert sens["anchors"] == []
+
+
+def test_find_regex_matches_tool_corpus():
+    """Codex P0 guard: the scan reads the PHYSICAL ``conversation_messages``
+    rows (the ``search_tool``/``search_thinking`` corpus), NOT the rendered
+    assembled items. The needle lives ONLY in a tool_result row's
+    ``search_tool`` column (no prose carries it), so a rendered-item scan would
+    miss it entirely."""
+    c = _conn()
+    # human kickoff (no needle)
+    _msg(c, id=1, session_id="s1", uuid="hu", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="kick off", cwd="/home/u/proj")
+    # assistant turn with a tool_use; prose does NOT carry the needle
+    _msg(c, id=2, session_id="s1", uuid="as", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="reply prose", model=_MODEL, msg_id="m1", req_id="r1",
+         blocks_json=_json.dumps([
+             {"kind": "text", "text": "reply prose"},
+             {"kind": "tool_use", "id": "tu1", "name": "Bash",
+              "input": {"command": "rg xyzzy"}}]),
+         search_tool="rg xyzzy", cwd="/home/u/proj")
+    # tool_result row owned by tu1 (folds into the assistant turn's anchor);
+    # the needle 'xyzzy' lives ONLY in search_tool (tool corpus).
+    _msg(c, id=3, session_id="s1", uuid="tr", source_path="f.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="tool_result",
+         text="found a match line", source_tool_use_id="tu1",
+         blocks_json=_json.dumps([
+             {"kind": "tool_result", "tool_use_id": "tu1",
+              "text": "the xyzzy line"}]),
+         search_tool="the xyzzy line", cwd="/home/u/proj")
+    res = cq.find_in_conversation(c, "s1", "xyzzy", kind="tools", regex=True)
+    assert res["total"] >= 1
+    assert any(a["match_kinds"] == ["tool"] for a in res["anchors"])
+    # kind="all" finds it too, badged 'tool', collapsed onto the assistant turn.
+    allres = cq.find_in_conversation(c, "s1", "xyzzy", kind="all", regex=True)
+    assert [a["uuid"] for a in allres["anchors"]] == ["as"]
+    assert allres["anchors"][0]["match_kinds"] == ["tool"]
+
+
+def test_find_regex_anchors_match_fts_for_simple_term():
+    """For a plain (non-regex-meta) needle, the regex scan and the FTS path
+    produce identical anchors/ordering/match_kinds — only the matcher differs
+    (proves the scan reuses the existing assembly-to-anchor loop)."""
+    c = _conn()
+    if not db._fts5_available(c):
+        _pytest.skip("sqlite build lacks FTS5")
+    _seed_find_session(c)
+    fts = cq.find_in_conversation(c, "s1", "needle", kind="all")
+    rx = cq.find_in_conversation(c, "s1", "needle", kind="all", regex=True)
+    assert rx["anchors"] == fts["anchors"]
+    assert rx["total"] == fts["total"]
+    assert rx["kind"] == fts["kind"]
+
+
+def test_find_regex_bounded_query_length():
+    """Codex P2 bounded scan: an over-long pattern/query is rejected (returns
+    an empty result rather than scanning) — the cap is ``_FIND_REGEX_MAX_LEN``."""
+    c = _conn()
+    _msg(c, id=1, session_id="s1", uuid="u1", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="a" * 50, cwd="/home/u/proj")
+    over = "a" * (cq._FIND_REGEX_MAX_LEN + 1)
+    out = cq.find_in_conversation(c, "s1", over, kind="all", regex=True)
+    assert out["total"] == 0 and out["anchors"] == []
+    # at the cap it still scans normally.
+    at = cq.find_in_conversation(c, "s1", "a" * 10, kind="all", regex=True)
+    assert at["total"] == 1
+
+
+def test_find_regex_unknown_session_returns_none():
+    """The unknown-session → None contract holds on the scan path too."""
+    c = _conn()
+    assert cq.find_in_conversation(c, "nope", "x", regex=True) is None
+
+
+def test_find_regex_empty_query_returns_empty():
+    c = _conn()
+    _seed_find_session(c)
+    out = cq.find_in_conversation(c, "s1", "   ", regex=True)
+    assert out is not None
+    assert out["anchors"] == [] and out["total"] == 0
+
+
+def test_find_case_scan_honors_kind_entry_type():
+    """The scan honors ``_KIND_ENTRY_TYPE`` like the FTS/LIKE path: a
+    ``kind='prompts'`` scan matches only human rows, ``kind='assistant'`` only
+    assistant rows."""
+    c = _conn()
+    _msg(c, id=1, session_id="s1", uuid="hu", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="needle prompt", cwd="/home/u/proj")
+    _msg(c, id=2, session_id="s1", uuid="as", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="needle reply", model=_MODEL, msg_id="m1", req_id="r1",
+         cwd="/home/u/proj")
+    pr = cq.find_in_conversation(c, "s1", "needle", kind="prompts", case=True)
+    assert [a["uuid"] for a in pr["anchors"]] == ["hu"]
+    asst = cq.find_in_conversation(c, "s1", "needle", kind="assistant", case=True)
+    assert [a["uuid"] for a in asst["anchors"]] == ["as"]
+
+
 # ---- #191: read-time recovery of already-ingested injected user lines ----
 import json as _json191
 

@@ -7,7 +7,7 @@ import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { FindBar } from './FindBar';
-import { HighlightContext } from './HighlightContext';
+import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
@@ -127,7 +127,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     return { kind: 'tail' };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #205 S1 — the ephemeral mobile outline flag + the effective open-state. On
@@ -156,7 +156,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const markersEnabled = useSyncExternalStore(subscribeStore, () =>
     selectMarkersEnabled(getState()),
   );
-  const [findTerms, setFindTerms] = useState<string[] | null>(null);
+  const [findTerms, setFindTerms] = useState<HighlightTerms | null>(null);
   // Live closure to the find bar's cursor stepper (n/N drive it while the bar
   // is open + the input is blurred). FindBar assigns its `step` here each render.
   const findStepRef = useRef<((delta: number) => void) | null>(null);
@@ -1343,12 +1343,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const jumpToLastRef = useRef(jumpToLast);
   jumpToLastRef.current = jumpToLast;
 
-  // #177 S6 — the find bar reports its DEBOUNCED needle here; split into
-  // highlight terms (whitespace-split, empties dropped) for the prose marks.
-  // Stable identity so FindBar's onTermsChange effect doesn't re-fire per render.
-  const onFindTermsChange = useCallback((terms: string) => {
+  // #177 S6 / #217 S4 — the find bar reports its DEBOUNCED needle + the case
+  // flag here; split into highlight terms (whitespace-split, empties dropped)
+  // for the prose marks. The bar passes '' in regex mode so marks are
+  // suppressed there (decision b). Stable identity so FindBar's onTermsChange
+  // effect doesn't re-fire per render.
+  const onFindTermsChange = useCallback((terms: string, caseSensitive: boolean) => {
     const split = terms.split(/\s+/).filter(Boolean);
-    setFindTerms(split.length ? split : null);
+    setFindTerms(split.length ? { terms: split, caseSensitive } : null);
   }, []);
 
   // #177 S6 — close-restore: return keyboard focus to the thread so j/k resume.
@@ -1564,7 +1566,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             className="conv-find-toggle"
             aria-pressed={convFindOpen}
             aria-label="Find in conversation"
-            title="Find in conversation (/)"
+            title="Find in conversation (/ or ⌘F / Ctrl+F)"
             onClick={toggleFind}
           ><SearchIcon /> Find</button>
           {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
@@ -1589,6 +1591,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           onClose={onFindClose}
           onTermsChange={onFindTermsChange}
           stepRef={findStepRef}
+          tailRevision={tailRevision}
         />
       )}
       <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>

@@ -7885,9 +7885,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
         P1-1: validates against ``_CONV_FIND_KINDS`` (NOT the search set), so the
         cross-session-only ``kind=title``/``files`` return 400 here, never a 500.
+
+        #217 S4 / I-1.2: ``regex``/``case`` are truthy params. An invalid regex
+        is PRE-COMPILED here, BEFORE dispatching to the kernel — exactly as the
+        detail route pre-validates ``after/before/tail`` — because
+        ``_run_conversation_query`` collapses every kernel exception to a 500, so
+        a ``re.error`` from the kernel's ``re.compile`` would otherwise leak as a
+        500 instead of the actionable 400 the client maps to "invalid regex".
         """
         if not self._require_transcripts_allowed():
             return
+        import re as _re
         import urllib.parse as _u
         session_id = _u.unquote(path[len("/api/conversation/"):-len("/find")])
         if not session_id:
@@ -7898,9 +7906,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         kind = self._parse_search_kind(q, valid=_CONV_FIND_KINDS)
         if kind is None:
             return
+        regex = _qs_str(q, "regex", None) in ("1", "true", "yes")
+        case = _qs_str(q, "case", None) in ("1", "true", "yes")
+        # Pre-validate the regex HERE (Codex P1): the kernel compiles the same
+        # pattern, but its ``re.error`` would be swallowed into the generic 500
+        # envelope below. Compiling first turns a bad pattern into a clean 400.
+        if regex:
+            try:
+                _re.compile(query, 0 if case else _re.IGNORECASE)
+            except _re.error as e:
+                self._respond_json(400, {"error": f"invalid regex: {e}"})
+                return
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().find_in_conversation(
-                conn, session_id, query, kind=kind),
+                conn, session_id, query, kind=kind, regex=regex, case=case),
             "/api/conversation/find")
         if not ok:
             return

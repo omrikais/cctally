@@ -112,6 +112,32 @@ describe('useConversation', () => {
     expect(result.current.hasMore).toBe(false);
   });
 
+  it('exposes a monotonic tailRevision bumped on each successful pollTail merge — including an overlap-window mutation that does NOT change items.length (#217 S4 / I-1.6 Codex P1)', async () => {
+    // Page 1: it1+it2 fully paged.
+    mockOnce(detail([it1, it2], null, { cost_usd: 1 }));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const rev0 = result.current.tailRevision;
+
+    // A live tail re-returns the SAME two ids but with it2 REPLACED in place
+    // (a fold/update into an already-delivered turn — its text changed). The
+    // length is UNCHANGED (2 → 2), yet the find corpus changed: tailRevision
+    // MUST still bump. (items.length as the signal would miss this — the P1 trap.)
+    const it2mut = { ...it2, text: 'yo (folded skill body added)', cost_usd: 2 };
+    mockOnce(detail([it1, it2mut], null, { cost_usd: 2 }));
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items[1].text).toBe('yo (folded skill body added)'));
+    expect(result.current.detail?.items).toHaveLength(2);             // length unchanged
+    expect(result.current.tailRevision).toBeGreaterThan(rev0);        // but revision bumped
+
+    // A genuinely-new append also bumps it (monotonic).
+    const rev1 = result.current.tailRevision;
+    mockOnce(detail([it1, it2mut, it3], null, { cost_usd: 3 }));
+    await act(async () => { bumpTick(rerender, 't2'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+    expect(result.current.tailRevision).toBeGreaterThan(rev1);
+  });
+
   it('refreshes last_anchor when a live tail append adds a new final turn (jump-to-latest staleness)', async () => {
     // REGRESSION (jump-to-latest stale anchor): the "Latest ↓" control jumps to
     // detail.last_anchor. pollTail's partial merge refreshed items/cost/models/

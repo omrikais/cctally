@@ -4,6 +4,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useConversationOutline } from '../hooks/useConversationOutline';
+import { useFindHotkey } from '../hooks/useFindHotkey';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
 import { ConversationReader } from './ConversationReader';
@@ -34,6 +35,9 @@ export function ConversationsView() {
   const { outline } = useConversationOutline(selected);
 
   useKeymap(CONVERSATIONS_BINDINGS);
+  // #217 S4 / I-1.5 — Cmd/Ctrl+F intercept (capture-phase; the central keymap
+  // bails on meta/ctrl). Mounted here so it lives only while this view is up.
+  useFindHotkey();
 
   if (!transcriptsEnabled(env)) {
     return (

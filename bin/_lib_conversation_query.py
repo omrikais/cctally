@@ -2781,6 +2781,14 @@ def _kind_match_expr(kind, fts_q):
 
 _FIND_ANCHOR_CAP = 500
 
+# #217 S4 / I-1.1: bound the regex/case Python-scan (Codex P2, ReDoS/perf).
+# An over-long pattern/query is rejected outright (empty result, no scan); each
+# scanned column value is also clipped before the predicate runs so a single
+# huge tool result can't pin a catastrophic-backtracking regex. Best-effort —
+# not a full ReDoS defense, but it bounds the worst case to a fixed budget.
+_FIND_REGEX_MAX_LEN = 1000
+_FIND_SCAN_TEXT_CAP = 200_000
+
 # Which physical-row columns the find match probes per kind, and the badge label
 # each non-prose column contributes. ``text`` maps to the synthetic ``prose``
 # label so a prose-only match still anchors a turn but never badges.
@@ -2795,7 +2803,8 @@ _FIND_KIND_COLUMNS = {
 
 
 def find_in_conversation(conn, session_id, query, *, kind="all",
-                         fts_available=None, cap=_FIND_ANCHOR_CAP):
+                         fts_available=None, cap=_FIND_ANCHOR_CAP,
+                         regex=False, case=False):
     """Document-ordered rendered-turn anchors for in-conversation find (#177 S6).
 
     Anchor identity is rendered-turn identity (spec F1): the FTS/LIKE match for
@@ -2812,7 +2821,24 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
 
     P1-1: validates against ``_FIND_KINDS`` (NOT ``_SEARCH_KINDS``), so the
     cross-session-only ``title``/``files`` kinds raise ValueError here (the route
-    → 400) rather than reaching ``_FIND_KIND_COLUMNS[kind]`` and KeyError → 500."""
+    → 400) rather than reaching ``_FIND_KIND_COLUMNS[kind]`` and KeyError → 500.
+
+    #217 S4 / I-1.1 — ``regex`` / ``case``: when either is set the FTS/LIKE fast
+    path is bypassed for a **physical-row Python scan** of ``conversation_messages``
+    (Codex P0 — *not* the rendered ``_assemble_session`` items, which drop the
+    ``search_tool``/``search_thinking`` corpus). The scan reuses the SAME column
+    derivation the FTS path matches on (``_find_kind_columns(kind, "full")`` +
+    ``_KIND_ENTRY_TYPE``) and produces the SAME ``{uuid -> labels}`` map, then
+    feeds the SAME assembly-to-anchor loop, so anchors / ordering / member_uuids /
+    match_kinds / the cap are byte-identical to the FTS path — only the matcher
+    differs. ``case`` only → case-sensitive substring (``mode == "like"``);
+    ``regex`` → per-row ``re.search`` compiled once (``re.IGNORECASE`` unless
+    ``case``; ``mode == "regex"``). Because the scan reads the full corpus
+    columns, ``search_depth == "full"`` — regex/case is NOT gated by the
+    prose-only split-index window. The scan is bounded by ``_FIND_REGEX_MAX_LEN``
+    (query/pattern length) and ``_FIND_SCAN_TEXT_CAP`` (per-row scanned text).
+    Default ``regex=False, case=False`` leaves every existing response
+    byte-stable (the ``_find_matched_rows`` path is untouched)."""
     if kind not in _FIND_KINDS:
         raise ValueError(f"unknown kind: {kind}")
     # Cheap existence probe (one indexed SELECT) BEFORE the full assembly, so an
@@ -2827,27 +2853,55 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
     if fts_available is None:
         fts_available = not _fts_flag_unavailable(conn)
     q = (query or "").strip()
+    # #217 S4 / I-1.1: a regex/case request scans the full corpus columns, so it
+    # reports search_depth "full" regardless of the prose-only split-index state,
+    # and is never blocked by it (the scan reads the base table, not the FTS).
+    scan = bool(regex or case)
+    eff_depth = "full" if scan else depth
     base = {"total": 0, "anchors": [], "anchors_truncated": False,
-            "search_depth": depth, "kind": kind,
-            "mode": "fts" if fts_available else "like"}
-    if not q or (depth == "prose-only" and kind in ("tools", "thinking")):
+            "search_depth": eff_depth, "kind": kind,
+            "mode": ("regex" if regex else "like") if scan
+                    else ("fts" if fts_available else "like")}
+    if not q:
         return base
-    # U2 (#217 S1): run the match probe BEFORE assembly so a non-empty query that
-    # matches ZERO rows in this session returns early — skipping the full
-    # `_assemble_session` walk a no-result find used to pay. The two functions are
-    # independent (neither consumes the other's output); a non-empty match still
-    # assembles, since the uuid → member_uuids anchor mapping needs the items.
-    # `mode` is taken from the match probe (it may fall through to LIKE on an FTS
-    # error) so the empty-match base carries the actually-used mode, not the
-    # `fts_available` default — byte-identical to the prior post-assembly answer.
-    mode, matched = _find_matched_rows(
-        conn, session_id, q, kind, depth, fts_available)
+    if scan:
+        # Bound the scan (Codex P2): reject an over-long pattern/query outright
+        # rather than risk a catastrophic-backtracking regex over the corpus.
+        if len(q) > _FIND_REGEX_MAX_LEN:
+            return base
+        mode = "regex" if regex else "like"
+        matched = _find_matched_scan(conn, session_id, q, kind, regex, case)
+    else:
+        if depth == "prose-only" and kind in ("tools", "thinking"):
+            return base
+        # U2 (#217 S1): run the match probe BEFORE assembly so a non-empty query
+        # that matches ZERO rows in this session returns early — skipping the full
+        # `_assemble_session` walk a no-result find used to pay. The two functions
+        # are independent (neither consumes the other's output); a non-empty match
+        # still assembles, since the uuid → member_uuids anchor mapping needs the
+        # items. `mode` is taken from the match probe (it may fall through to LIKE
+        # on an FTS error) so the empty-match base carries the actually-used mode,
+        # not the `fts_available` default — byte-identical to the prior
+        # post-assembly answer.
+        mode, matched = _find_matched_rows(
+            conn, session_id, q, kind, depth, fts_available)
     if not matched:
         return {**base, "mode": mode}
     asm = _assemble_session(conn, session_id)
     if asm is None:
         return None
-    # matched: {uuid -> set of labels in {"prose", "tool", "thinking"}}
+    anchors = _find_anchors_from_matched(asm, matched)
+    total = len(anchors)
+    return {**base, "mode": mode, "total": total,
+            "anchors": anchors[:cap], "anchors_truncated": total > cap}
+
+
+def _find_anchors_from_matched(asm, matched):
+    """Map the ``{uuid -> set(labels)}`` match map onto document-ordered
+    rendered-turn anchors (shared by the FTS/LIKE path and the regex/case scan,
+    so the two can never diverge on ordering / member folding / match_kinds).
+    ``matched`` labels are in ``{"prose", "tool", "thinking"}``; the synthetic
+    ``prose`` label anchors a turn but never badges."""
     anchors = []
     for it in asm["items"]:
         hit_kinds = set()
@@ -2861,9 +2915,47 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
             anchors.append({
                 "uuid": it["anchor"]["uuid"],
                 "match_kinds": sorted(k for k in hit_kinds if k != "prose")})
-    total = len(anchors)
-    return {**base, "mode": mode, "total": total,
-            "anchors": anchors[:cap], "anchors_truncated": total > cap}
+    return anchors
+
+
+def _find_matched_scan(conn, session_id, q, kind, regex, case):
+    """({uuid -> {labels}}) for a regex/case PHYSICAL-ROW scan (Codex P0). Reads
+    the same corpus columns the FTS path matches on (``_find_kind_columns(kind,
+    "full")``) over the base ``conversation_messages`` rows — NOT the rendered
+    ``_assemble_session`` items, which drop the ``search_tool``/``search_thinking``
+    columns. Honors ``_KIND_ENTRY_TYPE`` exactly like ``_find_matched_like``.
+    Each scanned value is clipped to ``_FIND_SCAN_TEXT_CAP`` before the predicate
+    so one huge tool result can't pin the regex engine."""
+    cols = _find_kind_columns(kind, "full")
+    if not cols:
+        return {}
+    et = _KIND_ENTRY_TYPE.get(kind)
+    et_pred = " AND entry_type = ?" if et is not None else ""
+    et_args = (et,) if et is not None else ()
+    if regex:
+        rx = re.compile(q, 0 if case else re.IGNORECASE)
+        pred = lambda text: rx.search(text) is not None
+    elif case:
+        pred = lambda text: q in text
+    else:  # case-insensitive substring (not reached via the public API today,
+        # which only scans when regex or case is set — kept for completeness).
+        ql = q.lower()
+        pred = lambda text: ql in text.lower()
+    out = {}
+    col_list = ", ".join(c for c, _ in cols)
+    rows = conn.execute(
+        f"SELECT uuid, {col_list} FROM conversation_messages "
+        f"WHERE session_id = ?{et_pred}",
+        (session_id, *et_args)).fetchall()
+    for row in rows:
+        u = row[0]
+        for idx, (_col, label) in enumerate(cols):
+            val = row[idx + 1]
+            if not val:
+                continue
+            if pred(val[:_FIND_SCAN_TEXT_CAP]):
+                out.setdefault(u, set()).add(label)
+    return out
 
 
 def _find_matched_rows(conn, session_id, q, kind, depth, fts_available):

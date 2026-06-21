@@ -49,6 +49,13 @@ export interface UseConversation {
   loadPrev: () => Promise<boolean>;
   loadToTarget: (uuid: string) => Promise<void>;
   jumpToLatest: () => Promise<void>;
+  // #217 S4 / I-1.6 — a monotonic counter bumped on each successful pollTail
+  // merge (live-tail growth). The open find bar keys its auto-refetch on this
+  // (debounced) so tail growth re-runs the query. It is deliberately NOT
+  // `detail.items.length`: pollTail can REPLACE/DELETE items inside the overlap
+  // window without changing the length while the find corpus still changed
+  // (Codex P1), so a length-keyed signal would silently miss those mutations.
+  tailRevision: number;
 }
 
 const PAGE = 500;
@@ -79,6 +86,8 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openScrollIntent, setOpenScrollIntent] = useState<'top' | 'bottom' | null>(null);
+  // #217 S4 / I-1.6 — monotonic live-tail merge counter (see UseConversation).
+  const [tailRevision, setTailRevision] = useState(0);
   // #183 — the session id the current `detail` was loaded FOR (see the derive
   // guard below). State (not a ref) so the page-1 resolve re-renders with it.
   const [loadedSessionId, setLoadedSessionId] = useState<string | null>(null);
@@ -424,6 +433,12 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
           page: prev.page,                                             // stays fully-paged at the bottom; top edge preserved
         } : prev));
+        // #217 S4 / I-1.6 — a successful merge bumps the monotonic revision so a
+        // mounted find bar re-runs its query against the grown corpus. Bumped
+        // even when `merged` length is unchanged (an in-place overlap-window
+        // replace/delete still changes the find corpus) — the explicit reason it
+        // is NOT keyed off items.length (Codex P1).
+        setTailRevision((r) => r + 1);
         if (appended === 0 || body.page.next_after == null) break;
       }
     } finally {
@@ -458,5 +473,6 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     detail: exposedDetail, loading: exposedLoading, error,
     hasMore, hasPrev, prevBefore, openScrollIntent,
     loadMore, loadPrev, loadToTarget, jumpToLatest,
+    tailRevision,
   };
 }
