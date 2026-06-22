@@ -7449,6 +7449,24 @@ mark.current {
 @media (prefers-reduced-motion: reduce) {
   .conv-item-actions { transition: none; }
 }
+/* #217 S6 F4 — per-turn bookmark control + note editor. The toggle reuses the
+   .conv-copy-btn shell (so it inherits the focus ring + the #205 mobile 44×44
+   ::before hit area); the pressed (bookmarked) state paints the star with the
+   amber accent. The note toggle is a compact dim caption; the inline editor is a
+   small bordered input. */
+.conv-bookmark { display: inline-flex; align-items: center; gap: 4px; }
+.conv-bookmark-btn[aria-pressed='true'] { color: var(--accent-amber); }
+.conv-bookmark-note-toggle {
+  background: none; border: 0; color: var(--text-dim); cursor: pointer;
+  font-size: 12px; max-width: 16ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-height: 24px;
+}
+.conv-bookmark-note-toggle:hover { color: var(--text); }
+.conv-bookmark-note-input {
+  font: inherit; font-size: 12px; padding: 2px 6px; min-height: 24px;
+  border: 1px solid var(--border-soft); border-radius: 4px;
+  background: var(--panel-bg); color: var(--text);
+}
 /* #192 — a HUMAN bubble floats its copy/permalink actions into the bordered
    box's top-right corner instead of reserving an always-present (but
    opacity:0) flow row. A short one-line "You" prompt otherwise carried that

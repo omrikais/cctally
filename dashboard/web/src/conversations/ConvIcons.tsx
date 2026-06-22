@@ -162,6 +162,27 @@ export function DocumentIcon() {
   );
 }
 
+// #217 S6 F4 — per-turn bookmark glyphs. The hollow star is the unbookmarked
+// state (stroke-only, matching every other glyph); the filled star is the
+// bookmarked state (it overrides `fill` to `currentColor` so the accent rule on
+// the pressed button paints it solid). The adjacent aria-label on the button
+// carries the accessible meaning ("Bookmark this turn" / "Remove bookmark").
+export function BookmarkIcon() {
+  return (
+    <Svg>
+      <path d="M12 3l2.6 5.3 5.8.9-4.2 4.1 1 5.8L12 17.8 6.8 19.2l1-5.8L3.6 9.2l5.8-.9Z" />
+    </Svg>
+  );
+}
+
+export function BookmarkFilledIcon() {
+  return (
+    <Svg fill="currentColor">
+      <path d="M12 3l2.6 5.3 5.8.9-4.2 4.1 1 5.8L12 17.8 6.8 19.2l1-5.8L3.6 9.2l5.8-.9Z" />
+    </Svg>
+  );
+}
+
 export function CopyIcon() {
   return (
     <Svg>
