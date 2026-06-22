@@ -1593,8 +1593,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               total + a progress bar. The reader computes the prefix-sum keyed off
               the scroll-sync current turn; `approx` flags a lower bound when
               earlier pages aren't loaded. Hidden for a costless session
-              (total === 0). First control in the row. */}
-          <CumulativeCostChip cumulative={cumCost.cost} total={detail.cost_usd} approx={cumCost.approx} />
+              (total === 0), and while no current turn is established yet
+              (`pending` — #226) to suppress the transient $0.00 flash. First
+              control in the row. */}
+          <CumulativeCostChip cumulative={cumCost.cost} total={detail.cost_usd} approx={cumCost.approx} pending={currentTurnUuid == null} />
           {/* #217 S5 F7 — task-completion chip. Always visible (regardless of
               scroll position) when the main thread's final task snapshot is fully
               done; clicking jumps to the snapshot turn. Hidden otherwise.

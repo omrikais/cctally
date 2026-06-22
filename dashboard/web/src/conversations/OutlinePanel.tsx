@@ -309,17 +309,19 @@ function OutlineStatsCard({
 // rebuilds · ~$X" stat into a navigable list (templated on the session modal's
 // CacheRebuildsSection rows). Fed entirely from props (no global access): the
 // worst-first `rebuilds[]` already on the wire, a uuid→OutlineTurn map for the
-// human label (falling back to "turn" when the uuid isn't in the skeleton), and
-// the display-tz fmtCtx for the rebuild time. Caps at 3 with a "+N more"
-// expander, like the modal. Each row's primary action is the same
-// OPEN_CONVERSATION jump every other outline jump uses; a stale uuid jumps as a
-// graceful no-op.
+// human label (falling back to the indexed "turn N" — #226 — when the turn has
+// no prose label, and to a bare "turn" only when the uuid isn't in the skeleton
+// at all), a uuid→skeleton-index map for that fallback, and the display-tz
+// fmtCtx for the rebuild time. Caps at 3 with a "+N more" expander, like the
+// modal. Each row's primary action is the same OPEN_CONVERSATION jump every
+// other outline jump uses; a stale uuid jumps as a graceful no-op.
 function OutlineCacheRebuilds({
-  sessionId, rebuilds, turnByUuid, fmtCtx,
+  sessionId, rebuilds, turnByUuid, indexByUuid, fmtCtx,
 }: {
   sessionId: string;
   rebuilds: CacheRebuild[];
   turnByUuid: Map<string, OutlineTurn>;
+  indexByUuid: Map<string, number>;
   fmtCtx: FmtCtx;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -329,7 +331,11 @@ function OutlineCacheRebuilds({
     <div className="conv-outline-rebuilds">
       <ul className="conv-rebuild-list">
         {shown.map((r) => {
-          const label = turnByUuid.get(r.uuid)?.label || 'turn';
+          // Prefer the turn's prose label; else the 1-based skeleton index
+          // ("turn N", #226) when the uuid IS in the skeleton; else a bare
+          // "turn" for a genuinely-stale uuid with no index.
+          const idx = indexByUuid.get(r.uuid);
+          const label = turnByUuid.get(r.uuid)?.label || (idx != null ? `turn ${idx + 1}` : 'turn');
           return (
             <li key={r.uuid}>
               <button
@@ -425,6 +431,15 @@ export function OutlinePanel({
     return m;
   }, [outline]);
 
+  // #226 — skeleton index per uuid, for the cache-rebuild label fallback when a
+  // flagged turn has no prose label (`_outline_label` → '' for a tool-only
+  // turn). Mirrors deriveOutline's `turn ${turnIndex + 1}` idiom.
+  const indexByUuid = useMemo(() => {
+    const m = new Map<string, number>();
+    (outline?.turns ?? []).forEach((t, i) => m.set(t.uuid, i));
+    return m;
+  }, [outline]);
+
   const jumpTo = (uuid: string) => {
     const turn = turnByUuid.get(uuid);
     if (turn && focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
@@ -484,6 +499,7 @@ export function OutlinePanel({
                 sessionId={sessionId}
                 rebuilds={outline.stats.cache_failures.rebuilds}
                 turnByUuid={turnByUuid}
+                indexByUuid={indexByUuid}
                 fmtCtx={fmtCtx}
               />
             )}

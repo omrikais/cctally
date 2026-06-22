@@ -19,6 +19,8 @@ describe('cumulativeCostThrough', () => {
     const through2 = cumulativeCostThrough(items, 'u2', { hasPrev: false });
     expect(through2.cost).toBeCloseTo(0.30, 9);
     expect(through2.approx).toBe(false);
+    // Single item, no summation → the cost is IEEE-exact (0.10), so toEqual is
+    // intentional here; contrast the 0.10+0.20 sum above, which needs toBeCloseTo.
     expect(cumulativeCostThrough(items, 'u1', { hasPrev: false })).toEqual({ cost: 0.10, approx: false });
   });
   it('matches the cutoff on a folded member uuid', () => {

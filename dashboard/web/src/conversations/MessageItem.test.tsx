@@ -218,8 +218,10 @@ describe('MessageItem', () => {
     );
     const bar = container.querySelector('.conv-cost-bar') as HTMLElement;
     expect(bar).toBeTruthy();
-    // 0.02 / 0.08 = 0.25 → the fraction var encodes 0.25.
-    expect(bar.style.getPropertyValue('--conv-cost-frac')).toMatch(/0\.25/);
+    // 0.02 / 0.08 = 0.25 → the fraction var encodes 0.25 exactly. Assert the
+    // exact value (not a loose substring — #226), matching the `.toBe('1')`
+    // sub-cent-at-max case below.
+    expect(bar.style.getPropertyValue('--conv-cost-frac')).toBe('0.25');
     // Decorative beyond the precise $-figure in the footer text.
     expect(bar.getAttribute('aria-hidden')).toBe('true');
   });

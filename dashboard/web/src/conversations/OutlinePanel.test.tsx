@@ -522,8 +522,26 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     const o = outline({ stats: stats({ cache_failures: { count: 1, tokens_recreated: 1, est_wasted_usd: 0.10, rebuilds } }) });
     const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
     const row = container.querySelector('.conv-outline-rebuilds .conv-rebuild-jump')!;
-    // No matching turn → the label falls back rather than rendering empty.
+    // No matching turn (no skeleton index) → bare "turn" fallback.
     expect(row.querySelector('.rb-label')!.textContent).toBe('turn');
+  });
+
+  it('uses the indexed "turn N" label when an in-skeleton rebuild turn has no prose label (#226)', () => {
+    // A tool-only assistant turn has label '' server-side (_outline_label → '');
+    // it IS in the skeleton, so the label falls back to its 1-based index, not "turn".
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'fix the bug' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'here is the plan' }),
+        turn({ uuid: 'tool', kind: 'assistant', label: '' }), // index 2
+      ],
+      stats: stats({ cache_failures: { count: 1, tokens_recreated: 1, est_wasted_usd: 0.10, rebuilds: [
+        { uuid: 'tool', subagent_key: null, ts: null, tokens_recreated: 1, est_wasted_usd: 0.10 },
+      ] } }),
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const row = container.querySelector('.conv-outline-rebuilds .conv-rebuild-jump')!;
+    expect(row.querySelector('.rb-label')!.textContent).toBe('turn 3'); // 1-based index 2 → "turn 3"
   });
 
   it('caps the rebuild list at 3 with a "+N more" expander', () => {
