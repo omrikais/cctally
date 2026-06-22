@@ -181,9 +181,7 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
     const jumpTargetsSid = s.conversationJump?.session_id === curr.sid;
     // #217 S7 F10 — comparison is the highest-priority URL state: while a
     // comparison is open, the hash is the compare route regardless of the
-    // anchor sid OPEN_COMPARE also set. Push on entering/changing a comparison;
-    // when it clears, fall through to the single-session/dashboard branches
-    // below (CLOSE/reverse-clear also move sid or view, so they reflect there).
+    // anchor sid OPEN_COMPARE also set. Push on entering/changing a comparison.
     if (curr.cmp && curr.cmp !== prev.cmp) {
       writeUrl(formatHash({ sessionId: null, turnUuid: null, compare: s.compare }), 'push');
       prev = curr;
@@ -192,6 +190,23 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
     if (curr.cmp) {
       // Comparison unchanged (a sibling state edit ticked the store) — never
       // overwrite the compare hash with the anchor's single-session hash.
+      prev = curr;
+      return;
+    }
+    // #217 S7 F10 — a comparison just closed/cleared (prev.cmp set, curr.cmp null).
+    // CLOSE_COMPARE sets ONLY compare=null and leaves the anchor sid + view intact,
+    // so the sid/view branch below would NOT fire and the URL would strand on the
+    // stale compare route. Write the single-session/dashboard hash explicitly. The
+    // reverse-clear actions (OPEN_CONVERSATION/SELECT_CONVERSATION/SET_VIEW) also
+    // clear compare but move sid/view; routing them through here too keeps ONE
+    // clear-write path — carry a jump if one rides along (e.g. an "open in reader"
+    // that closes the comparison and lands on a specific turn).
+    if (prev.cmp && !curr.cmp) {
+      let desired = baseHash(curr.view, curr.sid);
+      if (curr.view === 'conversations' && curr.sid && curr.jumpUuid && jumpTargetsSid) {
+        desired = formatHash(curr.sid, curr.jumpUuid);
+      }
+      writeUrl(desired, 'push');
       prev = curr;
       return;
     }

@@ -73,6 +73,23 @@ describe('installUrlRouting — read path', () => {
     });
   });
 
+  it('boots a compare route to OPEN_COMPARE (#217 S7 F10)', () => {
+    seed('#/conversations/compare/A/B');
+    const { deps, dispatch } = makeStore({ view: 'dashboard' });
+    dispose = installUrlRouting(deps);
+    expect(dispatch).toHaveBeenCalledWith({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+  });
+
+  it('boots a degenerate compare/X/X route to a plain OPEN_CONVERSATION (#217 S7 F10)', () => {
+    seed('#/conversations/compare/X/X');
+    const { deps, dispatch } = makeStore({ view: 'dashboard' });
+    dispose = installUrlRouting(deps);
+    expect(dispatch).toHaveBeenCalledWith({ type: 'OPEN_CONVERSATION', sessionId: 'X' });
+    expect(dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'OPEN_COMPARE' }),
+    );
+  });
+
   it('boots the no-selection route to SET_VIEW conversations + SELECT_CONVERSATION null', () => {
     seed('#/conversations');
     const { deps, dispatch } = makeStore({ view: 'dashboard' });
@@ -136,6 +153,47 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     push.mockClear();
     set({ view: 'dashboard', selectedConversationId: null });
     expect(push).toHaveBeenCalledWith(null, '', '/');
+  });
+
+  it('pushes the compare hash when a comparison opens (#217 S7 F10)', () => {
+    const { deps, set } = makeStore({ view: 'conversations', selectedConversationId: 'A' });
+    dispose = installUrlRouting(deps);
+    seed('#/conversations/A');
+    push.mockClear();
+    set({ compare: { a: 'A', b: 'B' } });
+    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/compare/A/B');
+  });
+
+  it('does NOT overwrite the compare hash on a sibling tick (compare unchanged) (#217 S7 F10)', () => {
+    const { deps, set } = makeStore({
+      view: 'conversations',
+      selectedConversationId: 'A',
+      compare: { a: 'A', b: 'B' },
+    });
+    dispose = installUrlRouting(deps);
+    seed('#/conversations/compare/A/B');
+    push.mockClear();
+    replace.mockClear();
+    set({ conversationJump: { session_id: 'A', uuid: 'u1' } }); // sibling tick, compare unchanged
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it('writes the single-session hash when CLOSE_COMPARE clears compare with sid/view unchanged (#217 S7 F10)', () => {
+    // The load-bearing P1 regression: CLOSE_COMPARE sets ONLY compare=null and
+    // leaves the anchor sid='A' + view='conversations' intact, so the sid/view
+    // branch can't fire — without the explicit clear-write the URL would strand
+    // on #/conversations/compare/A/B while the single reader is shown.
+    const { deps, set } = makeStore({
+      view: 'conversations',
+      selectedConversationId: 'A',
+      compare: { a: 'A', b: 'B' },
+    });
+    dispose = installUrlRouting(deps);
+    seed('#/conversations/compare/A/B');
+    push.mockClear();
+    set({ compare: null }); // CLOSE_COMPARE
+    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/A');
   });
 
   it('replaces with the turn when a jump lands within the same conversation', () => {
