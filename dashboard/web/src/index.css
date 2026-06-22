@@ -6739,6 +6739,11 @@ mark.current {
   background: var(--accent-blue, #60a5fa);
   opacity: calc(0.45 + var(--conv-cost-frac, 0) * 0.55);
 }
+/* #217 S6 F3 — cumulative-cost reader chip ($through / $total + progress bar). */
+.conv-cumcost-chip { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.conv-cumcost-track { display: inline-block; width: 48px; height: 4px; border-radius: 2px; background: var(--panel-bg-2); overflow: hidden; }
+.conv-cumcost-fill { display: block; height: 100%; width: calc(var(--conv-cumcost-frac, 0) * 100%); background: var(--accent-blue, #60a5fa); transition: width 0.2s ease; }
+@media (prefers-reduced-motion: reduce) { .conv-cumcost-fill { transition: none; } }
 /* #177 S5 §6 — eyebrow time `· HH:mm` at the end of an item head / summary.
    Muted, monospace, sized to match the eyebrow label without crowding it. */
 .conv-item-time {

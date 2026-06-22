@@ -12,6 +12,8 @@ import { FocusMoreMenu, type FocusSubagentOption } from './FocusMoreMenu';
 import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
+import { CumulativeCostChip } from './CumulativeCostChip';
+import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
@@ -508,6 +510,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     () => groupSidechains(detail?.items ?? [], detail?.subagent_meta),
     [detail?.items, detail?.subagent_meta],
   );
+  // #217 S6 F3 — the session's heaviest LOADED per-turn cost (the micro-bar
+  // denominator). Max over loaded assistant items; since the windowed pager
+  // accrues items as you page, this is effectively monotonic (a future change
+  // that drops loaded items would need a monotonic ref). Provided ONCE on the
+  // transcript context so memoized MessageItems don't subscribe to recompute it.
+  const sessionMaxTurnCost = useMemo(() => {
+    let m = 0;
+    for (const it of detail?.items ?? []) {
+      if (it.kind === 'assistant' && typeof it.cost_usd === 'number') m = Math.max(m, it.cost_usd);
+    }
+    return m;
+  }, [detail?.items]);
+  // #217 S6 F3 — cumulative cost through the topmost-visible turn for the header
+  // chip. `approx` ≡ hasPrev: any unloaded earlier page makes the prefix-sum a
+  // lower bound (the honesty marker, Codex P1).
+  const cumCost = useMemo(
+    () => cumulativeCostThrough(detail?.items ?? [], currentTurnUuid, { hasPrev: !!hasPrev }),
+    [detail?.items, currentTurnUuid, hasPrev],
+  );
   // #217 S5 E4 — the TOP-LEVEL subagent keys present in the loaded groups, with
   // labels from subagent_meta (kind, then the spawning description) and a key
   // fallback when meta is empty (buckets exist even without meta — Codex P1-4).
@@ -580,9 +601,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // markersEnabled rides along too (cache-failure-markers spec §3) so MessageItem
   // reads the opt-out from context (no per-item store subscription); the provider
   // identity flips only when the opt-out actually changes.
+  // #217 S6 F3 — maxTurnCost rides along too so the per-turn cost micro-bar can
+  // size itself from context (no per-item store subscription); the provider
+  // identity flips when the session's heaviest loaded turn cost changes.
   const transcriptCtx = useMemo(
-    () => ({ sessionId, focusMode, fmtCtx, markersEnabled }),
-    [sessionId, focusMode, fmtCtx, markersEnabled],
+    () => ({ sessionId, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost }),
+    [sessionId, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost],
   );
 
   // Lazy-load when the bottom sentinel scrolls into view.
@@ -1548,6 +1572,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           </div>
         </div>
         <div className="conv-reader-controls">
+          {/* #217 S6 F3 — cumulative-cost chip: $through-current-turn / $session
+              total + a progress bar. The reader computes the prefix-sum keyed off
+              the scroll-sync current turn; `approx` flags a lower bound when
+              earlier pages aren't loaded. Hidden for a costless session
+              (total === 0). First control in the row. */}
+          <CumulativeCostChip cumulative={cumCost.cost} total={detail.cost_usd} approx={cumCost.approx} />
           {/* #217 S5 F7 — task-completion chip. Always visible (regardless of
               scroll position) when the main thread's final task snapshot is fully
               done; clicking jumps to the snapshot turn. Hidden otherwise.
