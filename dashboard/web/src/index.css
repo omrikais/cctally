@@ -5369,6 +5369,9 @@ mark.current {
 /* #217 S5 F7 — completion landmark: a green ✓ cue (the terminal "session
    complete" marker). Same wrapper-coloring pattern as compaction. */
 .conv-outline-entry--completion .conv-outline-entry-glyph { color: var(--accent-green); }
+/* #217 S6 F4 — bookmark landmark: an amber ★ cue. Same wrapper-coloring pattern
+   as compaction/completion. */
+.conv-outline-entry--bookmark .conv-outline-entry-glyph { color: var(--accent-amber); }
 /* #217 S3 E6(a) — per-subagent cost chip on a subagent entry (display-only). */
 .conv-outline-entry-cost {
   flex: 0 0 auto;

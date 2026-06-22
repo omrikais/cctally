@@ -54,7 +54,10 @@ export interface OutlineEntry {
   // 'compaction'); it joins the existing landmark family. #217 S5 F7 —
   // 'completion' (a "✓ Session complete (N tasks)" landmark at the final
   // main-thread task snapshot, emitted only when all_done).
-  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache' | 'compaction' | 'completion';
+  // #217 S6 F4 — 'bookmark' added: a client-only ★ landmark for a bookmarked
+  // turn (entryId `bm:<uuid>`, jump anchor = the bare turn uuid). Emitted by the
+  // bookmark pass below from the `bookmarks` param, NOT from the server skeleton.
+  type: 'human' | 'heading' | 'subagent' | 'error' | 'plan' | 'question' | 'cache' | 'compaction' | 'completion' | 'bookmark';
   label: string;
   // 0 = prompt / pre-prompt landmark; 1 = section landmark. #217 S3 E6(c) — a
   // NESTED subagent (one whose parent is ANOTHER subagent bucket) renders one
@@ -104,6 +107,11 @@ export function deriveOutline(
   // `completion` landmark is emitted at `anchor_uuid` ONLY when `all_done`;
   // null/absent (no main-thread tasks, or an older payload) → no landmark.
   taskCompletion?: OutlineTaskCompletion | null,
+  // #217 S6 F4 — the current session's bookmarks (uuid → { note, ts }), client-
+  // only. A trailing param (the same extra-param pattern taskCompletion uses) so
+  // the section walk is untouched; the bookmark pass runs LAST over the full
+  // skeleton. Absent/empty → byte-identical output (no bookmark entries).
+  bookmarks?: Record<string, { note: string; ts: number }>,
 ): DerivedOutline {
   // 1. Bucket sidechains by subagent_key over the WHOLE list (mirror
   //    groupSidechains resolution; placement differs below).
@@ -323,6 +331,39 @@ export function deriveOutline(
       thinkingCount: 0, toolCount: 0,
       turnIndex: indexOf.get(taskCompletion.anchor_uuid) ?? turns.length,
     });
+  }
+
+  // #217 S6 F4 — bookmark landmarks. Run over the FULL skeleton (independent of
+  // the early subagent-member `continue` in the section walk above) so a bookmark
+  // on a subagent-member turn still appears (Codex P1). Each entry uses
+  // `entryId: bm:<uuid>` (NOT the bare uuid) to avoid a React-key collision with
+  // a coinciding prompt/landmark row that keys on the same uuid; its `uuid` stays
+  // the jump anchor. A stale bookmark (uuid not in the skeleton — e.g. a turn
+  // since compacted away) is skipped. Each bookmark is stable-inserted before the
+  // first existing entry with a strictly greater turnIndex, so the existing
+  // tree/nesting order is untouched.
+  if (bookmarks && Object.keys(bookmarks).length) {
+    const idxOf = new Map<string, number>();
+    turns.forEach((t, i) => idxOf.set(t.uuid, i));
+    const bmEntries: OutlineEntry[] = [];
+    for (const t of turns) {
+      const bm = bookmarks[t.uuid];
+      if (!bm) continue;
+      const turnIndex = idxOf.get(t.uuid) ?? 0;
+      bmEntries.push({
+        entryId: `bm:${t.uuid}`, uuid: t.uuid, type: 'bookmark',
+        label: bm.note || t.label || `turn ${turnIndex + 1}`,
+        depth: 0, error: false, plan: false, question: false,
+        thinkingCount: 0, toolCount: 0, turnIndex,
+      });
+    }
+    for (const bm of bmEntries) {
+      let at = entries.length;
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].turnIndex > bm.turnIndex) { at = i; break; }
+      }
+      entries.splice(at, 0, bm);
+    }
   }
 
   return { entries, sectionByUuid };

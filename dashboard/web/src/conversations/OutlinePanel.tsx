@@ -182,6 +182,9 @@ function entryGlyph(e: OutlineEntry) {
     case 'compaction': return <span className="conv-outline-entry-compaction-glyph" aria-hidden="true">⊟</span>;
     // #217 S5 F7 — the terminal "session complete" landmark leads with a check.
     case 'completion': return <span className="conv-outline-entry-completion-glyph" aria-hidden="true">✓</span>;
+    // #217 S6 F4 — a bookmark landmark leads with a ★ (the
+    // .conv-outline-entry--bookmark rule paints it the amber accent).
+    case 'bookmark': return <span className="conv-outline-entry-bookmark-glyph" aria-hidden="true">★</span>;
     default: return <ToolGenericIcon />;
   }
 }

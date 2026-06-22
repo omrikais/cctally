@@ -481,3 +481,38 @@ describe('deriveOutline task-completion landmark (#217 S5 F7)', () => {
     expect(deriveOutline(turns, undefined).entries.some((e) => e.type === 'completion')).toBe(false);
   });
 });
+
+// #217 S6 F4 — bookmark landmarks. A trailing `bookmarks?` param emits one
+// `bookmark` entry (entryId `bm:<uuid>`) per in-skeleton bookmarked uuid,
+// positioned by turnIndex, with label = note || turn label || "turn N". The
+// bookmark pass runs over the FULL skeleton (independent of deriveOutline's early
+// subagent-member skip), so a bookmark on a subagent-member turn still appears.
+describe('deriveOutline bookmark landmarks (#217 S6 F4)', () => {
+  it('emits bookmark landmarks (entryId bm:uuid, note as label) including on subagent members', () => {
+    const turns = [
+      turn({ uuid: 'h1', kind: 'human', label: 'do the thing' }),
+      turn({ uuid: 's1m', kind: 'assistant', label: 'sub work', subagent_key: 'k1' }),
+    ];
+    const bookmarks = { h1: { note: 'important', ts: 1 }, s1m: { note: '', ts: 2 } };
+    const { entries } = deriveOutline(turns, { k1: { kind: 'general' } as any }, true, null, bookmarks);
+    const bm = entries.filter((e) => e.type === 'bookmark');
+    expect(bm.map((e) => e.entryId).sort()).toEqual(['bm:h1', 'bm:s1m']);
+    expect(bm.find((e) => e.uuid === 'h1')!.label).toBe('important'); // note wins
+    expect(bm.find((e) => e.uuid === 's1m')!.label).toBe('sub work'); // empty note → turn label
+  });
+  it('falls back to "turn N" when both note and turn label are empty', () => {
+    const turns = [turn({ uuid: 'h1', kind: 'human', label: 'x' }), turn({ uuid: 'a1', kind: 'assistant', label: '' })];
+    const { entries } = deriveOutline(turns, undefined, true, null, { a1: { note: '', ts: 1 } });
+    expect(entries.find((e) => e.type === 'bookmark')!.label).toBe('turn 2');
+  });
+  it('skips a stale bookmark whose uuid is not in the skeleton', () => {
+    const turns = [turn({ uuid: 'h1', kind: 'human', label: 'x' })];
+    const { entries } = deriveOutline(turns, undefined, true, null, { gone: { note: 'n', ts: 1 } });
+    expect(entries.some((e) => e.type === 'bookmark')).toBe(false);
+  });
+  it('emits no bookmark entries when the param is empty (unchanged output)', () => {
+    const turns = [turn({ uuid: 'h1', kind: 'human', label: 'x' })];
+    const { entries } = deriveOutline(turns, undefined, true, null, {});
+    expect(entries.some((e) => e.type === 'bookmark')).toBe(false);
+  });
+});
