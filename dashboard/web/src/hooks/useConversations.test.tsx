@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversations } from './useConversations';
-import { _resetForTests, dispatch } from '../store/store';
+import { _resetForTests, dispatch, getState } from '../store/store';
 import { clearRailPrefs } from '../store/conversationRailPrefs';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick
@@ -50,6 +50,20 @@ describe('useConversations', () => {
     expect(result.current.rows[0].session_id).toBe('a');
     expect(result.current.hasMore).toBe(true);
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversations?sort=recent&limit=50&offset=0');
+  });
+
+  it('feeds the shared title cache as rows land (#227)', async () => {
+    const titled = {
+      conversations: [
+        { session_id: 'a', title: 'Refactor the store', project_label: 'p', git_branch: null, started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T01:00:00Z', msg_count: 3, cost_usd: 1.5, models: ['opus'] },
+        { session_id: 'b', title: 'Fix the dashboard', project_label: 'q', git_branch: null, started_utc: '2026-01-02T00:00:00Z', last_activity_utc: '2026-01-02T01:00:00Z', msg_count: 5, cost_usd: 2.0, models: ['sonnet'] },
+      ],
+      page: { next_offset: null, has_more: false },
+    };
+    mockFetchOnce(titled);
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+    await waitFor(() => expect(getState().conversationTitles).toEqual({ a: 'Refactor the store', b: 'Fix the dashboard' }));
   });
 
   it('appends the next page via loadMore (offset cursor)', async () => {

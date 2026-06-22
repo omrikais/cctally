@@ -104,7 +104,7 @@ function Cell({ side, row }: { side: 'a' | 'b'; row: AlignmentRow }) {
   let marker: string | null = null;
   if (row.kind === 'replace') {
     tone = side === 'a' ? 'conv-cmp-cell--del' : 'conv-cmp-cell--add';
-    marker = side === 'a' ? '◆' : '◆';
+    marker = '◆'; // #227 — same diamond on both sides of a replace (tone carries the side)
   } else if (row.kind === 'aOnly') {
     tone = 'conv-cmp-cell--del';
   } else if (row.kind === 'bOnly') {

@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard conversation viewer — the session-comparison header now shows each run's real title.** The ⟷ Compare view's Run A / Run B column headers now show the same derived conversation title the rail shows for each session (sourced from the loaded browse list), falling back to the short `Session <id>` label only when that title hasn't been loaded yet — previously they always rendered the short id. The comparison also stops re-fetching both sessions' outlines on every dashboard refresh: it loads them once as a static snapshot of the two finished runs, trimming redundant `/api/conversation/<id>/outline` requests (e.g. while a compared session is still live elsewhere). (#227)
+
 ## [1.54.0] - 2026-06-22
 
 ### Added

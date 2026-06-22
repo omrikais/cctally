@@ -363,6 +363,12 @@ export interface UIState {
   // SET_VIEW) so a stale comparison can never linger behind the reader.
   compare: { a: string; b: string } | null;
   comparePick: { anchor: string } | null;
+  // #227 — accumulating session_id → title cache, populated by the rail's browse
+  // fetch (useConversations) as pages land. Read by ComparisonView so its header
+  // can prefer the real derived title over the `Session <slug>` fallback without
+  // fetching the browse list itself (which would worsen the #227 outline-refetch
+  // churn). Accumulate-only (never shrinks); not persisted.
+  conversationTitles: Record<string, string>;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -614,6 +620,8 @@ function loadInitial(): UIState {
     // #217 S7 F10 — no comparison / pick in flight at init.
     compare: null,
     comparePick: null,
+    // #227 — empty title cache; filled lazily as the rail browse list loads.
+    conversationTitles: {},
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -819,6 +827,9 @@ export type Action =
   | { type: 'OPEN_COMPARE'; a: string; b: string }
   | { type: 'SWAP_COMPARE' }
   | { type: 'CLOSE_COMPARE' }
+  // #227 — merge a batch of [session_id, title] pairs into the title cache. The
+  // rail's useConversations dispatches it as pages land; non-empty titles only.
+  | { type: 'CACHE_CONVERSATION_TITLES'; titles: Array<[string, string]> }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -1178,6 +1189,22 @@ export function dispatch(action: Action): void {
     case 'CLOSE_COMPARE':
       state = { ...state, compare: null };            // keep selectedConversationId = anchor
       break;
+    case 'CACHE_CONVERSATION_TITLES': {
+      // #227 — merge non-empty titles into the accumulating cache. Skip the
+      // emit entirely when nothing actually changes (the rail re-dispatches the
+      // same rows on every SSE-tick revalidation) so a no-op doesn't churn
+      // subscribers.
+      let changed = false;
+      const next = { ...state.conversationTitles };
+      for (const [sid, title] of action.titles) {
+        if (!sid || !title) continue;
+        if (next[sid] === title) continue;
+        next[sid] = title;
+        changed = true;
+      }
+      if (changed) state = { ...state, conversationTitles: next };
+      break;
+    }
     case 'SET_CONV_CURRENT_TURN':
       // No-op same-uuid ticks FIRST (the scroll-sync observer re-fires the same
       // topmost-visible uuid repeatedly): skip both the emit AND the persistence

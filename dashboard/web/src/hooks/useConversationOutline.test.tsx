@@ -71,6 +71,20 @@ describe('useConversationOutline', () => {
     await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
   });
 
+  it('revalidateOnTick:false suppresses the tick-driven refetch (#227)', async () => {
+    mockOnce(outline('s'));
+    const { result, rerender } = renderHook(() => useConversationOutline('s', { revalidateOnTick: false }));
+    await waitFor(() => expect(result.current.outline?.session_id).toBe('s'));
+    // Initial load fired once.
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+
+    // A generated_at bump must NOT trigger a refetch when opted out.
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await act(async () => { bumpTick(rerender, 't2'); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    expect(result.current.outline?.session_id).toBe('s');
+  });
+
   it('coalesces a tick that lands mid-fetch into exactly one trailing refetch', async () => {
     let resolveSecond!: (body: unknown) => void;
     let fetchCount = 0;

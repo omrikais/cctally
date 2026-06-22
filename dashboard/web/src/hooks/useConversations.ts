@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
-import { getState, subscribeStore } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
 import { filterParams } from './conversationFilterParams';
 import type { ConversationSummary, ConversationsPage } from '../types/conversation';
@@ -212,6 +212,16 @@ export function useConversations(): UseConversations {
       setLoadingMore(false);
     }
   }, [nextOffset]);
+
+  // #227 — feed the shared session_id → title cache as rows land (page 1, every
+  // loadMore append, and each SSE-tick revalidation). The reducer merges
+  // non-empty titles and no-ops when nothing changed, so re-dispatching the same
+  // rows on every tick is cheap. ComparisonView reads this so its header can show
+  // the real derived title without issuing its own browse fetch.
+  useEffect(() => {
+    if (rows.length === 0) return;
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: rows.map((r) => [r.session_id, r.title]) });
+  }, [rows]);
 
   return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry };
 }

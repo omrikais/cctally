@@ -55,3 +55,36 @@ describe('compare slice', () => {
     expect(getState().comparePick).toBeNull();
   });
 });
+
+// #227 — the shared session_id → title cache the rail feeds and the comparison
+// header reads.
+describe('CACHE_CONVERSATION_TITLES', () => {
+  it('starts empty and merges non-empty titles, accumulating across dispatches', () => {
+    expect(getState().conversationTitles).toEqual({});
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'First run'], ['b', 'Second run']] });
+    expect(getState().conversationTitles).toEqual({ a: 'First run', b: 'Second run' });
+    // A later batch merges in new ids without dropping prior ones.
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['c', 'Third run']] });
+    expect(getState().conversationTitles).toEqual({ a: 'First run', b: 'Second run', c: 'Third run' });
+  });
+
+  it('skips empty session ids and empty titles', () => {
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['', 'x'], ['z', ''], ['ok', 'kept']] });
+    expect(getState().conversationTitles).toEqual({ ok: 'kept' });
+  });
+
+  it('preserves the object reference on a no-op (same titles re-dispatched)', () => {
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'First run']] });
+    const before = getState().conversationTitles;
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'First run']] });
+    // Identity is preserved so useSyncExternalStore subscribers don't re-render
+    // on the rail's per-tick re-dispatch of unchanged rows.
+    expect(getState().conversationTitles).toBe(before);
+  });
+
+  it('updates a changed title for an existing id', () => {
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'Old']] });
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'New']] });
+    expect(getState().conversationTitles).toEqual({ a: 'New' });
+  });
+});

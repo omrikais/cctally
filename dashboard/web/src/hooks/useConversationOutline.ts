@@ -9,7 +9,16 @@ import type { ConversationOutline } from '../types/conversation';
 // mid-fetch replays exactly once after it settles. A fetch error degrades
 // gracefully ({outline: null, error}); the reader itself is unaffected. A
 // stale-session response (session switched mid-fetch) is dropped, never exposed.
-export function useConversationOutline(sessionId: string | null) {
+// #227 — `revalidateOnTick` (default true) gates the per-SSE-tick refetch. The
+// reader/OutlinePanel keep the default (a live session's outline must track
+// growth); ComparisonView passes false so its two finished-run snapshots open
+// once and don't re-fetch on every dashboard tick (the comparison never
+// live-tails by design).
+export function useConversationOutline(
+  sessionId: string | null,
+  opts?: { revalidateOnTick?: boolean },
+) {
+  const revalidateOnTick = opts?.revalidateOnTick ?? true;
   const [outline, setOutline] = useState<ConversationOutline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,9 +74,12 @@ export function useConversationOutline(sessionId: string | null) {
   const env = useSnapshot();
   const generatedAt = env?.generated_at ?? '';
   useEffect(() => {
-    if (outlineRef.current) void refetch();
+    // #227 — skip the SSE-tick revalidation entirely when the caller opted out
+    // (ComparisonView's static two-run snapshot). The initial-load effect above
+    // is unaffected, so a non-revalidating caller still gets its first fetch.
+    if (revalidateOnTick && outlineRef.current) void refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generatedAt]);
+  }, [generatedAt, revalidateOnTick]);
 
   return { outline, loading, error };
 }

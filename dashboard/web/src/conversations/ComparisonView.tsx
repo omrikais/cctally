@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { dispatch } from '../store/store';
+import { useMemo, useState, useSyncExternalStore } from 'react';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversationOutline } from '../hooks/useConversationOutline';
 import { useConversationPrompts } from '../hooks/useConversationPrompts';
 import { useIsWide } from '../hooks/useIsWide';
@@ -30,6 +30,14 @@ export function spineFromOutline(outline: ConversationOutline | null): SpineProm
         t.kind === 'human' &&
         t.subagent_key == null &&
         !t.is_sidechain &&
+        // #227 — basis note: the outline carries only the ANSI-stripped `label`
+        // (first non-blank rendered line), whereas the /prompts route keeps a
+        // turn on the non-stripped `_item_text`. A human prompt whose ENTIRE
+        // text is ANSI/control chars would be kept by /prompts but dropped here,
+        // diverging the Prompts count + alignment rows. That input is
+        // unreachable for real human prompts (a human prompt always carries
+        // visible text), so the spine stays on the stripped `label` the outline
+        // already ships rather than refetching raw text just to match the edge.
         (t.label ?? '').trim() !== '',
     )
     .map((t) => ({ uuid: t.uuid, label: t.label }));
@@ -41,26 +49,37 @@ function headerOf(
   sessionId: string,
   outline: ConversationOutline | null,
   ctx: HeaderCtx,
+  titles: Record<string, string>,
 ): SideHeader {
-  // The outline carries no title — fall back to a short session id (the rail
-  // ConversationSummary.title would be preferred when to hand, but the view
-  // doesn't fetch the browse list). Date from the first turn's ts; model from
-  // the stats.models keys.
+  // #227 — prefer the real derived title from the shared rail title cache (the
+  // spec's "title from the rail conversations list if loaded"); fall back to a
+  // short session id when the rail hasn't loaded it (e.g. a cold-boot compare
+  // from a pasted URL, or the mobile flow where the rail is hidden). The outline
+  // itself carries no title. Date from the first turn's ts; model from the
+  // stats.models keys.
+  const cachedTitle = titles[sessionId]?.trim();
   const date = outline?.turns[0]?.ts ? fmt.dateShort(outline.turns[0].ts, ctx) : null;
   const models = Object.keys(outline?.stats.models ?? {});
   return {
-    title: `Session ${sessionId.slice(0, 8)}`,
+    title: cachedTitle ? cachedTitle : `Session ${sessionId.slice(0, 8)}`,
     date: date ?? null,
     model: models.length ? models.join(', ') : null,
   };
 }
 
 export function ComparisonView({ a, b }: { a: string; b: string }) {
-  const outA = useConversationOutline(a);
-  const outB = useConversationOutline(b);
+  // #227 — static snapshot of two finished runs (no live-tail by design), so the
+  // outline hooks skip per-SSE-tick revalidation: the comparison opens once and
+  // stays put instead of re-fetching both /outline endpoints ~30+ times a minute
+  // while a compared session live-tails elsewhere.
+  const outA = useConversationOutline(a, { revalidateOnTick: false });
+  const outB = useConversationOutline(b, { revalidateOnTick: false });
   const wide = useIsWide();
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  // #227 — the shared rail title cache (populated by useConversations); lets the
+  // header show the real derived title without fetching the browse list here.
+  const titles = useSyncExternalStore(subscribeStore, () => getState().conversationTitles);
 
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   // Lazily load full prompt text once ANY row is expanded (per side). Both
@@ -83,8 +102,8 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
   return (
     <div className={`conv-cmp ${wide ? 'conv-cmp--wide' : 'conv-cmp--unified'}`}>
       <ComparisonHeader
-        a={headerOf(a, outA.outline, ctx)}
-        b={headerOf(b, outB.outline, ctx)}
+        a={headerOf(a, outA.outline, ctx, titles)}
+        b={headerOf(b, outB.outline, ctx, titles)}
         onSwap={() => dispatch({ type: 'SWAP_COMPARE' })}
         onClose={() => dispatch({ type: 'CLOSE_COMPARE' })}
       />

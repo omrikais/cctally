@@ -68,6 +68,19 @@ describe('ComparisonView', () => {
     expect(screen.getByText('use fixtures')).toBeInTheDocument();
   });
 
+  it('header prefers a cached rail title, else falls back to the session slug (#227)', async () => {
+    mockFetch();
+    // Seed the shared rail title cache for A only; B has no cached title.
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['A', 'Refactor the store']] });
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    render(<ComparisonView a="A" b="B" />);
+    await waitFor(() => expect(screen.getByText(/Comparing/i)).toBeInTheDocument());
+    // A: real derived title from the cache.
+    expect(screen.getByText('Refactor the store')).toBeInTheDocument();
+    // B: no cached title → `Session <slug>` fallback (slug of 'B' is 'B').
+    expect(screen.getByText('Session B')).toBeInTheDocument();
+  });
+
   it('swap dispatches SWAP_COMPARE', async () => {
     mockFetch();
     dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });

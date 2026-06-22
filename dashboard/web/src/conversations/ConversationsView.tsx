@@ -38,7 +38,10 @@ export function ConversationsView() {
   // hook owns its own SSE-tick revalidation; a null `selected` yields a null
   // outline. Shared with the reader (toggle button + scroll-sync registration in
   // Tasks 4/5) and the OutlinePanel (third grid column / mobile slide-over).
-  const { outline } = useConversationOutline(selected);
+  // #227 — pass null while a comparison is open: the compare branch returns
+  // before `outline` is consumed, so this hook would otherwise double-fetch A's
+  // outline (selected === compare.a) alongside ComparisonView's own A hook.
+  const { outline } = useConversationOutline(compare !== null ? null : selected);
 
   useKeymap(CONVERSATIONS_BINDINGS);
   // #217 S4 / I-1.5 — Cmd/Ctrl+F intercept (capture-phase; the central keymap
