@@ -16,7 +16,7 @@ describe('ExportMenu', () => {
 
     render(<ExportMenu sessionId="s1" title="My Sess" />);
     fireEvent.click(screen.getByRole('button', { name: /export/i }));
-    fireEvent.click(screen.getByRole('button', { name: /whole transcript.*copy/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /whole transcript.*copy/i }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -41,7 +41,7 @@ describe('ExportMenu', () => {
 
     render(<ExportMenu sessionId="s1" title="My Sess" />);
     fireEvent.click(screen.getByRole('button', { name: /export/i }));
-    fireEvent.click(screen.getByRole('button', { name: /replay recipe.*download/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /replay recipe.*download/i }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -58,6 +58,63 @@ describe('ExportMenu', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
     expect(screen.queryByRole('menu')).toBeNull();
+  });
+
+  // #224 — APG menu keyboard pattern: the action buttons are role="menuitem"
+  // with roving tabindex; Arrow/Home/End move focus, focus enters the menu on
+  // open.
+  describe('keyboard (APG menu pattern)', () => {
+    const open = () => {
+      render(<ExportMenu sessionId="s1" title="t" />);
+      fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    };
+
+    it('moves focus to the first menuitem on open', () => {
+      open();
+      expect(document.activeElement).toBe(
+        screen.getByRole('menuitem', { name: /whole transcript.*copy/i }),
+      );
+    });
+
+    it('roving tabindex: only the active menuitem is tabbable', () => {
+      open();
+      const first = screen.getByRole('menuitem', { name: /whole transcript.*copy/i });
+      const second = screen.getByRole('menuitem', { name: /whole transcript.*download/i });
+      expect(first.getAttribute('tabindex')).toBe('0');
+      expect(second.getAttribute('tabindex')).toBe('-1');
+      fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowDown' });
+      expect(first.getAttribute('tabindex')).toBe('-1');
+      expect(second.getAttribute('tabindex')).toBe('0');
+    });
+
+    it('ArrowDown advances roving focus to the next menuitem', () => {
+      open();
+      fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowDown' });
+      expect(document.activeElement).toBe(
+        screen.getByRole('menuitem', { name: /whole transcript.*download/i }),
+      );
+    });
+
+    it('ArrowUp from the first menuitem wraps to the last', () => {
+      open();
+      fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowUp' });
+      expect(document.activeElement).toBe(
+        screen.getByRole('menuitem', { name: /replay recipe.*download/i }),
+      );
+    });
+
+    it('End jumps to the last menuitem, Home back to the first', () => {
+      open();
+      const menu = screen.getByRole('menu');
+      fireEvent.keyDown(menu, { key: 'End' });
+      expect(document.activeElement).toBe(
+        screen.getByRole('menuitem', { name: /replay recipe.*download/i }),
+      );
+      fireEvent.keyDown(menu, { key: 'Home' });
+      expect(document.activeElement).toBe(
+        screen.getByRole('menuitem', { name: /whole transcript.*copy/i }),
+      );
+    });
   });
 
   it('slugifyTitle strips non-ascii/control and caps, falling back to session id', () => {

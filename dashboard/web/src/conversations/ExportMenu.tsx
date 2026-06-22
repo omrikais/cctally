@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useCopy } from './useCopy';
+import { nextRovingIndex } from './menuKeyboard';
 
 // #217 S5 §4 (F1/F5) — the reader-header "Export ▾" menu. Lists the four
 // Markdown export scopes, each with a Copy (clipboard) and a Download (.md
@@ -12,6 +13,12 @@ import { useCopy } from './useCopy';
 // captured at open and restored to the trigger on close, ≥44px touch targets,
 // reduced-motion via CSS only. Local component state (no store slot) per the
 // plan, with its own outside-click + Escape close.
+//
+// APG menu keyboard pattern (#224): the eight action buttons are role="menuitem"
+// with a single roving tabindex (only the active item is Tab-reachable). Opening
+// moves focus into the menu; Arrow Up/Down cycle (wrapping), Home/End jump to the
+// ends, Escape closes and restores focus to the trigger. Index math is the pure
+// `nextRovingIndex` helper; this component owns the imperative `.focus()`.
 
 type Scope = 'all' | 'prompts' | 'chat' | 'recipe';
 
@@ -65,6 +72,17 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
   const [busy, setBusy] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const restoreRef = useRef<Element | null>(null);
+  // Roving-focus state for the menuitems (flat index over the scope×{copy,download}
+  // grid). A mirroring ref lets the focus-on-open effect read the latest value
+  // without re-subscribing to it.
+  const itemCount = SCOPES.length * 2;
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const activeIndexRef = useRef(0);
+  const setActive = useCallback((i: number) => {
+    activeIndexRef.current = i;
+    setActiveIndex(i);
+  }, []);
   // Belt-and-suspenders (mirrors useCopy): doCopy/doDownload setBusy in a
   // `finally` after an awaited fetch; if the reader unmounts mid-fetch, skip the
   // post-await setState to avoid a setState-on-unmounted-component.
@@ -90,13 +108,60 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
     if (el instanceof HTMLElement) el.focus();
   }, []);
 
+  // Open with a chosen initial active item (0 for click / ArrowDown, last for
+  // ArrowUp). The focus-on-open effect moves focus there once the menu mounts.
+  const openAt = useCallback(
+    (index: number) => {
+      restoreRef.current = document.activeElement;
+      setActive(index);
+      setOpen(true);
+    },
+    [setActive],
+  );
+
   const toggle = useCallback(() => {
-    setOpen((prev) => {
-      const next = !prev;
-      if (next) restoreRef.current = document.activeElement;
-      return next;
-    });
-  }, []);
+    if (open) {
+      setOpen(false);
+    } else {
+      openAt(0);
+    }
+  }, [open, openAt]);
+
+  // On open, move focus into the menu (the active menuitem). Reads the index via
+  // ref so the effect depends only on `open`.
+  useEffect(() => {
+    if (open) itemRefs.current[activeIndexRef.current]?.focus();
+  }, [open]);
+
+  const onMenuKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        close();
+        return;
+      }
+      const ni = nextRovingIndex(e.key, activeIndexRef.current, itemCount);
+      if (ni !== null) {
+        e.preventDefault();
+        setActive(ni);
+        itemRefs.current[ni]?.focus();
+      }
+    },
+    [close, itemCount, setActive],
+  );
+
+  const onTriggerKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        openAt(0);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        openAt(itemCount - 1);
+      }
+    },
+    [openAt, itemCount],
+  );
 
   const doCopy = useCallback(
     async (scope: Scope) => {
@@ -146,6 +211,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
         aria-expanded={open}
         aria-label="Export transcript"
         onClick={toggle}
+        onKeyDown={onTriggerKeyDown}
       >
         Export ▾
       </button>
@@ -155,36 +221,45 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
           role="menu"
           aria-label="Export transcript"
           tabIndex={-1}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              e.stopPropagation();
-              close();
-            }
-          }}
+          onKeyDown={onMenuKeyDown}
         >
-          {SCOPES.map(({ scope, label }) => (
-            <div key={scope} className="conv-export-row" role="none">
-              <span className="conv-export-row-label">{label}</span>
-              <button
-                type="button"
-                className="conv-export-action"
-                aria-label={`${label} — Copy`}
-                disabled={busy === `${scope}:copy`}
-                onClick={() => void doCopy(scope)}
-              >
-                {busy === `${scope}:copy` ? '…' : 'Copy'}
-              </button>
-              <button
-                type="button"
-                className="conv-export-action"
-                aria-label={`${label} — Download`}
-                disabled={busy === `${scope}:download`}
-                onClick={() => void doDownload(scope)}
-              >
-                {busy === `${scope}:download` ? '…' : 'Download'}
-              </button>
-            </div>
-          ))}
+          {SCOPES.map(({ scope, label }, rowIdx) => {
+            const copyIdx = rowIdx * 2;
+            const downloadIdx = copyIdx + 1;
+            return (
+              <div key={scope} className="conv-export-row" role="none">
+                <span className="conv-export-row-label">{label}</span>
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabIndex={copyIdx === activeIndex ? 0 : -1}
+                  ref={(el) => {
+                    itemRefs.current[copyIdx] = el;
+                  }}
+                  className="conv-export-action"
+                  aria-label={`${label} — Copy`}
+                  disabled={busy === `${scope}:copy`}
+                  onClick={() => void doCopy(scope)}
+                >
+                  {busy === `${scope}:copy` ? '…' : 'Copy'}
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabIndex={downloadIdx === activeIndex ? 0 : -1}
+                  ref={(el) => {
+                    itemRefs.current[downloadIdx] = el;
+                  }}
+                  className="conv-export-action"
+                  aria-label={`${label} — Download`}
+                  disabled={busy === `${scope}:download`}
+                  onClick={() => void doDownload(scope)}
+                >
+                  {busy === `${scope}:download` ? '…' : 'Download'}
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

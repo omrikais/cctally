@@ -14,6 +14,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Dashboard conversation search — the Files facet now matches a file-path substring instead of a path prefix.** Searching the Files facet for a bare basename (`package.json`) or a mid-path fragment (`cctally`) now returns the sessions that touched a matching path, instead of requiring a leading path prefix; the match is a case-insensitive substring over the (modest) touched-file table. (#223)
 - **Dashboard conversation find bar — regex matches are now underlined in the transcript.** In regex find mode the in-prose highlight is no longer suppressed: matches get a best-effort inline underline (per rendered text segment, case-toggle-aware), alongside the existing match count and jump-to-match. Invalid or pathological patterns degrade to no underline (the match count still drives navigation). (#223)
 
+### Fixed
+- **Dashboard conversation viewer — the reader-header `Export ▾` and focus `▾ More` menus are now fully keyboard-navigable.** Both popovers previously exposed a `role="menu"` with no arrow-key navigation; they now implement the full menu keyboard pattern — opening moves focus to the first item, `↑`/`↓` cycle through items (wrapping), `Home`/`End` jump to the ends, and `Esc` closes and restores focus to the trigger, with a single roving tab stop so `Tab` moves past the menu rather than through every item. In the focus `▾ More` menu, `→` opens the Subagent submenu (focusing its first entry) and `←` collapses back to the parent. (#224)
+- **Dashboard conversation viewer — git-context diff path parsing no longer over-captures a trailing word into the file path.** The `diff --git a/… b/…` path capture now stops at whitespace instead of greedily running to end-of-line, so a pathological marker line carrying trailing prose after the `b/` path can't bleed that text into the displayed new-path header; real injected diffs (whose paths are whitespace-free) are unaffected. (#224)
+
 ## [1.53.0] - 2026-06-21
 
 ### Added

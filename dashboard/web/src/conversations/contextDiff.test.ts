@@ -154,4 +154,14 @@ describe('parseUnifiedDiff', () => {
     expect(files[0].oldPath).toBe('dir/foo.py');
     expect(files[0].newPath).toBe('dir/foo.py');
   });
+
+  // #224 — the path capture is a non-whitespace run, NOT a greedy `.+ … $`, so a
+  // pathological marker carrying trailing prose on the same physical line (the
+  // segmenter slices `diff --git …` to EOL) can't bleed the trailing word into
+  // newPath.
+  it('does not over-capture a trailing-prose path after the b/ path (#224)', () => {
+    const files = parseUnifiedDiff('diff --git a/foo b/bar now\n@@ -1 +1 @@\n-a\n+b\n');
+    expect(files[0].oldPath).toBe('foo');
+    expect(files[0].newPath).toBe('bar');
+  });
 });

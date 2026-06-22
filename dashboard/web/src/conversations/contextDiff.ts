@@ -26,8 +26,13 @@ export interface FileDiff {
 // context puts a prose lead on the same physical line ("- Unstaged changes: diff
 // --git …"), so we match anywhere in the line and flush the pre-marker text as
 // prose. The `a/…` / `b/…` shape is required (Codex P2-1) so a bare "diff" word
-// in prose can't fire it.
-const DIFF_GIT_RE = /diff --git a\/.+ b\/.+/;
+// in prose can't fire it. Each path is a NON-WHITESPACE run (`\S+`), not a greedy
+// `.+`: the segmenter slices the marker line to EOL, so any trailing prose after
+// the `b/` path must not bleed into the captured path (#224). The unfenced
+// `diff --git a/… b/…` header is inherently ambiguous for space-bearing paths;
+// real injected context carries space-free paths, so stopping at whitespace is
+// the right tradeoff.
+const DIFF_GIT_RE = /diff --git a\/\S+ b\/\S+/;
 
 // Git extended-header line prefixes that belong INSIDE a diff region (so a valid
 // diff with mode/rename/copy/index headers isn't split early — Codex P2-1).
@@ -144,7 +149,10 @@ function pushBodyRows(
 }
 
 const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
-const PATH_RE = /diff --git a\/(.+) b\/(.+)$/;
+// Mirrors DIFF_GIT_RE: capture each path as a non-whitespace run so trailing
+// prose on the marker line can't over-capture newPath (#224). No `$` anchor —
+// the path ends at the first whitespace, not end-of-line.
+const PATH_RE = /diff --git a\/(\S+) b\/(\S+)/;
 
 // Convert a diff region (one or more `diff --git` files) into per-file
 // `{ oldPath, newPath, hunks }`. Line-level only (no intra-line word emphasis —
