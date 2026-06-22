@@ -63,6 +63,20 @@ def _human_prompts(items):
             if it.get("kind") == "human" and _is_main(it) and _item_text(it)]
 
 
+def extract_prompt_entries(items):
+    """Ordered main-thread human prompts as ``[{"uuid", "text"}]``.
+
+    Single source of truth for the structured prompt spine (#217 S7) — reuses
+    the same main-thread predicate (``_human_prompts``) and the same prose
+    extraction (``_item_text``) as the recipe/prompts export, so the
+    ``/prompts`` route and the export can never drift. The uuid is the turn's
+    ``anchor`` uuid — the same identity ``get_conversation_outline`` emits — so
+    the spine aligns 1:1 with the outline's human turns.
+    """
+    return [{"uuid": it["anchor"]["uuid"], "text": _item_text(it)}
+            for it in _human_prompts(items)]
+
+
 def _title_header(title):
     """An H1 title block (with a trailing blank line) or empty string."""
     t = (title or "").strip()

@@ -1996,6 +1996,26 @@ def get_conversation_outline(conn, session_id):
             "turns": turns}
 
 
+def get_conversation_prompts(conn, session_id):
+    """``{session_id, prompts:[{uuid,text}]}`` — ordered main-thread human
+    prompts with full text (#217 S7, F10 — the session-comparison spine).
+
+    Reuses the SAME ``_assemble_session`` pass as ``get_conversation_outline``
+    (one grouping/dedup pipeline, never a parallel one) and the SAME main-thread
+    predicate as the recipe/prompts export (``extract_prompt_entries`` →
+    ``_human_prompts``), so the spine aligns 1:1 with the outline's human turns
+    and can never drift from the export. Returns ``None`` for an unknown session
+    (the handler's 404 sentinel) — the same contract ``get_conversation_outline``
+    uses (``asm is None``).
+    """
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None
+    from _lib_conversation_export import extract_prompt_entries
+    return {"session_id": session_id,
+            "prompts": extract_prompt_entries(asm["items"])}
+
+
 def get_conversation_export(conn, session_id, scope):
     """Whole-session Markdown export for one scope (#217 S5, F1/F5).
 

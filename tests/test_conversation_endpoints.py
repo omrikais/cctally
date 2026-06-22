@@ -366,6 +366,44 @@ def test_conversation_export_route(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_conversation_prompts_route(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/prompts`` (#217 S7 F10): loopback 200 with the
+    prompt-spine shape (``session_id``/``prompts`` of ``{uuid,text}``), 404 on an
+    unknown id, 403 under a LAN hostname Host (gate reused), and route-ordering
+    proof that the ``/prompts`` suffix dispatches to the prompts handler — NOT
+    the detail catch-all parsing ``s1/prompts`` as a session id.
+    """
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Happy path: 200 with the prompt-spine body shape (s1 has one main
+        # human prompt "hi"; the assistant turn is not a human prompt).
+        status, body = _get(port, "/api/conversation/s1/prompts")
+        assert status == 200, (status, body)
+        payload = json.loads(body)
+        assert payload["session_id"] == "s1"
+        assert "prompts" in payload and isinstance(payload["prompts"], list)
+        # Precedence: this is the prompts handler (has "prompts"), not the detail
+        # catch-all (which carries "items"/"page") and not the outline handler
+        # (which carries "turns"/"stats"); both would mis-handle "s1/prompts".
+        assert "items" not in payload and "turns" not in payload
+        assert [p["text"] for p in payload["prompts"]] == ["hi"]
+        assert all(p["uuid"] for p in payload["prompts"])
+
+        # Unknown session → 404.
+        status, _ = _get(port, "/api/conversation/does-not-exist/prompts")
+        assert status == 404
+
+        # Privacy gate reused verbatim: LAN hostname + expose=False → 403.
+        status, _ = _get(port, "/api/conversation/s1/prompts",
+                         host="machine.local:8789")
+        assert status == 403
+    finally:
+        srv.shutdown()
+
+
 def test_conversation_find_route(tmp_path, monkeypatch):
     """``/api/conversation/<sid>/find`` (#177 S6): loopback 200 with the anchor
     shape (``anchors``/``total``/``mode``/``search_depth``), 404 on an unknown

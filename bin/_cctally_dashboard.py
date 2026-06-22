@@ -5487,6 +5487,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # #217 S5: whole-session Markdown export (F1/F5). Matched BEFORE the
             # <id> reader catch-all (same precedence as /outline).
             self._handle_get_conversation_export(path)
+        elif path.startswith("/api/conversation/") and path.endswith("/prompts"):
+            # #217 S7: ordered main-thread prompt spine for session comparison
+            # (F10). Matched BEFORE the <id> reader catch-all (same precedence
+            # as /outline).
+            self._handle_get_conversation_prompts(path)
         elif path.startswith("/api/conversation/"):
             self._handle_get_conversation_detail(path)
         else:
@@ -7874,6 +7879,30 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         ok, body = self._run_conversation_query(
             lambda conn: self._conversation_query().get_conversation_outline(conn, session_id),
             "/api/conversation/outline")
+        if not ok:
+            return
+        if body is None:
+            self.send_error(404, "conversation not found")
+            return
+        self._respond_json(200, body)
+
+    def _handle_get_conversation_prompts(self, path: str) -> None:
+        """``GET /api/conversation/<sid>/prompts`` — ordered main-thread human
+        prompts + full text (#217 S7 F10, the session-comparison spine). Same
+        fail-closed transcript privacy gate as ``/outline`` —
+        ``_require_transcripts_allowed()`` ONLY (no ``_check_origin_csrf``: the
+        sibling transcript GETs gate on this predicate alone). Unknown id → 404.
+        """
+        if not self._require_transcripts_allowed():
+            return
+        import urllib.parse as _u
+        session_id = _u.unquote(path[len("/api/conversation/"):-len("/prompts")])
+        if not session_id:
+            self.send_error(404, "conversation not found")
+            return
+        ok, body = self._run_conversation_query(
+            lambda conn: self._conversation_query().get_conversation_prompts(conn, session_id),
+            "/api/conversation/prompts")
         if not ok:
             return
         if body is None:
