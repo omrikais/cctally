@@ -193,6 +193,76 @@ describe('MessageItem', () => {
     expect(container.querySelectorAll('.conv-item-cost')).toHaveLength(1);
   });
 
+  // #217 S6 F3 — the per-turn cost micro-bar. Width/intensity rides a CSS var
+  // (--conv-cost-frac) carrying the cost/maxTurnCost ratio so the JSDOM test can
+  // assert it without layout. The denominator (session max-turn-cost) is provided
+  // by the reader via TranscriptContext.maxTurnCost.
+  it('renders a per-turn cost bar sized to cost / maxTurnCost', () => {
+    const item: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's1', uuid: 'a1', id: 1 },
+      member_uuids: ['a1'],
+      ts: '2026-06-22T00:00:00Z',
+      text: 'hi',
+      blocks: [{ kind: 'text', text: 'hi' }],
+      model: 'claude-opus-4',
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0.02,
+    };
+    const { container } = render(
+      <TranscriptContext.Provider value={{ sessionId: 's1', maxTurnCost: 0.08 }}>
+        <MessageItem item={item} />
+      </TranscriptContext.Provider>,
+    );
+    const bar = container.querySelector('.conv-cost-bar') as HTMLElement;
+    expect(bar).toBeTruthy();
+    // 0.02 / 0.08 = 0.25 → the fraction var encodes 0.25.
+    expect(bar.style.getPropertyValue('--conv-cost-frac')).toMatch(/0\.25/);
+    // Decorative beyond the precise $-figure in the footer text.
+    expect(bar.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  // #217 S6 F3 — a SUB-CENT turn that is the session max still reads as a FULL
+  // bar: intensity tracks the RELATIVE ratio (cost/sessionMaxTurnCost), not the
+  // absolute costClass (which would bin every sub-cent turn into cost-xs). This is
+  // the Codex P2 correction made non-vacuous: frac is 1.0 here despite a < $0.01
+  // absolute cost.
+  it('drives bar intensity from the ratio, not absolute cost (sub-cent max → full bar)', () => {
+    const item: ConversationItem = {
+      kind: 'assistant',
+      anchor: { session_id: 's1', uuid: 'a1', id: 1 },
+      member_uuids: ['a1'],
+      ts: '2026-06-22T00:00:00Z',
+      text: 'hi',
+      blocks: [{ kind: 'text', text: 'hi' }],
+      model: 'claude-opus-4',
+      is_sidechain: false,
+      subagent_key: null,
+      parent_uuid: null,
+      cost_usd: 0.004,
+    };
+    const { container } = render(
+      <TranscriptContext.Provider value={{ sessionId: 's1', maxTurnCost: 0.004 }}>
+        <MessageItem item={item} />
+      </TranscriptContext.Provider>,
+    );
+    const bar = container.querySelector('.conv-cost-bar') as HTMLElement;
+    expect(bar).toBeTruthy();
+    expect(bar.style.getPropertyValue('--conv-cost-frac')).toBe('1');
+  });
+
+  it('renders no cost bar when maxTurnCost is 0 (no positive-cost turn loaded)', () => {
+    // Provider value omits maxTurnCost → defaults 0 → costIntensity 0 → no bar.
+    const { container } = render(
+      <TranscriptContext.Provider value={{ sessionId: 's1' }}>
+        <MessageItem item={assistant} />
+      </TranscriptContext.Provider>,
+    );
+    expect(container.querySelector('.conv-cost-bar')).toBeNull();
+  });
+
   it('renders the assistant model as a .chip with the modelChipClass (#175 F3)', () => {
     const opusItem: ConversationItem = { ...assistant, model: 'claude-opus-4-8' };
     const { container } = render(<MessageItem item={opusItem} />);

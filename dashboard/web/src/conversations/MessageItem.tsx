@@ -7,7 +7,8 @@ import { PermalinkButton } from './PermalinkButton';
 import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
 import { fmt } from '../lib/fmt';
-import { useFmtCtx, useMarkersEnabled } from './TranscriptContext';
+import { costIntensity } from '../lib/cost';
+import { useFmtCtx, useMarkersEnabled, useMaxTurnCost } from './TranscriptContext';
 import { segmentContextBody, parseUnifiedDiff } from './contextDiff';
 import { UnifiedDiffView } from './UnifiedDiffView';
 import type { ConversationItem } from '../types/conversation';
@@ -136,6 +137,12 @@ function MessageItemImpl(
     // Present only on a flagged turn; the chip renders iff markers are on AND
     // the turn is flagged. Pure prop derivation → memo stays valid.
     const cf = 'cache_failure' in item ? item.cache_failure : undefined;
+    // #217 S6 F3 — per-turn cost micro-bar. The denominator is the session's
+    // heaviest LOADED turn cost, provided once by the reader on the context (no
+    // per-item store subscription). costIntensity returns the cost/max ratio
+    // clamped to [0,1], or 0 when there is no positive denominator (→ no bar).
+    const maxTurnCost = useMaxTurnCost();
+    const costFrac = hasCost ? costIntensity(item.cost_usd as number, maxTurnCost) : 0;
     return (
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
@@ -188,6 +195,17 @@ function MessageItemImpl(
               <>
                 {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)} · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}
               </>
+            )}
+            {/* #217 S6 F3 — relative cost micro-bar: width/intensity ∝
+                cost / session max-turn-cost. Decorative (the exact $-figure above
+                is the accessible value), so aria-hidden. Rendered only with a
+                positive ratio (a costless turn / zero denominator → no bar). */}
+            {costFrac > 0 && (
+              <span
+                className="conv-cost-bar"
+                aria-hidden="true"
+                style={{ ['--conv-cost-frac' as string]: String(costFrac) }}
+              />
             )}
           </div>
         )}

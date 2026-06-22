@@ -6725,6 +6725,20 @@ mark.current {
   color: var(--text-dim);                     /* de-emphasized, AA-passing */
   text-align: right;
 }
+/* #217 S6 F3 — per-turn cost micro-bar: width ∝ cost / session max-turn-cost.
+   The fraction rides a CSS var so JSDOM tests can assert it without layout.
+   Opacity also scales with the fraction so a heavier turn reads bolder. */
+.conv-cost-bar {
+  display: inline-block;
+  height: 4px;
+  width: calc(var(--conv-cost-frac, 0) * 40px);
+  min-width: 2px;
+  margin-inline-start: 8px;
+  vertical-align: middle;
+  border-radius: 2px;
+  background: var(--accent-blue, #60a5fa);
+  opacity: calc(0.45 + var(--conv-cost-frac, 0) * 0.55);
+}
 /* #177 S5 §6 — eyebrow time `· HH:mm` at the end of an item head / summary.
    Muted, monospace, sized to match the eyebrow label without crowding it. */
 .conv-item-time {
