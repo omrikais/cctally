@@ -8198,6 +8198,20 @@ mark.current {
   margin-top: 4px;
 }
 .conv-media-caption a { margin-left: auto; }
+/* #217 S6 F9 — inline click-to-expand PDF viewer. The toggle is a small accent
+   link-button; the <object> mounts at a capped, scrollable height. The expand is
+   instant (no transition), so prefers-reduced-motion is moot; the toggle's
+   focus-visible ring + aria-expanded carry the a11y. */
+.conv-pdf-toggle {
+  background: none; border: 0; color: var(--accent-blue); cursor: pointer;
+  min-height: 24px; padding: 0; font: inherit;
+}
+.conv-pdf-toggle:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+.conv-pdf-inline {
+  display: block; width: 100%; max-height: min(600px, 70vh); height: 600px;
+  margin-top: 8px; border: 1px solid var(--border-soft); border-radius: 6px;
+  background: var(--panel-bg-2);
+}
 /* The unaddressable / source-gone degrade hint on the byte-count badge. */
 .conv-media-gone { color: var(--text-faint); }
 

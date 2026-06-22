@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent } from '@testing-library/react';
 import { MediaFigure } from './MediaFigure';
 import { TranscriptContext } from './TranscriptContext';
 
@@ -49,12 +49,43 @@ describe('MediaFigure', () => {
     expect(container.querySelector('img')).toBeNull();
     expect(container.textContent).toContain('source no longer available');
   });
-  it('renders documents as a badge with an open link, never an img', () => {
+  it('PDF document: badge + view-inline toggle; expands to an <object>, keeps open ↗', () => {
     const doc = { kind: 'document' as const, media_type: 'application/pdf', bytes: 4000, index: 0 };
     const { container } = renderWith(<MediaFigure media={doc} uuid="u1" context="attached" />);
     expect(container.querySelector('img')).toBeNull();
-    const a = container.querySelector('a')!;
-    expect(a.getAttribute('href')).toBe('/api/conversation/s1/media?uuid=u1&index=0');
-    expect(container.textContent).toContain('open');
+    expect(container.querySelector('object')).toBeNull(); // collapsed by default
+    const toggle = container.querySelector('.conv-pdf-toggle') as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(toggle);
+    const obj = container.querySelector('object') as HTMLObjectElement;
+    expect(obj.getAttribute('data')).toBe('/api/conversation/s1/media?uuid=u1&index=0');
+    expect(obj.getAttribute('type')).toBe('application/pdf');
+    expect(obj.querySelector('a')!.getAttribute('href')).toBe('/api/conversation/s1/media?uuid=u1&index=0'); // fallback child
+    expect(container.querySelector('.conv-pdf-toggle')!.getAttribute('aria-expanded')).toBe('true');
+    // collapse removes the <object>
+    fireEvent.click(container.querySelector('.conv-pdf-toggle')!);
+    expect(container.querySelector('object')).toBeNull();
+  });
+  it('non-PDF document stays a plain badge with no inline toggle', () => {
+    const doc = { kind: 'document' as const, media_type: 'text/plain', bytes: 100, index: 0 };
+    const { container } = renderWith(<MediaFigure media={doc} uuid="u1" context="attached" />);
+    expect(container.querySelector('.conv-pdf-toggle')).toBeNull();
+    expect(container.querySelector('a')!.getAttribute('href')).toBe('/api/conversation/s1/media?uuid=u1&index=0');
+  });
+  it('a failed PDF still renders only the badge (no inline toggle)', () => {
+    // An unaddressable PDF (no session) falls to the badge branch — no toggle.
+    const doc = { kind: 'document' as const, media_type: 'application/pdf', bytes: 4000, index: 0 };
+    const { container } = renderWith(<MediaFigure media={doc} uuid="u1" context="x" />, null);
+    expect(container.querySelector('.conv-pdf-toggle')).toBeNull();
+    expect(container.querySelector('object')).toBeNull();
+  });
+  it('builds a session-scoped media URL (cross-session)', () => {
+    const doc = { kind: 'document' as const, media_type: 'application/pdf', bytes: 4000, index: 0 };
+    const { container: c1 } = renderWith(<MediaFigure media={doc} uuid="u1" context="x" />, 's1');
+    const { container: c2 } = renderWith(<MediaFigure media={doc} uuid="u1" context="x" />, 's2');
+    // open-↗ link reflects each session id
+    expect(c1.querySelector('a')!.getAttribute('href')).toContain('/conversation/s1/');
+    expect(c2.querySelector('a')!.getAttribute('href')).toContain('/conversation/s2/');
   });
 });

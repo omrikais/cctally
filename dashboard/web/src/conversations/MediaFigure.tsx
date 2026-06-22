@@ -31,6 +31,10 @@ export function MediaFigure({
 }) {
   const sessionId = useSessionId();
   const [failed, setFailed] = useState(false);
+  // #217 S6 F9 — inline PDF expand state. Collapsed by default so the <object>
+  // (and thus the byte fetch) mounts only on demand; a transcript with several
+  // PDFs stays light until the user expands one.
+  const [pdfOpen, setPdfOpen] = useState(false);
 
   const key = toolUseId
     ? `tool_use_id=${encodeURIComponent(toolUseId)}`
@@ -52,10 +56,36 @@ export function MediaFigure({
   const url = `/api/conversation/${encodeURIComponent(sessionId)}/media?${key}&index=${media.index}`;
 
   if (media.kind === 'document') {
+    // #217 S6 F9 — only application/pdf gets the inline click-to-expand option;
+    // every other document type (and the `failed` path above) keeps today's
+    // badge verbatim. The media route already serves application/pdf with a
+    // Content-Type + inline disposition and no CSP sandbox, so the <object>
+    // reuses the same gated URL — no backend/privacy change. <object>'s JS
+    // onError is unreliable, so the declarative fallback CHILD (the open-↗ link)
+    // renders automatically when the browser has no PDF viewer.
+    const isPdf = media.media_type === 'application/pdf';
     return (
-      <span className="conv-chip conv-chip--media">
+      <span className="conv-chip conv-chip--media conv-doc">
         <DocumentIcon /> {media.media_type ?? 'document'} · {approxSize(media.bytes)} ·{' '}
+        {isPdf && (
+          <>
+            <button
+              type="button"
+              className="conv-pdf-toggle"
+              aria-expanded={pdfOpen}
+              aria-controls={`conv-pdf-${media.index}`}
+              onClick={() => setPdfOpen((v) => !v)}
+            >
+              {pdfOpen ? 'collapse ▴' : 'view inline ▾'}
+            </button>{' · '}
+          </>
+        )}
         <a href={url} target="_blank" rel="noopener noreferrer">open ↗</a>
+        {isPdf && pdfOpen && (
+          <object id={`conv-pdf-${media.index}`} className="conv-pdf-inline" data={url} type="application/pdf" aria-label={`PDF preview ${media.index + 1}`}>
+            <a href={url} target="_blank" rel="noopener noreferrer">open ↗</a>
+          </object>
+        )}
       </span>
     );
   }
