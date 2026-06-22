@@ -5266,6 +5266,15 @@ mark.current {
 /* cache-failure-markers spec §4 — the "Cache" KV row glyph + value in amber. */
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-glyph,
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-value { color: var(--accent-amber); }
+/* #217 S6 F3 — outline per-rebuild jump list (expands the scalar Cache stat). */
+.conv-outline-rebuilds { margin-top: 4px; padding-inline-start: 4px; }
+.conv-rebuild-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.conv-rebuild-jump { display: flex; gap: 8px; align-items: baseline; width: 100%; min-height: 28px; padding: 4px 6px; background: none; border: 0; color: var(--text); text-align: start; cursor: pointer; font-variant-numeric: tabular-nums; }
+.conv-rebuild-jump:hover { background: var(--panel-bg-2); }
+.conv-rebuild-jump .rb-cost { color: var(--accent-amber); }
+.conv-rebuild-jump .rb-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.conv-rebuild-jump .rb-sub { color: var(--accent-blue); }
+.conv-rebuild-more { background: none; border: 0; color: var(--accent-blue); cursor: pointer; padding: 4px 6px; min-height: 28px; }
 /* Navigable landmark list. */
 .conv-outline-list {
   flex: 1 1 auto;

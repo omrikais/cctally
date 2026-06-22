@@ -498,6 +498,62 @@ describe('OutlinePanel (#186 §4 header redesign)', () => {
     expect(cacheEntry!.textContent?.toLowerCase()).toContain('cache rebuilt');
   });
 
+  // ---- #217 S6 F3 — outline per-rebuild jump list ----------------------
+  it('renders a per-rebuild jump list under the cache stat (markers on, count>0)', () => {
+    const rebuilds = [
+      { uuid: 'a1', subagent_key: null, ts: '2026-06-22T01:00:00Z', tokens_recreated: 120000, est_wasted_usd: 0.90 },
+      { uuid: 'h2', subagent_key: null, ts: '2026-06-22T02:00:00Z', tokens_recreated: 80000, est_wasted_usd: 0.28 },
+    ];
+    const o = outline({ stats: stats({ cache_failures: { count: 2, tokens_recreated: 200000, est_wasted_usd: 1.18, rebuilds } }) });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const rows = container.querySelectorAll('.conv-outline-rebuilds .conv-rebuild-jump');
+    expect(rows.length).toBe(2);
+    // label resolves from outline.turns (a1 → "here is the plan")
+    expect(container.querySelector('.conv-outline-rebuilds')!.textContent).toContain('here is the plan');
+    // clicking dispatches a jump to the rebuild uuid
+    fireEvent.click(rows[0]);
+    expect(getState().conversationJump?.uuid).toBe('a1');
+  });
+
+  it('falls back to "turn" label when a rebuild uuid is absent from outline.turns', () => {
+    const rebuilds = [
+      { uuid: 'ghost', subagent_key: null, ts: '2026-06-22T01:00:00Z', tokens_recreated: 1, est_wasted_usd: 0.10 },
+    ];
+    const o = outline({ stats: stats({ cache_failures: { count: 1, tokens_recreated: 1, est_wasted_usd: 0.10, rebuilds } }) });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const row = container.querySelector('.conv-outline-rebuilds .conv-rebuild-jump')!;
+    // No matching turn → the label falls back rather than rendering empty.
+    expect(row.querySelector('.rb-label')!.textContent).toBe('turn');
+  });
+
+  it('caps the rebuild list at 3 with a "+N more" expander', () => {
+    const rebuilds = Array.from({ length: 5 }, (_, i) => ({
+      uuid: `r${i}`, subagent_key: null, ts: '2026-06-22T01:00:00Z',
+      tokens_recreated: 1000 * (5 - i), est_wasted_usd: 0.5 - i * 0.05,
+    }));
+    const o = outline({ stats: stats({ cache_failures: { count: 5, tokens_recreated: 1, est_wasted_usd: 1, rebuilds } }) });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    expect(container.querySelectorAll('.conv-outline-rebuilds .conv-rebuild-jump').length).toBe(3);
+    const more = container.querySelector('.conv-rebuild-more')!;
+    expect(more.textContent).toContain('+2 more');
+    fireEvent.click(more);
+    expect(container.querySelectorAll('.conv-outline-rebuilds .conv-rebuild-jump').length).toBe(5);
+  });
+
+  it('hides the rebuild list when markers are off OR count is 0', () => {
+    // count 0 → no list even with markers on.
+    const noneOutline = outline({ stats: stats({ cache_failures: { count: 0, tokens_recreated: 0, est_wasted_usd: 0, rebuilds: [] } }) });
+    const { container: c1 } = render(<OutlinePanel sessionId="s1" outline={noneOutline} />);
+    expect(c1.querySelector('.conv-outline-rebuilds')).toBeNull();
+
+    // markers off → no list even with count>0.
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers: false } });
+    const rebuilds = [{ uuid: 'a1', subagent_key: null, ts: null, tokens_recreated: 1, est_wasted_usd: 0.1 }];
+    const offOutline = outline({ stats: stats({ cache_failures: { count: 1, tokens_recreated: 1, est_wasted_usd: 0.1, rebuilds } }) });
+    const { container: c2 } = render(<OutlinePanel sessionId="s1" outline={offOutline} />);
+    expect(c2.querySelector('.conv-outline-rebuilds')).toBeNull();
+  });
+
   it('toggle OFF (dashboard_prefs) hides the cache stats row, jump chip, and landmark', () => {
     dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: { cache_failure_markers: false } });
     const o = outline({

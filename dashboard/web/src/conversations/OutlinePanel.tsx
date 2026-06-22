@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
 import {
   buildOutlineTargets,
@@ -10,7 +11,7 @@ import {
 } from './outlineNavigation';
 import type { FocusMode } from './applyFocusMode';
 import { FilesTab } from './FilesTab';
-import { fmt } from '../lib/fmt';
+import { fmt, type FmtCtx } from '../lib/fmt';
 import {
   ChatIcon,
   PlanIcon,
@@ -19,7 +20,7 @@ import {
   ToolGenericIcon,
   WarningIcon,
 } from './ConvIcons';
-import type { ConversationOutline, OutlineStats, OutlineTurn } from '../types/conversation';
+import type { CacheRebuild, ConversationOutline, OutlineStats, OutlineTurn } from '../types/conversation';
 
 // The shared jump-target lists (built once in OutlinePanel from
 // buildOutlineTargets, passed to both the stats card and the jump cluster) — so
@@ -297,6 +298,57 @@ function OutlineStatsCard({
   );
 }
 
+// #217 S6 F3 — the per-rebuild jump list that expands the scalar "Cache · N
+// rebuilds · ~$X" stat into a navigable list (templated on the session modal's
+// CacheRebuildsSection rows). Fed entirely from props (no global access): the
+// worst-first `rebuilds[]` already on the wire, a uuid→OutlineTurn map for the
+// human label (falling back to "turn" when the uuid isn't in the skeleton), and
+// the display-tz fmtCtx for the rebuild time. Caps at 3 with a "+N more"
+// expander, like the modal. Each row's primary action is the same
+// OPEN_CONVERSATION jump every other outline jump uses; a stale uuid jumps as a
+// graceful no-op.
+function OutlineCacheRebuilds({
+  sessionId, rebuilds, turnByUuid, fmtCtx,
+}: {
+  sessionId: string;
+  rebuilds: CacheRebuild[];
+  turnByUuid: Map<string, OutlineTurn>;
+  fmtCtx: FmtCtx;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const CAP = 3;
+  const shown = expanded ? rebuilds : rebuilds.slice(0, CAP);
+  return (
+    <div className="conv-outline-rebuilds">
+      <ul className="conv-rebuild-list">
+        {shown.map((r) => {
+          const label = turnByUuid.get(r.uuid)?.label || 'turn';
+          return (
+            <li key={r.uuid}>
+              <button
+                type="button"
+                className="conv-rebuild-jump"
+                aria-label={`Jump to cache rebuild: ~${fmt.usd2(r.est_wasted_usd)} wasted`}
+                onClick={() => dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: r.uuid } })}
+              >
+                <span className="rb-cost">{fmt.usd2(r.est_wasted_usd)}</span>
+                <span className="rb-label">{label}</span>
+                <span className="rb-time">{r.ts ? fmt.timeHHmm(r.ts, fmtCtx, { noSuffix: true }) : ''}</span>
+                {r.subagent_key ? <span className="rb-sub">subagent</span> : null}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {rebuilds.length > CAP && !expanded && (
+        <button type="button" className="conv-rebuild-more" onClick={() => setExpanded(true)}>
+          +{rebuilds.length - CAP} more
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function OutlinePanel({
   sessionId,
   outline,
@@ -324,6 +376,14 @@ export function OutlinePanel({
     selectMarkersEnabled(getState()),
   );
   const reduced = useReducedMotion();
+  // #217 S6 F3 — display-tz fmtCtx for the cache-rebuild list times. Same source
+  // the reader uses (the server resolves "local" before the envelope leaves
+  // Python); panel-level subscription is fine (the panel re-renders per tick).
+  const display = useDisplayTz();
+  const fmtCtx = useMemo<FmtCtx>(
+    () => ({ tz: display.resolvedTz, offsetLabel: display.offsetLabel }),
+    [display.resolvedTz, display.offsetLabel],
+  );
 
   const { entries, sectionByUuid } = useMemo(
     () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled,
@@ -405,6 +465,17 @@ export function OutlinePanel({
         <>
           <div className="conv-outline-stats">
             <OutlineStatsCard stats={outline.stats} errorTurns={lists.error.length} markersEnabled={markersEnabled} />
+            {/* #217 S6 F3 — expand the scalar Cache stat into a per-rebuild jump
+                list. Gated on the same markersEnabled opt-out + count > 0 as the
+                stats row above it. */}
+            {markersEnabled && outline.stats.cache_failures && outline.stats.cache_failures.count > 0 && (
+              <OutlineCacheRebuilds
+                sessionId={sessionId}
+                rebuilds={outline.stats.cache_failures.rebuilds}
+                turnByUuid={turnByUuid}
+                fmtCtx={fmtCtx}
+              />
+            )}
             <JumpCluster
               sessionId={sessionId}
               turns={outline.turns}
