@@ -138,20 +138,34 @@ export function SidechainGroup({
   isMobile?: boolean;
 }) {
   const [userOpen, setUserOpen] = useState(false);
+  // #222 — latch a force into userOpen DURING RENDER (React's official "adjust
+  // state when a prop changes" pattern), so the latched open-state commits
+  // ATOMICALLY with forceOpen in the SAME commit — NOT a microtask later via an
+  // effect. The old effect-latch raced the reader's force-RESET
+  // (setForcedOpenKeys(∅), dispatched one microtask behind a synchronous
+  // loadToTarget once the jump's scroll lands): when the reset won the race, a
+  // nested node's parent dropped forceOpen before the parent's latch effect had
+  // flushed, so the parent collapsed for a beat — UNMOUNTING the (grand)child and
+  // discarding ITS pending latch. The parent then re-opened (its own latch
+  // survived, never having unmounted), but the grandchild re-mounted fresh
+  // (forceOpen already ∅, userOpen=false) and stayed permanently collapsed after
+  // the jump (~44% of jumps under perturbed scheduling; ~0% in CI declaration
+  // order, hence the latent flake). Deriving userOpen in render is
+  // microtask-order-INDEPENDENT: the node never reaches open=false, so it never
+  // unmounts and its latch can't be lost. Guarded by `!userOpen` so it runs at
+  // most once per force (no render loop); React applies it before rendering
+  // children, so the body (and any nested card) renders once, already open.
+  if (forceOpen && !userOpen) setUserOpen(true);
   const open = userOpen || forceOpen;
-  // Latch a force into userOpen so the thread stays open after forceOpen drops
-  // (independent of whether the browser/jsdom fires `toggle` on a programmatic
-  // `open` change). `open` is already true via the derivation this same render,
-  // so this causes no flicker and the member ref was already attached.
+  // #188 S4/C1 — a force-open makes this thread VISIBLE, so report it open; the
+  // reader then counts a subsequent append into it (Bug 5). The OPEN-STATE itself
+  // is latched in render above (the #222 fix) — this effect now carries ONLY the
+  // onOpenChange side-effect (effects, not render, are where side-effects belong).
+  // Keyed on forceOpen so it fires once per force, mirroring the latch.
   useEffect(() => {
-    if (forceOpen) {
-      setUserOpen(true);
-      // #188 S4/C1 — a force-open makes this thread VISIBLE, so report it open;
-      // the reader then counts a subsequent append into it (Bug 5).
-      onOpenChange?.(subagentKey, true);
-    }
+    if (forceOpen) onOpenChange?.(subagentKey, true);
     // onOpenChange is a stable reader callback; keep the dep list keyed on the
-    // force latch so this fires once per force (mirrors the userOpen latch).
+    // force latch so this fires once per force.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceOpen]);
 

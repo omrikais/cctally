@@ -575,10 +575,22 @@ describe('ConversationReader', () => {
       expect(parent?.open).toBe(true);
       expect(grandchild?.open).toBe(true);
     });
+    // #222 — assert the open-state HOLDS at STEADY STATE (after the jump fully
+    // clears = the reader's forcedOpenKeys reset has run). The waitFor above can
+    // pass transiently while forceOpen is still true; the real regression is the
+    // grandchild SILENTLY collapsing once the force resets — the old effect-latch
+    // raced that reset, the grandchild's parent transiently collapsed and
+    // UNMOUNTED it (discarding its latch), then re-opened while the grandchild
+    // re-mounted fresh + collapsed. Without this steady-state check the test
+    // missed ~44% of failures under shuffle: it only verified the grandchild was
+    // PRESENT (classList), never that it was still OPEN. Assert open=true here.
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    const parentSteady = container.querySelector('details.conv-sidechain[data-uuid="c1"]') as HTMLDetailsElement | null;
     const grandchild = container.querySelector('details.conv-sidechain[data-uuid="g1"]') as HTMLDetailsElement | null;
+    expect(parentSteady?.open).toBe(true);    // parent stays open at steady state
+    expect(grandchild?.open).toBe(true);      // grandchild STAYS open (the #222 fix)
     // The grandchild card is nested (rendered inside the parent's body).
     expect(grandchild!.classList.contains('conv-sidechain--nested')).toBe(true);
-    await waitFor(() => expect(getState().conversationJump).toBeNull());
   });
 
   // #204 — a jump to a nested subagent CARD root aligns the card HEAD to the top
