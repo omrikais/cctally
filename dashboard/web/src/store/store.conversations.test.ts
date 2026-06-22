@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetForTests, dispatch, getState } from './store';
 import { clearReadingPositions, loadReadingPos } from './readingPosition';
 import { clearRailPrefs } from './conversationRailPrefs';
+import { clearBookmarks, loadBookmarks, toggleBookmark } from './bookmarks';
 
 // #217 S4 / I-2.2 — filters/sort now persist to localStorage; clear before each
 // reset so a prior test's SET_CONVERSATION_FILTERS never bleeds into loadInitial.
@@ -517,5 +518,42 @@ describe('#205 S1 — convOutlineMobileOpen (ephemeral mobile outline)', () => {
     dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
     dispatch({ type: 'SELECT_CONVERSATION', sessionId: null });
     expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+});
+
+// #217 S6 F4 — convBookmarks store slice: hydrate on BOTH selection actions
+// (rail clicks → SELECT_CONVERSATION; search-hit/deep-link → OPEN_CONVERSATION),
+// clear to {} on a null select, and write through to localStorage on the two
+// mutating actions.
+describe('convBookmarks store slice (#217 S6 F4)', () => {
+  beforeEach(() => { clearBookmarks(); _resetForTests(); });
+  afterEach(() => { clearBookmarks(); _resetForTests(); });
+
+  it('hydrates convBookmarks on OPEN_CONVERSATION and SELECT_CONVERSATION, clears on null', () => {
+    _resetForTests();
+    toggleBookmark('s1', 'u1', 1000); // seed localStorage
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's1' });
+    expect(getState().convBookmarks).toEqual({ u1: { note: '', ts: 1000 } });
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: null });
+    expect(getState().convBookmarks).toEqual({});
+    clearBookmarks();
+  });
+  it('hydrates convBookmarks on a rail SELECT_CONVERSATION too', () => {
+    _resetForTests();
+    toggleBookmark('s9', 'u7', 1500);
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 's9' });
+    expect(getState().convBookmarks).toEqual({ u7: { note: '', ts: 1500 } });
+    clearBookmarks();
+  });
+  it('TOGGLE_BOOKMARK and SET_BOOKMARK_NOTE write through and update state', () => {
+    _resetForTests();
+    clearBookmarks();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's2' });
+    dispatch({ type: 'TOGGLE_BOOKMARK', uuid: 'a1' });
+    expect('a1' in getState().convBookmarks).toBe(true);
+    dispatch({ type: 'SET_BOOKMARK_NOTE', uuid: 'a1', note: 'hi' });
+    expect(getState().convBookmarks.a1.note).toBe('hi');
+    expect(loadBookmarks('s2').a1.note).toBe('hi'); // persisted
+    clearBookmarks();
   });
 });

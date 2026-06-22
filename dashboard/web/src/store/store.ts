@@ -3,6 +3,8 @@ import type { ConversationFilters, ConversationJump, RailSortKey, SearchKind } f
 import type { FocusMode } from '../conversations/applyFocusMode';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { recordReadingPos } from './readingPosition';
+import { loadBookmarks, setBookmarkNote, toggleBookmark } from './bookmarks';
+import type { SessionBookmarks } from './bookmarks';
 import { loadRailPrefs, saveRailPrefs } from './conversationRailPrefs';
 import { clampOutlineWidth, loadOutlineWidth, saveOutlineWidth } from './outlineWidth';
 import {
@@ -50,7 +52,10 @@ const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on fir
 const CONV_OUTLINE_OPEN_KEY = 'cctally.conv.outlineOpen';
 
 export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'alerts' | 'update' | 'projects' | 'cache-report';
-export type InputMode = null | 'filter' | 'search';
+// #217 S6 F4 — 'note' added: the per-turn bookmark note editor sets inputMode
+// 'note' on focus / null on blur+close so the reader's hotkey guard (which gates
+// on inputMode === null) suppresses j/k/i/t/… while the user is typing a note.
+export type InputMode = null | 'filter' | 'search' | 'note';
 
 // ---------- Update subcommand (spec §6) ----------
 //
@@ -323,6 +328,12 @@ export interface UIState {
   // (Bug 2 ≡ #187) rather than the scroll-sync topmost-visible turn (which sits
   // above a centered target). Transient: reset on a genuine session switch.
   convPinnedUuid: string | null;
+  // #217 S6 F4 — the CURRENT conversation's bookmarks (uuid → { note, ts }), UI
+  // state in the same family as convPinnedUuid / convFocusMode. Hydrated from
+  // localStorage (loadBookmarks) on BOTH selection actions (OPEN_CONVERSATION +
+  // SELECT_CONVERSATION) and cleared to {} when the selection is null; mutated by
+  // TOGGLE_BOOKMARK / SET_BOOKMARK_NOTE (which also write through to localStorage).
+  convBookmarks: SessionBookmarks;
   // #177 S6 — the floating in-conversation find bar (Cmd+F style). Transient:
   // opened by '/' over an open reader, closed on Esc / its ✕ / a genuine
   // session switch. Never persists.
@@ -585,6 +596,8 @@ function loadInitial(): UIState {
     convOutlineTab: 'outline',
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
+    // #217 S6 F4 — no conversation selected at init → no bookmarks hydrated.
+    convBookmarks: {},
     convFindOpen: false,
     conversationFilters: railPrefs.filters,
     convFiltersOpen: false,
@@ -763,6 +776,11 @@ export type Action =
   // aria-current + jump-to-next (closes #187).
   | { type: 'SET_CONV_PINNED_TURN'; uuid: string }
   | { type: 'CLEAR_CONV_PIN' }
+  // #217 S6 F4 — bookmark mutations on the current conversation. Both reducers
+  // write through to localStorage (the recordReadingPos write-through pattern)
+  // and re-hydrate convBookmarks from the saved map.
+  | { type: 'TOGGLE_BOOKMARK'; uuid: string }
+  | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string }
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
@@ -965,8 +983,12 @@ export function dispatch(action: Action): void {
         // #205 S1 — a genuine switch also closes the ephemeral mobile outline
         // sheet so the new conversation's transcript is never auto-buried; a
         // same-session OPEN_CONVERSATION (in-session jump) leaves it open.
+        // #217 S6 F4 — a GENUINE session switch re-hydrates convBookmarks from
+        // localStorage for the new session; a same-session OPEN (an in-session
+        // jump) keeps the live map (which may carry an unsaved-to-state mutation
+        // mid-flight). action.sessionId is non-null for OPEN_CONVERSATION.
         ...(switched
-          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false }
+          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false, convBookmarks: loadBookmarks(action.sessionId) }
           : {}),
       };
       break;
@@ -982,7 +1004,12 @@ export function dispatch(action: Action): void {
         // Find button lets open-find → Back → reselect auto-reopen the bar and
         // pop the keyboard. Read the PRIOR selectedConversationId (state, not
         // action) before the overwrite.
-        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false, convFindOpen: false } : {}),
+        // #217 S6 F4 — a genuine change re-hydrates convBookmarks from
+        // localStorage for the new session (or clears to {} on a select-to-null /
+        // Back). Rail-row clicks dispatch SELECT_CONVERSATION, so hydrating only
+        // OPEN_CONVERSATION would leave the prior session's bookmarks showing
+        // (Codex P1). A same-id reselect leaves the live map untouched.
+        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false, convFindOpen: false, convBookmarks: action.sessionId ? loadBookmarks(action.sessionId) : {} } : {}),
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
@@ -1110,6 +1137,23 @@ export function dispatch(action: Action): void {
       if (state.convPinnedUuid === null) break; // already clear — no emit
       state = { ...state, convPinnedUuid: null };
       break;
+    case 'TOGGLE_BOOKMARK': {
+      // #217 S6 F4 — write through to localStorage, then re-read the saved map so
+      // convBookmarks reflects the canonical persisted shape (mirrors the
+      // recordReadingPos write-through). No-op when no conversation is selected.
+      const sid = state.selectedConversationId;
+      if (!sid) break;
+      toggleBookmark(sid, action.uuid);
+      state = { ...state, convBookmarks: loadBookmarks(sid) };
+      break;
+    }
+    case 'SET_BOOKMARK_NOTE': {
+      const sid = state.selectedConversationId;
+      if (!sid) break;
+      setBookmarkNote(sid, action.uuid, action.note);
+      state = { ...state, convBookmarks: loadBookmarks(sid) };
+      break;
+    }
     case 'SET_FILTER': {
       if (action.text) localStorage.setItem(FILTER_KEY, action.text);
       else localStorage.removeItem(FILTER_KEY);
