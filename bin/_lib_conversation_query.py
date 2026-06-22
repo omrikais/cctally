@@ -1335,7 +1335,7 @@ def _assemble_session(conn, session_id):
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     nested_candidates = []  # §4 1a: (tool_use_id, block) — string-content spawn
                             # results with no structured agent_id, resolved after
-                            # spawn_kind is complete (text still present pre-fold)
+                            # the spawn maps are complete (text still present pre-fold)
     ask_link = {}       # tool_use id -> (answers, annotations)  (#177 S2)
     bash_link = {}      # tool_use id -> (stderr, interrupted)   (#177 S3)
     web_search_link = {}  # tool_use id -> web_search payload    (#177 S4)
@@ -1370,7 +1370,7 @@ def _assemble_session(conn, session_id):
                     agent_link[b["tool_use_id"]] = (aid, meta or {})
                 elif b.get("tool_use_id") is not None:
                     # §4 1a candidate — a tool_result with no structured agentId.
-                    # Resolved AFTER spawn_kind is complete (text still present,
+                    # Resolved AFTER the spawn maps are complete (text still present,
                     # pre-Phase-2-fold). The block's `text` holds the result body.
                     nested_candidates.append((b["tool_use_id"], b))
                 ans = b.pop("ask_answers", None)            # #177 S2
