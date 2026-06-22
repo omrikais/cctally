@@ -37,6 +37,11 @@ export interface TranscriptCtxValue {
   // every tick — same memo economics as fmtCtx). Optional + default true
   // (opt-out): an absent provider value renders the chip.
   markersEnabled?: boolean;
+  // #217 S6 F3 — the session's heaviest LOADED per-turn cost, provided ONCE by
+  // the reader (same memo economics as fmtCtx/markersEnabled) so the per-turn
+  // cost bar can size itself without each memoized MessageItem subscribing to
+  // the store. Optional + default 0 (→ no bar) for the many provider-less tests.
+  maxTurnCost?: number;
 }
 
 export const TranscriptContext = createContext<TranscriptCtxValue>({
@@ -44,6 +49,7 @@ export const TranscriptContext = createContext<TranscriptCtxValue>({
   focusMode: 'all',
   fmtCtx: DEFAULT_FMT_CTX,
   markersEnabled: true,
+  maxTurnCost: 0,
 });
 
 export const useSessionId = () => useContext(TranscriptContext).sessionId;
@@ -52,3 +58,7 @@ export const useFmtCtx = (): FmtCtx => useContext(TranscriptContext).fmtCtx ?? D
 // Default true (opt-out): a missing provider value reads as markers-on.
 export const useMarkersEnabled = (): boolean =>
   useContext(TranscriptContext).markersEnabled ?? true;
+// #217 S6 F3 — the session max-turn-cost denominator for the per-turn cost bar.
+// Default 0 (no provider value) → costIntensity returns 0 → no bar.
+export const useMaxTurnCost = (): number =>
+  useContext(TranscriptContext).maxTurnCost ?? 0;
