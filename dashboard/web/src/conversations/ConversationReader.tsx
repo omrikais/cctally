@@ -1670,6 +1670,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               onClick={() => { void jumpToLatest(); }}
             >{jumpingLatest ? '… ' : ''}Latest ↓</button>
           )}
+          {/* #217 S7 F10 — "Compare with…" — enters rail pick-mode with this
+              session as the anchor (START_COMPARE_PICK). The rail then shows a
+              banner and rows pick the second session. ≥44px touch target (#205);
+              CSS in index.css. */}
+          <button
+            type="button"
+            className="conv-compare-with"
+            aria-label="Compare this session with another"
+            title="Compare with another session"
+            onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+          >⟷ Compare with…</button>
           {/* #205 S2 (F3) — Find toggle. Mirrors the outline toggle's
               aria-pressed semantics + chrome; gives the `/` shortcut a visible,
               tappable counterpart (the only find affordance on touch). */}

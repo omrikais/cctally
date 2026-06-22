@@ -748,3 +748,43 @@ describe('ConversationRail filtered search (#217 S4 / I-2.5)', () => {
     expect(note!.textContent).toMatch(/filters/i);
   });
 });
+
+// #217 S7 F10 — comparison pick-mode.
+describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
+  it('shows the aria-live pick banner with the anchor when comparePick is set', () => {
+    browseRows = [summary({ session_id: 's2', title: 'pick me' })];
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'anchorsid-1234' });
+    render(<ConversationRail />);
+    const banner = document.querySelector('.conv-rail-pickbanner')!;
+    expect(banner).toBeTruthy();
+    expect(banner.getAttribute('aria-live')).toBe('polite');
+    expect(banner.textContent).toMatch(/pick a session/i);
+    // the anchor is shown (short form)
+    expect(banner.textContent).toContain('anchorsi');
+  });
+
+  it('Cancel in the banner dispatches CANCEL_COMPARE_PICK', () => {
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    render(<ConversationRail />);
+    fireEvent.click(screen.getByRole('button', { name: /cancel comparison pick/i }));
+    expect(getState().comparePick).toBeNull();
+  });
+
+  it('clicking a NON-anchor browse row in pick-mode dispatches OPEN_COMPARE, not SELECT_CONVERSATION', () => {
+    browseRows = [summary({ session_id: 'B', title: 'pick me' })];
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    render(<ConversationRail />);
+    fireEvent.click(screen.getByText('pick me'));
+    expect(getState().compare).toEqual({ a: 'A', b: 'B' });
+    // selection was NOT set by a SELECT_CONVERSATION
+    expect(getState().selectedConversationId).toBe('A'); // OPEN_COMPARE sets the anchor
+  });
+
+  it('the anchor row is disabled (non-pickable) in pick-mode', () => {
+    browseRows = [summary({ session_id: 'A', title: 'the anchor' })];
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    render(<ConversationRail />);
+    const row = screen.getByText('the anchor').closest('button') as HTMLButtonElement;
+    expect(row.disabled).toBe(true);
+  });
+});

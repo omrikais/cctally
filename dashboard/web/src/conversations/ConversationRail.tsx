@@ -1,4 +1,4 @@
-import { Fragment, useRef, useSyncExternalStore } from 'react';
+import { Fragment, useEffect, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useConversations } from '../hooks/useConversations';
@@ -143,15 +143,50 @@ export function ConversationRail() {
   const filtersOpen = useSyncExternalStore(subscribeStore, () => getState().convFiltersOpen);
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
+  // #217 S7 F10 — comparison pick-mode. When `comparePick` is set (the reader's
+  // "Compare with…" affordance fired START_COMPARE_PICK), the rail shows a banner
+  // and rows PICK the second session (OPEN_COMPARE) instead of opening it. Esc
+  // cancels.
+  const comparePick = useSyncExternalStore(subscribeStore, () => getState().comparePick);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Esc cancels pick-mode from anywhere in the rail (the banner's Cancel button
+  // is the visible affordance; this is the keyboard parity). Bound only while
+  // pick-mode is active so it never competes with the view-level Esc otherwise.
+  useEffect(() => {
+    if (!comparePick) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        dispatch({ type: 'CANCEL_COMPARE_PICK' });
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [comparePick]);
 
   const isSearching = search.trim() !== '';
   const chips = activeFilterChips(filters);
 
   return (
-    <aside className="conv-rail">
+    <aside className={`conv-rail${comparePick ? ' conv-rail--picking' : ''}`}>
+      {comparePick && (
+        <div className="conv-rail-pickbanner" role="status" aria-live="polite">
+          <span className="conv-rail-pickbanner-text">
+            Comparing with <code>{comparePick.anchor.slice(0, 8)}</code> — pick a session
+          </span>
+          <button
+            type="button"
+            className="conv-rail-pickcancel"
+            aria-label="Cancel comparison pick"
+            onClick={() => dispatch({ type: 'CANCEL_COMPARE_PICK' })}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       <div className="conv-rail-search">
         <div className="conv-rail-search-bar">
           <input
@@ -227,15 +262,31 @@ export function ConversationRail() {
         )}
       </div>
       {isSearching
-        ? <SearchList needle={search} kind={kind} ctx={ctx} />
-        : <BrowseList selectedId={selected} ctx={ctx} />}
+        ? <SearchList needle={search} kind={kind} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />
+        : <BrowseList selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
     </aside>
   );
 }
 
+// #217 S7 F10 — the click action for a rail row, shared by browse + search rows.
+// In pick-mode (`pickAnchor` set) a click on a NON-anchor row dispatches
+// OPEN_COMPARE { a: anchor, b: row }; otherwise it falls back to the row's normal
+// open/select action. The anchor row is rendered disabled, so its click never
+// reaches here.
+function pickOr(
+  pickAnchor: string | null,
+  rowSessionId: string,
+  fallback: () => void,
+): () => void {
+  if (pickAnchor && pickAnchor !== rowSessionId) {
+    return () => dispatch({ type: 'OPEN_COMPARE', a: pickAnchor, b: rowSessionId });
+  }
+  return fallback;
+}
+
 interface RailCtx { tz: string; offsetLabel: string }
 
-function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailCtx }) {
+function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null; ctx: RailCtx; pickAnchor: string | null }) {
   const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry } = useConversations();
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   // filters spec §1 dual-branch parity — a one-line muted note when the
@@ -300,7 +351,7 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
         return (
           <Fragment key={r.session_id}>
             {isNewBucket && <div className="conv-rail-sec">{bucket}</div>}
-            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} />
+            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} pickAnchor={pickAnchor} />
           </Fragment>
         );
       })}
@@ -321,12 +372,16 @@ function BrowseList({ selectedId, ctx }: { selectedId: string | null; ctx: RailC
   );
 }
 
-function BrowseRow({ row, ctx, active }: { row: ConversationSummary; ctx: RailCtx; active: boolean }) {
+function BrowseRow({ row, ctx, active, pickAnchor }: { row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: string | null }) {
+  const isAnchor = pickAnchor === row.session_id;
   return (
     <button
       type="button"
-      className={`conv-rail-row${active ? ' is-active' : ''}`}
-      onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id })}
+      className={`conv-rail-row${active ? ' is-active' : ''}${pickAnchor ? ' conv-rail-row--pick' : ''}${isAnchor ? ' conv-rail-row--anchor' : ''}`}
+      disabled={isAnchor}
+      aria-disabled={isAnchor || undefined}
+      title={isAnchor ? 'This is the anchor session' : undefined}
+      onClick={pickOr(pickAnchor, row.session_id, () => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id }))}
     >
       <div className="conv-rail-row-title">{row.title}</div>
       <div className="conv-rail-row-meta">
@@ -376,7 +431,7 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
   );
 }
 
-function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; ctx: RailCtx }) {
+function SearchList({ needle, kind, ctx, pickAnchor }: { needle: string; kind: SearchKind; ctx: RailCtx; pickAnchor: string | null }) {
   const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore } =
     useConversationSearch(needle, kind);
   const proseOnly = searchDepth === 'prose-only';
@@ -412,7 +467,7 @@ function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; c
             <>
               <div className="conv-rail-count" aria-live="polite">{countText}</div>
               {hits.map((h, i) => (
-                <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} />
+                <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} pickAnchor={pickAnchor} />
               ))}
               {hits.length < total && (
                 <button
@@ -430,8 +485,9 @@ function SearchList({ needle, kind, ctx }: { needle: string; kind: SearchKind; c
   );
 }
 
-function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
+function SearchRow({ hit, ctx, pickAnchor }: { hit: SearchHit; ctx: RailCtx; pickAnchor: string | null }) {
   const badges = hit.match_kinds ?? [];
+  const isAnchor = pickAnchor === hit.session_id;
   // #217 S4 / I-3.3 — a kind=files hit (`match_kinds` includes 'file') renders
   // the FILE PATH prominently (primary line, file styling) with the session
   // title secondary; its snippet IS the plain path. Every other hit keeps the
@@ -442,14 +498,17 @@ function SearchRow({ hit, ctx }: { hit: SearchHit; ctx: RailCtx }) {
   return (
     <button
       type="button"
-      className={`conv-rail-row conv-rail-row--hit${isFileHit ? ' conv-rail-row--filehit' : ''}`}
-      onClick={() =>
+      className={`conv-rail-row conv-rail-row--hit${isFileHit ? ' conv-rail-row--filehit' : ''}${pickAnchor ? ' conv-rail-row--pick' : ''}${isAnchor ? ' conv-rail-row--anchor' : ''}`}
+      disabled={isAnchor}
+      aria-disabled={isAnchor || undefined}
+      title={isAnchor ? 'This is the anchor session' : undefined}
+      onClick={pickOr(pickAnchor, hit.session_id, () =>
         dispatch({
           type: 'OPEN_CONVERSATION',
           sessionId: hit.session_id,
           jump: { session_id: hit.session_id, uuid: hit.uuid },
-        })
-      }
+        }),
+      )}
     >
       {isFileHit ? (
         // File hit: the path leads (file styling), the session title trails as a

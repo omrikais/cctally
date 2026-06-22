@@ -8,6 +8,7 @@ import { useFindHotkey } from '../hooks/useFindHotkey';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
 import { ConversationReader } from './ConversationReader';
+import { ComparisonView } from './ComparisonView';
 import { OutlinePanel } from './OutlinePanel';
 import { OutlineResizer } from '../components/OutlineResizer';
 import { ChatIcon } from './ConvIcons';
@@ -18,6 +19,11 @@ import { ChatIcon } from './ConvIcons';
 // view-aware '/' (focus rail search) and Esc (clear search, else exit).
 export function ConversationsView() {
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
+  // #217 S7 F10 — when a comparison is open, the whole workspace renders the
+  // side-by-side ComparisonView instead of the single reader (see the branch
+  // below). Subscribed here so an OPEN_COMPARE / SWAP_COMPARE / CLOSE_COMPARE
+  // re-renders the view.
+  const compare = useSyncExternalStore(subscribeStore, () => getState().compare);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #217 S3 E6(b) — the persisted outline column width, driven into the grid as a
   // CSS custom property on the desktop shell only.
@@ -45,6 +51,27 @@ export function ConversationsView() {
         Transcript viewing is disabled. Enable it with
         {' '}<code>cctally config set dashboard.expose_transcripts true</code>{' '}
         (loopback is always allowed; restart the dashboard to apply).
+      </div>
+    );
+  }
+
+  // #217 S7 F10 — comparison takes over the workspace. On desktop the rail
+  // stays visible (so the user can pick a different pair or click away — the
+  // reverse-clear actions drop `compare`); on mobile the comparison goes
+  // full-width (the rail is hidden, matching the single-reader mobile flow). The
+  // ComparisonView itself owns its header's ✕ close (CLOSE_COMPARE).
+  if (compare !== null) {
+    if (isMobile) {
+      return (
+        <div className="conv-view conv-view--mobile conv-view--compare">
+          <ComparisonView a={compare.a} b={compare.b} />
+        </div>
+      );
+    }
+    return (
+      <div className="conv-view conv-view--compare">
+        <ConversationRail />
+        <ComparisonView a={compare.a} b={compare.b} />
       </div>
     );
   }
