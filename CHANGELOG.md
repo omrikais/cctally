@@ -20,6 +20,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - **Dashboard conversation viewer — the reader-header `Export ▾` and focus `▾ More` menus are now fully keyboard-navigable.** Both popovers previously exposed a `role="menu"` with no arrow-key navigation; they now implement the full menu keyboard pattern — opening moves focus to the first item, `↑`/`↓` cycle through items (wrapping), `Home`/`End` jump to the ends, and `Esc` closes and restores focus to the trigger, with a single roving tab stop so `Tab` moves past the menu rather than through every item. In the focus `▾ More` menu, `→` opens the Subagent submenu (focusing its first entry) and `←` collapses back to the parent. (#224)
 - **Dashboard conversation viewer — git-context diff path parsing no longer over-captures a trailing word into the file path.** The `diff --git a/… b/…` path capture now stops at whitespace instead of greedily running to end-of-line, so a pathological marker line carrying trailing prose after the `b/` path can't bleed that text into the displayed new-path header; real injected diffs (whose paths are whitespace-free) are unaffected. (#224)
+- Conversation viewer: subagents dispatched without an explicit type (the default general-purpose case, e.g. SDD implementors/reviewers) now show their kind, description, and token/duration/tool usage in the card chip and outline — previously only explicitly-typed subagents (e.g. Explore) did (#225).
 
 ## [1.53.0] - 2026-06-21
 

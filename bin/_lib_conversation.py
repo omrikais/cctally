@@ -617,9 +617,12 @@ def _attach_subagent_result(blocks, obj):
     block — the unambiguous subagent-spawn result shape. Zero or >1 tool_result
     blocks: no-op (the kernel then degrades that subagent card to title-only).
     The kind (subagent_type) is captured separately on the spawn tool_use block;
-    the kernel joins the two on tool_use_id. ``agentId`` == the subagent file's
-    ``_subagent_key``. Meta keys are normalized to snake_case here so the kernel
-    stays a pure pass-through (same posture as is_error / tool_use_id)."""
+    the kernel identifies a spawn by the tool NAME (Agent/Task), so an untyped
+    general-purpose spawn — no subagent_type recorded — still links, with the
+    kernel defaulting its kind to ``general-purpose`` (#225). The kernel joins
+    the two on tool_use_id. ``agentId`` == the subagent file's ``_subagent_key``.
+    Meta keys are normalized to snake_case here so the kernel stays a pure
+    pass-through (same posture as is_error / tool_use_id)."""
     tur = obj.get("toolUseResult")
     if not isinstance(tur, dict):
         return

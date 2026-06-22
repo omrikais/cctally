@@ -1223,6 +1223,13 @@ def _turn_usage_map(conn, turn_keys):
     return usage
 
 
+# #225: the two tool names that spawn a subagent. `Agent` = modern, `Task` =
+# older. Exact-match (does NOT match the TaskCreate/TaskUpdate/TaskList checklist
+# family). A spawn is identified by this name even when it carried no
+# subagent_type (the default general-purpose dispatch).
+_SPAWN_TOOL_NAMES = ("Agent", "Task")
+
+
 def _assemble_session(conn, session_id):
     """Shared assembly for get_conversation / get_conversation_outline (#177 S5).
 
@@ -1320,8 +1327,11 @@ def _assemble_session(conn, session_id):
     # tool_call/tool_result block shapes are unchanged — the only new output is
     # the top-level subagent_meta map (no undocumented block keys leak). Join is
     # spawn tool_use id <-> tool_result tool_use_id; agent_id == subagent_key.
-    spawn_kind = {}     # tool_use id -> subagent_type
-    spawn_desc = {}     # tool_use id -> spawning Task description (#193)
+    spawn_kind = {}     # tool_use id -> subagent_type (kind), only when declared
+    spawn_ids = {}      # tool_use id -> None: ordered set of Agent/Task spawn ids
+                        # (#225, typed OR untyped). spawn_kind ⊆ spawn_ids. Dict
+                        # (NOT a set) so iteration stays document-ordered.
+    spawn_desc = {}     # tool_use id -> spawning Agent/Task description (#193/#225)
     agent_link = {}     # tool_use id -> (agent_id, raw_meta)
     nested_candidates = []  # §4 1a: (tool_use_id, block) — string-content spawn
                             # results with no structured agent_id, resolved after
@@ -1336,15 +1346,23 @@ def _assemble_session(conn, session_id):
             k = b.get("kind")
             if k == "tool_use":
                 st = b.pop("subagent_type", None)
-                if st and b.get("id") is not None:
-                    spawn_kind[b["id"]] = st
-                    # #193: harvest the spawning Task description from the
-                    # already-stored bounded input. Guarded on subagent_type, so
-                    # a Bash `description` (no subagent_type) is NEVER picked up.
+                _id = b.get("id")
+                # #225: a spawn is an Agent/Task tool_use. Identify it by tool
+                # NAME (so an untyped general-purpose spawn — no subagent_type —
+                # still counts) OR by a recorded subagent_type. The name gate is
+                # what keeps a Bash/Read `description` (and a coincidental
+                # structured agent_id, #218 I-B.5) from ever being read as a
+                # spawn.
+                if _id is not None and (st or b.get("name") in _SPAWN_TOOL_NAMES):
+                    spawn_ids[_id] = None
+                    if st:
+                        spawn_kind[_id] = st       # #166: declared kind
+                    # #193/#225: harvest the spawn description from the bounded
+                    # input for ANY spawn (typed or untyped); name-gated above.
                     _inp = b.get("input")
                     _d = _inp.get("description") if isinstance(_inp, dict) else None
                     if isinstance(_d, str) and _d.strip():
-                        spawn_desc[b["id"]] = _d
+                        spawn_desc[_id] = _d
             elif k == "tool_result":
                 aid = b.pop("agent_id", None)
                 meta = b.pop("subagent_meta", None)
@@ -1373,30 +1391,33 @@ def _assemble_session(conn, session_id):
                 tlist_ = b.pop("task_list", None)
                 if b.get("tool_use_id") is not None and (tid_ is not None or tlist_ is not None):
                     task_link[b["tool_use_id"]] = {"task_id": tid_, "task_list": tlist_}
-    # §4 symmetry (#218 I-B.5): the structured-agent_id populate above runs
-    # mid-loop, before spawn_kind is complete, so it cannot self-gate on spawn
-    # ownership. Re-validate here now that spawn_kind is final — drop any
-    # agent_link entry whose owning tool_use is NOT a spawn, mirroring the nested
-    # fallback's `_tuid in spawn_kind` gate so BOTH link paths only ever carry
-    # spawn-owned results. Inert today (every agent_link consumer is itself
-    # spawn-gated); this protects a future, un-gated agent_link consumer.
-    agent_link = {t: v for t, v in agent_link.items() if t in spawn_kind}
+    # §4 symmetry (#218 I-B.5 / #225): drop any agent_link entry whose owning
+    # tool_use is NOT a spawn — an ordinary tool result that coincidentally
+    # carries a structured agent_id (e.g. a Read). Gated on spawn_ids (every
+    # Agent/Task spawn, typed OR untyped) rather than the old spawn_kind, which
+    # wrongly excluded untyped general-purpose spawns. A structured agent_id on a
+    # real spawn is authoritative; the heuristic nested text-parse below stays
+    # spawn-gated all the same.
+    agent_link = {t: v for t, v in agent_link.items() if t in spawn_ids}
     # §4 1a — nested grandchild results: gate the text-parse on the owning
-    # tool_use being a spawn (in spawn_kind), so an ordinary tool result that
+    # tool_use being a spawn (in spawn_ids), so an ordinary tool result that
     # merely mentions "agentId" never matches.
     for _tuid, _block in nested_candidates:
-        if _tuid in spawn_kind and _tuid not in agent_link:
+        if _tuid in spawn_ids and _tuid not in agent_link:
             parsed = _parse_nested_agent_result(_block.get("text"))
             if parsed is not None:
                 agent_link[_tuid] = parsed
     subagent_meta = {}
-    for _tuid, _kind in spawn_kind.items():
+    for _tuid in spawn_ids:                 # document order (ordered dict)
         _link = agent_link.get(_tuid)
         if _link is None:
             continue                       # spawn with no (yet) result -> title-only
         _aid, _raw = _link
-        _entry = {"kind": _kind}
-        if spawn_desc.get(_tuid):          # #193: spawning Task description
+        # #225: kind defaults to "general-purpose" for an untyped Agent/Task
+        # spawn (subagent_type omitted at dispatch ⟹ general-purpose; 0
+        # counterexamples across 3085 real sidecars).
+        _entry = {"kind": spawn_kind.get(_tuid, "general-purpose")}
+        if spawn_desc.get(_tuid):          # #193/#225: spawn description
             _entry["description"] = spawn_desc[_tuid]
         for _f in ("total_tokens", "total_duration_ms", "total_tool_use_count", "status"):
             if _raw.get(_f) is not None:

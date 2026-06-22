@@ -480,17 +480,23 @@ def _seed_tool_result(conn, *, sid, uuid, blocks,
 
 def _seed_assistant_with_cost(conn, *, sid, uuid, msg_id, req_id, blocks, model,
                               ts="2026-06-01T00:00:01Z", source_path="a.jsonl",
+                              byte_offset=0, line_offset=0,
                               inp=1000, out=500, cc=0, cr=0, cost_usd_raw=None,
                               stop_reason=None, attribution_skill=None,
                               attribution_plugin=None):
     """An assistant turn + its single deduped session_entries cost row. The
     token counts and the optional cost_usd_raw override are passed through so a
-    raw-cost-override turn can surface tokens AND the override cost (#177)."""
+    raw-cost-override turn can surface tokens AND the override cost (#177).
+    `byte_offset`/`line_offset` must be made distinct when seeding TWO rows under
+    the SAME source_path — conversation_messages is UNIQUE(source_path,
+    byte_offset), so a second row at the default offset 0 is silently dropped by
+    the INSERT OR IGNORE."""
     _seed_assistant(conn, sid=sid, uuid=uuid, msg_id=msg_id, req_id=req_id,
                     blocks=blocks, ts=ts, model=model, source_path=source_path,
+                    byte_offset=byte_offset,
                     stop_reason=stop_reason, attribution_skill=attribution_skill,
                     attribution_plugin=attribution_plugin)
-    _entry(conn, source_path=source_path, line_offset=0, model=model,
+    _entry(conn, source_path=source_path, line_offset=line_offset, model=model,
            msg_id=msg_id, req_id=req_id, inp=inp, out=out, cc=cc, cr=cr,
            cost_usd_raw=cost_usd_raw)
 
@@ -1292,6 +1298,87 @@ def test_subagent_meta_happy_path_and_block_keys_stripped():
             assert "subagent_type" not in b
             assert "agent_id" not in b
             assert "subagent_meta" not in b
+
+
+def test_subagent_meta_untyped_general_purpose_spawn_gets_meta():
+    # #225: an Agent spawn dispatched WITHOUT a subagent_type (default
+    # general-purpose) must still get a subagent_meta entry. The spawn block
+    # carries no subagent_type; the result carries the structured agent_id. The
+    # kind defaults to "general-purpose" and the description is harvested from
+    # the spawn input.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Agent", "input_summary": "{}",
+                 "input": {"description": "Implement I-1 F3 analytics"},
+                 "id": "t1", "preview": "Implement I-1 F3 analytics"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "done", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "aaaa1111",
+                 "subagent_meta": {"status": "async_launched"}}])
+    out = cq.get_conversation(conn, "s1")
+    assert "aaaa1111" in out["subagent_meta"]
+    entry = out["subagent_meta"]["aaaa1111"]
+    assert entry["kind"] == "general-purpose"
+    assert entry["description"] == "Implement I-1 F3 analytics"
+    # §4 1b parent linkage still attaches (additive).
+    assert entry["spawn_tool_use_id"] == "t1"
+    assert entry["spawn_uuid"] == "a1"
+
+
+def test_untyped_nonspawn_tool_with_agent_id_gets_no_meta():
+    # #225 / #218 I-B.5: a NON-spawn tool (Read) carrying a description AND a
+    # coincidental structured agent_id must NOT be treated as a spawn — the
+    # name gate (Agent/Task only) excludes it, so no meta entry is keyed for it.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "input": {"description": "/x.py"},
+                 "id": "t1", "preview": "/x.py"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1",
+        blocks=[{"kind": "tool_result", "text": "contents", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "bbbb2222"}])
+    out = cq.get_conversation(conn, "s1")
+    assert "bbbb2222" not in out["subagent_meta"]
+    assert out["subagent_meta"] == {}
+
+
+def test_subagent_meta_untyped_totals_derived_from_thread():
+    # #225: with the entry now created, the existing usage-derivation pass fills
+    # tokens/duration/tool-count from the untyped agent's own child thread.
+    conn = _conn()
+    _seed_assistant(conn, sid="s1", uuid="a1", msg_id="m1", req_id="r1",
+        ts="2026-06-01T00:00:00Z",
+        blocks=[{"kind": "tool_use", "name": "Agent", "input_summary": "{}",
+                 "input": {"description": "Code-review I-1"},
+                 "id": "t1", "preview": "Code-review I-1"}])
+    _seed_tool_result(conn, sid="s1", uuid="u1", ts="2026-06-01T00:00:01Z",
+        blocks=[{"kind": "tool_result", "text": "ok", "truncated": False,
+                 "is_error": False, "tool_use_id": "t1",
+                 "agent_id": "cccc3333", "subagent_meta": {}}])
+    # Child thread (two timestamped, costed assistant rows under agent-cccc3333).
+    # Distinct byte_offset/line_offset so BOTH rows survive the
+    # UNIQUE(source_path, byte_offset) INSERT OR IGNORE (same source_path).
+    _seed_assistant_with_cost(conn, sid="s1", uuid="c1", msg_id="cm1", req_id="cr1",
+        ts="2026-06-01T00:00:02Z", model=_MODEL,
+        source_path="agent-cccc3333.jsonl", byte_offset=0, line_offset=0,
+        inp=100, out=50, cc=0, cr=0,
+        blocks=[{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+                 "id": "ct1", "preview": "x"}])
+    _seed_assistant_with_cost(conn, sid="s1", uuid="c2", msg_id="cm2", req_id="cr2",
+        ts="2026-06-01T00:00:09Z", model=_MODEL,
+        source_path="agent-cccc3333.jsonl", byte_offset=1, line_offset=1,
+        inp=10, out=20, cc=0, cr=0,
+        blocks=[{"kind": "text", "text": "done"}])
+    out = cq.get_conversation(conn, "s1")
+    entry = out["subagent_meta"]["cccc3333"]
+    assert entry["kind"] == "general-purpose"
+    assert entry["description"] == "Code-review I-1"
+    assert entry.get("totals_derived") is True
+    assert entry["total_tool_use_count"] == 1          # the child Read
+    assert entry["total_duration_ms"] == 7000          # 00:09 - 00:02 over the child bucket
+    assert entry["total_tokens"] == 180                # 100+50 + 10+20
 
 
 # ---- injected-meta classification (skill / command / context) ------------
