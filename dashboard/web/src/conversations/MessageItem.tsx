@@ -4,6 +4,7 @@ import { MessageBlocks } from './MessageBlocks';
 import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
+import { BookmarkButton } from './BookmarkButton';
 import { isSystemMarker } from './systemMarkers';
 import { modelChipClass } from '../lib/model';
 import { fmt } from '../lib/fmt';
@@ -173,6 +174,7 @@ function MessageItemImpl(
           <div className="conv-item-actions">
             <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
             <CopyButton text={item.text} />
+            <BookmarkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
           </div>
         )}
         {(hasCost || tok) && (
@@ -271,6 +273,7 @@ function MessageItemImpl(
                 <div className="conv-item-actions">
                   <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
                   <CopyButton text={item.text} />
+                  <BookmarkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
                 </div>
               )}
             </div>
@@ -321,6 +324,7 @@ function MessageItemImpl(
         <div className="conv-item-actions">
           <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
           <CopyButton text={item.text} />
+          <BookmarkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
         </div>
       )}
     </div>

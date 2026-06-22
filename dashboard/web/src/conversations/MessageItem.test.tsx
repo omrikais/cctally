@@ -1049,3 +1049,13 @@ describe('MessageItem cache-failure chip (cache-failure-markers spec §3)', () =
     expect(container.querySelector('.conv-cache-chip')).toBeNull();
   });
 });
+
+// #217 S6 F4 — the per-turn bookmark control rides in each .conv-item-actions
+// row (an assistant turn with prose renders one).
+describe('MessageItem bookmark control (#217 S6 F4)', () => {
+  it('renders a .conv-bookmark-btn in the actions row of a prose assistant turn', () => {
+    const { container } = renderWithTz(assistant);
+    const actions = container.querySelector('.conv-item-actions')!;
+    expect(actions.querySelector('.conv-bookmark-btn')).not.toBeNull();
+  });
+});
