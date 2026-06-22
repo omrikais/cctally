@@ -354,6 +354,15 @@ export interface UIState {
   // threaded into the /api/conversations `sort` param. Persisted alongside the
   // filters in the railPrefs blob; default 'recent'.
   conversationRailSort: RailSortKey;
+  // #217 S7 F10 — session comparison. `compare` holds the two session ids being
+  // diffed side-by-side (null = single-session mode); `comparePick` is the
+  // transient rail pick-mode (the user clicked "Compare with…" and is choosing
+  // the other side — `anchor` is the session already selected). Neither persists
+  // — a reload lands on the dashboard. The reverse-clear discipline (below) wipes
+  // both whenever a single-session action runs (OPEN_/SELECT_CONVERSATION,
+  // SET_VIEW) so a stale comparison can never linger behind the reader.
+  compare: { a: string; b: string } | null;
+  comparePick: { anchor: string } | null;
   openModal: ModalKind | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
@@ -602,6 +611,9 @@ function loadInitial(): UIState {
     conversationFilters: railPrefs.filters,
     convFiltersOpen: false,
     conversationRailSort: railPrefs.sort,
+    // #217 S7 F10 — no comparison / pick in flight at init.
+    compare: null,
+    comparePick: null,
     openModal: null,
     openSessionId: null,
     openBlockStartAt: null,
@@ -797,6 +809,16 @@ export type Action =
   | { type: 'SET_CONV_FILTERS_OPEN'; open: boolean }
   // #217 S4 / I-2 — the persisted rail sort key.
   | { type: 'SET_CONVERSATION_RAIL_SORT'; sort: RailSortKey }
+  // #217 S7 F10 — session comparison. START/CANCEL drive the rail pick-mode;
+  // OPEN_COMPARE enters the comparison (sets the anchor selection + view);
+  // SWAP flips the two sides; CLOSE returns to the single-session reader on the
+  // anchor. OPEN_COMPARE is a no-op when a===b (a session never compares to
+  // itself — the URL boot path routes that to a plain OPEN_CONVERSATION).
+  | { type: 'START_COMPARE_PICK'; anchor: string }
+  | { type: 'CANCEL_COMPARE_PICK' }
+  | { type: 'OPEN_COMPARE'; a: string; b: string }
+  | { type: 'SWAP_COMPARE' }
+  | { type: 'CLOSE_COMPARE' }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -944,6 +966,11 @@ export function dispatch(action: Action): void {
         ...state,
         view: action.view,
         ...DISMISSED_ON_VIEW_SWITCH,
+        // #217 S7 F10 — reverse-clear: a view switch (incl. into the dashboard)
+        // wipes any in-flight comparison + pick-mode so a stale compare never
+        // lingers behind the next view.
+        compare: null,
+        comparePick: null,
         ...(action.view === 'dashboard'
           ? { selectedConversationId: null, conversationJump: null, conversationSearch: '', conversationSearchKind: 'all' as const }
           : {}),
@@ -973,6 +1000,11 @@ export function dispatch(action: Action): void {
         ...state,
         view: 'conversations',
         ...DISMISSED_ON_VIEW_SWITCH,
+        // #217 S7 F10 — reverse-clear: opening a single conversation (incl. the
+        // "open in reader →" affordance inside a comparison) leaves comparison
+        // mode, so the reader replaces the comparison view.
+        compare: null,
+        comparePick: null,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
         // #177 S6 — a GENUINE session switch closes the find bar (its anchor
@@ -1013,6 +1045,10 @@ export function dispatch(action: Action): void {
         // OPEN_CONVERSATION would leave the prior session's bookmarks showing
         // (Codex P1). A same-id reselect leaves the live map untouched.
         ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false, convFindOpen: false, convBookmarks: action.sessionId ? loadBookmarks(action.sessionId) : {} } : {}),
+        // #217 S7 F10 — reverse-clear: selecting a rail row (single-session)
+        // leaves any in-flight comparison + pick-mode.
+        compare: null,
+        comparePick: null,
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
@@ -1111,6 +1147,36 @@ export function dispatch(action: Action): void {
       // #217 S4 / I-2 — persist the filters+sort blob on a sort change too.
       saveRailPrefs({ filters: state.conversationFilters, sort: action.sort });
       state = { ...state, conversationRailSort: action.sort };
+      break;
+    // #217 S7 F10 — session comparison.
+    case 'START_COMPARE_PICK':
+      state = { ...state, comparePick: { anchor: action.anchor } };
+      break;
+    case 'CANCEL_COMPARE_PICK':
+      state = { ...state, comparePick: null };
+      break;
+    case 'OPEN_COMPARE': {
+      if (action.a === action.b) break;               // guard: never A===B
+      state = {
+        ...state,
+        ...DISMISSED_ON_VIEW_SWITCH,
+        view: 'conversations',
+        // A is the anchor: initial selectedConversationId is null, so without
+        // this a cold-boot OPEN_COMPARE (e.g. from a pasted compare URL) would
+        // leave CLOSE_COMPARE with nothing to fall back to. Anchoring on A keeps
+        // close → single-session-reader-on-A correct.
+        selectedConversationId: action.a,
+        conversationJump: null,
+        comparePick: null,
+        compare: { a: action.a, b: action.b },
+      };
+      break;
+    }
+    case 'SWAP_COMPARE':
+      state = { ...state, compare: state.compare ? { a: state.compare.b, b: state.compare.a } : null };
+      break;
+    case 'CLOSE_COMPARE':
+      state = { ...state, compare: null };            // keep selectedConversationId = anchor
       break;
     case 'SET_CONV_CURRENT_TURN':
       // No-op same-uuid ticks FIRST (the scroll-sync observer re-fires the same
