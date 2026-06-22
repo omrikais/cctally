@@ -37,4 +37,34 @@ describe('BookmarkButton', () => {
     expect(getState().convBookmarks.u1.note).toBe('');
     expect(getState().inputMode).toBeNull();
   });
+  it('does NOT save the discarded draft when Escape is followed by the unmount blur', () => {
+    // Regression (#217 S6 F4, real browser): Escape sets editing=false, which
+    // unmounts the <input>; the browser then fires a native blur on the way out.
+    // A naive onBlur=closeEditor(true) SAVES the draft the user just discarded;
+    // the cancelledRef guard must swallow that blur. NOTE: jsdom does NOT route a
+    // post-unmount blur to React's onBlur (the synthetic-event root delegation
+    // drops it once the fiber detaches), so the trailing fireEvent.blur here is a
+    // no-op under jsdom and this test exercises only the Escape-discard half. The
+    // guard itself is browser-verified (Playwright). The keyDown assertion still
+    // goes RED if Escape ever saves, so the test is non-vacuous.
+    dispatch({ type: 'TOGGLE_BOOKMARK', uuid: 'u1' });
+    const { container } = render(<BookmarkButton sessionId="s1" uuid="u1" />);
+    fireEvent.click(container.querySelector('.conv-bookmark-note-toggle')!);
+    const input = container.querySelector('.conv-bookmark-note-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'discard me' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+    fireEvent.blur(input); // the unmount blur the real DOM fires after Escape (no-op under jsdom)
+    expect(getState().convBookmarks.u1.note).toBe('');
+    expect(getState().inputMode).toBeNull();
+  });
+  it('saves the draft on a plain blur (no Escape)', () => {
+    dispatch({ type: 'TOGGLE_BOOKMARK', uuid: 'u1' });
+    const { container } = render(<BookmarkButton sessionId="s1" uuid="u1" />);
+    fireEvent.click(container.querySelector('.conv-bookmark-note-toggle')!);
+    const input = container.querySelector('.conv-bookmark-note-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'keep me' } });
+    fireEvent.blur(input);
+    expect(getState().convBookmarks.u1.note).toBe('keep me');
+    expect(getState().inputMode).toBeNull();
+  });
 });

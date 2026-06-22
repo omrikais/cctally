@@ -83,6 +83,9 @@ export function setBookmarkNote(sessionId: string, uuid: string, note: string, t
   const map = readMap();
   const sess = map[sessionId] ?? {};
   sess[uuid] = { note, ts };
+  // A note always implies a populated session, so we unconditionally keep
+  // map[sessionId] here. That's why this lacks toggleBookmark's empty-session
+  // prune (`else delete map[sessionId]`): setting a note never empties the map.
   map[sessionId] = sess;
   writeMap(evictLru(map, BOOKMARKS_CAP));
 }

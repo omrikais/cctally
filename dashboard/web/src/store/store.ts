@@ -779,8 +779,11 @@ export type Action =
   // #217 S6 F4 — bookmark mutations on the current conversation. Both reducers
   // write through to localStorage (the recordReadingPos write-through pattern)
   // and re-hydrate convBookmarks from the saved map.
-  | { type: 'TOGGLE_BOOKMARK'; uuid: string }
-  | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string }
+  // #217 S6 F4 (review) — optional sessionId targets a specific conversation;
+  // when absent the reducer falls back to state.selectedConversationId (the
+  // default in-reader path), so existing callers are unchanged.
+  | { type: 'TOGGLE_BOOKMARK'; uuid: string; sessionId?: string }
+  | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string; sessionId?: string }
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
@@ -1140,18 +1143,22 @@ export function dispatch(action: Action): void {
     case 'TOGGLE_BOOKMARK': {
       // #217 S6 F4 — write through to localStorage, then re-read the saved map so
       // convBookmarks reflects the canonical persisted shape (mirrors the
-      // recordReadingPos write-through). No-op when no conversation is selected.
-      const sid = state.selectedConversationId;
+      // recordReadingPos write-through). The action's sessionId (when set) wins
+      // over the selected conversation so the bookmark always lands on THIS
+      // button's session; both absent → no-op.
+      const sid = action.sessionId ?? state.selectedConversationId;
       if (!sid) break;
       toggleBookmark(sid, action.uuid);
-      state = { ...state, convBookmarks: loadBookmarks(sid) };
+      // Only re-hydrate the in-view convBookmarks when the target IS the open
+      // conversation; a write to some other session must not clobber it.
+      if (sid === state.selectedConversationId) state = { ...state, convBookmarks: loadBookmarks(sid) };
       break;
     }
     case 'SET_BOOKMARK_NOTE': {
-      const sid = state.selectedConversationId;
+      const sid = action.sessionId ?? state.selectedConversationId;
       if (!sid) break;
       setBookmarkNote(sid, action.uuid, action.note);
-      state = { ...state, convBookmarks: loadBookmarks(sid) };
+      if (sid === state.selectedConversationId) state = { ...state, convBookmarks: loadBookmarks(sid) };
       break;
     }
     case 'SET_FILTER': {

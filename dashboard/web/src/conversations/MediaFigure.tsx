@@ -64,6 +64,11 @@ export function MediaFigure({
     // onError is unreliable, so the declarative fallback CHILD (the open-↗ link)
     // renders automatically when the browser has no PDF viewer.
     const isPdf = media.media_type === 'application/pdf';
+    // #217 S6 F9 (review) — the <object> id (and its aria-controls) must be unique
+    // within the document. `index` alone collides when one turn carries two PDFs
+    // addressed by different keys (e.g. a tool_use_id and a uuid) that happen to
+    // share the same ordinal, so fold the addressing key into the id.
+    const pdfDomId = `conv-pdf-${toolUseId ?? uuid ?? 'x'}-${media.index}`;
     return (
       <span className="conv-chip conv-chip--media conv-doc">
         <DocumentIcon /> {media.media_type ?? 'document'} · {approxSize(media.bytes)} ·{' '}
@@ -73,7 +78,7 @@ export function MediaFigure({
               type="button"
               className="conv-pdf-toggle"
               aria-expanded={pdfOpen}
-              aria-controls={`conv-pdf-${media.index}`}
+              aria-controls={pdfDomId}
               onClick={() => setPdfOpen((v) => !v)}
             >
               {pdfOpen ? 'collapse ▴' : 'view inline ▾'}
@@ -82,7 +87,7 @@ export function MediaFigure({
         )}
         <a href={url} target="_blank" rel="noopener noreferrer">open ↗</a>
         {isPdf && pdfOpen && (
-          <object id={`conv-pdf-${media.index}`} className="conv-pdf-inline" data={url} type="application/pdf" aria-label={`PDF preview ${media.index + 1}`}>
+          <object id={pdfDomId} className="conv-pdf-inline" data={url} type="application/pdf" aria-label={`PDF preview ${media.index + 1}`}>
             <a href={url} target="_blank" rel="noopener noreferrer">open ↗</a>
           </object>
         )}

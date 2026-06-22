@@ -350,6 +350,10 @@ export function deriveOutline(
       const bm = bookmarks[t.uuid];
       if (!bm) continue;
       const turnIndex = idxOf.get(t.uuid) ?? 0;
+      // Bookmark rows are intentionally FLAT (depth 0, no parentEntryId) so they
+      // never participate in the subagent tree linkage — even a bookmark on a
+      // subagent-member turn renders as a top-level ★ landmark, not nested under
+      // the bucket. Its jump anchor (t.uuid) still lands inside the thread.
       bmEntries.push({
         entryId: `bm:${t.uuid}`, uuid: t.uuid, type: 'bookmark',
         label: bm.note || t.label || `turn ${turnIndex + 1}`,

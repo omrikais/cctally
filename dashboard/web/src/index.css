@@ -8068,12 +8068,22 @@ mark.current {
   #root .conv-tool-io > .conv-copy-btn { position: absolute; }
   /* #217 S5 (F1/F5) — the diff Download-.patch and terminal Copy-full corner
      buttons are the same tiny-glyph case as .conv-copy-btn; give them the same
-     invisible 44×44 ::before hit area so they meet the #205 mobile floor. */
+     invisible 44×44 ::before hit area so they meet the #205 mobile floor.
+     #217 S6 (F4/F9) — the bookmark note toggle and the PDF view-inline toggle
+     are the same small-glyph link-buttons; they get the same overlay so their
+     compact visual size is unchanged but the tap target meets the 44px floor.
+     (The bookmark note <input> can't take a ::before — replaced/input elements
+     drop generated content — so it floors via min-height/font-size below,
+     mirroring the .conv-rail-search-input / .conv-findbar-input inputs.) */
   #root .conv-diff-patch-btn,
-  #root .conv-term-copyfull { position: relative; }
+  #root .conv-term-copyfull,
+  #root .conv-bookmark-note-toggle,
+  #root .conv-pdf-toggle { position: relative; }
   #root .conv-copy-btn::before,
   #root .conv-diff-patch-btn::before,
-  #root .conv-term-copyfull::before {
+  #root .conv-term-copyfull::before,
+  #root .conv-bookmark-note-toggle::before,
+  #root .conv-pdf-toggle::before {
     content: "";
     position: absolute;
     top: 50%;
@@ -8082,6 +8092,7 @@ mark.current {
     height: 44px;
     transform: translate(-50%, -50%);
   }
+  #root .conv-bookmark-note-input { font-size: 16px; min-height: 44px; }
   /* The per-turn actions row places Permalink + Copy adjacent; widen the gap so
      the two 44px hit zones don't overlap into an ambiguous tap target. The diff
      and terminal corner rows pair Copy + Download/Copy-full the same way. */

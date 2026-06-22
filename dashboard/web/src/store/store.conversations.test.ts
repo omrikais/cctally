@@ -556,4 +556,20 @@ describe('convBookmarks store slice (#217 S6 F4)', () => {
     expect(loadBookmarks('s2').a1.note).toBe('hi'); // persisted
     clearBookmarks();
   });
+  it('an explicit action.sessionId targets that session, not the selected one', () => {
+    // #217 S6 F4 (review) — the BookmarkButton passes its sessionId prop so the
+    // mutation lands on THAT session even if a future caller renders the button
+    // off the selected-conversation path. A write to a non-selected session must
+    // persist there WITHOUT clobbering the open conversation's in-view list.
+    _resetForTests();
+    clearBookmarks();
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'open-sess' });
+    dispatch({ type: 'TOGGLE_BOOKMARK', uuid: 'other1', sessionId: 'other-sess' });
+    expect(loadBookmarks('other-sess').other1).toBeTruthy(); // persisted to the target
+    expect(getState().convBookmarks).toEqual({});             // open conv untouched
+    dispatch({ type: 'SET_BOOKMARK_NOTE', uuid: 'other1', note: 'n', sessionId: 'other-sess' });
+    expect(loadBookmarks('other-sess').other1.note).toBe('n');
+    expect(getState().convBookmarks).toEqual({});             // still untouched
+    clearBookmarks();
+  });
 });
