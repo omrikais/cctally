@@ -57,7 +57,10 @@ export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean 
 // index lists in outline-skeleton space, one per landmark family.
 // cache-failure-markers spec §4 — 'cache' added: the flagged-turn jump family.
 // #217 S3 F8 — 'compaction' added: the compaction-landmark jump family.
-export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan' | 'cache' | 'compaction';
+// #217 S6 F4 — 'bookmark' added: the client-only bookmark jump family. Its index
+// list is built from the explicitly-passed `bookmarks` param (OutlineTurn has no
+// bookmark field), NOT from the server skeleton.
+export type JumpKind = 'error' | 'prompt' | 'subagent' | 'plan' | 'cache' | 'compaction' | 'bookmark';
 
 // The tools whose presence marks a turn as a plan / question landmark.
 export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
@@ -83,6 +86,9 @@ export interface OutlineTargets {
   cache: number[];
   // #217 S3 F8 — turns the parser stamped meta_kind 'compaction' (#191).
   compaction: number[];
+  // #217 S6 F4 — the bookmarked turn indices in document order. Built from the
+  // client `bookmarks` param (not the skeleton), so it is [] when none are passed.
+  bookmark: number[];
   // Every turn's OWN uuid → its skeleton index (cursor resolution).
   indexByUuid: Map<string, number>;
   // #217 S3 E2 (Codex P1) — every MEMBER (folded-fragment) uuid → its owning
@@ -94,13 +100,20 @@ export interface OutlineTargets {
   memberIndex: Map<string, number>;
 }
 
-export function buildOutlineTargets(turns: OutlineTurn[]): OutlineTargets {
+export function buildOutlineTargets(
+  turns: OutlineTurn[],
+  // #217 S6 F4 — the current session's bookmarks (uuid → anything truthy). Only
+  // the KEYS matter here; a turn whose own uuid is a bookmark key pushes its
+  // index onto the `bookmark` list. Absent → no bookmark targets.
+  bookmarks?: Record<string, unknown>,
+): OutlineTargets {
   const error: number[] = [];
   const prompt: number[] = [];
   const subagent: number[] = [];
   const plan: number[] = [];
   const cache: number[] = [];
   const compaction: number[] = [];
+  const bookmark: number[] = [];
   const indexByUuid = new Map<string, number>();
   const memberIndex = new Map<string, number>();
   const seenSub = new Set<string>();
@@ -122,8 +135,10 @@ export function buildOutlineTargets(turns: OutlineTurn[]): OutlineTargets {
     if (t.cache_failure) cache.push(i);
     // #217 S3 F8 — compaction-summary turns (parser stamp, #191).
     if (t.kind === 'meta' && t.meta_kind === 'compaction') compaction.push(i);
+    // #217 S6 F4 — a turn whose own uuid is a bookmark key (client-only).
+    if (bookmarks && t.uuid in bookmarks) bookmark.push(i);
   });
-  return { error, prompt, subagent, plan, cache, compaction, indexByUuid, memberIndex };
+  return { error, prompt, subagent, plan, cache, compaction, bookmark, indexByUuid, memberIndex };
 }
 
 // #217 S3 E2 (Codex P1) — resolve a (possibly folded-fragment) uuid to its

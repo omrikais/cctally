@@ -289,3 +289,23 @@ describe('nextTarget — edge cases', () => {
     expect(nextTarget([1, 4, 8], 3, -1)).toBe(1);
   });
 });
+
+// #217 S6 F4 — buildOutlineTargets threads a client-only bookmark list (the
+// bookmarked turn indices in document order) so the cluster + i/I keys can
+// navigate it; OutlineTurn has no bookmark field, so the bookmarks are passed in
+// explicitly (not derived from the server skeleton).
+describe('buildOutlineTargets bookmark list (#217 S6 F4)', () => {
+  it('builds a bookmark target list from the bookmarks param', () => {
+    const turns = [
+      turn({ uuid: 'a', kind: 'human' }),
+      turn({ uuid: 'b', kind: 'assistant' }),
+      turn({ uuid: 'c', kind: 'assistant' }),
+    ];
+    const t = buildOutlineTargets(turns, { c: { note: '', ts: 1 }, a: { note: '', ts: 2 } });
+    expect(t.bookmark).toEqual([0, 2]); // indices of a and c, in document order
+  });
+  it('defaults bookmark to [] when no bookmarks param is passed', () => {
+    const turns = [turn({ uuid: 'a', kind: 'human' })];
+    expect(buildOutlineTargets(turns).bookmark).toEqual([]);
+  });
+});

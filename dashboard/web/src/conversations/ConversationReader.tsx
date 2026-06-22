@@ -150,6 +150,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // press steps strictly past where the last jump LANDED (closes #187), not past
   // the scroll-sync topmost-visible turn (which sits above a centered target).
   const convPinnedUuid = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
+  // #217 S6 F4 — the current session's bookmarks, threaded into the reader's
+  // buildOutlineTargets memo so the `bookmark` jump list (the i/I keys) stays in
+  // lock-step with the OutlinePanel cluster. A toggle re-derives the targets.
+  const convBookmarks = useSyncExternalStore(subscribeStore, () => getState().convBookmarks);
   // #177 S6 — the floating in-conversation find bar. `convFindOpen` gates its
   // render + the n/N step bindings. `findTerms` is the debounced needle split
   // into highlight terms (null when the bar is closed → no prose marks).
@@ -1298,8 +1302,8 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // reader keys and the OutlinePanel cluster can never drift. Memoized on
   // `outline` so a paged tick doesn't rebuild them; jumpNext reads via refs.
   const { indexByUuid: turnIndexByUuid, ...targetLists } = useMemo(
-    () => buildOutlineTargets(outline?.turns ?? []),
-    [outline],
+    () => buildOutlineTargets(outline?.turns ?? [], convBookmarks),
+    [outline, convBookmarks],
   );
   const targetListsRef = useRef(targetLists);
   targetListsRef.current = targetLists;
@@ -1499,6 +1503,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // shared guard + the #156 conversations-view scope like every jump key.
         mk('m', () => jumpNextRef.current('compaction', 1)),
         mk('M', () => jumpNextRef.current('compaction', -1)),
+        // #217 S6 F4 — `i`/`I` step to the next/prev bookmark (the ★ jump family),
+        // reusing the reader's real jump dispatcher (jumpNextRef) exactly like
+        // e/E. `t` toggles a bookmark on the CURRENT turn — the explicit pin (where
+        // the last jump landed) if set, else the scroll-sync topmost-visible turn;
+        // a no-op when neither is set. `i`/`I`/`t` come from the free single-char
+        // set (h i t w x y z) confirmed unused in the conversations view. Gated by
+        // the shared `guard` + the #156 conversations-view scope like every jump key.
+        mk('i', () => jumpNextRef.current('bookmark', 1)),
+        mk('I', () => jumpNextRef.current('bookmark', -1)),
+        mk('t', () => {
+          const u = getState().convPinnedUuid ?? getState().convCurrentTurnUuid;
+          if (u) dispatch({ type: 'TOGGLE_BOOKMARK', uuid: u });
+        }),
         mk('v', () => cycleFocusMode()),
         // #217 S3 E8 — direct jump to the LAST (most-recent) prompt / error,
         // distinct from u/U,e/E STEPPING. `a` = last user prompt ("ask"); `L`

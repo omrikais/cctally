@@ -115,6 +115,10 @@ function JumpCluster({
     { kind: 'cache', glyph: '⚡', label: 'cache rebuilds', aria: 'cache rebuild', key: 'c' },
     // #217 S3 F8 — compaction landmark jump chip, `m` key (compaction summary).
     { kind: 'compaction', glyph: '⊟', label: 'compaction', aria: 'compaction', key: 'm' },
+    // #217 S6 F4 — bookmark jump chip, `i` key. No markers gate (the
+    // d.kind !== 'cache' clause already admits it); shown only when there are
+    // bookmark targets.
+    { kind: 'bookmark', glyph: '★', label: 'bookmarks', aria: 'bookmark', key: 'i' },
   ];
   // A def is shown when it has targets AND (for cache) markers are on — the
   // opt-out suppresses the chip even when flagged turns exist.
@@ -378,6 +382,10 @@ export function OutlinePanel({
   const markersEnabled = useSyncExternalStore(subscribeStore, () =>
     selectMarkersEnabled(getState()),
   );
+  // #217 S6 F4 — the current session's bookmarks, threaded into deriveOutline (★
+  // landmarks) and buildOutlineTargets (the ★ jump list). The panel re-renders
+  // per store tick, so a bookmark toggle live-updates the outline.
+  const bookmarks = useSyncExternalStore(subscribeStore, () => getState().convBookmarks);
   const reduced = useReducedMotion();
   // #217 S6 F3 — display-tz fmtCtx for the cache-rebuild list times. Same source
   // the reader uses (the server resolves "local" before the envelope leaves
@@ -390,9 +398,9 @@ export function OutlinePanel({
 
   const { entries, sectionByUuid } = useMemo(
     () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled,
-                                   outline.task_completion)
+                                   outline.task_completion, bookmarks)
                    : { entries: [], sectionByUuid: new Map<string, string>() }),
-    [outline, markersEnabled],
+    [outline, markersEnabled, bookmarks],
   );
 
   // #217 S3 E6(a) — the display-only per-subagent cost map (subagent_key → USD).
@@ -405,8 +413,8 @@ export function OutlinePanel({
   // source. `lists.error.length` is the error-TURN count (13), distinct from the
   // server's `error_count` total (14).
   const lists = useMemo(
-    () => buildOutlineTargets(outline?.turns ?? []),
-    [outline],
+    () => buildOutlineTargets(outline?.turns ?? [], bookmarks),
+    [outline, bookmarks],
   );
 
   // uuid → OutlineTurn, so a jump can test the target's visibility under the
