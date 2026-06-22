@@ -208,13 +208,16 @@ Before merging or releasing v2 changes, run through:
 | `GET /api/conversation/<id>/media` | On-demand media bytes (#177 S4) — re-reads the source JSONL line to decode and serve one inline image or PDF (`?tool_use_id=…&index=N` for tool-result media, or `?uuid=…&index=N` for user-content media). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2) **plus** a cross-origin Fetch-Metadata check; see [Conversation viewer endpoints](#conversation-viewer-endpoints-plan-2). |
 | `GET /api/conversation/<id>/events` | Conversation-viewer live-tail SSE stream — watches only the open session's JSONL file(s) and emits `event: tail` within ~1s of growth (with `: keep-alive` comments while idle). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Live-tail](#live-tail). |
 | `GET /api/conversation/<id>/export` | Conversation-viewer whole-session Markdown export (#217 S5, F1/F5) — runs the full server-side assembly and serializes it to Markdown for one `?scope=` ∈ `{all, prompts, chat, recipe}` (default `all`; an unknown value is `400`, validated in the handler before the kernel — never a `500`). Serves `text/markdown; charset=utf-8`; unknown session → `404`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2) — the **same** `_require_transcripts_allowed()` fail-closed gate as the sibling reader routes, with **no** extra CSRF check (parity with `/payload`/`/outline`/`/find`). |
+| `GET /api/conversation/<id>/prompts` | Conversation-viewer session-comparison prompt bodies (#217 S7, F10) — returns `{session_id, prompts: [{uuid, text}]}`, the ordered **main-thread** human prompts (the same `subagent_key == null && !is_sidechain` + non-empty-text predicate the `recipe`/`prompts` export reuses) each with its **full** text and turn uuid, in document order. Used by the [Session comparison](#session-comparison-217-s7) view for lazy inline full-prompt expansion. Unknown session → `404`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
 | `POST /api/sync` | OAuth refresh + snapshot rebuild (chip / `r`). 204 on clean success; 200 + `{warnings:[{code: ...}]}` when refresh-usage returned a non-`ok` status (`rate_limited`, `no_oauth_token`, `fetch_failed`, `parse_failed`, `record_failed`); 503 if another sync is in flight. Origin-vs-Host parity CSRF (see [Threat model](#threat-model)). |
 
 > `/api/conversation/search`, `/api/conversation/<id>/payload`,
 > `/api/conversation/<id>/media`, `/api/conversation/<id>/find`,
-> `/api/conversation/<id>/events`, and `/api/conversation/<id>/export` are all
+> `/api/conversation/<id>/events`, `/api/conversation/<id>/export`, and
+> `/api/conversation/<id>/prompts` are all
 > matched **before** the `/api/conversation/<id>` reader, so neither `search`
-> nor a `…/payload` / `…/media` / `…/find` / `…/events` / `…/export` suffix is
+> nor a `…/payload` / `…/media` / `…/find` / `…/events` / `…/export` / `…/prompts`
+> suffix is
 > ever treated as a session
 > id. `/api/data` carries a
 > per-request `transcriptsEnabled` boolean (the same gate value) so the client
@@ -392,6 +395,18 @@ To opt out of the live-tail entirely, set `dashboard.live_tail` to `false` (via 
 ### Cache rebuilds in the session modal
 
 The Recent Sessions (session-detail) modal carries a **Cache rebuilds** section for the selected conversation, surfacing the same prompt-cache-failure signal the [conversation viewer](#conversation-viewer-endpoints-plan-2) detects per turn. It shows the count of cache-rebuild events, the total wasted USD they cost, the total tokens re-created, and a green session cache-value-saved figure (what the session's cached prefixes saved versus paying full input price, shown only when positive). Below the tiles a worst-first list (capped, with a "+N more" expander) gives one jump-link per rebuild — clicking one opens the conversation viewer scrolled to the message that triggered that rebuild. A session with no rebuilds shows a "No cache rebuilds ✓" zero-state instead of the list. The section respects the `dashboard.cache_failure_markers` opt-out (it disappears when the markers are turned off, the same toggle that hides the in-reader cache-rebuild chips), and it is absent entirely when transcripts are not accessible — for example on a LAN-bound dashboard without `dashboard.expose_transcripts`, where the gated outline data the section reads returns `403`.
+
+### Session comparison (#217 S7)
+
+The conversation viewer can put **two** sessions side by side and diff their **human-prompt sequences** — built for comparing variations of the same or a similar task to see, at a glance, where two runs took different paths and which run was cheaper / faster / cleaner.
+
+**Entry.** From an open reader, click **⟷ Compare with…** in the reader head. The conversation list enters a **pick-mode** — a banner ("Comparing with `<anchor>` — pick a session") with a **Cancel** control (or **Esc**); the anchor session's own row is greyed out and non-pickable, every other row picks the second session. Choosing one opens the comparison. The comparison is shareable and cold-loadable via its URL, `#/conversations/compare/<A>/<B>`; an `A === B` URL degrades to the single reader, and an unknown/removed session shows a "couldn't load — close comparison" fallback rather than a broken split.
+
+**Layout.** Above ~1100px the view is a **two-column** split (run A left, run B right); below ~1100px it falls back to a **unified** single column (the same aligned data, shared one alignment model — this is the mobile path and also a legitimate desktop view if you prefer it). A **metrics-delta strip** heads the view with six A→B cells — Cost, Tokens, Prompts, Errors, Duration, Files — each with a delta; a subtle green ▼ marks an improvement on the unambiguously lower-is-better metrics (cost / errors / duration), while tokens / prompts / files show a plain signed delta with no value-judgment color. (Tokens is cache-inclusive — the sum of the per-session token breakdown; "# prompts" is the length of the aligned prompt spine.) The header carries **⇄ swap** (flip which run is on the left — the URL follows) and **✕ close** (return to the single reader).
+
+**The aligned diff.** The two runs' prompts are aligned by a longest-common-subsequence over each prompt's **normalized first line** (trimmed, whitespace-collapsed, lowercased). Matched prompts sit on a shared neutral row; a replaced region is marked with a **⚡ DIVERGENCE** bar and rendered A (removed) / B (added); a prompt only one run has renders as a real row with a hatched gap on the empty side. Divergence is conveyed by the ⚡ bar + a ◆ marker + the add/del styling, never by color alone. Clicking any row lazily fetches and expands the **full** prompt text for both runs inline (via [`/api/conversation/<id>/prompts`](#endpoints), once per session), each with an **"open in reader →"** jump to that session's single reader at the turn.
+
+> **Heuristic, first-line alignment.** The alignment matches on prompt first lines only, so two genuinely different prompts that share a first line read as "matched", and a paraphrased prompt reads as "divergent". That is acceptable for a *sequence-level* overview — the full-text expand exists precisely so you can verify any row by eye. The expanded panel shows both full prompts side by side **without** an A↔B word-diff (they are two different prompts, so a word-diff would be noise). The comparison is a static, re-openable snapshot — it does **not** live-tail.
 
 ## Shutdown
 

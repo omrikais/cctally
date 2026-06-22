@@ -8259,3 +8259,388 @@ mark.current {
 .conv-web-link { margin: 6px 0; }
 .conv-web-link-domain { display: block; font-size: 11.5px; color: var(--text-dim); }
 .conv-web-copy { position: absolute; top: 8px; right: 8px; }
+
+/* ====================================================================
+   #217 S7 F10 — session comparison (side-by-side prompt diff).
+
+   The two-column ↔ unified switch is a JS branch (useIsWide @ 1100px) that
+   sets `.conv-cmp--wide` / `.conv-cmp--unified` on the root; the `@media
+   (max-width: 1100px)` safety block at the end reflows a STALE wide render so
+   the layout never overflows on a slow viewport change. Divergence is conveyed
+   by the ⚡ bar + ◆ markers + add/del classes — never color alone.
+   ==================================================================== */
+
+/* The comparison view occupies the reader column of .conv-view (the rail stays
+   in its grid track on desktop; .conv-view--compare full-bleeds on mobile). */
+.conv-cmp {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+.conv-view--compare.conv-view--mobile { display: block; }
+
+/* ---- "Compare with…" reader-head control (mirrors .conv-outline-toggle) -- */
+.conv-compare-with {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-compare-with:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-compare-with:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+
+/* ---- Header bar --------------------------------------------------------- */
+.conv-cmp-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky;
+  top: 0;
+  background: var(--panel-bg);
+  z-index: 2;
+}
+.conv-cmp-head-title {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.conv-cmp-head-glyph { color: var(--accent-blue); }
+.conv-cmp-head-sides {
+  display: flex;
+  gap: 18px;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.conv-cmp-head-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.conv-cmp-head-side-tag {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-cmp-head-side-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-cmp-head-side-meta { font-size: 10.5px; color: var(--text-dim); }
+.conv-cmp-head-controls { display: flex; gap: 8px; flex: 0 0 auto; }
+.conv-cmp-swap,
+.conv-cmp-close {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.conv-cmp-swap:hover,
+.conv-cmp-close:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-cmp-swap:focus-visible,
+.conv-cmp-close:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+
+/* ---- Metrics-delta strip ----------------------------------------------- */
+.conv-cmp-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.conv-cmp-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  min-width: 0;
+}
+.conv-cmp-metric-label {
+  font-size: 9.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.conv-cmp-metric-vals {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-cmp-metric-arrow { color: var(--text-faint); }
+.conv-cmp-metric-delta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+/* Improvement (lower-is-better metric, B<A): a subtle green ▼ + value. */
+.conv-cmp-metric-down .conv-cmp-metric-delta { color: var(--accent-green); }
+.conv-cmp-metric-dir { color: var(--accent-green); }
+
+/* ---- The aligned diff -------------------------------------------------- */
+.conv-cmp-diff { display: flex; flex-direction: column; padding: 8px 0; }
+
+/* The ⚡ DIVERGENCE bar above each contiguous replaced region. */
+.conv-cmp-divbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 14px 2px;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--accent-amber);
+  background: rgba(251, 191, 36, 0.08);
+  border-left: 3px solid var(--accent-amber);
+  border-radius: 0 4px 4px 0;
+}
+
+/* Two-column rows: an A cell + a B cell on one grid row. The whole row is a
+   button (keyboard-expandable). */
+.conv-cmp-row {
+  appearance: none;
+  text-align: left;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 3px 14px;
+  width: 100%;
+  font: inherit;
+}
+.conv-cmp-row:hover { background: rgba(255, 255, 255, 0.02); }
+.conv-cmp-row:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: -2px; }
+.conv-cmp-row.is-expanded { background: rgba(96, 165, 250, 0.06); }
+.conv-cmp-cell {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border-left: 3px solid transparent;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--reader-ink, var(--text));
+}
+.conv-cmp-cell--match { color: var(--text-dim); border-left-color: var(--border-soft); }
+.conv-cmp-cell--del {
+  background: rgba(239, 68, 68, 0.08);
+  border-left-color: var(--accent-red);
+}
+.conv-cmp-cell--add {
+  background: rgba(61, 220, 132, 0.08);
+  border-left-color: var(--accent-green);
+}
+.conv-cmp-cell--del .conv-cmp-cell-marker { color: var(--accent-red); }
+.conv-cmp-cell--add .conv-cmp-cell-marker { color: var(--accent-green); }
+/* The hatched gap on a one-sided row's empty side. */
+.conv-cmp-cell--gap {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 5px,
+    rgba(255, 255, 255, 0.04) 5px,
+    rgba(255, 255, 255, 0.04) 10px
+  );
+  border-radius: 4px;
+  min-height: 26px;
+}
+
+/* Unified single-column rows. */
+.conv-cmp-urow {
+  appearance: none;
+  text-align: left;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 14px;
+  width: 100%;
+  font: inherit;
+}
+.conv-cmp-urow:hover { background: rgba(255, 255, 255, 0.02); }
+.conv-cmp-urow:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: -2px; }
+.conv-cmp-urow.is-expanded { background: rgba(96, 165, 250, 0.06); }
+.conv-cmp-uline {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border-left: 3px solid transparent;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conv-cmp-uline--match { color: var(--text-dim); border-left-color: var(--border-soft); }
+.conv-cmp-uline--del { background: rgba(239, 68, 68, 0.08); border-left-color: var(--accent-red); }
+.conv-cmp-uline--add { background: rgba(61, 220, 132, 0.08); border-left-color: var(--accent-green); }
+.conv-cmp-uline-sign { font-weight: 700; }
+.conv-cmp-uline--del .conv-cmp-uline-sign { color: var(--accent-red); }
+.conv-cmp-uline--add .conv-cmp-uline-sign { color: var(--accent-green); }
+.conv-cmp-uline-tag {
+  display: inline-block;
+  min-width: 14px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--text-faint);
+  margin-right: 4px;
+}
+
+/* ---- The lazy expand panel --------------------------------------------- */
+.conv-cmp-expand {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0 14px 8px;
+  padding: 8px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+}
+.conv-cmp-diff--unified .conv-cmp-expand { grid-template-columns: 1fr; }
+.conv-cmp-expand-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.conv-cmp-expand-body { min-width: 0; }
+.conv-cmp-expand-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--reader-ink, var(--text));
+  max-height: 360px;
+  overflow: auto;
+}
+.conv-cmp-expand-loading { font-size: 11px; color: var(--text-faint); font-style: italic; }
+.conv-cmp-expand-open {
+  align-self: flex-start;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.conv-cmp-expand-open:hover { border-color: var(--accent-blue); }
+.conv-cmp-expand-open:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+
+/* The expand panel slide; gated on prefers-reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .conv-cmp-expand { animation: conv-cmp-expand-in 140ms ease-out; }
+  @keyframes conv-cmp-expand-in {
+    from { opacity: 0; transform: translateY(-2px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/* ---- Not-found fallback ------------------------------------------------ */
+.conv-cmp--notfound {
+  align-items: flex-start;
+  gap: 12px;
+  padding: 20px;
+}
+.conv-cmp-notfound-msg { font-size: 13px; color: var(--text-dim); }
+
+/* ---- Rail pick-mode ---------------------------------------------------- */
+.conv-rail-pickbanner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: rgba(96, 165, 250, 0.1);
+  border: 1px solid var(--accent-blue);
+  border-radius: 6px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.conv-rail-pickbanner-text code { color: var(--accent-blue); }
+.conv-rail-pickcancel {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.conv-rail-pickcancel:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-rail-pickcancel:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+/* The pickable rows get a hover ring; the anchor row reads as disabled. */
+.conv-rail--picking .conv-rail-row--pick:not(.conv-rail-row--anchor):hover {
+  border-color: var(--accent-blue);
+}
+.conv-rail-row--anchor {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ---- 1100px safety reflow (a stale .conv-cmp--wide render) -------------- */
+@media (max-width: 1100px) {
+  .conv-cmp-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  /* Force the two-column diff + expand to single-column even if the JS still
+     thinks it is wide (a slow matchMedia event). */
+  .conv-cmp-row { grid-template-columns: 1fr; }
+  .conv-cmp-row .conv-cmp-cell--gap { display: none; }
+  .conv-cmp--wide .conv-cmp-expand { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .conv-cmp-head { gap: 8px; }
+}
+
+/* ---- ≥44px tap targets on the comparison touch controls (#205) --------- */
+@media (pointer: coarse) {
+  #root .conv-compare-with,
+  #root .conv-cmp-swap,
+  #root .conv-cmp-close,
+  #root .conv-cmp-expand-open,
+  #root .conv-rail-pickcancel { min-height: 44px; }
+  #root .conv-cmp-row,
+  #root .conv-cmp-urow { min-height: 44px; }
+}
