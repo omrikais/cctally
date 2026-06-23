@@ -8102,10 +8102,18 @@ mark.current {
     gap: var(--space-2);
     align-items: stretch;
   }
+  /* The rows are flex items in the column-direction header; align-items:stretch
+     does NOT clamp their cross-axis (horizontal) width when a row is itself a
+     flex container — it sizes to its children's ~464px min-content and spills ⋯
+     off-screen. A definite width:100% forces the row to the header content box
+     (~348px at 390); min-width:0 then lets the headmain child ellipsize within
+     it. (overflow:hidden is avoided — it would clip the ⋯/Focus dropdowns.) */
   #root .conv-reader-row1 {
     display: flex;
     align-items: flex-start;
     gap: var(--space-2);
+    width: 100%;
+    min-width: 0;
   }
   /* The Back button shrinks to its content (not a full-width row) so it sits
      inline with the title + ⋯ on row 1. Overrides the desktop full-row rule. */
@@ -8199,10 +8207,13 @@ mark.current {
   #root .conv-overflow-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
   #root .conv-overflow-item:disabled { opacity: 0.5; cursor: not-allowed; }
   /* Row 2: the compact Focus dropdown grows; Find + Outline sit beside it. */
+  /* Same definite-width clamp as row1 — keeps Focus · Find · Outline on-screen. */
   #root .conv-reader-row2 {
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    width: 100%;
+    min-width: 0;
   }
   #root .conv-focus-compact { flex: 1 1 auto; position: relative; min-width: 0; }
   #root .conv-focus-compact-toggle {
