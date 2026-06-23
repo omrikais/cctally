@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FocusMode } from './applyFocusMode';
-import type { FocusSubagentOption } from './FocusMoreMenu';
+import { subagentLabel, type FocusSubagentOption } from './FocusMoreMenu';
 import { nextRovingIndex } from './menuKeyboard';
 
 // #228 S3 C2 — the mobile (≤640px) compact focus picker: a single
@@ -29,9 +29,7 @@ const EXTRA: { mode: FocusMode; label: string }[] = [
   { mode: 'bash', label: 'Bash' },
 ];
 
-function subagentLabel(opt: FocusSubagentOption): string {
-  return opt.label.trim() || opt.key.slice(0, 8);
-}
+// `subagentLabel` is shared with FocusMoreMenu (#230 P3 — one source of truth).
 
 // The active mode's display label for the trigger. Mirrors the desktop segment +
 // FocusMoreMenu's `activeLabel`, but covers the four primary modes too (the

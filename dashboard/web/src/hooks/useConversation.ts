@@ -588,6 +588,19 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
       fetchInFlight,
     });
+    // #230 P3 — dev-only telemetry. The cap can stay exceeded when protected edges
+    // (the active find match / current / pinned turn / an in-flight target) block
+    // the trim from reaching it: correctness wins over the cap, so the helper never
+    // evicts a protected uuid. This warns rather than force-trimming. Bounded in
+    // practice (only a handful are ever protected at once). `import.meta.env.DEV` is
+    // statically false in the committed production bundle, so the whole branch is
+    // dead-code-eliminated — zero shipped cost. Must precede the `plan.keep === items`
+    // early-out so the all-protected no-op (which is over the cap) is also caught.
+    if (import.meta.env.DEV && !fetchInFlight && plan.keep.length > WINDOW_CAP_ITEMS) {
+      console.warn(
+        `[reader] windowed DOM cap (${WINDOW_CAP_ITEMS}) exceeded: ${plan.keep.length} items kept — protected edges block the trim`,
+      );
+    }
     if (plan.keep === items) return;  // no-op (under cap / in-flight / all-protected)
 
     // Apply `keep` + reset ONLY the opposite edge cursor + its has-more flag, then

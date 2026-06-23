@@ -110,4 +110,17 @@ describe('planTrim (#228 S3 B3 windowed DOM cap)', () => {
     expect(r.keep).toHaveLength(1000);
     expect(r.resetBottomCursorTo).toBeNull();
   });
+
+  it('keeps the window ABOVE the cap when a protected edge blocks a full trim (#230 P3)', () => {
+    // A protected uuid in the drop zone (u100) stops the top-trim early: only
+    // u0..u99 are dropped, so the kept window (900) stays OVER the cap (600). The
+    // hook's dev-only telemetry (useConversation) keys on exactly this after-trim
+    // `keep.length > cap` condition — a real, reachable over-cap outcome, since a
+    // protected uuid is never evicted (correctness wins over the cap).
+    const r = planTrim({ items: mk(0, 1000), op: 'append', cap: 600, protectedUuids: new Set(['u100']), fetchInFlight: false });
+    expect(r.droppedTop).toBe(100);              // trimmed up to (not into) the protected u100
+    expect(r.keep[0].anchor.uuid).toBe('u100');
+    expect(r.keep.length).toBeGreaterThan(600);  // window remains ABOVE the cap
+    expect(r.keep).toHaveLength(900);
+  });
 });

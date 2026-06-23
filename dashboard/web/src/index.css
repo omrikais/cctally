@@ -7135,7 +7135,21 @@ mark.current {
 
 /* Summary parts: bold name, faint ellipsized one-line preview that flexes to
    fill, and a fixed-width trailing status. */
-.conv-chip-name { font-weight: 600; flex: 0 0 auto; }
+/* #230 P2 — the name must be able to ellipsize. A long tool name (e.g.
+   `browser_console_messages`) in the nowrap summary row was `flex:0 0 auto`, so
+   it never shrank and shoved the trailing status/server badges past the card
+   edge — where `.conv-reader-body { overflow-x:hidden }` clipped them invisible
+   at narrow widths. `flex:0 1 auto` + `min-width:0` lets the NAME absorb the
+   squeeze (the badges stay `flex:0 0 auto`), so it truncates instead of the
+   badges going off-screen. Inert when there's room → desktop unchanged. */
+.conv-chip-name {
+  font-weight: 600;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .conv-chip-preview {
   flex: 1;
   min-width: 0;
@@ -7329,7 +7343,18 @@ mark.current {
   flex: 1;
   font-size: 11.5px;
 }
-.conv-diff-base { font-weight: 700; color: var(--text); flex: 0 0 auto; }
+/* #230 P2 — same containment as .conv-chip-name: a long bold basename ellipsizes
+   instead of shoving the +N/−M stat + tags off-screen. The muted .conv-diff-dir
+   (flex:1) still ellipsizes first; the base only truncates when even it can't fit. */
+.conv-diff-base {
+  font-weight: 700;
+  color: var(--text);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .conv-diff-dir {
   color: var(--text-faint);
   flex: 1;

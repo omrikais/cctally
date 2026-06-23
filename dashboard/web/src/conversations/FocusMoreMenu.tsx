@@ -43,7 +43,9 @@ function activeLabel(mode: FocusMode, subagents: FocusSubagentOption[]): string 
 
 // A subagent's display label: its resolved meta label, or a truncated key when
 // the meta is empty (buckets exist even without subagent_meta — Codex P1-4).
-function subagentLabel(opt: FocusSubagentOption): string {
+// Exported so FocusCompactMenu (#228 S3 C2) reuses the SAME rule rather than
+// duplicating it (#230 P3 — one source of truth for the label derivation).
+export function subagentLabel(opt: FocusSubagentOption): string {
   return opt.label.trim() || opt.key.slice(0, 8);
 }
 
