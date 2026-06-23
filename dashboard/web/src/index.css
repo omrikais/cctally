@@ -5631,6 +5631,7 @@ mark.current {
   cursor: pointer;
 }
 .conv-export-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-export-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .conv-export-toggle[aria-expanded="true"] {
   color: var(--accent-blue);
   border-color: var(--accent-blue);
