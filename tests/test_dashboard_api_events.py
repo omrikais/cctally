@@ -45,6 +45,12 @@ def test_events_headers_and_first_frame():
     ns["DashboardHTTPHandler"].snapshot_ref = ref
 
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    # #220: the /api/events SSE handler runs an infinite loop; teardown only
+    # `srv.shutdown()`s (never joins the in-flight handler), so the abandoned
+    # daemon thread can raise a non-disconnect exception after the test returns.
+    # The stdlib default `handle_error` would dump that traceback to sys.stderr,
+    # contaminating a later test's capsys window under serial pytest. Silence it.
+    srv.handle_error = lambda request, client_address: None
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     port = srv.server_address[1]

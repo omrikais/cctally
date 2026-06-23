@@ -72,3 +72,8 @@ tests/fixtures/weekly/*/.local/share/cctally/*.db
 # docs/) isn't accidentally dropped.
 /share-v2-smoke*.png
 baseline/
+# Ad-hoc UI/UX QA artifacts (screenshots, captured DOM, findings reports)
+# saved at the repo root during manual conversation-viewer / dashboard QA
+# passes — e.g. cctally-qa-comparison/, cctally-qa-discovery/. Tool-generated,
+# regenerated each session. Anchored to root.
+/cctally-qa-*/

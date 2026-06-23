@@ -89,6 +89,17 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
 
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
     srv.daemon_threads = True
+    # #220: this is a long-lived SSE server whose handler thread we abandon at
+    # teardown — callers only `srv.shutdown()` (stops the accept loop); the
+    # in-flight watch-loop handler is never joined. After the test returns that
+    # daemon thread can still raise a NON-disconnect exception (its tmp_path
+    # JSONL / cache.db went away — the handler catches BrokenPipe/ConnectionReset
+    # but not these), which the stdlib default `handle_error` dumps as a
+    # traceback to sys.stderr, landing in a LATER test's capsys window under
+    # serial pytest. Production uses `_QuietThreadingHTTPServer`; here we just
+    # silence it — a throwaway test server's post-assertion handler errors are
+    # pure teardown noise, never the thing under test.
+    srv.handle_error = lambda request, client_address: None
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     return srv, projects, jsonl
