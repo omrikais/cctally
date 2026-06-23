@@ -7,6 +7,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **Dashboard conversation viewer — the session-comparison header now shows each run's real title.** The ⟷ Compare view's Run A / Run B column headers now show the same derived conversation title the rail shows for each session (sourced from the loaded browse list), falling back to the short `Session <id>` label only when that title hasn't been loaded yet — previously they always rendered the short id. The comparison also stops re-fetching both sessions' outlines on every dashboard refresh: it loads them once as a static snapshot of the two finished runs, trimming redundant `/api/conversation/<id>/outline` requests (e.g. while a compared session is still live elsewhere). (#227)
+- **Dashboard conversation viewer — a shared design-token foundation plus accessibility fixes.** The viewer gains a shared design-token layer (a type scale, semantic-intent and diff colours, a distinct A/B comparison palette, a spacing rhythm, and a shared focus ring) with all viewer text lifted to a ≥11px floor so nothing renders too small to read; the outline resize divider now takes keyboard focus on click (so a mouse user can immediately arrow-resize), closing a comparison returns focus to the **⟷ Compare with…** trigger instead of dropping it, and live-tail arrivals plus the cross-session search error / "Searching…" states are now announced to screen readers. (#228 S1)
 
 ## [1.54.0] - 2026-06-22
 
