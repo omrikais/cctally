@@ -31,7 +31,16 @@ export interface Route {
 const PREFIX = '#/conversations';
 
 export function parseHash(hash: string): Route | null {
-  const h = hash.startsWith('#') ? hash.slice(1) : hash; // strip one leading '#'
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash; // strip one leading '#'
+  // #228 S3 F4 — read-tolerance alias: the SINGULAR `/conversation/<id>` form the
+  // issue literally writes is normalized to the canonical plural `/conversations/`
+  // before any matching. Only the bare `/conversation` segment (end-of-string or
+  // followed by `/`) is rewritten — `/conversations…` (already plural) is left
+  // untouched, and `/conversationfoo` (not a full segment) does NOT match.
+  const h =
+    raw === '/conversation' || raw.startsWith('/conversation/')
+      ? '/conversations' + raw.slice('/conversation'.length)
+      : raw;
   if (h === '' || h === '/') return null; // dashboard
   if (h === '/conversations' || h === '/conversations/') {
     return { sessionId: null, turnUuid: null, compare: null }; // conversations, no selection

@@ -73,6 +73,28 @@ describe('installUrlRouting — read path', () => {
     });
   });
 
+  it('F4: boots the singular /conversation/<id> alias to OPEN_CONVERSATION', () => {
+    seed('#/conversation/A');
+    const { deps, dispatch } = makeStore({ view: 'dashboard' });
+    dispose = installUrlRouting(deps);
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'OPEN_CONVERSATION',
+      sessionId: 'A',
+      jump: undefined,
+    });
+  });
+
+  it('F4: boots the singular /conversation/<id>/<turn> alias with a jump', () => {
+    seed('#/conversation/A/u1');
+    const { deps, dispatch } = makeStore({ view: 'dashboard' });
+    dispose = installUrlRouting(deps);
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'OPEN_CONVERSATION',
+      sessionId: 'A',
+      jump: { session_id: 'A', uuid: 'u1' },
+    });
+  });
+
   it('boots a compare route to OPEN_COMPARE (#217 S7 F10)', () => {
     seed('#/conversations/compare/A/B');
     const { deps, dispatch } = makeStore({ view: 'dashboard' });

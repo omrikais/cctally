@@ -35,6 +35,26 @@ describe('parseHash', () => {
   it('a single-session hash has compare === null', () => {
     expect(parseHash('#/conversations/s1')).toEqual({ sessionId: 's1', turnUuid: null, compare: null });
   });
+
+  // #228 S3 F4 — the singular `#/conversation/<id>` form the issue literally
+  // writes is a read-tolerance ALIAS of the canonical plural route.
+  it('F4: accepts the singular /conversation/<id> as an alias of the plural route', () => {
+    expect(parseHash('#/conversation/abc')).toEqual({ sessionId: 'abc', turnUuid: null, compare: null });
+    expect(parseHash('#/conversation/abc/u1')).toEqual({ sessionId: 'abc', turnUuid: 'u1', compare: null });
+  });
+
+  it('F4: the singular alias also covers the no-selection + compare arms', () => {
+    expect(parseHash('#/conversation')).toEqual({ sessionId: null, turnUuid: null, compare: null });
+    expect(parseHash('#/conversation/')).toEqual({ sessionId: null, turnUuid: null, compare: null });
+    expect(parseHash('#/conversation/compare/AA/BB')).toEqual({
+      sessionId: null, turnUuid: null, compare: { a: 'AA', b: 'BB' },
+    });
+  });
+
+  it('F4: the singular alias must be a FULL segment (no false prefix match)', () => {
+    expect(parseHash('#/conversationfoo')).toBeNull();
+    expect(parseHash('#/conversationsfoo')).toBeNull();
+  });
 });
 
 describe('formatHash', () => {
