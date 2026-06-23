@@ -2378,6 +2378,58 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     expect(order.filter((u) => /^t[1-4]$/.test(u ?? ''))).toEqual(['t1', 't2', 't3', 't4']);
   });
 
+  it('#228 S3 B3: a tail-open prepend is recognised via op metadata — no stick, no "↓ N new" mis-fire', async () => {
+    // This proves the reader keys its live-append/stick + "↓ N new" pill paths on
+    // the hook's explicit WindowOp (op==='prepend' / addedBottom), NOT on
+    // items.length / firstId. The TRAP this fixes: a prepend at a TAIL open
+    // (hasMore===false) grows items.length AND satisfies the old live
+    // discriminator, so a count/firstId inference would mis-count the prepended
+    // turns as "↓ N new" and could wrongly stick-to-bottom. (The pixel-level
+    // scroll-anchor restore itself is a layout concern verified at the ui-qa gate,
+    // not in JSDOM, which never lays out — here we assert the LOGIC: the op routes
+    // the prepend away from the live-append path.) This is also the count-flat
+    // case the windowed-cap trim will hit (a prepend+far-trim keeps len flat).
+    const observed: { el: Element; cb: IntersectionObserverCallback; obs: IntersectionObserver }[] = [];
+    class CapturingIO {
+      cb: IntersectionObserverCallback;
+      constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
+      observe(el: Element): void { observed.push({ el, cb: this.cb, obs: this as unknown as IntersectionObserver }); }
+      unobserve(): void {}
+      disconnect(): void {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+    }
+    (globalThis as unknown as { IntersectionObserver: typeof CapturingIO }).IntersectionObserver = CapturingIO;
+
+    // Tail open at the bottom (hasMore===false, has_prev:true).
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    setScroll(body, { scrollTop: 500, clientHeight: 100, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    const scrollToSpy = spyScrollTo();
+
+    // The before-page (the earlier window). The prepend grows items.length while
+    // hasMore stays false — the exact discriminator trap.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
+    await act(async () => {
+      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // The op routed the prepend AWAY from the live-append path: no stick-to-bottom
+    // and no "↓ N new" pill, even though items.length grew and hasMore was false.
+    expect(scrollToSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
+    // And the prepended items landed in order (the prepend itself succeeded).
+    const order = Array.from(container.querySelectorAll('[data-uuid]')).map((e) => e.getAttribute('data-uuid'));
+    expect(order.filter((u) => /^t[1-4]$/.test(u ?? ''))).toEqual(['t1', 't2', 't3', 't4']);
+  });
+
   it('open precedence slot 1: a deep-link anchor overrides a saved reading position', async () => {
     // A saved reading position for the session exists, AND a deep-link jump is set
     // — the deep-link wins (it pages to the anchor). We assert the jump uuid is

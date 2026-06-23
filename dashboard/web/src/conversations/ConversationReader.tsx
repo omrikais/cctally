@@ -134,7 +134,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     return { kind: 'tail' };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
@@ -290,8 +290,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const b = bodyRef.current;
     if (!b || prependPendingRef.current) return;
     prependPendingRef.current = { prevScrollHeight: b.scrollHeight, prevScrollTop: b.scrollTop };
-    void loadPrev().then((prepended) => {
-      if (!prepended && prependPendingRef.current) {
+    // #228 S3 B3 — loadPrev resolves to the prepend's WindowOp (or null on a
+    // genuine no-op). Success is `op.addedTop > 0`, NOT a count compare (which a
+    // same-commit prepend+far-trim would defeat). On a no-op no commit fires, so
+    // the scroll-anchor effect never runs to clear the snapshot — clear it here.
+    void loadPrev().then((op) => {
+      if (!op && prependPendingRef.current) {
         prependPendingRef.current = null;  // no-op: free the snapshot for the next loadPrev
       }
     });
@@ -425,39 +429,49 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, []);
 
   // Stick-if-at-bottom on a live append; otherwise preserve position + count the
-  // new turns. Keyed on items.length (+ hasMore so prevHasMoreRef tracks each
-  // commit). useLayoutEffect so atBottomRef reflects the PRE-append position and
-  // the stick happens before paint (no visible jump).
+  // new turns. #228 S3 B3 — keyed on `lastOp.rev` (+ hasMore so prevHasMoreRef
+  // tracks each commit), NOT on items.length: a prepend+far-trim (the windowed
+  // DOM cap) can keep items.length flat while still mutating the window, and a
+  // length key would miss it. The op metadata also REPLACES the firstId/count
+  // inferences below. useLayoutEffect so atBottomRef reflects the PRE-append
+  // position and the stick happens before paint (no visible jump).
   useLayoutEffect(() => {
     const b = bodyRef.current;
     const items = detail?.items ?? [];
     const len = items.length;
     const firstId = items[0]?.anchor.uuid ?? null;
-    // P1 fix (cross-branch review) — a reverse-page PREPEND must NOT be mistaken
-    // for a live append. A prepend grows items.length too, and on a tail open
-    // (hasMore === false) it satisfies the live discriminator below, so
-    // `tail = items.slice(prevLen)` would read the OLD back-of-window turns as
-    // "new" and bump the "↓ N new" pill by the prior window size (and could
-    // wrongly scroll-to-bottom). We detect a prepend by a TOP-EDGE ADVANCE: the
-    // first item's stable anchor uuid changed while content exists. This is
-    // direction- and source-agnostic — it catches the top-sentinel path
-    // (doLoadPrev, which also sets prependPendingRef) AND a jump to an early
-    // target whose backward branch prepends INSIDE the hook
-    // (loadToTarget → fetchPrev), where prependPendingRef can never be set. Bail
-    // (just advancing the prev-trackers) so the scroll-anchor effect owns the
-    // prepend; the prependPendingRef snapshot it relies on is left intact.
-    const prepended = firstId != null && prevFirstIdRef.current != null && firstId !== prevFirstIdRef.current;
-    if (prepended) {
+    // #228 S3 B3 — direction comes straight from the hook op, not a top-edge id
+    // advance. A reverse-page PREPEND (top-sentinel doLoadPrev OR a jump's
+    // backward branch inside the hook) must NOT be mistaken for a live append:
+    // it grows items.length too and on a tail open (hasMore === false) would
+    // satisfy the live discriminator, bumping "↓ N new" by the prior window size.
+    // A reset replaces the whole window and is likewise neither a stick nor a
+    // count. Bail (advancing the prev-trackers) so the scroll-anchor effect owns
+    // the prepend; the prependPendingRef snapshot it relies on stays intact.
+    if (lastOp != null && lastOp.op !== 'append') {
+      // A RESET replaces the whole window, so it must SEED the known-subagent set
+      // from the ENTIRE new window (mirrors the old code, where the null-detail
+      // transient zeroed prevLen and the next page seeded the full slice). Without
+      // this the new session's first live append into a thread present on page-1
+      // would mis-read as a brand-new group and over-count "↓ N new".
+      if (lastOp.op === 'reset') {
+        for (const it of items) {
+          if (it.subagent_key != null) knownSubagentKeysRef.current.add(it.subagent_key);
+        }
+      }
       prevLenRef.current = len;
       prevHasMoreRef.current = hasMore;
       prevFirstIdRef.current = firstId;
       return;
     }
-    const prevLen = prevLenRef.current;
-    const added = len - prevLen;
+    // The count of genuinely-new TAIL items comes from the op (addedBottom), not
+    // `len - prevLen` (which a top-trim in the same commit would corrupt). The
+    // newly-appended items are the LAST `added` items of the window — trim-safe
+    // because any top-drop shifts indices but never the bottom slice's content.
+    const added = lastOp?.op === 'append' ? lastOp.addedBottom : 0;
     // Live append (not the final pagination page): already fully paged before
     // this growth, and not the very first page load (prevLen > 0).
-    const live = added > 0 && prevHasMoreRef.current === false && prevLen > 0;
+    const live = added > 0 && prevHasMoreRef.current === false && prevLenRef.current > 0;
     // #188 S4/C2 — classify each newly-appended item by VISIBILITY against the
     // OLD known-set + open-set (Bug 5): top-level (+1); first item of a
     // brand-new subagent group (+1, deduped per key per tick); append into an
@@ -465,7 +479,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // known thread (+0, below the fold). Computed only on a live append; during
     // non-live growth (first page / pagination) the tail just SEEDS the
     // known-set below WITHOUT counting.
-    const tail = added > 0 ? items.slice(prevLen) : [];
+    const tail = added > 0 ? items.slice(len - added) : [];
     let visibleAdded = 0;
     if (live) {
       const newThisTick = new Set<string>();
@@ -497,7 +511,8 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     prevLenRef.current = len;
     prevHasMoreRef.current = hasMore;
     prevFirstIdRef.current = firstId;
-  }, [detail?.items.length, hasMore]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastOp?.rev, hasMore]);
 
   const jumpToNew = useCallback(() => {
     const b = bodyRef.current;
@@ -679,11 +694,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // #217 S3 E2 — scroll-anchoring on a prepend. After loadPrev grows the thread
   // ABOVE the viewport, re-pin scrollTop by the scrollHeight delta so the turn
   // the user was reading stays put (the classic reverse-infinite-scroll problem).
-  // useLayoutEffect so the correction lands before paint (no visible jump). Keyed
-  // on items.length: a prepend grew it AND left a captured snapshot in
-  // prependPendingRef (set by doLoadPrev). An append (bottom-stick effect's
-  // domain) leaves no snapshot, so this no-ops there.
+  // useLayoutEffect so the correction lands before paint (no visible jump).
+  // #228 S3 B3 — keyed on `lastOp.rev` + `op === 'prepend'`, NOT items.length: a
+  // prepend+far-trim (the windowed DOM cap) can keep the count flat AND net the
+  // scrollHeight delta to ~0 if it ran in the same commit, defeating a
+  // length-keyed restore (Codex P0). The trim is decoupled to a later tick (2c),
+  // so this still measures a pure prepend; the op gate makes the trigger explicit
+  // instead of inferring it from a count growth. It still requires the
+  // reader-owned `prependPendingRef` snapshot (set only by the top-sentinel
+  // doLoadPrev), so a jump-driven hook prepend with no snapshot no-ops here.
   useLayoutEffect(() => {
+    if (lastOp?.op !== 'prepend') return;
     const snap = prependPendingRef.current;
     const b = bodyRef.current;
     if (!snap || !b) return;
@@ -691,7 +712,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (delta > 0) b.scrollTop = snap.prevScrollTop + delta;
     prependPendingRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail?.items.length]);
+  }, [lastOp?.rev]);
 
   // #217 S3 E2 — open-scroll-intent: once the FIRST page resolves, land per the
   // hook's precedence verdict. 'bottom' (a multi-page tail open) scrolls to the

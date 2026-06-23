@@ -568,7 +568,7 @@ describe('useConversation', () => {
     expect(result.current.detail?.items[0].anchor.session_id).toBe('s');
 
     // Kick off s1's page-2 (deferred — promise registered, not yet resolved).
-    let morePromise!: Promise<void>;
+    let morePromise!: Promise<unknown>;
     act(() => { morePromise = result.current.loadMore(); });
     await waitFor(() => expect(Object.keys(deferred).some((u) => u.includes('after='))).toBe(true));
 

@@ -26,6 +26,24 @@ import type { ConversationDetail, ConversationItem, OpenIntent, OutlineTurn } fr
 // refreshes the whole-session header. Codex P1: a `before` page must NEVER touch
 // the bottom edge — `hasMore` / the live-tail gate key on the bottom edge only,
 // else a tail-opened reader would look "not at tail" and live-tail would die.
+// #228 S3 B3 — explicit operation metadata. Every window mutation emits a
+// WindowOp so the reader NEVER infers paging direction from `items.length`,
+// the first-item id, or a count delta — all of which a future prepend+far-trim
+// (the windowed DOM cap) silently defeats (a same-commit prepend+bottom-trim
+// can keep the count/firstId flat). `rev` is monotonic and bumps on EVERY
+// mutation (even a length-flat one), so a reader effect keyed on `rev` fires
+// reliably; `op` names the direction; the four `added*`/`dropped*` counts let
+// the reader's anchor-restore, live-append/stick, and `newCount` paths read
+// exactly what changed at each edge.
+export interface WindowOp {
+  rev: number;                  // monotonic, bumped on every window mutation
+  op: 'prepend' | 'append' | 'reset';
+  addedTop: number;
+  addedBottom: number;
+  droppedTop: number;
+  droppedBottom: number;
+}
+
 export interface UseConversation {
   detail: ConversationDetail | null;
   loading: boolean;
@@ -42,11 +60,16 @@ export interface UseConversation {
   // until the first page resolves, or when the open was a deep-link/restore
   // anchor (the jump pipeline drives the scroll then).
   openScrollIntent: 'top' | 'bottom' | null;
-  loadMore: () => Promise<void>;
-  // Resolves to whether the reverse page actually PREPENDED ≥1 item (false for a
-  // no-op: null cursor, stale cursor → empty page, or a fetch error). The reader
-  // uses this to clear its scroll-anchor snapshot only on a genuine no-op.
-  loadPrev: () => Promise<boolean>;
+  // #228 S3 B3 — the latest window-mutation metadata (null before the first
+  // mutation). The reader keys its scroll-anchor restore, live-append/stick, and
+  // `newCount` pill on this, NOT on items.length / firstId / count deltas.
+  lastOp: WindowOp | null;
+  loadMore: () => Promise<WindowOp | null>;
+  // #228 S3 B3 — resolves to the prepend's WindowOp (or null for a genuine no-op:
+  // null cursor, stale cursor → empty page, or a fetch error). The reader checks
+  // `addedTop > 0` for success (NOT a count compare, which a far-trim defeats) and
+  // uses it to clear its scroll-anchor snapshot only on a genuine no-op.
+  loadPrev: () => Promise<WindowOp | null>;
   loadToTarget: (uuid: string) => Promise<void>;
   jumpToLatest: () => Promise<void>;
   // #217 S4 / I-1.6 — a monotonic counter bumped on each successful pollTail
@@ -86,6 +109,16 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openScrollIntent, setOpenScrollIntent] = useState<'top' | 'bottom' | null>(null);
+  // #228 S3 B3 — the latest window-mutation metadata + its monotonic source.
+  // `opRevRef` is the single monotonic counter (a ref so concurrent emits in one
+  // tick still get distinct, ordered revisions without a stale-state race).
+  const [lastOp, setLastOp] = useState<WindowOp | null>(null);
+  const opRevRef = useRef(0);
+  const emitOp = useCallback((op: Omit<WindowOp, 'rev'>): WindowOp => {
+    const next: WindowOp = { rev: ++opRevRef.current, ...op };
+    setLastOp(next);
+    return next;
+  }, []);
   // #217 S4 / I-1.6 — monotonic live-tail merge counter (see UseConversation).
   const [tailRevision, setTailRevision] = useState(0);
   // #183 — the session id the current `detail` was loaded FOR (see the derive
@@ -130,7 +163,11 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     nextAfterRef.current = body.page.next_after;
     prevBeforeRef.current = body.page.prev_before ?? null;
     setHasPrev(body.page.has_prev ?? false);
-  }, [setDetailSynced]);
+    // #228 S3 B3 — a window reset replaces the whole window; the reader treats it
+    // as neither a prepend nor an append (its one-shot open-scroll-intent latch
+    // and the prev-trackers handle the fresh window).
+    emitOp({ op: 'reset', addedTop: 0, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
+  }, [setDetailSynced, emitOp]);
 
   // ── Initial fetch (hook-owned, precedence-correct — Codex P1) ──────────────
   useEffect(() => {
@@ -190,19 +227,22 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   }, [sessionId, openIntent?.kind, openIntent && 'uuid' in openIntent ? openIntent.uuid : null, setDetailSynced, applyWindow]);
 
   // ── Forward paging (bottom edge) ───────────────────────────────────────────
-  const fetchNext = useCallback(async (): Promise<boolean> => {
+  // #228 S3 B3 — resolves to the append's WindowOp (addedBottom = the count this
+  // page appended) or null for a no-op (null/stale cursor, session change, or a
+  // fetch error). `fetchNext` is also driven by the jump pager; loadMore wraps it.
+  const fetchNext = useCallback(async (): Promise<WindowOp | null> => {
     const after = nextAfterRef.current;
     const sid = sessionRef.current;
-    if (after == null || sid == null || loadingMoreRef.current) return false;
+    if (after == null || sid == null || loadingMoreRef.current) return null;
     loadingMoreRef.current = true;
     try {
       let body: ConversationDetail;
       try {
         body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${after}`);
       } catch {
-        return false;
+        return null;
       }
-      if (sessionRef.current !== sid) return false;  // session changed mid-fetch — drop this stale page
+      if (sessionRef.current !== sid) return null;  // session changed mid-fetch — drop this stale page
       // #166: keep the whole-session subagent_meta map across paged appends.
       // Codex P1 — an `after` page updates ONLY the bottom edge; the top edge
       // (prevBeforeRef / hasPrev) is left untouched.
@@ -210,28 +250,35 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         page: { ...prev.page, next_after: body.page.next_after, has_more: body.page.has_more },
         subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body));
       nextAfterRef.current = body.page.next_after;
-      return body.page.next_after != null;
+      // Emit even for an empty page (addedBottom 0) so a follow-up trim tick still
+      // fires; the reader's stick/newCount paths gate on addedBottom themselves.
+      return emitOp({ op: 'append', addedTop: 0, addedBottom: body.items.length, droppedTop: 0, droppedBottom: 0 });
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [setDetailSynced]);
+  }, [setDetailSynced, emitOp]);
 
-  const loadMore = useCallback(async () => { await fetchNext(); }, [fetchNext]);
+  const loadMore = useCallback(async (): Promise<WindowOp | null> => fetchNext(), [fetchNext]);
 
   // ── Reverse paging (top edge) — Codex P1: NEVER touches the bottom edge ─────
-  const fetchPrev = useCallback(async (): Promise<boolean> => {
+  // #228 S3 B3 — resolves to the prepend's WindowOp (addedTop = the count this
+  // page prepended) or null for a no-op (null/stale cursor, session change, or a
+  // fetch error). The drain loops below read `prevBeforeRef.current` for the
+  // "more reverse pages remain" signal, NOT the op (an op is emitted even on the
+  // last page, when the cursor goes null).
+  const fetchPrev = useCallback(async (): Promise<WindowOp | null> => {
     const before = prevBeforeRef.current;
     const sid = sessionRef.current;
-    if (before == null || sid == null || loadingPrevRef.current) return false;
+    if (before == null || sid == null || loadingPrevRef.current) return null;
     loadingPrevRef.current = true;
     try {
       let body: ConversationDetail;
       try {
         body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&before=${before}`);
       } catch {
-        return false;
+        return null;
       }
-      if (sessionRef.current !== sid) return false;
+      if (sessionRef.current !== sid) return null;
       // PREPEND the page and update ONLY the top edge. The before-page envelope
       // legitimately carries next_after / has_more for the items AFTER it (already
       // loaded) — storing those would flip the reader to "not at tail" and kill
@@ -242,20 +289,20 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body));
       prevBeforeRef.current = body.page.prev_before ?? null;
       setHasPrev(body.page.has_prev ?? false);
-      return (body.page.has_prev ?? false) && prevBeforeRef.current != null;
+      return emitOp({ op: 'prepend', addedTop: body.items.length, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
     } finally {
       loadingPrevRef.current = false;
     }
-  }, [setDetailSynced]);
+  }, [setDetailSynced, emitOp]);
 
-  // Returns whether the reverse page actually prepended ≥1 item. The synchronous
-  // detailRef mirror is updated inside fetchPrev's setDetailSynced BEFORE this
-  // await resolves, so the count delta is race-free (no DOM / commit dependency).
-  const loadPrev = useCallback(async (): Promise<boolean> => {
-    const before = detailRef.current?.items.length ?? 0;
-    await fetchPrev();
-    const after = detailRef.current?.items.length ?? 0;
-    return after > before;
+  // #228 S3 B3 — resolves to the prepend's WindowOp (or null for a genuine no-op).
+  // The reader checks `op?.addedTop` for success rather than a count compare,
+  // which a same-commit prepend+far-trim (the windowed cap) would defeat. The
+  // synchronous detailRef mirror is updated inside fetchPrev BEFORE this resolves,
+  // and the emitted op carries the true addedTop regardless of any trailing trim.
+  const loadPrev = useCallback(async (): Promise<WindowOp | null> => {
+    const op = await fetchPrev();
+    return op && op.addedTop > 0 ? op : null;
   }, [fetchPrev]);
 
   // ── Unified jump pager (replaces loadUntil + loadToEnd) ─────────────────────
@@ -288,8 +335,11 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       const sidF = sid;
       for (;;) {
         if (has()) return;
-        const more = await fetchNext();
-        if (more) continue;
+        // #228 S3 B3 — fetchNext now returns the append WindowOp (or null on a
+        // no-op); "more pages remain" is read from the bottom-edge cursor, not the
+        // op (an op is emitted even on the last page when the cursor goes null).
+        const op = await fetchNext();
+        if (op && nextAfterRef.current != null) continue;
         if (nextAfterRef.current == null || sessionRef.current !== sidF) return;
         while (loadingMoreRef.current && sessionRef.current === sidF) await Promise.resolve();
         if (sessionRef.current !== sidF) return;
@@ -326,13 +376,14 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
 
     if (backward) {
       // Page head-ward via the top edge until the target loads or the head is
-      // reached. fetchPrev returns false for a genuine exhaustion (cursor null /
+      // reached. fetchPrev returns null for a genuine exhaustion (cursor null /
       // session change / error) OR a transient overlap early-return; disambiguate
       // via the synchronous cursor mirror (same discipline as the forward path).
+      // "More remain" is read from prevBeforeRef, not the op (#228 S3 B3).
       for (;;) {
         if (has()) return;
-        const more = await fetchPrev();
-        if (more) continue;
+        const op = await fetchPrev();
+        if (op && prevBeforeRef.current != null) continue;
         if (prevBeforeRef.current == null || sessionRef.current !== sid) return;
         while (loadingPrevRef.current && sessionRef.current === sid) await Promise.resolve();
         if (sessionRef.current !== sid) return;
@@ -341,8 +392,8 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       // Page tail-ward via the bottom edge (the ported overlap-race-safe drain).
       for (;;) {
         if (has()) return;
-        const more = await fetchNext();
-        if (more) continue;
+        const op = await fetchNext();
+        if (op && nextAfterRef.current != null) continue;
         if (nextAfterRef.current == null || sessionRef.current !== sid) return;
         while (loadingMoreRef.current && sessionRef.current === sid) await Promise.resolve();
         if (sessionRef.current !== sid) return;
@@ -447,13 +498,22 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         // genuine no-op and must NOT bump, else an idle conversation with the
         // find bar open refetches /find every ~5s snapshot tick for nothing.
         if (corpusChanged) setTailRevision((r) => r + 1);
+        // #228 S3 B3 — a live-tail merge that touched the corpus emits an append
+        // op so the reader's stick-to-bottom / "↓ N new" paths fire off explicit
+        // metadata (addedBottom = the count of genuinely-new tail items) rather
+        // than an items.length delta. An in-place overlap replace/delete with no
+        // append (corpusChanged && appended===0) still emits (addedBottom 0) so
+        // the reader re-seeds its trackers but neither sticks nor counts.
+        if (corpusChanged) {
+          emitOp({ op: 'append', addedTop: 0, addedBottom: appended, droppedTop: 0, droppedBottom: 0 });
+        }
         if (appended === 0 || body.page.next_after == null) break;
       }
     } finally {
       pollingRef.current = false;
       if (pendingTickRef.current) { pendingTickRef.current = false; void pollTail(); }  // replay one coalesced tick
     }
-  }, [setDetailSynced]);
+  }, [setDetailSynced, emitOp]);
 
   // Trigger on each SSE tick, but only while fully paged at the bottom.
   const env = useSnapshot();
@@ -480,6 +540,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   return {
     detail: exposedDetail, loading: exposedLoading, error,
     hasMore, hasPrev, prevBefore, openScrollIntent,
+    lastOp,
     loadMore, loadPrev, loadToTarget, jumpToLatest,
     tailRevision,
   };
