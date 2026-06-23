@@ -133,6 +133,22 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, [sessionId]);
   const { detail, loading, error, hasMore, hasPrev, openScrollIntent, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
+  // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
+  // once the single reader has rendered. The reader loads async, so a single
+  // rAF fired at close time can land during the loading branch and miss the
+  // trigger; instead we consume the store flag once detail is ready.
+  const compareCloseFocusPending = useSyncExternalStore(
+    subscribeStore, () => getState().compareCloseFocusPending,
+  );
+  useEffect(() => {
+    if (!compareCloseFocusPending) return;
+    if (loading && !detail) return;          // wait for the detail branch
+    const el =
+      document.getElementById('conv-compare-with') ??
+      document.querySelector<HTMLElement>('.conv-reader');
+    el?.focus();
+    dispatch({ type: 'CLEAR_COMPARE_CLOSE_FOCUS' });
+  }, [compareCloseFocusPending, loading, detail]);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #205 S1 — the ephemeral mobile outline flag + the effective open-state. On
   // mobile the ☰/`o` toggle and aria-pressed track convOutlineMobileOpen (never
@@ -1574,7 +1590,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   );
 
   return (
-    <div className="conv-reader">
+    <div className="conv-reader" tabIndex={-1}>
       <div className="conv-reader-head">
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
@@ -1676,6 +1692,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               CSS in index.css. */}
           <button
             type="button"
+            id="conv-compare-with"
             className="conv-compare-with"
             aria-label="Compare this session with another"
             title="Compare with another session"

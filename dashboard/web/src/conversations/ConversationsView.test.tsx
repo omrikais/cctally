@@ -633,4 +633,82 @@ describe('Conversations workspace integration', () => {
     act(() => { updateSnapshot(baseEnvelope(undefined, '2026-05-13T10:00:30Z')); });
     expect(screen.queryByRole('group', { name: 'Workspace' })).toBeNull();
   });
+
+  // #228 S1 (F3) — closing a comparison must return keyboard focus to the
+  // "Compare with…" trigger in the single reader, never drop it to <body>. The
+  // reader loads async, so this is driven to completion before asserting focus.
+  it('F3: closing a comparison returns focus to #conv-compare-with once the reader detail renders', async () => {
+    updateSnapshot(baseEnvelope(true));
+    // Enter a comparison anchored on sess-1 (A is the anchor → the single
+    // reader falls back to it on close).
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    render(<App />);
+
+    // The comparison takes over the workspace.
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+    const closeBtn = await waitFor(() => {
+      const el = document.querySelector<HTMLButtonElement>('.conv-cmp-close');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+
+    // Close via the header ✕ — the real ComparisonView path through onClose →
+    // CLOSE_COMPARE (which arms the focus-return flag).
+    fireEvent.click(closeBtn);
+    expect(getState().compare).toBeNull();
+
+    // The single reader re-renders for the anchor; once its detail lands, focus
+    // returns to the compare trigger — never <body>.
+    const trigger = await waitFor(() => {
+      const el = document.getElementById('conv-compare-with');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(document.activeElement).not.toBe(document.body);
+    // The one-shot flag is cleared after the return.
+    expect(getState().compareCloseFocusPending).toBe(false);
+  });
+
+  // #228 S1 (F3) — the not-found comparison state routes its close through the
+  // SAME shared onClose, so focus return still works when an outline 404s.
+  it('F3: the not-found comparison close also returns focus via the shared handler', async () => {
+    // Override fetch so sess-2's OUTLINE 404s (→ outB.error → ComparisonNotFound),
+    // while sess-1 (the anchor reader) loads normally.
+    const fn = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      let body: unknown = {};
+      let ok = true;
+      let status = 200;
+      if (u.includes('/api/conversation/search')) body = searchResult;
+      else if (u.includes('/api/conversations')) body = conversationsPage;
+      else if (u.includes('/outline')) {
+        if (u.includes('sess-2')) { ok = false; status = 404; body = {}; }
+        else body = outlinePayload();
+      } else if (u.includes('/api/conversation/')) body = detail();
+      return { ok, status, json: async () => body } as Response;
+    });
+    globalThis.fetch = fn as unknown as typeof fetch;
+
+    updateSnapshot(baseEnvelope(true));
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    render(<App />);
+
+    // The not-found state renders (sess-2 outline 404'd) with its own close ✕.
+    await waitFor(() => expect(document.querySelector('.conv-cmp--notfound')).not.toBeNull());
+    const closeBtn = document.querySelector<HTMLButtonElement>('.conv-cmp--notfound .conv-cmp-close')!;
+    expect(closeBtn).not.toBeNull();
+
+    fireEvent.click(closeBtn);
+    expect(getState().compare).toBeNull();
+    expect(getState().compareCloseFocusPending).toBe(true);
+
+    const trigger = await waitFor(() => {
+      const el = document.getElementById('conv-compare-with');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(document.activeElement).not.toBe(document.body);
+  });
 });

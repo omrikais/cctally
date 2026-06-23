@@ -363,6 +363,9 @@ export interface UIState {
   // SET_VIEW) so a stale comparison can never linger behind the reader.
   compare: { a: string; b: string } | null;
   comparePick: { anchor: string } | null;
+  // #228 S1 (F3) — one-shot: set by CLOSE_COMPARE, consumed+cleared by the
+  // reader's focus-on-ready effect to return focus to #conv-compare-with.
+  compareCloseFocusPending: boolean;
   // #227 — accumulating session_id → title cache, populated by the rail's browse
   // fetch (useConversations) as pages land. Read by ComparisonView so its header
   // can prefer the real derived title over the `Session <slug>` fallback without
@@ -620,6 +623,8 @@ function loadInitial(): UIState {
     // #217 S7 F10 — no comparison / pick in flight at init.
     compare: null,
     comparePick: null,
+    // #228 S1 (F3) — no focus-return pending at init.
+    compareCloseFocusPending: false,
     // #227 — empty title cache; filled lazily as the rail browse list loads.
     conversationTitles: {},
     openModal: null,
@@ -827,6 +832,9 @@ export type Action =
   | { type: 'OPEN_COMPARE'; a: string; b: string }
   | { type: 'SWAP_COMPARE' }
   | { type: 'CLOSE_COMPARE' }
+  // #228 S1 (F3) — clear the transient focus-return flag once the reader has
+  // returned focus to the compare trigger.
+  | { type: 'CLEAR_COMPARE_CLOSE_FOCUS' }
   // #227 — merge a batch of [session_id, title] pairs into the title cache. The
   // rail's useConversations dispatches it as pages land; non-empty titles only.
   | { type: 'CACHE_CONVERSATION_TITLES'; titles: Array<[string, string]> }
@@ -1187,7 +1195,15 @@ export function dispatch(action: Action): void {
       state = { ...state, compare: state.compare ? { a: state.compare.b, b: state.compare.a } : null };
       break;
     case 'CLOSE_COMPARE':
-      state = { ...state, compare: null };            // keep selectedConversationId = anchor
+      // #228 S1 (F3) — keep selectedConversationId = anchor AND arm the
+      // focus-return flag so the reader returns focus to #conv-compare-with
+      // once its detail re-renders. ONLY CLOSE_COMPARE arms it — the
+      // reverse-clear sites (SET_VIEW/OPEN_/SELECT_CONVERSATION) clear compare
+      // for a different reason and must NOT request a focus return.
+      state = { ...state, compare: null, compareCloseFocusPending: true };
+      break;
+    case 'CLEAR_COMPARE_CLOSE_FOCUS':
+      state = { ...state, compareCloseFocusPending: false };
       break;
     case 'CACHE_CONVERSATION_TITLES': {
       // #227 — merge non-empty titles into the accumulating cache. Skip the

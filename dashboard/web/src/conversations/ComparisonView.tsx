@@ -92,8 +92,13 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
   const spineB = useMemo(() => spineFromOutline(outB.outline), [outB.outline]);
   const rows = useMemo(() => computeSequenceDiff(spineA, spineB), [spineA, spineB]);
 
+  // #228 S1 (F3) — one shared close handler for BOTH the header and the
+  // not-found state, so every way out of the comparison goes through
+  // CLOSE_COMPARE (which arms the reader's focus-return to #conv-compare-with).
+  const onClose = () => dispatch({ type: 'CLOSE_COMPARE' });
+
   if (outA.error || outB.error) {
-    return <ComparisonNotFound onClose={() => dispatch({ type: 'CLOSE_COMPARE' })} />;
+    return <ComparisonNotFound onClose={onClose} />;
   }
 
   const mA = outA.outline ? metricsFromOutline(outA.outline, spineA.length) : null;
@@ -105,7 +110,7 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
         a={headerOf(a, outA.outline, ctx, titles)}
         b={headerOf(b, outB.outline, ctx, titles)}
         onSwap={() => dispatch({ type: 'SWAP_COMPARE' })}
-        onClose={() => dispatch({ type: 'CLOSE_COMPARE' })}
+        onClose={onClose}
       />
       {mA && mB && <ComparisonMetrics a={mA} b={mB} />}
       <ComparisonDiff

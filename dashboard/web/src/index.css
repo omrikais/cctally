@@ -8333,7 +8333,7 @@ mark.current {
   cursor: pointer;
 }
 .conv-compare-with:hover { color: var(--text); border-color: var(--accent-blue); }
-.conv-compare-with:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+.conv-compare-with:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 /* ---- Header bar --------------------------------------------------------- */
 .conv-cmp-head {
