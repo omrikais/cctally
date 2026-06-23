@@ -460,9 +460,9 @@ function SearchList({ needle, kind, ctx, pickAnchor }: { needle: string; kind: S
         <div className="conv-rail-search-filters-degraded">Some filters unavailable while indexing.</div>
       )}
       {error
-        ? <div className="conv-rail-empty">{error}</div>
+        ? <div className="conv-rail-empty" role="alert">{error}</div>
         : loading && hits.length === 0
-          ? <div className="conv-rail-empty">Searching…</div>
+          ? <div className="conv-rail-empty" role="status">Searching…</div>
           : (
             <>
               <div className="conv-rail-count" aria-live="polite">{countText}</div>

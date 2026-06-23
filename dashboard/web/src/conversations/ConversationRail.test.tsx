@@ -17,6 +17,11 @@ let searchTotal = 0;
 let searchMode: 'fts' | 'like' = 'fts';
 let searchDepth: 'prose-only' | 'full' = 'full';
 let searchLoadingMore = false;
+// #228 S1 (F6) — overridable search loading/error so the role="status" /
+// role="alert" branches can be exercised. Defaults preserve every existing
+// search test (no loading, no error).
+let searchLoading = false;
+let searchError: string | null = null;
 let filterDegraded = false;
 // #217 S4 / I-2 — browse sort_degraded + search top-level filter_degraded.
 let sortDegraded = false;
@@ -49,9 +54,9 @@ vi.mock('./ConversationFiltersPopover', () => ({
 vi.mock('../hooks/useConversationSearch', () => ({
   useConversationSearch: () => ({
     hits: searchHits, mode: searchMode, total: searchTotal,
-    loading: false, loadingMore: searchLoadingMore, searchDepth,
+    loading: searchLoading, loadingMore: searchLoadingMore, searchDepth,
     filterDegraded: searchFilterDegraded,
-    error: null, loadMore: loadMoreSpy,
+    error: searchError, loadMore: loadMoreSpy,
   }),
 }));
 vi.mock('../hooks/useDisplayTz', () => ({
@@ -100,6 +105,8 @@ beforeEach(() => {
   searchMode = 'fts';
   searchDepth = 'full';
   searchLoadingMore = false;
+  searchLoading = false;
+  searchError = null;
   filterDegraded = false;
   sortDegraded = false;
   searchFilterDegraded = false;
@@ -786,5 +793,40 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
     render(<ConversationRail />);
     const row = screen.getByText('the anchor').closest('button') as HTMLButtonElement;
     expect(row.disabled).toBe(true);
+  });
+});
+
+// #228 S1 (F6) — cross-session search states must be announced. The error
+// branch is an alert (assertive); the "Searching…" branch is a status (polite).
+// The hit-count div keeps its existing aria-live="polite"; the three branches
+// are mutually exclusive, so there is no double-announce.
+describe('ConversationRail search-state a11y (#228 S1 F6)', () => {
+  it('the search error branch carries role="alert"', () => {
+    searchError = "Search failed.";
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const el = document.querySelector('.conv-rail-empty[role="alert"]');
+    expect(el).toBeTruthy();
+    expect(el!.textContent).toContain('Search failed.');
+  });
+
+  it('the "Searching…" loading branch carries role="status"', () => {
+    searchLoading = true;
+    searchHits = [];
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const el = document.querySelector('.conv-rail-empty[role="status"]');
+    expect(el).toBeTruthy();
+    expect(el!.textContent).toContain('Searching…');
+  });
+
+  it('the hit-count div keeps its aria-live="polite" (no role on the count)', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const count = document.querySelector('.conv-rail-count');
+    expect(count).toBeTruthy();
+    expect(count).toHaveAttribute('aria-live', 'polite');
   });
 });

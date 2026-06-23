@@ -1878,6 +1878,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       {newCount > 0 && !atBottomRef.current && (
         <button type="button" className="conv-new-pill" onClick={jumpToNew}>↓ {newCount} new</button>
       )}
+      {/* #228 S1 (F6) — the pill above is conditionally mounted, so aria-live on
+          it can't announce. This persistent .sr-only polite region is ALWAYS
+          rendered and mirrors newCount, so a screen reader hears live-tail
+          arrivals. */}
+      <div className="sr-only" aria-live="polite" data-testid="conv-newcount-live">
+        {newCount > 0 ? `${newCount} new message${newCount === 1 ? '' : 's'} below` : ''}
+      </div>
       {/* #176 — floating "↑ Top of turn" button. A child of .conv-reader (NOT the
           scrolling .conv-reader-body), absolutely positioned bottom-right so it
           floats over the body without scrolling with it and clears the

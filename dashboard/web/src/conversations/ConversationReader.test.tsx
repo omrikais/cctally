@@ -909,6 +909,27 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
+  // #228 S1 (F6) — the "↓ N new" pill is conditionally mounted, so an aria-live
+  // ON it can't announce. A persistent, always-rendered .sr-only polite region
+  // mirrors newCount so screen readers hear live-tail arrivals.
+  it('announces newly-arrived live-tail messages via a persistent polite region', async () => {
+    const { body, container } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // The region is ALWAYS present (even at zero) with aria-live="polite".
+    const live = container.querySelector('[data-testid="conv-newcount-live"]');
+    expect(live).toBeTruthy();
+    expect(live).toHaveAttribute('aria-live', 'polite');
+    expect(live?.textContent).toBe('');
+
+    // Scroll up so a live append raises newCount instead of sticking.
+    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
+    fireEvent.scroll(body);
+    spyScrollTo();
+
+    await appendLiveItem('live1');
+    // The region's text now mentions the count (the pill also shows).
+    await waitFor(() => expect(live?.textContent).toMatch(/1 new/));
+  });
+
   it('the final PAGINATION append (was hasMore) shows no pill and no stick (P0 discriminator)', async () => {
     // Page 1 has a cursor (hasMore true). Render in conversations view with the
     // keymap installed so `j` at the last item triggers loadMore -> the FINAL
