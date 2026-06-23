@@ -5187,7 +5187,7 @@ mark.current {
   outline: none;
 }
 .conv-outline-resizer:focus-visible {
-  box-shadow: 0 0 0 2px var(--accent-blue);
+  box-shadow: var(--focus-ring);
 }
 .conv-outline-resizer-grip {
   width: 2px;

@@ -68,6 +68,9 @@ export function OutlineResizer() {
       ? outlineEl.getBoundingClientRect().right
       : host.getBoundingClientRect().right;
     draggingRef.current = true;
+    // #228 S1 (F2) — a mouse click moves keyboard focus to the divider, so a
+    // pointer user can immediately Arrow-resize from the keyboard.
+    ref.current?.focus();
     ev.preventDefault();
     try { ref.current?.setPointerCapture(ev.pointerId); } catch { /* jsdom */ }
   }, []);

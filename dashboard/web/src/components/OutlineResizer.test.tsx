@@ -88,6 +88,17 @@ describe('OutlineResizer (#217 S3 E6(b))', () => {
     expect(getState().convOutlineWidth).toBe(OUTLINE_WIDTH_MIN);
   });
 
+  // #228 S1 (F2) — a mouse click must move keyboard focus to the divider, so a
+  // pointer user can immediately Arrow-resize. JSDOM has no pixel layout but it
+  // DOES track document.activeElement, so the focus call is testable here.
+  it('focuses the resizer on pointer-down (so a mouse click can then keyboard-resize)', () => {
+    const { container } = render(<OutlineResizer />);
+    const sep = container.querySelector('[role="separator"]')! as HTMLElement;
+    expect(sep).not.toHaveFocus();
+    fireEvent.pointerDown(sep, { pointerId: 1 });
+    expect(sep).toHaveFocus();
+  });
+
   // Cross-branch review P3 — a HANDLED resizer key must NOT also reach the
   // document-level global keymap (a double-fire). The reader binds `End` to
   // jump-to-latest at scope 'global'; pressing `End` while the resizer is focused
