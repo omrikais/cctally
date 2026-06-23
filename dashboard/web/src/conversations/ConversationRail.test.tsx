@@ -17,7 +17,7 @@ let searchTotal = 0;
 let searchMode: 'fts' | 'like' = 'fts';
 let searchDepth: 'prose-only' | 'full' = 'full';
 let searchLoadingMore = false;
-// #228 S1 (F6) — overridable search loading/error so the role="status" /
+// #228 S1 (§6c) — overridable search loading/error so the role="status" /
 // role="alert" branches can be exercised. Defaults preserve every existing
 // search test (no loading, no error).
 let searchLoading = false;
@@ -796,11 +796,11 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
   });
 });
 
-// #228 S1 (F6) — cross-session search states must be announced. The error
+// #228 S1 (§6c) — cross-session search states must be announced. The error
 // branch is an alert (assertive); the "Searching…" branch is a status (polite).
 // The hit-count div keeps its existing aria-live="polite"; the three branches
 // are mutually exclusive, so there is no double-announce.
-describe('ConversationRail search-state a11y (#228 S1 F6)', () => {
+describe('ConversationRail search-state a11y (#228 S1 §6c)', () => {
   it('the search error branch carries role="alert"', () => {
     searchError = "Search failed.";
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });

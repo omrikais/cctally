@@ -1878,7 +1878,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       {newCount > 0 && !atBottomRef.current && (
         <button type="button" className="conv-new-pill" onClick={jumpToNew}>↓ {newCount} new</button>
       )}
-      {/* #228 S1 (F6) — the pill above is conditionally mounted, so aria-live on
+      {/* #228 S1 (§6c) — the pill above is conditionally mounted, so aria-live on
           it can't announce. This persistent .sr-only polite region is ALWAYS
           rendered and mirrors newCount, so a screen reader hears live-tail
           arrivals. */}

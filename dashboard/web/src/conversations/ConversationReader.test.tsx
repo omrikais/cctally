@@ -909,7 +909,7 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
-  // #228 S1 (F6) — the "↓ N new" pill is conditionally mounted, so an aria-live
+  // #228 S1 (§6c) — the "↓ N new" pill is conditionally mounted, so an aria-live
   // ON it can't announce. A persistent, always-rendered .sr-only polite region
   // mirrors newCount so screen readers hear live-tail arrivals.
   it('announces newly-arrived live-tail messages via a persistent polite region', async () => {
