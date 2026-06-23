@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader, deriveReaderTitle } from './ConversationReader';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
@@ -10,7 +10,8 @@ import {
 } from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import { clearReadingPositions, recordReadingPos } from '../store/readingPosition';
-import { stubMobileMedia } from '../test-utils/mobileMedia';
+import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia';
+import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 // §6 overlap-upsert keys the live-tail merge off `anchor.id`, so fixtures need
@@ -1435,12 +1436,24 @@ describe('ConversationReader keyboard navigation (G3)', () => {
   });
 });
 
-// #205 S1 — the ☰ outline toggle is viewport-aware: on mobile it flips the
-// ephemeral convOutlineMobileOpen flag (never the persisted desktop pref), on
-// desktop it flips the persisted convOutlineOpen. `aria-pressed` tracks the
-// EFFECTIVE state. The matchMedia stub must be installed BEFORE the reader
-// renders so useIsMobile's initial state reads it.
-describe('ConversationReader outline toggle is viewport-aware (#205 S1)', () => {
+// #205 S1 / #228 S3 F1 — the ☰ outline toggle is viewport-aware, now keyed on
+// the WIDE breakpoint (≥1101px), not mobile (≤640px): the persistent COLUMN
+// pref (convOutlineOpen) flips only when WIDE; the ephemeral SHEET flag
+// (convOutlineMobileOpen) flips across the whole no-column band (≤1100px =
+// mobile AND the 641–1100 tablet band — so the tablet-band ☰ stops lying).
+// `aria-pressed` tracks the EFFECTIVE state. The matchMedia stub must be
+// installed BEFORE the reader renders so useIsWide's initial state reads it.
+// The per-query stub keeps the 640 vs 1100 breakpoints distinct (the old
+// stubMobileMedia returned ONE value for both queries, conflating them).
+describe('ConversationReader outline toggle is viewport-aware (#205 S1 / #228 S3 F1)', () => {
+  // Per-band resolver: tablet = NOT mobile AND NOT wide.
+  function bandResolver(band: 'mobile' | 'tablet' | 'wide') {
+    return (q: string): boolean => {
+      if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
+      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+      return false;
+    };
+  }
   async function renderInConversations(items: ConversationItem[]) {
     mockFetchOnce(detail(items));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-A' });
@@ -1450,20 +1463,34 @@ describe('ConversationReader outline toggle is viewport-aware (#205 S1)', () => 
     return utils;
   }
 
-  it('desktop: ☰ toggles the persisted flag, mobile flag untouched', async () => {
-    stubMobileMedia(false);
+  it('wide (≥1101px): ☰ toggles the persisted COLUMN flag, sheet flag untouched', async () => {
+    stubResponsiveMedia(bandResolver('wide'));
     _resetForTests();
     const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
     const btn = container.querySelector<HTMLButtonElement>('.conv-outline-toggle')!;
     expect(getState().convOutlineMobileOpen).toBe(false);
     const before = getState().convOutlineOpen;
     fireEvent.click(btn);
-    expect(getState().convOutlineOpen).toBe(!before);       // desktop flag flips
-    expect(getState().convOutlineMobileOpen).toBe(false);    // mobile flag untouched
+    expect(getState().convOutlineOpen).toBe(!before);       // column flag flips
+    expect(getState().convOutlineMobileOpen).toBe(false);    // sheet flag untouched
   });
 
-  it('mobile: ☰ toggles the ephemeral flag and never mutates the persisted pref', async () => {
-    stubMobileMedia(true);
+  it('tablet band (641–1100): ☰ toggles the ephemeral SHEET flag, never the persisted pref', async () => {
+    // F1's new behavior: the tablet-band ☰ is now LIVE — it opens the sheet
+    // (the column is hidden ≤1100px), keyed on !isWide while isMobile is FALSE.
+    stubResponsiveMedia(bandResolver('tablet'));
+    _resetForTests();
+    localStorage.removeItem('cctally.conv.outlineOpen');
+    const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
+    const btn = container.querySelector<HTMLButtonElement>('.conv-outline-toggle')!;
+    fireEvent.click(btn);
+    expect(getState().convOutlineMobileOpen).toBe(true);     // sheet flag flips
+    expect(localStorage.getItem('cctally.conv.outlineOpen')).toBeNull(); // pref untouched
+    await waitFor(() => expect(btn.getAttribute('aria-pressed')).toBe('true')); // EFFECTIVE state
+  });
+
+  it('mobile (≤640px): ☰ toggles the ephemeral SHEET flag and never mutates the persisted pref', async () => {
+    stubResponsiveMedia(bandResolver('mobile'));
     _resetForTests();
     localStorage.removeItem('cctally.conv.outlineOpen');
     const { container } = await renderInConversations([makeItem({ uuid: 'h1' })]);
@@ -2168,6 +2195,85 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
     await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
     const meta = container.querySelector('.conv-reader-meta')!.textContent!;
     expect(meta).toContain('claude-haiku-4-5-20251001');
+  });
+});
+
+// ---- #228 S3 C2 — two-row mobile reader header (≤640px only) -----------
+// At ≤640px the reader header collapses: Row 1 (Back · title · ⋯), Row 2 (the
+// compact Focus dropdown · Find · Outline). The secondary actions (Export,
+// Compare with…, Latest ↓, Expand-all, Collapse-all) move INTO the ⋯ overflow
+// menu, and the 4-button focus segment becomes the compact Focus dropdown.
+// Desktop/tablet keep the full inline controls unchanged. matchMedia-mocked
+// (per-query) so the 640 vs 1100 breakpoints stay distinct; the visual
+// first-paint reclaim + 44px targets are the ui-qa gate.
+describe('ConversationReader two-row mobile header (#228 S3 C2)', () => {
+  function bandResolver(band: 'mobile' | 'wide') {
+    return (q: string): boolean => {
+      if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
+      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+      return false;
+    };
+  }
+  async function renderHeader(band: 'mobile' | 'wide') {
+    stubResponsiveMedia(bandResolver(band));
+    _resetForTests();
+    // last_anchor present so the "Latest ↓" control is reachable (it gates on it,
+    // on desktop inline AND inside the mobile ⋯ menu).
+    const d = detail([makeItem({ uuid: 'h1' })]);
+    (d as { last_anchor?: unknown }).last_anchor = { session_id: 's', uuid: 'h1' };
+    mockFetchOnce(d);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" mobileBack />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-head')).not.toBeNull());
+    return utils;
+  }
+
+  it('mobile (≤640): secondary actions live in the ⋯ menu, not inline; two slim rows render', async () => {
+    const { container } = await renderHeader('mobile');
+    // The ⋯ overflow trigger is present.
+    const overflow = container.querySelector('.conv-overflow-toggle');
+    expect(overflow).not.toBeNull();
+    // The secondary actions are NOT inline in the header controls (they moved
+    // into the ⋯ menu, which is closed). The inline Compare / Latest / Export
+    // header buttons are absent.
+    expect(container.querySelector('.conv-reader-controls .conv-compare-with')).toBeNull();
+    expect(container.querySelector('.conv-reader-controls .conv-jump-latest')).toBeNull();
+    expect(container.querySelector('.conv-reader-controls .conv-export')).toBeNull();
+    // The 4-button focus segment is replaced by the compact Focus dropdown.
+    expect(container.querySelector('.conv-focus-seg')).toBeNull();
+    expect(container.querySelector('.conv-focus-compact-toggle')).not.toBeNull();
+    // Row 2 keeps Find + Outline inline (the primary on-screen affordances).
+    expect(container.querySelector('.conv-find-toggle')).not.toBeNull();
+    expect(container.querySelector('.conv-outline-toggle')).not.toBeNull();
+    // Two slim rows: the structural row wrappers.
+    expect(container.querySelector('.conv-reader-head--mobile')).not.toBeNull();
+    expect(container.querySelector('.conv-reader-row1')).not.toBeNull();
+    expect(container.querySelector('.conv-reader-row2')).not.toBeNull();
+
+    // Opening the ⋯ menu reveals the moved actions.
+    fireEvent.click(overflow as HTMLButtonElement);
+    const menu = screen.getByRole('menu', { name: /more actions/i });
+    expect(within(menu).getByRole('menuitem', { name: /compare with/i })).not.toBeNull();
+    expect(within(menu).getByRole('menuitem', { name: /latest/i })).not.toBeNull();
+    expect(within(menu).getByRole('menuitem', { name: /expand all/i })).not.toBeNull();
+    expect(within(menu).getByRole('menuitem', { name: /collapse all/i })).not.toBeNull();
+  });
+
+  it('desktop (≥1101): the full inline controls render unchanged; no ⋯ menu', async () => {
+    const { container } = await renderHeader('wide');
+    // The full inline desktop controls are present.
+    expect(container.querySelector('.conv-focus-seg')).not.toBeNull();      // 4-button segment
+    expect(container.querySelector('.conv-export-toggle')).not.toBeNull();   // Export menu
+    expect(container.querySelector('.conv-compare-with')).not.toBeNull();    // Compare inline
+    expect(container.querySelector('.conv-jump-latest')).not.toBeNull();     // Latest inline
+    expect(container.querySelector('.conv-find-toggle')).not.toBeNull();
+    expect(container.querySelector('.conv-outline-toggle')).not.toBeNull();
+    // The mobile collapse did NOT happen: no ⋯ menu, no compact focus dropdown,
+    // no two-row wrappers.
+    expect(container.querySelector('.conv-overflow-toggle')).toBeNull();
+    expect(container.querySelector('.conv-focus-compact-toggle')).toBeNull();
+    expect(container.querySelector('.conv-reader-head--mobile')).toBeNull();
   });
 });
 

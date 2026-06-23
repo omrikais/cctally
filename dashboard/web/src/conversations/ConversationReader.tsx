@@ -3,12 +3,15 @@ import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../sto
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useIsWide } from '../hooks/useIsWide';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
 import { FindBar } from './FindBar';
 import { ExportMenu } from './ExportMenu';
 import { FocusMoreMenu, type FocusSubagentOption } from './FocusMoreMenu';
+import { FocusCompactMenu } from './FocusCompactMenu';
+import { ReaderOverflowMenu } from './ReaderOverflowMenu';
 import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
@@ -150,12 +153,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'CLEAR_COMPARE_CLOSE_FOCUS' });
   }, [compareCloseFocusPending, loading, detail]);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
-  // #205 S1 — the ephemeral mobile outline flag + the effective open-state. On
-  // mobile the ☰/`o` toggle and aria-pressed track convOutlineMobileOpen (never
-  // the persisted desktop pref); on desktop they track convOutlineOpen.
+  // #205 S1 / #228 S3 F1 — the ephemeral outline-sheet flag + the effective
+  // open-state. The SHEET governs whenever the column is hidden (≤1100px =
+  // !isWide); the persisted column pref governs only when wide. So the ☰/`o`
+  // toggle and aria-pressed track convOutlineMobileOpen across the whole
+  // no-column band (mobile AND the 641–1100 tablet band, where the ☰ is now a
+  // live control), and convOutlineOpen only ≥1101px (was keyed on isMobile in
+  // #205 S1; widened to isWide so the tablet-band ☰ stops lying — §8).
   const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
   const isMobile = useIsMobile();
-  const effectiveOutlineOpen = isMobile ? outlineMobileOpen : outlineOpen;
+  const isWide = useIsWide();
+  const effectiveOutlineOpen = isWide ? outlineOpen : outlineMobileOpen;
   // #177 S5 — the active focus mode (all/chat/prompts/errors) + scroll-sync
   // cursor uuid. focusMode drives the `visible` pipeline below; the cursor uuid
   // seeds jump-to-next.
@@ -298,6 +306,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // across a resize.
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+  // #228 S3 F1 — live mirror of isWide for the same stable toggleOutline closure:
+  // the column/sheet decision is keyed on isWide (≥1101 = column), so the toggle
+  // must read the live wide-state, not the mobile-state.
+  const isWideRef = useRef(isWide);
+  isWideRef.current = isWide;
   // #177 S5 §4 — live mirrors for the stable jump-to-next key closures (the
   // keymap array is built once; its actions read refs, never re-registering).
   const outlineRef = useRef<ConversationOutline | null | undefined>(outline);
@@ -1467,11 +1480,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: next });
   }, []);
 
-  // #205 S1 — one stable toggle for the ☰ button AND the `o` key. Reads the
-  // live isMobile mirror so the useMemo([]) keymap neither churns nor captures
-  // a stale viewport across a resize.
+  // #205 S1 / #228 S3 F1 — one stable toggle for the ☰ button AND the `o` key.
+  // Reads the live isWide mirror so the useMemo([]) keymap neither churns nor
+  // captures a stale viewport across a resize. When wide (≥1101px) it flips the
+  // persisted column pref; otherwise (the whole ≤1100px no-column band) it flips
+  // the ephemeral sheet flag — so the tablet-band ☰ opens the sheet, not a lie.
   const toggleOutline = useCallback(() => {
-    dispatch({ type: isMobileRef.current ? 'TOGGLE_CONV_OUTLINE_MOBILE' : 'TOGGLE_CONV_OUTLINE' });
+    dispatch({ type: isWideRef.current ? 'TOGGLE_CONV_OUTLINE' : 'TOGGLE_CONV_OUTLINE_MOBILE' });
   }, []);
 
   // #205 S2 (F3) — Find toggle, mirroring toggleOutline: one stable handler
@@ -1607,6 +1622,69 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
 
   return (
     <div className="conv-reader" tabIndex={-1}>
+      {isMobile ? (
+        // #228 S3 C2 — the two-row mobile header (≤640px only). Row 1: ← Back ·
+        // title · ⋯ overflow. Row 2 (slim): the compact Focus dropdown · 🔍 Find
+        // · ☰ Outline. The secondary actions (Export, Compare, Latest, bulk
+        // expand/collapse) + the completion/cost summaries fold into the ⋯ menu so
+        // reading starts in the top ~40% of the screen. Desktop/tablet keep the
+        // full inline header below — this branch is ≤640px ONLY.
+        <div className="conv-reader-head conv-reader-head--mobile">
+          <div className="conv-reader-row1">
+            {mobileBack && (
+              <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
+            )}
+            <div className="conv-reader-headmain">
+              <div className="conv-reader-title">{title || detail.session_id}</div>
+              <div className="conv-reader-meta">
+                {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {Array.from(new Set(detail.models.map(abbreviateModel))).join(', ')}
+              </div>
+            </div>
+            {/* #228 S3 C2 — the ⋯ overflow menu: Export, Compare with…, Latest ↓,
+                Expand-all, Collapse-all, plus the read-only completion + cost rows.
+                Built on the shared menu primitive (Escape-to-close, focus-return). */}
+            <ReaderOverflowMenu
+              sessionId={sessionId}
+              exportTitle={detail.title}
+              onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+              onLatest={detail.last_anchor ? () => { void jumpToLatest(); } : null}
+              latestBusy={jumpingLatest}
+              onExpandAll={() => sweepDetails(true)}
+              onCollapseAll={() => sweepDetails(false)}
+              completionTotal={outline?.task_completion?.all_done ? outline.task_completion.total : null}
+              costCumulative={cumCost.cost}
+              costTotal={detail.cost_usd}
+              costApprox={cumCost.approx}
+            />
+          </div>
+          <div className="conv-reader-row2">
+            {/* The 4-button focus segment collapses to one compact dropdown that
+                also absorbs the FocusMoreMenu sub-options (Edits/Bash/Subagents). */}
+            <FocusCompactMenu
+              focusMode={focusMode}
+              subagents={subagentOptions}
+              onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
+              errorCount={targetLists.error.length}
+            />
+            <button
+              type="button"
+              className="conv-find-toggle"
+              aria-pressed={convFindOpen}
+              aria-label="Find in conversation"
+              title="Find in conversation (/ or ⌘F / Ctrl+F)"
+              onClick={toggleFind}
+            ><SearchIcon /> Find</button>
+            <button
+              type="button"
+              className="conv-outline-toggle"
+              aria-pressed={effectiveOutlineOpen}
+              aria-label="Toggle session outline"
+              title="Toggle session outline (o)"
+              onClick={toggleOutline}
+            >☰ Outline</button>
+          </div>
+        </div>
+      ) : (
       <div className="conv-reader-head">
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
@@ -1617,7 +1695,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         <div className="conv-reader-headmain">
           <div className="conv-reader-title">{title || detail.session_id}</div>
           <div className="conv-reader-meta">
-            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {(isMobile ? Array.from(new Set(detail.models.map(abbreviateModel))) : detail.models).join(', ')}
+            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
           </div>
         </div>
         <div className="conv-reader-controls">
@@ -1744,9 +1822,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             title="Find in conversation (/ or ⌘F / Ctrl+F)"
             onClick={toggleFind}
           ><SearchIcon /> Find</button>
-          {/* outline toggle. Visible on desktop + mobile; aria-pressed reflects
-              the EFFECTIVE open flag (mobile sheet flag on mobile, persisted pref
-              on desktop). On mobile it opens the slide-over sheet (#205 S1). */}
+          {/* outline toggle. Visible on desktop + tablet; aria-pressed reflects
+              the EFFECTIVE open flag (sheet flag ≤1100px, persisted pref ≥1101px).
+              In the tablet band it opens the slide-over sheet (#228 S3 F1). */}
           <button
             type="button"
             className="conv-outline-toggle"
@@ -1757,6 +1835,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           >☰ Outline</button>
         </div>
       </div>
+      )}
       {/* #177 S6 — the floating in-conversation find bar. Absolutely
           positioned top-right inside the reader column (zero layout shift). The
           stepRef wires its cursor to the reader's n/N bindings. */}

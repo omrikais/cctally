@@ -7955,6 +7955,84 @@ mark.current {
   border-radius: 3px;
 }
 
+/* #228 S3 F1 — the outline slide-over SHEET spans the whole no-column band
+   (≤1100px), not just mobile (≤640px). ≤1100px the persistent column +
+   resizer are `display:none` (the @media (min-width:641px) and (max-width:1100px)
+   block above hides the column in the tablet band; the mobile block below drops
+   it ≤640px), so the column and the sheet never coexist. These sheet rules moved
+   up from the ≤640px block so the tablet-band ☰ opens a real sheet (F1). Each is
+   #root-prefixed + every property respelled per the id-selector specificity
+   floor. The ≤640px header-collapse / 44px-target rules stay at 640 (C2). */
+@media (max-width: 1100px) {
+  #root .conv-outline-backdrop {
+    position: fixed;
+    inset: 0;
+    /* #205 S1 (F2) — above the sticky .topbar (z-index 50) so the sheet + its
+       ✕ close are pointer-reachable, not buried under the topbar (QA #205 S1);
+       still below the app modals (z-index 100+). */
+    z-index: 60;
+    appearance: none;
+    border: none;
+    background: rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+  }
+  #root .conv-outline-sheet {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    /* #205 S1 (F2) — above the sticky .topbar (z-index 50); see backdrop note. */
+    z-index: 61;
+    width: min(86vw, 340px);
+    display: flex;
+    /* #205 S1 (F2) — stack a fixed titled header over the scrolling panel. */
+    flex-direction: column;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+    animation: conv-outline-slide-in 0.18s ease-out;
+  }
+  #root .conv-outline-sheet .conv-outline {
+    flex: 1 1 auto;
+    /* #205 S1 (F2) — let the panel shrink so its own scroll box (not the sheet)
+       absorbs overflow now that the header takes fixed height above it. */
+    min-height: 0;
+    border-radius: 0;
+    border: none;
+    border-left: 1px solid var(--border-soft);
+  }
+  /* #205 S1 (F2) — the outline slide-over gets a titled header with a visible ✕.
+     The sheet stacks this fixed header over the scrolling panel. */
+  #root .conv-outline-sheet-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 var(--space-2) 0 var(--space-4);
+    height: 46px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--panel-bg-2);
+  }
+  #root .conv-outline-sheet-title {
+    font-weight: 600;
+    color: var(--text);
+    font-size: 13px;
+  }
+  #root .conv-outline-close {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;   /* #205 S4 (F5) — was 38px; edit in place (a new earlier rule loses on source order) */
+    height: 44px;
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    background: var(--panel-bg);
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
+  }
+  #root .conv-outline-close:hover { color: var(--text); border-color: var(--accent-blue); }
+}
+
 /* ---- Mobile: single column, rail-OR-reader (DOM-swapped by the view
    shell). Every rule re-prefixed with `#root` to beat the desktop
    class-chain specificity floor (id-selector-specificity-floor gotcha);
@@ -8012,44 +8090,188 @@ mark.current {
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* #177 S5 — below the mobile breakpoint the outline never renders as a
-     column; it slides in over the reader as a sheet with a dimming backdrop.
-     Re-prefixed with #root + each property respelled per the id-selector
-     specificity gotcha. */
-  #root .conv-outline-backdrop {
-    position: fixed;
-    inset: 0;
-    /* #205 S1 (F2) — above the sticky .topbar (z-index 50) so the sheet + its
-       ✕ close are pointer-reachable, not buried under the topbar (QA #205 S1);
-       still below the app modals (z-index 100+). */
-    z-index: 60;
+  /* #228 S3 C2 — two-row mobile reader header. Row 1: ← Back · title · ⋯ (the
+     overflow menu). Row 2 (slim): the compact Focus dropdown · Find · Outline.
+     Reclaims the ~347px desktop toolbar height so reading starts in the top ~40%
+     of a phone screen. Desktop/tablet keep the full inline header (unchanged).
+     #root-prefixed + every property respelled per the id-selector specificity
+     floor. The 44px tap-target floors below still apply to row-2's controls. */
+  #root .conv-reader-head--mobile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    align-items: stretch;
+  }
+  #root .conv-reader-row1 {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+  /* The Back button shrinks to its content (not a full-width row) so it sits
+     inline with the title + ⋯ on row 1. Overrides the desktop full-row rule. */
+  #root .conv-reader-head--mobile .conv-back {
+    flex: 0 0 auto;
+    min-height: 44px;
+  }
+  /* The title/meta block grows to fill the gap between Back and ⋯. */
+  #root .conv-reader-head--mobile .conv-reader-headmain {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  /* The ⋯ overflow trigger pins to the right; the menu drops below it. */
+  #root .conv-overflow { flex: 0 0 auto; position: relative; }
+  #root .conv-overflow-toggle {
     appearance: none;
-    border: none;
-    background: rgba(0, 0, 0, 0.5);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    background: var(--panel-bg);
+    color: var(--text-dim);
+    font-size: 18px;
+    line-height: 1;
     cursor: pointer;
   }
-  #root .conv-outline-sheet {
-    position: fixed;
-    top: 0;
+  #root .conv-overflow-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+  #root .conv-overflow-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  /* The ⋯ dropdown: a right-aligned popover under the trigger. */
+  #root .conv-overflow-menu {
+    position: absolute;
+    top: calc(100% + 4px);
     right: 0;
-    bottom: 0;
-    /* #205 S1 (F2) — above the sticky .topbar (z-index 50); see backdrop note. */
-    z-index: 61;
-    width: min(86vw, 340px);
+    z-index: 40;
+    min-width: min(260px, 86vw);
     display: flex;
-    /* #205 S1 (F2) — stack a fixed titled header over the scrolling panel. */
     flex-direction: column;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
-    animation: conv-outline-slide-in 0.18s ease-out;
+    padding: var(--space-1);
+    background: var(--panel-bg-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   }
-  #root .conv-outline-sheet .conv-outline {
-    flex: 1 1 auto;
-    /* #205 S1 (F2) — let the panel shrink so its own scroll box (not the sheet)
-       absorbs overflow now that the header takes fixed height above it. */
-    min-height: 0;
-    border-radius: 0;
+  /* Read-only summary rows (completion / cost) at the top of the ⋯ menu. */
+  #root .conv-overflow-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-1) var(--space-2) var(--space-2);
+    border-bottom: 1px solid var(--border-soft);
+    margin-bottom: var(--space-1);
+  }
+  #root .conv-overflow-summary-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  #root .conv-overflow-summary-label { color: var(--text-faint); }
+  #root .conv-overflow-summary-value { color: var(--text); }
+  /* The embedded Export popover sits as a full-width row in the menu. */
+  #root .conv-overflow-export { padding: 0; }
+  #root .conv-overflow-export .conv-export { width: 100%; }
+  #root .conv-overflow-export .conv-export-toggle {
+    width: 100%;
+    justify-content: flex-start;
+    min-height: 44px;
+  }
+  /* The flat action menuitems. */
+  #root .conv-overflow-item {
+    appearance: none;
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 44px;
+    padding: var(--space-2) var(--space-2);
     border: none;
-    border-left: 1px solid var(--border-soft);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  #root .conv-overflow-item:hover { background: var(--panel-bg); }
+  #root .conv-overflow-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  #root .conv-overflow-item:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Row 2: the compact Focus dropdown grows; Find + Outline sit beside it. */
+  #root .conv-reader-row2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  #root .conv-focus-compact { flex: 1 1 auto; position: relative; min-width: 0; }
+  #root .conv-focus-compact-toggle {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    width: 100%;
+    min-height: 44px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    background: var(--panel-bg);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #root .conv-focus-compact-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+  #root .conv-focus-compact-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  #root .conv-focus-compact-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 40;
+    min-width: min(220px, 80vw);
+    display: flex;
+    flex-direction: column;
+    padding: var(--space-1);
+    background: var(--panel-bg-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  }
+  #root .conv-focus-compact-item {
+    appearance: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: 44px;
+    padding: var(--space-2);
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  #root .conv-focus-compact-item:hover { background: var(--panel-bg); }
+  #root .conv-focus-compact-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  #root .conv-focus-compact-item--on { color: var(--accent-blue); font-weight: 600; }
+  #root .conv-focus-compact-badge {
+    margin-left: auto;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: var(--accent-red);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  /* Row 2's Find + Outline share the remaining width as equal 44px controls. */
+  #root .conv-reader-row2 .conv-find-toggle,
+  #root .conv-reader-row2 .conv-outline-toggle {
+    flex: 0 0 auto;
+    min-height: 44px;
   }
   #root .conv-reader-thread {
     padding-left: 0;
@@ -8157,38 +8379,6 @@ mark.current {
   /* #217 S5 E4 — the focus "▾ More" menu controls honor the same floor. */
   #root .conv-focus-more-toggle { min-height: 44px; }
   #root .conv-focus-more-item { min-height: 44px; }
-  /* #205 S1 (F2) — the mobile outline slide-over gets a titled header with a
-     visible ✕. The sheet stacks this fixed header over the scrolling panel. */
-  #root .conv-outline-sheet-head {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 var(--space-2) 0 var(--space-4);
-    height: 46px;
-    border-bottom: 1px solid var(--border-soft);
-    background: var(--panel-bg-2);
-  }
-  #root .conv-outline-sheet-title {
-    font-weight: 600;
-    color: var(--text);
-    font-size: 13px;
-  }
-  #root .conv-outline-close {
-    appearance: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;   /* #205 S4 (F5) — was 38px; edit in place (a new earlier rule loses on source order) */
-    height: 44px;
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    background: var(--panel-bg);
-    color: var(--text-dim);
-    font-size: 16px;
-    cursor: pointer;
-  }
-  #root .conv-outline-close:hover { color: var(--text); border-color: var(--accent-blue); }
 
   /* #205 S4 (F5) — mobile touch-target sweep: raise every interactive control
      in the conversation viewer to a ≥44×44px effective hit area. Each rule is

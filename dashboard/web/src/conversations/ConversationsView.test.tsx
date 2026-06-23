@@ -31,8 +31,9 @@ import {
   _resetForTests as _resetKeymap,
 } from '../store/keymap';
 import { openPanelByPosition } from '../lib/openPanelByPosition';
-import { stubMobileMedia } from '../test-utils/mobileMedia';
+import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
+import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { Envelope, SessionRow } from '../types/envelope';
 
 // Mirror of main.tsx's view-aware global panel-digit binding. Registered
@@ -715,5 +716,77 @@ describe('Conversations workspace integration', () => {
     });
     await waitFor(() => expect(document.activeElement).toBe(trigger));
     expect(document.activeElement).not.toBe(document.body);
+  });
+});
+
+// #228 S3 F1 — the outline lives as a slide-over SHEET across the whole
+// no-column band (≤1100px, keyed on !useIsWide), not just on mobile (≤640px).
+// The persistent column + resizer render only when wide (≥1101px). These branch
+// tests model the THREE bands distinctly via the per-query matchMedia stub
+// (stubMobileMedia returns one value for all queries, so it can't express the
+// tablet band where useIsMobile=false but useIsWide=false too). The visual
+// sheet animation / first-paint is the ui-qa gate; here we pin the DOM branch.
+describe('Conversations outline sheet generalized to the tablet band (#228 S3 F1)', () => {
+  // Build a resolver for the three bands keyed on the project's two media
+  // queries. Tablet band: NOT mobile (≤640 false) AND NOT wide (≥1101 false).
+  function bandResolver(band: 'mobile' | 'tablet' | 'wide') {
+    return (q: string): boolean => {
+      if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
+      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+      return false;
+    };
+  }
+
+  it('renders the outline SHEET (not the column) in the 641–1100 tablet band', async () => {
+    stubResponsiveMedia(bandResolver('tablet'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
+    render(<App />);
+
+    // The slide-over sheet mounts (the tablet-band ☰ is now LIVE); the persistent
+    // outline column does NOT (it's the wide-only surface).
+    await waitFor(() => {
+      expect(document.querySelector('.conv-outline-sheet')).not.toBeNull();
+      expect(document.querySelector('.conv-outline-sheet .conv-outline')).not.toBeNull();
+    });
+    expect(document.querySelector('.conv-view--outline > .conv-outline')).toBeNull();
+    // It is NOT the mobile single-pane: the rail stays mounted beside the reader
+    // (the desktop two-pane shell), confirming the 640 vs 1100 split is distinct.
+    expect(document.querySelector('.conv-rail')).not.toBeNull();
+  });
+
+  it('renders the COLUMN (not the sheet) only when wide (≥1101px)', async () => {
+    stubResponsiveMedia(bandResolver('wide'));
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    _resetForTests();
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+
+    await waitFor(() => {
+      expect(document.querySelector('.conv-view--outline > .conv-outline')).not.toBeNull();
+    });
+    expect(document.querySelector('.conv-outline-sheet')).toBeNull();
+    localStorage.removeItem('cctally.conv.outlineOpen');
+  });
+
+  it('crossing from tablet (sheet open) into wide closes the sheet (no resurrect-on-resize)', async () => {
+    const ctl = stubResponsiveMedia(bandResolver('tablet'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
+    render(<App />);
+
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).not.toBeNull());
+    expect(getState().convOutlineMobileOpen).toBe(true);
+
+    // Resize the viewport up into the wide band: the rising edge of isWide must
+    // dispatch CLOSE_CONV_OUTLINE_MOBILE so the ephemeral sheet flag is cleared
+    // (it otherwise only resets on a conversation switch, so tablet→wide→tablet
+    // would resurrect it — Codex P3).
+    act(() => { ctl.set(bandResolver('wide')); });
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
   });
 });

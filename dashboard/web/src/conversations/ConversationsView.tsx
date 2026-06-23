@@ -1,8 +1,9 @@
-import { useSyncExternalStore } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useIsWide } from '../hooks/useIsWide';
 import { useConversationOutline } from '../hooks/useConversationOutline';
 import { useFindHotkey } from '../hooks/useFindHotkey';
 import { transcriptsEnabled } from '../lib/transcripts';
@@ -34,6 +35,19 @@ export function ConversationsView() {
   const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
   const env = useSnapshot();
   const isMobile = useIsMobile();
+  // #228 S3 F1 — the outline rides as a SHEET across the whole no-column band
+  // (≤1100px, keyed on !isWide), not just on mobile (≤640px). The persistent
+  // column + resizer render only when wide. Distinct from `isMobile` (the
+  // single-pane / 44px-target / two-row-header cutover) — see §8.
+  const isWide = useIsWide();
+  // #228 S3 F1 (Codex P3) — `convOutlineMobileOpen` is ephemeral but only resets
+  // on a conversation switch, so a tablet→wide→tablet resize would resurrect the
+  // sheet. Close it on the isWide rising edge (the column takes over when wide).
+  const prevWideRef = useRef(isWide);
+  useEffect(() => {
+    if (isWide && !prevWideRef.current) dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' });
+    prevWideRef.current = isWide;
+  }, [isWide]);
   // #177 S5 — full-session outline + stats for the selected conversation. The
   // hook owns its own SSE-tick revalidation; a null `selected` yields a null
   // outline. Shared with the reader (toggle button + scroll-sync registration in
@@ -79,12 +93,41 @@ export function ConversationsView() {
     );
   }
 
-  // Mobile: rail until a conversation is chosen, then reader (+ back). The
-  // outline rides as a slide-over SHEET (not a column) gated on the EPHEMERAL
+  // #228 S3 F1 — the outline slide-over SHEET, rendered whenever the persistent
+  // column is hidden (≤1100px = !isWide). Gated on the EPHEMERAL
   // convOutlineMobileOpen flag (#205 S1 — default closed, so it never
   // auto-buries the transcript), opened via the reader-head ☰ toggle. The sheet
   // carries a titled header with a visible ✕; both the ✕ and the backdrop
-  // dispatch CLOSE_CONV_OUTLINE_MOBILE to dismiss it.
+  // dispatch CLOSE_CONV_OUTLINE_MOBILE to dismiss it. Shared by the mobile
+  // single-pane branch AND the desktop two-pane branch below (the tablet band
+  // 641–1100 keeps the two-pane shell but gets the sheet, not the column).
+  const outlineSheet = (sid: string) => (
+    outlineMobileOpen && (
+      <>
+        <button
+          type="button"
+          className="conv-outline-backdrop"
+          aria-label="Dismiss outline (tap outside)"
+          onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
+        />
+        <div className="conv-outline-sheet">
+          <div className="conv-outline-sheet-head">
+            <span className="conv-outline-sheet-title">Outline</span>
+            <button
+              type="button"
+              className="conv-outline-close"
+              aria-label="Close outline"
+              onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
+            >✕</button>
+          </div>
+          <OutlinePanel sessionId={sid} outline={outline} />
+        </div>
+      </>
+    )
+  );
+
+  // Mobile: rail until a conversation is chosen, then reader (+ back) with the
+  // outline as the slide-over sheet (always a sheet ≤640px since !isWide holds).
   if (isMobile) {
     return (
       <div className="conv-view conv-view--mobile">
@@ -92,33 +135,15 @@ export function ConversationsView() {
           ? <ConversationRail />
           : <>
               <ConversationReader sessionId={selected} outline={outline} mobileBack />
-              {outlineMobileOpen && (
-                <>
-                  <button
-                    type="button"
-                    className="conv-outline-backdrop"
-                    aria-label="Dismiss outline (tap outside)"
-                    onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
-                  />
-                  <div className="conv-outline-sheet">
-                    <div className="conv-outline-sheet-head">
-                      <span className="conv-outline-sheet-title">Outline</span>
-                      <button
-                        type="button"
-                        className="conv-outline-close"
-                        aria-label="Close outline"
-                        onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
-                      >✕</button>
-                    </div>
-                    <OutlinePanel sessionId={selected} outline={outline} />
-                  </div>
-                </>
-              )}
+              {outlineSheet(selected)}
             </>}
       </div>
     );
   }
-  const outlineVisible = outlineOpen && selected != null;
+  // #228 S3 F1 — the persistent column shows ONLY when wide (≥1101px); ≤1100px
+  // the desktop two-pane shell keeps the rail + reader but the outline rides as
+  // the slide-over sheet (the tablet-band ☰ is now a live control, not a lie).
+  const outlineVisible = isWide && outlineOpen && selected != null;
   return (
     <div
       className={['conv-view', outlineVisible ? 'conv-view--outline' : ''].filter(Boolean).join(' ')}
@@ -143,6 +168,9 @@ export function ConversationsView() {
           <OutlinePanel sessionId={selected!} outline={outline} />
         </>
       )}
+      {/* #228 S3 F1 — the tablet-band (641–1100) outline sheet, rendered when the
+          column is hidden (!isWide) and a conversation is selected. */}
+      {!isWide && selected != null && outlineSheet(selected)}
     </div>
   );
 }

@@ -1,0 +1,228 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { nextRovingIndex } from './menuKeyboard';
+import { ExportMenu } from './ExportMenu';
+import { fmt } from '../lib/fmt';
+
+// #228 S3 C2 — the mobile (≤640px) reader-header "⋯" overflow menu. Collapses
+// the secondary reader actions — Export, Compare with…, Latest ↓, Expand-all,
+// Collapse-all — off the always-visible header so reading starts in the top ~40%
+// of a phone screen. Two read-only rows at the top surface the completion (✓ N)
+// and cumulative-cost summaries that lose their inline chips on mobile.
+//
+// Built on the SAME menu primitive as ExportMenu / FocusMoreMenu
+// (dashboard-gotchas): container-level Escape (onKeyDown on the role="menu" div,
+// NOT per-item), focus captured at open + restored to the trigger on close,
+// ≥44px touch targets (CSS), reduced-motion via CSS only. The action items are
+// role="menuitem" with a single roving tabindex (only the active item is
+// Tab-reachable); ArrowUp/Down wrap, Home/End jump, Escape closes. Index math is
+// the pure `nextRovingIndex` helper; this component owns the imperative
+// `.focus()`. Presentational — every action is a passed callback so the reader
+// owns the dispatch and the unit tests stay pure (modal-level integration test).
+//
+// Export is the one self-contained popover among the actions, so it rides inside
+// the menu as its own ExportMenu row (role="none") rather than a flat callback;
+// the four bulk/jump/compare actions are flat menuitems.
+
+export interface ReaderOverflowMenuProps {
+  // Export rides as the embedded ExportMenu (its own nested popover).
+  sessionId: string;
+  exportTitle?: string;
+  // Compare with… — enters rail pick-mode anchored on this session.
+  onCompare: () => void;
+  // Latest ↓ — reset to the tail + jump/flash the final turn. Hidden when null
+  // (a genuinely empty conversation, mirroring the desktop control's gate).
+  onLatest: (() => void) | null;
+  latestBusy?: boolean;
+  // Bulk disclosure sweeps (the S2 ] / [ keys surfaced as menu actions).
+  onExpandAll: () => void;
+  onCollapseAll: () => void;
+  // Read-only summary rows. `completionTotal` non-null → a "✓ N" row; cumulative
+  // cost shows when `costTotal > 0` ("$through / $total", with a ~ when approx).
+  completionTotal?: number | null;
+  costCumulative?: number;
+  costTotal?: number;
+  costApprox?: boolean;
+}
+
+export function ReaderOverflowMenu({
+  sessionId,
+  exportTitle,
+  onCompare,
+  onLatest,
+  latestBusy = false,
+  onExpandAll,
+  onCollapseAll,
+  completionTotal = null,
+  costCumulative = 0,
+  costTotal = 0,
+  costApprox = false,
+}: ReaderOverflowMenuProps) {
+  const [open, setOpen] = useState(false);
+  const restoreRef = useRef<Element | null>(null);
+
+  // The flat action menuitems, in render order (Export rides separately as its
+  // own popover row and is NOT in this roving set). `null` entries are filtered
+  // out (e.g. Latest when the conversation is empty), so the roving index always
+  // spans only the live items.
+  const actions = [
+    { key: 'compare', label: '⟷ Compare with…', run: onCompare },
+    onLatest ? { key: 'latest', label: `${latestBusy ? '… ' : ''}Latest ↓`, run: onLatest, busy: latestBusy } : null,
+    { key: 'expand', label: '⤢ Expand all', run: onExpandAll },
+    { key: 'collapse', label: '⤡ Collapse all', run: onCollapseAll },
+  ].filter(Boolean) as { key: string; label: string; run: () => void; busy?: boolean }[];
+  const itemCount = actions.length;
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const activeIndexRef = useRef(0);
+  const setActive = useCallback((i: number) => {
+    activeIndexRef.current = i;
+    setActiveIndex(i);
+  }, []);
+
+  // The reader is not keyed by session, so an open menu would otherwise persist
+  // across a session switch; close it when the conversation changes (mirrors
+  // ExportMenu).
+  useEffect(() => {
+    setOpen(false);
+  }, [sessionId]);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    const el = restoreRef.current;
+    if (el instanceof HTMLElement) el.focus();
+  }, []);
+
+  const openAt = useCallback(
+    (index: number) => {
+      restoreRef.current = document.activeElement;
+      setActive(index);
+      setOpen(true);
+    },
+    [setActive],
+  );
+
+  const toggle = useCallback(() => {
+    if (open) setOpen(false);
+    else openAt(0);
+  }, [open, openAt]);
+
+  // On open, move focus to the active menuitem. Reads the index via ref so the
+  // effect depends only on `open`.
+  useEffect(() => {
+    if (open) itemRefs.current[activeIndexRef.current]?.focus();
+  }, [open]);
+
+  const onMenuKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        close();
+        return;
+      }
+      const ni = nextRovingIndex(e.key, activeIndexRef.current, itemCount);
+      if (ni !== null) {
+        e.preventDefault();
+        setActive(ni);
+        itemRefs.current[ni]?.focus();
+      }
+    },
+    [close, itemCount, setActive],
+  );
+
+  const onTriggerKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        openAt(0);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        openAt(itemCount - 1);
+      }
+    },
+    [openAt, itemCount],
+  );
+
+  const pick = useCallback(
+    (run: () => void) => {
+      run();
+      close();
+    },
+    [close],
+  );
+
+  const showCost = costTotal > 0;
+  const showCompletion = completionTotal != null;
+
+  return (
+    <div
+      className="conv-overflow"
+      onBlur={(e) => {
+        // Outside-click / focus-out close: if focus leaves the container, close.
+        // The embedded ExportMenu lives inside this container, so opening it does
+        // not blur us out (its own focus stays within currentTarget).
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+      }}
+    >
+      <button
+        type="button"
+        className="conv-overflow-toggle"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="More actions"
+        title="More actions"
+        onClick={toggle}
+        onKeyDown={onTriggerKeyDown}
+      >
+        ⋯
+      </button>
+      {open && (
+        <div
+          className="conv-overflow-menu"
+          role="menu"
+          aria-label="More actions"
+          tabIndex={-1}
+          onKeyDown={onMenuKeyDown}
+        >
+          {(showCompletion || showCost) && (
+            <div className="conv-overflow-summary" role="none">
+              {showCompletion && (
+                <div className="conv-overflow-summary-row" role="none">
+                  <span className="conv-overflow-summary-label">Completion</span>
+                  <span className="conv-overflow-summary-value">✓ {completionTotal}</span>
+                </div>
+              )}
+              {showCost && (
+                <div className="conv-overflow-summary-row" role="none">
+                  <span className="conv-overflow-summary-label">Cost</span>
+                  <span className="conv-overflow-summary-value">
+                    {costApprox ? '~' : ''}{fmt.usd2(costCumulative)} / {fmt.usd2(costTotal)}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+          {/* Export is its own nested popover — rides as a row, not a menuitem. */}
+          <div className="conv-overflow-export" role="none">
+            <ExportMenu sessionId={sessionId} title={exportTitle} />
+          </div>
+          {actions.map((a, i) => (
+            <button
+              key={a.key}
+              type="button"
+              role="menuitem"
+              tabIndex={i === activeIndex ? 0 : -1}
+              ref={(el) => {
+                itemRefs.current[i] = el;
+              }}
+              className="conv-overflow-item"
+              disabled={a.busy}
+              onClick={() => pick(a.run)}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
