@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState } from 'react';
 import { MessageItem } from './MessageItem';
+import { sidechainIndentClass } from './sidechainIndent';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
@@ -84,7 +85,6 @@ export interface SidechainChildContext {
 export function SidechainGroup({
   subagentKey,
   items,
-  nested,
   meta,
   getItemRef,
   rootUuid,
@@ -100,7 +100,6 @@ export function SidechainGroup({
 }: {
   subagentKey: string;
   items: ConversationItem[];
-  nested: boolean;
   // #166: the subagent's kind + result meta, keyed off subagent_key by the
   // reader. Absent on old transcripts → the card degrades to title-only.
   meta?: SubagentMeta;
@@ -205,7 +204,6 @@ export function SidechainGroup({
       key={`sc-${child.subagentKey}`}
       subagentKey={child.subagentKey}
       items={child.items}
-      nested={child.nested}
       meta={childCtx?.subagentMeta?.[child.subagentKey]}
       getItemRef={childCtx?.getItemRef}
       rootUuid={child.items[0]?.anchor.uuid}
@@ -228,10 +226,13 @@ export function SidechainGroup({
       data-uuid={rootUuid}
       ref={rootUuid != null && getCardRef ? getCardRef(rootUuid) : undefined}
       className={[
-        nested ? 'conv-sidechain conv-sidechain--nested' : 'conv-sidechain',
-        // §5 — deeper than the first nesting level adds a depth-keyed indent
-        // class (depth 2+). depth 1 is the existing conv-sidechain--nested.
-        depth >= 2 ? `conv-sidechain--depth-${depth}` : '',
+        'conv-sidechain',
+        // #228 S2 (A2) — VISUAL hierarchy keys on `depth`, not the `nested`
+        // boolean: depth-0 agents (main-spawned OR orphan) stay on the main
+        // spine with the magenta dot + a stronger card and NO indent; only
+        // depth >= 1 (true agent-in-agent nesting) gets the indent marker. The
+        // indent magnitude is a single CSS rule reading the inline --sc-depth.
+        sidechainIndentClass(depth),
         // G1 §4a: while a #160 jump force-opens this thread, snap it open
         // instantly (CSS `transition: none`) so layout is final before
         // scrollIntoView lands. The class drops when the force releases, so
@@ -239,7 +240,7 @@ export function SidechainGroup({
         forceOpen ? 'conv-sidechain--force' : '',
         riseClassName,
       ].filter(Boolean).join(' ')}
-      style={riseStyle}
+      style={depth >= 1 ? { ...riseStyle, ['--sc-depth' as string]: depth } as React.CSSProperties : riseStyle}
       open={open}
       onToggle={(e) => {
         const isOpen = (e.currentTarget as HTMLDetailsElement).open;

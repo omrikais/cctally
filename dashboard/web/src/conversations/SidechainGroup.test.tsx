@@ -60,7 +60,7 @@ describe('SidechainGroup', () => {
       member('s1', { kind: 'assistant', text: 'Audit module A', cost_usd: 0.30 } as Partial<ConversationItem>),
       member('s2', { kind: 'assistant', text: '', cost_usd: 0.12 } as Partial<ConversationItem>),
     ];
-    const { container } = render(<SidechainGroup subagentKey="k1" items={items} nested={false} />);
+    const { container } = render(<SidechainGroup subagentKey="k1" items={items} />);
     const details = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     expect(details).not.toBeNull();
     expect(details.open).toBe(false);
@@ -71,13 +71,22 @@ describe('SidechainGroup', () => {
     expect(summary).toContain('$0.42');           // 0.30 + 0.12
   });
 
-  it('applies the nested class when nested', () => {
-    const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1')]} nested={true} />);
-    expect(container.querySelector('details.conv-sidechain')!.classList.contains('conv-sidechain--nested')).toBe(true);
+  it('keeps a depth-0 card OFF the indent ladder (no --nested), even when placed under a main turn', () => {
+    // depth stays 0 even for a main-spawned agent (where:'main'); only true
+    // agent-in-agent nesting (depth >= 1) indents.
+    const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1')]} depth={0} />);
+    expect(container.querySelector('details.conv-sidechain')!.classList.contains('conv-sidechain--nested')).toBe(false);
+  });
+
+  it('applies the --nested indent class and sets --sc-depth at depth >= 1 (true nesting)', () => {
+    const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1')]} depth={2} />);
+    const details = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(details.classList.contains('conv-sidechain--nested')).toBe(true);
+    expect(details.style.getPropertyValue('--sc-depth')).toBe('2');
   });
 
   it('renders each member as a MessageItem in the body', () => {
-    const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1'), member('s2')]} nested={false} />);
+    const { container } = render(<SidechainGroup subagentKey="k1" items={[member('s1'), member('s2')]} />);
     expect(container.querySelectorAll('.conv-sidechain-body .conv-item')).toHaveLength(2);
     expect(container.querySelector('[data-uuid="s1"]')).not.toBeNull();
   });
@@ -87,7 +96,7 @@ describe('SidechainGroup', () => {
       member('r', { kind: 'assistant', text: 'Audit module A', model: 'claude-opus-4', cost_usd: 0.30 } as Partial<ConversationItem>),
       member('s2', { kind: 'assistant', text: '', model: 'claude-opus-4', cost_usd: 0.12 } as Partial<ConversationItem>),
     ];
-    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false} />);
+    render(<SidechainGroup subagentKey="aaaa1111" items={items} />);
     // The eyebrow leads with the static "Subagent" word (Q1). With no meta it
     // is the whole eyebrow text (no kindname child). Class-based, not getByText,
     // since the kind span becomes a child when meta is present.
@@ -103,7 +112,7 @@ describe('SidechainGroup', () => {
 
   it('renders the kind in the eyebrow when meta.kind is present', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module A', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false}
+    render(<SidechainGroup subagentKey="aaaa1111" items={items}
              meta={{ kind: 'Explore', total_tokens: 23285, total_duration_ms: 10668,
                      total_tool_use_count: 1, status: 'completed' }} />);
     expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore');
@@ -111,7 +120,7 @@ describe('SidechainGroup', () => {
 
   it('renders the toolUseResult meta line', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module A', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="aaaa1111" items={items} nested={false}
+    render(<SidechainGroup subagentKey="aaaa1111" items={items}
              meta={{ kind: 'Explore', total_tokens: 23285, total_duration_ms: 10668,
                      total_tool_use_count: 1, status: 'completed' }} />);
     const sub = document.querySelector('.conv-sidechain-submeta')!;
@@ -123,7 +132,7 @@ describe('SidechainGroup', () => {
 
   it('spells out a failure status with the error class', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module B', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="bbbb2222" items={items} nested={false}
+    render(<SidechainGroup subagentKey="bbbb2222" items={items}
              meta={{ kind: 'code-reviewer', status: 'error' }} />);
     const err = document.querySelector('.conv-subagent-err')!;
     expect(err.textContent).toContain('error');
@@ -131,7 +140,7 @@ describe('SidechainGroup', () => {
 
   it('spells out a non-completed terminal status (⚠ <status>) with the warn class', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module D', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="dddd4444" items={items} nested={false}
+    render(<SidechainGroup subagentKey="dddd4444" items={items}
              meta={{ kind: 'Explore', status: 'aborted' }} />);
     const warn = document.querySelector('.conv-subagent-warn')!;
     expect(warn.textContent).toContain('aborted');
@@ -140,7 +149,7 @@ describe('SidechainGroup', () => {
 
   it('renders the kind eyebrow but no submeta line when only kind is present (no-blank-line guard)', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module E', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="eeee5555" items={items} nested={false}
+    render(<SidechainGroup subagentKey="eeee5555" items={items}
              meta={{ kind: 'Explore' }} />);
     expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore');
     expect(document.querySelector('.conv-sidechain-submeta')).toBeNull();
@@ -148,7 +157,7 @@ describe('SidechainGroup', () => {
 
   it('falls back to title-only when meta is absent (no kind, no submeta line)', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module C', cost_usd: 0.30 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="cccc3333" items={items} nested={false} />);
+    render(<SidechainGroup subagentKey="cccc3333" items={items} />);
     expect(document.querySelector('.conv-sidechain-kindname')).toBeNull();
     expect(document.querySelector('.conv-sidechain-submeta')).toBeNull();
     expect(document.querySelector('.conv-sidechain-kind')!.textContent).toBe('Subagent');
@@ -156,10 +165,10 @@ describe('SidechainGroup', () => {
 
   it('pluralizes the tool count (0 tools / 2 tools)', () => {
     const items = [member('r', { kind: 'assistant', text: 'x', cost_usd: 0 } as Partial<ConversationItem>)];
-    const { rerender } = render(<SidechainGroup subagentKey="k" items={items} nested={false}
+    const { rerender } = render(<SidechainGroup subagentKey="k" items={items}
              meta={{ kind: 'Explore', total_tool_use_count: 0 }} />);
     expect(document.querySelector('.conv-sidechain-submeta')!.textContent).toContain('0 tools');
-    rerender(<SidechainGroup subagentKey="k" items={items} nested={false}
+    rerender(<SidechainGroup subagentKey="k" items={items}
              meta={{ kind: 'Explore', total_tool_use_count: 2 }} />);
     expect(document.querySelector('.conv-sidechain-submeta')!.textContent).toContain('2 tools');
   });
@@ -167,11 +176,11 @@ describe('SidechainGroup', () => {
   it('applies conv-sidechain--force only while forceOpen (G1 §4a #160 instant-open)', () => {
     const items = [member('s1'), member('s2')];
     const { container, rerender } = render(
-      <SidechainGroup subagentKey="k1" items={items} nested={false} forceOpen={false} />,
+      <SidechainGroup subagentKey="k1" items={items} forceOpen={false} />,
     );
     const details = container.querySelector('details.conv-sidechain')!;
     expect(details).not.toHaveClass('conv-sidechain--force');
-    rerender(<SidechainGroup subagentKey="k1" items={items} nested={false} forceOpen={true} />);
+    rerender(<SidechainGroup subagentKey="k1" items={items} forceOpen={true} />);
     expect(details).toHaveClass('conv-sidechain--force');
   });
 
@@ -188,7 +197,7 @@ describe('SidechainGroup', () => {
     };
     const items = [member('root', { kind: 'assistant', text: 'task' } as Partial<ConversationItem>), member('s2')];
     const { container } = render(
-      <SidechainGroup subagentKey="k1" items={items} nested={false} rootUuid="root" getCardRef={getCardRef} />,
+      <SidechainGroup subagentKey="k1" items={items} rootUuid="root" getCardRef={getCardRef} />,
     );
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     expect(det.open).toBe(false);                 // collapsed
@@ -205,7 +214,7 @@ describe('SidechainGroup', () => {
       else cardRefs.delete(rootUuid);
     };
     const items = [member('root'), member('s2')];
-    const base = { subagentKey: 'k1', items, nested: false, rootUuid: 'root', getCardRef };
+    const base = { subagentKey: 'k1', items, rootUuid: 'root', getCardRef };
     const { container, rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     expect(cardRefs.get('root')).toBe(det);
@@ -222,7 +231,7 @@ describe('SidechainGroup', () => {
     const onOpenChange = vi.fn();
     const items = [member('s1'), member('s2')];
     const { container } = render(
-      <SidechainGroup subagentKey="k1" items={items} nested={false} onOpenChange={onOpenChange} />,
+      <SidechainGroup subagentKey="k1" items={items} onOpenChange={onOpenChange} />,
     );
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     // jsdom doesn't fire `toggle` from a property set; simulate the user opening
@@ -240,7 +249,7 @@ describe('SidechainGroup', () => {
   it('fires onOpenChange(subagentKey, true) when a force-open latches', () => {
     const onOpenChange = vi.fn();
     const items = [member('s1'), member('s2')];
-    const base = { subagentKey: 'k1', items, nested: false, onOpenChange };
+    const base = { subagentKey: 'k1', items, onOpenChange };
     const { rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
     expect(onOpenChange).not.toHaveBeenCalled();
     // Force the thread open: the latch effect must report the key as open so the
@@ -258,7 +267,7 @@ describe('SidechainGroup', () => {
       }
     };
     const items = [member('s1'), member('s2')];
-    const base = { subagentKey: 'k1', items, nested: false, getItemRef };
+    const base = { subagentKey: 'k1', items, getItemRef };
 
     const { container, rerender } = render(<SidechainGroup {...base} forceOpen={false} />);
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
@@ -297,7 +306,6 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
       <SidechainGroup
         subagentKey="cc110001"
         items={childItems}
-        nested={true}
         meta={{ kind: 'code-reviewer', description: 'Sync audit' }}
         forceOpen={true}                       // open so the body (and child) render
         children={[grandchild]}
@@ -325,7 +333,7 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
   it('does NOT render nested children while the parent thread is collapsed', () => {
     const childItems = [member('c1', { kind: 'assistant', text: 'Sync audit', cost_usd: 0.3 } as Partial<ConversationItem>)];
     const { container } = render(
-      <SidechainGroup subagentKey="cc110001" items={childItems} nested={true}
+      <SidechainGroup subagentKey="cc110001" items={childItems}
         forceOpen={false} children={[grandchild]} depth={0} childCtx={{}} />,
     );
     // Collapsed parent → exactly one card (no grandchild rendered yet).
@@ -335,7 +343,7 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
 
   it('renders the "~" derived-totals affordance when meta.totals_derived is true', () => {
     const items = [member('r', { kind: 'assistant', text: 'Background audit', cost_usd: 0.1 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="a55c0003" items={items} nested={false}
+    render(<SidechainGroup subagentKey="a55c0003" items={items}
       meta={{ kind: 'Explore', total_tokens: 2300, total_duration_ms: 4000,
               total_tool_use_count: 1, status: 'completed', totals_derived: true }} />);
     const sub = document.querySelector('.conv-sidechain-submeta')!;
@@ -347,7 +355,7 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
 
   it('omits the "~" affordance when totals are authoritative (no totals_derived)', () => {
     const items = [member('r', { kind: 'assistant', text: 'Sync audit', cost_usd: 0.1 } as Partial<ConversationItem>)];
-    render(<SidechainGroup subagentKey="cc110001" items={items} nested={false}
+    render(<SidechainGroup subagentKey="cc110001" items={items}
       meta={{ kind: 'code-reviewer', total_tokens: 12000, status: 'completed' }} />);
     expect(document.querySelector('.conv-sidechain-submeta .conv-sidechain-derived')).toBeNull();
   });
@@ -359,7 +367,7 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
     };
     const childItems = [member('c1', { kind: 'assistant', text: 'Parent', cost_usd: 0 } as Partial<ConversationItem>)];
     const { container } = render(
-      <SidechainGroup subagentKey="par" items={childItems} nested={false}
+      <SidechainGroup subagentKey="par" items={childItems}
         forceOpen={true} children={[orphanChild]} depth={0}
         childCtx={{ forcedOpenKeys: new Set() }} />,
     );
@@ -371,7 +379,7 @@ describe('SidechainGroup — recursive nesting (§5)', () => {
 describe('SidechainGroup header (#193)', () => {
   it('shows meta.description as the title when present', () => {
     const items = [member('u1', { kind: 'human', text: 'long raw prompt blob...' })];
-    render(<SidechainGroup subagentKey="abc" items={items} nested={false}
+    render(<SidechainGroup subagentKey="abc" items={items}
       meta={{ kind: 'general-purpose', description: 'Code review Phase A' }} />);
     expect(screen.getByText('Code review Phase A')).toBeTruthy();
     // The first-prompt label must NOT win when a description is present.
@@ -380,7 +388,7 @@ describe('SidechainGroup header (#193)', () => {
 
   it('falls back to the first-prompt label when no description', () => {
     const items = [member('u1', { kind: 'human', text: 'Do the analysis' })];
-    render(<SidechainGroup subagentKey="abc" items={items} nested={false}
+    render(<SidechainGroup subagentKey="abc" items={items}
       meta={{ kind: 'general-purpose' }} />);
     // "Do the analysis" also appears in the rendered member body, so scope to
     // the title span — the label fallback must still drive the header title.
@@ -411,7 +419,7 @@ describe('SidechainGroup mobile model abbreviation (#205 S3 F7)', () => {
   ];
 
   it('abbreviates + de-duplicates the model list when isMobile', () => {
-    const { container } = render(<SidechainGroup subagentKey="k1" items={items} nested={false} isMobile />);
+    const { container } = render(<SidechainGroup subagentKey="k1" items={items} isMobile />);
     const model = container.querySelector('.conv-sidechain-model')!.textContent!;
     expect(model).toBe('opus-4-8');                 // both collapse to one
     expect(model).not.toContain('claude-');
@@ -419,7 +427,7 @@ describe('SidechainGroup mobile model abbreviation (#205 S3 F7)', () => {
   });
 
   it('renders the full ids on desktop (isMobile false)', () => {
-    const { container } = render(<SidechainGroup subagentKey="k1" items={items} nested={false} isMobile={false} />);
+    const { container } = render(<SidechainGroup subagentKey="k1" items={items} isMobile={false} />);
     const model = container.querySelector('.conv-sidechain-model')!.textContent!;
     expect(model).toContain('claude-opus-4-8-20251101');
     expect(model).toContain('claude-opus-4-8');
@@ -428,7 +436,7 @@ describe('SidechainGroup mobile model abbreviation (#205 S3 F7)', () => {
   it('shows >60 chars of a no-meta fallback title on mobile (MOBILE_LABEL_MAX path)', () => {
     const long = 'Implement the conversation reader find bar and wire up the n and N step bindings cleanly';
     const longItems = [member('r', { kind: 'assistant', text: long, cost_usd: 0 } as Partial<ConversationItem>)];
-    const { container } = render(<SidechainGroup subagentKey="k1" items={longItems} nested={false} isMobile />);
+    const { container } = render(<SidechainGroup subagentKey="k1" items={longItems} isMobile />);
     const title = container.querySelector('.conv-sidechain-title')!.textContent!;
     expect(title.length).toBeGreaterThan(61); // desktop would cap at 60 + ellipsis
   });

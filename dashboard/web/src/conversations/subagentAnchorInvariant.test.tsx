@@ -88,7 +88,7 @@ describe('subagent anchor invariant (meta-first sidechain, #188 S3/C3)', () => {
     //    as ConversationReader does: `rootUuid={g.items[0].anchor.uuid}`.
     const g = group as Extract<RenderNode, { kind: 'subagent' }>;
     const { container } = render(
-      <SidechainGroup subagentKey={g.subagentKey} items={g.items} nested={g.nested} rootUuid={groupRoot} />,
+      <SidechainGroup subagentKey={g.subagentKey} items={g.items} rootUuid={groupRoot} />,
     );
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     const cardDataUuid = det.getAttribute('data-uuid');

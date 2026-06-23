@@ -84,6 +84,16 @@
      scroll-container rows, full-width comparison rows, tightly-clipped chips (#229). */
   --focus-ring: 0 0 0 2px var(--accent-blue);
   --focus-ring-inset: inset 0 0 0 2px var(--accent-blue);
+
+  /* #228 S2 — subagent thread tokens. --sc-indent-base/-step drive the nested
+     indent ladder via the inline --sc-depth custom property (handles arbitrary
+     depth in one rule). --sc-body-wash / --sc-head-bg are SOLID composites
+     (color-mix, no alpha) so the role-dot knockout ring can reuse the wash
+     colour exactly. */
+  --sc-indent-base: 22px;
+  --sc-indent-step: 16px;   /* = --space-4 */
+  --sc-body-wash: color-mix(in srgb, var(--panel-bg) 92%, var(--accent-magenta));
+  --sc-head-bg:   color-mix(in srgb, var(--panel-bg) 86%, var(--accent-magenta));
 }
 
 /* Apply to every panel so scroll anchoring lands the title below the
@@ -7576,6 +7586,14 @@ mark.current {
   border-radius: 10px;
   background: linear-gradient(180deg, rgba(217,70,239,0.05), transparent 42%);
 }
+/* #228 S2 (A2) — depth-0 agents sit on the main spine: a stronger card so an
+   agent reads as a first-class branch. The direct-child selector matches ONLY
+   depth-0 cards (depth >= 1 cards render inside a parent's body, never as a
+   direct .conv-reader-thread child), so nested cards keep the lighter base. */
+.conv-reader-thread > .conv-sidechain {
+  border-color: rgba(217, 70, 239, 0.40);
+  box-shadow: 0 1px 0 rgba(217, 70, 239, 0.10), 0 10px 26px -18px rgba(217, 70, 239, 0.55);
+}
 /* outer spine dot — reuses the Session-1 role-dot idiom, magenta */
 .conv-reader-thread > .conv-sidechain::before {
   content: "";
@@ -7586,8 +7604,6 @@ mark.current {
   background: var(--accent-magenta);
   box-shadow: 0 0 0 3px var(--panel-bg);
 }
-/* nested cards are indented under a parent → off the main spine; no dot */
-.conv-reader-thread > .conv-sidechain--nested::before { display: none; }
 
 .conv-sidechain-head {
   display: flex;
@@ -7688,13 +7704,13 @@ mark.current {
 }
 .conv-sidechain-body > .conv-item--human::before { background: var(--accent-blue); }
 .conv-sidechain-body > .conv-item--assistant::before { background: var(--accent-purple); }
-.conv-sidechain--nested { margin-left: 20px; }
-/* §5 — deeper recursive nesting (grandchild and below) keeps stepping the
-   indent so the tree depth reads at a glance. A nested card already lives inside
-   its parent's indented body, so this is an ADDITIONAL step per level. */
-.conv-sidechain--depth-2 { margin-left: 20px; }
-.conv-sidechain--depth-3 { margin-left: 28px; }
-.conv-sidechain--depth-4 { margin-left: 36px; }
+/* #228 S2 (A2) — true agent-in-agent nesting (depth >= 1) indents progressively.
+   The magnitude reads the inline --sc-depth the component sets, so any depth
+   works in one rule (the old --depth-2..4 ladder collided at 20px and capped at
+   4). Mirrors the outline panel's --conv-outline-depth calc idiom. */
+.conv-sidechain--nested {
+  margin-left: calc(var(--sc-indent-base) + (var(--sc-depth, 1) - 1) * var(--sc-indent-step));
+}
 
 /* ---- Markdown prose ----------------------------------------------- */
 .md {

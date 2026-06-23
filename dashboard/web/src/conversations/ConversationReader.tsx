@@ -1801,7 +1801,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   key={`sc-${g.subagentKey}`}
                   subagentKey={g.subagentKey}
                   items={g.items}
-                  nested={g.nested}
                   meta={detail.subagent_meta?.[g.subagentKey]}
                   getItemRef={getItemRef}
                   // #188 S3/B6 — the bucket-root uuid (the same value the
