@@ -5083,7 +5083,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 12.5px;
   font-weight: 600;
-  padding: 4px 12px;
+  padding: var(--space-1) var(--space-3);
   border-radius: 4px;
   cursor: pointer;
   white-space: nowrap;
@@ -5129,12 +5129,12 @@ mark.current {
 .conv-view {
   display: grid;
   grid-template-columns: minmax(280px, 340px) 1fr;
-  gap: 12px;
+  gap: var(--space-3);
   /* Fill the viewport below the sticky topbar; the panes scroll, the
      shell itself does not (overflow hidden clips the rounded corners). */
   height: calc(100vh - var(--topbar-h) - 28px);
   overflow: hidden;
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
 }
 /* #177 S5 §3 — when the outline panel is open, the two-column grid grows a
    resize divider + a third column on the reader's right. Closed → back to two
@@ -5224,7 +5224,7 @@ mark.current {
    stat tiles + labeled distribution rows + the in-card "Jump to" chip row. */
 .conv-outline-stats {
   flex: 0 0 auto;
-  padding: 12px 14px;
+  padding: var(--space-3) 14px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-bg-2);
   font-family: var(--font-mono);
@@ -5242,13 +5242,13 @@ mark.current {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 6px;
-  margin-bottom: 8px;
+  margin-bottom: var(--space-2);
 }
 .conv-outline-stat-tile {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 6px 8px;
+  padding: 6px var(--space-2);
   border: 1px solid var(--border-soft);
   border-radius: 5px;
   background: var(--panel-bg);
@@ -5307,14 +5307,14 @@ mark.current {
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-glyph,
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-value { color: var(--accent-amber); }
 /* #217 S6 F3 — outline per-rebuild jump list (expands the scalar Cache stat). */
-.conv-outline-rebuilds { margin-top: 4px; padding-inline-start: 4px; }
+.conv-outline-rebuilds { margin-top: var(--space-1); padding-inline-start: 4px; }
 .conv-rebuild-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.conv-rebuild-jump { display: flex; gap: 8px; align-items: baseline; width: 100%; min-height: 28px; padding: 4px 6px; background: none; border: 0; color: var(--text); text-align: start; cursor: pointer; font-variant-numeric: tabular-nums; }
+.conv-rebuild-jump { display: flex; gap: var(--space-2); align-items: baseline; width: 100%; min-height: 28px; padding: var(--space-1) 6px; background: none; border: 0; color: var(--text); text-align: start; cursor: pointer; font-variant-numeric: tabular-nums; }
 .conv-rebuild-jump:hover { background: var(--panel-bg-2); }
 .conv-rebuild-jump .rb-cost { color: var(--accent-amber); }
 .conv-rebuild-jump .rb-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
 .conv-rebuild-jump .rb-sub { color: var(--accent-blue); }
-.conv-rebuild-more { background: none; border: 0; color: var(--accent-blue); cursor: pointer; padding: 4px 6px; min-height: 28px; }
+.conv-rebuild-more { background: none; border: 0; color: var(--accent-blue); cursor: pointer; padding: var(--space-1) 6px; min-height: 28px; }
 /* Navigable landmark list. */
 .conv-outline-list {
   flex: 1 1 auto;
@@ -5431,7 +5431,7 @@ mark.current {
 .conv-outline-tabs {
   flex: 0 0 auto;
   display: flex;
-  gap: 4px;
+  gap: var(--space-1);
   padding: 6px 6px 0;
 }
 .conv-outline-tab {
@@ -5444,7 +5444,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 10px;
+  padding: var(--space-1) 10px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5530,7 +5530,7 @@ mark.current {
 }
 .conv-files-touches {
   list-style: none;
-  margin: 2px 0 4px;
+  margin: 2px 0 var(--space-1);
   padding: 0 0 0 19px;
 }
 .conv-files-touches li { margin: 0; padding: 0; }
@@ -5547,7 +5547,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
   border-radius: 4px;
-  padding: 4px 7px;
+  padding: var(--space-1) 7px;
   cursor: pointer;
 }
 .conv-files-touch:hover { background: var(--panel-bg-2); color: var(--text); }
@@ -5565,7 +5565,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5585,7 +5585,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5606,7 +5606,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5626,7 +5626,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5662,7 +5662,7 @@ mark.current {
   grid-template-columns: 1fr auto auto;
   align-items: center;
   gap: 6px;
-  padding: 2px 4px;
+  padding: 2px var(--space-1);
 }
 .conv-export-row-label {
   font-family: var(--font-mono);
@@ -5677,7 +5677,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   border-radius: 4px;
   cursor: pointer;
 }
@@ -5701,7 +5701,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
   white-space: nowrap;
@@ -5727,7 +5727,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -5746,7 +5746,7 @@ mark.current {
   place-items: center;
   min-width: 15px;
   height: 15px;
-  padding: 0 4px;
+  padding: 0 var(--space-1);
   border-radius: 8px;
   background: var(--accent-red);
   color: #fff;
@@ -5763,7 +5763,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -5802,7 +5802,7 @@ mark.current {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
   text-align: left;
   border: 1px solid transparent;
@@ -5810,7 +5810,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 5px 8px;
+  padding: 5px var(--space-2);
   border-radius: 4px;
   cursor: pointer;
 }
@@ -5874,7 +5874,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   border-radius: 5px;
   cursor: pointer;
   display: inline-flex;
@@ -5975,21 +5975,21 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 11px;
   border-radius: 5px;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   cursor: pointer;
 }
 .conv-rail-empty-clear:hover { border-color: var(--accent-blue); }
 /* #205 S3 (F8) — retry affordance in the browse-list error state. */
 .conv-rail-retry {
   display: inline-block;
-  margin-top: 8px;
+  margin-top: var(--space-2);
   appearance: none;
   border: 1px solid var(--border-soft);
   background: var(--panel-bg);
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 4px 12px;
+  padding: var(--space-1) var(--space-3);
   border-radius: 5px;
   cursor: pointer;
 }
@@ -6004,8 +6004,8 @@ mark.current {
   color: var(--text);
   font-family: var(--font-mono);
   border-radius: 5px;
-  padding: 8px 9px;
-  margin-bottom: 4px;
+  padding: var(--space-2) 9px;
+  margin-bottom: var(--space-1);
   cursor: pointer;
 }
 .conv-rail-row:hover { background: var(--panel-bg-2); }
@@ -6023,7 +6023,7 @@ mark.current {
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-faint);
-  padding: 12px 8px 4px;
+  padding: var(--space-3) var(--space-2) var(--space-1);
 }
 .conv-rail-row-title {
   font-family: var(--font-prose);
@@ -6051,13 +6051,13 @@ mark.current {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 4px 8px;
+  gap: var(--space-1) var(--space-2);
   font-size: 11px;
   color: var(--text-dim);
 }
 .conv-rail-row-cost { color: var(--accent-green); }
 .conv-rail-row-snippet {
-  margin-top: 4px;
+  margin-top: var(--space-1);
   font-size: 11.5px;
   color: var(--text-dim);
   line-height: 1.4;
@@ -6075,7 +6075,7 @@ mark.current {
   padding: 6px;
   border-radius: 5px;
   cursor: pointer;
-  margin-top: 4px;
+  margin-top: var(--space-1);
 }
 .conv-rail-more:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-rail-more:disabled { opacity: 0.5; cursor: default; }
@@ -6085,8 +6085,8 @@ mark.current {
 .conv-rail-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  padding: 2px 2px 8px;
+  gap: var(--space-1);
+  padding: 2px 2px var(--space-2);
 }
 .conv-rail-chip {
   appearance: none;
@@ -6097,7 +6097,7 @@ mark.current {
   font-size: var(--fs-eyebrow);
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   border-radius: 999px;
   cursor: pointer;
 }
@@ -6117,7 +6117,7 @@ mark.current {
   flex: 0 0 auto;
   align-self: stretch;
   width: 1px;
-  margin: 1px 4px;
+  margin: 1px var(--space-1);
   background: var(--border-soft);
 }
 .conv-rail-count {
@@ -6151,7 +6151,7 @@ mark.current {
   flex-shrink: 0;      /* badges keep their width; never clipped by the title text */
   display: inline-flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--space-1);
   margin-left: auto;   /* right-align in the title row (Q7 mock) */
 }
 .conv-rail-kindb {
@@ -6162,7 +6162,7 @@ mark.current {
   color: var(--accent-blue);
   border: 1px solid var(--border-soft);
   border-radius: 3px;
-  padding: 1px 4px;
+  padding: 1px var(--space-1);
   line-height: 1.4;
 }
 /* #217 S4 / I-3.3 — file-path search hit. The PATH leads (monospace, full color,
@@ -6213,7 +6213,7 @@ mark.current {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 .conv-rail-filters-activechip {
   display: inline-flex;
@@ -6242,7 +6242,7 @@ mark.current {
   font-size: var(--fs-eyebrow);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 2px 4px;
+  padding: 2px var(--space-1);
   cursor: pointer;
 }
 .conv-rail-filters-clearall:hover { color: var(--accent-blue); }
@@ -6257,7 +6257,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
   line-height: 1.4;
-  padding: 6px 8px;
+  padding: 6px var(--space-2);
 }
 
 /* #217 S4 / I-2.4 — the rail sort control (a labeled <select> in the search bar
@@ -6266,7 +6266,7 @@ mark.current {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
 }
 .conv-rail-sort-label {
   font-family: var(--font-mono);
@@ -6292,14 +6292,14 @@ mark.current {
 
 /* The popover: drops below the search bar inside the rail (no portal). */
 .conv-rail-filters {
-  margin-top: 8px;
+  margin-top: var(--space-2);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
   background: var(--panel-bg-2);
   padding: 10px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 .conv-rail-filters-sec { display: flex; flex-direction: column; gap: 6px; }
 .conv-rail-filters-label {
@@ -6324,7 +6324,7 @@ mark.current {
 .conv-rail-filters-chip:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-rail-filters-chip:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .conv-rail-filters-chip.is-on { color: var(--bg); background: var(--accent-blue); border-color: var(--accent-blue); }
-.conv-rail-filters-range { display: flex; gap: 8px; flex-wrap: wrap; }
+.conv-rail-filters-range { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .conv-rail-filters-field {
   display: flex;
   flex-direction: column;
@@ -6339,7 +6339,7 @@ mark.current {
   flex-direction: row;
   align-items: center;
   flex: 0 0 auto;
-  gap: 4px;
+  gap: var(--space-1);
 }
 .conv-rail-filters-field input {
   background: var(--panel-bg);
@@ -6348,7 +6348,7 @@ mark.current {
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 5px 8px;
+  padding: 5px var(--space-2);
   width: 100%;
   box-sizing: border-box;
 }
@@ -6373,7 +6373,7 @@ mark.current {
 }
 .conv-rail-filters-proj-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-rail-filters-proj-count { color: var(--text-faint); font-size: var(--fs-eyebrow); }
-.conv-rail-filters-empty { color: var(--text-faint); font-size: 11px; padding: 4px 2px; }
+.conv-rail-filters-empty { color: var(--text-faint); font-size: 11px; padding: var(--space-1) 2px; }
 .conv-rail-filters-footer {
   display: flex;
   justify-content: space-between;
@@ -6430,7 +6430,7 @@ mark.current {
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 12.5px;
-  padding: 4px 8px;
+  padding: var(--space-1) var(--space-2);
 }
 .conv-findbar-input::placeholder { color: var(--text-faint); }
 .conv-findbar-input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
@@ -6450,7 +6450,7 @@ mark.current {
   color: var(--accent-blue);
   border: 1px solid var(--border-soft);
   border-radius: 3px;
-  padding: 1px 4px;
+  padding: 1px var(--space-1);
 }
 .conv-findbar-hint {
   font-family: var(--font-mono);
@@ -6511,7 +6511,7 @@ mark.current {
 }
 /* Narrow viewports: shrink the input so the pill still floats without overflow. */
 @media (max-width: 640px) {
-  .conv-findbar { gap: 4px; padding: 4px 5px; }
+  .conv-findbar { gap: var(--space-1); padding: var(--space-1) 5px; }
   .conv-findbar-input { width: 110px; min-width: 70px; }
 }
 /* Touch targets: the toggles inherit the same ≥44px floor as the input on
@@ -6547,7 +6547,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 11.5px;
   font-weight: 700;
-  padding: 5px 12px;
+  padding: 5px var(--space-3);
   border-radius: 999px;
   cursor: pointer;
   box-shadow: 0 4px 14px rgba(0,0,0,0.4);
@@ -6585,8 +6585,8 @@ mark.current {
 .conv-reader--empty,
 .conv-reader--loading,
 .conv-reader--error { align-items: center; justify-content: center; }
-.conv-state { text-align: center; padding: 24px; max-width: 360px; }
-.conv-state-glyph { opacity: 0.55; display: block; margin-bottom: 12px; line-height: 0; }
+.conv-state { text-align: center; padding: var(--space-5); max-width: 360px; }
+.conv-state-glyph { opacity: 0.55; display: block; margin-bottom: var(--space-3); line-height: 0; }
 .conv-state-glyph .conv-ico { width: 30px; height: 30px; vertical-align: 0; }
 /* Animated loading spinner (#175 F1). The SpinnerIcon's shell hardcodes its
    className, so the rotation is driven by this loading-container selector, not a
@@ -6599,7 +6599,7 @@ mark.current {
 .conv-reader--error .conv-state-title { color: var(--accent-red); }
 .conv-reader-head {
   flex: 0 0 auto;
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-bg-2);
   /* #177 S5 — flex row: title/meta block grows, controls right-align. Replaces
@@ -6609,14 +6609,14 @@ mark.current {
   display: flex;
   align-items: flex-start;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .conv-reader-headmain { flex: 1 1 240px; min-width: 0; }
 .conv-reader-controls {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
 /* The mobile back button is a full-width row above the title/controls. */
@@ -6640,20 +6640,20 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 4px 10px;
+  padding: var(--space-1) 10px;
   border-radius: 5px;
   cursor: pointer;
-  margin-bottom: 8px;
+  margin-bottom: var(--space-2);
 }
 .conv-back:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-reader-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 16px;
+  padding: 14px var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 /* ---- Timeline spine (full scroll height via the thread wrapper) --- */
@@ -6661,7 +6661,7 @@ mark.current {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
   padding-left: 22px;   /* gutter the spine + markers live in */
 }
 /* #217 S4 QA fix — the thread carries tabIndex={-1} purely so onFindClose can
@@ -6769,7 +6769,7 @@ mark.current {
 .conv-item-cost.is-cache-failure { color: var(--accent-amber); }
 .conv-item-cost {
   margin-top: 10px;
-  padding-top: 8px;
+  padding-top: var(--space-2);
   border-top: 1px solid var(--border-soft);  /* the "rule" */
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
@@ -6813,8 +6813,8 @@ mark.current {
   align-self: center;
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 4px 0;
+  gap: var(--space-2);
+  margin: var(--space-1) 0;
   padding: 0 10px;
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
@@ -6840,7 +6840,7 @@ mark.current {
 .conv-system-marker > summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
   padding: 3px 10px;
   font-family: var(--font-mono);
@@ -6854,7 +6854,7 @@ mark.current {
 .conv-system-marker[open] > summary .conv-chev { transform: rotate(45deg); }
 .conv-system-marker-body {
   margin: 0;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-top: 1px solid var(--border-soft);
   white-space: pre-wrap;
   word-break: break-word;
@@ -6881,7 +6881,7 @@ mark.current {
 .conv-meta > summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
   padding: 3px 10px;
   font-family: var(--font-mono);
@@ -6907,7 +6907,7 @@ mark.current {
 .conv-meta--skill > summary,
 .conv-meta--skill[open] > summary { color: var(--accent-cyan); }
 .conv-meta-body {
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-top: 1px solid var(--border-soft);
 }
 .conv-meta-body--pre {
@@ -7007,7 +7007,7 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 .conv-chip {
   border: 1px solid var(--border-soft);
@@ -7018,7 +7018,7 @@ mark.current {
 .conv-chip > summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
   padding: 5px 10px;
   color: var(--text-dim);
@@ -7076,7 +7076,7 @@ mark.current {
 }
 
 .conv-chip-body {
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-top: 1px solid var(--border-soft);
   white-space: pre-wrap;
   word-break: break-word;
@@ -7091,7 +7091,7 @@ mark.current {
 .conv-chip--media,
 .conv-chip--ref {
   display: inline-block;
-  padding: 4px 10px;
+  padding: var(--space-1) 10px;
   color: var(--text-dim);
   background: var(--panel-bg-2);
 }
@@ -7129,7 +7129,7 @@ mark.current {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-faint);
-  margin: 0 0 4px;
+  margin: 0 0 var(--space-1);
 }
 .conv-tool-io-label--none { font-style: italic; }
 .conv-code {
@@ -7140,7 +7140,7 @@ mark.current {
   background: var(--bg);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   overflow-x: auto;
   color: var(--text);
   white-space: pre-wrap;
@@ -7161,14 +7161,14 @@ mark.current {
   max-height: 220px; overflow: auto;
 }
 .cb-gutter {
-  white-space: pre; text-align: right; padding: 8px 8px 8px 10px;
+  white-space: pre; text-align: right; padding: var(--space-2) var(--space-2) var(--space-2) 10px;
   color: var(--text-faint); user-select: none; font-variant-numeric: tabular-nums;
   border-right: 1px solid var(--border-soft);
   position: sticky; left: 0; background: var(--bg);
 }
 .conv-code--numbered > pre.conv-code {
   border: 0; border-radius: 0; margin: 0; background: transparent;
-  padding: 8px 10px 8px 8px; white-space: pre; overflow: visible;
+  padding: var(--space-2) 10px var(--space-2) var(--space-2); white-space: pre; overflow: visible;
   word-break: normal; overflow-wrap: normal;   /* reset .conv-code's break-word */
 }
 
@@ -7177,7 +7177,7 @@ mark.current {
    optional filename + copy button) over a refractor-tokenized <pre>. The
    tool-I/O request/result dumps stay plain mono (no language signal). */
 .codeblock {
-  margin: 12px 0;
+  margin: var(--space-3) 0;
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   overflow: hidden;
@@ -7186,7 +7186,7 @@ mark.current {
 .cb-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   padding: 6px 10px;
   background: var(--panel-bg-2);
   border-bottom: 1px solid var(--border-soft);
@@ -7221,7 +7221,7 @@ mark.current {
 .conv-diff-card .conv-diff-hdr {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--space-2);
   min-width: 0;
   flex: 1;
   font-size: 11.5px;
@@ -7254,10 +7254,10 @@ mark.current {
 }
 .conv-diff-body {
   position: relative;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-top: 1px solid var(--border-soft);
 }
-.conv-diff-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: 4px; align-items: center; }
+.conv-diff-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: var(--space-1); align-items: center; }
 /* #217 S5 §4 — Download-.patch button beside the diff Copy. */
 .conv-diff-patch-btn,
 .conv-term-copyfull {
@@ -7283,7 +7283,7 @@ mark.current {
   box-shadow: var(--focus-ring);
 }
 .conv-diff-divider {
-  margin: 8px 0 4px;
+  margin: var(--space-2) 0 var(--space-1);
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
   letter-spacing: 0.12em;
@@ -7315,7 +7315,7 @@ mark.current {
   font-variant-numeric: tabular-nums;
 }
 .conv-diff-sign { text-align: center; user-select: none; color: var(--text-faint); }
-.conv-diff-text { padding-right: 8px; }
+.conv-diff-text { padding-right: var(--space-2); }
 .conv-diff-row--context { color: var(--text-dim); }
 .conv-diff-row--add { background: rgba(61, 220, 132, 0.08); }
 .conv-diff-row--add .conv-diff-sign { color: var(--accent-green); }
@@ -7325,7 +7325,7 @@ mark.current {
 .conv-diff-row--add .conv-diff-word { background: rgba(61, 220, 132, 0.28); border-radius: 2px; }
 .conv-diff-row--del .conv-diff-word { background: rgba(239, 68, 68, 0.28); border-radius: 2px; }
 /* Result sub-panel beneath the diff (collapsed; the real cat -n numbers). */
-.conv-diff-result { margin-top: 8px; }
+.conv-diff-result { margin-top: var(--space-2); }
 
 /* ---- Git-context diff (#217 S5 F6 — UnifiedDiffView) -------------- */
 /* An injected meta:context body's unfenced git diff, rendered through the SAME
@@ -7334,11 +7334,11 @@ mark.current {
    hunks. The header reuses the card's flex layout (the .conv-diff-base/-dir/
    -stat classes are global; only the .conv-diff-hdr flex is card-scoped). */
 .conv-ctx-diff { margin: 6px 0; display: flex; flex-direction: column; gap: 10px; }
-.conv-ctx-diff-file { display: flex; flex-direction: column; gap: 4px; }
+.conv-ctx-diff-file { display: flex; flex-direction: column; gap: var(--space-1); }
 .conv-ctx-diff .conv-diff-hdr {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--space-2);
   min-width: 0;
   font-size: 11.5px;
 }
@@ -7347,13 +7347,13 @@ mark.current {
 /* ---- Bash terminal card (#177 S3, spec §4.2) ---------------------- */
 .conv-term-body {
   position: relative;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-top: 1px solid var(--border-soft);
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: 4px; align-items: center; }
+.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: var(--space-1); align-items: center; }
 .conv-term-cmd {
   margin: 0;
   font-family: var(--font-mono);
@@ -7362,7 +7362,7 @@ mark.current {
   background: var(--bg);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -7375,7 +7375,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.5;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   border-radius: 6px;
   max-height: 320px;
   overflow: auto;
@@ -7434,7 +7434,7 @@ mark.current {
   background: var(--bg);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   color: var(--accent-blue);
   cursor: pointer;
   font-family: var(--font-mono);
@@ -7461,7 +7461,7 @@ mark.current {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 6px;
-  padding: 2px 4px;
+  padding: 2px var(--space-1);
   color: var(--text-faint);
   line-height: 0;
 }
@@ -7481,7 +7481,7 @@ mark.current {
 .conv-item-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--space-1);
   margin-top: 6px;
   opacity: 0;
   transition: opacity 0.15s ease;
@@ -7497,7 +7497,7 @@ mark.current {
    ::before hit area); the pressed (bookmarked) state paints the star with the
    amber accent. The note toggle is a compact dim caption; the inline editor is a
    small bordered input. */
-.conv-bookmark { display: inline-flex; align-items: center; gap: 4px; }
+.conv-bookmark { display: inline-flex; align-items: center; gap: var(--space-1); }
 .conv-bookmark-btn[aria-pressed='true'] { color: var(--accent-amber); }
 .conv-bookmark-note-toggle {
   background: none; border: 0; color: var(--text-dim); cursor: pointer;
@@ -7551,7 +7551,7 @@ mark.current {
 .conv-toolresult-run > summary {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   cursor: pointer;
   padding: 5px 10px;
   color: var(--accent-teal);
@@ -7562,10 +7562,10 @@ mark.current {
 }
 .conv-toolresult-run > summary::-webkit-details-marker { display: none; }
 .conv-toolresult-run-body {
-  padding: 6px 12px 10px;
+  padding: 6px var(--space-3) 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 /* ---- Subagent thread card (#161 D1–D3 / #165 §4.2) ---------------- */
@@ -7591,7 +7591,7 @@ mark.current {
 .conv-sidechain-head {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 11px 14px;
   cursor: pointer;
   user-select: none;
@@ -7664,7 +7664,7 @@ mark.current {
 /* nested turn stream — its OWN spine + small role dots (D3) */
 .conv-sidechain-body {
   position: relative;
-  padding: 6px 14px 12px 30px;
+  padding: 6px 14px var(--space-3) 30px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -7704,12 +7704,12 @@ mark.current {
   word-break: break-word;
 }
 .conv-item--human .md { font-size: 15.5px; }
-.md p { margin: 0 0 8px; }
+.md p { margin: 0 0 var(--space-2); }
 .md p:last-child { margin-bottom: 0; }
-.md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
+.md ul, .md ol { margin: var(--space-1) 0 var(--space-2); padding-left: 22px; }
 .md li { margin: 2px 0; }
 .md h1, .md h2, .md h3, .md h4 {
-  margin: 16px 0 6px;
+  margin: var(--space-4) 0 6px;
   font-weight: 600;
   line-height: 1.25;
   color: var(--reader-ink);
@@ -7726,7 +7726,7 @@ mark.current {
 .md code {
   font-family: var(--font-mono);
   background: var(--panel-bg-2);
-  padding: 1px 4px;
+  padding: 1px var(--space-1);
   border-radius: 3px;
   font-size: 12px;
 }
@@ -7736,9 +7736,9 @@ mark.current {
   background: var(--panel-bg-2);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
-  padding: 10px 12px;
+  padding: 10px var(--space-3);
   overflow-x: auto;
-  margin: 6px 0 8px;
+  margin: 6px 0 var(--space-2);
 }
 .md pre code {
   background: transparent;
@@ -7748,7 +7748,7 @@ mark.current {
 }
 .md blockquote {
   margin: 6px 0;
-  padding: 2px 12px;
+  padding: 2px var(--space-3);
   border-left: 3px solid var(--border-soft);
   color: var(--text-dim);
 }
@@ -7757,12 +7757,12 @@ mark.current {
   max-inline-size: 100%;
   overflow-x: auto;
   border-collapse: collapse;
-  margin: 8px 0;
+  margin: var(--space-2) 0;
   font-size: 13.5px;
 }
 .md th, .md td {
   border: 1px solid var(--border-soft);
-  padding: 4px 8px;
+  padding: var(--space-1) var(--space-2);
   text-align: left;
 }
 .md th { background: var(--panel-bg-2); }
@@ -7786,7 +7786,7 @@ mark.current {
   text-align: center;
   color: var(--text-faint);
   font-size: 11px;
-  padding: 12px;
+  padding: var(--space-3);
 }
 
 /* ---- Disabled state (transcripts not exposed for this request) ---- */
@@ -7798,7 +7798,7 @@ mark.current {
   font-size: 13px;
   line-height: 1.6;
   padding: 18px 22px;
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
 }
 .conv-disabled code {
   font-family: var(--font-mono);
@@ -7828,7 +7828,7 @@ mark.current {
     height: calc(var(--mobile-vh) - var(--topbar-h) - 40px);
     gap: 0;
     overflow: hidden;
-    margin-bottom: 12px;
+    margin-bottom: var(--space-3);
   }
   #root .conv-rail {
     border: 1px solid var(--border-soft);
@@ -7843,7 +7843,7 @@ mark.current {
     min-height: 0;
   }
   #root .conv-reader-body {
-    padding: 10px 12px;
+    padding: 10px var(--space-3);
     gap: 10px;
     /* #205 S1 (F1) — backstop only. overflow:hidden clips but does NOT reduce
        scrollWidth; the per-child clamp below is what makes scrollWidth fit. */
@@ -7853,7 +7853,7 @@ mark.current {
      long title at 2 lines, and keep the meta to a single ellipsized line (with
      the abbreviated model list it fits; the ellipsis is the tail backstop).
      #root-prefixed + every property respelled per the specificity-floor. */
-  #root .conv-reader-head { padding: 8px 12px; }
+  #root .conv-reader-head { padding: var(--space-2) var(--space-3); }
   #root .conv-reader-title {
     display: -webkit-box;
     -webkit-line-clamp: 2;
@@ -7962,7 +7962,7 @@ mark.current {
     overflow: hidden;
   }
   #root .conv-item {
-    padding: 8px 11px;
+    padding: var(--space-2) 11px;
     border-radius: 7px;
     /* #205 S1 (F1) — long prose tokens/URLs wrap instead of clipping. Scoped to
        message items (incl. those nested inside subagent cards) so the sidechain
@@ -7975,7 +7975,7 @@ mark.current {
     gap: 2px;
   }
   #root .view-seg {
-    padding: 4px 10px;
+    padding: var(--space-1) 10px;
     font-size: 12px;
     min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
@@ -7988,7 +7988,7 @@ mark.current {
     flex-wrap: wrap;
     justify-content: flex-end;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
   }
   #root .conv-focus-seg {
     display: flex;
@@ -7999,7 +7999,7 @@ mark.current {
   #root .conv-focus-seg-btn {
     flex: 1;
     justify-content: center;
-    padding: 7px 4px;
+    padding: 7px var(--space-1);
     font-size: 11px;
     min-height: 44px;   /* #205 S4 (F5) — tap-target floor */
   }
@@ -8017,7 +8017,7 @@ mark.current {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 8px 0 14px;
+    padding: 0 var(--space-2) 0 14px;
     height: 46px;
     border-bottom: 1px solid var(--border-soft);
     background: var(--panel-bg-2);
@@ -8138,7 +8138,7 @@ mark.current {
      and terminal corner rows pair Copy + Download/Copy-full the same way. */
   #root .conv-item-actions,
   #root .conv-diff-copy,
-  #root .conv-term-copy { gap: 24px; }
+  #root .conv-term-copy { gap: var(--space-5); }
 }
 
 /* ===== #177 S2 — decision & planning tool cards ===== */
@@ -8147,10 +8147,10 @@ mark.current {
 .conv-ask { border-left: 2px solid var(--accent-cyan); }
 .conv-ask-eyebrow { color: var(--accent-cyan); }
 .conv-ask-count { color: var(--text-faint); font-size: 11px; }
-.conv-ask-body { padding: 4px 12px 12px; }
+.conv-ask-body { padding: var(--space-1) var(--space-3) var(--space-3); }
 .conv-ask-q { padding: 11px 0; }
 .conv-ask-q + .conv-ask-q { border-top: 1px dashed var(--border-soft); }
-.conv-ask-qhead { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.conv-ask-qhead { display: flex; gap: var(--space-2); align-items: center; margin-bottom: 6px; }
 .conv-ask-tag { font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: .06em;
   text-transform: uppercase; color: var(--text-dim); background: var(--panel-bg-2);
   border: 1px solid var(--border-soft); border-radius: 4px; padding: 2px 7px; }
@@ -8159,7 +8159,7 @@ mark.current {
 .conv-ask-opts { display: flex; flex-direction: column; gap: 7px; }
 .conv-ask-opt { border: 1px solid var(--border-soft); border-radius: 8px; padding: 9px 11px;
   background: var(--panel-bg-2); }
-.conv-ask-opt-label { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+.conv-ask-opt-label { display: flex; align-items: center; gap: var(--space-2); font-weight: 600; font-size: 14px; }
 .conv-ask-opt-desc { color: var(--text-dim); font-size: 12.5px; margin-top: 3px; line-height: 1.45; }
 .conv-ask-opt-preview { font-family: var(--font-mono); font-size: 11.5px; background: #07080c;
   border: 1px solid var(--border-soft); border-radius: 6px; padding: 7px 9px; margin: 6px 0 0;
@@ -8171,7 +8171,7 @@ mark.current {
 .conv-ask-pick { margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-eyebrow);
   letter-spacing: .05em; text-transform: uppercase; color: var(--accent-green); }
 .conv-ask-custom { border: 1px solid rgba(61,220,132,.5); background: rgba(61,220,132,.08);
-  border-left: 3px solid var(--accent-green); border-radius: 8px; padding: 9px 11px; margin-top: 8px;
+  border-left: 3px solid var(--accent-green); border-radius: 8px; padding: 9px 11px; margin-top: var(--space-2);
   font-size: 14px; }
 .conv-ask-note { margin-top: 6px; font-size: 12px; color: var(--text-dim);
   font-style: italic; }
@@ -8179,19 +8179,19 @@ mark.current {
 
 /* TodoWrite */
 .conv-todo { border-left: 2px solid var(--accent-cyan); }
-.conv-todo-summary { display: flex; align-items: center; gap: 8px; }
+.conv-todo-summary { display: flex; align-items: center; gap: var(--space-2); }
 .conv-todo-preview { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font-size: 12.5px; }
 .conv-todo-minibar { width: 60px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.08);
   overflow: hidden; flex: 0 0 auto; margin-left: auto; }
 .conv-todo-minibar > i { display: block; height: 100%; background: var(--accent-green); }
 .conv-todo-frac { color: var(--accent-amber); font-family: var(--font-mono); font-size: 11.5px; flex: 0 0 auto; }
-.conv-todo-body { padding: 6px 12px 10px; }
-.conv-todo-head { display: flex; align-items: center; gap: 8px; }
+.conv-todo-body { padding: 6px var(--space-3) 10px; }
+.conv-todo-head { display: flex; align-items: center; gap: var(--space-2); }
 .conv-todo-title { font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em;
   text-transform: uppercase; color: var(--accent-cyan); }
 .conv-todo-bar { height: 6px; border-radius: 4px; background: rgba(255,255,255,.08);
-  overflow: hidden; margin: 8px 0; }
+  overflow: hidden; margin: var(--space-2) 0; }
 .conv-todo-bar > i { display: block; height: 100%; background: var(--accent-green); }
 .conv-todo-items { list-style: none; margin: 0; padding: 0; }
 .conv-todo-item { display: flex; align-items: flex-start; gap: 9px; padding: 5px 6px;
@@ -8214,25 +8214,25 @@ mark.current {
 .conv-plan { border-left: 2px solid var(--accent-purple); }
 .conv-plan-eyebrow { color: var(--accent-purple); }
 .conv-plan-badge { margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
-  font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: .04em; border-radius: 5px; padding: 2px 8px; }
+  font-family: var(--font-mono); font-size: var(--fs-eyebrow); letter-spacing: .04em; border-radius: 5px; padding: 2px var(--space-2); }
 .conv-plan-badge .conv-ico { width: 12px; height: 12px; }
 .conv-plan-badge--ok { color: #eafff1; background: rgba(61,220,132,.16); border: 1px solid rgba(61,220,132,.5); }
 .conv-plan-badge--no { color: #ffe7e7; background: rgba(239,68,68,.14); border: 1px solid rgba(239,68,68,.5); }
 .conv-plan-badge--neutral { color: var(--text-dim); background: var(--panel-bg-2); border: 1px solid var(--border-soft); }
-.conv-plan-body { padding: 4px 0 0; }
-.conv-plan-md { padding: 4px 14px 10px; }
+.conv-plan-body { padding: var(--space-1) 0 0; }
+.conv-plan-md { padding: var(--space-1) 14px 10px; }
 .conv-plan-md--clamp { max-height: 230px; overflow: hidden; position: relative; }
 .conv-plan-md--clamp::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0;
   height: 60px; background: linear-gradient(180deg, transparent, var(--panel-bg)); }
 .conv-plan-more { border-top: 1px solid var(--border-soft); }
 .conv-plan-more button { all: unset; cursor: pointer; width: 100%; text-align: center;
-  font-family: var(--font-mono); font-size: 11px; color: var(--accent-purple); padding: 8px 0; }
+  font-family: var(--font-mono); font-size: 11px; color: var(--accent-purple); padding: var(--space-2) 0; }
 .conv-plan-more button:hover { background: rgba(192,132,252,.06); }
 .conv-plan-trunc { font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-faint);
   padding: 6px 14px 10px; }
 
 /* #177 S4 (Q7-A): inline media figure + quiet caption row. */
-.conv-media-figure { margin: 8px 0; }
+.conv-media-figure { margin: var(--space-2) 0; }
 .conv-media-figure img {
   display: block;
   max-width: 100%;
@@ -8246,7 +8246,7 @@ mark.current {
   gap: 10px;
   font-size: 11px;
   color: var(--text-dim);
-  margin-top: 4px;
+  margin-top: var(--space-1);
 }
 .conv-media-caption a { margin-left: auto; }
 /* #217 S6 F9 — inline click-to-expand PDF viewer. The toggle is a small accent
@@ -8260,7 +8260,7 @@ mark.current {
 .conv-pdf-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .conv-pdf-inline {
   display: block; width: 100%; max-height: min(600px, 70vh); height: 600px;
-  margin-top: 8px; border: 1px solid var(--border-soft); border-radius: 6px;
+  margin-top: var(--space-2); border: 1px solid var(--border-soft); border-radius: 6px;
   background: var(--panel-bg-2);
 }
 /* The unaddressable / source-gone degrade hint on the byte-count badge. */
@@ -8281,8 +8281,8 @@ mark.current {
 }
 .conv-web-status--ok { color: #eafff1; background: rgba(61,220,132,.16); border: 1px solid rgba(61,220,132,.5); }
 .conv-web-status--err { color: #ffe7e7; background: rgba(239,68,68,.14); border: 1px solid rgba(239,68,68,.5); }
-.conv-web-body { padding: 8px 12px; position: relative; }
-.conv-web-field { display: flex; gap: 8px; margin: 3px 0; font-size: 12px; }
+.conv-web-body { padding: var(--space-2) var(--space-3); position: relative; }
+.conv-web-field { display: flex; gap: var(--space-2); margin: 3px 0; font-size: 12px; }
 .conv-web-field .conv-web-key {
   flex: none; width: 52px; text-transform: uppercase;
   font-size: var(--fs-eyebrow); letter-spacing: 0.07em; color: var(--text-dim); padding-top: 2px;
@@ -8294,7 +8294,7 @@ mark.current {
   height: 60px; background: linear-gradient(180deg, transparent, var(--panel-bg)); }
 .conv-web-more { border-top: 1px solid var(--border-soft); margin-top: 6px; }
 .conv-web-more button { all: unset; cursor: pointer; width: 100%; text-align: center;
-  font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan); padding: 8px 0; }
+  font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan); padding: var(--space-2) 0; }
 .conv-web-more button:hover { background: rgba(34,211,238,.06); }
 .conv-web-link { margin: 6px 0; }
 .conv-web-link-domain { display: block; font-size: 11.5px; color: var(--text-dim); }
@@ -8331,7 +8331,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -8386,7 +8386,7 @@ mark.current {
   text-overflow: ellipsis;
 }
 .conv-cmp-head-side-meta { font-size: var(--fs-eyebrow); color: var(--text-dim); }
-.conv-cmp-head-controls { display: flex; gap: 8px; flex: 0 0 auto; }
+.conv-cmp-head-controls { display: flex; gap: var(--space-2); flex: 0 0 auto; }
 .conv-cmp-swap,
 .conv-cmp-close {
   appearance: none;
@@ -8418,7 +8418,7 @@ mark.current {
 .conv-cmp-metrics {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
+  gap: var(--space-2);
   padding: 10px 14px;
   border-bottom: 1px solid var(--border-soft);
 }
@@ -8426,7 +8426,7 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 6px 8px;
+  padding: 6px var(--space-2);
   background: var(--panel-bg-2);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
@@ -8457,7 +8457,7 @@ mark.current {
 .conv-cmp-metric-dir { color: var(--accent-green); }
 
 /* ---- The aligned diff -------------------------------------------------- */
-.conv-cmp-diff { display: flex; flex-direction: column; padding: 8px 0; }
+.conv-cmp-diff { display: flex; flex-direction: column; padding: var(--space-2) 0; }
 
 /* The ⚡ DIVERGENCE bar above each contiguous replaced region. */
 .conv-cmp-divbar {
@@ -8465,7 +8465,7 @@ mark.current {
   align-items: center;
   gap: 6px;
   margin: 6px 14px 2px;
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
   font-weight: 700;
@@ -8499,7 +8499,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
-  padding: 4px 8px;
+  padding: var(--space-1) var(--space-2);
   border-radius: 4px;
   border-left: 3px solid transparent;
   white-space: pre-wrap;
@@ -8552,7 +8552,7 @@ mark.current {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
-  padding: 3px 8px;
+  padding: 3px var(--space-2);
   border-radius: 4px;
   border-left: 3px solid transparent;
   white-space: pre-wrap;
@@ -8570,7 +8570,7 @@ mark.current {
   font-size: var(--fs-eyebrow);
   font-weight: 700;
   color: var(--text-faint);
-  margin-right: 4px;
+  margin-right: var(--space-1);
 }
 
 /* ---- The lazy expand panel --------------------------------------------- */
@@ -8578,8 +8578,8 @@ mark.current {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
-  margin: 0 14px 8px;
-  padding: 8px;
+  margin: 0 14px var(--space-2);
+  padding: var(--space-2);
   background: var(--panel-bg-2);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
@@ -8607,7 +8607,7 @@ mark.current {
   color: var(--accent-blue);
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -8626,7 +8626,7 @@ mark.current {
 /* ---- Not-found fallback ------------------------------------------------ */
 .conv-cmp--notfound {
   align-items: flex-start;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 20px;
 }
 .conv-cmp-notfound-msg { font-size: 13px; color: var(--text-dim); }
@@ -8636,9 +8636,9 @@ mark.current {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding: 8px 10px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  padding: var(--space-2) 10px;
   background: rgba(96, 165, 250, 0.1);
   border: 1px solid var(--accent-blue);
   border-radius: 6px;
@@ -8653,7 +8653,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 4px 9px;
+  padding: var(--space-1) 9px;
   border-radius: 5px;
   cursor: pointer;
   flex: 0 0 auto;
@@ -8680,7 +8680,7 @@ mark.current {
 }
 @media (max-width: 640px) {
   .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .conv-cmp-head { gap: 8px; }
+  .conv-cmp-head { gap: var(--space-2); }
 }
 
 /* ---- ≥44px tap targets on the comparison touch controls (#205) --------- */
