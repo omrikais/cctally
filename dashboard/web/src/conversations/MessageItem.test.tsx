@@ -929,14 +929,21 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
   };
   const tokens = { input: 1200, output: 4800, cache_creation: 10000, cache_read: 300000 };
 
-  it('cost-only footer when tokens are absent (graceful degradation)', () => {
-    const { container } = render(<MessageItem item={assistantBase} />);
+  it('cost-only footer when tokens are absent and cost is above the floor', () => {
+    // #228 S3 B2 — bump this fixture above the $0.05 floor so the verbose
+    // $-figure renders (the sub-floor variant is covered in the B2 suite). The
+    // title now also leads with the exact $-figure (Codex P2 accessibility).
+    const item = { ...assistantBase, cost_usd: 0.0814 } as ConversationItem;
+    const { container } = render(<MessageItem item={item} />);
     const cost = container.querySelector('.conv-item-cost')!;
-    expect(cost.textContent).toBe('$0.0214');
-    expect(cost.getAttribute('title')).toBeNull();
+    expect(cost.textContent).toBe('$0.0814');
+    expect(cost.getAttribute('title')).toBe('$0.0814');
   });
 
   it('tokens-only footer when cost is zero but tokens are present', () => {
+    // #228 S3 B2 — a zero-cost (no-attributable-cost) tokens-bearing turn is the
+    // graceful-degradation footer, not a noisy cost line, so the floor does NOT
+    // suppress it: the token breakout stays visible.
     const item = { ...assistantBase, cost_usd: 0, tokens } as ConversationItem;
     const { container } = render(<MessageItem item={item} />);
     const cost = container.querySelector('.conv-item-cost')!;
@@ -945,13 +952,15 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
     expect(cost.textContent).toBe('in 1.2k · out 4.8k · cache 310k');
   });
 
-  it('combined cost + tokens footer with the exact-count tooltip', () => {
-    const item = { ...assistantBase, tokens } as ConversationItem;
+  it('combined cost + tokens footer (above floor) with the exact-count tooltip', () => {
+    // #228 S3 B2 — above the floor the verbose text shows; the title now leads
+    // with the exact $-figure ahead of the per-count token breakdown.
+    const item = { ...assistantBase, cost_usd: 0.0814, tokens } as ConversationItem;
     const { container } = render(<MessageItem item={item} />);
     const cost = container.querySelector('.conv-item-cost')!;
-    expect(cost.textContent).toBe('$0.0214 · in 1.2k · out 4.8k · cache 310k');
+    expect(cost.textContent).toBe('$0.0814 · in 1.2k · out 4.8k · cache 310k');
     expect(cost.getAttribute('title')).toBe(
-      'input 1200 · output 4800 · cache create 10000 · cache read 300000',
+      '$0.0814 · input 1200 · output 4800 · cache create 10000 · cache read 300000',
     );
   });
 
@@ -1059,5 +1068,84 @@ describe('MessageItem bookmark control (#217 S6 F4)', () => {
     const { container } = renderWithTz(assistant);
     const actions = container.querySelector('.conv-item-actions')!;
     expect(actions.querySelector('.conv-bookmark-btn')).not.toBeNull();
+  });
+});
+
+// #228 S3 B2 — gate the verbose per-turn cost text below an absolute floor
+// ($0.05). The micro-bar stays on EVERY positive-cost turn; the verbose
+// `$… · in … · out … · cache …` line renders only at/above the floor; and the
+// exact `$cost` (+ token breakdown) moves into the footer `title` for every
+// positive-cost turn — including the sub-floor ones whose text is hidden — so
+// cost is never lost to accessibility (Codex P2). All sub-cent figures rely on
+// the maxTurnCost context to size the bar (provided here via the provider).
+describe('MessageItem per-turn cost gating (#228 S3 B2)', () => {
+  const base: ConversationItem = {
+    kind: 'assistant',
+    anchor: { session_id: 's1', uuid: 'b2', id: 1 },
+    member_uuids: ['b2'],
+    ts: '2026-06-22T00:00:00Z',
+    text: 'hi',
+    blocks: [{ kind: 'text', text: 'hi' }],
+    model: 'claude-opus-4',
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+    cost_usd: 0.002,
+  };
+  const tokens = { input: 2, output: 10, cache_creation: 0, cache_read: 100 };
+
+  function renderWithMax(item: ConversationItem, maxTurnCost = 0.1) {
+    return render(
+      <TranscriptContext.Provider value={{ sessionId: 's1', maxTurnCost }}>
+        <MessageItem item={item} />
+      </TranscriptContext.Provider>,
+    );
+  }
+
+  it('sub-floor turn hides the verbose text but keeps the bar + exact $ in title', () => {
+    const item = { ...base, cost_usd: 0.002, tokens } as ConversationItem;
+    const { container } = renderWithMax(item);
+    // Micro-bar stays (the always-on relative signal).
+    expect(container.querySelector('.conv-cost-bar')).not.toBeNull();
+    // Verbose text line is hidden — neither the $-figure nor the token breakout.
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost.textContent).not.toContain('out 10');
+    expect(cost.textContent).not.toContain('$0.0020');
+    // The exact $-figure + the token breakdown live in the title (accessible).
+    expect(cost.getAttribute('title')).toBe(
+      '$0.0020 · input 2 · output 10 · cache create 0 · cache read 100',
+    );
+  });
+
+  it('at/above-floor turn shows the verbose cost text and keeps the bar', () => {
+    const item = {
+      ...base,
+      cost_usd: 0.08,
+      tokens: { input: 2, output: 380, cache_creation: 0, cache_read: 173000 },
+    } as ConversationItem;
+    const { container } = renderWithMax(item);
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost.textContent).toContain('out 380');
+    expect(cost.textContent).toContain('$0.0800');
+    expect(container.querySelector('.conv-cost-bar')).not.toBeNull();
+  });
+
+  it('sub-floor cost-only turn (no tokens) still carries the exact $ in the title', () => {
+    const item = { ...base, cost_usd: 0.0123 } as ConversationItem;
+    delete (item as { tokens?: unknown }).tokens;
+    const { container } = renderWithMax(item);
+    const cost = container.querySelector('.conv-item-cost')!;
+    // Text is hidden (no rendered $-figure)...
+    expect(cost.textContent).not.toContain('$0.0123');
+    // ...but the title carries the exact figure so the cost stays reachable.
+    expect(cost.getAttribute('title')).toBe('$0.0123');
+  });
+
+  it('a turn exactly at the floor ($0.05) shows the verbose text', () => {
+    const item = { ...base, cost_usd: 0.05, tokens } as ConversationItem;
+    const { container } = renderWithMax(item);
+    const cost = container.querySelector('.conv-item-cost')!;
+    expect(cost.textContent).toContain('$0.0500');
+    expect(cost.textContent).toContain('out 10');
   });
 });

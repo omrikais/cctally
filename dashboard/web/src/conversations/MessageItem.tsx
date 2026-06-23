@@ -14,6 +14,13 @@ import { segmentContextBody, parseUnifiedDiff } from './contextDiff';
 import { UnifiedDiffView } from './UnifiedDiffView';
 import type { ConversationItem } from '../types/conversation';
 
+// #228 S3 B2 — below this per-turn cost the verbose `$… · in … · out … · cache …`
+// text is hidden (the cost micro-bar stays, and the exact $-figure + token
+// breakdown move into the footer `title`). An ABSOLUTE floor (not relative) so
+// it doesn't wobble as reverse-paging changes the session max — the micro-bar
+// already carries the relative signal. Tuned in ui-qa.
+const COST_TEXT_FLOOR_USD = 0.05;
+
 // #217 S5 F6 — an injected `meta_kind:'context'` body sometimes carries an
 // UNFENCED git diff (e.g. `- Unstaged changes: diff --git a/CLAUDE.md …`). Split
 // the body into prose + diff segments (conservative `diff --git` anchor) and
@@ -148,6 +155,26 @@ function MessageItemImpl(
     // clamped to [0,1], or 0 when there is no positive denominator (→ no bar).
     const maxTurnCost = useMaxTurnCost();
     const costFrac = hasCost ? costIntensity(item.cost_usd as number, maxTurnCost) : 0;
+    // #228 S3 B2 — gate the VERBOSE cost text on an absolute floor. A positive
+    // cost below the floor hides its noisy `$… · in … · out …` line (the bar +
+    // title carry the signal instead). A zero-cost-but-tokens turn (the
+    // graceful-degradation footer) is NOT a noisy cost line, so the floor never
+    // suppresses it — only a positive sub-floor cost is gated.
+    const showCostText = !hasCost || (item.cost_usd as number) >= COST_TEXT_FLOOR_USD;
+    // #228 S3 B2 (Codex P2) — the exact $-figure was previously accessible ONLY
+    // as rendered text, so hiding the text would drop cost from accessibility.
+    // Always fold the exact `$cost` (when present) — and the token breakdown
+    // (when present) — into the footer `title`, so cost stays reachable on
+    // hover / long-press for every positive-cost turn, including sub-floor ones.
+    const costTitle =
+      [
+        hasCost ? `$${(item.cost_usd as number).toFixed(4)}` : null,
+        tok
+          ? `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(' · ') || undefined;
     return (
       <div ref={ref} className={cls('conv-item--assistant')} style={style} data-uuid={item.anchor.uuid}>
         <div className="conv-item-head">
@@ -185,7 +212,11 @@ function MessageItemImpl(
           // #177 S5 §6 — footer renders when `hasCost || tokens`: a zero-cost
           // turn that carries tokens shows a tokens-only footer; an un-reingested
           // turn without tokens keeps the cost-only footer. cache = creation +
-          // read summed for display; the `title` breaks out the four exact counts.
+          // read summed for display.
+          // #228 S3 B2 — the verbose text is split into its own span gated on the
+          // absolute cost floor (`showCostText`); the micro-bar + the `title`
+          // (which always carries the exact $-figure) stay on every turn. The
+          // `title` breaks out the four exact token counts after the $-figure.
           // toFixed(4), not fmt.usd2: per-turn costs are typically sub-cent,
           // where 2-decimal formatting would read "$0.00" — 4 decimals keep
           // the real figure legible. Intentional bypass of the usd2 helper.
@@ -194,18 +225,23 @@ function MessageItemImpl(
             // figure amber on a flagged turn (only when markers are on, so the
             // opt-out hides this cue too).
             className={`conv-item-cost${markersEnabled && cf ? ' is-cache-failure' : ''}`}
-            title={tok ? `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}` : undefined}
+            title={costTitle}
           >
-            {hasCost && `$${(item.cost_usd as number).toFixed(4)}`}
-            {tok && (
-              <>
-                {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)} · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}
-              </>
+            {showCostText && (
+              <span className="conv-item-cost-text">
+                {hasCost && `$${(item.cost_usd as number).toFixed(4)}`}
+                {tok && (
+                  <>
+                    {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)} · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}
+                  </>
+                )}
+              </span>
             )}
             {/* #217 S6 F3 — relative cost micro-bar: width/intensity ∝
-                cost / session max-turn-cost. Decorative (the exact $-figure above
-                is the accessible value), so aria-hidden. Rendered only with a
-                positive ratio (a costless turn / zero denominator → no bar). */}
+                cost / session max-turn-cost. Decorative (the exact $-figure is
+                accessible via the footer `title` on every positive-cost turn —
+                #228 S3 B2), so aria-hidden. Rendered only with a positive ratio
+                (a costless turn / zero denominator → no bar). */}
             {costFrac > 0 && (
               <span
                 className="conv-cost-bar"

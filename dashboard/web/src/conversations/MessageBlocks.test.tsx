@@ -170,6 +170,30 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(container.textContent).toContain('pondering deeply');
   });
 
+  // #228 S3 B1 — the "quiet reasoning" CSS hook. The expanded thinking body must
+  // stay `.conv-chip--thinking > .conv-chip-body > .md` (the indigo wash /
+  // dimmed-italic prose rules key on exactly this chain), and a NON-thinking
+  // chip (a tool degradation chip here) must NOT carry the thinking class, so the
+  // treatment never bleeds onto other chips. The italic/wash/size are CSS-only
+  // (verified at the ui-qa gate, not JSDOM); this pins the stable structure.
+  it('B1: pins the thinking CSS hook (.conv-chip--thinking > .conv-chip-body > .md) and leaves other chips untouched', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[
+          { kind: 'thinking', text: 'reasoning prose' },
+          { kind: 'tool_use', name: 'Bash', input_summary: 'ls' },
+        ]}
+      />,
+    );
+    const thinking = container.querySelector('details.conv-chip--thinking')!;
+    expect(thinking).not.toBeNull();
+    expect(thinking.querySelector('.conv-chip-body .md')).not.toBeNull();
+    // The tool chip is a distinct chip that must NOT carry the thinking hook.
+    const tool = container.querySelector('details.conv-chip--tool')!;
+    expect(tool).not.toBeNull();
+    expect(tool.classList.contains('conv-chip--thinking')).toBe(false);
+  });
+
   it('renders the tool_use degradation chip with name and input summary', () => {
     const blocks: ConversationBlock[] = [{ kind: 'tool_use', name: 'Bash', input_summary: 'ls -la' }];
     const { container } = render(<MessageBlocks blocks={blocks} />);

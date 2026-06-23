@@ -310,7 +310,7 @@ describe('Conversations workspace integration', () => {
     });
   });
 
-  it('5: the assistant per-turn cost is rendered exactly once', async () => {
+  it('5: the assistant per-turn cost footer is rendered exactly once', async () => {
     updateSnapshot(baseEnvelope(true));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
     render(<App />);
@@ -318,10 +318,15 @@ describe('Conversations workspace integration', () => {
     await waitFor(() => {
       expect(document.querySelector('.conv-item--assistant')).not.toBeNull();
     });
-    // 0.0123 → "$0.0123" (toFixed(4) per the per-turn cost contract).
+    // #228 S3 B2 — exactly one cost footer. The fixture cost (0.0123) is BELOW
+    // the $0.05 verbose-text floor, so the footer hides the `$…` text line and
+    // carries the exact figure in the `title` (toFixed(4) per the per-turn cost
+    // contract) — proving the gating reaches the rendered reader, not just the
+    // MessageItem unit.
     const costs = document.querySelectorAll('.conv-item-cost');
     expect(costs).toHaveLength(1);
-    expect(costs[0].textContent).toBe('$0.0123');
+    expect(costs[0].textContent).not.toContain('$0.0123');
+    expect(costs[0].getAttribute('title')).toBe('$0.0123');
   });
 
   it('6: in conversations view, "1" does not open a panel modal; Esc with empty search exits to dashboard', async () => {

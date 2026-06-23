@@ -5138,7 +5138,11 @@ mark.current {
 /* ---- Two-pane workspace shell ------------------------------------- */
 .conv-view {
   display: grid;
-  grid-template-columns: minmax(280px, 340px) 1fr;
+  /* #228 S3 C1 — the reader track is minmax(0,1fr), not 1fr: a 1fr grid track
+     floors at min-content, so an unwrappable code line inside the reader would
+     widen the whole track. minmax(0,1fr) lets the reader column shrink so its
+     own min-width:0 chain (below) can contain the overflow internally. */
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
   gap: var(--space-3);
   /* Fill the viewport below the sticky topbar; the panes scroll, the
      shell itself does not (overflow hidden clips the rounded corners). */
@@ -5156,7 +5160,7 @@ mark.current {
 .conv-view--outline {
   grid-template-columns:
     minmax(280px, 340px)
-    1fr
+    minmax(0, 1fr)            /* #228 S3 C1 — see .conv-view note: reader track must floor at 0 */
     6px
     clamp(230px, var(--conv-outline-width, 290px), 480px);
 }
@@ -5171,7 +5175,7 @@ mark.current {
    untouched. */
 @media (min-width: 641px) and (max-width: 1100px) {
   .conv-view--outline {
-    grid-template-columns: minmax(280px, 340px) 1fr;
+    grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);   /* #228 S3 C1 — reader track floors at 0 */
   }
   .conv-view--outline > .conv-outline,
   .conv-view--outline > .conv-outline-resizer {
@@ -6536,6 +6540,10 @@ mark.current {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* #228 S3 C1 — as a grid child of .conv-view, min-width:0 lets the reader
+     column shrink below its content's min-content width so an inner unwrappable
+     code line can't widen the whole column (the containment chain's top link). */
+  min-width: 0;
   border: 1px solid var(--border-soft);
   border-radius: 6px;
   background: var(--panel-bg);
@@ -6676,7 +6684,16 @@ mark.current {
 .conv-reader-body {
   flex: 1 1 auto;
   min-height: 0;
+  /* #228 S3 C1 — min-width:0 keeps this flex child from being forced wider than
+     .conv-reader by an inner unwrappable line. overflow-x:hidden +
+     overscroll-behavior-x:contain promote the reading-column backstop to ALL
+     widths (mobile already clipped it): defense-in-depth on top of the
+     min-width:0 chain so even a future misbehaving block can't drag the column,
+     and a slightly-diagonal swipe stays vertical. */
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior-x: contain;
   padding: var(--space-4) var(--space-4);
   display: flex;
   flex-direction: column;
@@ -6690,7 +6707,17 @@ mark.current {
   flex-direction: column;
   gap: var(--space-3);
   padding-left: 22px;   /* gutter the spine + markers live in */
+  /* #228 S3 C1 — extend the #205 mobile clamp idiom to ALL widths: a flex
+     column floors at min-content width, so without min-width:0 an inner
+     unwrappable code line widens the thread and shears the whole transcript
+     (the desktop column drifted sideways too, not just mobile). */
+  min-width: 0;
 }
+/* #228 S3 C1 — clamp every DIRECT thread child at all widths (mirrors the #205
+   mobile `#root .conv-reader-thread > *` rule): .conv-item, .conv-sidechain, and
+   .conv-toolresult-run are all direct children, and any of them holding an
+   unwrappable line must shrink, not inflate the column. */
+.conv-reader-thread > * { min-width: 0; }
 /* #217 S4 QA fix — the thread carries tabIndex={-1} purely so onFindClose can
    restore focus here when the find bar closes (a focus-management container, not
    a visible focus target). Suppress the focus ring so the programmatic restore
@@ -6728,6 +6755,7 @@ mark.current {
   border-radius: 8px;
   padding: 10px var(--space-4);
   scroll-margin-top: 12px;
+  min-width: 0;   /* #228 S3 C1 — chain link: an item is a flex child of the thread AND the parent of the block walk */
 }
 .conv-item--human {
   background: rgba(96,165,250,0.05);          /* recessed blue-tinted input */
@@ -7039,12 +7067,14 @@ mark.current {
   flex-direction: column;
   gap: 6px;
   margin-top: var(--space-2);
+  min-width: 0;   /* #228 S3 C1 — flex column must floor at 0 so inner code can't widen it */
 }
 .conv-chip {
   border: 1px solid var(--border-soft);
   border-radius: 6px;
   background: var(--panel-bg-2);
   font-size: 12px;
+  min-width: 0;   /* #228 S3 C1 — chain link: a chip can't outgrow its flex column */
 }
 .conv-chip > summary {
   display: flex;
@@ -7062,6 +7092,30 @@ mark.current {
 .conv-chip--thinking > summary { color: var(--accent-indigo); }
 .conv-chip--tool > summary { color: var(--accent-cyan); }
 .conv-chip--result > summary { color: var(--accent-teal); }
+
+/* #228 S3 B1 — "quiet reasoning" treatment for the EXPANDED thinking body, so
+   reasoning stops reading like an answer. Distinction is carried by border +
+   wash + dim + italic + SIZE (never colour alone — the wave's north star), and
+   scoped strictly under .conv-chip--thinking so no other chip or prose moves.
+   The wash reuses S2's color-mix(--panel-bg N%, --accent-indigo) idiom. */
+.conv-chip--thinking[open] > .conv-chip-body {
+  border-left: 3px solid var(--accent-indigo);
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--accent-indigo));
+}
+.conv-chip--thinking .md {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: var(--fs-body);            /* 13.5px, down from the ~16.5px serif default */
+}
+/* Codex P2 — the italic must NOT bleed into inline `code` or fenced <pre>:
+   `.md code` / `.md pre` don't reset font-style, so without these resets
+   italicizing the .md container would render mono code in an unreadable italic.
+   Reset every code surface (inline, fenced, and their descendants) upright. */
+.conv-chip--thinking .md code,
+.conv-chip--thinking .md pre,
+.conv-chip--thinking .md pre * {
+  font-style: normal;
+}
 
 /* Chevron expand affordance (#164, C4): a rotated border triangle that
    turns down when the disclosure opens. Cheap transform transition only —
@@ -7115,6 +7169,7 @@ mark.current {
   font-size: 11.5px;
   color: var(--text);
   margin: 0;
+  min-width: 0;       /* #228 S3 C1 — chain link so the body can't outgrow its chip */
   overflow-x: auto;
 }
 /* Paired request/result body: a non-pre container holding two tool-io blocks. */
@@ -7132,6 +7187,7 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;   /* #228 S3 C1 — flex column floors at 0 so inner tool-io code can't widen it */
 }
 .conv-toolrun-head {
   display: flex;
@@ -7152,7 +7208,10 @@ mark.current {
 }
 
 /* ---- Paired tool-io request/result blocks ------------------------- */
-.conv-tool-io { margin-top: 6px; }
+/* #228 S3 C1 — min-width:0 so the tool-io block (which wraps the line-numbered
+   code grid) shrinks with its parent instead of inflating it; the caged
+   .conv-code--numbered grid does the internal horizontal scrolling. */
+.conv-tool-io { margin-top: 6px; min-width: 0; }
 .conv-tool-io:first-child { margin-top: 0; }
 .conv-tool-io-label {
   font-family: var(--font-mono);
@@ -7186,7 +7245,16 @@ mark.current {
 /* Read-result line-number gutter (tool I/O syntax highlighting). ONE scroll
    container so the gutter + code scroll together and stay row-aligned. */
 .conv-code--numbered {
-  display: grid; grid-template-columns: auto 1fr;
+  display: grid;
+  /* #228 S3 C1 — the code track is minmax(0,1fr), not 1fr: a 1fr track defaults
+     to min-width:min-content, so an unwrappable long line forces the track
+     wider than the container and (with no min-width:0 in the chain) the width
+     escapes UP into .conv-reader-body, dragging the reading column sideways.
+     minmax(0,1fr) lets the track shrink below content width; the grid (already
+     overflow:auto) becomes the internal h-scroll container with its sticky
+     gutter pinned, and max-width:100% caps the box at the column. */
+  grid-template-columns: auto minmax(0, 1fr);
+  max-width: 100%;
   font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
   background: var(--bg); border: 1px solid var(--border-soft); border-radius: 6px;
   max-height: 220px; overflow: auto;
@@ -7201,6 +7269,10 @@ mark.current {
   border: 0; border-radius: 0; margin: 0; background: transparent;
   padding: var(--space-2) 10px var(--space-2) var(--space-2); white-space: pre; overflow: visible;
   word-break: normal; overflow-wrap: normal;   /* reset .conv-code's break-word */
+  /* #228 S3 C1 — the pre sits in the minmax(0,1fr) code track; min-width:0 lets
+     it shrink with the track instead of projecting its intrinsic line width past
+     the caged grid (the grid does the internal horizontal scrolling). */
+  min-width: 0;
 }
 
 /* ---- Syntax-highlighted code blocks (C6) -------------------------- */
@@ -7597,6 +7669,7 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  min-width: 0;   /* #228 S3 C1 — chain link for orphan tool-result bodies */
 }
 
 /* ---- Subagent thread card (#161 D1–D3 / #165 §4.2) ---------------- */
@@ -7722,6 +7795,7 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;   /* #228 S3 C1 — chain link so nested subagent code can't widen the card */
   /* #228 S2 (A1) — tinted body wash so agent content reads as contained even
      where the spine dot is suppressed (mobile). SOLID composite so the role-dot
      knockout ring (below) can reuse this exact colour with no halo. */
