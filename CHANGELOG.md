@@ -5,7 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation viewer: agent/subagent threads now keep a sticky orientation header (and a tinted body wash) so you always know which agent you're reading at any scroll depth, with the pinned header doubling as an always-reachable collapse control; a discoverable expand-all/collapse-all control surfaces the existing `]`/`[` shortcuts. (#228 S2)
+
 ### Changed
+- Conversation viewer: agents spawned from a main turn now sit on the main thread spine with the magenta branch-dot and a stronger card instead of being indented like nested agents; only true agent-in-agent nesting indents (progressively, at any depth). A `↳ launched <kind> agent` connector now marks where each subagent was launched. (#228 S2)
 - **Dashboard conversation viewer — consistent keyboard-focus rings and a spacing rhythm applied viewer-wide.** Every interactive element in the conversation viewer now shows the same blue keyboard-focus ring — replacing the previous mix of border-colour, outline, and inset-shadow styles — including rows inside scrolling lists (where the ring is drawn inset so it no longer clips against the list edge), the full-width comparison rows, and the `Export ▾` button (which previously showed no ring at all); and the viewer's hard-coded padding/margin/gap values are put onto a shared 8px spacing scale, snapping a handful of off-grid values (mostly by ~1px) so spacing reads more evenly, while deliberately tight spacing and nesting indents are left untouched. No behavioural change beyond the visual normalization. (#229)
 
 ### Fixed
