@@ -243,17 +243,44 @@ export function SidechainGroup({
         forceOpen ? 'conv-sidechain--force' : '',
         riseClassName,
       ].filter(Boolean).join(' ')}
-      style={depth >= 1 ? { ...riseStyle, ['--sc-depth' as string]: depth } as React.CSSProperties : riseStyle}
+      style={depth >= 1 ? { ...riseStyle, ['--sc-depth' as string]: String(depth) } as React.CSSProperties : riseStyle}
       open={open}
       onToggle={(e) => {
-        const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+        const details = e.currentTarget as HTMLDetailsElement;
+        const isOpen = details.open;
+        // #228 S2 (A1) — collapsing a long thread via its (pinned) header would
+        // otherwise let the native <details> collapse + the browser's
+        // scroll-anchoring fling the viewport far from the card. The summary's
+        // onClick added `--snap` (transition:none) so this collapse is instant;
+        // now re-pin the collapsed card's header to the top of the
+        // .conv-reader-body scroller so the collapse lands where the user clicked.
+        // Guarded by the snap marker, so a bulk sweep (which sets .open directly,
+        // with no summary click) never re-pins.
+        if (!isOpen && details.classList.contains('conv-sidechain--snap')) {
+          const scroller = details.closest('.conv-reader-body') as HTMLElement | null;
+          if (scroller) {
+            const delta = details.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+            if (delta < 0) scroller.scrollTop += delta;
+          }
+          details.classList.remove('conv-sidechain--snap');
+        }
         setUserOpen(isOpen);
         // #188 S4/C1 — report the new open-state to the reader so the live-append
         // pill counts an append into THIS thread only while it's expanded (Bug 5).
         onOpenChange?.(subagentKey, isOpen);
       }}
     >
-      <summary className="conv-sidechain-head">
+      <summary
+        className="conv-sidechain-head"
+        onClick={(e) => {
+          // #228 S2 (A1) — about to collapse: suppress the height animation so the
+          // collapse is instant and onToggle can re-pin the card without fighting a
+          // 240ms block-size transition + scroll-anchoring. No preventDefault — the
+          // native <details> toggle still runs.
+          const details = e.currentTarget.parentElement as HTMLDetailsElement | null;
+          if (details?.open) details.classList.add('conv-sidechain--snap');
+        }}
+      >
         <span className="conv-sidechain-glyph" aria-hidden="true"><SubagentIcon /></span>
         <span className="conv-sidechain-headtext">
           <span className="conv-sidechain-kind">

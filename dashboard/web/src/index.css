@@ -7019,6 +7019,10 @@ mark.current {
 /* A #160 force-open snaps instantly so layout is final before the scroll
    lands; the class drops afterward and later user toggles animate. */
 .conv-sidechain--force::details-content { transition: none; }
+/* #228 S2 (A1) — user click-collapse adds this transiently so the collapse is
+   instant (no 240ms height animation to fight), letting onToggle re-pin the
+   collapsed card to the scroller top instead of the viewport flinging away. */
+.conv-sidechain--snap::details-content { transition: none; }
 @media (prefers-reduced-motion: reduce) {
   .conv-reader ::details-content,
   /* Codex P3: the chevron rotate transition (above) is gated here too. */

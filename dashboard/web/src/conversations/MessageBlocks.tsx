@@ -36,8 +36,8 @@ function ChipName({ name }: { name: string | null | undefined }) {
 function SpawnConnector({ kind }: { kind: string }) {
   return (
     <div className="conv-spawn-connector">
-      <span className="conv-spawn-connector-arc" aria-hidden="true">↳</span>{' '}
-      {kind ? `launched ${kind} agent` : 'launched agent'}
+      <span className="conv-spawn-connector-arc" aria-hidden="true">↳</span>
+      <span>{kind ? `launched ${kind} agent` : 'launched agent'}</span>
     </div>
   );
 }
@@ -129,7 +129,7 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKin
           const kind = tc.tool_use_id != null ? spawnKindByToolUseId?.get(tc.tool_use_id) : undefined;
           if (!chat && kind !== undefined) {
             flushRun();
-            out.push(<SpawnConnector key={`sc${out.length}`} kind={kind} />);
+            out.push(<SpawnConnector key={`sc-${tc.tool_use_id}`} kind={kind} />);
           }
           // else: paged-out spawn (suppressed, not loaded) → render nothing.
         } else {
