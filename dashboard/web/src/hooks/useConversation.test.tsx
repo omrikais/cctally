@@ -863,3 +863,154 @@ describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => 
     expect(result.current.hasMore).toBe(false);
   });
 });
+
+describe('useConversation — windowed DOM cap (#228 S3 B3)', () => {
+  // The cap is WINDOW_CAP_ITEMS = 2 * PAGE = 1000 items. Build oversize windows to
+  // drive the trim. Each item's anchor.id == its uuid index, so the reset cursor
+  // assertions read the new edge item's id directly.
+  function bigItems(start: number, count: number, over: (i: number) => Record<string, unknown> = () => ({})) {
+    const out: unknown[] = [];
+    for (let i = start; i < start + count; i++) {
+      out.push({
+        kind: 'human', anchor: { session_id: 's', uuid: `u${i}`, id: i },
+        member_uuids: [`u${i}`], ts: 't', text: `t${i}`, blocks: [], is_sidechain: false,
+        ...over(i),
+      });
+    }
+    return out;
+  }
+  function pageDetail(items: unknown[], edges: { next_after?: number | null; has_more?: boolean; prev_before?: number | null; has_prev?: boolean }) {
+    return {
+      session_id: 's', project_label: 'p', git_branch: null,
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 3, models: ['opus'], items,
+      page: {
+        next_after: edges.next_after ?? null, has_more: edges.has_more ?? (edges.next_after != null),
+        prev_before: edges.prev_before ?? null, has_prev: edges.has_prev ?? false,
+      },
+    };
+  }
+  const ids = (result: { current: { detail: { items: { anchor: { id: number } }[] } | null } }) =>
+    (result.current.detail?.items ?? []).map((i) => i.anchor.id);
+
+  it('an over-cap PREPEND trims the far BOTTOM and flips hasMore (bottom cursor re-armed)', async () => {
+    // Tail window: ids 600..1199 (600 items), at the bottom (next_after null), top
+    // armed (prev_before 599).
+    mockOnce(pageDetail(bigItems(600, 600), { next_after: null, has_more: false, prev_before: 599, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(600));
+    expect(result.current.hasMore).toBe(false);
+
+    // Reverse page: ids 0..599 (600 items) prepended → 1200-item window → over the
+    // 1000 cap → drop the far bottom 200 → keep ids 0..999.
+    mockOnce(pageDetail(bigItems(0, 600), { prev_before: null, has_prev: false }));
+    await act(async () => {
+      await result.current.loadPrev();
+      // let the decoupled trim (passive effect keyed on lastOp.rev) run + commit
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1000));
+
+    const got = ids(result);
+    expect(got[0]).toBe(0);           // top (just-prepended) preserved
+    expect(got[got.length - 1]).toBe(999);  // far bottom dropped back to the cap
+    // The bottom edge re-armed so scroll-down re-fetches the dropped tail.
+    expect(result.current.hasMore).toBe(true);
+    // The trim WindowOp carries the drop counts.
+    expect(result.current.lastOp?.droppedBottom).toBe(200);
+    expect(result.current.lastOp?.droppedTop).toBe(0);
+  });
+
+  it('an over-cap APPEND trims the far TOP and flips hasPrev (top cursor re-armed)', async () => {
+    // Head window: ids 0..599 (600 items), forward armed (next_after 599), top
+    // exhausted (has_prev false) — a legacy head open.
+    mockOnce(pageDetail(bigItems(0, 600), { next_after: 599, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(600));
+    expect(result.current.hasPrev).toBe(false);
+
+    // Forward page: ids 600..1199 (600 items) appended → 1200 → drop the far top
+    // 200 → keep ids 200..1199.
+    mockOnce(pageDetail(bigItems(600, 600), { next_after: null, has_more: false }));
+    await act(async () => {
+      await result.current.loadMore();
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1000));
+
+    const got = ids(result);
+    expect(got[0]).toBe(200);          // far top dropped back to the cap
+    expect(got[got.length - 1]).toBe(1199);  // bottom (just-appended) preserved
+    // The top edge re-armed so scroll-up re-fetches the dropped head.
+    expect(result.current.hasPrev).toBe(true);
+    expect(result.current.lastOp?.droppedTop).toBe(200);
+    expect(result.current.lastOp?.droppedBottom).toBe(0);
+  });
+
+  it('a PROTECTED uuid is never dropped — the trim stops short (trims less that round)', async () => {
+    // Same prepend-over-cap setup, but protect a uuid that the unguarded trim
+    // WOULD drop (id 1100, deep in the far-bottom drop zone). The trim must keep
+    // through it → keep ids 0..1100 (1101 items, only 99 dropped).
+    const protectedSet = new Set(['u1100']);
+    mockOnce(pageDetail(bigItems(600, 600), { next_after: null, has_more: false, prev_before: 599, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { openIntent: { kind: 'tail' }, protectedUuids: protectedSet }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(600));
+
+    mockOnce(pageDetail(bigItems(0, 600), { prev_before: null, has_prev: false }));
+    await act(async () => {
+      await result.current.loadPrev();
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1101));
+
+    const got = ids(result);
+    expect(got).toContain(1100);                 // the protected uuid survived
+    expect(got[got.length - 1]).toBe(1100);      // trim stopped exactly at it
+    expect(result.current.lastOp?.droppedBottom).toBe(99);
+  });
+
+  it('does NOT trim while a fetch is in flight (the trim waits for the window to settle)', async () => {
+    // Open over-cap directly (1200 items in ONE page would already exceed the cap,
+    // but the trim only fires on append/prepend, not reset — so seed a 600 tail).
+    mockOnce(pageDetail(bigItems(600, 600), { next_after: null, has_more: false, prev_before: 599, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(600));
+
+    // Arm a SLOW reverse page (resolves on command) and, while it's in flight, a
+    // forward page so loadingPrevRef is set when an op would fire. We assert that
+    // mid-flight the window is NOT trimmed (it grows to 1200 only after settle,
+    // then trims). The guard is the in-flight ref, proven by no early trim op.
+    let resolvePrev!: () => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { resolvePrev = () => res({ ok: true, status: 200, json: async () => pageDetail(bigItems(0, 600), { prev_before: null, has_prev: false }) } as Response); }),
+    );
+    await act(async () => {
+      const p = result.current.loadPrev();
+      // While in flight: no commit yet, window still 600, no trim op fired.
+      expect(result.current.detail?.items).toHaveLength(600);
+      resolvePrev();
+      await p;
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    // After settle the trim runs once (1200 → 1000).
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1000));
+    expect(result.current.lastOp?.droppedBottom).toBe(200);
+  });
+
+  it('stays a no-op below the cap (a normal small window is never trimmed)', async () => {
+    mockOnce(pageDetail(bigItems(0, 2), { next_after: 1, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    mockOnce(pageDetail(bigItems(2, 2), { next_after: null, has_more: false }));
+    await act(async () => {
+      await result.current.loadMore();
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    // No drop — the op is the plain append, not a trim.
+    expect(result.current.lastOp?.op).toBe('append');
+    expect(result.current.lastOp?.droppedTop).toBe(0);
+    expect(result.current.lastOp?.droppedBottom).toBe(0);
+    expect(result.current.hasPrev).toBe(false);
+  });
+});

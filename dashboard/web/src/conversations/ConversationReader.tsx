@@ -134,8 +134,26 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     return { kind: 'tail' };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent });
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
+  // #228 S3 B3 — read the protected-anchor sources BEFORE the hook so the
+  // windowed-cap trim never drops the turn the user is on / navigating to. The
+  // current-turn + pinned reads are also used below; declared once here.
+  const currentTurnUuidEarly = useSyncExternalStore(subscribeStore, () => getState().convCurrentTurnUuid);
+  const convPinnedUuidEarly = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
+  // The set passed INTO the hook (Codex P1 — the hook doesn't own these anchors):
+  // the active find match + in-flight jump target (both flow through
+  // `conversationJump` for THIS session), the keyboard current turn, and the
+  // explicit pin. Memoized on the member uuids so identity is stable between
+  // unrelated renders.
+  const jumpUuidForSession = jump && jump.session_id === sessionId ? jump.uuid : null;
+  const protectedUuids = useMemo(() => {
+    const s = new Set<string>();
+    if (jumpUuidForSession) s.add(jumpUuidForSession);
+    if (currentTurnUuidEarly) s.add(currentTurnUuidEarly);
+    if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
+    return s;
+  }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids });
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
@@ -168,12 +186,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // cursor uuid. focusMode drives the `visible` pipeline below; the cursor uuid
   // seeds jump-to-next.
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
-  const currentTurnUuid = useSyncExternalStore(subscribeStore, () => getState().convCurrentTurnUuid);
-  // #188 B5 — the explicit-selection pin. The keyboard jump-to-next (e/u/b/p)
-  // resolves its cursor from `pinned ?? currentTurnUuid` so a repeat forward
-  // press steps strictly past where the last jump LANDED (closes #187), not past
-  // the scroll-sync topmost-visible turn (which sits above a centered target).
-  const convPinnedUuid = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
+  // #228 S3 B3 — reuse the early reads (declared above the hook for protectedUuids)
+  // so there's one subscription per store slice. The keyboard jump-to-next
+  // (e/u/b/p) resolves its cursor from `pinned ?? currentTurnUuid` so a repeat
+  // forward press steps strictly past where the last jump LANDED (#188 B5 / #187).
+  const currentTurnUuid = currentTurnUuidEarly;
+  const convPinnedUuid = convPinnedUuidEarly;
   // #217 S6 F4 — the current session's bookmarks, threaded into the reader's
   // buildOutlineTargets memo so the `bookmark` jump list (the i/I keys) stays in
   // lock-step with the OutlinePanel cluster. A toggle re-derives the targets.

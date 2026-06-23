@@ -3,6 +3,7 @@ import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import { getState, selectLiveTailEnabled, subscribeStore } from '../store/store';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
+import { planTrim } from '../conversations/windowedCap';
 import type { ConversationDetail, ConversationItem, OpenIntent, OutlineTurn } from '../types/conversation';
 
 // #217 S3 E2 — the bidirectional windowed reader pager. The reader holds ONE
@@ -42,6 +43,11 @@ export interface WindowOp {
   addedBottom: number;
   droppedTop: number;
   droppedBottom: number;
+  // #228 S3 B3 — true when THIS op is the windowed-cap trim itself (a pure drop).
+  // The trim effect skips a trim-origin op so it can't recurse, and the reader's
+  // append/stick path treats it as a no-op (addedBottom is 0). A non-trim paging
+  // op leaves this undefined.
+  trim?: true;
 }
 
 export interface UseConversation {
@@ -92,6 +98,17 @@ const PAGE = 500;
 // tight. Items OUTSIDE the window are never touched (earlier pages preserved).
 const TAIL_WINDOW = 10;
 
+// #228 S3 B3 — the soft windowed-DOM cap, in ITEMS. Page-aligned to PAGE so the
+// trim drops whole pages and never strands a partial page. Kept ≤ 2 pages so the
+// loaded window is bounded at ~1000 items on a very long transcript (one 500-item
+// page can alone be ~650k DOM nodes at the audit's worst ~1.3k nodes/item, so two
+// is the ceiling). The exact cap K and whether to LOWER `PAGE` (e.g. to ~150–200,
+// so the cap bites harder and the initial tail page isn't itself oversized) is a
+// ui-qa tuning decision against the real long #217 transcripts — any reduction
+// must preserve TAIL_WINDOW=10 (the live-tail overlap) and the server's ≤1000
+// per-request limit. Trimming never crosses a protected uuid (windowedCap.ts).
+const WINDOW_CAP_ITEMS = 2 * PAGE;
+
 export interface UseConversationOptions {
   // #217 S3 E2 — the full-session outline turns, for `loadToTarget`'s nearest-edge
   // direction decision + member-uuid resolution. Independent of the loaded
@@ -101,10 +118,20 @@ export interface UseConversationOptions {
   // follows it: 'anchor'/'restore' → loadToTarget(uuid); 'tail' → ?tail=1.
   // Omitted/undefined → the legacy head-fetch (?limit=500).
   openIntent?: OpenIntent | null;
+  // #228 S3 B3 — uuids the windowed-DOM-cap trim must NEVER drop (the active find
+  // match, the current/pinned turn, an in-flight jump target). The hook can't own
+  // these (they live in FindBar / the store / loadToTarget's caller), so the
+  // reader assembles the set and passes it in. The trim skips any page holding a
+  // member of this set.
+  protectedUuids?: Set<string>;
 }
 
 export function useConversation(sessionId: string | null, opts: UseConversationOptions = {}): UseConversation {
-  const { outlineTurns, openIntent } = opts;
+  const { outlineTurns, openIntent, protectedUuids } = opts;
+  // Live mirror so the ref-stable trim effect reads the latest protected set
+  // without re-creating itself (mirrors outlineTurnsRef).
+  const protectedUuidsRef = useRef<Set<string> | undefined>(protectedUuids);
+  protectedUuidsRef.current = protectedUuids;
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -536,6 +563,75 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, transcriptsEnabled, liveTailEnabled]);
+
+  // ── #228 S3 B3 — the decoupled windowed-DOM-cap trim ───────────────────────
+  // Applied on a FOLLOW-UP passive effect keyed on `lastOp.rev`, NEVER in the
+  // same commit as the paging mutation (the Codex P0 hazard: a same-commit
+  // prepend+far-trim nets the scrollHeight delta and breaks the anchor restore).
+  // A passive effect runs after the commit's layout effects (the prepend's
+  // anchor-restore / the append's stick) AND after the browser paints, so the
+  // far-edge drop — already off-screen — is invisible and never coincides with a
+  // measurement. The brief DOM peak of cap+1 page before this fires is accepted.
+  useEffect(() => {
+    const op = lastOp;
+    if (!op || op.trim) return;  // the trim's own op must never re-trigger a trim (no recursion)
+    if (op.op !== 'append' && op.op !== 'prepend') return;  // reset / no op → nothing to trim
+    // Never trim while ANY fetch is in flight (forward / reverse / live-tail) —
+    // a trim must not race an in-progress page apply or the overlap re-fetch.
+    const fetchInFlight = loadingMoreRef.current || loadingPrevRef.current || pollingRef.current;
+    const items = detailRef.current?.items;
+    if (!items) return;
+    const plan = planTrim({
+      items,
+      op: op.op,
+      cap: WINDOW_CAP_ITEMS,
+      protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
+      fetchInFlight,
+    });
+    if (plan.keep === items) return;  // no-op (under cap / in-flight / all-protected)
+
+    // Apply `keep` + reset ONLY the opposite edge cursor + its has-more flag, then
+    // emit a trim op carrying the drop counts so the reader knows the window
+    // shrank. The opposite-edge invariant mirrors the pager: a bottom-drop touches
+    // ONLY the bottom edge (nextAfterRef / page.next_after / has_more); a top-drop
+    // ONLY the top edge (prevBeforeRef / page.prev_before / has_prev).
+    if (plan.droppedBottom > 0) {
+      // Prepend trimmed the bottom → re-arm the bottom cursor so scroll-down
+      // re-fetches the dropped tail; the top edge is untouched.
+      nextAfterRef.current = plan.resetBottomCursorTo;
+      setDetailSynced((prev) => (prev ? {
+        ...prev,
+        items: plan.keep,
+        page: { ...prev.page, next_after: plan.resetBottomCursorTo, has_more: true },
+      } : prev));
+    } else if (plan.droppedTop > 0) {
+      // Append / live-tail trimmed the top → re-arm the top cursor so scroll-up
+      // re-fetches the dropped head; the bottom edge (and the live-tail gate) is
+      // untouched.
+      prevBeforeRef.current = plan.resetTopCursorTo;
+      setHasPrev(true);
+      setDetailSynced((prev) => (prev ? {
+        ...prev,
+        items: plan.keep,
+        page: { ...prev.page, prev_before: plan.resetTopCursorTo, has_prev: true },
+      } : prev));
+    } else {
+      return;
+    }
+    // The trim is itself a window mutation — emit `op: 'append'` (so the reader's
+    // anchor-restore, which keys on `op === 'prepend'`, never fires) with
+    // addedBottom 0 (so the reader neither sticks nor counts) carrying the dropped
+    // counts, and `trim: true` so this effect skips it (no recursion). One pass
+    // per paging op: a protected-uuid round may leave the window above the cap,
+    // but it does NOT re-trim (which would drop the OTHER edge and defeat the
+    // protection) — the cap re-applies on the NEXT genuine paging op.
+    emitOp({
+      op: 'append', addedTop: 0, addedBottom: 0,
+      droppedTop: plan.droppedTop, droppedBottom: plan.droppedBottom,
+      trim: true,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastOp?.rev]);
 
   return {
     detail: exposedDetail, loading: exposedLoading, error,
