@@ -67,7 +67,7 @@ function notificationSummary(s: string): string {
 // A top-level tool_result item (empty prose) collapses into a single disclosure
 // wrapping its blocks. Memoized for long transcripts.
 function MessageItemImpl(
-  { item, className = '', style, suppressToolUseIds }: {
+  { item, className = '', style, suppressToolUseIds, spawnKindByToolUseId }: {
     item: ConversationItem;
     className?: string;
     style?: React.CSSProperties;
@@ -76,6 +76,10 @@ function MessageItemImpl(
     // sits (main item AND subagent-thread item — a grandchild's spawn lives in a
     // child thread). A stable Set identity (reader-memoized) keeps the memo valid.
     suppressToolUseIds?: Set<string>;
+    // #228 S2 (A3) — tool_use_id → kind for LOADED spawns; forwarded alongside
+    // suppressToolUseIds so a suppressed spawn renders the "↳ launched <kind>
+    // agent" connector in place (main item AND subagent-thread item).
+    spawnKindByToolUseId?: Map<string, string>;
   },
   ref: React.ForwardedRef<HTMLDivElement>,
 ) {
@@ -117,7 +121,7 @@ function MessageItemImpl(
             <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} className="conv-chip-permalink" />
             {eyebrow}
           </summary>
-          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} /></div>
+          <div className="conv-chip-body"><MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} /></div>
         </details>
       </div>
     );
@@ -167,7 +171,7 @@ function MessageItemImpl(
         </div>
         {/* Document-order walk renders prose (from text blocks) + thinking +
             tool runs in order — no separate item.text render (#164). */}
-        <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
+        <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
         {item.text && (
           // Hover/focus-revealed action copying the turn's joined prose. Only
           // when there IS prose — a tool-only assistant turn renders none.
@@ -268,7 +272,7 @@ function MessageItemImpl(
             </div>
           ) : (
             <div className="conv-meta-body">
-              <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
+              <MessageBlocks blocks={item.blocks} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
               {mk === 'skill' && item.text && (
                 <div className="conv-item-actions">
                   <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
@@ -319,7 +323,7 @@ function MessageItemImpl(
       {item.text && <Markdown>{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}
-      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} />
+      <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
       {item.text && (
         <div className="conv-item-actions">
           <PermalinkButton sessionId={item.anchor.session_id} uuid={item.anchor.uuid} />
@@ -337,6 +341,7 @@ export const MessageItem = memo(
     className?: string;
     style?: React.CSSProperties;
     suppressToolUseIds?: Set<string>;
+    spawnKindByToolUseId?: Map<string, string>;
   }>(
     MessageItemImpl,
   ),

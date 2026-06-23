@@ -7735,6 +7735,19 @@ mark.current {
   margin-left: calc(var(--sc-indent-base) + (var(--sc-depth, 1) - 1) * var(--sc-indent-step));
 }
 
+/* #228 S2 (A3) — spawn → agent connector (replaces the suppressed spawn chip). */
+.conv-spawn-connector {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 2px 0 2px 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.02em;
+  color: var(--agent-accent);
+}
+.conv-spawn-connector-arc { font-size: 13px; line-height: 1; }
+
 /* ---- Markdown prose ----------------------------------------------- */
 .md {
   font-family: var(--font-prose);

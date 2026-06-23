@@ -58,6 +58,9 @@ export interface SidechainChildContext {
   // so a grandchild's spawn chip (which lives in a CHILD thread item) is also
   // suppressed in favor of its nested card.
   suppressToolUseIds?: Set<string>;
+  // #228 S2 (A3) — the loaded-spawn kind map, threaded the same way so a nested
+  // thread's spawns also render the "↳ launched <kind> agent" connector.
+  spawnKindByToolUseId?: Map<string, string>;
   // #205 S3 (F7) — threaded so a nested card abbreviates models + widens its
   // title cap on mobile WITHOUT a per-card matchMedia listener.
   isMobile?: boolean;
@@ -300,6 +303,9 @@ export function SidechainGroup({
                 // §5 — suppress a spawn chip inside this thread (a child's spawn
                 // lives in THIS thread's items when THIS is the parent).
                 suppressToolUseIds={childCtx?.suppressToolUseIds}
+                // #228 S2 (A3) — the loaded-spawn kind map so a nested-thread
+                // spawn renders its connector too.
+                spawnKindByToolUseId={childCtx?.spawnKindByToolUseId}
               />
               {after?.map(renderChild)}
             </Fragment>

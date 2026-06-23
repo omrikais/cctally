@@ -281,6 +281,64 @@ describe('MessageBlocks — spawn-chip suppression (§5 / Codex P1-C)', () => {
     );
     expect(container.querySelector('.conv-chip--tool')).not.toBeNull();
   });
+
+  it('renders a kind-aware connector for a suppressed+LOADED spawn (connector ⟺ card)', () => {
+    render(
+      <MessageBlocks
+        blocks={[call({ name: 'Agent', preview: 'Spawn child', tool_use_id: 'tu_spawn' })]}
+        suppressToolUseIds={new Set(['tu_spawn'])}
+        spawnKindByToolUseId={new Map([['tu_spawn', 'Explore']])}
+      />,
+    );
+    expect(screen.getByText(/launched Explore agent/i)).toBeInTheDocument();
+  });
+
+  it('renders a generic connector when the kind is empty', () => {
+    render(
+      <MessageBlocks
+        blocks={[call({ name: 'Agent', preview: 'Spawn child', tool_use_id: 'tu_spawn' })]}
+        suppressToolUseIds={new Set(['tu_spawn'])}
+        spawnKindByToolUseId={new Map([['tu_spawn', '']])}
+      />,
+    );
+    expect(screen.getByText(/launched agent/i)).toBeInTheDocument();
+  });
+
+  it('suppresses WITHOUT a connector when the spawn is paged out (in suppress set, NOT in the loaded map)', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'Agent', preview: 'Spawn child', tool_use_id: 'tu_spawn' })]}
+        suppressToolUseIds={new Set(['tu_spawn'])}
+        spawnKindByToolUseId={new Map()}
+      />,
+    );
+    expect(container.querySelector('.conv-spawn-connector')).toBeNull();
+    expect(container.querySelector('.conv-chip--tool')).toBeNull();
+  });
+
+  it('keeps document order: [tool, spawnA, spawnB, tool] → tool, ↳A, ↳B, tool', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[
+          call({ name: 'Read', preview: '/one.txt', tool_use_id: 'tu_read1' }),
+          call({ name: 'Agent', preview: 'child A', tool_use_id: 'tu_a' }),
+          call({ name: 'Agent', preview: 'child B', tool_use_id: 'tu_b' }),
+          call({ name: 'Write', preview: '/two.txt', tool_use_id: 'tu_write' }),
+        ]}
+        suppressToolUseIds={new Set(['tu_a', 'tu_b'])}
+        spawnKindByToolUseId={new Map([['tu_a', 'Explore'], ['tu_b', 'general-purpose']])}
+      />,
+    );
+    // Two connectors sit BETWEEN the two tool runs (not appended after).
+    const kids = Array.from(container.querySelector('.conv-blocks')!.children);
+    const classes = kids.map((el) => el.className);
+    const firstConn = classes.findIndex((c) => c.includes('conv-spawn-connector'));
+    const lastRun = classes.length - 1;
+    expect(kids[0].textContent).toContain('/one.txt');       // first run
+    expect(firstConn).toBe(1);                                // connector A right after
+    expect(kids[firstConn + 1].className).toContain('conv-spawn-connector'); // connector B
+    expect(kids[lastRun].textContent).toContain('/two.txt');  // last run after both connectors
+  });
 });
 
 describe('MessageBlocks — chat focus mode block suppression (#177 S5)', () => {

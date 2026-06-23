@@ -31,6 +31,17 @@ function ChipName({ name }: { name: string | null | undefined }) {
   );
 }
 
+// #228 S2 (A3) — the spawn→agent connector that replaces a suppressed spawn
+// chip, making the spawn→work flow explicit.
+function SpawnConnector({ kind }: { kind: string }) {
+  return (
+    <div className="conv-spawn-connector">
+      <span className="conv-spawn-connector-arc" aria-hidden="true">↳</span>{' '}
+      {kind ? `launched ${kind} agent` : 'launched agent'}
+    </div>
+  );
+}
+
 type ToolCall = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
 // Claude Code's live to-do family. A run of these whose FIRST call carries a
@@ -60,7 +71,7 @@ function isTaskChecklistRun(calls: ToolCall[]): boolean {
 // degradation) and `tool_result` (orphan item only) render as single chips too.
 // This single source of truth is used by both the assistant turn (which renders
 // its prose-from-text-blocks here, in order) and the human turn.
-export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds }: {
+export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKindByToolUseId }: {
   blocks: ConversationBlock[];
   anchorUuid?: string | null;
   // §5 (Codex P1-C) — the set of spawn `tool_use_id`s whose nested subagent card
@@ -70,6 +81,12 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds }: {
   // spawns; an unresolved spawn (no nested card, e.g. >16 KB clip) is NOT in the
   // set so its chip still renders.
   suppressToolUseIds?: Set<string>;
+  // #228 S2 (A3) — tool_use_id → subagent kind for spawns whose card IS loaded
+  // (built from flattenSubagents, so the map omits paged-out spawns). A
+  // suppressed spawn in this map renders a "↳ launched <kind> agent" connector
+  // IN PLACE of the dropped chip; a suppressed spawn NOT in the map (paged out)
+  // renders nothing — connector ⟺ card present.
+  spawnKindByToolUseId?: Map<string, string>;
 }) {
   // #177 S5 — chat focus mode strips tool/orphan-result texture so a turn reads
   // as prose-only conversation. text + thinking render unchanged; tool_call /
@@ -95,20 +112,32 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds }: {
     }
     flushText();
     if (b.kind === 'tool_call') {
-      const run: Extract<ConversationBlock, { kind: 'tool_call' }>[] = [];
+      let run: Extract<ConversationBlock, { kind: 'tool_call' }>[] = [];
+      const flushRun = () => {
+        // chat mode suppresses tool runs entirely (prose only).
+        if (!chat && run.length) out.push(<ToolRun key={`r${out.length}`} calls={run} />);
+        run = [];
+      };
       while (i < blocks.length && blocks[i].kind === 'tool_call') {
         const tc = blocks[i] as Extract<ConversationBlock, { kind: 'tool_call' }>;
-        // §5 — drop a spawn tool_call whose nested subagent card is canonical.
-        // tool_use_id granularity (one item can hold several spawns); a spawn
-        // not in the set (unresolved / clipped) still renders its chip.
-        if (!(tc.tool_use_id != null && suppressToolUseIds?.has(tc.tool_use_id))) {
+        const suppressed = tc.tool_use_id != null && suppressToolUseIds?.has(tc.tool_use_id);
+        if (suppressed) {
+          // §5 — the spawn's nested card is canonical, so the chip is dropped.
+          // #228 S2 (A3) — if the card is LOADED (in the kind map), emit a
+          // connector in document position; flush the current run first so
+          // [tool, spawn, spawn, tool] renders in order, not connectors-after-run.
+          const kind = tc.tool_use_id != null ? spawnKindByToolUseId?.get(tc.tool_use_id) : undefined;
+          if (!chat && kind !== undefined) {
+            flushRun();
+            out.push(<SpawnConnector key={`sc${out.length}`} kind={kind} />);
+          }
+          // else: paged-out spawn (suppressed, not loaded) → render nothing.
+        } else {
           run.push(tc);
         }
         i++;
       }
-      // After suppression a run can become empty (the item held ONLY spawns) —
-      // emit nothing in that case rather than an empty run head.
-      if (!chat && run.length) out.push(<ToolRun key={`r${out.length}`} calls={run} />);
+      flushRun();
       continue;
     }
     // chat mode suppresses the tool_use degradation chip + orphan tool_result

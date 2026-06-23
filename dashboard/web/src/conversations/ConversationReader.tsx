@@ -579,6 +579,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     return s;
   }, [detail?.subagent_meta]);
+  // #228 S2 (A3) — tool_use_id → kind for spawns whose subagent card is LOADED
+  // (walk the emitted render tree, NOT whole-session subagent_meta), so a
+  // connector never dangles above a paged-out agent. `suppressToolUseIds` stays
+  // whole-session (to avoid a duplicate chip when a paged-out agent later
+  // loads), but a spawn whose bucket is still paged out is ABSENT here, so it
+  // renders neither a chip (suppressed) nor a dangling connector. Stable
+  // identity (memoized) keeps the memoized MessageItems valid across ticks.
+  const spawnKindByToolUseId = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const node of flattenSubagents(groups)) {
+      const meta = detail?.subagent_meta?.[node.subagentKey];
+      if (meta?.spawn_tool_use_id) m.set(meta.spawn_tool_use_id, meta.kind ?? '');
+    }
+    return m;
+  }, [groups, detail?.subagent_meta]);
   // #177 S5 §5 — focus-mode-filtered render list. `all` short-circuits to the
   // SAME `groups` array identity (byte-identical render path); other modes drop
   // suppressed nodes and coalesce them into `hidden_run` markers. EVERYTHING the
@@ -1162,9 +1177,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       getCardRef,
       onOpenChange: handleSubagentOpenChange,
       suppressToolUseIds,
+      spawnKindByToolUseId,
       isMobile,
     }),
-    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds, isMobile],
+    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds, spawnKindByToolUseId, isMobile],
   );
 
   // Reset the focused-turn cursor to the top on a session switch (the reused
@@ -1845,7 +1861,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                   </summary>
                   <div className="conv-toolresult-run-body">
                     {g.items.map((item) => (
-                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} />
+                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
                     ))}
                   </div>
                 </details>
@@ -1862,6 +1878,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                 // §5 — suppress a spawn chip on a main-thread item (its nested
                 // subagent card is canonical).
                 suppressToolUseIds={suppressToolUseIds}
+                // #228 S2 (A3) — the loaded-spawn kind map for the connector that
+                // replaces a suppressed spawn chip (main-thread spawns).
+                spawnKindByToolUseId={spawnKindByToolUseId}
               />
             );
           })}
