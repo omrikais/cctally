@@ -7614,6 +7614,23 @@ mark.current {
   user-select: none;
   list-style: none;
 }
+/* #228 S2 (A1) — depth-0 agent header pins to the .conv-reader-body scroller
+   while its card is in view, releasing when scrolled past, so an agent is always
+   identifiable at any scroll depth. The pinned bar is opaque (--sc-head-bg) with
+   a hairline rule so body content scrolls cleanly under it; it stays the native
+   click-to-collapse target, now reachable from anywhere in a long thread. top:0
+   assumes the reader toolbar is OUTSIDE .conv-reader-body (verified) — if not,
+   set top to the toolbar height. Scoped to the direct-child summary so only
+   depth-0 cards stick (nested summaries sit inside a parent's overflow:hidden
+   ::details-content where sticky can't escape). */
+.conv-reader-thread > .conv-sidechain > .conv-sidechain-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--sc-head-bg);
+  border-bottom: 1px solid rgba(217, 70, 239, 0.22);
+  border-radius: 10px 10px 0 0;
+}
 .conv-sidechain-head::-webkit-details-marker { display: none; }
 .conv-sidechain-head:hover { background: rgba(217,70,239,0.04); }
 .conv-sidechain-glyph {
@@ -7685,6 +7702,10 @@ mark.current {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* #228 S2 (A1) — tinted body wash so agent content reads as contained even
+     where the spine dot is suppressed (mobile). SOLID composite so the role-dot
+     knockout ring (below) can reuse this exact colour with no halo. */
+  background: var(--sc-body-wash);
 }
 .conv-sidechain-body::before {
   content: "";
@@ -7700,7 +7721,9 @@ mark.current {
   left: -13px; top: 14px;
   width: 7px; height: 7px;
   border-radius: 50%;
-  box-shadow: 0 0 0 3px var(--panel-bg);
+  /* #228 S2 (A1, Codex P3) — knock out with the body wash, not --panel-bg: the
+     dots sit in the washed body gutter, so a --panel-bg ring would halo. */
+  box-shadow: 0 0 0 3px var(--sc-body-wash);
 }
 .conv-sidechain-body > .conv-item--human::before { background: var(--accent-blue); }
 .conv-sidechain-body > .conv-item--assistant::before { background: var(--accent-purple); }
