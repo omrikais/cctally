@@ -44,6 +44,43 @@
      mobile @media block re-defines this as a safe-area-aware calc() so it
      tracks the taller two-row bar incl. env(safe-area-inset-top) (#206). */
   --topbar-h: 64px;
+
+  /* ── #228 S1 facelift foundation tokens ───────────────────────────────────
+     One shared visual language for the conversation viewer (S2–S5 consume it).
+     This block is the canonical documentation; follow the usage-rule comments. */
+
+  /* Type scale (px; base = --fs-body = 13.5px). --fs-eyebrow (11px) is THE floor:
+     no conversation-viewer text renders below it. --fs-meta is adopt-forward. */
+  --fs-eyebrow: 11px;
+  --fs-meta: 12px;
+  --fs-body: 13.5px;
+
+  /* Semantic intent — ALWAYS paired with a glyph + sr label via semanticState()
+     (conversations/semantics.ts); never convey state by colour alone. */
+  --intent-improve: var(--accent-green);
+  --intent-regress: var(--accent-red);
+  --intent-neutral: var(--text-dim);
+  --diff-add: var(--accent-green);
+  --diff-del: var(--accent-red);
+  --diff-match: var(--text-dim);
+  --agent-accent: var(--accent-magenta);   /* the subagent spine */
+
+  /* A/B comparison identity (consumed by S5). Deliberately NOT green/red, so
+     A/B never reads as add/del/improve/regress. */
+  --ab-a: var(--accent-blue);
+  --ab-b: var(--accent-purple);
+
+  /* Spacing rhythm (8px base, 4px half-step). Adopt-forward; viewer-wide rollout #229. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Shared focus ring (box-shadow idiom — the dominant existing pattern).
+     Reference consumers: F2 outline resizer, F3 compare trigger. Full unification #229. */
+  --focus-ring: 0 0 0 2px var(--accent-blue);
 }
 
 /* Apply to every panel so scroll anchoring lands the title below the
@@ -8364,6 +8401,15 @@ mark.current {
 .conv-cmp-close:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-cmp-swap:focus-visible,
 .conv-cmp-close:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+
+/* #228 S1 — semantic-state colour classes (consumed by S5; inert until then).
+   Pair with a glyph + sr label via semanticState() — never colour alone. */
+.sem-improve { color: var(--intent-improve); }
+.sem-regress { color: var(--intent-regress); }
+.sem-neutral { color: var(--intent-neutral); }
+.sem-add { color: var(--diff-add); }
+.sem-del { color: var(--diff-del); }
+.sem-match { color: var(--diff-match); }
 
 /* ---- Metrics-delta strip ----------------------------------------------- */
 .conv-cmp-metrics {
