@@ -1621,6 +1621,25 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           </div>
         </div>
         <div className="conv-reader-controls">
+          {/* #228 S2 — surface the keyboard-only bulk collapse/expand
+              (sweepDetails, bound to ] / [) as a discoverable control. Sweeps
+              all MOUNTED disclosures, in lockstep with the keys. */}
+          <div className="conv-bulk-toggle" role="group" aria-label="Expand or collapse all threads">
+            <button
+              type="button"
+              className="conv-bulk-btn"
+              aria-label="Expand all threads"
+              title="Expand all (])"
+              onClick={() => sweepDetails(true)}
+            >⤢</button>
+            <button
+              type="button"
+              className="conv-bulk-btn"
+              aria-label="Collapse all threads"
+              title="Collapse all ([)"
+              onClick={() => sweepDetails(false)}
+            >⤡</button>
+          </div>
           {/* #217 S6 F3 — cumulative-cost chip: $through-current-turn / $session
               total + a progress bar. The reader computes the prefix-sum keyed off
               the scroll-sync current turn; `approx` flags a lower bound when

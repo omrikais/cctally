@@ -6632,6 +6632,22 @@ mark.current {
 }
 /* The mobile back button is a full-width row above the title/controls. */
 .conv-reader-head .conv-back { flex: 1 0 100%; }
+/* #228 S2 — bulk expand/collapse pair in the reader controls. */
+.conv-bulk-toggle { display: inline-flex; gap: 2px; }
+.conv-bulk-btn {
+  display: inline-grid;
+  place-items: center;
+  min-width: 28px;
+  padding: var(--space-1) var(--space-2);
+  font-size: 14px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.conv-bulk-btn:hover { color: var(--text); }
+.conv-bulk-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 /* reader header title in serif (matches the rail anchor) */
 .conv-reader-title {
   font-family: var(--font-prose);
