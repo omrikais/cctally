@@ -6807,7 +6807,7 @@ mark.current {
   border-radius: 8px;
   padding: 10px var(--space-4);
   scroll-margin-top: 12px;
-  min-width: 0;   /* #228 S3 C1 — chain link: an item is a flex child of the thread AND the parent of the block walk */
+  min-width: 0;   /* #228 S3 C1 — chain link: an item is a block child within the thread (display:block since #232) AND the parent of the block walk */
 }
 .conv-item--human {
   background: rgba(96,165,250,0.05);          /* recessed blue-tinted input */
@@ -8406,9 +8406,10 @@ mark.current {
   #root .conv-reader-thread::before { display: none; }
   #root .conv-reader-thread > .conv-reader-item > .conv-item--human::before,
   #root .conv-reader-thread > .conv-reader-item > .conv-item--assistant::before { display: none; }
-  /* The thread loses its left padding/spine on mobile, so suppress the
-     subagent card's outer spine dot too (it would float in negative
-     space). Re-prefixed with #root + respelled per the id-selector
+  /* The thread has no spine on mobile (the `::before` spine is hidden above;
+     its mobile padding is a pure symmetric reading inset, not a spine gutter),
+     so suppress the subagent card's outer spine dot too (it would float in
+     negative space). Re-prefixed with #root + respelled per the id-selector
      specificity gotcha so it outranks the desktop dot rule. #232 — retargeted
      through the `.conv-reader-item` wrapper. */
   #root .conv-reader-thread > .conv-reader-item > .conv-sidechain::before { display: none; }
