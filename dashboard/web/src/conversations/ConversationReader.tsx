@@ -1895,6 +1895,18 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           flashedUuid={jumpedUuid}
           // #232 — the bulk [/] sweep state (data-model expand/collapse-all).
           bulkSweep={bulkSweep}
+          // #232 (Codex P1-4) — re-pin this depth-0 card through Virtuoso on a
+          // user click-collapse: scroll to THIS node's virtual index aligned to
+          // the scroller top, instead of the old raw `scrollTop +=` write that
+          // fought Virtuoso. `arrayIndex` is this node's position in `nodes`;
+          // virtual index = firstItemIndex + arrayIndex (Codex P0-2).
+          pinToSelf={() => {
+            virtuosoRef.current?.scrollToIndex({
+              index: firstItemIndexRef.current + arrayIndex,
+              align: 'start',
+              behavior: reducedRef.current ? 'auto' : 'smooth',
+            });
+          }}
           // §5 — recursive nesting: the child subagent threads + this node's depth
           // + the per-key machinery for every nested level.
           children={g.children}

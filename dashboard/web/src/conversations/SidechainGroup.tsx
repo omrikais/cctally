@@ -111,6 +111,7 @@ export function SidechainGroup({
   flashedUuid = null,
   cursored = false,
   bulkSweep,
+  pinToSelf,
 }: {
   subagentKey: string;
   items: ConversationItem[];
@@ -163,6 +164,14 @@ export function SidechainGroup({
   // monotonic `rev` + desired `open`, adopted in render so off-screen sidechains
   // are swept too (threaded to nested cards via renderChild from childCtx).
   bulkSweep?: { rev: number; open: boolean };
+  // #232 (Codex P1-4) — re-pin THIS depth-0 card to the top of the
+  // .conv-reader-body scroller after a user click-collapse, expressed THROUGH the
+  // Virtuoso handle (`scrollToIndex` to this group's node index) instead of a raw
+  // `scrollTop +=` write under it (which fights Virtuoso's scroll management and
+  // is wrong once only mounted rows have a measured offset). Supplied by the
+  // reader only for top-level cards; nested cards (rendered via renderChild) don't
+  // receive it, matching the old behavior where only depth-0 sticky headers re-pin.
+  pinToSelf?: () => void;
 }) {
   const [userOpen, setUserOpen] = useState(false);
   // #222 — latch a force into userOpen DURING RENDER (React's official "adjust
@@ -315,12 +324,14 @@ export function SidechainGroup({
         // .conv-reader-body scroller so the collapse lands where the user clicked.
         // Guarded by the snap marker, so a bulk sweep (which sets .open directly,
         // with no summary click) never re-pins.
+        // #232 (Codex P1-4) — re-express the re-pin THROUGH Virtuoso
+        // (`pinToSelf` → `scrollToIndex` to this card's node) rather than writing
+        // the scroller's `scrollTop` directly: a raw write fights Virtuoso's own
+        // scroll management and, with only mounted rows measured, lands on a
+        // stale offset. The collapse stays instant (the `--snap` transition
+        // guard), then `pinToSelf` aligns the card to the scroller top.
         if (!isOpen && details.classList.contains('conv-sidechain--snap')) {
-          const scroller = details.closest('.conv-reader-body') as HTMLElement | null;
-          if (scroller) {
-            const delta = details.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-            if (delta < 0) scroller.scrollTop += delta;
-          }
+          pinToSelf?.();
           details.classList.remove('conv-sidechain--snap');
         }
         setUserOpen(isOpen);

@@ -6705,7 +6705,11 @@ mark.current {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  /* #232 — Virtuoso positions each item by measured offset (absolute-positioned
+     [data-index] wrappers), NOT by flex layout, so a flex-column `gap` between
+     virtualized items is inert. The inter-card vertical rhythm moves to a
+     per-item `margin-block` on `.conv-reader-item` below (same --space-3 token);
+     the container `gap` is dropped to avoid an extra unmeasured gap. */
   padding-left: 22px;   /* gutter the spine + markers live in */
   /* #228 S3 C1 — extend the #205 mobile clamp idiom to ALL widths: a flex
      column floors at min-content width, so without min-width:0 an inner
@@ -6713,11 +6717,19 @@ mark.current {
      (the desktop column drifted sideways too, not just mobile). */
   min-width: 0;
 }
+/* #232 — the inter-card vertical rhythm, moved off the now-inert flex-column
+   `gap` (Virtuoso offset-positions items, so the container gap doesn't apply)
+   onto a per-item margin. Same --space-3 token as the old gap, so the visible
+   spacing is unchanged. The Virtuoso item wrapper IS the per-card unit. */
+.conv-reader-item { margin-block: calc(var(--space-3) / 2); }
 /* #228 S3 C1 — clamp every DIRECT thread child at all widths (mirrors the #205
-   mobile `#root .conv-reader-thread > *` rule): .conv-item, .conv-sidechain, and
-   .conv-toolresult-run are all direct children, and any of them holding an
-   unwrappable line must shrink, not inflate the column. */
+   mobile `#root .conv-reader-thread > *` rule). Under virtualization the direct
+   child is Virtuoso's `.conv-reader-item` wrapper; the real card (.conv-item /
+   .conv-sidechain / .conv-toolresult-run) sits one level down, so clamp BOTH the
+   wrapper and (via the wrapper) the card, or an unwrappable line inflates the
+   column. */
 .conv-reader-thread > * { min-width: 0; }
+.conv-reader-thread > .conv-reader-item > * { min-width: 0; }
 /* #217 S4 QA fix — the thread carries tabIndex={-1} purely so onFindClose can
    restore focus here when the find bar closes (a focus-management container, not
    a visible focus target). Suppress the focus ring so the programmatic restore
@@ -6732,11 +6744,13 @@ mark.current {
   width: 2px;
   background: var(--border-soft);
 }
-/* Role dots: ONLY top-level human/assistant turns (direct children of the
-   thread). tool_result rows and nested sidechain members are excluded — the
-   former aren't --human/--assistant, the latter aren't direct children. */
-.conv-reader-thread > .conv-item--human::before,
-.conv-reader-thread > .conv-item--assistant::before {
+/* Role dots: ONLY top-level human/assistant turns. #232 — under virtualization
+   the top-level turn is no longer a DIRECT thread child: Virtuoso wraps it in a
+   `.conv-reader-item`, so retarget through that wrapper. tool_result rows and
+   nested sidechain members are still excluded — the former aren't
+   --human/--assistant, the latter aren't a wrapper's direct child. */
+.conv-reader-thread > .conv-reader-item > .conv-item--human::before,
+.conv-reader-thread > .conv-reader-item > .conv-item--assistant::before {
   content: "";
   position: absolute;
   left: -17px;          /* sits the 9px dot centered on the spine (fine-tune in §5) */
@@ -6746,8 +6760,8 @@ mark.current {
   border-radius: 50%;
   box-shadow: 0 0 0 3px var(--panel-bg);  /* punch through the spine */
 }
-.conv-reader-thread > .conv-item--human::before { background: var(--accent-blue); }
-.conv-reader-thread > .conv-item--assistant::before { background: var(--accent-purple); }
+.conv-reader-thread > .conv-reader-item > .conv-item--human::before { background: var(--accent-blue); }
+.conv-reader-thread > .conv-reader-item > .conv-item--assistant::before { background: var(--accent-purple); }
 
 /* ---- Message bubbles ---------------------------------------------- */
 .conv-item {
@@ -7051,6 +7065,17 @@ mark.current {
    instant (no 240ms height animation to fight), letting onToggle re-pin the
    collapsed card to the scroller top instead of the viewport flinging away. */
 .conv-sidechain--snap::details-content { transition: none; }
+/* #232 — measurement-stability guard for the virtualized list. Virtuoso sizes
+   each row from its mounted height via a ResizeObserver; a 240ms block-size
+   animation mid-expand would feed it intermediate heights and shift the scroll
+   offset of every following row while the animation runs. Snapping the
+   ::details-content transition for cards rendered inside a Virtuoso item wrapper
+   makes the expand/collapse a single committed height change, so Virtuoso
+   re-measures once against the final layout (the onToggle re-pin then goes
+   through scrollToIndex). Scoped to `.conv-reader-item` so the non-virtualized
+   reader surfaces (if any) keep the animation. */
+.conv-reader-item .conv-sidechain::details-content,
+.conv-reader-item .conv-toolresult-run::details-content { transition: none; }
 @media (prefers-reduced-motion: reduce) {
   .conv-reader ::details-content,
   /* Codex P3: the chevron rotate transition (above) is gated here too. */
@@ -7705,15 +7730,16 @@ mark.current {
   background: linear-gradient(180deg, rgba(217,70,239,0.05), transparent 42%);
 }
 /* #228 S2 (A2) — depth-0 agents sit on the main spine: a stronger card so an
-   agent reads as a first-class branch. The direct-child selector matches ONLY
-   depth-0 cards (depth >= 1 cards render inside a parent's body, never as a
-   direct .conv-reader-thread child), so nested cards keep the lighter base. */
-.conv-reader-thread > .conv-sidechain {
+   agent reads as a first-class branch. The selector matches ONLY depth-0 cards
+   (depth >= 1 cards render inside a parent's body, never as a top-level item),
+   so nested cards keep the lighter base. #232 — retargeted through Virtuoso's
+   `.conv-reader-item` wrapper, which now sits between the thread and the card. */
+.conv-reader-thread > .conv-reader-item > .conv-sidechain {
   border-color: rgba(217, 70, 239, 0.40);
   box-shadow: 0 1px 0 rgba(217, 70, 239, 0.10), 0 10px 26px -18px rgba(217, 70, 239, 0.55);
 }
 /* outer spine dot — reuses the Session-1 role-dot idiom, magenta */
-.conv-reader-thread > .conv-sidechain::before {
+.conv-reader-thread > .conv-reader-item > .conv-sidechain::before {
   content: "";
   position: absolute;
   left: -17px; top: 18px;
@@ -7738,10 +7764,13 @@ mark.current {
    a hairline rule so body content scrolls cleanly under it; it stays the native
    click-to-collapse target, now reachable from anywhere in a long thread. top:0
    assumes the reader toolbar is OUTSIDE .conv-reader-body (verified) — if not,
-   set top to the toolbar height. Scoped to the direct-child summary so only
-   depth-0 cards stick (nested summaries sit inside a parent's overflow:hidden
-   ::details-content where sticky can't escape). */
-.conv-reader-thread > .conv-sidechain > .conv-sidechain-head {
+   set top to the toolbar height. Scoped to the depth-0 summary so only depth-0
+   cards stick (nested summaries sit inside a parent's overflow:hidden
+   ::details-content where sticky can't escape). #232 — retargeted through
+   Virtuoso's `.conv-reader-item` wrapper; the wrapper is `position: relative`
+   with no overflow clip, so the sticky head still resolves against the
+   .conv-reader-body scroller (verified in ui-qa). */
+.conv-reader-thread > .conv-reader-item > .conv-sidechain > .conv-sidechain-head {
   position: sticky;
   top: 0;
   z-index: 3;
@@ -8311,7 +8340,9 @@ mark.current {
   }
   #root .conv-reader-thread {
     padding-left: 0;
-    gap: 10px;
+    /* #232 — the inter-card gap moves to a per-item margin (Virtuoso offset-
+       positions items, so the flex `gap` is inert); the mobile 10px override
+       moves onto `.conv-reader-item` below. */
     /* #205 S1 (F1) — clamp the thread so no child can inflate the body width.
        Prose wrapping lives on .conv-item (below), NOT here: an inherited
        overflow-wrap:anywhere on the whole thread shatters the subagent-card
@@ -8319,21 +8350,28 @@ mark.current {
     min-width: 0;
     max-width: 100%;
   }
+  /* #232 — mobile inter-card spacing on the per-item wrapper (was the thread's
+     mobile `gap: 10px`). */
+  #root .conv-reader-item { margin-block: 5px; }
   /* #205 S1 (F1) — clamp ALL direct thread children (not only .conv-item:
      SidechainGroup/.conv-sidechain and .conv-toolresult-run are also direct
-     children) so none can inflate the body width and shear the transcript. */
-  #root .conv-reader-thread > * {
+     children) so none can inflate the body width and shear the transcript.
+     #232 — under virtualization the direct child is Virtuoso's
+     `.conv-reader-item` wrapper, with the real card one level down; clamp both. */
+  #root .conv-reader-thread > *,
+  #root .conv-reader-thread > .conv-reader-item > * {
     min-width: 0;
     max-width: 100%;
   }
   #root .conv-reader-thread::before { display: none; }
-  #root .conv-reader-thread > .conv-item--human::before,
-  #root .conv-reader-thread > .conv-item--assistant::before { display: none; }
+  #root .conv-reader-thread > .conv-reader-item > .conv-item--human::before,
+  #root .conv-reader-thread > .conv-reader-item > .conv-item--assistant::before { display: none; }
   /* The thread loses its left padding/spine on mobile, so suppress the
      subagent card's outer spine dot too (it would float in negative
      space). Re-prefixed with #root + respelled per the id-selector
-     specificity gotcha so it outranks the desktop dot rule. */
-  #root .conv-reader-thread > .conv-sidechain::before { display: none; }
+     specificity gotcha so it outranks the desktop dot rule. #232 — retargeted
+     through the `.conv-reader-item` wrapper. */
+  #root .conv-reader-thread > .conv-reader-item > .conv-sidechain::before { display: none; }
   /* #205 S1 (F1) — minimal "contain the card" header guardrail. .conv-sidechain-head
      is a nowrap flex row whose rigid flex:0 0 auto meta column (~218px) — once the
      card is clamped to the viewport — crushes the title column to ~0 and stacks the

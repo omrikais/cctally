@@ -246,6 +246,51 @@ describe('SidechainGroup', () => {
     expect(onOpenChange).toHaveBeenCalledWith('k1', false);
   });
 
+  // #232 (Codex P1-4) — the depth-0 click-collapse re-pin goes THROUGH Virtuoso
+  // (`pinToSelf` → the reader's scrollToIndex), NOT a raw `scrollTop +=` write on
+  // the scroller. The summary's onClick arms the `--snap` marker on the open card;
+  // the collapse `toggle` then calls `pinToSelf` (guarded by that marker) and
+  // clears the marker. A bulk sweep (sets `.open` with no summary click → no
+  // `--snap`) must NOT re-pin.
+  it('calls pinToSelf on a user click-collapse (through Virtuoso, not raw scrollTop) (#232)', () => {
+    const pinToSelf = vi.fn();
+    const items = [member('s1'), member('s2')];
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} pinToSelf={pinToSelf} />,
+    );
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    // Open the card first.
+    det.open = true;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    // The summary onClick arms `--snap` (suppress the height animation) just before
+    // the native collapse — mirror a real click on the (now-open) header.
+    const summary = det.querySelector('summary')!;
+    fireEvent.click(summary);
+    expect(det.classList.contains('conv-sidechain--snap')).toBe(true);
+    // Now the native collapse fires `toggle` with open=false → re-pin via Virtuoso.
+    det.open = false;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    expect(pinToSelf).toHaveBeenCalledTimes(1);
+    // The snap marker is cleared so later toggles animate again.
+    expect(det.classList.contains('conv-sidechain--snap')).toBe(false);
+  });
+
+  it('does NOT call pinToSelf on a collapse with no --snap (e.g. a bulk sweep) (#232)', () => {
+    const pinToSelf = vi.fn();
+    const items = [member('s1'), member('s2')];
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} pinToSelf={pinToSelf} />,
+    );
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    // Open then collapse WITHOUT a summary click (no `--snap`), as a bulk sweep does
+    // (it sets `.open` directly). The re-pin must not fire.
+    det.open = true;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    det.open = false;
+    fireEvent(det, new Event('toggle', { bubbles: false }));
+    expect(pinToSelf).not.toHaveBeenCalled();
+  });
+
   it('fires onOpenChange(subagentKey, true) when a force-open latches', () => {
     const onOpenChange = vi.fn();
     const items = [member('s1'), member('s2')];
