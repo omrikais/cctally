@@ -131,11 +131,32 @@ function nodeTurnUuid(node: TimedNode): string | null {
 // #232 — Virtuoso's per-item wrapper. A known className (`.conv-reader-item`)
 // gives the CSS retargets (T6) a stable hook through Virtuoso's wrapper, and the
 // VIRTUAL `data-index` rides through so the index math is inspectable. Virtuoso
-// injects `role`/`aria-posinset`/`aria-setsize`/`style` via the spread props
-// (role="feed" support, T5) — forward them all so they aren't clobbered.
+// forwards `data-index` / `data-item-index` (both the VIRTUAL index =
+// firstItemIndex + arrayIndex) / `style` via the spread props, but does NOT
+// inject `aria-posinset` / `aria-setsize` (verified against react-virtuoso 4.18.7
+// — its Item props carry only the data-* / style / key set). So under
+// `role="feed"` we set them OURSELVES: the 1-based ARRAY position
+// (virtualIndex − firstItemIndex + 1) and the set size (total node count), both
+// derived from values threaded through Virtuoso's `context`. Without them a
+// screen reader can't announce "item N of M" for the virtualized feed.
 const ReaderItem = forwardRef<HTMLDivElement, Record<string, unknown>>(
   function ReaderItem(props, ref) {
-    return <div {...props} ref={ref} className="conv-reader-item" />;
+    // Virtuoso's `data-item-index` is the VIRTUAL index (firstItemIndex +
+    // arrayIndex), so the 1-based feed position = (virtual − firstItemIndex) + 1.
+    // Both `firstItemIndex` and `setSize` (the total node count) ride through
+    // Virtuoso's `context`. (react-virtuoso 4.18.7 does NOT inject posinset/setsize
+    // itself — verified against its dist — so role="feed" needs them set here.)
+    const virtualIndex = Number(props['data-item-index']);
+    const ctx = props.context as { setSize?: number; firstItemIndex?: number } | undefined;
+    const setSize = ctx?.setSize;
+    const firstItemIndex = ctx?.firstItemIndex;
+    const aria =
+      Number.isFinite(virtualIndex) && typeof setSize === 'number' && typeof firstItemIndex === 'number'
+        ? { 'aria-posinset': virtualIndex - firstItemIndex + 1, 'aria-setsize': setSize }
+        : {};
+    // `context` is a Virtuoso-internal prop — don't spread it onto the DOM node.
+    const { context: _context, ...domProps } = props;
+    return <div {...domProps} {...aria} ref={ref} className="conv-reader-item" />;
   },
 ) as unknown as Components<TimedNode>['Item'];
 
@@ -415,6 +436,27 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const atBottomRef = useRef(true);
   const prevLenRef = useRef(0);
   const prevHasMoreRef = useRef(false);
+  // #232 — paging-arming gate (the cold-load freeze fix's defense-in-depth layer).
+  // FALSE on every session open; flipped TRUE only once the initial open
+  // positioning has SETTLED, so Virtuoso's transient startReached/endReached
+  // during cold mount + the programmatic jump drain can't trigger paging (which
+  // would re-enter the drain that's positioning the window). A real user
+  // scroll-to-edge only happens after settle, so genuine reverse/forward paging
+  // still works. `jumpDrainingRef` additionally suppresses both edges WHILE a
+  // loadToTarget drain is in flight (set around the reader's await of it).
+  const reversePagingArmedRef = useRef(false);
+  const forwardPagingArmedRef = useRef(false);
+  const jumpDrainingRef = useRef(false);
+  const armPagingTimerRef = useRef<number | null>(null);
+  // Arm both edges (idempotent). Called when the open settles: the first
+  // atBottomStateChange (tail open lands at the bottom), the jump pipeline's
+  // scrollToIndex landing (deep-link lands on the target), or the 750ms fallback
+  // armed on each session open — whichever fires first.
+  const armPaging = useCallback(() => {
+    reversePagingArmedRef.current = true;
+    forwardPagingArmedRef.current = true;
+    if (armPagingTimerRef.current != null) { window.clearTimeout(armPagingTimerRef.current); armPagingTimerRef.current = null; }
+  }, []);
   // P1 (cross-branch review) — track the FIRST item's stable anchor uuid so the
   // stick-to-bottom effect can recognise a PREPEND by a top-edge advance (the
   // first-item id changed) regardless of which code path prepended. This is more
@@ -743,6 +785,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     [display.resolvedTz, display.offsetLabel],
   );
   const nodes = useMemo(() => insertTimeMarkers(visible, fmtCtx), [visible, fmtCtx]);
+  // #232 — the Virtuoso `context` threaded to every ReaderItem so it can set
+  // `aria-posinset` (1-based feed position = virtualIndex − firstItemIndex + 1) and
+  // `aria-setsize` (total node count) under role="feed". Memoized so the object
+  // identity only changes when the count or offset actually moves.
+  const virtuosoContext = useMemo(
+    () => ({ setSize: nodes.length, firstItemIndex: virtualFirstItemIndex }),
+    [nodes.length, virtualFirstItemIndex],
+  );
   // #232 — live mirror of the render-node list so the stable (empty-dep) keymap /
   // pill closures can read the CURRENT nodes (the "↓ N new" pill's last-node
   // scroll, the j/k cursor clamp) without re-registering.
@@ -952,7 +1002,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     let cancelled = false;
     void (async () => {
-      await loadToTarget(jump.uuid);
+      // #232 — suppress startReached/endReached while the programmatic jump drain
+      // pages the window toward the target. Even with the arming gate, a drain that
+      // runs AFTER paging is armed (an in-session jump, not just the cold open)
+      // must not let Virtuoso's settle-time edge hits re-enter paging mid-drain.
+      jumpDrainingRef.current = true;
+      try {
+        await loadToTarget(jump.uuid);
+      } finally {
+        jumpDrainingRef.current = false;
+      }
       if (cancelled) return;
       // #232 — the mode-hidden check runs FIRST, before resolving the node index.
       // A non-`all` focus mode coalesces the target's turn into a `hidden_run`
@@ -1009,6 +1068,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         }
         const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
         virtuosoRef.current?.scrollToIndex({ index: hit.virtualIndex, align, behavior: reduced ? 'auto' : 'smooth' });
+        // #232 — the jump has LANDED on the target: the open has settled, so arm
+        // paging. From here a user scroll to either edge legitimately pages.
+        armPaging();
         // Render-driven flash (#232): the row may mount AFTER the scroll settles,
         // and the class still lands because renderNode reads `jumpedUuid` on every
         // (re)mount — unmount-safe, unlike the old imperative classList.add.
@@ -1193,7 +1255,28 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // a prepend (which would otherwise bail-and-reseed harmlessly anyway, but an
     // explicit null keeps the discriminator's intent legible).
     prevFirstIdRef.current = null;
+    // #232 — DISARM paging for the new open and arm the fallback timer. Both edges
+    // stay no-op until the open settles (atBottomStateChange / jump-landing /
+    // this 750ms fallback). Clearing any prior timer first keeps it one-shot per
+    // open. The fallback guarantees paging is eventually usable even if neither
+    // settle signal fires (e.g. a single-page conversation that never reaches the
+    // bottom-state edge nor runs a jump).
+    reversePagingArmedRef.current = false;
+    forwardPagingArmedRef.current = false;
+    jumpDrainingRef.current = false;
+    if (armPagingTimerRef.current != null) window.clearTimeout(armPagingTimerRef.current);
+    armPagingTimerRef.current = window.setTimeout(() => {
+      reversePagingArmedRef.current = true;
+      forwardPagingArmedRef.current = true;
+      armPagingTimerRef.current = null;
+    }, 750);
   }, [sessionId, openIntent]);
+
+  // #232 — clear the arming fallback timer on unmount so it never fires into a
+  // torn-down reader.
+  useEffect(() => () => {
+    if (armPagingTimerRef.current != null) { window.clearTimeout(armPagingTimerRef.current); armPagingTimerRef.current = null; }
+  }, []);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
@@ -2251,15 +2334,31 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         role="feed"
         scrollerRef={(el) => { bodyRef.current = el as HTMLDivElement | null; }}
         data={nodes}
+        context={virtuosoContext}
         firstItemIndex={virtualFirstItemIndex}
         computeItemKey={(_index, node) => nodeKey(node)}
         itemContent={(index, node) => renderNode(node, index - firstItemIndexRef.current)}
         components={virtuosoComponents}
-        startReached={() => { doLoadPrevRef.current(); }}
-        endReached={() => { void loadMore(); }}
+        startReached={() => {
+          // #232 — ARMING GATE (defense-in-depth on top of loadToTarget's
+          // re-entrancy guard). On a cold open Virtuoso fires startReached/endReached
+          // as it settles the initial position (the deep-link target's scrollToIndex,
+          // or the tail), BEFORE any user scroll. Paging on those transient edge hits
+          // re-enters the very drain that's positioning the window. Gate both edges:
+          // they no-op until the open has SETTLED (first atBottomStateChange OR the
+          // jump landed OR a 750ms fallback — see the arming effect) AND while a
+          // programmatic jump drain is in flight. A genuine user scroll-to-edge
+          // happens only after settle, so real reverse/forward paging is preserved.
+          if (!reversePagingArmedRef.current || jumpDrainingRef.current) return;
+          doLoadPrevRef.current();
+        }}
+        endReached={() => {
+          if (!forwardPagingArmedRef.current || jumpDrainingRef.current) return;
+          void loadMore();
+        }}
         followOutput={(atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
         atBottomThreshold={80}
-        atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
+        atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; armPaging(); if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
         itemsRendered={onItemsRendered}
         increaseViewportBy={600}
         onScroll={onBodyScroll}

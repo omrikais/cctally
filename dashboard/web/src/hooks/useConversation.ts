@@ -175,6 +175,17 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   hasPrevRef.current = hasPrev;
   const loadingMoreRef = useRef(false);   // forward (after) overlap guard
   const loadingPrevRef = useRef(false);   // reverse (before) overlap guard
+  // #232 — single-in-flight guard for loadToTarget. Holds the running drain's
+  // promise so a re-entrant call (the jump effect re-fires on every prepend the
+  // drain itself causes) awaits the existing drain instead of starting a rival
+  // that would livelock on the overlap flags. See loadToTarget for the full note.
+  const drainingRef = useRef<Promise<void> | null>(null);
+  // #232 — holds the drain body so the guarded `loadToTarget` wrapper (declared
+  // first, to keep its identity stable for the reader's effect deps) can invoke it
+  // without a temporal-dead-zone reference to the const declared further below.
+  const runDrainToTargetRef = useRef<(uuid: string, sid: string) => Promise<void>>(
+    () => Promise.resolve(),
+  );
   const sessionRef = useRef<string | null>(null);
   // #175 F4 live-tail bookkeeping.
   const hasMoreRef = useRef(false);
@@ -216,7 +227,9 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // as neither a prepend nor an append (its one-shot open-scroll-intent latch
     // and the prev-trackers handle the fresh window).
     emitOp({ op: 'reset', addedTop: 0, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
-  }, [setDetailSynced, emitOp]);
+    // #232 — applyWindow now calls setWindowState directly (to re-base firstItemIndex
+    // atomically), so setDetailSynced is no longer a dependency.
+  }, [emitOp]);
 
   // ── Initial fetch (hook-owned, precedence-correct — Codex P1) ──────────────
   useEffect(() => {
@@ -373,6 +386,49 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const loadToTarget = useCallback(async (uuid: string) => {
     const sid = sessionRef.current;
     if (sid == null) return;
+    // #232 — RE-ENTRANCY GUARD (the cold-deep-link freeze fix). The jump effect
+    // re-fires on every prepend THIS drain itself causes (its deps include
+    // `nodes` / `virtualFirstItemIndex` / `detail.items.length`), and each re-fire
+    // calls loadToTarget again. Without a guard that spawns MULTIPLE concurrent
+    // backward drains that race on the single `loadingPrevRef` overlap flag: one
+    // drain holds it while paging (its progress gated on a macrotask `yieldPaint`),
+    // a sibling drain finds `op == null` and enters the `while (loadingPrevRef…)
+    // await Promise.resolve()` MICROTASK spin — and because microtasks always drain
+    // before the holder's `setTimeout(0)` can run, the holder can never make
+    // progress to release the flag. The result is an unbreakable microtask livelock
+    // that pins the main thread at 100% forever (measured: the spin iterated past
+    // 50 000 with the holder never advancing — the P0 #232 cold-load freeze). A
+    // single in-flight drain per hook instance eliminates the race entirely: a
+    // re-fire while a drain runs simply AWAITS the existing one (already paging
+    // toward the same target) instead of starting a rival. Awaiting (not dropping)
+    // also lets a genuine NEW target — a second jump dispatched mid-drain — run its
+    // own drain right after the first settles.
+    const inFlight = drainingRef.current;
+    if (inFlight) { await inFlight; return; }
+    let release: () => void = () => {};
+    drainingRef.current = new Promise<void>((res) => { release = res; });
+    try {
+      await runDrainToTarget(uuid, sid);
+    } finally {
+      drainingRef.current = null;
+      release();
+    }
+    // runDrainToTargetRef is a stable ref, so this callback's identity never churns.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Hold the drain body in a ref so the guarded wrapper above (declared first, to
+  // keep loadToTarget's identity stable for the reader's effect deps) can call it
+  // without a temporal-dead-zone reference to a const declared below.
+  const runDrainToTarget = useCallback(
+    (uuid: string, sid: string): Promise<void> => runDrainToTargetRef.current(uuid, sid),
+    [],
+  );
+
+  // The actual nearest-edge drain, wrapped by loadToTarget's re-entrancy guard
+  // above (so only ONE drain is ever in flight per hook instance — see the freeze
+  // note there). `sid` is captured by the wrapper at entry.
+  const runDrainImpl = useCallback(async (uuid: string, sid: string) => {
     // Already loaded? (read the synchronous mirror, not React state.)
     const has = () => {
       const s = detailRef.current;
@@ -476,7 +532,10 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         const op = await fetchNext();
         if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sidF) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sidF) return;
-        while (loadingMoreRef.current && sessionRef.current === sidF) await Promise.resolve();
+        // #232 — macrotask yield (see the directional drains' note) instead of an
+        // `await Promise.resolve()` microtask spin, so an overlap wait can never
+        // starve the in-flight fetchNext's macrotask progress.
+        while (loadingMoreRef.current && sessionRef.current === sidF) await yieldPaint();
         if (sessionRef.current !== sidF) return;
       }
     }
@@ -520,7 +579,14 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         const op = await fetchPrev();
         if (op && prevBeforeRef.current != null) { capWindowDuringDrain('prepend'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (prevBeforeRef.current == null || sessionRef.current !== sid) return;
-        while (loadingPrevRef.current && sessionRef.current === sid) await Promise.resolve();
+        // #232 — wait for an overlapping fetchPrev to finish via a MACROTASK
+        // (`yieldPaint`), NOT `await Promise.resolve()`. The re-entrancy guard on
+        // loadToTarget already makes a concurrent drain impossible, but a microtask
+        // spin here would starve the page-fetch holder's own `setTimeout(0)`
+        // continuation if one ever recurred — a macrotask yield can't (it sits in
+        // the SAME queue as the holder's progress, so the holder advances and
+        // clears the flag). Belt-and-suspenders against the freeze.
+        while (loadingPrevRef.current && sessionRef.current === sid) await yieldPaint();
         if (sessionRef.current !== sid) return;
       }
     } else {
@@ -530,11 +596,15 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         const op = await fetchNext();
         if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sid) return;
-        while (loadingMoreRef.current && sessionRef.current === sid) await Promise.resolve();
+        // #232 — macrotask yield (see the backward branch's note) instead of an
+        // `await Promise.resolve()` microtask spin, so an overlap wait can never
+        // starve the in-flight fetchNext's own macrotask progress.
+        while (loadingMoreRef.current && sessionRef.current === sid) await yieldPaint();
         if (sessionRef.current !== sid) return;
       }
     }
   }, [fetchNext, fetchPrev]);
+  runDrainToTargetRef.current = runDrainImpl;
 
   // ── Jump-to-latest = a ?tail=1 RESET (instant; not a forward drain) ─────────
   const jumpToLatest = useCallback(async () => {

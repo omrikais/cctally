@@ -19,8 +19,8 @@ import type { ConversationItem, ConversationOutline, OutlineTurn } from '../type
 // renders EVERY item — keeping the memo-defeat render-count assertions valid —
 // and exposes `startReached` (the reverse-paging trigger that replaces the old
 // top-sentinel IntersectionObserver).
-const virtuosoTestHandle: { firstItemIndex: number; startReached: (() => void) | null } = {
-  firstItemIndex: 0, startReached: null,
+const virtuosoTestHandle: { firstItemIndex: number; startReached: (() => void) | null; atBottomStateChange: ((b: boolean) => void) | null } = {
+  firstItemIndex: 0, startReached: null, atBottomStateChange: null,
 };
 vi.mock('react-virtuoso', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
@@ -37,6 +37,7 @@ vi.mock('react-virtuoso', async () => {
     const scroller = React.useRef<HTMLDivElement>(null);
     virtuosoTestHandle.firstItemIndex = firstItemIndex;
     virtuosoTestHandle.startReached = (props.startReached as (() => void)) ?? null;
+    virtuosoTestHandle.atBottomStateChange = (props.atBottomStateChange as ((b: boolean) => void)) ?? null;
     React.useEffect(() => {
       scrollerRef?.(scroller.current);
       (props.itemsRendered as ((items: unknown[]) => void) | undefined)?.(data.map((d, i) => ({ index: firstItemIndex + i, data: d })));
@@ -116,6 +117,7 @@ beforeEach(() => {
   _id = 1;
   virtuosoTestHandle.firstItemIndex = 0;
   virtuosoTestHandle.startReached = null;
+  virtuosoTestHandle.atBottomStateChange = null;
 });
 afterEach(() => { _resetForTests(); clearReadingPositions(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -137,7 +139,9 @@ describe('#231 — a reverse-page prepend does not re-render already-mounted tur
     // the old top "Load earlier" sentinel intersection).
     const older = Array.from({ length: 15 }, (_, i) => turn(`o${i}`));
     mockFetchOnce(pageBody(older, 500));
-    await act(async () => { virtuosoTestHandle.startReached?.(); for (let i = 0; i < 16; i++) await Promise.resolve(); });
+    // #232 — arm paging (the open settles → atBottomStateChange) before firing
+    // startReached; the freeze guard no-ops paging until the open has settled.
+    await act(async () => { virtuosoTestHandle.atBottomStateChange?.(true); virtuosoTestHandle.startReached?.(); for (let i = 0; i < 16; i++) await Promise.resolve(); });
     await flush();
 
     // The prepend really happened: older turns mounted, total grew, head changed.

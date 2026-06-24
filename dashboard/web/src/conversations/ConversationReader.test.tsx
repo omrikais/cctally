@@ -2459,9 +2459,13 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // The FIRST request was ?tail=1 — not the legacy head page.
     expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])).toContain('tail=1');
     // #232 — reverse paging is now driven by Virtuoso's `startReached`, not a top
-    // sentinel. Firing it (has_prev:true) issues the ?before= reverse fetch.
+    // sentinel. Firing it (has_prev:true) issues the ?before= reverse fetch — but
+    // only once paging is ARMED. A tail open settles at the bottom, so Virtuoso's
+    // atBottomStateChange(true) fires and arms both edges (the cold-load freeze
+    // guard: the gate stays disarmed through the open's transient edge hits).
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
     await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // settle → arm paging
       virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -2497,8 +2501,11 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // for the already-loaded items — the prepend must ignore it.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
 
-    // Fire Virtuoso's startReached (the head reached) — the reader runs doLoadPrev.
+    // Arm paging (the tail open settles at the bottom → atBottomStateChange(true)),
+    // then fire Virtuoso's startReached — the reader runs doLoadPrev. The arming
+    // step is the #232 freeze guard: startReached no-ops until the open settles.
     await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);
       virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -2509,6 +2516,52 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // The window now holds the prepended items in order (t1,t2,t3,t4).
     const order = Array.from(container.querySelectorAll('[data-uuid]')).map((e) => e.getAttribute('data-uuid'));
     expect(order.filter((u) => /^t[1-4]$/.test(u ?? ''))).toEqual(['t1', 't2', 't3', 't4']);
+  });
+
+  it('#232 freeze guard: startReached does NOT page while paging is UNARMED, and DOES once armed', async () => {
+    // The cold-deep-link freeze (P0): on a cold open Virtuoso fires startReached as
+    // it settles the initial position, BEFORE any user scroll. Paging on that
+    // transient edge hit re-enters the very drain positioning the window, and (with
+    // the jump effect re-firing on every prepend it causes) spawns concurrent
+    // loadToTarget drains that LIVELOCK on the overlap flags — pinning the main
+    // thread forever. The fix gates startReached/endReached behind an arming flag
+    // that flips only once the open has SETTLED (first atBottomStateChange / jump
+    // landing / 750ms fallback). This proves the gate: an UNARMED startReached
+    // issues NO ?before= fetch; an ARMED one does.
+    //
+    // NON-VACUITY: against the pre-fix code (startReached → doLoadPrev unguarded)
+    // the first assertion FAILS — the unarmed startReached would already have
+    // issued before=3. The arming gate is exactly what makes the unarmed fire a
+    // no-op while preserving the armed fire.
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
+
+    const beforeCalls = () =>
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter((c) => String(c[0]).includes('before=3')).length;
+
+    // (1) UNARMED — fire startReached repeatedly: NO reverse fetch is issued and
+    // NO earlier page mounts. This is the cold-mount transient the freeze rode.
+    await act(async () => {
+      virtuosoTestHandle.startReached?.();
+      virtuosoTestHandle.startReached?.();
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(beforeCalls()).toBe(0);
+    expect(container.querySelector('[data-uuid="t1"]')).toBeNull();
+
+    // (2) ARM via the settle signal (atBottomStateChange), then fire startReached:
+    // now the genuine reverse page loads — real user reverse-paging is preserved.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // open settled → arm paging
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+    expect(beforeCalls()).toBe(1);
   });
 
   it('#232: firstItemIndex decrements by the prepended count, pinning the virtual index of the old head', async () => {
@@ -2525,9 +2578,10 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     const t3Wrap = (container.querySelector('[data-uuid="t3"]')!.closest('.conv-reader-item')) as HTMLElement;
     const t3VirtualBefore = Number(t3Wrap.getAttribute('data-index'));
 
-    // Prepend a 2-item reverse page.
+    // Prepend a 2-item reverse page (arm paging first — #232 freeze guard).
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
     await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);
       virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -2556,6 +2610,7 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
 
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
     await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // arm paging (#232 freeze guard)
       virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -2595,6 +2650,7 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // hasMore stays false — the exact discriminator trap.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
     await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // arm paging (#232 freeze guard)
       virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -2787,6 +2843,9 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
 
     const body = container.querySelector('.conv-reader-body') as HTMLElement;
     // Scroll UP so a real live append would surface the pill (atBottomRef false).
+    // The bottom-state edge (scrolled away from bottom) also ARMS paging — the
+    // #232 freeze guard — which is what lets the subsequent startReached page.
+    act(() => { virtuosoTestHandle.atBottomStateChange?.(false); });
     setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
     fireEvent.scroll(body);
 

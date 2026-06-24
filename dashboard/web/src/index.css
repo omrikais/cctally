@@ -7982,14 +7982,6 @@ mark.current {
   border-radius: 2px;
 }
 
-/* ---- Lazy-load sentinel ------------------------------------------- */
-.conv-load-sentinel {
-  text-align: center;
-  color: var(--text-faint);
-  font-size: 11px;
-  padding: var(--space-3);
-}
-
 /* ---- Disabled state (transcripts not exposed for this request) ---- */
 .conv-disabled {
   border: 1px solid var(--accent-amber);
