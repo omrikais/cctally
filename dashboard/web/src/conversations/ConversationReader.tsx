@@ -1077,10 +1077,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // [0, totalCount], so react-virtuoso clamps + ignores it and a warm in-session
         // jump never scrolls toward its target (measured in-browser: scrollTop did not
         // move at all; scrollToIndex with the DATA index moved, with the virtual index
-        // did not). The cold deep-link only appeared to work because its near/in-window
-        // target also caught the DOM scrollIntoView precise-align pass below. Pass the
-        // array index. (itemContent still receives the virtual index from Virtuoso, so
-        // the `index - firstItemIndex` conversion there is unchanged + correct.)
+        // did not). Pass the array index. (itemContent still receives the virtual index
+        // from Virtuoso, so the `index - firstItemIndex` conversion there is unchanged
+        // + correct.) NOTE this lands warm jumps (the model is measured); a COLD
+        // deep-link to a far/off-screen target is positioned by the drain + the
+        // within-row rAF pass below, the same as before #232 (a precise cold landing
+        // to an off-window target is a separate, pre-existing limitation).
         virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align, behavior: reduced ? 'auto' : 'smooth' });
         // #232 — the jump has LANDED on the target: the open has settled, so arm
         // paging. From here a user scroll to either edge legitimately pages.
@@ -1886,10 +1888,28 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // never churns Virtuoso's internals across reader re-renders; it captures
   // `threadRef` (a stable ref) so the closure stays correct.
   const virtuosoComponents = useMemo<Components<TimedNode>>(() => {
-    const ReaderThread = forwardRef<HTMLDivElement, { children?: React.ReactNode }>(
+    const ReaderThread = forwardRef<HTMLDivElement, Record<string, unknown>>(
       function ReaderThread(props, ref) {
+        // #232 fix — SPREAD the props Virtuoso passes the List. The critical one is
+        // `style`, which carries `padding-top` / `padding-bottom` = the VIRTUAL
+        // SCROLL SPACE (the total measured height of the rows above / below the
+        // mounted window). Dropping it (the prior `className`-only render) collapses
+        // the List to just the mounted window's contiguous height: `scrollHeight`
+        // shrinks to ~5 rows, no virtual space exists, and EVERY programmatic scroll
+        // — `scrollToIndex` (j/k, jump-to-latest, outline jumps, find-step) and the
+        // openScrollIntent landing — can only reach the few initially-mounted rows
+        // (measured in-browser: a 278-node session had scrollHeight frozen at
+        // ~5430px and scrolling mounted nothing further; jump-to-latest never reached
+        // the tail). Virtuoso also passes `data-testid="virtuoso-item-list"` here.
+        // Our `className` / `tabIndex` are applied AFTER the spread so they win (the
+        // thread carries the styling + the focus target). `children` rides through
+        // the spread too, so it isn't re-applied.
+        const { children: _children, className: _vClassName, ...rest } = props as {
+          children?: React.ReactNode; className?: string;
+        } & Record<string, unknown>;
         return (
           <div
+            {...rest}
             ref={(el) => {
               threadRef.current = el;
               if (typeof ref === 'function') ref(el);
@@ -1898,7 +1918,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             className="conv-reader-thread"
             tabIndex={-1}
           >
-            {props.children}
+            {props.children as React.ReactNode}
           </div>
         );
       },

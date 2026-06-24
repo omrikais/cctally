@@ -116,6 +116,43 @@ afterEach(() => {
 });
 
 describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', () => {
+  it('(z) the List (.conv-reader-thread) forwards Virtuoso\'s virtual-space style + data-testid', async () => {
+    // #232 follow-up — the custom `List` component (ReaderThread) MUST spread the
+    // props Virtuoso passes it: the `style` object carrying `padding-top` /
+    // `padding-bottom` (the virtual scroll space = total height of the rows above /
+    // below the rendered window) and `data-testid="virtuoso-item-list"`. When those
+    // props are dropped (only `className` applied), the List collapses to the
+    // mounted window's contiguous height: `scrollHeight` ≈ the few mounted rows, no
+    // virtual space exists, and EVERY programmatic scroll — scrollToIndex (j/k,
+    // jump-to-latest, outline jumps, find-step), the openScrollIntent landing —
+    // can only reach the ~5 initially-mounted rows. The viewport never follows the
+    // cursor/anchor for any off-window target. Measured in-browser (Playwright):
+    // a 278-node session had scrollHeight frozen at ~5430px (≈ the 5 mounted rows)
+    // and scrolling mounted nothing further. This assertion is the JSDOM proxy for
+    // that browser-only failure: under VirtuosoMockContext the real <Virtuoso>
+    // computes the same padding it would in a browser, so the List element must
+    // expose it. (The render-all mock in ConversationReader.test.tsx can't catch
+    // this — it never mounts a real Virtuoso List.)
+    mockFetchOnce(detail(uuids.map((u) => makeItem(u))));
+    // A 'top' open: head-anchored window ⇒ all the rows BELOW are virtual space ⇒
+    // a large `padding-bottom` on the List.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = renderReader();
+    await waitFor(() => expect(container.querySelector('[data-uuid="t0"]')).not.toBeNull());
+    await act(async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); });
+
+    const list = container.querySelector('.conv-reader-thread') as HTMLElement | null;
+    expect(list).not.toBeNull();
+    // Virtuoso tags its List wrapper; if ReaderThread forwards props this is present.
+    expect(list!.getAttribute('data-testid')).toBe('virtuoso-item-list');
+    // The virtual scroll space: a head-anchored window over 60 rows leaves dozens
+    // of rows below the window, so `padding-bottom` must be substantial (each mock
+    // row is 100px). A dropped-style List would report 0 here (and `scrollHeight`
+    // would collapse to the mounted window's height — the production freeze).
+    const padBottom = parseFloat(list!.style.paddingBottom || '0');
+    expect(padBottom).toBeGreaterThan(1000);
+  });
+
   it('(a) mounts only a windowed subset — far off-screen rows are genuinely UNMOUNTED', async () => {
     mockFetchOnce(detail(uuids.map((u) => makeItem(u))));
     // A 'top' open so the mounted window is anchored at the head (t0…), leaving

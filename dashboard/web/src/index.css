@@ -6703,13 +6703,21 @@ mark.current {
 /* ---- Timeline spine (full scroll height via the thread wrapper) --- */
 .conv-reader-thread {
   position: relative;
-  display: flex;
-  flex-direction: column;
-  /* #232 — Virtuoso positions each item by measured offset (absolute-positioned
-     [data-index] wrappers), NOT by flex layout, so a flex-column `gap` between
-     virtualized items is inert. The inter-card vertical rhythm moves to a
-     per-item `margin-block` on `.conv-reader-item` below (same --space-3 token);
-     the container `gap` is dropped to avoid an extra unmeasured gap. */
+  /* #232 — this element IS Virtuoso's List wrapper (data-testid="virtuoso-item-list").
+     Virtuoso creates the VIRTUAL SCROLL SPACE by setting `padding-top` /
+     `padding-bottom` on THIS element (= the total measured height of the rows
+     above / below the mounted window) and laying the rendered item wrappers out in
+     NORMAL BLOCK FLOW within that padding. So the List MUST be `display: block`:
+     a `display: flex` here breaks that padding-based positioning — flex packs the
+     few mounted children against the content box and the virtual padding stops
+     offsetting them, collapsing `scrollHeight` to the mounted window's height
+     (measured: a 278-node session froze at ~5430px, and no scroll could reach an
+     off-window target — j/k, jump-to-latest, outline jumps, and find-step all
+     no-op'd because there was nowhere to scroll to). The inter-card vertical rhythm
+     is a per-item `margin-block` on `.conv-reader-item` below (the old flex `gap`
+     was already inert under virtualization), so block flow keeps the visible
+     spacing unchanged. */
+  display: block;
   padding-left: 22px;   /* gutter the spine + markers live in */
   /* #228 S3 C1 — extend the #205 mobile clamp idiom to ALL widths: a flex
      column floors at min-content width, so without min-width:0 an inner
