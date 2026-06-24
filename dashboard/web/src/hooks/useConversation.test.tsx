@@ -765,6 +765,67 @@ describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => 
     expect(result.current.detail?.items.some((i: { anchor: { uuid: string } }) => i.anchor.uuid === 'u1')).toBe(true);
   });
 
+  it('loadToTarget keeps the mounted window BOUNDED while draining backward to a near-head target (#231 cold-load balloon)', async () => {
+    // The #231 regression: a cold deep-link to a near-head turn in a >cap
+    // conversation paged the WHOLE transcript into one React commit (the mounted
+    // window ballooned toward the full item count) and blocked the main thread.
+    // The drain now caps the window IN-PLACE inside each page's `setState`
+    // updater, so the committed window never accumulates past the cap. We capture
+    // the window length on EVERY commit and assert the PEAK stays bounded — without
+    // the in-updater cap every backward prepend collapses into one commit reaching
+    // 2500 (this assertion fails); with it, each page's prepend+trim collapse to
+    // ≤cap. (JSDOM can't reproduce the browser paint freeze, but it proves this
+    // data-model invariant, which is the freeze's root cause.)
+    const PAGE = 500;
+    const CAP = 1000;
+    const N = 2500;
+    const mk = (idx: number) => ({
+      kind: idx % 2 ? 'assistant' : 'human',
+      anchor: { session_id: 's', uuid: `m${idx}`, id: idx + 1 },
+      member_uuids: [`m${idx}`], ts: 't', text: `t${idx}`, blocks: [], is_sidechain: false,
+    });
+    const all = Array.from({ length: N }, (_, i) => mk(i));
+    const turns: OutlineTurn[] = all.map((_it, i) => ({
+      uuid: `m${i}`, kind: (i % 2 ? 'assistant' : 'human') as OutlineTurn['kind'], member_uuids: [`m${i}`],
+      subagent_key: null, parent_uuid: null, is_sidechain: false, ts: null, label: '',
+    }));
+    const slice = (lo: number, hi: number, edges: Parameters<typeof pageDetail>[1]) =>
+      pageDetail(all.slice(lo, hi), edges);
+
+    // Cold tail open = last 500 (idx 2000..2499); top edge armed, bottom done.
+    mockOnce(slice(2000, 2500, { next_after: null, has_more: false, prev_before: 2000, has_prev: true }));
+
+    const lengths: number[] = [];
+    const { result } = renderHook(() => {
+      const r = useConversation('s', { outlineTurns: turns, openIntent: { kind: 'tail' } });
+      lengths.push(r.detail?.items.length ?? 0);  // record EVERY committed window size
+      return r;
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(PAGE));
+
+    // Four backward pages walk head-ward toward the near-head target m50. The
+    // before-page envelopes carry a non-null next_after/has_more (for the already-
+    // loaded items after them) which the top-edge prepend must ignore.
+    mockOnce(slice(1500, 2000, { prev_before: 1500, has_prev: true, next_after: 9, has_more: true }));
+    mockOnce(slice(1000, 1500, { prev_before: 1000, has_prev: true, next_after: 9, has_more: true }));
+    mockOnce(slice(500, 1000, { prev_before: 500, has_prev: true, next_after: 9, has_more: true }));
+    mockOnce(slice(0, 500, { prev_before: null, has_prev: false, next_after: 9, has_more: true }));
+
+    await act(async () => { await result.current.loadToTarget('m50'); });
+
+    // The near-head target is loaded…
+    await waitFor(() =>
+      expect(result.current.detail?.items.some((i: { anchor: { uuid: string } }) => i.anchor.uuid === 'm50')).toBe(true),
+    );
+    // …and the mounted window never ballooned: bounded at ≤ cap+1 page on every
+    // committed render (the #231 invariant — peak would be 2500 without the cap).
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(CAP + PAGE);
+    expect(result.current.detail!.items.length).toBeLessThanOrEqual(CAP + PAGE);
+    // The backward drain trimmed the BOTTOM → the bottom cursor was re-armed so
+    // the dropped tail is re-fetchable (proof the in-place cap ran).
+    expect(result.current.hasMore).toBe(true);
+  });
+
   it('loadToTarget resolves a MEMBER (folded-fragment) uuid to its owning turn (Codex P1)', async () => {
     // u2b is a folded fragment of turn u2 (outline index 1). It is NOT an outline
     // turn's own uuid — only resolvable via member_uuids. Targeting it from the

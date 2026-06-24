@@ -350,6 +350,75 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     };
     if (has()) return;
 
+    // #231 — cap the window IN-PLACE right after each drain page, from inside a
+    // functional `setState` updater. A cold deep-link into a >cap conversation
+    // pages the reader open by draining from the tail toward the target; a tight
+    // programmatic drain batches every page's prepend/append into ONE React
+    // commit, so the mounted window balloons toward the full transcript and that
+    // single giant commit blocks the main thread on a cold deep-link (the
+    // pre-existing P1 the #230 B3 QA surfaced). The decoupled passive-effect trim
+    // can't prevent it: it computes from `detailRef`, which only catches up once
+    // React processes the batch, and it never gets an idle, fetch-free moment
+    // mid-drain — so observed peaks reached the full ~1764 items. Trimming from
+    // the updater's `prev` (ALWAYS the latest queued state, unlike `detailRef`)
+    // instead means even a single batched commit's FINAL state is already bounded:
+    // each page's prepend collapses with its trim to ≤cap. The committed tree
+    // therefore never exceeds the cap, DETERMINISTICALLY, independent of React's
+    // commit/paint timing.
+    //
+    // Safe to trim in the SAME commit as the prepend here (the Codex P0 hazard a
+    // same-commit prepend+far-trim poses for scroll-anchor restore does NOT apply):
+    // the reader's anchor-restore (ConversationReader useLayoutEffect) is gated on
+    // its `prependPendingRef` snapshot, which only the top-sentinel scroll-up path
+    // sets — a jump-driven hook prepend has no snapshot, so it no-ops. The in-flight
+    // jump target is in `protectedUuids`, so the trim never drops it even if a
+    // stale `has()` over-drains past it. The opposite-edge cursor is re-armed so
+    // the dropped far edge stays re-fetchable: a bottom drop (backward drain)
+    // re-arms the bottom cursor — `hasMore` is DERIVED from `page.next_after`, no
+    // state to sync; a top drop (forward drain) re-arms the top cursor and syncs
+    // the `hasPrev` STATE out-of-render via a microtask. No-op (ref-equal `prev` →
+    // React bails the render) under the cap or when all-protected.
+    const capWindowDuringDrain = (drainOp: 'prepend' | 'append'): void => {
+      setDetailSynced((prev) => {
+        if (!prev || prev.items.length <= WINDOW_CAP_ITEMS) return prev;
+        const plan = planTrim({
+          items: prev.items,
+          op: drainOp,
+          cap: WINDOW_CAP_ITEMS,
+          protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
+          fetchInFlight: false,
+        });
+        if (plan.keep === prev.items) return prev;  // all-protected → React bails
+        if (plan.droppedBottom > 0) {
+          nextAfterRef.current = plan.resetBottomCursorTo;
+          return { ...prev, items: plan.keep,
+            page: { ...prev.page, next_after: plan.resetBottomCursorTo, has_more: true } };
+        }
+        prevBeforeRef.current = plan.resetTopCursorTo;
+        queueMicrotask(() => setHasPrev(true));  // hasPrev is state, not derived — sync out-of-render
+        return { ...prev, items: plan.keep,
+          page: { ...prev.page, prev_before: plan.resetTopCursorTo, has_prev: true } };
+      });
+    };
+
+    // #231 — yield a macrotask between drain pages so React COMMITS AND PAINTS the
+    // (already capped) bounded window before the next page is fetched. The cap
+    // bounds how many items are committed, but a cold deep-link still has to MOUNT
+    // that bounded window from scratch (no prior fiber tree to diff) — and a tight
+    // back-to-back drain lets React fold the whole drain into one cold first-mount
+    // commit, which pins the main thread even at the cap (the residual freeze the
+    // #230 B3 / #231 QA surfaced — each card is a deep nested `<details>` block).
+    // Yielding makes the cold mount INCREMENTAL — one ≤cap commit per page with a
+    // paint between — so the reader becomes interactive after the first page and
+    // stays responsive as the rest streams in, the same way a normal tail-open
+    // already mounts. Paired with the in-place cap this gives bounded AND
+    // incremental; on a warm jump (prior tree already mounted) the per-page commit
+    // is cheap, so the few extra macrotasks are negligible. List virtualization
+    // (render only visible cards) is the deeper fix for the per-card mount cost and
+    // is tracked separately.
+    const yieldPaint = (): Promise<void> =>
+      new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+
     const turns = outlineTurnsRef.current ?? [];
 
     // Fallback: with NO full-session outline (it hasn't loaded yet, or a caller
@@ -366,7 +435,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
         // no-op); "more pages remain" is read from the bottom-edge cursor, not the
         // op (an op is emitted even on the last page when the cursor goes null).
         const op = await fetchNext();
-        if (op && nextAfterRef.current != null) continue;
+        if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sidF) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sidF) return;
         while (loadingMoreRef.current && sessionRef.current === sidF) await Promise.resolve();
         if (sessionRef.current !== sidF) return;
@@ -410,7 +479,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       for (;;) {
         if (has()) return;
         const op = await fetchPrev();
-        if (op && prevBeforeRef.current != null) continue;
+        if (op && prevBeforeRef.current != null) { capWindowDuringDrain('prepend'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (prevBeforeRef.current == null || sessionRef.current !== sid) return;
         while (loadingPrevRef.current && sessionRef.current === sid) await Promise.resolve();
         if (sessionRef.current !== sid) return;
@@ -420,7 +489,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       for (;;) {
         if (has()) return;
         const op = await fetchNext();
-        if (op && nextAfterRef.current != null) continue;
+        if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sid) return;
         while (loadingMoreRef.current && sessionRef.current === sid) await Promise.resolve();
         if (sessionRef.current !== sid) return;

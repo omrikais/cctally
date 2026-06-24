@@ -15,6 +15,7 @@ import { ReaderOverflowMenu } from './ReaderOverflowMenu';
 import { HighlightContext, type HighlightTerms } from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
+import { useStableSet, useStableMap, useMonotonicMax } from './useStableIdentity';
 import { CumulativeCostChip } from './CumulativeCostChip';
 import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
@@ -258,6 +259,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // post-commit effect AFTER the render-time classifier has read it, so the
   // decision is stable for that frame.
   const seenRef = useRef<Set<string>>(new Set());
+  // #231 — per-uuid freeze of the rise-class decision (see riseFor). Cleared on
+  // session change alongside seenRef.
+  const riseCacheRef = useRef<Map<string, [string, React.CSSProperties | undefined]>>(new Map());
 
   // G3 keyboard navigation. A focused-turn cursor over the DIRECT children of
   // `.conv-reader-thread` (the sentinel lives outside the thread). The
@@ -577,17 +581,26 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     [detail?.items, detail?.subagent_meta],
   );
   // #217 S6 F3 — the session's heaviest LOADED per-turn cost (the micro-bar
-  // denominator). Max over loaded assistant items; since the windowed pager
-  // accrues items as you page, this is effectively monotonic (a future change
-  // that drops loaded items would need a monotonic ref). Provided ONCE on the
-  // transcript context so memoized MessageItems don't subscribe to recompute it.
-  const sessionMaxTurnCost = useMemo(() => {
+  // denominator). Max over loaded assistant items. Provided ONCE on the transcript
+  // context so memoized MessageItems don't subscribe to recompute it.
+  const sessionMaxTurnCostRaw = useMemo(() => {
     let m = 0;
     for (const it of detail?.items ?? []) {
       if (it.kind === 'assistant' && typeof it.cost_usd === 'number') m = Math.max(m, it.cost_usd);
     }
     return m;
   }, [detail?.items]);
+  // #231 — monotonic ratchet (the "monotonic ref" the comment above anticipated).
+  // The windowed DOM cap (added in this same fix) can TRIM the max-cost item OUT
+  // of the loaded window, which would LOWER this value. Because it rides on the
+  // TranscriptContext that EVERY memoized MessageItem consumes (via useMaxTurnCost),
+  // any change re-renders the entire rendered window — bypassing React.memo
+  // entirely — and a non-monotonic value churns on every prepend AND every trim,
+  // the O(n²) re-render cascade that froze the cold deep-link reader (~80s). Ratchet
+  // it so it only ever rises within a session (reset on session switch): "heaviest
+  // turn seen this session" is the correct micro-bar denominator AND a stable
+  // context that lets the memo hold across paging/trim commits.
+  const sessionMaxTurnCost = useMonotonicMax(sessionMaxTurnCostRaw, sessionId);
   // #217 S6 F3 — cumulative cost through the topmost-visible turn for the header
   // chip. `approx` ≡ hasPrev: any unloaded earlier page makes the prefix-sum a
   // lower bound (the honesty marker, Codex P1).
@@ -618,13 +631,18 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // spawns); an UNLINKED spawn (>16 KB clip) has no nested card and no entry
   // here, so its chip still renders. Stable identity (memoized) keeps the
   // memoized MessageItems' memo valid across ticks.
-  const suppressToolUseIds = useMemo(() => {
+  const suppressToolUseIdsRaw = useMemo(() => {
     const s = new Set<string>();
     for (const m of Object.values(detail?.subagent_meta ?? {})) {
       if (m.spawn_tool_use_id) s.add(m.spawn_tool_use_id);
     }
     return s;
   }, [detail?.subagent_meta]);
+  // #231 — collapse identity to content: the server re-sends `subagent_meta` (a
+  // fresh object, usually identical content) on every page apply, so the raw
+  // useMemo identity churns each prepend and defeats the MessageItem memo for the
+  // whole window. Stabilize so the identity changes only when a spawn id does.
+  const suppressToolUseIds = useStableSet(suppressToolUseIdsRaw);
   // #228 S2 (A3) — tool_use_id → kind for spawns whose subagent card is LOADED
   // (walk the emitted render tree, NOT whole-session subagent_meta), so a
   // connector never dangles above a paged-out agent. `suppressToolUseIds` stays
@@ -632,7 +650,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // loads), but a spawn whose bucket is still paged out is ABSENT here, so it
   // renders neither a chip (suppressed) nor a dangling connector. Stable
   // identity (memoized) keeps the memoized MessageItems valid across ticks.
-  const spawnKindByToolUseId = useMemo(() => {
+  const spawnKindByToolUseIdRaw = useMemo(() => {
     const m = new Map<string, string>();
     for (const node of flattenSubagents(groups)) {
       const meta = detail?.subagent_meta?.[node.subagentKey];
@@ -640,6 +658,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     return m;
   }, [groups, detail?.subagent_meta]);
+  // #231 — `groups` recomputes to a NEW identity on every prepend AND every
+  // windowed-DOM-cap trim (both rewrite `detail.items`), so without this the Map
+  // identity churns each commit and re-renders the whole window. Stabilize to
+  // content: identity changes only when a loaded spawn entry actually changes.
+  const spawnKindByToolUseId = useStableMap(spawnKindByToolUseIdRaw);
   // #177 S5 §5 — focus-mode-filtered render list. `all` short-circuits to the
   // SAME `groups` array identity (byte-identical render path); other modes drop
   // suppressed nodes and coalesce them into `hidden_run` markers. EVERYTHING the
@@ -1119,6 +1142,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // flag to keep in sync).
   useEffect(() => {
     seenRef.current.clear();
+    riseCacheRef.current.clear();  // #231 — the new session's items rise afresh
   }, [sessionId]);
 
   // After each commit, mark every currently-rendered top-level group as seen.
@@ -1159,22 +1183,39 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // `conv-rise`, and the two never run on one element.
   const riseFor = useCallback(
     (anchorUuid: string, memberUuids: string[], idx: number): [string, React.CSSProperties | undefined] => {
-      if (reduced) return ['', undefined];
-      if (seenRef.current.has(anchorUuid)) return ['', undefined];
+      // #231 — FREEZE each item's rise decision the first time it renders, and
+      // return that SAME tuple (stable className + stable style-object identity)
+      // on every later render. Without this, an item rendered with `conv-rise`
+      // flips to `['', undefined]` once the post-commit effect marks it seen — and
+      // because that effect is a ref mutation (no re-render), the flip is deferred
+      // to the NEXT commit, which is a reverse-page PREPEND. On that prepend EVERY
+      // retained item's className AND style change at once, defeating the
+      // MessageItem React.memo for the whole window — the O(n²) re-render cascade
+      // behind the cold-load freeze (measured: ~2.4× the mounted window per
+      // prepend). `conv-rise` uses `animation-fill-mode: both` ending at the
+      // natural state, so keeping the class after the one-shot entrance animation
+      // is visually inert (and a stable class never re-triggers the animation).
+      const cached = riseCacheRef.current.get(anchorUuid);
+      if (cached) return cached;
       const isJumpTarget =
         jump != null && jump.session_id === sessionId && memberUuids.includes(jump.uuid);
-      if (isJumpTarget) return ['', undefined];
-      // "First page" is computed at RENDER time from the seen-Set being empty —
-      // NOT a commit-flipped flag. The populate effect runs AFTER this render
-      // commits, so on the first CONTENT render seenRef is still empty for every
-      // group and they all get the staggered `idx*40ms`. Any later first
-      // appearance (paged in) sees a populated seenRef and fades with no stagger
-      // so the scroll position doesn't lurch. The earlier loading branch renders
-      // empty `groups`, so it never marks anything seen and never consumes the
-      // first page before real content paints (the dead-stagger bug this fixes).
-      const firstPage = seenRef.current.size === 0;
-      const delay = firstPage ? `${idx * 40}ms` : '0ms';
-      return ['conv-rise', { animationDelay: delay }];
+      let result: [string, React.CSSProperties | undefined];
+      if (reduced || isJumpTarget || seenRef.current.has(anchorUuid)) {
+        result = ['', undefined];
+      } else {
+        // "First page" is computed at RENDER time from the seen-Set being empty —
+        // the populate effect runs AFTER this render commits, so on the first
+        // CONTENT render seenRef is still empty for every group and they all get
+        // the staggered `idx*40ms`. A later first appearance (paged in) sees a
+        // populated seenRef and fades with no stagger so the scroll doesn't lurch.
+        const firstPage = seenRef.current.size === 0;
+        result = ['conv-rise', { animationDelay: firstPage ? `${idx * 40}ms` : '0ms' }];
+      }
+      // Don't freeze a TRANSIENT jump-target suppression: once the jump clears the
+      // item should be free to settle (or rise). Every other decision is stable
+      // for the life of the session and is frozen so the memo holds.
+      if (!isJumpTarget) riseCacheRef.current.set(anchorUuid, result);
+      return result;
     },
     [reduced, jump, sessionId],
   );

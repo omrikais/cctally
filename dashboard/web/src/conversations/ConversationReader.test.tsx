@@ -433,10 +433,19 @@ describe('ConversationReader', () => {
 
     const first = container.querySelector('[data-uuid="h1"]')!;
     expect(first.className).toMatch(/conv-rise/);
-    // A re-render (same props) must NOT re-animate the already-painted item:
-    // the seen-Set ref marks it after commit.
+    // #231 — the rise decision is FROZEN per uuid: className + style keep a STABLE
+    // identity across re-renders (a reverse-page prepend re-renders the reader), so
+    // the MessageItem memo holds and the whole loaded window is NOT re-rendered.
+    // The entrance animation still runs only once — a stable, un-toggled class does
+    // not replay, and `conv-rise` uses animation-fill-mode `both` ending at the
+    // natural state, so KEEPING the class is visually inert. So conv-rise REMAINS
+    // (it is not stripped on re-render — stripping it was the className flip that
+    // defeated the memo for the whole window and froze the cold-load reader).
+    const before = first.className;
     rerender(<ConversationReader sessionId="s" />);
-    expect(container.querySelector('[data-uuid="h1"]')!.className).not.toMatch(/conv-rise/);
+    const after = container.querySelector('[data-uuid="h1"]')!;
+    expect(after.className).toBe(before);           // stable className → memo holds
+    expect(after.className).toMatch(/conv-rise/);    // kept across re-render, not stripped
   });
 
   it('staggers the first content page with a per-index animationDelay (idx*40ms, G1 §4b)', async () => {
