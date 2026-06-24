@@ -1479,20 +1479,27 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     expect(sidechain().open).toBe(false); // collapse-all via the data model
   });
 
-  it('g scrolls the reader body to top and resets the cursor to 0', async () => {
-    const scrollTo = vi.fn();
-    const { container, thread } = await renderInConversations([
+  it('g scrolls the reader to the top via Virtuoso and resets the cursor to 0 (#232)', async () => {
+    const { thread } = await renderInConversations([
       makeItem({ uuid: 'h1' }),
       makeItem({ uuid: 'h2' }),
       makeItem({ uuid: 'h3' }),
     ]);
-    const body = container.querySelector('.conv-reader-body') as HTMLElement;
-    body.scrollTo = scrollTo as never;
+    // The first virtual index = the live firstItemIndex (VIRTUAL_INDEX_BASE on a
+    // fresh open) + 0; read it off the first rendered row's data-index so the
+    // assertion tracks the real base rather than hardcoding it.
+    const firstVirtual = Number(row(thread, 0).closest('[data-index]')!.getAttribute('data-index'));
     press('j');
     press('j');
     expect(row(thread, 2)).toHaveClass('conv-item--focused');
+    virtuosoTestHandle.scrollToIndex.mockClear();
     press('g');
-    expect(scrollTo).toHaveBeenCalled();
+    // #232 — the top jump routes through Virtuoso's scrollToIndex on the FIRST
+    // virtual index (firstItemIndex + 0), not a raw body.scrollTo — the mounted
+    // window may not include array index 0.
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(
+      expect.objectContaining({ index: firstVirtual, align: 'start' }),
+    );
     expect(row(thread, 0)).toHaveClass('conv-item--focused');
   });
 

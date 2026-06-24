@@ -312,12 +312,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // session change alongside seenRef.
   const riseCacheRef = useRef<Map<string, [string, React.CSSProperties | undefined]>>(new Map());
 
-  // G3 keyboard navigation. A focused-turn cursor over the DIRECT children of
-  // `.conv-reader-thread` (the sentinel lives outside the thread). The
-  // `conv-item--focused` class is moved imperatively (mirroring the jump
-  // flash) so the memoized MessageItems don't re-render on every step. The
-  // ref mirrors the state so the stable keymap action closures read the live
-  // cursor without re-registering on every move.
+  // G3 keyboard navigation. A focused-turn cursor over the rendered nodes. The
+  // `conv-item--focused` class is now RENDER-DRIVEN (#232 Codex P1-1): `renderNode`
+  // adds it to the node whose uuid === `cursorUuid`, keyed per-uuid so the class
+  // only flips on a real cursor move (a uuid is stable across head mutations,
+  // unlike a raw index) — that keeps the MessageItem memo intact instead of
+  // re-rendering the whole window. The ref mirrors the state so the stable keymap
+  // action closures read the live cursor without re-registering on every move.
   const [focusedIndex, setFocusedIndex] = useState(0);
   const focusedIndexRef = useRef(0);
   focusedIndexRef.current = focusedIndex;
@@ -333,10 +334,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const cursorUuidRef = useRef<string | null>(null);
   cursorUuidRef.current = cursorUuid;
   // #177 S5 — the focus-mode remap keys off the PREVIOUS render's RENDERED-NODE
-  // list (`nodes` = what the thread actually paints: filtered turns + hidden_run
-  // markers + time markers). `focusedIndex` indexes thread.children = nodes-space,
-  // so the remap must read its prev list AND compute its target in nodes-space
-  // too — a marker-less `visible` list would mis-resolve `prevNodesRef[cur]`
+  // list (`nodes` = the full logical render list: filtered turns + hidden_run
+  // markers + time markers; under virtualization only a window is mounted, but
+  // `nodes` and `focusedIndex` are nodes-space, not DOM-space). `focusedIndex`
+  // indexes that nodes array, so the remap must read its prev list AND compute its
+  // target in nodes-space too — a marker-less `visible` list would mis-resolve
+  // `prevNodesRef[cur]`
   // (and the target) by the count of any markers that precede the cursor.
   // `prevNodesRef` is updated in a post-render effect AFTER the remap reads it,
   // so the remap sees the list the user was actually looking at.
@@ -518,8 +521,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // it grows items.length too and on a tail open (hasMore === false) would
     // satisfy the live discriminator, bumping "↓ N new" by the prior window size.
     // A reset replaces the whole window and is likewise neither a stick nor a
-    // count. Bail (advancing the prev-trackers) so the scroll-anchor effect owns
-    // the prepend; the prependPendingRef snapshot it relies on stays intact.
+    // count. Bail (advancing the prev-trackers) so this effect never miscounts a
+    // prepend as a live append; #232 Virtuoso's `firstItemIndex` keeps the
+    // viewport pinned across the prepend, so there is no scroll-anchor snapshot to
+    // preserve here.
     if (lastOp != null && lastOp.op !== 'append') {
       // A RESET replaces the whole window, so it must SEED the known-subagent set
       // from the ENTIRE new window (mirrors the old code, where the null-detail
@@ -1363,8 +1368,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // rendered list reshuffles (turns vanish, hidden_run markers appear, time
   // markers recompute), so the raw index no longer points at the same turn.
   // Everything here is RENDERED-NODE space (`nodes` / `prevNodesRef`) — the same
-  // space `focusedIndex` indexes thread.children in — so markers that precede the
-  // cursor never offset the resolution. Resolve the formerly-focused node's uuid
+  // nodes-space `focusedIndex` indexes (NOT DOM-space: under virtualization only a
+  // window is mounted, but the cursor ring is uuid-keyed and the remap walks the
+  // full `nodes` array) — so markers that precede the cursor never offset the
+  // resolution. Resolve the formerly-focused node's uuid
   // in the OLD `nodes` list, then find that uuid in the NEW `nodes`; if it was
   // suppressed, land on the nearest FOLLOWING turn by original order; failing
   // that, clamp to the last index. Markers (time_marker + hidden_run) carry no
@@ -1490,8 +1497,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, []);
 
   const jumpToTop = useCallback(() => {
-    const body = bodyRef.current;
-    body?.scrollTo({ top: 0, behavior: reducedRef.current ? 'auto' : 'smooth' });
+    // #232 — route through Virtuoso (not a raw body.scrollTo) so the top jump
+    // speaks the VIRTUAL index, consistent with every other reader scroll under
+    // virtualization. The mounted window may not include array index 0, so a raw
+    // scrollTop:0 would land short of the true first item.
+    virtuosoRef.current?.scrollToIndex({
+      index: firstItemIndexRef.current,
+      align: 'start',
+      behavior: reducedRef.current ? 'auto' : 'smooth',
+    });
     setCursor(0);
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — the `g` key is explicit nav
   }, [setCursor]);

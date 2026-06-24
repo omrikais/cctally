@@ -258,6 +258,37 @@ describe('SidechainGroup', () => {
     expect(onOpenChange).toHaveBeenCalledWith('k1', true);
   });
 
+  // #232 — a sidechain scrolled OFF-SCREEN under virtualization UNMOUNTS. If the
+  // user then hits expand-all/collapse-all (`]`/`[`, advancing bulkSweep.rev) and
+  // scrolls the group back into view, it REMOUNTS while bulkSweep.rev is already
+  // advanced. A fresh mount must ADOPT the latest sweep (rev > 0) — the whole
+  // reason the sweep moved to the data model (Codex P1-1) is to reach groups that
+  // were unmounted during the sweep. The render-all mock never unmounts, so this
+  // needs a DIRECT mount with rev already advanced.
+  it('adopts an already-advanced bulk sweep on a fresh (re)mount (#232 off-screen group)', () => {
+    const items = [member('s1'), member('s2')];
+    // Fresh mount with rev already at 2 (the group was off-screen when the user
+    // hit expand-all): it must render OPEN, adopting the swept open-state.
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} bulkSweep={{ rev: 2, open: true }} />,
+    );
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(det.open).toBe(true);
+  });
+
+  it('renders collapsed by default on a no-sweep mount (rev 0 / undefined — never spuriously open)', () => {
+    const items = [member('s1'), member('s2')];
+    // rev 0 = "no sweep yet" → the group keeps its natural collapsed default even
+    // though the sweep open-state is true (it was never actually swept).
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={items} bulkSweep={{ rev: 0, open: true }} />,
+    );
+    expect((container.querySelector('details.conv-sidechain') as HTMLDetailsElement).open).toBe(false);
+    // And with no bulkSweep prop at all.
+    const { container: c2 } = render(<SidechainGroup subagentKey="k2" items={items} />);
+    expect((c2.querySelector('details.conv-sidechain') as HTMLDetailsElement).open).toBe(false);
+  });
+
   it('opens on forceOpen, registers member refs only while open, and latches open after the force drops', () => {
     const refs = new Map<string, HTMLDivElement>();
     const getItemRef = (item: ConversationItem) => (el: HTMLDivElement | null) => {

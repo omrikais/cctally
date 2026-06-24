@@ -189,8 +189,14 @@ export function SidechainGroup({
   // last-applied rev in a ref means a group that was OFF-SCREEN during the sweep
   // still adopts it the moment it (re)mounts — the data-model reach the old
   // querySelectorAll('details') walk lacked. A collapse sweep (`open: false`) also
-  // wins over a stale force (the bulk action is explicit user intent).
-  const lastSweepRevRef = useRef(bulkSweep?.rev ?? 0);
+  // wins over a stale force (the bulk action is explicit user intent). SEED the
+  // ref at 0 (NOT the live `bulkSweep.rev`): `rev` is monotonic from 0 where 0
+  // means "no sweep yet", so a fresh REMOUNT under virtualization (the off-screen
+  // group scrolled back after an expand/collapse-all) sees `rev > 0 !== 0` and
+  // adopts the latest swept state. Seeding from the live rev would make a remount
+  // think it had already applied the sweep and silently keep its own default —
+  // the exact gap the data-model move was meant to close.
+  const lastSweepRevRef = useRef(0);
   if (bulkSweep != null && bulkSweep.rev !== lastSweepRevRef.current) {
     lastSweepRevRef.current = bulkSweep.rev;
     if (userOpen !== bulkSweep.open) setUserOpen(bulkSweep.open);
