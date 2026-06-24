@@ -6,13 +6,53 @@
 // AND style changed at once, defeating the MessageItem React.memo for the whole
 // window (an O(n²) re-render cascade = the cold-load freeze). The fix freezes each
 // turn's rise decision per uuid so its className/style identity is stable across
-// commits. This test drives a real prepend (via the top-sentinel IntersectionObserver)
+// commits. This test drives a real prepend (#232: via Virtuoso's startReached)
 // and asserts the already-mounted turns are NOT re-rendered.
 import { act, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetForTests, dispatch } from '../store/store';
 import { clearReadingPositions } from '../store/readingPosition';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
+
+// #232 — render-all react-virtuoso mock (mirrors ConversationReader.test.tsx):
+// real Virtuoso renders nothing in JSDOM (zero layout), so this passthrough
+// renders EVERY item — keeping the memo-defeat render-count assertions valid —
+// and exposes `startReached` (the reverse-paging trigger that replaces the old
+// top-sentinel IntersectionObserver).
+const virtuosoTestHandle: { firstItemIndex: number; startReached: (() => void) | null } = {
+  firstItemIndex: 0, startReached: null,
+};
+vi.mock('react-virtuoso', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+    React.useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn(), scrollIntoView: vi.fn(), scrollBy: vi.fn(), scrollTo: vi.fn() }), []);
+    const data = (props.data as unknown[]) ?? [];
+    const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
+    const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;
+    const components = (props.components as { List?: unknown; Item?: unknown }) ?? {};
+    const firstItemIndex = (props.firstItemIndex as number) ?? 0;
+    const scrollerRef = props.scrollerRef as ((el: unknown) => void) | undefined;
+    const List = (components.List ?? 'div') as React.ElementType;
+    const Item = (components.Item ?? 'div') as React.ElementType;
+    const scroller = React.useRef<HTMLDivElement>(null);
+    virtuosoTestHandle.firstItemIndex = firstItemIndex;
+    virtuosoTestHandle.startReached = (props.startReached as (() => void)) ?? null;
+    React.useEffect(() => {
+      scrollerRef?.(scroller.current);
+      (props.itemsRendered as ((items: unknown[]) => void) | undefined)?.(data.map((d, i) => ({ index: firstItemIndex + i, data: d })));
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [data.length]);
+    return React.createElement(
+      'div',
+      { ref: scroller, className: props.className as string, role: props.role as string, onScroll: props.onScroll as React.UIEventHandler },
+      React.createElement(List, {}, data.map((d, i) =>
+        React.createElement(Item as React.ElementType,
+          { key: computeItemKey ? computeItemKey(firstItemIndex + i, d) : i, 'data-index': firstItemIndex + i },
+          itemContent(firstItemIndex + i, d)))),
+    );
+  });
+  return { Virtuoso, VirtuosoMockContext: React.createContext(undefined) };
+});
 
 // Count every render of each MessageItem by uuid, INSIDE a memo boundary that
 // mirrors the real component's default shallow-prop memo — so a count only ticks
@@ -44,16 +84,6 @@ class ControllableIO {
   disconnect(): void { this.targets = []; }
   takeRecords(): IntersectionObserverEntry[] { return []; }
 }
-function fireIntersection(selector: string): void {
-  for (const o of observers) {
-    for (const t of o.targets) {
-      if (t.matches?.(selector)) {
-        o.cb([{ isIntersecting: true, target: t } as IntersectionObserverEntry], o as unknown as IntersectionObserver);
-      }
-    }
-  }
-}
-
 let _id = 1;
 function turn(uuid: string): ConversationItem {
   return {
@@ -84,6 +114,8 @@ beforeEach(() => {
   observers.length = 0;
   h.renders.clear();
   _id = 1;
+  virtuosoTestHandle.firstItemIndex = 0;
+  virtuosoTestHandle.startReached = null;
 });
 afterEach(() => { _resetForTests(); clearReadingPositions(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -101,10 +133,11 @@ describe('#231 — a reverse-page prepend does not re-render already-mounted tur
     const tailUuids = tail.map((t) => t.anchor.uuid);
     expect(tailUuids.every((u) => before.has(u))).toBe(true);
 
-    // Prepend an older page by firing the top "Load earlier" sentinel.
+    // Prepend an older page by firing Virtuoso's startReached (#232 — replaces
+    // the old top "Load earlier" sentinel intersection).
     const older = Array.from({ length: 15 }, (_, i) => turn(`o${i}`));
     mockFetchOnce(pageBody(older, 500));
-    await act(async () => { fireIntersection('.conv-load-sentinel--top'); for (let i = 0; i < 16; i++) await Promise.resolve(); });
+    await act(async () => { virtuosoTestHandle.startReached?.(); for (let i = 0; i < 16; i++) await Promise.resolve(); });
     await flush();
 
     // The prepend really happened: older turns mounted, total grew, head changed.

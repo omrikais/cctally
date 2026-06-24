@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { Virtuoso, type VirtuosoHandle, type ListItem, type Components } from 'react-virtuoso';
 import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
@@ -21,7 +22,7 @@ import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
-import { insertTimeMarkers } from './insertTimeMarkers';
+import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
@@ -104,6 +105,32 @@ function findTopLevelNodeFor(
   return groups.find((n) => n.kind === 'subagent' && n.subagentKey === rootKey) ?? null;
 }
 
+// #232 — the stable per-kind React identity key for a rendered node. Reuses the
+// exact keys the pre-virtualization `nodes.map` used (so the virtual index only
+// drives Virtuoso scroll stability, never React identity): time markers carry
+// their own stable `key` (re-keyed off adjacent uuids in insertTimeMarkers, T1),
+// every other kind keys off its anchor/root uuid. Fed to <Virtuoso computeItemKey>.
+function nodeKey(node: TimedNode): React.Key {
+  switch (node.kind) {
+    case 'time_marker': return node.key;
+    case 'hidden_run': return `hr-${node.firstUuid}`;
+    case 'subagent': return `sc-${node.subagentKey}`;
+    case 'tool_result_run': return `trr-${node.items[0].anchor.uuid}`;
+    case 'item': return node.item.anchor.uuid;
+  }
+}
+
+// #232 — Virtuoso's per-item wrapper. A known className (`.conv-reader-item`)
+// gives the CSS retargets (T6) a stable hook through Virtuoso's wrapper, and the
+// VIRTUAL `data-index` rides through so the index math is inspectable. Virtuoso
+// injects `role`/`aria-posinset`/`aria-setsize`/`style` via the spread props
+// (role="feed" support, T5) — forward them all so they aren't clobbered.
+const ReaderItem = forwardRef<HTMLDivElement, Record<string, unknown>>(
+  function ReaderItem(props, ref) {
+    return <div {...props} ref={ref} className="conv-reader-item" />;
+  },
+) as unknown as Components<TimedNode>['Item'];
+
 // Paginated transcript reader (spec §4). Lazy-loads the next page when a
 // bottom sentinel scrolls into view (IntersectionObserver), and supports a
 // jump-to-message: when a search hit sets conversationJump for THIS session,
@@ -154,7 +181,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
     return s;
   }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids });
+  // #232 — the imperative Virtuoso handle (scrollToIndex for jumps / keyboard
+  // nav / the "↓ N new" pill) and a live mirror of the firstItemIndex so
+  // `itemContent`'s array-index math (`virtualIndex − firstItemIndex`) reads the
+  // current offset without re-subscribing. Virtuoso speaks the VIRTUAL index
+  // space (firstItemIndex + arrayIndex); the array index feeds riseFor's stagger.
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const firstItemIndexRef = useRef(virtualFirstItemIndex);
+  firstItemIndexRef.current = virtualFirstItemIndex;
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
@@ -212,19 +247,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // is open + the input is blurred). FindBar assigns its `step` here each render.
   const findStepRef = useRef<((delta: number) => void) | null>(null);
   const reduced = useReducedMotion();
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  // #217 S3 E2 — the TOP sentinel (mirror of the bottom one) → loadPrev on
-  // scroll-up. Plus scroll-anchoring bookkeeping: a prepend grows scrollHeight
-  // above the viewport, so we capture the PRE-prepend height/scrollTop here (in
-  // loadPrev) and re-apply the delta in a layout effect after the render commits,
-  // keeping the viewport pinned to the same turn. `prependPendingRef` carries the
-  // captured metrics across the async fetch + render so the scroll-anchor effect
-  // can re-pin the viewport on the TOP-SENTINEL prepend path. (The stick-to-bottom
-  // effect tells a prepend from an append via a top-edge advance — see
-  // `prevFirstIdRef` below — which also covers jump-driven hook prepends that
-  // never set `prependPendingRef`.)
-  const topSentinelRef = useRef<HTMLDivElement>(null);
-  const prependPendingRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+  // #232 — the bottom/top sentinel IntersectionObservers + the `prependPendingRef`
+  // scroll-anchor snapshot are GONE: Virtuoso's `startReached`/`endReached` drive
+  // the load triggers and `firstItemIndex` (owned in useConversation, T2) keeps
+  // the viewport pinned across a reverse-page prepend without any scrollTop math.
   const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   // #188 S3/B6 — a SEPARATE map holding each subagent card's <details> element,
   // keyed by the bucket-root uuid. Registered UNCONDITIONALLY (open and closed),
@@ -281,8 +307,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // `prevNodesRef` is updated in a post-render effect AFTER the remap reads it,
   // so the remap sees the list the user was actually looking at.
   const prevNodesRef = useRef<ReturnType<typeof insertTimeMarkers>>([]);
-  const threadRef = useRef<HTMLDivElement>(null);
-  const bodyRef = useRef<HTMLDivElement>(null);
+  // #232 — both are now assigned imperatively (threadRef from the ReaderThread
+  // List wrapper's ref callback, bodyRef from Virtuoso's scrollerRef), so they
+  // must be MUTABLE refs (`| null` widens to MutableRefObject).
+  const threadRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   // Stable mirrors so the `useMemo(() => [...], [])` keymap array never churns.
   const hasMoreRef = useRef(hasMore);
   hasMoreRef.current = hasMore;
@@ -291,36 +320,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // #217 S3 E2 — top-edge mirrors for the stable top-sentinel observer closure.
   const hasPrevRef = useRef(hasPrev);
   hasPrevRef.current = hasPrev;
-  // Scroll-anchored reverse paging: snapshot the body's scroll metrics BEFORE
-  // the prepend (the "before" height is unrecoverable post-update, Codex P2),
-  // then the layout effect below re-pins the viewport. A guard against
-  // overlapping loadPrevs (the captured metrics must not be overwritten
-  // mid-flight).
-  //
-  // P3 fix — the layout effect is the SOLE clearer of prependPendingRef on a
-  // SUCCESSFUL prepend. The old `.finally` compared the body's scrollHeight, but
-  // `.finally` runs in the resolve microtask BEFORE React commits the prepend, so
-  // the DOM height is still the OLD value: the comparison falsely read "no
-  // growth" and could clear the snapshot out from under the (post-commit)
-  // scroll-anchor effect → a viewport jump. We now drive the decision off the
-  // hook's `loadPrev()` boolean (did it prepend ≥1 item — computed off the
-  // synchronous detail mirror, no DOM/commit race). On a genuine no-op (stale
-  // cursor / error → nothing prepended) NO new commit fires, so the layout effect
-  // never runs to clear the snapshot; we clear it here in that case ONLY. On a
-  // successful prepend we leave the snapshot for the layout effect to consume.
+  // #232 — reverse paging now needs no scroll-anchor snapshot. Virtuoso's
+  // `firstItemIndex` (decremented by the prepended count in useConversation's
+  // state, T2, in the SAME commit as the prepend) keeps the viewport pinned to
+  // the same turn across a `?before=` prepend — the classic reverse-infinite-
+  // scroll problem is solved by the library. So `doLoadPrev` is just `loadPrev()`
+  // (Virtuoso's `startReached` calls it when the head scrolls into view).
   const doLoadPrev = useCallback(() => {
-    const b = bodyRef.current;
-    if (!b || prependPendingRef.current) return;
-    prependPendingRef.current = { prevScrollHeight: b.scrollHeight, prevScrollTop: b.scrollTop };
-    // #228 S3 B3 — loadPrev resolves to the prepend's WindowOp (or null on a
-    // genuine no-op). Success is `op.addedTop > 0`, NOT a count compare (which a
-    // same-commit prepend+far-trim would defeat). On a no-op no commit fires, so
-    // the scroll-anchor effect never runs to clear the snapshot — clear it here.
-    void loadPrev().then((op) => {
-      if (!op && prependPendingRef.current) {
-        prependPendingRef.current = null;  // no-op: free the snapshot for the next loadPrev
-      }
-    });
+    void loadPrev();
   }, [loadPrev]);
   const doLoadPrevRef = useRef(doLoadPrev);
   doLoadPrevRef.current = doLoadPrev;
@@ -713,47 +720,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     [sessionId, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost],
   );
 
-  // Lazy-load when the bottom sentinel scrolls into view.
-  useEffect(() => {
-    if (!sentinelRef.current || !hasMore) return;
-    const obs = new IntersectionObserver((es) => { if (es[0].isIntersecting) void loadMore(); });
-    obs.observe(sentinelRef.current);
-    return () => obs.disconnect();
-  }, [hasMore, loadMore]);
-
-  // #217 S3 E2 — reverse paging: a TOP sentinel mirrors the bottom one. When it
-  // scrolls into view (the user scrolled up to the head of the loaded window)
-  // and there are more reverse pages, prepend the previous page. Scroll-anchoring
-  // (the layout effect below) keeps the viewport pinned to the same turn.
-  useEffect(() => {
-    if (!topSentinelRef.current || !hasPrev) return;
-    const obs = new IntersectionObserver((es) => { if (es[0].isIntersecting) doLoadPrevRef.current(); });
-    obs.observe(topSentinelRef.current);
-    return () => obs.disconnect();
-  }, [hasPrev]);
-
-  // #217 S3 E2 — scroll-anchoring on a prepend. After loadPrev grows the thread
-  // ABOVE the viewport, re-pin scrollTop by the scrollHeight delta so the turn
-  // the user was reading stays put (the classic reverse-infinite-scroll problem).
-  // useLayoutEffect so the correction lands before paint (no visible jump).
-  // #228 S3 B3 — keyed on `lastOp.rev` + `op === 'prepend'`, NOT items.length: a
-  // prepend+far-trim (the windowed DOM cap) can keep the count flat AND net the
-  // scrollHeight delta to ~0 if it ran in the same commit, defeating a
-  // length-keyed restore (Codex P0). The trim is decoupled to a later tick (2c),
-  // so this still measures a pure prepend; the op gate makes the trigger explicit
-  // instead of inferring it from a count growth. It still requires the
-  // reader-owned `prependPendingRef` snapshot (set only by the top-sentinel
-  // doLoadPrev), so a jump-driven hook prepend with no snapshot no-ops here.
-  useLayoutEffect(() => {
-    if (lastOp?.op !== 'prepend') return;
-    const snap = prependPendingRef.current;
-    const b = bodyRef.current;
-    if (!snap || !b) return;
-    const delta = b.scrollHeight - snap.prevScrollHeight;
-    if (delta > 0) b.scrollTop = snap.prevScrollTop + delta;
-    prependPendingRef.current = null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lastOp?.rev]);
+  // #232 — the bottom sentinel observer, the top sentinel observer, and the
+  // prepend scroll-anchor `useLayoutEffect` are all DELETED. Lazy-load on scroll
+  // now rides Virtuoso's `startReached` (→ doLoadPrev) / `endReached` (→ loadMore)
+  // props (wired on the <Virtuoso> below), and `firstItemIndex` (T2) keeps the
+  // viewport pinned across a prepend with no scrollTop math.
 
   // #217 S3 E2 — open-scroll-intent: once the FIRST page resolves, land per the
   // hook's precedence verdict. 'bottom' (a multi-page tail open) scrolls to the
@@ -772,22 +743,30 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // where the intent is resolved AND content exists, then bail on every later
   // commit. It is reset to false on session switch (the effect below), so the
   // NEXT open re-applies its own intent.
+  // #232 — land through Virtuoso's `scrollToIndex` (not a raw `scrollTop` write,
+  // which fights the library's scroll management). A 'bottom' open jumps to the
+  // last node aligned to the bottom edge; a 'top' open jumps to the first. The
+  // one-shot latch + atBottomRef arming are unchanged.
   const appliedIntentRef = useRef(false);
-  useLayoutEffect(() => {
-    const b = bodyRef.current;
-    if (!b || openScrollIntent == null) return;
+  useEffect(() => {
+    if (openScrollIntent == null) return;
     if (appliedIntentRef.current) return;          // already applied this open
-    if (!(detail?.items.length)) return;            // wait for the first content page
+    const len = detail?.items.length ?? 0;
+    if (!len) return;                               // wait for the first content page
+    const nodeCount = nodes.length;
+    if (!nodeCount) return;                         // wait for the render list too
     appliedIntentRef.current = true;
+    // Virtuoso speaks the VIRTUAL index (firstItemIndex + arrayIndex) (Codex P0-2).
+    const base = firstItemIndexRef.current;
     if (openScrollIntent === 'bottom') {
-      b.scrollTop = b.scrollHeight;
+      virtuosoRef.current?.scrollToIndex({ index: base + nodeCount - 1, align: 'end' });
       atBottomRef.current = true;
     } else {
-      b.scrollTop = 0;
+      virtuosoRef.current?.scrollToIndex({ index: base, align: 'start' });
       atBottomRef.current = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openScrollIntent, detail?.items.length]);
+  }, [openScrollIntent, detail?.items.length, nodes.length]);
 
   // #217 S3 E1 — restore the saved reading position (open-precedence slot 2). A
   // deep-link anchor (slot 1) already lives in the store as a jump (the jump
@@ -1287,13 +1266,19 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // MessageItems don't re-render. hidden_run markers carry `data-conv-marker`;
   // the focused class is never placed on one (stepFocus skips landing on them,
   // and the remap effect resolves the cursor to a real turn after a switch).
+  // #232 — Virtuoso wraps each node in a `.conv-reader-item`, so the class + the
+  // data-conv-marker probe target the wrapper's INNER node element
+  // (`firstElementChild`); the marker attribute / data-uuid live there, not on the
+  // wrapper. (T5 replaces this whole DOM-walking cursor with a render-driven
+  // `cursorIndex` class.)
   useEffect(() => {
     const thread = threadRef.current;
     if (!thread) return;
     const kids = thread.children;
     for (let i = 0; i < kids.length; i++) {
-      const isMarker = (kids[i] as HTMLElement).dataset.convMarker != null;
-      kids[i].classList.toggle('conv-item--focused', i === focusedIndex && !isMarker);
+      const node = (kids[i].firstElementChild ?? kids[i]) as HTMLElement;
+      const isMarker = node.dataset.convMarker != null;
+      node.classList.toggle('conv-item--focused', i === focusedIndex && !isMarker);
     }
   }, [focusedIndex, visible]);
 
@@ -1374,17 +1359,24 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (last < 0) return;
     const cur = focusedIndexRef.current;
     const dir = delta >= 0 ? 1 : -1;
+    // #232 — Virtuoso wraps each node in a `.conv-reader-item`; the marker flag
+    // lives on the INNER node element, so probe `firstElementChild`.
+    const isMarkerAt = (i: number): boolean => {
+      const wrap = thread.children[i] as HTMLElement | undefined;
+      const node = (wrap?.firstElementChild ?? wrap) as HTMLElement | undefined;
+      return node?.dataset.convMarker != null;
+    };
     // Step at least one child, then keep walking PAST any `data-conv-marker`
     // child (the hidden_run buttons) so the cursor never lands on a marker — a
     // marker can never take keyboard focus (Codex F5). Stops at the edge.
     let next = cur + delta;
-    while (next >= 0 && next <= last && (thread.children[next] as HTMLElement).dataset.convMarker != null) {
+    while (next >= 0 && next <= last && isMarkerAt(next)) {
       next += dir;
     }
     next = Math.max(0, Math.min(last, next));
     // If clamping landed back on a marker (the run sits at an edge), there is no
     // real turn that way — stay put.
-    if ((thread.children[next] as HTMLElement | undefined)?.dataset.convMarker != null) return;
+    if (isMarkerAt(next)) return;
     // At the last loaded group with more to come, kick a load; the cursor
     // advances on the next press once the new child has mounted.
     if (delta > 0 && cur === last && hasMoreRef.current) { void loadMoreRef.current(); return; }
@@ -1680,6 +1672,165 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   );
   useKeymap(keymapBindings);
 
+  // #232 — Virtuoso's `List` wrapper IS the `.conv-reader-thread`. It carries the
+  // focus target (`threadRef`, tabIndex={-1} so onFindClose's restore lands here
+  // and j/k run through the document keymap, never thread focus) and the thread
+  // styling. Built ONCE (empty-dep useMemo) so the <Virtuoso components> object
+  // never churns Virtuoso's internals across reader re-renders; it captures
+  // `threadRef` (a stable ref) so the closure stays correct.
+  const virtuosoComponents = useMemo<Components<TimedNode>>(() => {
+    const ReaderThread = forwardRef<HTMLDivElement, { children?: React.ReactNode }>(
+      function ReaderThread(props, ref) {
+        return (
+          <div
+            ref={(el) => {
+              threadRef.current = el;
+              if (typeof ref === 'function') ref(el);
+              else if (ref) (ref as React.MutableRefObject<HTMLDivElement | null>).current = el;
+            }}
+            className="conv-reader-thread"
+            tabIndex={-1}
+          >
+            {props.children}
+          </div>
+        );
+      },
+    ) as unknown as Components<TimedNode>['List'];
+    return { List: ReaderThread, Item: ReaderItem };
+    // threadRef is a stable ref — the components must be built once so Virtuoso's
+    // internal state doesn't reset on every reader render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // #232 — the per-node render switch, lifted verbatim from the old `nodes.map`
+  // callback (so it returns the SAME JSX per kind) into a function Virtuoso calls
+  // per visible item. `arrayIndex` is the position in `nodes` (the ARRAY index,
+  // = virtualIndex − firstItemIndex — Codex P0-2): it feeds `riseFor`'s stagger
+  // only. The resolved `node` comes straight from Virtuoso's `data` arg, so there
+  // is no `nodes[...]` lookup. Closes over the same refs/handlers the old map did.
+  const renderNode = useCallback((g: TimedNode, arrayIndex: number): React.ReactNode => {
+    if (!detail) return null;
+    // #177 S5 §6 — an inter-turn gap/day marker. Real DOM text (screen-reader
+    // visible), role="separator", data-conv-marker so j/k and the focus-class
+    // effect skip it (never a keyboard stop).
+    if (g.kind === 'time_marker') {
+      const gapTxt = g.gapSeconds != null ? `⏸ ${fmt.gapDuration(g.gapSeconds)} later` : null;
+      const text =
+        gapTxt && g.dayLabel ? `${gapTxt} · ${g.dayLabel}`
+        : gapTxt ? gapTxt
+        : `— ${g.dayLabel} —`;
+      return (
+        <div className="conv-time-marker" data-conv-marker="" role="separator">
+          {text}
+        </div>
+      );
+    }
+    // #177 S5 §5 — a coalesced run of focus-hidden nodes. Renders as a marker
+    // button (data-conv-marker: never keyboard-focusable, never gets
+    // conv-item--focused). Clicking it drops back to `all` and jumps to the first
+    // hidden node so the user can resume reading there.
+    if (g.kind === 'hidden_run') {
+      return (
+        <button
+          type="button"
+          className="conv-hidden-run"
+          data-conv-marker=""
+          // #217 S3 E10#1 — the `· N hidden ·` pill is icon-like prose; name the
+          // action for screen readers (the glyph run alone is opaque). Click drops
+          // back to `all` and jumps to the first hidden turn.
+          aria-label={`Show ${g.count} hidden ${g.count === 1 ? 'turn' : 'turns'}`}
+          onClick={() => {
+            dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+            dispatch({
+              type: 'OPEN_CONVERSATION',
+              sessionId,
+              jump: { session_id: sessionId, uuid: g.firstUuid },
+            });
+          }}
+        >· {g.count} hidden ·</button>
+      );
+    }
+    if (g.kind === 'subagent') {
+      // The thread's member_uuids (every fragment) decide jump-target suppression
+      // so a folded/sidechain jump target is covered.
+      const members = g.items.flatMap((it) => it.member_uuids);
+      const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, arrayIndex);
+      return (
+        <SidechainGroup
+          subagentKey={g.subagentKey}
+          items={g.items}
+          meta={detail.subagent_meta?.[g.subagentKey]}
+          getItemRef={getItemRef}
+          // #188 S3/B6 — the bucket-root uuid (the same value the outline subagent
+          // entry jumps to). It tags the card's <details> via data-uuid and keys
+          // it in cardRefs.
+          rootUuid={g.items[0].anchor.uuid}
+          getCardRef={getCardRef}
+          // #188 S4/C2 — lift the thread's open-state so the "↓ N new" pill counts
+          // only VISIBLE appends (Bug 5).
+          onOpenChange={handleSubagentOpenChange}
+          // §5 (Codex P1-D) — force-open iff this key is in the ancestor chain set
+          // (a jump into a nested target opens this parent too).
+          forceOpen={detail.session_id === sessionId && forcedOpenKeys.has(g.subagentKey)}
+          isMobile={isMobile}
+          riseClassName={riseClass}
+          riseStyle={riseStyle}
+          // §5 — recursive nesting: the child subagent threads + this node's depth
+          // + the per-key machinery for every nested level.
+          children={g.children}
+          depth={g.depth}
+          childCtx={childCtx}
+        />
+      );
+    }
+    if (g.kind === 'tool_result_run') {
+      // Collapsed orphan-result run (#164). Members render their own MessageItem
+      // so each keeps its data-uuid + per-member ref for the #160 jump; the
+      // disclosure is open by default so a jump target inside it is reachable
+      // without a force-open dance.
+      const members = g.items.flatMap((it) => it.member_uuids);
+      const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, arrayIndex);
+      return (
+        <details
+          className={['conv-toolresult-run', riseClass].filter(Boolean).join(' ')}
+          style={riseStyle}
+          open
+        >
+          <summary>
+            <span className="conv-chev" aria-hidden="true" />
+            <ResultIcon /> {g.items.length} tool results
+          </summary>
+          <div className="conv-toolresult-run-body">
+            {g.items.map((item) => (
+              <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
+            ))}
+          </div>
+        </details>
+      );
+    }
+    const [riseClass, riseStyle] = riseFor(g.item.anchor.uuid, g.item.member_uuids, arrayIndex);
+    return (
+      <MessageItem
+        item={g.item}
+        ref={getItemRef(g.item)}
+        className={riseClass}
+        style={riseStyle}
+        // §5 — suppress a spawn chip on a main-thread item (its nested subagent
+        // card is canonical).
+        suppressToolUseIds={suppressToolUseIds}
+        // #228 S2 (A3) — the loaded-spawn kind map for the connector that replaces
+        // a suppressed spawn chip (main-thread spawns).
+        spawnKindByToolUseId={spawnKindByToolUseId}
+      />
+    );
+  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId]);
+
+  // #232 — Virtuoso's itemsRendered callback (scroll-sync re-registration is
+  // wired in T5). Defined here so the <Virtuoso> prop has a stable referent.
+  const onItemsRendered = useCallback((_items: ListItem<TimedNode>[]) => {
+    // T5 re-registers the scroll-sync IntersectionObserver here.
+  }, []);
+
   if (loading && !detail) return (
     <div className="conv-reader conv-reader--loading">
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><SpinnerIcon /></span>
@@ -1928,145 +2079,40 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           tailRevision={tailRevision}
         />
       )}
-      <div className="conv-reader-body" ref={bodyRef} onScroll={onBodyScroll}>
-        {/* #217 S3 E2 — TOP sentinel (mirror of the bottom one). When it scrolls
-            into view at the head of the loaded window, loadPrev prepends the
-            previous page (scroll-anchored). Rendered only while there are more
-            reverse pages. */}
-        {hasPrev && <div ref={topSentinelRef} className="conv-load-sentinel conv-load-sentinel--top">Loading earlier…</div>}
-        <HighlightContext.Provider value={findTerms}>
-        <TranscriptContext.Provider value={transcriptCtx}>
-        {/* #217 S4 QA fix — tabIndex={-1} makes the thread programmatically
-            focusable so onFindClose's `threadRef.current.focus()` actually
-            restores focus here (a plain <div> isn't focusable, so the restore
-            silently landed on <body>). -1 keeps it OUT of the Tab order (j/k
-            nav runs through the document-level keymap, not thread focus). */}
-        <div className="conv-reader-thread" ref={threadRef} tabIndex={-1}>
-          {nodes.map((g, idx) => {
-            // #177 S5 §6 — an inter-turn gap/day marker. Real DOM text
-            // (screen-reader visible), role="separator", data-conv-marker so j/k
-            // and the focus-class effect skip it (never a keyboard stop).
-            if (g.kind === 'time_marker') {
-              const gapTxt = g.gapSeconds != null ? `⏸ ${fmt.gapDuration(g.gapSeconds)} later` : null;
-              const text =
-                gapTxt && g.dayLabel ? `${gapTxt} · ${g.dayLabel}`
-                : gapTxt ? gapTxt
-                : `— ${g.dayLabel} —`;
-              return (
-                <div key={g.key} className="conv-time-marker" data-conv-marker="" role="separator">
-                  {text}
-                </div>
-              );
-            }
-            // #177 S5 §5 — a coalesced run of focus-hidden nodes. Renders as a
-            // marker button (data-conv-marker: never keyboard-focusable, never
-            // gets conv-item--focused). Clicking it drops back to `all` and jumps
-            // to the first hidden node so the user can resume reading there.
-            if (g.kind === 'hidden_run') {
-              return (
-                <button
-                  key={`hr-${g.firstUuid}`}
-                  type="button"
-                  className="conv-hidden-run"
-                  data-conv-marker=""
-                  // #217 S3 E10#1 — the `· N hidden ·` pill is icon-like prose;
-                  // name the action for screen readers (the glyph run alone is
-                  // opaque). Click drops back to `all` and jumps to the first
-                  // hidden turn.
-                  aria-label={`Show ${g.count} hidden ${g.count === 1 ? 'turn' : 'turns'}`}
-                  onClick={() => {
-                    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
-                    dispatch({
-                      type: 'OPEN_CONVERSATION',
-                      sessionId,
-                      jump: { session_id: sessionId, uuid: g.firstUuid },
-                    });
-                  }}
-                >· {g.count} hidden ·</button>
-              );
-            }
-            if (g.kind === 'subagent') {
-              // The thread's member_uuids (every fragment) decide jump-target
-              // suppression so a folded/sidechain jump target is covered.
-              const members = g.items.flatMap((it) => it.member_uuids);
-              const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, idx);
-              return (
-                <SidechainGroup
-                  key={`sc-${g.subagentKey}`}
-                  subagentKey={g.subagentKey}
-                  items={g.items}
-                  meta={detail.subagent_meta?.[g.subagentKey]}
-                  getItemRef={getItemRef}
-                  // #188 S3/B6 — the bucket-root uuid (the same value the
-                  // outline subagent entry jumps to). It tags the card's
-                  // <details> via data-uuid and keys it in cardRefs.
-                  rootUuid={g.items[0].anchor.uuid}
-                  getCardRef={getCardRef}
-                  // #188 S4/C2 — lift the thread's open-state so the "↓ N new"
-                  // pill counts only VISIBLE appends (Bug 5).
-                  onOpenChange={handleSubagentOpenChange}
-                  // §5 (Codex P1-D) — force-open iff this key is in the ancestor
-                  // chain set (a jump into a nested target opens this parent too).
-                  forceOpen={detail.session_id === sessionId && forcedOpenKeys.has(g.subagentKey)}
-                  isMobile={isMobile}
-                  riseClassName={riseClass}
-                  riseStyle={riseStyle}
-                  // §5 — recursive nesting: the child subagent threads + this
-                  // node's depth + the per-key machinery for every nested level.
-                  children={g.children}
-                  depth={g.depth}
-                  childCtx={childCtx}
-                />
-              );
-            }
-            if (g.kind === 'tool_result_run') {
-              // Collapsed orphan-result run (#164). Members render their own
-              // MessageItem so each keeps its data-uuid + per-member ref for the
-              // #160 jump; the disclosure is open by default so a jump target
-              // inside it is reachable without a force-open dance.
-              const members = g.items.flatMap((it) => it.member_uuids);
-              const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, idx);
-              return (
-                <details
-                  key={`trr-${g.items[0].anchor.uuid}`}
-                  className={['conv-toolresult-run', riseClass].filter(Boolean).join(' ')}
-                  style={riseStyle}
-                  open
-                >
-                  <summary>
-                    <span className="conv-chev" aria-hidden="true" />
-                    <ResultIcon /> {g.items.length} tool results
-                  </summary>
-                  <div className="conv-toolresult-run-body">
-                    {g.items.map((item) => (
-                      <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
-                    ))}
-                  </div>
-                </details>
-              );
-            }
-            const [riseClass, riseStyle] = riseFor(g.item.anchor.uuid, g.item.member_uuids, idx);
-            return (
-              <MessageItem
-                key={g.item.anchor.uuid}
-                item={g.item}
-                ref={getItemRef(g.item)}
-                className={riseClass}
-                style={riseStyle}
-                // §5 — suppress a spawn chip on a main-thread item (its nested
-                // subagent card is canonical).
-                suppressToolUseIds={suppressToolUseIds}
-                // #228 S2 (A3) — the loaded-spawn kind map for the connector that
-                // replaces a suppressed spawn chip (main-thread spawns).
-                spawnKindByToolUseId={spawnKindByToolUseId}
-              />
-            );
-          })}
-        </div>
-        </TranscriptContext.Provider>
-        </HighlightContext.Provider>
-        {hasMore && <div ref={sentinelRef} className="conv-load-sentinel">Loading more…</div>}
-      </div>
+      {/* #232 — the reader list is virtualized: <Virtuoso> IS the
+          `.conv-reader-body` scroll surface (not a nested scroller — its own
+          scroller carries the className and `scrollerRef` keeps `bodyRef`
+          pointing at it). Only viewport-near cards mount, so cold-mount is
+          O(viewport), not O(window). `firstItemIndex` (owned in useConversation,
+          T2) pins the viewport across reverse-page prepends; `startReached` /
+          `endReached` replace the deleted sentinel observers; `followOutput` /
+          `atBottomStateChange` (with the 80px slack) drive stick + the "↓ N new"
+          pill; `role="feed"` keeps the off-screen turns navigable for a screen
+          reader (T5). The Highlight/Transcript providers wrap it so every mounted
+          card reads the find terms + transcript context. */}
+      <HighlightContext.Provider value={findTerms}>
+      <TranscriptContext.Provider value={transcriptCtx}>
+      <Virtuoso
+        ref={virtuosoRef}
+        className="conv-reader-body"
+        role="feed"
+        scrollerRef={(el) => { bodyRef.current = el as HTMLDivElement | null; }}
+        data={nodes}
+        firstItemIndex={virtualFirstItemIndex}
+        computeItemKey={(_index, node) => nodeKey(node)}
+        itemContent={(index, node) => renderNode(node, index - firstItemIndexRef.current)}
+        components={virtuosoComponents}
+        startReached={() => { doLoadPrevRef.current(); }}
+        endReached={() => { void loadMore(); }}
+        followOutput={(atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
+        atBottomThreshold={80}
+        atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
+        itemsRendered={onItemsRendered}
+        increaseViewportBy={600}
+        onScroll={onBodyScroll}
+      />
+      </TranscriptContext.Provider>
+      </HighlightContext.Provider>
       {/* #175 F4 — "↓ N new" pill. A child of .conv-reader (NOT the scrolling
           .conv-reader-body), absolutely positioned so it floats over the body
           without scrolling with it. Shown only while scrolled up with unseen

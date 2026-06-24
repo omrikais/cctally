@@ -36,6 +36,47 @@ import { installIntersectionObserverStub } from '../test-utils/intersectionObser
 import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { Envelope, SessionRow } from '../types/envelope';
 
+// #232 — render-all react-virtuoso mock (mirrors ConversationReader.test.tsx).
+// The integration tests render the real reader, but real Virtuoso renders
+// nothing in JSDOM (zero layout). This passthrough mounts every item so the
+// reader's rows, jump flash, and cost footer assertions stay valid. The handle
+// surfaces the imperative scrollToIndex spy + startReached load trigger.
+const virtuosoTestHandle: {
+  scrollToIndex: ReturnType<typeof vi.fn>;
+  startReached: (() => void) | null;
+} = { scrollToIndex: vi.fn(), startReached: null };
+vi.mock('react-virtuoso', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+    const scrollToIndex = virtuosoTestHandle.scrollToIndex;
+    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView: vi.fn(), scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
+    const data = (props.data as unknown[]) ?? [];
+    const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
+    const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;
+    const components = (props.components as { List?: unknown; Item?: unknown }) ?? {};
+    const firstItemIndex = (props.firstItemIndex as number) ?? 0;
+    const scrollerRef = props.scrollerRef as ((el: unknown) => void) | undefined;
+    const List = (components.List ?? 'div') as React.ElementType;
+    const Item = (components.Item ?? 'div') as React.ElementType;
+    const scroller = React.useRef<HTMLDivElement>(null);
+    virtuosoTestHandle.startReached = (props.startReached as (() => void)) ?? null;
+    React.useEffect(() => {
+      scrollerRef?.(scroller.current);
+      (props.itemsRendered as ((items: unknown[]) => void) | undefined)?.(data.map((d, i) => ({ index: firstItemIndex + i, data: d })));
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [data.length]);
+    return React.createElement(
+      'div',
+      { ref: scroller, className: props.className as string, role: props.role as string, onScroll: props.onScroll as React.UIEventHandler },
+      React.createElement(List, {}, data.map((d, i) =>
+        React.createElement(Item as React.ElementType,
+          { key: computeItemKey ? computeItemKey(firstItemIndex + i, d) : i, 'data-index': firstItemIndex + i },
+          itemContent(firstItemIndex + i, d)))),
+    );
+  });
+  return { Virtuoso, VirtuosoMockContext: React.createContext(undefined) };
+});
+
 // Mirror of main.tsx's view-aware global panel-digit binding. Registered
 // here (rather than importing main.tsx, which boots SSE + createRoot against
 // a #root this test does not mount) so scenario 6 exercises the production
@@ -217,6 +258,8 @@ beforeEach(() => {
   registerPanelDigitBindings();
   installRoutedFetch();
   installIntersectionObserverStub();
+  virtuosoTestHandle.scrollToIndex = vi.fn();
+  virtuosoTestHandle.startReached = null;
 });
 
 afterEach(() => {

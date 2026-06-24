@@ -14,6 +14,87 @@ import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia'
 import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
+// #232 — render-all react-virtuoso mock (Codex P2-1). Real Virtuoso needs real
+// layout (ResizeObserver / offsetHeight / scrollHeight) which JSDOM reports as
+// 0, so it would render a degenerate item set and every render/jump/stick
+// assertion in this 2,700-line suite would go vacuous. This passthrough renders
+// EVERY item (so `itemContent` runs for the whole list), forwards the
+// scroller/list/item wrappers exactly as the reader supplies them (so
+// `.conv-reader-body` / `.conv-reader-thread` / `[data-uuid]` selectors keep
+// resolving), and exposes the imperative handle + the load/at-bottom callbacks
+// the migrated tests drive. The `data-index` carries the VIRTUAL index
+// (firstItemIndex + array position) so tests can assert the index math.
+//
+// `virtuosoTestHandle` lets a test reach the live `scrollToIndex` spy and the
+// captured callbacks (startReached / endReached / atBottomStateChange) of the
+// most-recently-mounted instance, and the IntersectionObserver-free top/bottom
+// load triggers (startReached/endReached replace the deleted sentinel
+// observers).
+const virtuosoTestHandle: {
+  scrollToIndex: ReturnType<typeof vi.fn>;
+  firstItemIndex: number;
+  startReached: (() => void) | null;
+  endReached: (() => void) | null;
+  atBottomStateChange: ((atBottom: boolean) => void) | null;
+  itemsRendered: ((items: unknown[]) => void) | null;
+  followOutput: ((atBottom: boolean) => unknown) | null;
+} = {
+  scrollToIndex: vi.fn(),
+  firstItemIndex: 0,
+  startReached: null,
+  endReached: null,
+  atBottomStateChange: null,
+  itemsRendered: null,
+  followOutput: null,
+};
+vi.mock('react-virtuoso', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+    const scrollToIndex = virtuosoTestHandle.scrollToIndex;
+    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView: vi.fn(), scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
+    const data = (props.data as unknown[]) ?? [];
+    const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
+    const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;
+    const components = (props.components as { List?: unknown; Item?: unknown }) ?? {};
+    const firstItemIndex = (props.firstItemIndex as number) ?? 0;
+    const scrollerRef = props.scrollerRef as ((el: unknown) => void) | undefined;
+    const List = (components.List ?? 'div') as React.ElementType;
+    const Item = (components.Item ?? 'div') as React.ElementType;
+    const scroller = React.useRef<HTMLDivElement>(null);
+    // Mirror the live props onto the shared test handle each render.
+    virtuosoTestHandle.firstItemIndex = firstItemIndex;
+    virtuosoTestHandle.startReached = (props.startReached as (() => void)) ?? null;
+    virtuosoTestHandle.endReached = (props.endReached as (() => void)) ?? null;
+    virtuosoTestHandle.atBottomStateChange = (props.atBottomStateChange as ((b: boolean) => void)) ?? null;
+    virtuosoTestHandle.itemsRendered = (props.itemsRendered as ((items: unknown[]) => void)) ?? null;
+    virtuosoTestHandle.followOutput = (props.followOutput as ((b: boolean) => unknown)) ?? null;
+    React.useEffect(() => {
+      scrollerRef?.(scroller.current);
+      // Emit an itemsRendered range covering the whole (rendered) list so the
+      // reader's scroll-sync re-registration fires post-mount, mirroring real
+      // Virtuoso's first range callback.
+      const rendered = props.itemsRendered as ((items: unknown[]) => void) | undefined;
+      rendered?.(data.map((d, i) => ({ index: firstItemIndex + i, data: d })));
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [data.length]);
+    return React.createElement(
+      'div',
+      { ref: scroller, className: props.className as string, role: props.role as string, 'data-virtuoso-scroller': true, onScroll: props.onScroll as React.UIEventHandler },
+      React.createElement(
+        List,
+        {},
+        data.map((d, i) =>
+          React.createElement(
+            Item as React.ElementType,
+            { key: computeItemKey ? computeItemKey(firstItemIndex + i, d) : i, 'data-index': firstItemIndex + i },
+            itemContent(firstItemIndex + i, d),
+          )),
+      ),
+    );
+  });
+  return { Virtuoso, VirtuosoMockContext: React.createContext(undefined) };
+});
+
 // §6 overlap-upsert keys the live-tail merge off `anchor.id`, so fixtures need
 // DISTINCT, STABLE ids (the real server's anchor.id is the cache rowid). A
 // per-uuid registry assigns a deterministic monotonic id so the SAME uuid always
@@ -95,6 +176,15 @@ beforeEach(() => {
   clearReadingPositions();
   _idByUuid.clear();
   _nextItemId = 1;
+  // #232 — reset the shared Virtuoso test handle so a prior test's scrollToIndex
+  // calls / captured callbacks don't bleed across tests.
+  virtuosoTestHandle.scrollToIndex = vi.fn();
+  virtuosoTestHandle.firstItemIndex = 0;
+  virtuosoTestHandle.startReached = null;
+  virtuosoTestHandle.endReached = null;
+  virtuosoTestHandle.atBottomStateChange = null;
+  virtuosoTestHandle.itemsRendered = null;
+  virtuosoTestHandle.followOutput = null;
 });
 afterEach(() => {
   uninstallGlobalKeydown();
@@ -1324,6 +1414,9 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     return { ...utils, thread };
   }
   const press = (key: string) => fireEvent.keyDown(document, { key });
+  // #232 — Virtuoso wraps each node in a `.conv-reader-item`, and the focus ring
+  // class lands on the INNER node element, so resolve it for the cursor asserts.
+  const row = (thread: HTMLElement, i: number): Element => thread.children[i].firstElementChild ?? thread.children[i];
 
   it('j/k move the focused-turn cursor and clamp at both ends', async () => {
     const { thread } = await renderInConversations([
@@ -1332,19 +1425,19 @@ describe('ConversationReader keyboard navigation (G3)', () => {
       makeItem({ uuid: 'h2' }),
     ]);
     // Starts at 0.
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
     press('j');
-    expect(thread.children[1]).toHaveClass('conv-item--focused');
-    expect(thread.children[0]).not.toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).not.toHaveClass('conv-item--focused');
     press('j');
-    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    expect(row(thread, 2)).toHaveClass('conv-item--focused');
     press('j'); // clamp at the last child
-    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    expect(row(thread, 2)).toHaveClass('conv-item--focused');
     press('k');
-    expect(thread.children[1]).toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).toHaveClass('conv-item--focused');
     press('k');
     press('k'); // clamp at 0
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
   });
 
   it('[ collapses and ] expands every <details> in the thread', async () => {
@@ -1372,10 +1465,10 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     body.scrollTo = scrollTo as never;
     press('j');
     press('j');
-    expect(thread.children[2]).toHaveClass('conv-item--focused');
+    expect(row(thread, 2)).toHaveClass('conv-item--focused');
     press('g');
     expect(scrollTo).toHaveBeenCalled();
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
   });
 
   it('bindings are inert while a modal is open', async () => {
@@ -1386,8 +1479,8 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     act(() => { dispatch({ type: 'OPEN_MODAL', kind: 'session' }); });
     press('j');
     // No move from index 0 while a modal owns the keys.
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
-    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).not.toHaveClass('conv-item--focused');
   });
 
   it('bindings are inert while input-mode is active', async () => {
@@ -1397,8 +1490,8 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     ]);
     act(() => { dispatch({ type: 'SET_INPUT_MODE', mode: 'search' }); });
     press('j');
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
-    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).not.toHaveClass('conv-item--focused');
   });
 
   it('does not fire on the dashboard view (view-scoped binding)', async () => {
@@ -1410,8 +1503,8 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     ]);
     act(() => { dispatch({ type: 'SET_VIEW', view: 'dashboard' }); });
     press('j');
-    expect(thread.children[0]).toHaveClass('conv-item--focused');
-    expect(thread.children[1]).not.toHaveClass('conv-item--focused');
+    expect(row(thread, 0)).toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).not.toHaveClass('conv-item--focused');
   });
 
   // #177 S5 — the `o` key toggles the outline open flag; the toggle button in
@@ -1530,6 +1623,9 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     return { ...utils, thread };
   }
   const press = (key: string) => fireEvent.keyDown(document, { key });
+  // #232 — the focus ring class lands on the INNER node inside Virtuoso's
+  // `.conv-reader-item` wrapper; resolve it for the cursor asserts.
+  const row = (thread: HTMLElement, i: number): Element => thread.children[i].firstElementChild ?? thread.children[i];
 
   const baseOutline = (turns: OutlineTurn[], errorCount = 0): ConversationOutline => ({
     session_id: 's',
@@ -1682,7 +1778,7 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     );
     // Focus the assistant turn (index 1).
     press('j');
-    expect(thread.children[1]).toHaveClass('conv-item--focused');
+    expect(row(thread, 1)).toHaveClass('conv-item--focused');
     // Switch to prompts: a1 is hidden (a hidden_run marker takes its slot). The
     // remap must move focus onto a real, visible human turn — never the marker.
     act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
@@ -2330,52 +2426,48 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
     // The FIRST request was ?tail=1 — not the legacy head page.
     expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])).toContain('tail=1');
-    // The top sentinel is present (more reverse pages); the bottom one is not.
-    expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull();
+    // #232 — reverse paging is now driven by Virtuoso's `startReached`, not a top
+    // sentinel. Firing it (has_prev:true) issues the ?before= reverse fetch.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some((c) => String(c[0]).includes('before=3'))).toBe(true);
   });
 
-  it('a single-page session opens (?tail=1 → has_prev:false) with NO top sentinel', async () => {
+  it('a single-page session opens (?tail=1 → has_prev:false) — startReached is a no-op', async () => {
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { prev_before: null, has_prev: false }));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
     const { container } = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(container.querySelector('[data-uuid="t2"]')).not.toBeNull());
     expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])).toContain('tail=1');
-    // Single page: everything is loaded, so no reverse paging → no top sentinel.
-    expect(container.querySelector('.conv-load-sentinel--top')).toBeNull();
+    // #232 — single page: nothing above, so a startReached fires no reverse fetch.
+    const callsBefore = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    await act(async () => {
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBefore);
   });
 
-  it('the top sentinel triggers loadPrev → a ?before= prepend (controllable IO)', async () => {
-    // A controllable IntersectionObserver so we can fire the TOP sentinel into
-    // view deterministically (JSDOM has no real IO; the default stub is a no-op).
-    // Records every observed element + its callback so we can pick the top
-    // sentinel by className and simulate an intersection.
-    const observed: { el: Element; cb: IntersectionObserverCallback; obs: IntersectionObserver }[] = [];
-    class CapturingIO {
-      cb: IntersectionObserverCallback;
-      constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
-      observe(el: Element): void { observed.push({ el, cb: this.cb, obs: this as unknown as IntersectionObserver }); }
-      unobserve(): void {}
-      disconnect(): void {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-    }
-    (globalThis as unknown as { IntersectionObserver: typeof CapturingIO }).IntersectionObserver = CapturingIO;
-
+  it('startReached triggers loadPrev → a ?before= prepend (#232)', async () => {
+    // #232 — reverse paging is driven by Virtuoso's `startReached` (the head
+    // scrolling into view), replacing the deleted top-sentinel IntersectionObserver.
     // tail open with a top edge armed (prev_before 3).
     mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
     const { container } = render(<ConversationReader sessionId="s" />);
-    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
 
     // The before-page (the earlier window). Its envelope carries a bottom edge
     // for the already-loaded items — the prepend must ignore it.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
 
-    // Fire the top sentinel into view (find the observation whose element is the
-    // top sentinel, then invoke its callback with isIntersecting).
-    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
-    expect(topEntry).toBeTruthy();
+    // Fire Virtuoso's startReached (the head reached) — the reader runs doLoadPrev.
     await act(async () => {
-      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
 
@@ -2385,6 +2477,36 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // The window now holds the prepended items in order (t1,t2,t3,t4).
     const order = Array.from(container.querySelectorAll('[data-uuid]')).map((e) => e.getAttribute('data-uuid'));
     expect(order.filter((u) => /^t[1-4]$/.test(u ?? ''))).toEqual(['t1', 't2', 't3', 't4']);
+  });
+
+  it('#232: firstItemIndex decrements by the prepended count, pinning the virtual index of the old head', async () => {
+    // The Virtuoso firstItemIndex (owned in useConversation, T2) must DROP by the
+    // count prepended so data[0]'s virtual index stays stable across a reverse
+    // page — the mechanism that pins the viewport. We read it off the render-all
+    // mock's exposed handle + the VIRTUAL data-index on the rendered rows.
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
+    const before = virtuosoTestHandle.firstItemIndex;
+    // t3 is the head node here — capture its current virtual index.
+    const t3Wrap = (container.querySelector('[data-uuid="t3"]')!.closest('.conv-reader-item')) as HTMLElement;
+    const t3VirtualBefore = Number(t3Wrap.getAttribute('data-index'));
+
+    // Prepend a 2-item reverse page.
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // firstItemIndex dropped by exactly the prepended count (2).
+    expect(virtuosoTestHandle.firstItemIndex).toBe(before - 2);
+    // t3's VIRTUAL index is unchanged — its viewport position is pinned even
+    // though its ARRAY position moved from 0 to 2.
+    const t3WrapAfter = (container.querySelector('[data-uuid="t3"]')!.closest('.conv-reader-item')) as HTMLElement;
+    expect(Number(t3WrapAfter.getAttribute('data-index'))).toBe(t3VirtualBefore);
   });
 
   it('#228 S3 B3: a tail-open prepend is recognised via op metadata — no stick, no "↓ N new" mis-fire', async () => {
@@ -2398,22 +2520,13 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // not in JSDOM, which never lays out — here we assert the LOGIC: the op routes
     // the prepend away from the live-append path.) This is also the count-flat
     // case the windowed-cap trim will hit (a prepend+far-trim keeps len flat).
-    const observed: { el: Element; cb: IntersectionObserverCallback; obs: IntersectionObserver }[] = [];
-    class CapturingIO {
-      cb: IntersectionObserverCallback;
-      constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
-      observe(el: Element): void { observed.push({ el, cb: this.cb, obs: this as unknown as IntersectionObserver }); }
-      unobserve(): void {}
-      disconnect(): void {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-    }
-    (globalThis as unknown as { IntersectionObserver: typeof CapturingIO }).IntersectionObserver = CapturingIO;
+    // #232 — the prepend is now triggered via Virtuoso's startReached.
 
     // Tail open at the bottom (hasMore===false, has_prev:true).
     mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
     const { container } = render(<ConversationReader sessionId="s" />);
-    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
 
     const body = container.querySelector('.conv-reader-body') as HTMLElement;
     setScroll(body, { scrollTop: 500, clientHeight: 100, scrollHeight: 1000 });
@@ -2423,9 +2536,8 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     // The before-page (the earlier window). The prepend grows items.length while
     // hasMore stays false — the exact discriminator trap.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
-    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
     await act(async () => {
-      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
@@ -2561,13 +2673,13 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
   // sticks-to-bottom and the pill never appears — RED. (Revert the one-shot guard
   // to reproduce.)
   it('P0: a reverse prepend does NOT re-arm atBottomRef (a later live append still raises the pill)', async () => {
-    const observed = installCapturingIO();
+    installCapturingIO();
     // tail open at the bottom; bottom edge fully paged (has_more:false) so the
     // live-tail poll path is eligible.
     mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
     const { container } = render(<ConversationReader sessionId="s" />);
-    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
 
     const body = container.querySelector('.conv-reader-body') as HTMLElement;
     // The user scrolls UP, away from the bottom → atBottomRef becomes false.
@@ -2576,11 +2688,10 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
 
     // Reverse-page prepend (t1,t2 above t3,t4). Its envelope carries a bottom
     // edge for the already-loaded items — the prepend must ignore it AND must not
-    // re-arm atBottomRef.
+    // re-arm atBottomRef. #232 — triggered via Virtuoso's startReached.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
-    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
     await act(async () => {
-      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
@@ -2613,11 +2724,11 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
   // hidden (the prepend contributed 0). Remove the prependPendingRef guard to
   // reproduce RED (the pill would read "↓ 2 new").
   it('P1: a reverse prepend does NOT bump the "↓ N new" pill', async () => {
-    const observed = installCapturingIO();
+    installCapturingIO();
     mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
     const { container } = render(<ConversationReader sessionId="s" />);
-    await waitFor(() => expect(container.querySelector('.conv-load-sentinel--top')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
 
     const body = container.querySelector('.conv-reader-body') as HTMLElement;
     // Scroll UP so a real live append would surface the pill (atBottomRef false).
@@ -2625,10 +2736,10 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     fireEvent.scroll(body);
 
     // Reverse-page prepend of TWO turns (t1,t2). A miscount would read "2 new".
+    // #232 — triggered via Virtuoso's startReached.
     mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
-    const topEntry = observed.find((o) => (o.el as HTMLElement).classList?.contains('conv-load-sentinel--top'));
     await act(async () => {
-      topEntry!.cb([{ isIntersecting: true, target: topEntry!.el } as IntersectionObserverEntry], topEntry!.obs);
+      virtuosoTestHandle.startReached?.();
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
