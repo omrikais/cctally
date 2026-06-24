@@ -457,15 +457,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     forwardPagingArmedRef.current = true;
     if (armPagingTimerRef.current != null) { window.clearTimeout(armPagingTimerRef.current); armPagingTimerRef.current = null; }
   }, []);
-  // P1 (cross-branch review) — track the FIRST item's stable anchor uuid so the
-  // stick-to-bottom effect can recognise a PREPEND by a top-edge advance (the
-  // first-item id changed) regardless of which code path prepended. This is more
-  // robust than `prependPendingRef` alone: that ref is set only by the top-sentinel
-  // path (doLoadPrev), but a JUMP to an early target prepends INSIDE the hook
-  // (loadToTarget → fetchPrev) where the reader-owned ref can never be set, so a
-  // tail-opened (hasMore===false) session would mis-read the old back-of-window
-  // turns as "↓ N new". A first-item-id advance catches EVERY prepend source.
-  const prevFirstIdRef = useRef<string | null>(null);
   const [newCount, setNewCount] = useState(0);
 
   // #188 S4/C2 — count only VISIBLE live appends in the "↓ N new" pill (Bug 5).
@@ -556,7 +547,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   useEffect(() => {
     const items = detail?.items ?? [];
     const len = items.length;
-    const firstId = items[0]?.anchor.uuid ?? null;
     // #228 S3 B3 — direction comes straight from the hook op, not a top-edge id
     // advance. A reverse-page PREPEND (top-sentinel doLoadPrev OR a jump's
     // backward branch inside the hook) must NOT be mistaken for a live append:
@@ -580,7 +570,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       }
       prevLenRef.current = len;
       prevHasMoreRef.current = hasMore;
-      prevFirstIdRef.current = firstId;
       return;
     }
     // The count of genuinely-new TAIL items comes from the op (addedBottom), not
@@ -629,7 +618,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     prevLenRef.current = len;
     prevHasMoreRef.current = hasMore;
-    prevFirstIdRef.current = firstId;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastOp?.rev, hasMore]);
 
@@ -1266,11 +1254,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // count (Bug 5 + #188 B6's per-session reset rationale).
     openKeysRef.current.clear();
     knownSubagentKeysRef.current.clear();
-    // P1 (cross-branch review) — drop the prior conversation's first-item id so
-    // the new session's opening page is treated as a fresh seed (null prev), not
-    // a prepend (which would otherwise bail-and-reseed harmlessly anyway, but an
-    // explicit null keeps the discriminator's intent legible).
-    prevFirstIdRef.current = null;
     // #232 — DISARM paging for the new open and arm the fallback timer. Both edges
     // stay no-op until the open settles (atBottomStateChange / jump-landing /
     // this 750ms fallback). Clearing any prior timer first keeps it one-shot per
