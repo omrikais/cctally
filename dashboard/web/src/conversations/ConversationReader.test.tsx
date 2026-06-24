@@ -13,6 +13,7 @@ import { clearReadingPositions, recordReadingPos } from '../store/readingPositio
 import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia';
 import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
+import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
 
 // #232 — render-all react-virtuoso mock (Codex P2-1). Real Virtuoso needs real
 // layout (ResizeObserver / offsetHeight / scrollHeight) which JSDOM reports as
@@ -281,7 +282,7 @@ describe('ConversationReader', () => {
       expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore'));
   });
 
-  it('jumps to a target message: pages until loaded, scrollToIndex on the virtual index, render-driven flash (#232)', async () => {
+  it('jumps to a target message: pages until loaded, scrollToIndex on the DATA index, render-driven flash (#232)', async () => {
     // Page 1 has h1 only, with more to come; page 2 carries the target.
     mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
     mockFetchOnce(detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null));
@@ -302,16 +303,55 @@ describe('ConversationReader', () => {
       expect(el).not.toBeNull();
     });
     // #232 — the primary landing is Virtuoso's scrollToIndex on the target node's
-    // VIRTUAL index (firstItemIndex + arrayIndex), NOT a DOM scrollIntoView on a
-    // resolved ref. Read the virtual index off the rendered row's wrapper.
+    // DATA (array) index, NOT a DOM scrollIntoView on a resolved ref. react-virtuoso
+    // takes the 0-based data index (firstItemIndex shifts itemContent + the prepend
+    // bookkeeping, NOT the scrollToIndex input space — see the dedicated regression
+    // test above), so the array index is the row's VIRTUAL data-index minus the live
+    // firstItemIndex.
     const targetWrap = container.querySelector('[data-uuid="target"]')!.closest('.conv-reader-item') as HTMLElement;
     const targetVirtual = Number(targetWrap.getAttribute('data-index'));
-    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetVirtual })));
+    const targetArrayIndex = targetVirtual - virtuosoTestHandle.firstItemIndex;
+    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
     // The within-row pass also centers the member element.
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     // The flash is render-driven (jumpedUuid), surviving an unmount/remount.
     const target = container.querySelector('[data-uuid="target"]')!;
     await waitFor(() => expect(target.classList.contains('conv-item--jumped')).toBe(true));
+  });
+
+  it('jump landing passes scrollToIndex the DATA (array) index, NOT the firstItemIndex-offset virtual index (#232 warm-jump landing regression)', async () => {
+    // ROOT CAUSE (#232 P1-A): react-virtuoso's `scrollToIndex({ index })` takes the
+    // 0-based DATA index — `firstItemIndex` shifts the `itemContent` index and the
+    // prepend bookkeeping, but NOT the scrollToIndex input space. The reader's jump
+    // landing was passing `hit.virtualIndex` (= firstItemIndex + arrayIndex), which
+    // — being ~1,000,000+, far outside [0, totalCount] — react-virtuoso clamps and
+    // ignores, so a warm in-session far jump never scrolls to / mounts its target
+    // (measured in-browser: scrollTop did not move; DATA index moved, virtual did
+    // not). This pins the exact index argument so the wrong-space regression can't
+    // return. (The render-all mock's scrollToIndex is a no-op spy, so only an index
+    // assertion — not a scroll-position one — catches it here.)
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    mockFetchOnce(detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null));
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'targetFrag' } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    await waitFor(() => expect(container.querySelector('[data-uuid="target"]')).not.toBeNull());
+
+    // The target row's data-index carries its VIRTUAL index (firstItemIndex + array
+    // position); the live firstItemIndex is on the test handle. The DATA index the
+    // library actually wants is the difference.
+    const targetWrap = container.querySelector('[data-uuid="target"]')!.closest('.conv-reader-item') as HTMLElement;
+    const targetVirtual = Number(targetWrap.getAttribute('data-index'));
+    const targetArrayIndex = targetVirtual - virtuosoTestHandle.firstItemIndex;
+    // The base is the real VIRTUAL_INDEX_BASE (1,000,000), so the virtual index is
+    // unmistakably different from the array index — a non-vacuous gap.
+    expect(targetVirtual).toBeGreaterThanOrEqual(VIRTUAL_INDEX_BASE);
+    expect(targetArrayIndex).toBeLessThan(VIRTUAL_INDEX_BASE);
+
+    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
+    // And NEVER with the virtual index (the bug).
+    expect(virtuosoTestHandle.scrollToIndex).not.toHaveBeenCalledWith(expect.objectContaining({ index: targetVirtual }));
   });
 
   it('gives up on a jump when pagination exhausts on an empty terminal page (no infinite loop)', async () => {
@@ -1485,20 +1525,18 @@ describe('ConversationReader keyboard navigation (G3)', () => {
       makeItem({ uuid: 'h2' }),
       makeItem({ uuid: 'h3' }),
     ]);
-    // The first virtual index = the live firstItemIndex (VIRTUAL_INDEX_BASE on a
-    // fresh open) + 0; read it off the first rendered row's data-index so the
-    // assertion tracks the real base rather than hardcoding it.
-    const firstVirtual = Number(row(thread, 0).closest('[data-index]')!.getAttribute('data-index'));
     press('j');
     press('j');
     expect(row(thread, 2)).toHaveClass('conv-item--focused');
     virtuosoTestHandle.scrollToIndex.mockClear();
     press('g');
-    // #232 — the top jump routes through Virtuoso's scrollToIndex on the FIRST
-    // virtual index (firstItemIndex + 0), not a raw body.scrollTo — the mounted
-    // window may not include array index 0.
+    // #232 — the top jump routes through Virtuoso's scrollToIndex (not a raw
+    // body.scrollTo — the mounted window may not include the first item). #232 fix:
+    // scrollToIndex takes the 0-based DATA (array) index, NOT the firstItemIndex-
+    // offset virtual index (which the library clamps + ignores — see the dedicated
+    // regression test). The first loaded node is array index 0.
     expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(
-      expect.objectContaining({ index: firstVirtual, align: 'start' }),
+      expect.objectContaining({ index: 0, align: 'start' }),
     );
     expect(row(thread, 0)).toHaveClass('conv-item--focused');
   });

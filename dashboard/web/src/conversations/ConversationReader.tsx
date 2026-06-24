@@ -634,14 +634,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, [lastOp?.rev, hasMore]);
 
   const jumpToNew = useCallback(() => {
-    // #232 — the pill scrolls to the LAST node via Virtuoso (its virtual index =
-    // firstItemIndex + (nodes.length − 1)), aligned to the bottom edge, instead of
-    // a raw scrollTo({top: scrollHeight}) (scrollHeight is only an estimate under
-    // virtualization).
+    // #232 — the pill scrolls to the LAST node via Virtuoso, aligned to the bottom
+    // edge, instead of a raw scrollTo({top: scrollHeight}) (scrollHeight is only an
+    // estimate under virtualization). scrollToIndex takes the 0-based DATA (array)
+    // index (NOT the firstItemIndex-offset virtual index — see the jump-landing fix
+    // note), so the last node's array index is nodes.length − 1.
     const count = nodesRef.current.length;
     if (count > 0) {
       virtuosoRef.current?.scrollToIndex({
-        index: firstItemIndexRef.current + count - 1,
+        index: count - 1,
         align: 'end',
         behavior: reducedRef.current ? 'auto' : 'smooth',
       });
@@ -877,13 +878,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     const nodeCount = nodes.length;
     if (!nodeCount) return;                         // wait for the render list too
     appliedIntentRef.current = true;
-    // Virtuoso speaks the VIRTUAL index (firstItemIndex + arrayIndex) (Codex P0-2).
-    const base = firstItemIndexRef.current;
+    // #232 fix — scrollToIndex takes the 0-based DATA (array) index, NOT the
+    // firstItemIndex-offset virtual index (which the library clamps + ignores —
+    // see the jump-landing fix note). A 'bottom' open lands on the last node
+    // (array index nodeCount − 1); a 'top' open lands on the first (array index 0).
     if (openScrollIntent === 'bottom') {
-      virtuosoRef.current?.scrollToIndex({ index: base + nodeCount - 1, align: 'end' });
+      virtuosoRef.current?.scrollToIndex({ index: nodeCount - 1, align: 'end' });
       atBottomRef.current = true;
     } else {
-      virtuosoRef.current?.scrollToIndex({ index: base, align: 'start' });
+      virtuosoRef.current?.scrollToIndex({ index: 0, align: 'start' });
       atBottomRef.current = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1067,7 +1070,18 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           }
         }
         const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
-        virtuosoRef.current?.scrollToIndex({ index: hit.virtualIndex, align, behavior: reduced ? 'auto' : 'smooth' });
+        // #232 fix (P1-A) — react-virtuoso's scrollToIndex takes the 0-based DATA
+        // (array) index. `firstItemIndex` shifts the `itemContent` index + the prepend
+        // bookkeeping, but NOT the scrollToIndex input space — passing the virtual
+        // index (firstItemIndex + arrayIndex, ~1,000,000+) lands far outside
+        // [0, totalCount], so react-virtuoso clamps + ignores it and a warm in-session
+        // jump never scrolls toward its target (measured in-browser: scrollTop did not
+        // move at all; scrollToIndex with the DATA index moved, with the virtual index
+        // did not). The cold deep-link only appeared to work because its near/in-window
+        // target also caught the DOM scrollIntoView precise-align pass below. Pass the
+        // array index. (itemContent still receives the virtual index from Virtuoso, so
+        // the `index - firstItemIndex` conversion there is unchanged + correct.)
+        virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align, behavior: reduced ? 'auto' : 'smooth' });
         // #232 — the jump has LANDED on the target: the open has settled, so arm
         // paging. From here a user scroll to either edge legitimately pages.
         armPaging();
@@ -1556,9 +1570,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — j/k focus-step is explicit nav
     setCursor(next);
     // Bring the cursor's node into view via Virtuoso (the row may be unmounted —
-    // scrollToIndex mounts it). The virtual index = firstItemIndex + array index.
+    // scrollToIndex mounts it). #232 fix — scrollToIndex takes the 0-based DATA
+    // (array) index, NOT the firstItemIndex-offset virtual index (which the library
+    // clamps + ignores — see the jump-landing fix note). `next` is already the
+    // array index into `nodes`.
     virtuosoRef.current?.scrollToIndex({
-      index: firstItemIndexRef.current + next,
+      index: next,
       align: 'center',
       behavior: reducedRef.current ? 'auto' : 'smooth',
     });
@@ -1580,12 +1597,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, []);
 
   const jumpToTop = useCallback(() => {
-    // #232 — route through Virtuoso (not a raw body.scrollTo) so the top jump
-    // speaks the VIRTUAL index, consistent with every other reader scroll under
-    // virtualization. The mounted window may not include array index 0, so a raw
-    // scrollTop:0 would land short of the true first item.
+    // #232 — route through Virtuoso (not a raw body.scrollTo): the mounted window
+    // may not include the first item, so a raw scrollTop:0 would land short of it.
+    // #232 fix — scrollToIndex takes the 0-based DATA (array) index, NOT the
+    // firstItemIndex-offset virtual index (which the library clamps + ignores — see
+    // the jump-landing fix note). The first loaded node is array index 0.
     virtuosoRef.current?.scrollToIndex({
-      index: firstItemIndexRef.current,
+      index: 0,
       align: 'start',
       behavior: reducedRef.current ? 'auto' : 'smooth',
     });
@@ -1979,13 +1997,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           // #232 — the bulk [/] sweep state (data-model expand/collapse-all).
           bulkSweep={bulkSweep}
           // #232 (Codex P1-4) — re-pin this depth-0 card through Virtuoso on a
-          // user click-collapse: scroll to THIS node's virtual index aligned to
-          // the scroller top, instead of the old raw `scrollTop +=` write that
-          // fought Virtuoso. `arrayIndex` is this node's position in `nodes`;
-          // virtual index = firstItemIndex + arrayIndex (Codex P0-2).
+          // user click-collapse: scroll to THIS node aligned to the scroller top,
+          // instead of the old raw `scrollTop +=` write that fought Virtuoso.
+          // #232 fix — scrollToIndex takes the 0-based DATA (array) index, NOT the
+          // firstItemIndex-offset virtual index (which the library clamps + ignores
+          // — see the jump-landing fix note). `arrayIndex` is already this node's
+          // position in `nodes`.
           pinToSelf={() => {
             virtuosoRef.current?.scrollToIndex({
-              index: firstItemIndexRef.current + arrayIndex,
+              index: arrayIndex,
               align: 'start',
               behavior: reducedRef.current ? 'auto' : 'smooth',
             });
