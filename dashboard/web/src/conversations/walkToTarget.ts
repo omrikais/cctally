@@ -61,7 +61,13 @@ export async function walkToTarget(d: WalkDeps): Promise<'mounted' | 'aborted' |
     await d.quiesce();
     if (d.isAborted()) return 'aborted';
     const after = d.getMountedArrayRange();
-    // progressed = the mounted range moved toward the target since the step
+    // progressed = the mounted range moved toward the target since the step.
+    // Gap handling is IMPLICIT, not an explicit contiguity check (spec §2.2-2):
+    // planWalkStep clamps each step to <= the live mounted window from the
+    // covered edge, so any gap is bounded to <= one window and the NEXT
+    // iteration re-anchors on the freshly-measured edge and closes it — a gap
+    // self-heals rather than stranding. We only shrink on no-progress (a stall
+    // or a wrong-direction landing), which `progressed` captures.
     const progressed = plan.align === 'end' ? after.last > range.last : after.first < range.first;
     step = nextStepSize(step, progressed, window);
   }

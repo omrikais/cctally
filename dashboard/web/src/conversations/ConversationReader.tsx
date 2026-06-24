@@ -1265,9 +1265,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       }
      } finally {
       // #232/#234 — re-enable edge paging once the whole jump operation (drain +
-      // walk + landing) has run or bailed. The walk-token guard remains the
-      // per-jump owner; this boolean is just the coarse edge-suppression gate.
-      jumpDrainingRef.current = false;
+      // walk + landing) has run or bailed, but ONLY if THIS run is still the
+      // current owner. If the effect re-fired mid-walk (a page load / focus
+      // change / live-tail append landing during the walk), the newer run bumped
+      // walkTokenRef and now owns the edge-suppression gate; this older run must
+      // NOT clear the boolean out from under it (a window where the newer walk's
+      // settle-time startReached/endReached leak into paging — the class of bug
+      // #232 fought). The gate stays asserted "while any walk token is active"
+      // (spec §2.2-1); the newest run clears it on its own exit. (Codex P2.)
+      if (walkTokenRef.current === myToken) jumpDrainingRef.current = false;
      }
     })();
     return () => { cancelled = true; };
