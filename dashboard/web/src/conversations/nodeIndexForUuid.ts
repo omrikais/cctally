@@ -4,9 +4,11 @@ import type { SubagentNode } from './groupSidechains';
 
 // Resolve a turn uuid (possibly a folded member fragment, or a turn nested inside
 // a subagent subtree) to the TOP-LEVEL node that renders it, in both coordinate
-// spaces (#232, Codex P0-2). The virtualIndex feeds Virtuoso APIs (scrollToIndex);
-// the arrayIndex feeds local render math. Returns null when the uuid is not in the
-// loaded `nodes`.
+// spaces (#232, Codex P0-2; index-space corrected in #232 P1-A). The arrayIndex
+// feeds Virtuoso's scrollToIndex (which takes the 0-based DATA position, NOT the
+// virtual index) and every nodes[...] lookup; the virtualIndex (firstItemIndex +
+// arrayIndex) feeds aria-posinset and the itemContent stagger. Returns null when
+// the uuid is not in the loaded `nodes`.
 export interface NodeIndex {
   arrayIndex: number;
   virtualIndex: number;
