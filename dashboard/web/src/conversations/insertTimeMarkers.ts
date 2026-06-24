@@ -1,4 +1,4 @@
-import type { FilteredNode } from './applyFocusMode';
+import { nodeUuid, type FilteredNode } from './applyFocusMode';
 import type { FmtCtx } from '../lib/fmt';
 
 // #177 S5 §6 — inter-turn time markers. A pure pass over the FILTERED node list
@@ -27,6 +27,11 @@ function nodeTs(n: FilteredNode): string | null {
 export function insertTimeMarkers(nodes: FilteredNode[], ctx: FmtCtx): TimedNode[] {
   const out: TimedNode[] = [];
   let prevTs: Date | null = null;
+  // #232 — the uuid of the previous TIMESTAMPED node, so a marker keys off the
+  // stable surrounding turn uuids (not its array position). A prepend/trim that
+  // shifts the same logical boundary's position must keep its key identical, or
+  // Virtuoso treats the row as new and loses scroll stability.
+  let lastTimedUuid: string | null = null;
   // Hoisted once per call (vs once per node-pair) — the formatter is the only
   // allocation worth memoizing here.
   const dayFmt = new Intl.DateTimeFormat('en-US', {
@@ -46,20 +51,28 @@ export function insertTimeMarkers(nodes: FilteredNode[], ctx: FmtCtx): TimedNode
       // never a marker, and a day-changed predicate on a backwards step would be
       // a false positive — guard the whole emit on a non-negative gap.
       if (gap >= 0 && (gap >= GAP_THRESHOLD_S || dayChanged)) {
-        // #184 — fold the output position into the React key. A non-monotonic
-        // transcript can repeat the SAME instant (resumed/merged sessions,
-        // out-of-order writes), so `tm-${iso}` alone could collide across two
-        // markers. `out.length` at push time is unique per emitted node, so the
-        // composite key stays stable AND collision-free.
+        // #232 — key off the STABLE surrounding turn uuids + this node's iso +
+        // marker kind, NOT the output position (`out.length`). A prepend/trim
+        // that shifts the same logical boundary's array position must keep its
+        // key identical, or Virtuoso treats the row as new and loses scroll
+        // stability. `prevUuid` is the previous timestamped node's uuid (or
+        // 'head' before the first one); appending this node's iso + a kind
+        // discriminator (d=day, g=gap) keeps two markers between the SAME pair of
+        // turns distinct AND collision-free across a non-monotonic transcript
+        // (resumed/merged sessions repeating an instant — the #184 hazard).
+        const prevUuid = lastTimedUuid ?? 'head';
         out.push({
           kind: 'time_marker',
           gapSeconds: gap >= GAP_THRESHOLD_S ? gap : null,
           dayLabel: dayChanged ? dayOf(d) : null,
-          key: `tm-${out.length}-${iso}`,
+          key: `tm-${prevUuid}-${iso}-${dayChanged ? 'd' : ''}${gap >= GAP_THRESHOLD_S ? 'g' : ''}`,
         });
       }
     }
-    if (valid) prevTs = d; // null-ts / hidden_run neighbors leave the anchor intact
+    if (valid) {
+      prevTs = d; // null-ts / hidden_run neighbors leave the anchor intact
+      lastTimedUuid = nodeUuid(n); // #232 — track the last timestamped turn's uuid for the next marker key
+    }
     out.push(n);
   }
   return out;

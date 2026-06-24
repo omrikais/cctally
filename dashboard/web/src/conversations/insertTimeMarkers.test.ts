@@ -158,6 +158,17 @@ describe('insertTimeMarkers', () => {
     expect(markers(out)).toHaveLength(0);
   });
 
+  it('keeps a marker key stable when the same boundary shifts position (prepend) (#232)', () => {
+    const ctx = { tz: 'UTC' } as any;
+    const a = { kind: 'item', item: { anchor: { uuid: 'a' }, ts: '2026-06-24T00:00:00Z', member_uuids: ['a'] } } as any;
+    const b = { kind: 'item', item: { anchor: { uuid: 'b' }, ts: '2026-06-24T01:00:00Z', member_uuids: ['b'] } } as any;
+    const pre = { kind: 'item', item: { anchor: { uuid: 'p' }, ts: '2026-06-23T23:00:00Z', member_uuids: ['p'] } } as any;
+    const before = insertTimeMarkers([a, b], ctx).find((n) => n.kind === 'time_marker') as any;
+    const after = insertTimeMarkers([pre, a, b], ctx).filter((n) => n.kind === 'time_marker');
+    const sameBoundary = after.find((n: any) => n.key === before.key);
+    expect(sameBoundary).toBeTruthy(); // a→b marker keeps its key after prepending `pre`
+  });
+
   it('keeps marker keys unique even when an out-of-order instant repeats (#184)', () => {
     // A non-monotonic transcript: the same instant recurs after a forward jump.
     // a (14:00) → b (14:42, +42m marker) → c (14:00 again, backwards: no marker)
