@@ -39,5 +39,9 @@ export function scrollNodeIntoView(
     elTop: er.top, elHeight: er.height, scrollerTop: sr.top, scrollTop: scroller.scrollTop,
     viewportHeight: scroller.clientHeight, maxScrollTop: scroller.scrollHeight - scroller.clientHeight, align,
   });
-  scroller.scrollTo({ top, behavior });
+  // JSDOM (the vitest env) does not implement Element.prototype.scrollTo; guard
+  // it so the jump effect can run end-to-end under test, falling back to a direct
+  // scrollTop write. Real browsers always have scrollTo (this is the precision path).
+  if (typeof scroller.scrollTo === 'function') scroller.scrollTo({ top, behavior });
+  else scroller.scrollTop = top;
 }

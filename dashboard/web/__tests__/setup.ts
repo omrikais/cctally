@@ -19,6 +19,31 @@ if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = function noop(): void {};
 }
 
+// jsdom's requestAnimationFrame does not actually schedule its callback in this
+// vitest config (callbacks never run), which would hang any code that awaits a
+// rAF loop — e.g. the reader's #234 layout-quiesce waiter. Install a setTimeout-
+// backed shim so rAF-driven code resolves under test (visual timing isn't
+// asserted here; pixel landing is the Playwright gate's job).
+{
+  const g = globalThis as unknown as {
+    requestAnimationFrame?: (cb: FrameRequestCallback) => number;
+    cancelAnimationFrame?: (h: number) => void;
+  };
+  let pending = false;
+  const probe = g.requestAnimationFrame;
+  if (typeof probe === 'function') {
+    // Detect a no-op rAF (jsdom): if a scheduled callback hasn't been observed
+    // synchronously we can't know here, so just always install the shim — a
+    // setTimeout-backed rAF is correct for tests regardless.
+    pending = true;
+  }
+  if (pending || typeof probe !== 'function') {
+    g.requestAnimationFrame = (cb: FrameRequestCallback): number =>
+      setTimeout(() => cb(performance.now()), 0) as unknown as number;
+    g.cancelAnimationFrame = (h: number): void => clearTimeout(h as unknown as NodeJS.Timeout);
+  }
+}
+
 // Node 25 ships an experimental built-in `localStorage` global that takes
 // precedence over jsdom's Storage implementation — the built-in stub lacks
 // `getItem`/`setItem` unless `--localstorage-file` is passed at boot.

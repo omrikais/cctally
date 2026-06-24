@@ -289,6 +289,45 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     expect(targetAfter!.classList.contains('conv-item--jumped')).toBe(true);
   });
 
+  it('(e) #234 R2 — a find/jump hit on a subagent card SECOND member force-opens the card', async () => {
+    // The exact #234 R2 topology (Codex P1-4): a top-level subagent card whose
+    // matched turn is its SECOND member (not the bucket root). The OLD flat
+    // detail.items.find((it) => it.member_uuids.includes(jump.uuid)) owner lookup
+    // failed to force-open the enclosing card (0 conv-sidechain--force across 109
+    // mounted samples in the in-browser recorder), so the member sat in
+    // un-accounted overflow OUTSIDE the scrollable range, unreachable by any scroll
+    // and with no <mark>. resolveJumpOwner walks the render tree, resolves the
+    // owning subagent key, and the reader force-opens its ancestor chain —
+    // surfacing the conv-sidechain--force class. This pins ONLY the force-open
+    // topology (the bug); the pixel-exact center + visible <mark> are the Playwright
+    // ui-qa gate's job (no layout in JSDOM, spec §5).
+    const items: ConversationItem[] = [
+      makeItem('m1', { kind: 'human', text: 'kick off the review' }),
+      // A top-level subagent thread 'A': sa1 is the bucket root, sa2 the SECOND member.
+      makeItem('sa1', { is_sidechain: true, subagent_key: 'A', text: 'Subagent root' }),
+      makeItem('sa2', { is_sidechain: true, subagent_key: 'A', text: 'second member — the find hit' }),
+    ];
+    mockFetchOnce(detail(items, {
+      subagent_meta: { A: { kind: 'general-purpose', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_a' } },
+    }));
+
+    // Jump to the SECOND member uuid (the nested find hit) BEFORE mount.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'sa2', expand_details: true } });
+    const { container } = renderReader();
+
+    // The head mounts; the jump effect resolves sa2's owning subagent (A) from the
+    // render tree and force-opens its ancestor chain — the card gains
+    // conv-sidechain--force. NON-VACUITY: the class is absent on a collapsed card
+    // with no active jump; here it appears only because the nested-member jump fired
+    // the force-open the flat-lookup bug never reached.
+    await waitFor(() => expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('.conv-sidechain--force')).not.toBeNull());
+    // The force-opened card carries the bucket-root uuid (sa1), confirming the chain
+    // resolved to the right top-level card for a SECOND-member hit.
+    const forced = container.querySelector('.conv-sidechain--force') as HTMLElement;
+    expect(forced.getAttribute('data-uuid')).toBe('sa1');
+  });
+
   it('(c) firstItemIndex pins an item\'s virtual index across a simulated prepend', async () => {
     // This is the contract that keeps the first visible item stable across a
     // reverse-page prepend: real Virtuoso assigns each row the VIRTUAL index

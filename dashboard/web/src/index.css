@@ -7103,6 +7103,14 @@ mark.current {
    instant (no 240ms height animation to fight), letting onToggle re-pin the
    collapsed card to the scroller top instead of the viewport flinging away. */
 .conv-sidechain--snap::details-content { transition: none; }
+/* #234 — a jump-opened inner disclosure (the matched member's collapsed tool/
+   thinking <details>, opened so its find <mark> renders) must NOT animate its
+   open: the ~240ms ::details-content transition would grow the row AFTER the
+   center has landed, drifting the target out of view (Codex P1-2). The class is
+   added when the jump opens the disclosure and removed when the flash clears, so
+   a later user toggle of the same disclosure animates normally again. */
+.conv-details--jumpopen,
+.conv-details--jumpopen::details-content { transition: none !important; }
 /* #232 — measurement-stability guard for the virtualized list. Virtuoso sizes
    each row from its mounted height via a ResizeObserver; a 240ms block-size
    animation mid-expand would feed it intermediate heights and shift the scroll

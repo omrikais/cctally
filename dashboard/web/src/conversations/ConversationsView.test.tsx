@@ -324,9 +324,13 @@ describe('Conversations workspace integration', () => {
   });
 
   it('4: clicking a search hit opens the reader, scrolls to the message, and flashes it', async () => {
-    const scrollSpy = vi
-      .spyOn(Element.prototype, 'scrollIntoView')
-      .mockImplementation(() => {});
+    // #234 — the reader's jump landing now writes the scroller's scrollTop directly
+    // (scrollNodeIntoView), not a native scrollIntoView. jsdom lacks
+    // Element.prototype.scrollTo, so define a no-op first, then spy on it.
+    if (typeof Element.prototype.scrollTo !== 'function') {
+      Element.prototype.scrollTo = () => {};
+    }
+    const scrollToSpy = vi.spyOn(Element.prototype, 'scrollTo').mockImplementation(() => {});
 
     updateSnapshot(baseEnvelope(true));
     render(<App />);
@@ -348,8 +352,8 @@ describe('Conversations workspace integration', () => {
     expect(getState().selectedConversationId).toBe('sess-1');
     expect(getState().conversationJump).toEqual({ session_id: 'sess-1', uuid: 'a-uuid' });
 
-    // The reader pages to the target, scrolls it into view, and flashes it.
-    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    // The reader pages to the target, direct-scrolls it into view, and flashes it.
+    await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
     await waitFor(() => {
       const target = document.querySelector('[data-uuid="a-uuid"]');
       expect(target).not.toBeNull();

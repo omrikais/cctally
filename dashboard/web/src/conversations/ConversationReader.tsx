@@ -24,6 +24,10 @@ import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
+import { scrollNodeIntoView } from './scrollNodeIntoView';
+import { walkToTarget } from './walkToTarget';
+import { resolveJumpOwner } from './resolveJumpOwner';
+import { isLayoutStable, type LayoutSnapshot } from './layoutStable';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
@@ -219,6 +223,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const firstItemIndexRef = useRef(virtualFirstItemIndex);
   firstItemIndexRef.current = virtualFirstItemIndex;
+  // #234 — walk-token guard (spec §2.2-1 / Codex P0-3). A cold far jump runs a
+  // longer async walk-to-mount than the old single scrollIntoView, and the
+  // effect re-fires on node/window/forcedOpenKeys changes WHILE that walk is in
+  // flight. A monotonic token (NOT the boolean jumpDrainingRef) lets each walk
+  // own its run: a new jump bumps it; an older superseded walk detects the
+  // mismatch after every await and bails WITHOUT clearing a newer walk's guard.
+  const walkTokenRef = useRef(0);
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
@@ -992,18 +1003,63 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     }
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     let cancelled = false;
+    // #234 — this jump owns a fresh walk token. The walk and the final landing run
+    // inside the async block below; `aborted()` after every await covers BOTH a
+    // session/jump-clear cancel AND a newer jump that bumped the token (Codex P0-3).
+    const myToken = ++walkTokenRef.current;
+    const aborted = () => cancelled || walkTokenRef.current !== myToken;
+    const targetUuid = jump.uuid;
+    // #234 §2.2-3 / Codex P0-2 — resolve once the layout tuple (mounted
+    // array-range, scrollHeight, scrollTop, target-anchor rect) is stable across 2
+    // consecutive rAFs, or after a bounded frame count. A range-only waiter would
+    // declare settled while ResizeObserver is still correcting scrollHeight (the
+    // measured R1 stranding) — gating on the whole tuple closes that window.
+    //
+    // Two settle modes keyed on whether the target is mounted yet:
+    //  - target MOUNTED (final landing, or a warm jump): require the FULL tuple
+    //    stable, anchorTop included (isLayoutStable), so the row's measured offset
+    //    has stopped drifting before we write the precise scrollTop.
+    //  - target UNMOUNTED (an intermediate walk step, incl. a stalled one): settle
+    //    on the structural part (range + scrollHeight + scrollTop) alone, so a step
+    //    that made no progress resolves in ~2 frames instead of burning the frame
+    //    bound — the coverage shrink then advances/exhausts quickly.
+    const waitForQuiesce = (anchorUuid: string): Promise<void> => new Promise((resolve) => {
+      const body = bodyRef.current;
+      const snap = (): LayoutSnapshot => {
+        const el = body?.querySelector(`[data-uuid="${CSS.escape(anchorUuid)}"]`) as HTMLElement | null;
+        const sr = body?.getBoundingClientRect();
+        return {
+          first: renderedRangeRef.current.first - firstItemIndexRef.current,
+          last: renderedRangeRef.current.last - firstItemIndexRef.current,
+          scrollHeight: body?.scrollHeight ?? 0, scrollTop: body?.scrollTop ?? 0,
+          anchorTop: el && sr ? el.getBoundingClientRect().top - sr.top : null,
+        };
+      };
+      // Structural stability (range + scroll metrics) ignoring the anchor — used
+      // while the target is unmounted; treats a null anchor as a settled step.
+      const structuralStable = (a: LayoutSnapshot, b: LayoutSnapshot): boolean =>
+        isLayoutStable({ ...a, anchorTop: 0 }, { ...b, anchorTop: 0 }, 1);
+      let prev = snap(); let frames = 0;
+      const tick = () => {
+        const cur = snap();
+        const mounted = cur.anchorTop != null && prev.anchorTop != null;
+        const settled = mounted ? isLayoutStable(prev, cur, 1) : structuralStable(prev, cur);
+        if (settled || frames++ > 30) { resolve(); return; }
+        prev = cur; requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
     void (async () => {
-      // #232 — suppress startReached/endReached while the programmatic jump drain
-      // pages the window toward the target. Even with the arming gate, a drain that
-      // runs AFTER paging is armed (an in-session jump, not just the cold open)
-      // must not let Virtuoso's settle-time edge hits re-enter paging mid-drain.
-      jumpDrainingRef.current = true;
-      try {
-        await loadToTarget(jump.uuid);
-      } finally {
-        jumpDrainingRef.current = false;
-      }
-      if (cancelled) return;
+     // #232/#234 — suppress startReached/endReached for the WHOLE programmatic jump
+     // operation: the loadToTarget drain, the R1 walk-to-mount, AND the final
+     // landing. Even with the arming gate, a drain/walk that runs AFTER paging is
+     // armed (an in-session jump, not just the cold open) must not let Virtuoso's
+     // settle-time edge hits re-enter paging mid-operation. The boolean is cleared
+     // in the finally below; the walk-token guard (above) is the per-jump owner.
+     jumpDrainingRef.current = true;
+     try {
+      await loadToTarget(jump.uuid);
+      if (aborted()) return;
       // #232 — the mode-hidden check runs FIRST, before resolving the node index.
       // A non-`all` focus mode coalesces the target's turn into a `hidden_run`
       // marker, and `nodeIndexForUuid` matches a hidden_run by its `firstUuid`, so
@@ -1032,116 +1088,144 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       // DOM-presence-driven.
       const hit = nodeIndexForUuid(nodes, jump.uuid, virtualFirstItemIndex);
       if (hit) {
+        // #234 §2.3-1 (Codex P1-4) — resolve the owning subagent from the RENDER
+        // TREE, not the flat detail.items list. A find hit on a card's nested
+        // member used to leave the card un-force-opened (the flat find-by-member
+        // path never fired conv-sidechain--force), so the member sat in
+        // un-accounted overflow OUTSIDE the scrollable range — unreachable by any
+        // scroll. resolveJumpOwner returns the deepest owning subagent key, the
+        // top-level card-root uuid, and whether the uuid IS that card root.
+        const owner = resolveJumpOwner(nodesRef.current, jump.uuid);
         // A subagent CARD-ROOT jump (the bucket-root uuid — an outline subagent
-        // entry / collapsed-card flash) aligns the card HEAD to the top; a normal
-        // turn / a deep inner-member find-jump centers (#204).
-        const hitNode = nodes[hit.arrayIndex];
-        const isCardRoot = hitNode.kind === 'subagent' && hitNode.items[0].anchor.uuid === jump.uuid;
-        // §5 (Codex P1-D) — a find-jump into a NESTED subagent MEMBER (not the
-        // bucket root) must force-open the owning ancestor chain FIRST, so the
-        // member renders, takes the render-driven flash, and can be centered. The
-        // node itself is already in `nodes` (so `hit` resolved on the card), but
-        // its member element is ref-less while the thread is collapsed. Set the
-        // force keys and return; the forcedOpenKeys re-fire then scrolls + flashes.
-        if (!isCardRoot) {
-          const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
-          if (targetItem && targetItem.subagent_key != null) {
-            const chain = ancestorKeys(targetItem.subagent_key, detail.subagent_meta);
-            if (chain.some((k) => !forcedOpenKeys.has(k))) {
-              setForcedOpenKeys((prev) => {
-                const next = new Set(prev);
-                for (const k of chain) next.add(k);
-                return next;
-              });
-              return; // wait for the thread to open, then re-fire to scroll + flash
-            }
+        // entry / collapsed-card flash) aligns the card to the top; a normal turn
+        // / a deep inner-member find-jump centers (#204).
+        const isCardRoot = owner?.isCardRoot ?? false;
+        // §5/§2.3-1 — a find-jump into a NESTED subagent MEMBER (not the bucket
+        // root) must force-open the owning ancestor chain FIRST, so the card's
+        // Virtuoso row re-measures from its 81px collapsed-summary height to full
+        // height (otherwise the member is in overflow the library never accounts
+        // for) and the member renders + takes the flash. Set the force keys and
+        // return; the forcedOpenKeys re-fire then walks + centers.
+        if (!isCardRoot && owner && owner.ownerSubagentKey != null) {
+          const chain = ancestorKeys(owner.ownerSubagentKey, detail.subagent_meta);
+          if (chain.some((k) => !forcedOpenKeys.has(k))) {
+            setForcedOpenKeys((prev) => {
+              const next = new Set(prev);
+              for (const k of chain) next.add(k);
+              return next;
+            });
+            return; // wait for the chain to open + re-measure, then re-fire to walk + center
           }
         }
         const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
-        // #233 — land via react-virtuoso's CONVERGENT primitive `scrollIntoView`
-        // ({ index, align, behavior, done }), not `scrollToIndex`. Under dynamic row
-        // heights a far target's offset is first computed from the size model's
-        // ESTIMATE for the still-unmeasured rows; react-virtuoso then re-issues the
-        // scroll on each re-measure until it converges — but it gives that retry only
-        // a ~1200ms internal budget, and with `behavior: 'smooth'` each retry is a
-        // full animation hop, so a FAR jump's multi-hop convergence can blow past the
-        // cap and strand the viewport in the target's REGION (the #233 symptom). So
-        // the jump landing is INSTANT (`behavior: 'auto'`): each retry hop is
-        // immediate, convergence completes well inside the cap, and a WARM far jump
-        // (target already loaded, intermediate rows unmeasured — #233's stated
-        // mechanism) lands pixel-exact. (Reduced-motion was already 'auto', so no
-        // regression.) `scrollIntoView` is the ONLY handle method with a completion
-        // callback — `done` fires after `scrollingInProgress` settles false, i.e.
-        // AFTER the convergent retries finish (or immediately if no scroll was needed)
-        // — which replaces the old blind 2-frame requestAnimationFrame for the
-        // within-row second pass (that rAF fired a NATIVE el.scrollIntoView before
-        // Virtuoso had finished re-correcting, fighting the library's scroll
-        // management).
-        //
-        // KNOWN RESIDUAL (tracked as a follow-up): a COLD far jump — one where the
-        // target was not yet loaded, so `loadToTarget` first pages in hundreds of
-        // rows that are still unmeasured when the single `scrollIntoView` fires — can
-        // still strand part-way (one call's retry budget can't cross the whole
-        // unmeasured gap); a second jump lands it. A deterministic fix needs a
-        // directed scroll-through that mounts each chunk en route, which is the same
-        // hard case #232 deferred; it is NOT attempted here.
-        //
-        // INDEX SPACE (#232 P1-A, unchanged): `index` is the 0-based DATA (array)
-        // index. `firstItemIndex` shifts `itemContent`'s index + the prepend
-        // bookkeeping, but NOT the scroll input space — passing the virtual index
-        // (firstItemIndex + arrayIndex, ~1,000,000+) lands outside [0, totalCount] and
-        // react-virtuoso clamps + ignores it (measured in-browser: scrollTop did not
-        // move). `calculateViewLocation` returns the location verbatim so the jump
-        // ALWAYS scrolls to `align` — Virtuoso's default skips the scroll when the item
-        // is already in view, which would drop the jump's always-reposition semantics.
-        virtuosoRef.current?.scrollIntoView({
-          index: hit.arrayIndex,
-          align,
-          behavior: 'auto',
-          calculateViewLocation: ({ locationParams }) => locationParams,
-          // Within-row second pass — run once the convergent scroll has SETTLED (the
-          // row is mounted AND Virtuoso has finished re-correcting): open the turn's
-          // collapsed disclosures for a tool/thinking find hit, then center the
-          // specific member element inside the (now-mounted) row. #232/#204 — a NESTED
-          // subagent CARD root (jump.uuid is a card bucket-root but its TOP-LEVEL node
-          // is the ROOT ancestor, so isCardRoot is false) is resolved from cardRefs and
-          // re-aimed at its <summary> HEAD (block 'start'), not centered — a tall card
-          // centered hides its head far above the fold. cancelled + isConnected guard a
-          // session switch in the gap before `done` fires.
-          done: () => {
-            if (cancelled) return;
-            const cardEl = cardRefs.current.get(jump.uuid);
-            const memberEl = itemRefs.current.get(jump.uuid) ?? cardEl;
-            if (memberEl && memberEl.isConnected) {
-              if (jump.expand_details) {
-                memberEl.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
-              }
-              if (cardEl) {
-                // A card root: align its head to the top (#204).
-                const head = cardEl.querySelector('summary') ?? cardEl;
-                head.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
-              } else if (!isCardRoot) {
-                memberEl.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
-              }
-            }
+        // #234 §2.2 (R1) — a single estimate-based scrollIntoView hop over hundreds
+        // of unmeasured high-variance rows cannot land deterministically: the
+        // library briefly reaches the target, then asynchronously re-measures the
+        // just-paged-in giant rows (scrollHeight 15705→~74266), moving the target's
+        // true offset out from under the in-flight scroll, and the ~1200ms
+        // convergence budget expires mid-correction — stranding the viewport in the
+        // target's region with the target UNMOUNTED (the #233-deferred residual).
+        // Instead, WALK Virtuoso toward the target in mounted-window steps so the
+        // path rows MEASURE, then write the scroller's scrollTop directly to the
+        // now-stable measured offset. scrollToIndex takes the ARRAY index ONLY
+        // (#232 P1-A); the walk re-resolves it each step through the live refs.
+        // #234 — if the target element is ALREADY mounted in the DOM (a warm jump,
+        // or the chain we just force-opened has attached its ref), its row is
+        // measured: skip the walk and go straight to the direct-center. Only a
+        // cold/far jump whose target is unmounted needs the walk-to-mount. The DOM
+        // presence check (not just renderedRangeRef) is robust to a lagging range.
+        const alreadyMounted = (): boolean => {
+          if (itemRefs.current.has(targetUuid) || cardRefs.current.has(targetUuid)) return true;
+          const b = bodyRef.current;
+          return !!b?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
+        };
+        const result = alreadyMounted() ? 'mounted' : await walkToTarget({
+          getTargetArrayIndex: () => {
+            const h = nodeIndexForUuid(nodesRef.current, targetUuid, firstItemIndexRef.current);
+            return h ? h.arrayIndex : null;
           },
+          getMountedArrayRange: () => ({
+            first: renderedRangeRef.current.first - firstItemIndexRef.current,
+            last: renderedRangeRef.current.last - firstItemIndexRef.current,
+          }),
+          scrollToIndex: (index, alignEdge) =>
+            virtuosoRef.current?.scrollToIndex({ index, align: alignEdge, behavior: 'auto' }),
+          quiesce: () => waitForQuiesce(targetUuid),
+          isAborted: aborted,
+          maxSteps: 60,
+          initialWindow: Math.max(1, renderedRangeRef.current.last - renderedRangeRef.current.first + 1),
         });
-        // #232 — the jump has LANDED on the target: the open has settled, so arm
-        // paging. From here a user scroll to either edge legitimately pages.
+        if (aborted()) return;
+        const body = bodyRef.current;
+        const el = (itemRefs.current.get(targetUuid)
+          ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+        if (result === 'mounted' && body && el) {
+          // #234 §2.3-2/§2.3-3 (R2) — for a tool/thinking find hit, open the matched
+          // member's collapsed inner disclosures so the <mark> actually renders, and
+          // suppress their ~240ms ::details-content open transition (Codex P1-2 — an
+          // animating open would grow the row AFTER we center, drifting the landing).
+          if (jump.expand_details) {
+            el.querySelectorAll('details:not([open])').forEach((d) => {
+              d.classList.add('conv-details--jumpopen');
+              (d as HTMLDetailsElement).open = true;
+            });
+          }
+          // Wait for the force-open re-measure + disclosure-open to QUIESCE (the row
+          // is full height) before computing the offset, then land precisely with a
+          // DIRECT scrollTop write — native el.scrollIntoView is inert inside the
+          // giant library-managed row (measured 0px).
+          //
+          // #204/#234 — a jump whose uuid IS a subagent bucket-root resolves a
+          // cardRefs entry: align that <details> CARD element to the top (NOT the
+          // sticky <summary>, whose rect reports the viewport top — §2.1/P2-1), so a
+          // tall card shows its head rather than centering it far below the fold.
+          // This covers BOTH the top-level card root (owner.isCardRoot) and a NESTED
+          // subagent's card root (whose owner.rootUuid is its top-level ancestor, so
+          // owner.isCardRoot is false — cardRefs presence is the truth). Any other
+          // hit (a member turn) centers.
+          const card = cardRefs.current.get(targetUuid);
+          await waitForQuiesce(targetUuid);
+          if (aborted()) return;
+          if (card) {
+            scrollNodeIntoView(body, card, 'start', 'auto');
+            await waitForQuiesce(targetUuid);
+            if (aborted()) return;
+            scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
+          } else {
+            scrollNodeIntoView(body, el, align, 'auto');
+            await waitForQuiesce(targetUuid);
+            if (aborted()) return;
+            scrollNodeIntoView(body, el, align, 'auto'); // §2.1 single re-assert
+          }
+        }
+        // result === 'exhausted' → fall through: the jumpedUuid flash still
+        // identifies the target (spec §2.2-6 — never spin or throw).
+        if (aborted()) return;
+        // #234 §2.2-7 (Codex P1-3) — post-landing bookkeeping runs ONLY after the
+        // verified final center, and only on the non-aborted path. Doing it early
+        // (as the old code did, right after the single scrollIntoView) released the
+        // paging/pin guards before the viewport was stable.
+        //
+        // #232 — the jump has LANDED on the target: arm paging. From here a user
+        // scroll to either edge legitimately pages.
         armPaging();
         // Render-driven flash (#232): the row may mount AFTER the scroll settles,
         // and the class still lands because renderNode reads `jumpedUuid` on every
         // (re)mount — unmount-safe, unlike the old imperative classList.add.
-        setJumpedUuid(jump.uuid);
+        setJumpedUuid(targetUuid);
         // #188 B2 — pin the landing so the outline selects EXACTLY this target and
         // a repeat forward jump-to-next steps strictly past it (closes #187).
-        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
+        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: targetUuid });
         // #177 S6 — sync the keyboard cursor to the jumped node so j/k (and find's
         // n/N) resume from the match (sets both the index + the stable ring uuid).
         setCursor(hit.arrayIndex);
         if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
         highlightTimerRef.current = window.setTimeout(() => {
           setJumpedUuid(null);
+          // #234 — drop the transient no-transition class once the flash clears, so a
+          // later user toggle of the same disclosure animates normally again.
+          if (bodyRef.current) bodyRef.current.querySelectorAll('.conv-details--jumpopen')
+            .forEach((d) => d.classList.remove('conv-details--jumpopen'));
           highlightTimerRef.current = null;
         }, 2000);
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
@@ -1179,6 +1263,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       if (!hasMore) {
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
       }
+     } finally {
+      // #232/#234 — re-enable edge paging once the whole jump operation (drain +
+      // walk + landing) has run or bailed. The walk-token guard remains the
+      // per-jump owner; this boolean is just the coarse edge-suppression gate.
+      jumpDrainingRef.current = false;
+     }
     })();
     return () => { cancelled = true; };
     // hasMore stays in deps so the give-up clear fires on the edge where the final
