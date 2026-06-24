@@ -214,6 +214,9 @@ describe('ConversationReader', () => {
 
     expect(container.querySelector('.conv-reader-meta')!.textContent).toContain('$3.50');
     const body = container.querySelector('.conv-reader-body')!;
+    // #232 — the virtualized list carries role="feed" so off-screen turns stay
+    // navigable for a screen reader (Codex P2-4).
+    expect(body.getAttribute('role')).toBe('feed');
     expect(body.querySelector('[data-uuid="h1"]')).not.toBeNull();
     // TWO separate subagent disclosures (not one fused group).
     const groups = body.querySelectorAll('details.conv-sidechain');
@@ -991,34 +994,37 @@ describe('ConversationReader live-tail scroll (#175 F4)', () => {
     });
   }
 
-  it('live append sticks to bottom when already at bottom', async () => {
-    const { body } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
-    setScroll(body, { scrollTop: 990, clientHeight: 10, scrollHeight: 1000 }); // at bottom
-    fireEvent.scroll(body);
-    const scrollToSpy = spyScrollTo();
+  it('live append sticks to bottom when already at bottom (#232 followOutput)', async () => {
+    await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // #232 — the at-bottom signal is Virtuoso's atBottomStateChange (not the old
+    // manual scrollTop math), and the stick is `followOutput`. Drive at-bottom.
+    act(() => { virtuosoTestHandle.atBottomStateChange?.(true); });
 
     await appendLiveItem('live1');
-    await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
-    // No pill while stuck to the bottom.
+    // followOutput requests a stick (a truthy behavior) while at bottom...
+    expect(virtuosoTestHandle.followOutput?.(true)).toBeTruthy();
+    // ...and returns false when scrolled up (no auto-stick).
+    expect(virtuosoTestHandle.followOutput?.(false)).toBe(false);
+    // No pill while stuck to the bottom (the count path is gated on !atBottom).
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
   it('live append while scrolled up preserves position and shows the pill', async () => {
-    const { body } = await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
-    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 }); // scrolled up
-    fireEvent.scroll(body);
-    const scrollToSpy = spyScrollTo();
+    await renderFullyPaged([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]);
+    // #232 — scrolled up = atBottomStateChange(false). The pill bump path is gated
+    // on !atBottomRef, set here through Virtuoso's signal.
+    act(() => { virtuosoTestHandle.atBottomStateChange?.(false); });
 
     await appendLiveItem('live1');
-    // Did not auto-scroll; surfaced the pill with a count.
-    expect(scrollToSpy).not.toHaveBeenCalled();
+    // Surfaced the pill with the visibleAdded count (no auto-stick while scrolled up).
     const pill = await screen.findByRole('button', { name: /new/i });
     expect(pill).toBeInTheDocument();
     expect(pill.textContent).toMatch(/1 new/);
 
-    // Clicking the pill scrolls to bottom and clears it.
+    // #232 — clicking the pill scrolls to the LAST node via Virtuoso's
+    // scrollToIndex (align 'end'), not a raw body.scrollTo, and clears the pill.
     fireEvent.click(pill);
-    expect(scrollToSpy).toHaveBeenCalled();
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ align: 'end' }));
     expect(screen.queryByRole('button', { name: /new/i })).toBeNull();
   });
 
@@ -1437,11 +1443,13 @@ describe('ConversationReader keyboard navigation (G3)', () => {
       makeItem({ uuid: 'a1', kind: 'assistant', text: 'r', model: 'm', cost_usd: 0.01 } as never),
       makeItem({ uuid: 'h2' }),
     ]);
-    // Starts at 0.
+    // Starts on the first turn (render-driven ring, keyed on the cursor uuid).
     expect(row(thread, 0)).toHaveClass('conv-item--focused');
     press('j');
     expect(row(thread, 1)).toHaveClass('conv-item--focused');
     expect(row(thread, 0)).not.toHaveClass('conv-item--focused');
+    // #232 — a step brings the cursor's node into view via Virtuoso's scrollToIndex.
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled();
     press('j');
     expect(row(thread, 2)).toHaveClass('conv-item--focused');
     press('j'); // clamp at the last child
@@ -1453,18 +1461,22 @@ describe('ConversationReader keyboard navigation (G3)', () => {
     expect(row(thread, 0)).toHaveClass('conv-item--focused');
   });
 
-  it('[ collapses and ] expands every <details> in the thread', async () => {
+  it('[ collapses and ] expands every sidechain via the DATA MODEL (#232 Codex P1-1)', async () => {
+    // #232 — the bulk sweep now flips the SidechainGroup open-state through the
+    // data model (a rev+open prop adopted in render), NOT querySelectorAll, so it
+    // reaches off-screen sidechains under virtualization. The subagent <details
+    // open> reflects the swept state.
     const { thread } = await renderInConversations([
       makeItem({ uuid: 's1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
       makeItem({ uuid: 's2', is_sidechain: true, subagent_key: 'A' } as never),
     ]);
-    // The thread renders at least one <details> (the subagent disclosure).
-    const allDetails = () => Array.from(thread.querySelectorAll('details'));
-    expect(allDetails().length).toBeGreaterThan(0);
+    const sidechain = () => thread.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(sidechain()).not.toBeNull();
+    expect(sidechain().open).toBe(false); // collapsed by default
     press(']');
-    allDetails().forEach((d) => expect((d as HTMLDetailsElement).open).toBe(true));
+    expect(sidechain().open).toBe(true);  // expand-all via the data model
     press('[');
-    allDetails().forEach((d) => expect((d as HTMLDetailsElement).open).toBe(false));
+    expect(sidechain().open).toBe(false); // collapse-all via the data model
   });
 
   it('g scrolls the reader body to top and resets the cursor to 0', async () => {
@@ -2522,6 +2534,32 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     expect(Number(t3WrapAfter.getAttribute('data-index'))).toBe(t3VirtualBefore);
   });
 
+  it('#232: the keyboard cursor ring stays on the same turn across a reverse-page prepend', async () => {
+    // The render-driven cursor ring is keyed on the cursor's TURN UUID (not the
+    // array index — #231 memo invariant), so a prepend that shifts indices must
+    // NOT move the ring to a different turn. The default cursor lands on the first
+    // turn (t3); after prepending t1,t2 the ring must STILL be on t3.
+    installGlobalKeydown();
+    mockFetchOnce(edged([makeItem({ uuid: 't3' }), makeItem({ uuid: 't4' })], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
+    // The default cursor ring is on t3 (the first turn).
+    await waitFor(() => expect(container.querySelector('[data-uuid="t3"]')!.classList.contains('conv-item--focused')).toBe(true));
+
+    mockFetchOnce(edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
+
+    // The ring is STILL on t3 (same turn, now at a later index) — not on the new
+    // head t1, and not lost.
+    expect(container.querySelector('[data-uuid="t3"]')!.classList.contains('conv-item--focused')).toBe(true);
+    expect(container.querySelector('[data-uuid="t1"]')!.classList.contains('conv-item--focused')).toBe(false);
+  });
+
   it('#228 S3 B3: a tail-open prepend is recognised via op metadata — no stick, no "↓ N new" mis-fire', async () => {
     // This proves the reader keys its live-append/stick + "↓ N new" pill paths on
     // the hook's explicit WindowOp (op==='prepend' / addedBottom), NOT on
@@ -2694,10 +2732,10 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     const { container } = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(container.querySelector('[data-uuid="t4"]')).not.toBeNull());
 
-    const body = container.querySelector('.conv-reader-body') as HTMLElement;
-    // The user scrolls UP, away from the bottom → atBottomRef becomes false.
-    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
-    fireEvent.scroll(body);
+    // #232 — the user scrolls UP, away from the bottom → Virtuoso reports
+    // atBottomStateChange(false), which sets atBottomRef false (the old manual
+    // scrollTop computation is gone).
+    act(() => { virtuosoTestHandle.atBottomStateChange?.(false); });
 
     // Reverse-page prepend (t1,t2 above t3,t4). Its envelope carries a bottom
     // edge for the already-loaded items — the prepend must ignore it AND must not
@@ -2709,11 +2747,8 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     });
     await waitFor(() => expect(container.querySelector('[data-uuid="t1"]')).not.toBeNull());
 
-    // Keep the viewport scrolled up, then drive a live append. Because
-    // atBottomRef is still false (the prepend did not re-arm it), the append
+    // The prepend did not re-arm atBottomRef (it's still false), so a live append
     // surfaces the "↓ N new" pill instead of sticking to bottom.
-    setScroll(body, { scrollTop: 100, clientHeight: 10, scrollHeight: 1000 });
-    fireEvent.scroll(body);
     // Live-tail overlap response: the running window (t1..t4) + a new turn t5.
     mockFetchOnce(detail([
       makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' }),

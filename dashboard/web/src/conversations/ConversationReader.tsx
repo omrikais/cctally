@@ -1,4 +1,4 @@
-import React, { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { forwardRef, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Virtuoso, type VirtuosoHandle, type ListItem, type Components } from 'react-virtuoso';
 import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
@@ -119,6 +119,13 @@ function nodeKey(node: TimedNode): React.Key {
     case 'tool_result_run': return `trr-${node.items[0].anchor.uuid}`;
     case 'item': return node.item.anchor.uuid;
   }
+}
+
+// #232 — the cursor TURN uuid of a render node (null for markers, which are never
+// a keyboard cursor stop). Mirrors `nodeUuid` for the turn-bearing kinds.
+function nodeTurnUuid(node: TimedNode): string | null {
+  if (node.kind === 'time_marker' || node.kind === 'hidden_run') return null;
+  return nodeUuid(node);
 }
 
 // #232 — Virtuoso's per-item wrapper. A known className (`.conv-reader-item`)
@@ -286,6 +293,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // and the jump effect re-fires (forcedOpenKeys dep) to scroll to it. Identity
   // changes on each set (a fresh Set), which the jump effect deps on.
   const [forcedOpenKeys, setForcedOpenKeys] = useState<Set<string>>(() => new Set());
+  // #232 — the bulk `[`/`]` expand/collapse sweep on the DATA MODEL (Codex P1-1).
+  // The old sweep walked `thread.querySelectorAll('details')`, which under
+  // virtualization sees only the mounted overscan window — so it silently missed
+  // off-screen sidechains. Instead a monotonic `rev` + a desired `open` flag is
+  // threaded to every SidechainGroup (mounted AND on next mount), which adopts the
+  // sweep's open-state in render whenever the rev advances. So a sweep reaches
+  // every group regardless of whether it is currently rendered.
+  const [bulkSweep, setBulkSweep] = useState<{ rev: number; open: boolean }>({ rev: 0, open: false });
   // G1 §4b load-in stagger. A Set of anchor uuids already painted at least
   // once (the `daily-fade-in` seen-Set precedent, index.css:2032): each
   // top-level group rises exactly once on first appearance, so paged appends
@@ -306,6 +321,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   const [focusedIndex, setFocusedIndex] = useState(0);
   const focusedIndexRef = useRef(0);
   focusedIndexRef.current = focusedIndex;
+  // #232 — the keyboard cursor's TURN UUID (Codex P1-1 + #231 memo invariant).
+  // The render-driven ring matches THIS uuid, not the array index: an index would
+  // flip the `conv-item--focused` className on a reverse-page PREPEND (the same
+  // node sits at a different index), defeating the MessageItem memo for the whole
+  // window — the #231 cascade. A uuid is stable across head mutations, so the ring
+  // class only changes on a real cursor move. `setCursor(i)` sets both: the index
+  // (used by remap / stepping / the keymap closures) and the uuid (the render
+  // key). null = no ring (markers and the empty state).
+  const [cursorUuid, setCursorUuid] = useState<string | null>(null);
+  const cursorUuidRef = useRef<string | null>(null);
+  cursorUuidRef.current = cursorUuid;
   // #177 S5 — the focus-mode remap keys off the PREVIOUS render's RENDERED-NODE
   // list (`nodes` = what the thread actually paints: filtered turns + hidden_run
   // markers + time markers). `focusedIndex` indexes thread.children = nodes-space,
@@ -426,12 +452,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // beat), so the button shows a spinner glyph + disables to prevent re-entry.
   const [jumpingLatest, setJumpingLatest] = useState(false);
 
+  // #232 — bumped by Virtuoso's `itemsRendered` whenever the rendered range
+  // changes (scroll mounts/unmounts rows), so the scroll-sync IntersectionObserver
+  // re-registers over the current mounted itemRefs/cardRefs. `renderedRangeRef`
+  // dedups: only bump when the [first,last] range actually moves (itemsRendered
+  // fires on every measure tick, not just range changes).
+  const [renderedRangeRev, setRenderedRangeRev] = useState(0);
+  const renderedRangeRef = useRef<{ first: number; last: number }>({ first: -1, last: -1 });
+
   const onBodyScroll = useCallback(() => {
     const b = bodyRef.current;
     if (!b) return;
-    const atBottom = b.scrollTop + b.clientHeight >= b.scrollHeight - 80;
-    atBottomRef.current = atBottom;
-    if (atBottom) setNewCount((n) => (n ? 0 : n));
+    // #232 — the at-bottom signal moved to Virtuoso's `atBottomStateChange`
+    // (accurate under virtualization, where `scrollHeight` is only an estimate of
+    // the measured rows). `onBodyScroll` stays only for the #176 jump-to-top
+    // button (a viewport-geometry read over the mounted rows).
 
     // #176 — decide whether to surface the floating jump-to-top button. Find the
     // top-level block straddling the viewport top, then show the button only once
@@ -465,15 +500,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
 
-  // Stick-if-at-bottom on a live append; otherwise preserve position + count the
-  // new turns. #228 S3 B3 — keyed on `lastOp.rev` (+ hasMore so prevHasMoreRef
-  // tracks each commit), NOT on items.length: a prepend+far-trim (the windowed
-  // DOM cap) can keep items.length flat while still mutating the window, and a
-  // length key would miss it. The op metadata also REPLACES the firstId/count
-  // inferences below. useLayoutEffect so atBottomRef reflects the PRE-append
-  // position and the stick happens before paint (no visible jump).
-  useLayoutEffect(() => {
-    const b = bodyRef.current;
+  // #232 — the "↓ N new" pill COUNT. The actual stick-to-bottom moved onto
+  // Virtuoso's `followOutput` (Task 3); this effect now only feeds `setNewCount`
+  // with the PRESERVED `visibleAdded` classifier (Codex P1-2 — do NOT replace it
+  // with a raw append count). Keyed on `lastOp.rev` (+ hasMore so prevHasMoreRef
+  // tracks each commit), NOT items.length: a prepend+far-trim (the windowed DOM
+  // cap) can keep items.length flat while still mutating the window, and a length
+  // key would miss it. A plain useEffect (no longer pre-paint — Virtuoso owns the
+  // scroll, so there is no manual scrollTo to land before paint).
+  useEffect(() => {
     const items = detail?.items ?? [];
     const len = items.length;
     const firstId = items[0]?.anchor.uuid ?? null;
@@ -538,12 +573,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     for (const it of tail) {
       if (it.subagent_key != null) knownSubagentKeysRef.current.add(it.subagent_key);
     }
-    if (b && live) {
-      if (atBottomRef.current && visibleAdded > 0) {
-        b.scrollTo({ top: b.scrollHeight });           // instant stick to the newest turn
-      } else if (visibleAdded > 0) {
-        setNewCount((n) => n + visibleAdded);          // preserve position, surface the pill
-      }
+    // #232 — stick is `followOutput`'s job now (it sticks when already at bottom).
+    // When the user is scrolled UP (atBottomRef false), surface the pill with the
+    // SAME `visibleAdded` count as before. When at bottom, followOutput sticks and
+    // atBottomStateChange resets the count, so no pill bump here.
+    if (live && visibleAdded > 0 && !atBottomRef.current) {
+      setNewCount((n) => n + visibleAdded);
     }
     prevLenRef.current = len;
     prevHasMoreRef.current = hasMore;
@@ -552,9 +587,18 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   }, [lastOp?.rev, hasMore]);
 
   const jumpToNew = useCallback(() => {
-    const b = bodyRef.current;
-    if (!b) return;
-    b.scrollTo({ top: b.scrollHeight, behavior: reducedRef.current ? 'auto' : 'smooth' });
+    // #232 — the pill scrolls to the LAST node via Virtuoso (its virtual index =
+    // firstItemIndex + (nodes.length − 1)), aligned to the bottom edge, instead of
+    // a raw scrollTo({top: scrollHeight}) (scrollHeight is only an estimate under
+    // virtualization).
+    const count = nodesRef.current.length;
+    if (count > 0) {
+      virtuosoRef.current?.scrollToIndex({
+        index: firstItemIndexRef.current + count - 1,
+        align: 'end',
+        behavior: reducedRef.current ? 'auto' : 'smooth',
+      });
+    }
     setNewCount(0);
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — explicit nav clears the pin
   }, []);
@@ -694,6 +738,20 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     [display.resolvedTz, display.offsetLabel],
   );
   const nodes = useMemo(() => insertTimeMarkers(visible, fmtCtx), [visible, fmtCtx]);
+  // #232 — live mirror of the render-node list so the stable (empty-dep) keymap /
+  // pill closures can read the CURRENT nodes (the "↓ N new" pill's last-node
+  // scroll, the j/k cursor clamp) without re-registering.
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  // #232 — set the keyboard cursor to a nodes-array index: stores BOTH the index
+  // (remap / stepping / keymap closures) and the turn UUID (the stable render key
+  // the ring matches, so a prepend can't flip the class — #231). A marker index
+  // clears the uuid (no ring) but keeps the index for stepping math.
+  const setCursor = useCallback((nodeIndex: number) => {
+    setFocusedIndex(nodeIndex);
+    const n = nodesRef.current[nodeIndex];
+    setCursorUuid(n ? nodeTurnUuid(n) : null);
+  }, []);
   // Live mirror of the unfiltered render-tree for the jump-to-next mode-hide
   // check (find the target node in `groups`, test nodeVisible under the mode).
   const groupsRef = useRef<RenderNode[]>(groups);
@@ -862,10 +920,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       obs.observe(el);
     }
     return () => obs.disconnect();
-    // `visible` changes on every paged append / session switch / focus-mode
-    // change — re-register so the observer tracks the freshly-rendered turns
-    // AND cards (cardRefs is repopulated in the same commit that grows `visible`).
-  }, [visible]);
+    // #232 — re-register on `visible` (paged append / session switch / focus-mode
+    // change) AND on Virtuoso's rendered-range change (`renderedRangeRev`, bumped
+    // by onItemsRendered): under virtualization, SCROLLING mounts/unmounts rows
+    // without changing `visible`, so the observe-set must be rebuilt over the
+    // fresh mounted itemRefs/cardRefs whenever the window of rendered items moves.
+    // The observer keeps its existing topmost-VISIBLE pick (re-deriving from
+    // Virtuoso's overscan-inclusive range would shift the semantics).
+  }, [visible, renderedRangeRev]);
 
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
   // Wait for the first page (`detail`) before attempting — otherwise the effect
@@ -949,9 +1011,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // #188 B2 — pin the landing so the outline selects EXACTLY this target and
         // a repeat forward jump-to-next steps strictly past it (closes #187).
         dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
-        // #177 S6 — sync the keyboard cursor to the jumped node's array index so
-        // j/k (and find's n/N) resume from the match.
-        setFocusedIndex(hit.arrayIndex);
+        // #177 S6 — sync the keyboard cursor to the jumped node so j/k (and find's
+        // n/N) resume from the match (sets both the index + the stable ring uuid).
+        setCursor(hit.arrayIndex);
         // Within-row second pass once the row mounts (#177 S6 / #204): open the
         // turn's collapsed disclosures for a tool/thinking find hit, then center
         // the specific member element inside the (now-mounted) row. rAF guarantees
@@ -1084,7 +1146,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
 
   // The reused reader must not carry a force-pin across sessions (subagent_key is
   // only an agent-file hash). Reset on every session change; no-op on first mount.
-  useEffect(() => { setForcedOpenKeys(new Set()); }, [sessionId]);
+  // #232 — also reset the bulk-sweep state so a prior conversation's expand/collapse-
+  // all doesn't sweep the new session's sidechains on mount.
+  useEffect(() => {
+    setForcedOpenKeys(new Set());
+    setBulkSweep({ rev: 0, open: false });
+  }, [sessionId]);
 
   // #175 — the reused reader must not carry the live-tail pill/scroll state across
   // sessions. Clearing `newCount` drops a stale "↓ N new" pill the instant we switch
@@ -1264,36 +1331,33 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       suppressToolUseIds,
       spawnKindByToolUseId,
       isMobile,
+      // #232 — the bulk-sweep state so nested sidechains adopt expand/collapse-all.
+      bulkSweep,
     }),
-    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds, spawnKindByToolUseId, isMobile],
+    [detail?.subagent_meta, forcedOpenKeys, getItemRef, getCardRef, handleSubagentOpenChange, suppressToolUseIds, spawnKindByToolUseId, isMobile, bulkSweep],
   );
 
   // Reset the focused-turn cursor to the top on a session switch (the reused
-  // reader carries no cursor across conversations).
-  useEffect(() => { setFocusedIndex(0); }, [sessionId]);
+  // reader carries no cursor across conversations). #232 — also clear the ring
+  // uuid so a stale cursor turn from the prior conversation doesn't flash.
+  useEffect(() => { setFocusedIndex(0); setCursorUuid(null); }, [sessionId]);
 
-  // Imperatively move the `conv-item--focused` class onto the cursor's child,
-  // off every other. Re-runs on a cursor step AND when the rendered list changes
-  // (paged appends / focus-mode switch grow or shrink `children`), so the ring
-  // tracks the right element. Imperative (not a render prop) so memoized
-  // MessageItems don't re-render. hidden_run markers carry `data-conv-marker`;
-  // the focused class is never placed on one (stepFocus skips landing on them,
-  // and the remap effect resolves the cursor to a real turn after a switch).
-  // #232 — Virtuoso wraps each node in a `.conv-reader-item`, so the class + the
-  // data-conv-marker probe target the wrapper's INNER node element
-  // (`firstElementChild`); the marker attribute / data-uuid live there, not on the
-  // wrapper. (T5 replaces this whole DOM-walking cursor with a render-driven
-  // `cursorIndex` class.)
+  // #232 — default the cursor to the FIRST real turn once content renders (the
+  // pre-virtualization default was index 0). Only when no cursor is set yet (a
+  // user j/k/jump takes over), so this fires once per open. Skips leading markers.
   useEffect(() => {
-    const thread = threadRef.current;
-    if (!thread) return;
-    const kids = thread.children;
-    for (let i = 0; i < kids.length; i++) {
-      const node = (kids[i].firstElementChild ?? kids[i]) as HTMLElement;
-      const isMarker = node.dataset.convMarker != null;
-      node.classList.toggle('conv-item--focused', i === focusedIndex && !isMarker);
-    }
-  }, [focusedIndex, visible]);
+    if (cursorUuid != null) return;
+    const idx = nodes.findIndex((n) => nodeTurnUuid(n) != null);
+    if (idx >= 0) setCursor(idx);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursorUuid, nodes]);
+
+  // #232 — the keyboard cursor ring is now RENDER-DRIVEN (Codex P1-1): `renderNode`
+  // adds `conv-item--focused` to the node at `focusedIndex` (the nodes-array
+  // index), so the old imperative DOM-walking effect (which under virtualization
+  // could only reach the mounted overscan window) is gone. `focusedIndex` is the
+  // single source of truth in nodes-space; a marker is never a cursor stop
+  // (stepFocus skips them, and the remap resolves to a real turn after a switch).
 
   // #177 S5 §5 (Codex F5) — focus-coherence remap. When the mode changes the
   // rendered list reshuffles (turns vanish, hidden_run markers appear, time
@@ -1347,7 +1411,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       target = t;
     }
     if (target < 0) target = 0;
-    setFocusedIndex(target);
+    setCursor(target);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusMode]);
 
@@ -1366,22 +1430,27 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // active; the keymap store already swallows single-char keys while a text
   // input is focused.
   const stepFocus = useCallback((delta: number) => {
-    const thread = threadRef.current;
-    if (!thread) return;
-    const last = thread.children.length - 1;
+    // #232 — the cursor walks `nodes` INDEX space (Codex P1-1), not DOM children:
+    // under virtualization `thread.children` holds only the mounted overscan
+    // window, so a DOM walk can't move the cursor past it. `nodesRef` is the live
+    // render list; a marker (time_marker / hidden_run) is never a cursor stop.
+    const nodeList = nodesRef.current;
+    const last = nodeList.length - 1;
     if (last < 0) return;
-    const cur = focusedIndexRef.current;
-    const dir = delta >= 0 ? 1 : -1;
-    // #232 — Virtuoso wraps each node in a `.conv-reader-item`; the marker flag
-    // lives on the INNER node element, so probe `firstElementChild`.
     const isMarkerAt = (i: number): boolean => {
-      const wrap = thread.children[i] as HTMLElement | undefined;
-      const node = (wrap?.firstElementChild ?? wrap) as HTMLElement | undefined;
-      return node?.dataset.convMarker != null;
+      const n = nodeList[i];
+      return n != null && (n.kind === 'time_marker' || n.kind === 'hidden_run');
     };
-    // Step at least one child, then keep walking PAST any `data-conv-marker`
-    // child (the hidden_run buttons) so the cursor never lands on a marker — a
-    // marker can never take keyboard focus (Codex F5). Stops at the edge.
+    // Resolve the CURRENT cursor index from its UUID (the index ref can be stale
+    // after a head mutation; the uuid is the source of truth — #231). Fall back to
+    // the index ref, then 0.
+    const curUuid = cursorUuidRef.current;
+    let cur = curUuid != null ? nodeList.findIndex((n) => nodeTurnUuid(n) === curUuid) : -1;
+    if (cur < 0) cur = Math.min(Math.max(0, focusedIndexRef.current), last);
+    const dir = delta >= 0 ? 1 : -1;
+    // Step at least one, then keep walking PAST any marker so the cursor never
+    // lands on one (a marker can never take keyboard focus — Codex F5). Stops at
+    // the edge.
     let next = cur + delta;
     while (next >= 0 && next <= last && isMarkerAt(next)) {
       next += dir;
@@ -1390,34 +1459,42 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // If clamping landed back on a marker (the run sits at an edge), there is no
     // real turn that way — stay put.
     if (isMarkerAt(next)) return;
-    // At the last loaded group with more to come, kick a load; the cursor
-    // advances on the next press once the new child has mounted.
+    // At the last loaded node with more to come, kick a load; the cursor advances
+    // on the next press once the new node renders.
     if (delta > 0 && cur === last && hasMoreRef.current) { void loadMoreRef.current(); return; }
     if (next === cur) return;
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — j/k focus-step is explicit nav
-    setFocusedIndex(next);
-    const target = thread.children[next] as HTMLElement | undefined;
-    target?.scrollIntoView({ block: 'nearest', behavior: reducedRef.current ? 'auto' : 'smooth' });
-  }, []);
+    setCursor(next);
+    // Bring the cursor's node into view via Virtuoso (the row may be unmounted —
+    // scrollToIndex mounts it). The virtual index = firstItemIndex + array index.
+    virtuosoRef.current?.scrollToIndex({
+      index: firstItemIndexRef.current + next,
+      align: 'center',
+      behavior: reducedRef.current ? 'auto' : 'smooth',
+    });
+  }, [setCursor]);
 
-  // Collapse-all / expand-all sweep. A transient bulk-suppression class on the
-  // thread sets `::details-content { transition: none }` for the frame so the
-  // N disclosures snap rather than cascade; removed next tick (§4d).
+  // #232 — Collapse-all / expand-all sweep on the DATA MODEL (Codex P1-1).
+  // Advancing `bulkSweep.rev` makes every SidechainGroup (mounted or not) adopt
+  // the new open-state in render, so off-screen sidechains are swept too. The
+  // transient `--bulk` class still snaps the `::details-content` transition for
+  // the mounted ones so the visible cascade doesn't animate; removed next tick.
   const sweepDetails = useCallback((open: boolean) => {
+    setBulkSweep((s) => ({ rev: s.rev + 1, open }));
     const thread = threadRef.current;
-    if (!thread) return;
-    thread.classList.add('conv-reader-thread--bulk');
-    thread.querySelectorAll('details').forEach((d) => { (d as HTMLDetailsElement).open = open; });
-    const drop = () => thread.classList.remove('conv-reader-thread--bulk');
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drop); else drop();
+    if (thread) {
+      thread.classList.add('conv-reader-thread--bulk');
+      const drop = () => thread.classList.remove('conv-reader-thread--bulk');
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drop); else drop();
+    }
   }, []);
 
   const jumpToTop = useCallback(() => {
     const body = bodyRef.current;
     body?.scrollTo({ top: 0, behavior: reducedRef.current ? 'auto' : 'smooth' });
-    setFocusedIndex(0);
+    setCursor(0);
     dispatch({ type: 'CLEAR_CONV_PIN' }); // #188 B3 — the `g` key is explicit nav
-  }, []);
+  }, [setCursor]);
 
   // #177 S5 §4 — jump-to-next. Targets derive from the reader's full-session
   // `outline.turns` (Codex F4), NOT the paged-in detail. A jump-kind names which
@@ -1466,8 +1543,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (cu != null && byUuid.has(cu)) {
       cursor = byUuid.get(cu)!;
     } else {
-      const focusedEl = threadRef.current?.children[focusedIndexRef.current] as HTMLElement | undefined;
-      const du = focusedEl?.getAttribute('data-uuid');
+      // #232 — the keyboard cursor's turn uuid IS the source of truth (the cursored
+      // node may be UNMOUNTED under virtualization, and the index ref can be stale
+      // after a head mutation, so a DOM/index read is wrong). Use cursorUuidRef.
+      const du = cursorUuidRef.current;
       if (du != null && byUuid.has(du)) cursor = byUuid.get(du)!;
     }
     const targetIdx = nextTarget(list, cursor, dir);
@@ -1763,6 +1842,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         >· {g.count} hidden ·</button>
       );
     }
+    // #232 — the keyboard cursor ring is RENDER-DRIVEN (Codex P1-1) and keyed on
+    // the cursor's TURN UUID, NOT the array index (#231 memo invariant): a prepend
+    // shifts indices but not uuids, so the `conv-item--focused` class only changes
+    // on a real cursor move — never on a reverse-page commit. Applied here so the
+    // ring lands even on a row that mounts after scrollToIndex.
+    const cursored = cursorUuid != null && nodeTurnUuid(g) === cursorUuid;
     if (g.kind === 'subagent') {
       // The thread's member_uuids (every fragment) decide jump-target suppression
       // so a folded/sidechain jump target is covered.
@@ -1773,6 +1858,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           subagentKey={g.subagentKey}
           items={g.items}
           meta={detail.subagent_meta?.[g.subagentKey]}
+          cursored={cursored}
           getItemRef={getItemRef}
           // #188 S3/B6 — the bucket-root uuid (the same value the outline subagent
           // entry jumps to). It tags the card's <details> via data-uuid and keys
@@ -1793,6 +1879,8 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           // MessageItem (threaded down through childCtx). Replaces the old
           // imperative classList.add, which can't reach an unmounted off-screen row.
           flashedUuid={jumpedUuid}
+          // #232 — the bulk [/] sweep state (data-model expand/collapse-all).
+          bulkSweep={bulkSweep}
           // §5 — recursive nesting: the child subagent threads + this node's depth
           // + the per-key machinery for every nested level.
           children={g.children}
@@ -1810,7 +1898,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       const [riseClass, riseStyle] = riseFor(g.items[0].anchor.uuid, members, arrayIndex);
       return (
         <details
-          className={['conv-toolresult-run', riseClass].filter(Boolean).join(' ')}
+          className={['conv-toolresult-run', riseClass, cursored ? 'conv-item--focused' : ''].filter(Boolean).join(' ')}
           style={riseStyle}
           open
         >
@@ -1839,7 +1927,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
       <MessageItem
         item={g.item}
         ref={getItemRef(g.item)}
-        className={riseClass}
+        className={[riseClass, cursored ? 'conv-item--focused' : ''].filter(Boolean).join(' ')}
         style={riseStyle}
         // §5 — suppress a spawn chip on a main-thread item (its nested subagent
         // card is canonical).
@@ -1853,12 +1941,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         flashed={jumpedUuid != null && g.item.member_uuids.includes(jumpedUuid)}
       />
     );
-  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId, jumpedUuid]);
+  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId, jumpedUuid, cursorUuid, bulkSweep]);
 
-  // #232 — Virtuoso's itemsRendered callback (scroll-sync re-registration is
-  // wired in T5). Defined here so the <Virtuoso> prop has a stable referent.
-  const onItemsRendered = useCallback((_items: ListItem<TimedNode>[]) => {
-    // T5 re-registers the scroll-sync IntersectionObserver here.
+  // #232 — Virtuoso's itemsRendered callback. On a genuine rendered-range MOVE
+  // (the first/last mounted index changed), bump `renderedRangeRev` so the
+  // scroll-sync IntersectionObserver effect re-registers over the freshly mounted
+  // itemRefs/cardRefs. Deduped so a same-range measure tick doesn't churn state.
+  const onItemsRendered = useCallback((items: ListItem<TimedNode>[]) => {
+    if (items.length === 0) return;
+    const first = items[0].index;
+    const last = items[items.length - 1].index;
+    const prev = renderedRangeRef.current;
+    if (prev.first !== first || prev.last !== last) {
+      renderedRangeRef.current = { first, last };
+      setRenderedRangeRev((r) => r + 1);
+    }
   }, []);
 
   if (loading && !detail) return (

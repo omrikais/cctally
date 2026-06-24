@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { sidechainIndentClass } from './sidechainIndent';
 import { SubagentIcon } from './ConvIcons';
@@ -67,6 +67,11 @@ export interface SidechainChildContext {
   // #232 — the render-driven jump flash uuid (Codex P0-1), threaded to every
   // nesting level so a nested card root / member flashes when it owns the jump.
   flashedUuid?: string | null;
+  // #232 — the bulk `[`/`]` expand/collapse-all sweep state (Codex P1-1): a
+  // monotonic `rev` + a desired `open`. Threaded to EVERY nesting level so an
+  // off-screen sidechain still adopts the sweep when it (re)mounts. Applied in
+  // render (adjust-state-on-prop-change) so it reaches groups regardless of mount.
+  bulkSweep?: { rev: number; open: boolean };
 }
 
 // One subagent thread (one agent-*.jsonl file) as a disclosure (#155). Summary =
@@ -104,6 +109,8 @@ export function SidechainGroup({
   childCtx,
   isMobile,
   flashedUuid = null,
+  cursored = false,
+  bulkSweep,
 }: {
   subagentKey: string;
   items: ConversationItem[];
@@ -147,6 +154,15 @@ export function SidechainGroup({
   // cards receive it via renderChild. Unmount-safe (a class derived in render,
   // not an imperative add against a possibly-absent element).
   flashedUuid?: string | null;
+  // #232 — the render-driven keyboard cursor ring (Codex P1-1): true when THIS
+  // top-level card is at the cursor's nodes-array index. Adds `conv-item--focused`
+  // to the root <details> (only top-level cards are cursor stops; nested cards are
+  // not, so this is NOT threaded to renderChild).
+  cursored?: boolean;
+  // #232 — the bulk `[`/`]` expand/collapse-all sweep state (Codex P1-1): a
+  // monotonic `rev` + desired `open`, adopted in render so off-screen sidechains
+  // are swept too (threaded to nested cards via renderChild from childCtx).
+  bulkSweep?: { rev: number; open: boolean };
 }) {
   const [userOpen, setUserOpen] = useState(false);
   // #222 — latch a force into userOpen DURING RENDER (React's official "adjust
@@ -167,6 +183,18 @@ export function SidechainGroup({
   // most once per force (no render loop); React applies it before rendering
   // children, so the body (and any nested card) renders once, already open.
   if (forceOpen && !userOpen) setUserOpen(true);
+  // #232 — adopt the bulk `[`/`]` sweep in render (Codex P1-1), same
+  // adjust-state-on-prop-change pattern as the forceOpen latch. When the reader
+  // advances `bulkSweep.rev`, set `userOpen` to the swept open-state. Tracking the
+  // last-applied rev in a ref means a group that was OFF-SCREEN during the sweep
+  // still adopts it the moment it (re)mounts — the data-model reach the old
+  // querySelectorAll('details') walk lacked. A collapse sweep (`open: false`) also
+  // wins over a stale force (the bulk action is explicit user intent).
+  const lastSweepRevRef = useRef(bulkSweep?.rev ?? 0);
+  if (bulkSweep != null && bulkSweep.rev !== lastSweepRevRef.current) {
+    lastSweepRevRef.current = bulkSweep.rev;
+    if (userOpen !== bulkSweep.open) setUserOpen(bulkSweep.open);
+  }
   const open = userOpen || forceOpen;
   // #188 S4/C1 — a force-open makes this thread VISIBLE, so report it open; the
   // reader then counts a subsequent append into it (Bug 5). The OPEN-STATE itself
@@ -179,6 +207,15 @@ export function SidechainGroup({
     // force latch so this fires once per force.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceOpen]);
+  // #232 — report the bulk-sweep open-state to the reader (mirrors the forceOpen
+  // effect) so the "↓ N new" pill's open/known sets stay correct after an
+  // expand/collapse-all. Keyed on the sweep rev so it fires once per sweep; rev 0
+  // is the initial (no-sweep) state, so skip it (groups already report their own
+  // collapsed default and a spurious report would be a no-op anyway).
+  useEffect(() => {
+    if (bulkSweep != null && bulkSweep.rev > 0) onOpenChange?.(subagentKey, bulkSweep.open);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkSweep?.rev]);
 
   const mobile = isMobile ?? childCtx?.isMobile ?? false;
   const label = subagentSummaryLabel(items, subagentKey, mobile ? MOBILE_LABEL_MAX : LABEL_MAX);
@@ -224,6 +261,7 @@ export function SidechainGroup({
       forceOpen={childCtx?.forcedOpenKeys?.has(child.subagentKey) ?? false}
       isMobile={childCtx?.isMobile}
       flashedUuid={flashedUuid}
+      bulkSweep={childCtx?.bulkSweep}
       children={child.children}
       depth={child.depth}
       childCtx={childCtx}
@@ -254,6 +292,8 @@ export function SidechainGroup({
         // #232 — render-driven flash on a card-ROOT jump (an outline subagent
         // entry / collapsed-card flash). A member jump flashes its MessageItem.
         rootUuid != null && flashedUuid === rootUuid ? 'conv-item--jumped' : '',
+        // #232 — render-driven keyboard cursor ring on a top-level card.
+        cursored ? 'conv-item--focused' : '',
         riseClassName,
       ].filter(Boolean).join(' ')}
       style={depth >= 1 ? { ...riseStyle, ['--sc-depth' as string]: String(depth) } as React.CSSProperties : riseStyle}
