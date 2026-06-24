@@ -49,7 +49,10 @@ vi.mock('react-virtuoso', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
   const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
     const scrollToIndex = virtuosoTestHandle.scrollToIndex;
-    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView: vi.fn(), scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
+    // #233 — the reader's jump landing routes through the convergent `scrollIntoView`
+    // and runs its within-row second pass (the native el.scrollIntoView this test's
+    // search-hit flow asserts) inside the `done` callback, so the mock must invoke it.
+    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView: vi.fn((loc?: { done?: () => void }) => { loc?.done?.(); }), scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
     const data = (props.data as unknown[]) ?? [];
     const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
     const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;

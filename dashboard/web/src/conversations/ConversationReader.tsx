@@ -1058,43 +1058,58 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           }
         }
         const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
-        // #232 fix (P1-A) — react-virtuoso's scrollToIndex takes the 0-based DATA
-        // (array) index. `firstItemIndex` shifts the `itemContent` index + the prepend
-        // bookkeeping, but NOT the scrollToIndex input space — passing the virtual
-        // index (firstItemIndex + arrayIndex, ~1,000,000+) lands far outside
-        // [0, totalCount], so react-virtuoso clamps + ignores it and a warm in-session
-        // jump never scrolls toward its target (measured in-browser: scrollTop did not
-        // move at all; scrollToIndex with the DATA index moved, with the virtual index
-        // did not). Pass the array index. (itemContent still receives the virtual index
-        // from Virtuoso, so the `index - firstItemIndex` conversion there is unchanged
-        // + correct.) NOTE this lands warm jumps (the model is measured); a COLD
-        // deep-link to a far/off-screen target is positioned by the drain + the
-        // within-row rAF pass below, the same as before #232 (a precise cold landing
-        // to an off-window target is a separate, pre-existing limitation).
-        virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align, behavior: reduced ? 'auto' : 'smooth' });
-        // #232 — the jump has LANDED on the target: the open has settled, so arm
-        // paging. From here a user scroll to either edge legitimately pages.
-        armPaging();
-        // Render-driven flash (#232): the row may mount AFTER the scroll settles,
-        // and the class still lands because renderNode reads `jumpedUuid` on every
-        // (re)mount — unmount-safe, unlike the old imperative classList.add.
-        setJumpedUuid(jump.uuid);
-        // #188 B2 — pin the landing so the outline selects EXACTLY this target and
-        // a repeat forward jump-to-next steps strictly past it (closes #187).
-        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
-        // #177 S6 — sync the keyboard cursor to the jumped node so j/k (and find's
-        // n/N) resume from the match (sets both the index + the stable ring uuid).
-        setCursor(hit.arrayIndex);
-        // Within-row second pass once the row mounts (#177 S6 / #204): open the
-        // turn's collapsed disclosures for a tool/thinking find hit, then center
-        // the specific member element inside the (now-mounted) row. rAF guarantees
-        // the row committed; isConnected guards a session switch in the gap.
-        // #232/#204 — a NESTED subagent CARD root (jump.uuid is a card bucket-root
-        // but its TOP-LEVEL node is the ROOT ancestor, so isCardRoot is false) is
-        // resolved from cardRefs and re-aimed at its <summary> HEAD (block 'start'),
-        // not centered — a tall card centered hides its head far above the fold.
-        if (typeof requestAnimationFrame === 'function') {
-          requestAnimationFrame(() => requestAnimationFrame(() => {
+        // #233 — land via react-virtuoso's CONVERGENT primitive `scrollIntoView`
+        // ({ index, align, behavior, done }), not `scrollToIndex`. Under dynamic row
+        // heights a far target's offset is first computed from the size model's
+        // ESTIMATE for the still-unmeasured rows; react-virtuoso then re-issues the
+        // scroll on each re-measure until it converges — but it gives that retry only
+        // a ~1200ms internal budget, and with `behavior: 'smooth'` each retry is a
+        // full animation hop, so a FAR jump's multi-hop convergence can blow past the
+        // cap and strand the viewport in the target's REGION (the #233 symptom). So
+        // the jump landing is INSTANT (`behavior: 'auto'`): each retry hop is
+        // immediate, convergence completes well inside the cap, and a WARM far jump
+        // (target already loaded, intermediate rows unmeasured — #233's stated
+        // mechanism) lands pixel-exact. (Reduced-motion was already 'auto', so no
+        // regression.) `scrollIntoView` is the ONLY handle method with a completion
+        // callback — `done` fires after `scrollingInProgress` settles false, i.e.
+        // AFTER the convergent retries finish (or immediately if no scroll was needed)
+        // — which replaces the old blind 2-frame requestAnimationFrame for the
+        // within-row second pass (that rAF fired a NATIVE el.scrollIntoView before
+        // Virtuoso had finished re-correcting, fighting the library's scroll
+        // management).
+        //
+        // KNOWN RESIDUAL (tracked as a follow-up): a COLD far jump — one where the
+        // target was not yet loaded, so `loadToTarget` first pages in hundreds of
+        // rows that are still unmeasured when the single `scrollIntoView` fires — can
+        // still strand part-way (one call's retry budget can't cross the whole
+        // unmeasured gap); a second jump lands it. A deterministic fix needs a
+        // directed scroll-through that mounts each chunk en route, which is the same
+        // hard case #232 deferred; it is NOT attempted here.
+        //
+        // INDEX SPACE (#232 P1-A, unchanged): `index` is the 0-based DATA (array)
+        // index. `firstItemIndex` shifts `itemContent`'s index + the prepend
+        // bookkeeping, but NOT the scroll input space — passing the virtual index
+        // (firstItemIndex + arrayIndex, ~1,000,000+) lands outside [0, totalCount] and
+        // react-virtuoso clamps + ignores it (measured in-browser: scrollTop did not
+        // move). `calculateViewLocation` returns the location verbatim so the jump
+        // ALWAYS scrolls to `align` — Virtuoso's default skips the scroll when the item
+        // is already in view, which would drop the jump's always-reposition semantics.
+        virtuosoRef.current?.scrollIntoView({
+          index: hit.arrayIndex,
+          align,
+          behavior: 'auto',
+          calculateViewLocation: ({ locationParams }) => locationParams,
+          // Within-row second pass — run once the convergent scroll has SETTLED (the
+          // row is mounted AND Virtuoso has finished re-correcting): open the turn's
+          // collapsed disclosures for a tool/thinking find hit, then center the
+          // specific member element inside the (now-mounted) row. #232/#204 — a NESTED
+          // subagent CARD root (jump.uuid is a card bucket-root but its TOP-LEVEL node
+          // is the ROOT ancestor, so isCardRoot is false) is resolved from cardRefs and
+          // re-aimed at its <summary> HEAD (block 'start'), not centered — a tall card
+          // centered hides its head far above the fold. cancelled + isConnected guard a
+          // session switch in the gap before `done` fires.
+          done: () => {
+            if (cancelled) return;
             const cardEl = cardRefs.current.get(jump.uuid);
             const memberEl = itemRefs.current.get(jump.uuid) ?? cardEl;
             if (memberEl && memberEl.isConnected) {
@@ -1109,8 +1124,21 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
                 memberEl.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
               }
             }
-          }));
-        }
+          },
+        });
+        // #232 — the jump has LANDED on the target: the open has settled, so arm
+        // paging. From here a user scroll to either edge legitimately pages.
+        armPaging();
+        // Render-driven flash (#232): the row may mount AFTER the scroll settles,
+        // and the class still lands because renderNode reads `jumpedUuid` on every
+        // (re)mount — unmount-safe, unlike the old imperative classList.add.
+        setJumpedUuid(jump.uuid);
+        // #188 B2 — pin the landing so the outline selects EXACTLY this target and
+        // a repeat forward jump-to-next steps strictly past it (closes #187).
+        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
+        // #177 S6 — sync the keyboard cursor to the jumped node so j/k (and find's
+        // n/N) resume from the match (sets both the index + the stable ring uuid).
+        setCursor(hit.arrayIndex);
         if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
         highlightTimerRef.current = window.setTimeout(() => {
           setJumpedUuid(null);

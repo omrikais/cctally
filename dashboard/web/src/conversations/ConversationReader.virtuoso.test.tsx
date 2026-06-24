@@ -190,8 +190,9 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     const { container } = renderReader();
 
     // The head mounts; the jump effect resolves (the target is already in the one
-    // loaded page, so loadToTarget is a no-op), fires the imperative
-    // scrollToIndex(targetVirtual), sets `jumpedUuid`, and self-clears the jump.
+    // loaded page, so loadToTarget is a no-op), fires the convergent
+    // scrollIntoView({ index: arrayIndex, done }), sets `jumpedUuid`, and self-clears
+    // the jump.
     await waitFor(() => expect(container.querySelector('[data-uuid="t0"]')).not.toBeNull());
     await waitFor(() => expect(getState().conversationJump).toBeNull());
 
@@ -221,6 +222,71 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     // — the unmount-safe behavior the old imperative `classList.add` against a
     // then-absent element could never deliver (Codex P0-1).
     expect(target!.classList.contains('conv-item--jumped')).toBe(true);
+  });
+
+  it('(d) a far jump routes through the CONVERGENT scrollIntoView — the target is the resting node after a re-measure, and real Virtuoso fires `done` (#233)', async () => {
+    // #233 — the jump landing was switched from `scrollToIndex` (no completion signal
+    // → a blind 2-frame rAF second pass) to react-virtuoso's CONVERGENT
+    // `scrollIntoView({ index, align, behavior:'auto', done })`. `done` fires after
+    // the library's measure-and-retry settles, so the within-row second pass runs
+    // AFTER convergence instead of fighting it. The render-all mock tests
+    // (ConversationReader.test.tsx) pin the CALL SHAPE (scrollIntoView with the DATA
+    // array index, never the virtual index) and the done-driven second pass (the mock
+    // fires `done` itself). This real-<Virtuoso> companion proves the genuine library
+    // accepts the new scrollIntoView options (calculateViewLocation + done) without
+    // error and that the target is the FINAL RESTING node — mounted + flashed — and
+    // HOLDS there across a re-window/re-measure.
+    //
+    // NB: VirtuosoMockContext uses UNIFORM item heights, so the true
+    // estimate-vs-measured DYNAMIC-HEIGHT divergence that strands a far smooth jump in
+    // production is NOT reproducible here (every row is exactly itemHeight), and real
+    // Virtuoso's scroll-completion/`done` does not settle under JSDOM's no-layout
+    // scroller (mirrors (b)'s "the mock-context scroll is a no-op" note). The
+    // pixel-exact landing + real `done` firing are the Playwright ui-qa gate's job.
+    mockFetchOnce(detail(uuids.map((u) => makeItem(u))));
+    const targetIdx = N - 6; // t54 — deep in the tail, unmounted at a head-anchored mount
+    const targetUuid = `t${targetIdx}`;
+
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: targetUuid } });
+    const { container } = renderReader();
+
+    await waitFor(() => expect(container.querySelector('[data-uuid="t0"]')).not.toBeNull());
+    // The jump effect resolves the target (already in the one loaded page), calls the
+    // real Virtuoso `scrollIntoView` (the new convergent path — would throw here if the
+    // calculateViewLocation/done options were malformed), and self-clears the jump.
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+
+    // NON-VACUITY: the target is genuinely UNMOUNTED at a head-anchored mount.
+    expect(container.querySelector(`[data-uuid="${targetUuid}"]`)).toBeNull();
+
+    // Drive the scroll real Virtuoso requested (JSDOM has no layout, so the
+    // mock-context scroll is a no-op — mirror (b)). A fixed-height row at index 54
+    // sits at top = 54 * itemHeight; dispatching the scroll makes real Virtuoso
+    // re-window and MOUNT the target — the convergent landing's measured position.
+    const scroller = container.querySelector('.conv-reader-body') as HTMLElement;
+    await act(async () => {
+      Object.defineProperty(scroller, 'scrollTop', {
+        configurable: true, writable: true, value: targetIdx * MOCK_VIEWPORT.itemHeight,
+      });
+      scroller.dispatchEvent(new Event('scroll'));
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+
+    // FINAL RESTING NODE: the target is mounted and carries the render-driven flash.
+    const target = container.querySelector(`[data-uuid="${targetUuid}"]`);
+    expect(target).not.toBeNull();
+    expect(target!.classList.contains('conv-item--jumped')).toBe(true);
+
+    // RE-MEASURE: fire another scroll at the same offset (Virtuoso re-windows /
+    // re-measures) and confirm the target HOLDS as the resting node (still mounted,
+    // still flashed) — the convergent scroll does not drift it off on re-measure.
+    await act(async () => {
+      scroller.dispatchEvent(new Event('scroll'));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    const targetAfter = container.querySelector(`[data-uuid="${targetUuid}"]`);
+    expect(targetAfter).not.toBeNull();
+    expect(targetAfter!.classList.contains('conv-item--jumped')).toBe(true);
   });
 
   it('(c) firstItemIndex pins an item\'s virtual index across a simulated prepend', async () => {

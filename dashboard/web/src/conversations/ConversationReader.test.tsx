@@ -31,8 +31,16 @@ import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
 // most-recently-mounted instance, and the IntersectionObserver-free top/bottom
 // load triggers (startReached/endReached replace the deleted sentinel
 // observers).
+// #233 — react-virtuoso's `scrollIntoView` is the only handle method with a
+// completion callback: `done` fires after the library's convergent retry settles
+// (or immediately if no scroll is needed). The reader's jump landing now routes
+// through it (replacing `scrollToIndex` + a blind rAF second pass), running the
+// within-row centering inside `done`. The render-all mock fires `done`
+// synchronously so that second pass runs deterministically in these tests.
+const fireScrollIntoViewDone = (loc?: { done?: () => void }) => { loc?.done?.(); };
 const virtuosoTestHandle: {
   scrollToIndex: ReturnType<typeof vi.fn>;
+  scrollIntoView: ReturnType<typeof vi.fn>;
   firstItemIndex: number;
   startReached: (() => void) | null;
   endReached: (() => void) | null;
@@ -41,6 +49,7 @@ const virtuosoTestHandle: {
   followOutput: ((atBottom: boolean) => unknown) | null;
 } = {
   scrollToIndex: vi.fn(),
+  scrollIntoView: vi.fn(fireScrollIntoViewDone),
   firstItemIndex: 0,
   startReached: null,
   endReached: null,
@@ -52,7 +61,8 @@ vi.mock('react-virtuoso', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
   const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
     const scrollToIndex = virtuosoTestHandle.scrollToIndex;
-    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView: vi.fn(), scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
+    const scrollIntoView = virtuosoTestHandle.scrollIntoView;
+    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView, scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex, scrollIntoView]);
     const data = (props.data as unknown[]) ?? [];
     const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
     const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;
@@ -180,6 +190,7 @@ beforeEach(() => {
   // #232 — reset the shared Virtuoso test handle so a prior test's scrollToIndex
   // calls / captured callbacks don't bleed across tests.
   virtuosoTestHandle.scrollToIndex = vi.fn();
+  virtuosoTestHandle.scrollIntoView = vi.fn(fireScrollIntoViewDone);
   virtuosoTestHandle.firstItemIndex = 0;
   virtuosoTestHandle.startReached = null;
   virtuosoTestHandle.endReached = null;
@@ -282,7 +293,7 @@ describe('ConversationReader', () => {
       expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore'));
   });
 
-  it('jumps to a target message: pages until loaded, scrollToIndex on the DATA index, render-driven flash (#232)', async () => {
+  it('jumps to a target message: pages until loaded, scrollIntoView on the DATA index, render-driven flash (#232/#233)', async () => {
     // Page 1 has h1 only, with more to come; page 2 carries the target.
     mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
     mockFetchOnce(detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null));
@@ -302,16 +313,16 @@ describe('ConversationReader', () => {
       const el = container.querySelector('[data-uuid="target"]');
       expect(el).not.toBeNull();
     });
-    // #232 — the primary landing is Virtuoso's scrollToIndex on the target node's
-    // DATA (array) index, NOT a DOM scrollIntoView on a resolved ref. react-virtuoso
+    // #233 — the primary landing is Virtuoso's CONVERGENT `scrollIntoView` (instant)
+    // on the target node's DATA (array) index, NOT a DOM scrollIntoView on a resolved
+    // ref and NOT `scrollToIndex` (which has no completion signal). react-virtuoso
     // takes the 0-based data index (firstItemIndex shifts itemContent + the prepend
-    // bookkeeping, NOT the scrollToIndex input space — see the dedicated regression
-    // test above), so the array index is the row's VIRTUAL data-index minus the live
-    // firstItemIndex.
+    // bookkeeping, NOT the input space — see the dedicated regression test above), so
+    // the array index is the row's VIRTUAL data-index minus the live firstItemIndex.
     const targetWrap = container.querySelector('[data-uuid="target"]')!.closest('.conv-reader-item') as HTMLElement;
     const targetVirtual = Number(targetWrap.getAttribute('data-index'));
     const targetArrayIndex = targetVirtual - virtuosoTestHandle.firstItemIndex;
-    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
+    await waitFor(() => expect(virtuosoTestHandle.scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
     // The within-row pass also centers the member element.
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     // The flash is render-driven (jumpedUuid), surviving an unmount/remount.
@@ -319,17 +330,19 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(target.classList.contains('conv-item--jumped')).toBe(true));
   });
 
-  it('jump landing passes scrollToIndex the DATA (array) index, NOT the firstItemIndex-offset virtual index (#232 warm-jump landing regression)', async () => {
-    // ROOT CAUSE (#232 P1-A): react-virtuoso's `scrollToIndex({ index })` takes the
-    // 0-based DATA index — `firstItemIndex` shifts the `itemContent` index and the
-    // prepend bookkeeping, but NOT the scrollToIndex input space. The reader's jump
-    // landing was passing `hit.virtualIndex` (= firstItemIndex + arrayIndex), which
-    // — being ~1,000,000+, far outside [0, totalCount] — react-virtuoso clamps and
-    // ignores, so a warm in-session far jump never scrolls to / mounts its target
-    // (measured in-browser: scrollTop did not move; DATA index moved, virtual did
-    // not). This pins the exact index argument so the wrong-space regression can't
-    // return. (The render-all mock's scrollToIndex is a no-op spy, so only an index
-    // assertion — not a scroll-position one — catches it here.)
+  it('jump landing passes scrollIntoView the DATA (array) index, NOT the firstItemIndex-offset virtual index (#232 P1-A / #233 warm-jump landing regression)', async () => {
+    // ROOT CAUSE (#232 P1-A): react-virtuoso's `scrollIntoView`/`scrollToIndex`
+    // `{ index }` takes the 0-based DATA index — `firstItemIndex` shifts the
+    // `itemContent` index and the prepend bookkeeping, but NOT the scroll input
+    // space. The reader's jump landing was passing `hit.virtualIndex` (= firstItemIndex
+    // + arrayIndex), which — being ~1,000,000+, far outside [0, totalCount] —
+    // react-virtuoso clamps and ignores, so a warm in-session far jump never scrolls
+    // to / mounts its target (measured in-browser: scrollTop did not move; DATA index
+    // moved, virtual did not). #233 routes the landing through the convergent
+    // `scrollIntoView` (instant + `done`); the DATA-index rule is unchanged. This
+    // pins the exact index argument so the wrong-space regression can't return. (The
+    // render-all mock's scrollIntoView is a no-op spy, so only an index assertion —
+    // not a scroll-position one — catches it here.)
     mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
     mockFetchOnce(detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null));
 
@@ -349,9 +362,9 @@ describe('ConversationReader', () => {
     expect(targetVirtual).toBeGreaterThanOrEqual(VIRTUAL_INDEX_BASE);
     expect(targetArrayIndex).toBeLessThan(VIRTUAL_INDEX_BASE);
 
-    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
+    await waitFor(() => expect(virtuosoTestHandle.scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ index: targetArrayIndex })));
     // And NEVER with the virtual index (the bug).
-    expect(virtuosoTestHandle.scrollToIndex).not.toHaveBeenCalledWith(expect.objectContaining({ index: targetVirtual }));
+    expect(virtuosoTestHandle.scrollIntoView).not.toHaveBeenCalledWith(expect.objectContaining({ index: targetVirtual }));
   });
 
   it('gives up on a jump when pagination exhausts on an empty terminal page (no infinite loop)', async () => {
@@ -679,16 +692,16 @@ describe('ConversationReader', () => {
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'sa1' } });
     const { container } = render(<ConversationReader sessionId="s" />);
 
-    // #232 — the card-root jump scrolls via Virtuoso's scrollToIndex (the node's
-    // virtual index) aligned to the head, and the flash is render-driven on the
-    // <details> card — the thread stays COLLAPSED (no force-open).
-    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled());
+    // #232/#233 — the card-root jump scrolls via Virtuoso's convergent scrollIntoView
+    // (the node's DATA index) aligned to the head, and the flash is render-driven on
+    // the <details> card — the thread stays COLLAPSED (no force-open).
+    await waitFor(() => expect(virtuosoTestHandle.scrollIntoView).toHaveBeenCalled());
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     expect(det.getAttribute('data-uuid')).toBe('sa1');
     await waitFor(() => expect(det.classList.contains('conv-item--jumped')).toBe(true));
     expect(det.open).toBe(false); // NOT force-opened
     // The card-root jump aligns to the head (block 'start').
-    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ align: 'start' }));
+    expect(virtuosoTestHandle.scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ align: 'start' }));
     // The pin lands on the bucket-root uuid so the outline subagent entry lights.
     await waitFor(() => expect(getState().convPinnedUuid).toBe('sa1'));
     await waitFor(() => expect(getState().conversationJump).toBeNull());
@@ -747,10 +760,11 @@ describe('ConversationReader', () => {
     expect(grandchild!.classList.contains('conv-sidechain--nested')).toBe(true);
   });
 
-  // #204/#232 — a jump to a nested subagent CARD root force-opens the ancestor
+  // #204/#232/#233 — a jump to a nested subagent CARD root force-opens the ancestor
   // chain (so the card mounts), then the primary scroll goes through Virtuoso's
-  // scrollToIndex (the top-level node's virtual index) and the WITHIN-ROW re-aim
-  // (rAF, once the nested card mounts) aligns the card HEAD to the top
+  // convergent scrollIntoView (the top-level node's DATA index) and the WITHIN-ROW
+  // re-aim — now run inside scrollIntoView's `done` callback (after convergence
+  // settles), no longer a blind rAF — aligns the card HEAD to the top
   // (`block: 'start'` on its <summary>), not center — a tall card centered leaves
   // its head far above the fold.
   it('#204 aligns a nested subagent card head to the top (block:start) via the within-row re-aim', async () => {
@@ -765,10 +779,9 @@ describe('ConversationReader', () => {
         G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
       },
     });
-    // Run rAF callbacks synchronously so the double-rAF within-row re-aim fires
-    // deterministically within the act/waitFor window.
-    const rafSpy = vi.spyOn(window, 'requestAnimationFrame')
-      .mockImplementation((cb: FrameRequestCallback) => { cb(0); return 0; });
+    // #233 — the within-row re-aim now runs inside scrollIntoView's `done` callback;
+    // the render-all mock fires `done` synchronously (fireScrollIntoViewDone), so the
+    // re-aim happens deterministically within the act/waitFor window — no rAF spy.
     const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
 
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'g1' } });
@@ -776,7 +789,7 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(getState().conversationJump).toBeNull());
 
     // The primary landing went through Virtuoso (the top-level node carrying g1).
-    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled();
+    expect(virtuosoTestHandle.scrollIntoView).toHaveBeenCalled();
     // The within-row re-aim scrolled the g1 card's <summary> head, top-aligned.
     const headCalls = scrollSpy.mock.instances
       .map((inst, i) => ({ inst: inst as Element, opts: scrollSpy.mock.calls[i][0] as ScrollIntoViewOptions }))
@@ -790,7 +803,6 @@ describe('ConversationReader', () => {
     expect(lastInst.tagName).toBe('SUMMARY');
     expect(lastInst.closest('details.conv-sidechain')?.getAttribute('data-uuid')).toBe('g1');
     expect((scrollSpy.mock.calls.at(-1)![0] as ScrollIntoViewOptions).block).toBe('start');
-    rafSpy.mockRestore();
   });
 
   // §5 (Codex P1-C) — a resolved spawn's chip is suppressed (its nested subagent
