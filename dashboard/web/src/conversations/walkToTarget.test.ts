@@ -2,7 +2,7 @@
 // effects (no DOM), so its convergence/abort/exhaust logic is unit-testable;
 // pixel-exact landing under react-virtuoso stays the Playwright ui-qa gate's job.
 import { describe, expect, it } from 'vitest';
-import { planWalkStep, nextStepSize } from './walkToTarget';
+import { planWalkStep, nextStepSize, walkToTarget } from './walkToTarget';
 
 describe('planWalkStep', () => {
   it('done when target is within the mounted range', () => {
@@ -33,5 +33,79 @@ describe('nextStepSize', () => {
   it('halves (>=1) on stall', () => {
     expect(nextStepSize(12, false, 12)).toBe(6);
     expect(nextStepSize(1, false, 12)).toBe(1);
+  });
+});
+
+function fakeVirtuoso(rowsPerWindow: number, total: number) {
+  // a fake where scrollToIndex(i) mounts a window [i .. i+rowsPerWindow-1]
+  // clamped into [0, total-1]; tracks calls. Starts at the tail.
+  let first = total - rowsPerWindow, last = total - 1; // start at tail
+  const calls: number[] = [];
+  return {
+    getMountedArrayRange: () => ({ first, last }),
+    scrollToIndex: (index: number) => {
+      calls.push(index);
+      first = Math.max(0, Math.min(index, total - rowsPerWindow));
+      last = Math.min(total - 1, first + rowsPerWindow - 1);
+    },
+    calls,
+  };
+}
+
+describe('walkToTarget', () => {
+  it('converges to a far target above the tail and reports mounted', async () => {
+    const fv = fakeVirtuoso(10, 400);
+    const res = await walkToTarget({
+      getTargetArrayIndex: () => 0,
+      getMountedArrayRange: fv.getMountedArrayRange,
+      scrollToIndex: fv.scrollToIndex,
+      quiesce: async () => {},
+      isAborted: () => false,
+      maxSteps: 100,
+      initialWindow: 10,
+    });
+    expect(res).toBe('mounted');
+    const r = fv.getMountedArrayRange();
+    expect(0 >= r.first && 0 <= r.last).toBe(true);
+  });
+
+  it('aborts immediately when superseded', async () => {
+    const fv = fakeVirtuoso(10, 400);
+    const res = await walkToTarget({
+      getTargetArrayIndex: () => 0, getMountedArrayRange: fv.getMountedArrayRange,
+      scrollToIndex: fv.scrollToIndex, quiesce: async () => {}, isAborted: () => true,
+      maxSteps: 100, initialWindow: 10,
+    });
+    expect(res).toBe('aborted');
+    expect(fv.calls.length).toBe(0);
+  });
+
+  it('returns exhausted if it cannot make progress within maxSteps', async () => {
+    // a stuck fake: scrollToIndex never moves the range
+    const res = await walkToTarget({
+      getTargetArrayIndex: () => 0,
+      getMountedArrayRange: () => ({ first: 50, last: 60 }),
+      scrollToIndex: () => {}, quiesce: async () => {}, isAborted: () => false,
+      maxSteps: 8, initialWindow: 10,
+    });
+    expect(res).toBe('exhausted');
+  });
+
+  it('returns mounted immediately if the target is already in range', async () => {
+    const res = await walkToTarget({
+      getTargetArrayIndex: () => 55, getMountedArrayRange: () => ({ first: 50, last: 60 }),
+      scrollToIndex: () => { throw new Error('should not step'); }, quiesce: async () => {},
+      isAborted: () => false, maxSteps: 8, initialWindow: 10,
+    });
+    expect(res).toBe('mounted');
+  });
+
+  it('aborts if the target can no longer be resolved (node trimmed)', async () => {
+    const res = await walkToTarget({
+      getTargetArrayIndex: () => null, getMountedArrayRange: () => ({ first: 50, last: 60 }),
+      scrollToIndex: () => {}, quiesce: async () => {}, isAborted: () => false,
+      maxSteps: 8, initialWindow: 10,
+    });
+    expect(res).toBe('aborted');
   });
 });
