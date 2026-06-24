@@ -4,6 +4,7 @@ import { useSnapshot } from './useSnapshot';
 import { getState, selectLiveTailEnabled, subscribeStore } from '../store/store';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
 import { planTrim } from '../conversations/windowedCap';
+import { VIRTUAL_INDEX_BASE, applyFirstItemDelta } from '../conversations/virtuosoFirstIndex';
 import type { ConversationDetail, ConversationItem, OpenIntent, OutlineTurn } from '../types/conversation';
 
 // #217 S3 E2 — the bidirectional windowed reader pager. The reader holds ONE
@@ -85,6 +86,11 @@ export interface UseConversation {
   // window without changing the length while the find corpus still changed
   // (Codex P1), so a length-keyed signal would silently miss those mutations.
   tailRevision: number;
+  // #232 — the Virtuoso `firstItemIndex` the reader passes to <Virtuoso>. The
+  // hook OWNS it in combined window state (atomically with detail.items) so it
+  // moves correctly even across `capWindowDuringDrain`'s head-trim, which emits
+  // NO WindowOp; virtualIndex = virtualFirstItemIndex + arrayIndex.
+  virtualFirstItemIndex: number;
 }
 
 const PAGE = 500;
@@ -132,7 +138,16 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // without re-creating itself (mirrors outlineTurnsRef).
   const protectedUuidsRef = useRef<Set<string> | undefined>(protectedUuids);
   protectedUuidsRef.current = protectedUuids;
-  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  // #232 — combined window state: `detail.items` and the Virtuoso firstItemIndex
+  // move together, in ONE state object updated atomically by each head-mutating
+  // updater. A reader ref accumulator would double-process under StrictMode
+  // (main.tsx) and miss `capWindowDuringDrain`'s emit-less head trim; folding the
+  // index into the same setState that holds the items keeps it pure (StrictMode-
+  // safe) and covers EVERY head mutation. virtualIndex = firstItemIndex +
+  // arrayIndex; firstItemIndex moves so data[0] keeps a stable virtual index.
+  interface WindowState { detail: ConversationDetail | null; firstItemIndex: number; }
+  const [windowState, setWindowState] = useState<WindowState>({ detail: null, firstItemIndex: VIRTUAL_INDEX_BASE });
+  const detail = windowState.detail;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openScrollIntent, setOpenScrollIntent] = useState<'top' | 'bottom' | null>(null);
@@ -172,12 +187,17 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // latest skeleton without re-creating the callback.
   const outlineTurnsRef = useRef<OutlineTurn[] | undefined>(outlineTurns);
   outlineTurnsRef.current = outlineTurns;
+  // #232 — the detail-only setter. It preserves `firstItemIndex` by default, so
+  // every caller that only touches the items (append / tail-poll / detail-only
+  // resets) leaves the Virtuoso offset untouched. The head-mutating call sites
+  // (applyWindow reset, fetchPrev prepend, capWindowDuringDrain, the decoupled
+  // trim) call setWindowState directly to move `firstItemIndex` atomically.
   const setDetailSynced = useCallback(
     (next: ConversationDetail | null | ((prev: ConversationDetail | null) => ConversationDetail | null)) => {
-      setDetail((prev) => {
-        const value = typeof next === 'function' ? next(prev) : next;
+      setWindowState((ws) => {
+        const value = typeof next === 'function' ? next(ws.detail) : next;
         detailRef.current = value;
-        return value;
+        return { detail: value, firstItemIndex: ws.firstItemIndex };
       });
     },
     [],
@@ -186,7 +206,9 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // Apply a fetched page as the SOLE window (open / tail / loadToTarget reset),
   // arming BOTH edges from the envelope. Used by the initial fetch + jumpToLatest.
   const applyWindow = useCallback((body: ConversationDetail) => {
-    setDetailSynced(body);
+    // #232 — a window RESET re-bases the Virtuoso offset to VIRTUAL_INDEX_BASE
+    // (the fresh window's data[0] is its new anchor).
+    setWindowState(() => { detailRef.current = body; return { detail: body, firstItemIndex: VIRTUAL_INDEX_BASE }; });
     nextAfterRef.current = body.page.next_after;
     prevBeforeRef.current = body.page.prev_before ?? null;
     setHasPrev(body.page.has_prev ?? false);
@@ -311,9 +333,17 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       // loaded) — storing those would flip the reader to "not at tail" and kill
       // live-tail / stick-to-bottom (Codex P1). So the bottom edge (page.next_after,
       // page.has_more, nextAfterRef, hasMore) is deliberately preserved.
-      setDetailSynced((prev) => (prev ? { ...prev, items: [...body.items, ...prev.items],
-        page: { ...prev.page, prev_before: body.page.prev_before ?? null, has_prev: body.page.has_prev ?? false },
-        subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body));
+      // #232 — the head grew by body.items.length, so DROP firstItemIndex by that
+      // count (atomically with the prepend) to keep data[0]'s virtual index stable
+      // — this is how Virtuoso pins the viewport across a reverse-paging prepend.
+      setWindowState((ws) => {
+        const prev = ws.detail;
+        const next = prev ? { ...prev, items: [...body.items, ...prev.items],
+          page: { ...prev.page, prev_before: body.page.prev_before ?? null, has_prev: body.page.has_prev ?? false },
+          subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body;
+        detailRef.current = next;
+        return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: body.items.length, droppedTop: 0 }) };
+      });
       prevBeforeRef.current = body.page.prev_before ?? null;
       setHasPrev(body.page.has_prev ?? false);
       return emitOp({ op: 'prepend', addedTop: body.items.length, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
@@ -379,8 +409,13 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // the `hasPrev` STATE out-of-render via a microtask. No-op (ref-equal `prev` →
     // React bails the render) under the cap or when all-protected.
     const capWindowDuringDrain = (drainOp: 'prepend' | 'append'): void => {
-      setDetailSynced((prev) => {
-        if (!prev || prev.items.length <= WINDOW_CAP_ITEMS) return prev;
+      // #232 — this is the ONE head mutation that emits no WindowOp, so it must
+      // move firstItemIndex itself (an emitOp-keyed accumulator would miss it).
+      // A bottom-drop leaves the head fixed; a top-drop raises firstItemIndex by
+      // the trimmed count to keep the surviving data[0]'s virtual index stable.
+      setWindowState((ws) => {
+        const prev = ws.detail;
+        if (!prev || prev.items.length <= WINDOW_CAP_ITEMS) return ws;
         const plan = planTrim({
           items: prev.items,
           op: drainOp,
@@ -388,16 +423,20 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
           protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
           fetchInFlight: false,
         });
-        if (plan.keep === prev.items) return prev;  // all-protected → React bails
+        if (plan.keep === prev.items) return ws;  // all-protected → React bails
         if (plan.droppedBottom > 0) {
           nextAfterRef.current = plan.resetBottomCursorTo;
-          return { ...prev, items: plan.keep,
+          const next = { ...prev, items: plan.keep,
             page: { ...prev.page, next_after: plan.resetBottomCursorTo, has_more: true } };
+          detailRef.current = next;
+          return { detail: next, firstItemIndex: ws.firstItemIndex };  // bottom-drop: head unchanged
         }
         prevBeforeRef.current = plan.resetTopCursorTo;
         queueMicrotask(() => setHasPrev(true));  // hasPrev is state, not derived — sync out-of-render
-        return { ...prev, items: plan.keep,
+        const next = { ...prev, items: plan.keep,
           page: { ...prev.page, prev_before: plan.resetTopCursorTo, has_prev: true } };
+        detailRef.current = next;
+        return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: 0, droppedTop: plan.droppedTop }) };
       });
     };
 
@@ -689,14 +728,20 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     } else if (plan.droppedTop > 0) {
       // Append / live-tail trimmed the top → re-arm the top cursor so scroll-up
       // re-fetches the dropped head; the bottom edge (and the live-tail gate) is
-      // untouched.
+      // untouched. #232 — a head trim RAISES firstItemIndex by droppedTop (moved
+      // atomically with the items) so the surviving data[0]'s virtual index stays
+      // stable. The droppedBottom branch above leaves the head fixed, so it stays
+      // on setDetailSynced (firstItemIndex preserved).
       prevBeforeRef.current = plan.resetTopCursorTo;
       setHasPrev(true);
-      setDetailSynced((prev) => (prev ? {
-        ...prev,
-        items: plan.keep,
-        page: { ...prev.page, prev_before: plan.resetTopCursorTo, has_prev: true },
-      } : prev));
+      setWindowState((ws) => {
+        const prev = ws.detail;
+        if (!prev) return ws;
+        const next = { ...prev, items: plan.keep,
+          page: { ...prev.page, prev_before: plan.resetTopCursorTo, has_prev: true } };
+        detailRef.current = next;
+        return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: 0, droppedTop: plan.droppedTop }) };
+      });
     } else {
       return;
     }
@@ -721,5 +766,6 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     lastOp,
     loadMore, loadPrev, loadToTarget, jumpToLatest,
     tailRevision,
+    virtualFirstItemIndex: windowState.firstItemIndex,
   };
 }

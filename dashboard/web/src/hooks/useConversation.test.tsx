@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversation } from './useConversation';
+import { VIRTUAL_INDEX_BASE } from '../conversations/virtuosoFirstIndex';
 import type { OutlineTurn } from '../types/conversation';
 
 // Minimal EventSource mock (copied from __tests__/sse.test.ts). The live-tail
@@ -1073,5 +1074,77 @@ describe('useConversation — windowed DOM cap (#228 S3 B3)', () => {
     expect(result.current.lastOp?.droppedTop).toBe(0);
     expect(result.current.lastOp?.droppedBottom).toBe(0);
     expect(result.current.hasPrev).toBe(false);
+  });
+});
+
+describe('useConversation — virtualFirstItemIndex (#232)', () => {
+  // The hook owns the Virtuoso `firstItemIndex` in combined window state so the
+  // reader can pin the viewport across head mutations. data[0] keeps a stable
+  // virtual index: a prepend DROPS the index by the count prepended; a head-trim
+  // RAISES it by the count trimmed; appends / tail-trims leave it fixed.
+  function bigItems(start: number, count: number) {
+    const out: unknown[] = [];
+    for (let i = start; i < start + count; i++) {
+      out.push({
+        kind: 'human', anchor: { session_id: 's', uuid: `u${i}`, id: i },
+        member_uuids: [`u${i}`], ts: 't', text: `t${i}`, blocks: [], is_sidechain: false,
+      });
+    }
+    return out;
+  }
+  function pageDetail(items: unknown[], edges: { next_after?: number | null; has_more?: boolean; prev_before?: number | null; has_prev?: boolean }) {
+    return {
+      session_id: 's', project_label: 'p', git_branch: null,
+      started_utc: '2026-01-01T00:00:00Z', last_activity_utc: '2026-01-01T02:00:00Z',
+      cost_usd: 3, models: ['opus'], items,
+      page: {
+        next_after: edges.next_after ?? null, has_more: edges.has_more ?? (edges.next_after != null),
+        prev_before: edges.prev_before ?? null, has_prev: edges.has_prev ?? false,
+      },
+    };
+  }
+
+  it('starts at VIRTUAL_INDEX_BASE on a fresh open', async () => {
+    mockOnce(pageDetail(bigItems(0, 3), { next_after: null, has_more: false, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s', { openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+    expect(result.current.virtualFirstItemIndex).toBe(VIRTUAL_INDEX_BASE);
+  });
+
+  it('decrements virtualFirstItemIndex by the prepended count on loadPrev (#232)', async () => {
+    // tail open: window = [u3, u4]; top edge armed (prev_before 3).
+    mockOnce(pageDetail(bigItems(3, 2), { next_after: null, has_more: false, prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', { openIntent: { kind: 'tail' } }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const before = result.current.virtualFirstItemIndex;
+    expect(before).toBe(VIRTUAL_INDEX_BASE);
+
+    // Reverse page prepends N=2 items (u1, u2) at the head.
+    const N = 2;
+    mockOnce(pageDetail(bigItems(1, N), { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadPrev(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(4));
+    // data[0] moved earlier by N → firstItemIndex drops by N to keep it stable.
+    expect(result.current.virtualFirstItemIndex).toBe(before - N);
+  });
+
+  it('raises virtualFirstItemIndex by droppedTop when an over-cap append trims the head (#232)', async () => {
+    // Head window: ids 0..599 (600 items), forward armed — a legacy head open.
+    mockOnce(pageDetail(bigItems(0, 600), { next_after: 599, has_more: true, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(600));
+    expect(result.current.virtualFirstItemIndex).toBe(VIRTUAL_INDEX_BASE);
+
+    // Append 600 → 1200 → over the 1000 cap → head trimmed by 200 (capWindow/trim
+    // effect). The append itself leaves the head fixed; only the head-trim moves
+    // firstItemIndex, by +droppedTop.
+    mockOnce(pageDetail(bigItems(600, 600), { next_after: null, has_more: false }));
+    await act(async () => {
+      await result.current.loadMore();
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1000));
+    expect(result.current.lastOp?.droppedTop).toBe(200);
+    expect(result.current.virtualFirstItemIndex).toBe(VIRTUAL_INDEX_BASE + 200);
   });
 });
