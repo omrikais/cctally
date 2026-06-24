@@ -6694,10 +6694,23 @@ mark.current {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-x: contain;
-  padding: var(--space-4) var(--space-4);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
+  /* #232 — the HORIZONTAL reading inset lives on `.conv-reader-thread` (the inner
+     List), NOT here on the scroller. Virtuoso's content wrapper is
+     `position:absolute; width:100%`, which resolves against THIS scroller's
+     PADDING box (clientWidth) — so any horizontal padding here makes the wrapper
+     (and the block-flow List inside it) overshoot the scroller's CONTENT box by
+     2× that padding, pushing one padding-width of every full-bleed row (the cost
+     footer, the assistant header meta) under the `overflow-x:hidden` right clip
+     and eating the right reading gutter (measured: thread/item right edge 32px @
+     1280 / 24px @ 390 past the content box; bodyOverflowX true at every width).
+     Keep only the VERTICAL padding here; the thread carries the L/R gutter so the
+     absolute wrapper spans the true content width and nothing overshoots.
+     `display:flex; flex-direction:column; gap` was already inert — Virtuoso's sole
+     child is the `position:absolute` wrapper (out of flex flow, zero in-flow flex
+     children), so the flex container and its gap never applied. Dropped so the
+     scroller is a plain block (a flex scroller can also mis-size Virtuoso's
+     wrapper). */
+  padding: var(--space-4) 0;
 }
 
 /* ---- Timeline spine (full scroll height via the thread wrapper) --- */
@@ -6718,7 +6731,18 @@ mark.current {
      was already inert under virtualization), so block flow keeps the visible
      spacing unchanged. */
   display: block;
-  padding-left: 22px;   /* gutter the spine + markers live in */
+  /* #232 — the HORIZONTAL reading gutter lives HERE, not on the
+     `.conv-reader-body` scroller (see the note there): with a zero-horizontal-
+     padding scroller, Virtuoso's `position:absolute; width:100%` wrapper spans the
+     scroller's true content width and the List inside it no longer overshoots /
+     gets right-clipped. `padding-left` = the old 22px spine+marker gutter PLUS the
+     16px (var(--space-4)) reading inset the scroller used to supply (so the card's
+     left edge stays put); `padding-right` = the matching 16px reading inset (this
+     is the right gutter that the scroller's `overflow-x:hidden` used to eat). The
+     spine `::before` / role-dot offsets below are bumped by the same +16px so the
+     spine stays at its original position relative to the reader. */
+  padding-left: calc(22px + var(--space-4));   /* spine+marker gutter (22px) + reading inset */
+  padding-right: var(--space-4);               /* the right reading gutter (was the scroller's) */
   /* #228 S3 C1 — extend the #205 mobile clamp idiom to ALL widths: a flex
      column floors at min-content width, so without min-width:0 an inner
      unwrappable code line widens the thread and shears the whole transcript
@@ -6746,7 +6770,13 @@ mark.current {
 .conv-reader-thread::before {
   content: "";
   position: absolute;
-  left: 8px;
+  /* #232 — bumped +16px (var(--space-4)) from the old 8px: the reading inset that
+     used to live on the `.conv-reader-body` scroller now lives in this thread's
+     `padding-left`, so this absolute offset (relative to the thread's padding box)
+     must grow by the same amount to keep the spine at its original reader-relative
+     position. The role dots below are item-relative (`left:-17px` from the item's
+     content box, which is unchanged), so they ride the item and need no shift. */
+  left: calc(8px + var(--space-4));
   top: 4px;
   bottom: 4px;
   width: 2px;
@@ -8122,8 +8152,12 @@ mark.current {
     min-height: 0;
   }
   #root .conv-reader-body {
-    padding: 10px var(--space-3);
-    gap: 10px;
+    /* #232 — VERTICAL padding only (matches the base rule): the horizontal reading
+       inset moves to `.conv-reader-thread` below so Virtuoso's absolute width:100%
+       wrapper spans the scroller's content width and full-bleed rows aren't right-
+       clipped (measured: 12px overshoot @ 390 before the fix). `gap` was inert
+       (the sole child is the absolute Virtuoso wrapper). */
+    padding: 10px 0;
     /* #205 S1 (F1) — backstop only. overflow:hidden clips but does NOT reduce
        scrollWidth; the per-child clamp below is what makes scrollWidth fit. */
     overflow-x: hidden;
@@ -8339,7 +8373,13 @@ mark.current {
     min-height: 44px;
   }
   #root .conv-reader-thread {
-    padding-left: 0;
+    /* #232 — the horizontal reading inset (was the scroller's mobile
+       `var(--space-3)` = 12px) lives here now so Virtuoso's absolute width:100%
+       wrapper spans the scroller's content box and no full-bleed row gets right-
+       clipped. The mobile spine/dots are `display:none` (below), so there's no
+       extra spine gutter to add — just the symmetric 12px reading inset. */
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
     /* #232 — the inter-card gap moves to a per-item margin (Virtuoso offset-
        positions items, so the flex `gap` is inert); the mobile 10px override
        moves onto `.conv-reader-item` below. */
