@@ -278,7 +278,7 @@ describe('ConversationReader', () => {
       expect(document.querySelector('.conv-sidechain-kindname')!.textContent).toContain('Explore'));
   });
 
-  it('jumps to a target message: pages until loaded, scrolls, and flashes the highlight', async () => {
+  it('jumps to a target message: pages until loaded, scrollToIndex on the virtual index, render-driven flash (#232)', async () => {
     // Page 1 has h1 only, with more to come; page 2 carries the target.
     mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
     mockFetchOnce(detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null));
@@ -292,15 +292,23 @@ describe('ConversationReader', () => {
 
     const { container } = render(<ConversationReader sessionId="s" />);
 
-    // The reader pages until the target's member_uuids include 'targetFrag',
-    // then scrolls it into view and marks it jumped.
+    // The reader pages until the target's member_uuids include 'targetFrag', then
+    // scrolls it into view and flashes it (render-driven, via jumpedUuid).
     await waitFor(() => {
       const el = container.querySelector('[data-uuid="target"]');
       expect(el).not.toBeNull();
     });
+    // #232 — the primary landing is Virtuoso's scrollToIndex on the target node's
+    // VIRTUAL index (firstItemIndex + arrayIndex), NOT a DOM scrollIntoView on a
+    // resolved ref. Read the virtual index off the rendered row's wrapper.
+    const targetWrap = container.querySelector('[data-uuid="target"]')!.closest('.conv-reader-item') as HTMLElement;
+    const targetVirtual = Number(targetWrap.getAttribute('data-index'));
+    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: targetVirtual })));
+    // The within-row pass also centers the member element.
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    // The flash is render-driven (jumpedUuid), surviving an unmount/remount.
     const target = container.querySelector('[data-uuid="target"]')!;
-    expect(target.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(target.classList.contains('conv-item--jumped')).toBe(true));
   });
 
   it('gives up on a jump when pagination exhausts on an empty terminal page (no infinite loop)', async () => {
@@ -623,18 +631,21 @@ describe('ConversationReader', () => {
       makeItem({ uuid: 'sa1', is_sidechain: true, subagent_key: 'A', text: 'Audit A' } as never),
       makeItem({ uuid: 'sa2', is_sidechain: true, subagent_key: 'A' } as never),
     ]));
-    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
 
     // The outline subagent entry's jump anchor is the bucket-root uuid (sa1).
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'sa1' } });
     const { container } = render(<ConversationReader sessionId="s" />);
 
-    // The card flashes — and the thread stays COLLAPSED (no force-open).
-    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    // #232 — the card-root jump scrolls via Virtuoso's scrollToIndex (the node's
+    // virtual index) aligned to the head, and the flash is render-driven on the
+    // <details> card — the thread stays COLLAPSED (no force-open).
+    await waitFor(() => expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled());
     const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
     expect(det.getAttribute('data-uuid')).toBe('sa1');
-    expect(det.classList.contains('conv-item--jumped')).toBe(true);
+    await waitFor(() => expect(det.classList.contains('conv-item--jumped')).toBe(true));
     expect(det.open).toBe(false); // NOT force-opened
+    // The card-root jump aligns to the head (block 'start').
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ align: 'start' }));
     // The pin lands on the bucket-root uuid so the outline subagent entry lights.
     await waitFor(() => expect(getState().convPinnedUuid).toBe('sa1'));
     await waitFor(() => expect(getState().conversationJump).toBeNull());
@@ -693,12 +704,13 @@ describe('ConversationReader', () => {
     expect(grandchild!.classList.contains('conv-sidechain--nested')).toBe(true);
   });
 
-  // #204 — a jump to a nested subagent CARD root aligns the card HEAD to the top
-  // (`block: 'start'` on its <summary>), not center: a tall subagent card centered
-  // leaves its head far above the fold. The scroll target is the card's summary,
-  // and — because the jump force-opened the ancestor chain — it is re-aimed on the
-  // next frame (rAF) so a late ancestor reflow can't shift it off-position.
-  it('#204 aligns a nested subagent card head to the top (block:start), re-aimed after force-open', async () => {
+  // #204/#232 — a jump to a nested subagent CARD root force-opens the ancestor
+  // chain (so the card mounts), then the primary scroll goes through Virtuoso's
+  // scrollToIndex (the top-level node's virtual index) and the WITHIN-ROW re-aim
+  // (rAF, once the nested card mounts) aligns the card HEAD to the top
+  // (`block: 'start'` on its <summary>), not center — a tall card centered leaves
+  // its head far above the fold.
+  it('#204 aligns a nested subagent card head to the top (block:start) via the within-row re-aim', async () => {
     mockFetchOnce({
       ...detail([
         makeItem({ uuid: 'm1', kind: 'human', text: 'Run the audit' }),
@@ -710,7 +722,7 @@ describe('ConversationReader', () => {
         G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
       },
     });
-    // Run rAF callbacks synchronously so the double-rAF re-aim fires
+    // Run rAF callbacks synchronously so the double-rAF within-row re-aim fires
     // deterministically within the act/waitFor window.
     const rafSpy = vi.spyOn(window, 'requestAnimationFrame')
       .mockImplementation((cb: FrameRequestCallback) => { cb(0); return 0; });
@@ -720,16 +732,17 @@ describe('ConversationReader', () => {
     render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(getState().conversationJump).toBeNull());
 
-    // Every scroll targets the g1 card's <summary> with block:'start' (the head),
-    // and there are at least two (initial + the force-open rAF re-aim).
+    // The primary landing went through Virtuoso (the top-level node carrying g1).
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled();
+    // The within-row re-aim scrolled the g1 card's <summary> head, top-aligned.
     const headCalls = scrollSpy.mock.instances
       .map((inst, i) => ({ inst: inst as Element, opts: scrollSpy.mock.calls[i][0] as ScrollIntoViewOptions }))
       .filter(({ inst }) =>
         inst.tagName === 'SUMMARY'
         && inst.closest('details.conv-sidechain')?.getAttribute('data-uuid') === 'g1');
-    expect(headCalls.length).toBeGreaterThanOrEqual(2);
+    expect(headCalls.length).toBeGreaterThanOrEqual(1);
     expect(headCalls.every(({ opts }) => opts.block === 'start')).toBe(true);
-    // The LAST scroll overall is the g1 card head, top-aligned.
+    // The LAST scrollIntoView overall is the g1 card head, top-aligned.
     const lastInst = scrollSpy.mock.instances.at(-1) as Element;
     expect(lastInst.tagName).toBe('SUMMARY');
     expect(lastInst.closest('details.conv-sidechain')?.getAttribute('data-uuid')).toBe('g1');

@@ -74,7 +74,7 @@ function notificationSummary(s: string): string {
 // A top-level tool_result item (empty prose) collapses into a single disclosure
 // wrapping its blocks. Memoized for long transcripts.
 function MessageItemImpl(
-  { item, className = '', style, suppressToolUseIds, spawnKindByToolUseId }: {
+  { item, className = '', style, suppressToolUseIds, spawnKindByToolUseId, flashed = false }: {
     item: ConversationItem;
     className?: string;
     style?: React.CSSProperties;
@@ -87,6 +87,12 @@ function MessageItemImpl(
     // suppressToolUseIds so a suppressed spawn renders the "↳ launched <kind>
     // agent" connector in place (main item AND subagent-thread item).
     spawnKindByToolUseId?: Map<string, string>;
+    // #232 — the render-driven jump/find flash (Codex P0-1). When true the turn
+    // carries `conv-item--jumped`. Driven by the reader's `jumpedUuid` state so
+    // the highlight lands even if the row mounts AFTER scrollToIndex settles
+    // (under virtualization the old imperative classList.add could no-op against
+    // an unmounted element). A plain boolean keeps the memo cheap.
+    flashed?: boolean;
   },
   ref: React.ForwardedRef<HTMLDivElement>,
 ) {
@@ -94,7 +100,8 @@ function MessageItemImpl(
   // animationDelay) is merged onto the root `.conv-item` div so it stays a
   // DIRECT child of the thread — the role-dot spine CSS keys on
   // `.conv-reader-thread > .conv-item--human`, so wrapping is not an option.
-  const cls = (suffix: string) => `conv-item ${suffix}${className ? ` ${className}` : ''}`;
+  const cls = (suffix: string) =>
+    `conv-item ${suffix}${className ? ` ${className}` : ''}${flashed ? ' conv-item--jumped' : ''}`;
   // #177 S5 §6 — eyebrow time `· HH:mm` on every item kind's head/summary line.
   // Routed through fmt.timeHHmm with the display-tz context (the chokepoint
   // rule); `noSuffix` drops the per-row tz abbrev (the tooltip carries the full
@@ -378,6 +385,7 @@ export const MessageItem = memo(
     style?: React.CSSProperties;
     suppressToolUseIds?: Set<string>;
     spawnKindByToolUseId?: Map<string, string>;
+    flashed?: boolean;
   }>(
     MessageItemImpl,
   ),

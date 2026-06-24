@@ -23,6 +23,7 @@ import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './Co
 import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
+import { nodeIndexForUuid } from './nodeIndexForUuid';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
@@ -265,9 +266,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // #188 S3/B6 — stable per-rootUuid card-ref callbacks (mirrors refCallbacks),
   // so the memoized SidechainGroups don't churn their <details> ref each render.
   const cardRefCallbacks = useRef<Map<string, (el: HTMLElement | null) => void>>(new Map());
-  // Tracks the pending highlight-removal timeout so it can be cancelled on
-  // unmount (no classList.remove on a detached node, no leaked timer) and
-  // superseded on a rapid re-jump (no two overlapping 2s timers racing).
+  // #232 — the jump/find FLASH is now render-driven (Codex P0-1). Under
+  // virtualization the target row may mount AFTER scrollToIndex settles, so the
+  // old imperative `el.classList.add('conv-item--jumped')` would no-op against an
+  // unmounted element. Instead `jumpedUuid` is state: `renderNode` passes
+  // `flashed={uuid === jumpedUuid}` to the matching card, which applies
+  // `conv-item--jumped` whenever it (re)mounts. A single timer clears it after 2s.
+  const [jumpedUuid, setJumpedUuid] = useState<string | null>(null);
+  // Tracks the pending flash-clear timeout so it can be cancelled on unmount /
+  // session change and superseded on a rapid re-jump (no two overlapping 2s
+  // timers racing).
   const highlightTimerRef = useRef<number | null>(null);
   // §5 (Codex P1-D) — the SET of subagent keys force-opened for the in-flight
   // jump (#160). Empty when no force is active. On a jump into a subagent target
@@ -879,116 +887,115 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     void (async () => {
       await loadToTarget(jump.uuid);
       if (cancelled) return;
-      // #188 B7 — resolve the target element: an inner member ref (itemRefs)
-      // OR, for a collapsed subagent whose members are ref-less, the card's
-      // <details> element (cardRefs, keyed by the bucket-root uuid). So an
-      // outline subagent click flashes the CARD with no force-open; the
-      // force-open path below still handles a find-jump to a real INNER uuid
-      // (in neither map while the thread is closed).
-      // #204 — cardRefs holds ONLY subagent bucket-root uuids. A jump whose uuid
-      // is a card root (outline subagent entry, or a collapsed-card flash) aligns
-      // the card HEAD to the top; a deep find-jump into an inner member (itemRefs
-      // hit, cardRefs miss) still centers. itemRefs takes precedence for `el` (the
-      // flash + keyboard-cursor target) so an open card flashes its first member.
-      const cardEl = cardRefs.current.get(jump.uuid);
-      const el = itemRefs.current.get(jump.uuid) ?? cardEl;
-      if (el) {
-        // #177 S6 — a find jump whose anchor matched in a tool/thinking block
-        // opens the target turn's collapsed disclosures BEFORE scrolling (the
-        // client can't know which disclosure holds the needle, so all of the
-        // turn's `<details>` open — bounded + predictable). Other jumps
-        // (search-hit click, outline, jump-to-next) leave expand_details unset.
-        if (jump.expand_details) {
-          el.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
+      // #232 — the mode-hidden check runs FIRST, before resolving the node index.
+      // A non-`all` focus mode coalesces the target's turn into a `hidden_run`
+      // marker, and `nodeIndexForUuid` matches a hidden_run by its `firstUuid`, so
+      // a target that IS the run's first uuid would otherwise resolve onto the
+      // marker and we'd scroll/flash the run instead of unhiding the turn. Reset to
+      // `all` so the turn re-renders, then the focusMode re-fire lands the jump via
+      // the index path below. (Carry-forward: this ordering is exactly why
+      // nodeIndexForUuid's hidden_run case can stay firstUuid-only.)
+      const mode = focusModeRef.current;
+      if (mode !== 'all') {
+        // §5 — the target's TOP-LEVEL RenderNode (recursing into nested subagents)
+        // decides visibility under the mode. A node missing from `groups` (paged in
+        // but its node not built yet) is treated as not-yet-paged → leave it to the
+        // detail-growth re-fire; do NOT reset (diverges from jumpNext's snapshot).
+        const node = findTopLevelNodeFor(groupsRef.current, jump.uuid, detail);
+        if (node != null && !nodeVisible(node, mode)) {
+          dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+          return; // re-run under `all`: the node renders + its index resolves
         }
-        // #204 — a subagent CARD-root jump aligns the card HEAD to the top of the
-        // viewport (`block: 'start'` on the <summary>). Centering it (`block:
-        // 'center'`, the right default for a normal message/member target) puts a
-        // TALL subagent card's head far above the fold — a 20000px grandchild card
-        // centered leaves its head ~420px above the top (the #204 symptom). The
-        // landing is stable, so this is a target/alignment fix, not a timing one.
-        // A normal turn or a deep inner-member find-jump (cardEl undefined) keeps
-        // the #188 B2 centering: the explicit pin set below drives the outline's
-        // aria-current + the jump-to-next cursor onto exactly the jumped target.
-        const scrollTarget: Element = cardEl ? (cardEl.querySelector('summary') ?? cardEl) : el;
-        const scrollBlock: ScrollLogicalPosition = cardEl ? 'start' : 'center';
-        scrollTarget.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: scrollBlock });
-        // #204 — when this jump force-opened ancestor cards, re-aim on the next
-        // frame once their `::details-content` block-size commits, so a late
-        // reflow can't leave the target off-position. A double requestAnimationFrame
-        // guarantees a full layout+paint cycle elapsed; idempotent (same target +
-        // block). Guarded on isConnected so a session switch in the gap can't
-        // scroll a detached node; only runs when a force-open was involved.
-        if (forcedOpenKeys.size > 0 && typeof requestAnimationFrame === 'function') {
-          const t = scrollTarget;
+      }
+      // Resolve the target to its TOP-LEVEL node POSITION (Codex P0-2), not a
+      // mounted DOM element: an off-screen-but-loaded target has no element under
+      // virtualization. `nodeIndexForUuid` matches an anchor / folded member /
+      // subagent-subtree uuid and returns both index spaces; the virtual index
+      // feeds Virtuoso's scrollToIndex. The jump is data-presence-driven, not
+      // DOM-presence-driven.
+      const hit = nodeIndexForUuid(nodes, jump.uuid, virtualFirstItemIndex);
+      if (hit) {
+        // A subagent CARD-ROOT jump (the bucket-root uuid — an outline subagent
+        // entry / collapsed-card flash) aligns the card HEAD to the top; a normal
+        // turn / a deep inner-member find-jump centers (#204).
+        const hitNode = nodes[hit.arrayIndex];
+        const isCardRoot = hitNode.kind === 'subagent' && hitNode.items[0].anchor.uuid === jump.uuid;
+        // §5 (Codex P1-D) — a find-jump into a NESTED subagent MEMBER (not the
+        // bucket root) must force-open the owning ancestor chain FIRST, so the
+        // member renders, takes the render-driven flash, and can be centered. The
+        // node itself is already in `nodes` (so `hit` resolved on the card), but
+        // its member element is ref-less while the thread is collapsed. Set the
+        // force keys and return; the forcedOpenKeys re-fire then scrolls + flashes.
+        if (!isCardRoot) {
+          const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
+          if (targetItem && targetItem.subagent_key != null) {
+            const chain = ancestorKeys(targetItem.subagent_key, detail.subagent_meta);
+            if (chain.some((k) => !forcedOpenKeys.has(k))) {
+              setForcedOpenKeys((prev) => {
+                const next = new Set(prev);
+                for (const k of chain) next.add(k);
+                return next;
+              });
+              return; // wait for the thread to open, then re-fire to scroll + flash
+            }
+          }
+        }
+        const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
+        virtuosoRef.current?.scrollToIndex({ index: hit.virtualIndex, align, behavior: reduced ? 'auto' : 'smooth' });
+        // Render-driven flash (#232): the row may mount AFTER the scroll settles,
+        // and the class still lands because renderNode reads `jumpedUuid` on every
+        // (re)mount — unmount-safe, unlike the old imperative classList.add.
+        setJumpedUuid(jump.uuid);
+        // #188 B2 — pin the landing so the outline selects EXACTLY this target and
+        // a repeat forward jump-to-next steps strictly past it (closes #187).
+        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
+        // #177 S6 — sync the keyboard cursor to the jumped node's array index so
+        // j/k (and find's n/N) resume from the match.
+        setFocusedIndex(hit.arrayIndex);
+        // Within-row second pass once the row mounts (#177 S6 / #204): open the
+        // turn's collapsed disclosures for a tool/thinking find hit, then center
+        // the specific member element inside the (now-mounted) row. rAF guarantees
+        // the row committed; isConnected guards a session switch in the gap.
+        // #232/#204 — a NESTED subagent CARD root (jump.uuid is a card bucket-root
+        // but its TOP-LEVEL node is the ROOT ancestor, so isCardRoot is false) is
+        // resolved from cardRefs and re-aimed at its <summary> HEAD (block 'start'),
+        // not centered — a tall card centered hides its head far above the fold.
+        if (typeof requestAnimationFrame === 'function') {
           requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (t.isConnected) {
-              t.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: scrollBlock });
+            const cardEl = cardRefs.current.get(jump.uuid);
+            const memberEl = itemRefs.current.get(jump.uuid) ?? cardEl;
+            if (memberEl && memberEl.isConnected) {
+              if (jump.expand_details) {
+                memberEl.querySelectorAll('details:not([open])').forEach((d) => { (d as HTMLDetailsElement).open = true; });
+              }
+              if (cardEl) {
+                // A card root: align its head to the top (#204).
+                const head = cardEl.querySelector('summary') ?? cardEl;
+                head.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
+              } else if (!isCardRoot) {
+                memberEl.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'center' });
+              }
             }
           }));
         }
-        el.classList.add('conv-item--jumped');
-        // #188 B2 — pin the landing so the outline selects EXACTLY this target
-        // and a repeat forward jump-to-next steps strictly past it (closes #187).
-        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: jump.uuid });
-        // #177 S6 — sync the keyboard cursor to the jumped element so j/k (and
-        // find's n/N) resume from the match. The jumped element is a direct
-        // thread child; find its index there (mirrors the outline-jump intent
-        // of landing focus on the target).
-        const thread = threadRef.current;
-        if (thread) {
-          const idx = Array.prototype.indexOf.call(thread.children, el);
-          if (idx >= 0) setFocusedIndex(idx);
-        }
         if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
         highlightTimerRef.current = window.setTimeout(() => {
-          el.classList.remove('conv-item--jumped');
+          setJumpedUuid(null);
           highlightTimerRef.current = null;
         }, 2000);
         dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
         setForcedOpenKeys(new Set()); // reset for the next jump (threads stay open via their latches)
         return;
       }
-      // No ref. Three reasons the target's element is absent:
+      // #232 — no node hit. Two remaining reasons the target's node is absent from
+      // `nodes` (the mode-hidden reset already ran ABOVE, before resolving the
+      // index):
       //
-      //   (1) It just paged in (its MessageItem ref attaches on React's NEXT
-      //       commit — the detail?.items.length re-fire handles that).
-      //   (2) The current focus mode HIDES it — a non-`all` mode coalesces the
-      //       node into a `hidden_run` marker, so it renders no MessageItem and
-      //       never attaches a ref, regardless of any force-open. A find-jump
-      //       (the find bar dispatches OPEN_CONVERSATION {jump} straight through
-      //       this effect, bypassing jumpNext's reset) onto such a turn must
-      //       escape the filter the same way jump-to-next does (spec §4 / §5):
-      //       reset to `all`, then let the effect re-run and land the jump.
-      //   (3) It lives inside a COLLAPSED subagent thread (members are ref-less
-      //       while closed) but is otherwise mode-visible — force the owning
-      //       thread open so the member's ref attaches.
-      //
-      // (2) MUST be checked before (3): a mode-hidden node renders no thread at
-      // all, so force-opening can't help it; whereas a node inside a collapsed
-      // BUT mode-visible subagent (e.g. an erroring sidechain under Errors mode)
-      // passes nodeVisible and falls through to the force-open branch. The two
-      // are disjoint by construction — nodeVisible decides which applies.
-      const mode = focusModeRef.current;
-      if (mode !== 'all') {
-        // Apply jumpNext's hidden-target VISIBILITY test (nodeVisible under the
-        // mode) to the target's RenderNode in the unfiltered `groups` (found by
-        // anchor uuid or any member uuid for a folded/sidechain target). The
-        // node-absent case diverges DELIBERATELY from jumpNext: here a node
-        // missing from `groups` means the target paged in but its node isn't
-        // built yet, so we treat it as not-yet-paged and leave it to the (1)
-        // re-fire — we do NOT reset to `all`. jumpNext, walking a fixed
-        // snapshot, instead treats an unresolved node as hidden.
-        // §5 — find the target's TOP-LEVEL RenderNode for the visibility test.
-        // A nested subagent member lives inside a parent node's `children`, so
-        // its visibility is decided by the top-level ROOT ancestor node — found
-        // via findTopLevelNodeFor.
-        const node = findTopLevelNodeFor(groupsRef.current, jump.uuid, detail);
-        if (node != null && !nodeVisible(node, mode)) {
-          dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
-          return; // re-run under `all`: the node renders, its ref attaches, scroll
-        }
-      }
+      //   (1) It just paged in but its node isn't built/rendered yet (the
+      //       detail-growth / forcedOpenKeys re-fire handles that).
+      //   (2) It lives inside a COLLAPSED subagent thread whose top-level card
+      //       didn't yet resolve a hit (e.g. the chain isn't open) — force the
+      //       owning ancestor chain open so the target's node enters `nodes`.
       const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
       if (targetItem && targetItem.subagent_key != null) {
         // §5 (Codex P1-D) — force-open the WHOLE ancestor chain (the target
@@ -1023,9 +1030,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     // bounded number of times, the forcedOpenKeys path either resolves (clears) or
     // settles to a stable set (every chain key present), and the focusMode reset
     // is one-way (non-`all` → `all`) so the mode-hidden branch can fire at most
-    // once per jump.
+    // once per jump. #232 — `nodes` + `virtualFirstItemIndex` are deps so the
+    // post-load scrollToIndex re-fires once the target is paged into the render
+    // list (a prepend can shift the virtual index without growing items.length).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKeys, focusMode]);
+  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKeys, focusMode, nodes, virtualFirstItemIndex]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful
@@ -1122,6 +1131,10 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   useEffect(() => {
     seenRef.current.clear();
     riseCacheRef.current.clear();  // #231 — the new session's items rise afresh
+    // #232 — drop a stale render-driven jump flash + its pending clear-timer so
+    // the next conversation doesn't carry the prior session's highlight.
+    setJumpedUuid(null);
+    if (highlightTimerRef.current != null) { window.clearTimeout(highlightTimerRef.current); highlightTimerRef.current = null; }
   }, [sessionId]);
 
   // After each commit, mark every currently-rendered top-level group as seen.
@@ -1775,6 +1788,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           isMobile={isMobile}
           riseClassName={riseClass}
           riseStyle={riseStyle}
+          // #232 — the render-driven jump flash (Codex P0-1): the card root flashes
+          // when it owns the jump, and a nested member flashes via its own
+          // MessageItem (threaded down through childCtx). Replaces the old
+          // imperative classList.add, which can't reach an unmounted off-screen row.
+          flashedUuid={jumpedUuid}
           // §5 — recursive nesting: the child subagent threads + this node's depth
           // + the per-key machinery for every nested level.
           children={g.children}
@@ -1802,7 +1820,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           </summary>
           <div className="conv-toolresult-run-body">
             {g.items.map((item) => (
-              <MessageItem key={item.anchor.uuid} item={item} ref={getItemRef(item)} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />
+              <MessageItem
+                key={item.anchor.uuid}
+                item={item}
+                ref={getItemRef(item)}
+                suppressToolUseIds={suppressToolUseIds}
+                spawnKindByToolUseId={spawnKindByToolUseId}
+                // #232 — render-driven flash on a folded-member jump hit.
+                flashed={jumpedUuid != null && item.member_uuids.includes(jumpedUuid)}
+              />
             ))}
           </div>
         </details>
@@ -1821,9 +1847,13 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         // #228 S2 (A3) — the loaded-spawn kind map for the connector that replaces
         // a suppressed spawn chip (main-thread spawns).
         spawnKindByToolUseId={spawnKindByToolUseId}
+        // #232 — render-driven flash (Codex P0-1): the turn flashes when the jump
+        // hit any of its member fragments. Survives an unmount/remount on scroll,
+        // unlike the old imperative classList.add against a (possibly absent) ref.
+        flashed={jumpedUuid != null && g.item.member_uuids.includes(jumpedUuid)}
       />
     );
-  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId]);
+  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId, jumpedUuid]);
 
   // #232 — Virtuoso's itemsRendered callback (scroll-sync re-registration is
   // wired in T5). Defined here so the <Virtuoso> prop has a stable referent.

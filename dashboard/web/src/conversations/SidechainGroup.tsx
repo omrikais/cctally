@@ -64,6 +64,9 @@ export interface SidechainChildContext {
   // #205 S3 (F7) — threaded so a nested card abbreviates models + widens its
   // title cap on mobile WITHOUT a per-card matchMedia listener.
   isMobile?: boolean;
+  // #232 — the render-driven jump flash uuid (Codex P0-1), threaded to every
+  // nesting level so a nested card root / member flashes when it owns the jump.
+  flashedUuid?: string | null;
 }
 
 // One subagent thread (one agent-*.jsonl file) as a disclosure (#155). Summary =
@@ -100,6 +103,7 @@ export function SidechainGroup({
   depth = 0,
   childCtx,
   isMobile,
+  flashedUuid = null,
 }: {
   subagentKey: string;
   items: ConversationItem[];
@@ -138,6 +142,11 @@ export function SidechainGroup({
   // #205 S3 (F7) — passed by the reader to the top-level card; nested cards
   // read childCtx.isMobile instead (threaded via renderChild).
   isMobile?: boolean;
+  // #232 — the render-driven jump flash uuid (Codex P0-1). The card root flashes
+  // when `flashedUuid === rootUuid`; a member flashes via its MessageItem; nested
+  // cards receive it via renderChild. Unmount-safe (a class derived in render,
+  // not an imperative add against a possibly-absent element).
+  flashedUuid?: string | null;
 }) {
   const [userOpen, setUserOpen] = useState(false);
   // #222 — latch a force into userOpen DURING RENDER (React's official "adjust
@@ -214,6 +223,7 @@ export function SidechainGroup({
       onOpenChange={childCtx?.onOpenChange}
       forceOpen={childCtx?.forcedOpenKeys?.has(child.subagentKey) ?? false}
       isMobile={childCtx?.isMobile}
+      flashedUuid={flashedUuid}
       children={child.children}
       depth={child.depth}
       childCtx={childCtx}
@@ -241,6 +251,9 @@ export function SidechainGroup({
         // scrollIntoView lands. The class drops when the force releases, so
         // later user toggles animate.
         forceOpen ? 'conv-sidechain--force' : '',
+        // #232 — render-driven flash on a card-ROOT jump (an outline subagent
+        // entry / collapsed-card flash). A member jump flashes its MessageItem.
+        rootUuid != null && flashedUuid === rootUuid ? 'conv-item--jumped' : '',
         riseClassName,
       ].filter(Boolean).join(' ')}
       style={depth >= 1 ? { ...riseStyle, ['--sc-depth' as string]: String(depth) } as React.CSSProperties : riseStyle}
@@ -333,6 +346,8 @@ export function SidechainGroup({
                 // #228 S2 (A3) — the loaded-spawn kind map so a nested-thread
                 // spawn renders its connector too.
                 spawnKindByToolUseId={childCtx?.spawnKindByToolUseId}
+                // #232 — render-driven flash on a find-jump into THIS thread member.
+                flashed={flashedUuid != null && item.member_uuids.includes(flashedUuid)}
               />
               {after?.map(renderChild)}
             </Fragment>
