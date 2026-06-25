@@ -25,6 +25,7 @@ import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFo
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
 import { scrollNodeIntoView } from './scrollNodeIntoView';
+import { firstLandableMark } from './findMark';
 import { walkToTarget } from './walkToTarget';
 import { resolveJumpOwner } from './resolveJumpOwner';
 import { isLayoutStable, type LayoutSnapshot } from './layoutStable';
@@ -1191,12 +1192,16 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             if (aborted()) return;
             scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
           } else {
-            // A member turn (never a card root — those resolve a cardRefs entry and
-            // take the branch above) always CENTERS (#204).
-            scrollNodeIntoView(body, el, 'center', 'auto');
+            // #236 — land on the matched WORD: center the turn's first LANDABLE
+            // <mark> when find is open, re-querying before each scroll (robust to
+            // a re-measure). No landable mark / find closed → center the turn root
+            // (unchanged #204 behavior).
+            const centerTarget = (): HTMLElement =>
+              (convFindOpenRef.current ? firstLandableMark(el) : null) ?? el;
+            scrollNodeIntoView(body, centerTarget(), 'center', 'auto');
             await waitForQuiesce(targetUuid);
             if (aborted()) return;
-            scrollNodeIntoView(body, el, 'center', 'auto'); // §2.1 single re-assert
+            scrollNodeIntoView(body, centerTarget(), 'center', 'auto'); // §2.1 single re-assert
           }
         }
         // result === 'exhausted' → fall through: the jumpedUuid flash still
