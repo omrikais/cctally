@@ -28,15 +28,18 @@ export function DiffRowEl({ row, lang }: { row: DiffRow; lang: string }) {
     content = highlightBody(row.text, lang, split);
   } else if (row.segments) {
     // Changed line with word-diff: brighten the emphasized segments, plain text.
-    content = row.segments.map((s, i) =>
-      s.emph ? (
+    // #236 — find-highlight-aware WITHIN each segment (a paired/modified line is
+    // the common Edit old→new case; find-closed → bare text, byte-identical).
+    content = row.segments.map((s, i) => {
+      const text = split ? splitToReactNodes(s.text, split) : s.text;
+      return s.emph ? (
         <span key={i} className="conv-diff-word">
-          {s.text}
+          {text}
         </span>
       ) : (
-        <span key={i}>{s.text}</span>
-      ),
-    );
+        <span key={i}>{text}</span>
+      );
+    });
   } else {
     // Changed line with no word pairing (unpaired add/del) — plain text.
     // #236 — find-highlight-aware (find-closed → bare text, byte-identical).

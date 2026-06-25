@@ -346,4 +346,21 @@ describe('DiffCard find highlighting (#236)', () => {
     const { container } = withTerms(call);
     expect(container.querySelector('.conv-diff-row--add mark')?.textContent).toBe('flock');
   });
+
+  it('marks find terms in a paired (word-diff) changed line', () => {
+    // "return flock" → "return flock now" is a MODIFIED line: word-diff pairs it,
+    // so the row carries `.conv-diff-word` segments (the branch that was NOT
+    // find-aware before the #236 review fix). The term sits in a non-emph segment.
+    const call = base({
+      input: {
+        file_path: '/a/x.ts',
+        old_string: 'const keep = 1;\nreturn flock',
+        new_string: 'const keep = 1;\nreturn flock now',
+      },
+    });
+    const { container } = withTerms(call);
+    const addRow = container.querySelector('.conv-diff-row--add');
+    expect(addRow?.querySelector('.conv-diff-word')).toBeTruthy(); // confirm it IS the segments branch
+    expect(addRow?.querySelector('mark')?.textContent).toBe('flock');
+  });
 });
