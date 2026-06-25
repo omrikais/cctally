@@ -234,6 +234,13 @@ export function SidechainGroup({
 
   const mobile = isMobile ?? childCtx?.isMobile ?? false;
   const label = subagentSummaryLabel(items, subagentKey, mobile ? MOBILE_LABEL_MAX : LABEL_MAX);
+  // #238 R4 — the FULL untruncated title for the hover tooltip. The visible
+  // `label` is JS-truncated to 60/120 chars (and CSS-clamped on top), so a
+  // starved card shows e.g. "Map si…"; the tooltip recovers the full text. NOT
+  // sourced from the visible text (which is already truncated): pass
+  // Number.MAX_SAFE_INTEGER so subagentSummaryLabel returns the untruncated
+  // first line, or use meta.description when present.
+  const fullTitle = meta?.description || subagentSummaryLabel(items, subagentKey, Number.MAX_SAFE_INTEGER);
   // `in` narrows: the meta arm has neither cost_usd nor model (injected content
   // carries no turn cost / model), so guard the access instead of summing/listing
   // phantom fields.
@@ -356,7 +363,7 @@ export function SidechainGroup({
           <span className="conv-sidechain-kind">
             Subagent{meta?.kind ? <span className="conv-sidechain-kindname"> · {meta.kind}</span> : null}
           </span>
-          <span className="conv-sidechain-title">{meta?.description || label}</span>
+          <span className="conv-sidechain-title" title={fullTitle}>{meta?.description || label}</span>
           {meta && (meta.total_tokens != null || meta.total_duration_ms != null
                     || meta.total_tool_use_count != null || meta.status != null) && (
             <span className="conv-sidechain-submeta">

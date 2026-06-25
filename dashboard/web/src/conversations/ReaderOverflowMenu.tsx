@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { nextRovingIndex } from './menuKeyboard';
+import { useOutsideDismiss } from './useOutsideDismiss';
 import { ExportMenu } from './ExportMenu';
 import { fmt } from '../lib/fmt';
 
@@ -59,6 +60,11 @@ export function ReaderOverflowMenu({
 }: ReaderOverflowMenuProps) {
   const [open, setOpen] = useState(false);
   const restoreRef = useRef<Element | null>(null);
+  // #238 R3 — pointerdown-outside dismiss. Silent (setOpen(false)), NOT the
+  // focus-restoring close(): a pointerdown fires before the clicked-outside
+  // control is focused, so close()'s trigger.focus() would yank focus back.
+  const rootRef = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(rootRef, open, useCallback(() => setOpen(false), []));
 
   // The flat action menuitems, in render order (Export rides separately as its
   // own popover row and is NOT in this roving set). `null` entries are filtered
@@ -155,6 +161,7 @@ export function ReaderOverflowMenu({
 
   return (
     <div
+      ref={rootRef}
       className="conv-overflow"
       onBlur={(e) => {
         // Outside-click / focus-out close: if focus leaves the container, close.

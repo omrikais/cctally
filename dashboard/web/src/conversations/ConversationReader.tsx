@@ -25,7 +25,7 @@ import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFo
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
 import { scrollNodeIntoView, alignScrollTop } from './scrollNodeIntoView';
-import { firstLandableMark } from './findMark';
+import { firstLandableMark, applyCurrentMark } from './findMark';
 import { walkToTarget } from './walkToTarget';
 import { reassertCenter } from './reassertCenter';
 import { resolveJumpOwner } from './resolveJumpOwner';
@@ -437,6 +437,15 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // without re-registering the keymap array.
   const convFindOpenRef = useRef(convFindOpen);
   convFindOpenRef.current = convFindOpen;
+  // #238 R5 — the currently-highlighted find <mark> (the n/N "current" match).
+  // Imperative because the marks live deep inside memoized react-markdown (matches
+  // the #236 landing architecture). `markCurrent` moves the conv-mark--current
+  // class to the landed mark (or clears it), updating the ref. Best-effort: a
+  // Virtuoso recycle can drop the class; it re-applies on the next n/N step.
+  const currentMarkRef = useRef<HTMLElement | null>(null);
+  const markCurrent = useCallback((el: HTMLElement | null) => {
+    currentMarkRef.current = applyCurrentMark(currentMarkRef.current, el);
+  }, []);
   // cache-failure-markers spec §4 — live mirror so the stable `c`/`C` keymap
   // closures no-op when the opt-out is off, without re-registering the array.
   const markersEnabledRef = useRef(markersEnabled);
@@ -1230,6 +1239,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
               budgetMs: REASSERT_BUDGET_MS,
             });
             if (aborted()) return;
+            // #238 R5 — mark the landed match distinct. Re-resolve the live turn
+            // (robust to a Virtuoso recycle) → its first landable <mark>, never
+            // the turn root: a no-mark landing clears the highlight.
+            const ct = (itemRefs.current.get(targetUuid)
+              ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+            markCurrent(ct && ct.isConnected && convFindOpenRef.current ? firstLandableMark(ct) : null);
           } else {
             // #236 — land on the matched WORD: center the turn's first LANDABLE
             // <mark> when find is open, re-querying before each scroll (robust to
@@ -1241,6 +1256,9 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             await waitForQuiesce(targetUuid);
             if (aborted()) return;
             scrollNodeIntoView(body, centerTarget(), 'center', 'auto'); // §2.1 single re-assert
+            // #238 R5 — mark the landed match distinct. Feed the ACTUAL <mark>
+            // only (never the turn-root fallback): a no-mark landing clears it.
+            markCurrent(convFindOpenRef.current ? firstLandableMark(el) : null);
           }
         }
         // result === 'exhausted' → fall through: the jumpedUuid flash still
@@ -1901,9 +1919,17 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
 
   // #177 S6 — drop highlight terms whenever the bar closes (e.g. a session
   // switch closes find via the store) so stale marks don't linger.
+  // #238 R5 — also clear the distinct current-match class on close.
   useEffect(() => {
-    if (!convFindOpen) setFindTerms(null);
-  }, [convFindOpen]);
+    if (!convFindOpen) { setFindTerms(null); markCurrent(null); }
+  }, [convFindOpen, markCurrent]);
+  // #238 R5 — clear the current-match class when the needle changes: React may
+  // reuse an imperatively-classed <mark> across a find-terms change, so a stale
+  // conv-mark--current must be dropped before the next landing re-applies it.
+  useEffect(() => { markCurrent(null); }, [findTerms, markCurrent]);
+  // #238 R5 — clear the current-match class on reader unmount (best-effort
+  // teardown so a recycled DOM node never carries a leftover class).
+  useEffect(() => () => { markCurrent(null); }, [markCurrent]);
 
   // `v` cycles the focus mode all → chat → prompts → errors → all.
   const cycleFocusMode = useCallback(() => {

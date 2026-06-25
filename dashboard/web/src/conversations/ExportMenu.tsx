@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useCopy } from './useCopy';
 import { nextRovingIndex } from './menuKeyboard';
+import { useOutsideDismiss } from './useOutsideDismiss';
 
 // #217 S5 §4 (F1/F5) — the reader-header "Export ▾" menu. Lists the four
 // Markdown export scopes, each with a Copy (clipboard) and a Download (.md
@@ -72,6 +73,11 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
   const [busy, setBusy] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const restoreRef = useRef<Element | null>(null);
+  // #238 R3 — pointerdown-outside dismiss. Silent (setOpen(false)), NOT the
+  // focus-restoring close() (which would yank focus back to the trigger before
+  // the clicked-outside control receives it).
+  const rootRef = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(rootRef, open, useCallback(() => setOpen(false), []));
   // Roving-focus state for the menuitems (flat index over the scope×{copy,download}
   // grid). A mirroring ref lets the focus-on-open effect read the latest value
   // without re-subscribing to it.
@@ -197,6 +203,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
 
   return (
     <div
+      ref={rootRef}
       className="conv-export"
       onBlur={(e) => {
         // Outside-click / focus-out close: if focus leaves the container, close.

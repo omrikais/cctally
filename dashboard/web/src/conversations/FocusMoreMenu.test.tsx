@@ -93,6 +93,28 @@ describe('FocusMoreMenu', () => {
     expect(screen.queryByRole('menu')).toBeNull();
   });
 
+  it('#238 R3 — dismisses on outside pointerdown without refocusing the trigger', () => {
+    render(
+      <div>
+        <FocusMoreMenu focusMode="all" subagents={[]} onSelect={() => {}} />
+        <button data-testid="outside">outside</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /more/i }));
+    expect(screen.getByRole('button', { name: /more/i })).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.pointerDown(screen.getByTestId('outside'));
+    expect(screen.getByRole('button', { name: /more/i })).toHaveAttribute('aria-expanded', 'false');
+    // Silent dismiss: focus must NOT have been forced back onto the trigger.
+    expect(document.activeElement).not.toBe(screen.getByRole('button', { name: /more/i }));
+  });
+
+  it('#238 R3 — a pointerdown INSIDE the menu does not dismiss it', () => {
+    render(<FocusMoreMenu focusMode="all" subagents={[]} onSelect={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /more/i }));
+    fireEvent.pointerDown(screen.getByRole('menuitem', { name: /edits/i }));
+    expect(screen.getByRole('button', { name: /more/i })).toHaveAttribute('aria-expanded', 'true');
+  });
+
   // #224 — APG menu keyboard pattern: roving tabindex over the main items,
   // Arrow/Home/End to move, ArrowRight/ArrowLeft to enter/leave the Subagent
   // submenu.

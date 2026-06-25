@@ -60,6 +60,28 @@ describe('ExportMenu', () => {
     expect(screen.queryByRole('menu')).toBeNull();
   });
 
+  it('#238 R3 — dismisses on outside pointerdown without refocusing the trigger', () => {
+    render(
+      <div>
+        <ExportMenu sessionId="s1" title="t" />
+        <button data-testid="outside">outside</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    expect(screen.getByRole('button', { name: /export/i })).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.pointerDown(screen.getByTestId('outside'));
+    expect(screen.getByRole('button', { name: /export/i })).toHaveAttribute('aria-expanded', 'false');
+    // Silent dismiss: focus must NOT have been forced back onto the trigger.
+    expect(document.activeElement).not.toBe(screen.getByRole('button', { name: /export/i }));
+  });
+
+  it('#238 R3 — a pointerdown INSIDE the menu does not dismiss it', () => {
+    render(<ExportMenu sessionId="s1" title="t" />);
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    fireEvent.pointerDown(screen.getByRole('menuitem', { name: /whole transcript.*copy/i }));
+    expect(screen.getByRole('button', { name: /export/i })).toHaveAttribute('aria-expanded', 'true');
+  });
+
   // #224 — APG menu keyboard pattern: the action buttons are role="menuitem"
   // with roving tabindex; Arrow/Home/End move focus, focus enters the menu on
   // open.

@@ -194,6 +194,37 @@ describe('#236 find-jump lands on the matched word', () => {
     expect(scrollCalls).toContain(turn);
   });
 
+  // #238 R5 — the landed match gets a distinct `conv-mark--current` class so the
+  // active hit reads apart from the other translucent <mark>s. JSDOM has no
+  // layout, so the visual saturation is the ui-qa gate's job; here we pin that the
+  // reader IMPERATIVELY classes the landed (sentinel) mark on a find jump and
+  // CLEARS it when find closes (the reused-needle / unmount clears, see findMark
+  // unit test, are the other half of the contract).
+  it('#238 R5 — classes the landed mark conv-mark--current, then clears it on find close', async () => {
+    sentinelMark.classList.remove('conv-mark--current'); // isolate from prior runs
+    mockFetchOnce(detail(items()));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull());
+
+    act(() => { dispatch({ type: 'OPEN_CONV_FIND' }); });
+    await waitFor(() => expect(getState().convFindOpen).toBe(true));
+
+    act(() => {
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's',
+        jump: { session_id: 's', uuid: 'targetMember' } });
+    });
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+
+    // The landed (sentinel) mark is the distinct current match.
+    await waitFor(() => expect(sentinelMark.classList.contains('conv-mark--current')).toBe(true));
+
+    // Closing find clears the distinct class (the existing convFindOpen effect).
+    act(() => { dispatch({ type: 'CLOSE_CONV_FIND' }); });
+    await waitFor(() => expect(getState().convFindOpen).toBe(false));
+    await waitFor(() => expect(sentinelMark.classList.contains('conv-mark--current')).toBe(false));
+  });
+
   it('#237 — an expand_details find-jump routes through the convergent loop and centers the mark', async () => {
     mockFetchOnce(detail(items()));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });

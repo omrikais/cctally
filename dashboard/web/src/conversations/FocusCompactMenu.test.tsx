@@ -86,4 +86,26 @@ describe('FocusCompactMenu', () => {
     expect(screen.queryByRole('menu', { name: /focus mode/i })).toBeNull();
     expect(document.activeElement).toBe(trigger);
   });
+
+  it('#238 R3 — dismisses on outside pointerdown without refocusing the trigger', () => {
+    render(
+      <div>
+        <FocusCompactMenu focusMode="all" subagents={[]} onSelect={vi.fn()} />
+        <button data-testid="outside">outside</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /focus:/i }));
+    expect(screen.getByRole('button', { name: /focus:/i })).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.pointerDown(screen.getByTestId('outside'));
+    expect(screen.getByRole('button', { name: /focus:/i })).toHaveAttribute('aria-expanded', 'false');
+    // Silent dismiss: focus must NOT have been forced back onto the trigger.
+    expect(document.activeElement).not.toBe(screen.getByRole('button', { name: /focus:/i }));
+  });
+
+  it('#238 R3 — a pointerdown INSIDE the menu does not dismiss it', () => {
+    render(<FocusCompactMenu focusMode="all" subagents={[]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /focus:/i }));
+    fireEvent.pointerDown(screen.getByRole('menuitemradio', { name: /All/ }));
+    expect(screen.getByRole('button', { name: /focus:/i })).toHaveAttribute('aria-expanded', 'true');
+  });
 });

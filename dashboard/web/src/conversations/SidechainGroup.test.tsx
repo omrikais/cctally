@@ -472,6 +472,32 @@ describe('SidechainGroup header (#193)', () => {
   });
 });
 
+describe('SidechainGroup title tooltip (#238 R4)', () => {
+  // A first-line prompt longer than LABEL_MAX (60) so the VISIBLE label truncates
+  // with an ellipsis, but the title= attribute carries the FULL untruncated text.
+  const long = 'Map the whole conversation viewer surface and locate every find-landing branch precisely';
+
+  it('carries the FULL untruncated first-line label in title= when no meta.description', () => {
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={[member('r', { text: long })]} />,
+    );
+    const titleEl = container.querySelector('.conv-sidechain-title')!;
+    // Visible text is truncated; the tooltip is the complete text.
+    expect(titleEl.textContent!.endsWith('…')).toBe(true);
+    expect(titleEl.getAttribute('title')).toBe(long);
+    expect(titleEl.getAttribute('title')).not.toContain('…');
+  });
+
+  it('uses meta.description (full) as the title when present', () => {
+    const desc = 'Code review Phase A — full untruncated description text used as the tooltip';
+    const { container } = render(
+      <SidechainGroup subagentKey="k1" items={[member('r', { text: long })]}
+        meta={{ kind: 'general-purpose', description: desc }} />,
+    );
+    expect(container.querySelector('.conv-sidechain-title')!.getAttribute('title')).toBe(desc);
+  });
+});
+
 describe('subagentSummaryLabel maxLen (#205 S3 F7)', () => {
   const prompt = 'x'.repeat(100); // 100 chars, no newline
 

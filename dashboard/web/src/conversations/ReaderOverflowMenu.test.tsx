@@ -114,4 +114,26 @@ describe('ReaderOverflowMenu', () => {
     expect(screen.queryByRole('menu', { name: /more actions/i })).toBeNull();
     expect(document.activeElement).toBe(trigger);
   });
+
+  it('#238 R3 — dismisses on outside pointerdown without refocusing the trigger', () => {
+    render(
+      <div>
+        <ReaderOverflowMenu {...baseProps} />
+        <button data-testid="outside">outside</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /more actions/i }));
+    expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.pointerDown(screen.getByTestId('outside'));
+    expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'false');
+    // Silent dismiss: focus must NOT have been forced back onto the trigger.
+    expect(document.activeElement).not.toBe(screen.getByRole('button', { name: /more actions/i }));
+  });
+
+  it('#238 R3 — a pointerdown INSIDE the menu does not dismiss it', () => {
+    render(<ReaderOverflowMenu {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: /more actions/i }));
+    fireEvent.pointerDown(screen.getByRole('menuitem', { name: /compare with/i }));
+    expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'true');
+  });
 });

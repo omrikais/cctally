@@ -184,3 +184,19 @@ export function firstLandableMark(turnEl: HTMLElement): HTMLElement | null {
   }
   return null;
 }
+
+// ---- #238 R5: distinct "current" find match -------------------------------
+
+// #238 R5 — move the distinct "current match" class from prev to next. Imperative
+// (marks live inside memoized markdown); returns the new current for the caller's
+// ref. Best-effort: lost on a Virtuoso recycle, re-applied on the next n/N step.
+export const CURRENT_MARK_CLASS = 'conv-mark--current';
+export function applyCurrentMark(
+  prev: HTMLElement | null,
+  next: HTMLElement | null,
+): HTMLElement | null {
+  if (prev === next) return prev;
+  prev?.classList.remove(CURRENT_MARK_CLASS);
+  next?.classList.add(CURRENT_MARK_CLASS);
+  return next;
+}

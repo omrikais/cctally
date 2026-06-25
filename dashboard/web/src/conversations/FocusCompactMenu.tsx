@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FocusMode } from './applyFocusMode';
 import { subagentLabel, type FocusSubagentOption } from './FocusMoreMenu';
 import { nextRovingIndex } from './menuKeyboard';
+import { useOutsideDismiss } from './useOutsideDismiss';
 
 // #228 S3 C2 — the mobile (≤640px) compact focus picker: a single
 // "Focus: <active> ▾" dropdown that REPLACES the desktop 4-button segment AND
@@ -60,6 +61,11 @@ export function FocusCompactMenu({
 }) {
   const [open, setOpen] = useState(false);
   const restoreRef = useRef<Element | null>(null);
+  // #238 R3 — pointerdown-outside dismiss. Silent (setOpen(false)), NOT the
+  // focus-restoring close() (which would yank focus back to the trigger before
+  // the clicked-outside control receives it).
+  const rootRef = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(rootRef, open, useCallback(() => setOpen(false), []));
 
   // The flat option list: the four primary modes, then Edits/Bash, then one
   // entry per top-level subagent. Built each render (cheap; the list is short).
@@ -148,6 +154,7 @@ export function FocusCompactMenu({
 
   return (
     <div
+      ref={rootRef}
       className="conv-focus-compact"
       onBlur={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);

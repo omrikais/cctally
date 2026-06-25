@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { render } from '@testing-library/react';
 import {
   splitByTerms, splitByRegex, buildSplit, applyMarksToHast,
-  splitToReactNodes, markRectClipped, firstLandableMark,
+  splitToReactNodes, markRectClipped, firstLandableMark, applyCurrentMark,
 } from './findMark';
 import type { Root } from 'hast';
 
@@ -134,5 +134,29 @@ describe('firstLandableMark', () => {
     document.body.appendChild(turn);
     expect(firstLandableMark(turn)).toBeNull();
     turn.remove();
+  });
+});
+
+describe('applyCurrentMark', () => {
+  it('moves the conv-mark--current class from prev to next and clears on null', () => {
+    const a = document.createElement('mark');
+    const b = document.createElement('mark');
+    let cur = applyCurrentMark(null, a);
+    expect(a.classList.contains('conv-mark--current')).toBe(true);
+    expect(cur).toBe(a);
+    cur = applyCurrentMark(cur, b);
+    expect(a.classList.contains('conv-mark--current')).toBe(false);
+    expect(b.classList.contains('conv-mark--current')).toBe(true);
+    cur = applyCurrentMark(cur, null);
+    expect(b.classList.contains('conv-mark--current')).toBe(false);
+    expect(cur).toBeNull();
+  });
+
+  it('is a no-op (keeps the class) when prev === next', () => {
+    const a = document.createElement('mark');
+    applyCurrentMark(null, a);
+    const cur = applyCurrentMark(a, a);
+    expect(a.classList.contains('conv-mark--current')).toBe(true);
+    expect(cur).toBe(a);
   });
 });

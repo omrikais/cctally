@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FocusMode } from './applyFocusMode';
 import { nextRovingIndex } from './menuKeyboard';
+import { useOutsideDismiss } from './useOutsideDismiss';
 
 // #217 S5 E4 — the focus "▾ More" menu beside the All/Chat/Prompts/Errors
 // segmented control. Adds the Edits / Bash / per-Subagent focus modes as
@@ -61,6 +62,13 @@ export function FocusMoreMenu({
   const [open, setOpen] = useState(false);
   const [subOpen, setSubOpen] = useState(false);
   const restoreRef = useRef<Element | null>(null);
+  // #238 R3 — pointerdown-outside dismiss. Silent (mirrors the existing onBlur:
+  // setOpen(false)+setSubOpen(false)), NOT the focus-restoring close() — a
+  // pointerdown fires before the clicked-outside control is focused, so close()'s
+  // trigger.focus() would yank focus back. The submenu lives inside the same
+  // container, so an outside pointerdown closing both is correct.
+  const rootRef = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(rootRef, open, useCallback(() => { setOpen(false); setSubOpen(false); }, []));
 
   // Roving-focus state. The main level lists Edits, Bash, and (when present) the
   // Subagent parent; `inSub` flips focus into the subagent submenu. Mirroring
@@ -209,6 +217,7 @@ export function FocusMoreMenu({
 
   return (
     <div
+      ref={rootRef}
       className="conv-focus-more"
       onBlur={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
