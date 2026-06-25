@@ -1565,6 +1565,14 @@ mark.current {
   background: var(--accent-amber);
   color: #000;
 }
+/* #236 — find <mark>s now appear inside code blocks / tool panels (the dark
+   .conv-code surface). A touch more amber than the prose default so the wash
+   reads against bright Prism token colors; keep `color: inherit` so the token
+   color shows through. ui-qa confirms contrast. */
+.conv-code mark {
+  background: rgba(251, 191, 36, 0.30);
+  color: inherit;
+}
 
 /* Rows that contain a search-match get a soft highlight so the `/` +
    n/N navigation is visible without replacing the cell-level <mark>
