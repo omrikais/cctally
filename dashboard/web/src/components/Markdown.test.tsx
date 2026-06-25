@@ -89,10 +89,16 @@ describe('Markdown', () => {
     expect(marks).toContain('build');
   });
 
-  it('does NOT mark terms inside a fenced code block', () => {
-    const { container } = renderWithTerms(['flock'], '```\nflock here\n```');
-    expect(container.querySelector('pre')).not.toBeNull();
-    expect(container.querySelector('mark')).toBeNull();
+  it('marks terms inside a fenced code block (registered language)', () => {
+    // ```js\nconst flock = 1;\n``` with term "flock" — routed through CodeBlock,
+    // which is highlight-aware as of #236.
+    const { container } = renderWithTerms(['flock'], '```js\nconst flock = 1;\n```');
+    expect(container.querySelector('mark')?.textContent).toBe('flock');
+  });
+
+  it('marks terms inside an unregistered / no-language fence', () => {
+    const { container } = renderWithTerms(['flock'], '```\nplain flock here\n```');
+    expect(container.querySelector('mark')?.textContent).toBe('flock');
   });
 
   it('does NOT mark terms inside inline code', () => {
@@ -148,10 +154,14 @@ describe('Markdown', () => {
     expect(container.querySelector('mark')).toBeNull();
   });
 
-  it('does NOT mark regex inside a fenced code block', () => {
-    const { container } = renderWithRegex('cache', '```\ncache here\n```');
-    expect(container.querySelector('pre')).not.toBeNull();
-    expect(container.querySelector('mark')).toBeNull();
+  it('marks regex inside a fenced code block (registered language)', () => {
+    const { container } = renderWithRegex('ca.he', '```js\nconst cache = 1;\n```');
+    expect(container.querySelector('mark')?.textContent).toBe('cache');
+  });
+
+  it('marks regex inside an unregistered / no-language fence', () => {
+    const { container } = renderWithRegex('ca.he', '```\nplain cache here\n```');
+    expect(container.querySelector('mark')?.textContent).toBe('cache');
   });
 
   it('over-cap regex source → no marks (no-op)', () => {
