@@ -136,4 +136,34 @@ describe('ReaderOverflowMenu', () => {
     fireEvent.pointerDown(screen.getByRole('menuitem', { name: /compare with/i }));
     expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'true');
   });
+
+  it('#238 R3 — nested: a pointerdown inside the overflow menu but outside the open Export popover closes only Export; outside both closes the overflow menu too', () => {
+    render(
+      <div>
+        <ReaderOverflowMenu {...baseProps} />
+        <button data-testid="outside">outside</button>
+      </div>,
+    );
+    // Open the overflow menu, then its embedded Export popover (its own nested
+    // useOutsideDismiss + its own .conv-export rootRef inside .conv-overflow).
+    fireEvent.click(screen.getByRole('button', { name: /more actions/i }));
+    const exportTrigger = screen.getByRole('button', { name: /export transcript/i });
+    fireEvent.click(exportTrigger);
+    expect(exportTrigger).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('menu', { name: /export transcript/i })).not.toBeNull();
+
+    // pointerdown INSIDE the overflow menu but OUTSIDE the Export popup (a sibling
+    // overflow menuitem) → Export's hook fires (target outside its ref) and closes
+    // only Export; the overflow menu's hook sees an inside target and stays open.
+    fireEvent.pointerDown(screen.getByRole('menuitem', { name: /compare with/i }));
+    expect(exportTrigger).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('menu', { name: /export transcript/i })).toBeNull();
+    expect(screen.queryByRole('menu', { name: /more actions/i })).not.toBeNull();
+    expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'true');
+
+    // pointerdown OUTSIDE both → the overflow menu closes too.
+    fireEvent.pointerDown(screen.getByTestId('outside'));
+    expect(screen.queryByRole('menu', { name: /more actions/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /more actions/i })).toHaveAttribute('aria-expanded', 'false');
+  });
 });
