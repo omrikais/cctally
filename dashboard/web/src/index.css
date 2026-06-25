@@ -6086,7 +6086,8 @@ mark.current {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
+  /* the actual ellipsis lives on the child spans below — text-overflow is
+     inert on a flex container, so it's intentionally not declared here. */
   display: flex;
   gap: var(--space-2);
   align-items: baseline;
@@ -6597,7 +6598,7 @@ mark.current {
 /* #228 S4 D8 — strengthen the pressed toggle (bolder than the old faint accent
    fill) so the on-state is unmistakable. */
 .conv-findbar-toggle[aria-pressed='true'] {
-  color: var(--bg-base);
+  color: var(--bg);
   background: var(--accent-blue);
   border-color: var(--accent-blue);
   font-weight: 700;
