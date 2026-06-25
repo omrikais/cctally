@@ -6,6 +6,7 @@ import { useConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
+import { pickBannerLabel } from './pickBannerLabel';
 import { fmt } from '../lib/fmt';
 import type { ConversationFilters, ConversationSummary, RailSortKey, SearchHit, SearchKind } from '../types/conversation';
 
@@ -148,6 +149,9 @@ export function ConversationRail() {
   // and rows PICK the second session (OPEN_COMPARE) instead of opening it. Esc
   // cancels.
   const comparePick = useSyncExternalStore(subscribeStore, () => getState().comparePick);
+  // #228 S5 E5 — the shared rail title cache, so the pick banner names the
+  // anchor session instead of echoing an opaque short hash.
+  const titles = useSyncExternalStore(subscribeStore, () => getState().conversationTitles);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const inputRef = useRef<HTMLInputElement>(null);
@@ -169,13 +173,19 @@ export function ConversationRail() {
 
   const isSearching = search.trim() !== '';
   const chips = activeFilterChips(filters);
+  // #228 S5 E5 — the cached title (truncated) when known, else the short hash.
+  const pickLabel = comparePick ? pickBannerLabel(comparePick.anchor, titles) : null;
 
   return (
     <aside className={`conv-rail${comparePick ? ' conv-rail--picking' : ''}`}>
       {comparePick && (
         <div className="conv-rail-pickbanner" role="status" aria-live="polite">
           <span className="conv-rail-pickbanner-text">
-            Comparing with <code>{comparePick.anchor.slice(0, 8)}</code> — pick a session
+            Comparing with{' '}
+            {pickLabel?.kind === 'title'
+              ? <strong className="conv-rail-pickbanner-title">“{pickLabel.text}”</strong>
+              : <code>{pickLabel?.text}</code>}
+            {' '}— pick a session
           </span>
           <button
             type="button"

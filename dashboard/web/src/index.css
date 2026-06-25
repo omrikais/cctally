@@ -9108,6 +9108,8 @@ mark.current {
   color: var(--text);
 }
 .conv-rail-pickbanner-text code { color: var(--accent-blue); }
+/* #228 S5 E5 — the resolved session title (when cached) reads as the anchor. */
+.conv-rail-pickbanner-title { color: var(--accent-blue); font-weight: 600; }
 .conv-rail-pickcancel {
   appearance: none;
   border: 1px solid var(--border-soft);
