@@ -211,6 +211,20 @@ describe('ConversationFiltersPopover', () => {
     expect(getState().convFiltersOpen).toBe(false);
   });
 
+  // #228 S4 D1 (Codex gate P1-2) — Escape inside the open filters popover must
+  // CLOSE it (SET_CONV_FILTERS_OPEN { open:false }), not fall through. With the
+  // view-level global Escape now gated on `inView` (which excludes
+  // convFiltersOpen) the global binding is inert here, so the popover owns its
+  // own Escape-to-close from any focused field inside the dialog root.
+  it('Escape on the dialog root closes the popover', () => {
+    dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+    render(<ConversationFiltersPopover />);
+    const dialog = screen.getByRole('dialog', { name: /conversation filters/i });
+    expect(dialog).toBeTruthy();
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(getState().convFiltersOpen).toBe(false);
+  });
+
   it('reflects an active project selection as a checked checkbox', () => {
     dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { projects: ['projB'] } });
     render(<ConversationFiltersPopover />);

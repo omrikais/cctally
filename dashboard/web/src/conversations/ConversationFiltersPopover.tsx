@@ -134,7 +134,22 @@ export function ConversationFiltersPopover() {
   };
 
   return (
-    <div className="conv-rail-filters" role="dialog" aria-label="Conversation filters">
+    <div
+      className="conv-rail-filters"
+      role="dialog"
+      aria-label="Conversation filters"
+      // #228 S4 D1 (Codex gate P1-2) — Escape closes the popover from any focused
+      // field inside it (SET_CONV_FILTERS_OPEN { open:false }), and stopPropagation
+      // keeps it from reaching the document keydown listener. The view-level global
+      // Escape already gates on `inView` (which excludes convFiltersOpen), so this
+      // makes Escape positively useful here rather than merely inert.
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.stopPropagation();
+          dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: false });
+        }
+      }}
+    >
       <section className="conv-rail-filters-sec">
         <div className="conv-rail-filters-label">Date (last activity)</div>
         <div className="conv-rail-filters-chips">
