@@ -270,6 +270,18 @@ describe('ConversationRail', () => {
     expect(getState().conversationSearchKind).toBe('files');
   });
 
+  // #228 S4 (ui-qa P3) — the popover's own Esc-to-close only fires when focus is
+  // INSIDE the dialog; right after a click focus sits on the toggle button (a
+  // sibling outside it), so the toggle owns Esc too. Closes the popover, never
+  // ejects the workspace.
+  it('Esc on the Filters toggle closes an open popover', () => {
+    render(<ConversationRail />);
+    fireEvent.click(screen.getByTitle('Filter conversations'));
+    expect(getState().convFiltersOpen).toBe(true);
+    fireEvent.keyDown(screen.getByTitle('Filter conversations'), { key: 'Escape' });
+    expect(getState().convFiltersOpen).toBe(false);
+  });
+
   it('Title and Files are NOT disabled under prose-only (needsSplit:false)', () => {
     // title → conversation_title_fts/LIKE, files → LIKE — neither rides the split
     // index, so the prose-only interim must NOT grey them out (unlike Tools/Thinking).

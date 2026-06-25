@@ -242,6 +242,15 @@ export function ConversationRail() {
               aria-expanded={filtersOpen}
               title="Filter conversations"
               onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
+              // The popover's own Esc-to-close only fires when focus is INSIDE
+              // it; right after a click focus sits on this toggle (a sibling
+              // outside the dialog), so close from here too — the natural Esc.
+              onKeyDown={(e) => {
+                if (filtersOpen && e.key === 'Escape') {
+                  e.stopPropagation();
+                  dispatch({ type: 'TOGGLE_CONV_FILTERS' });
+                }
+              }}
             >
               Filters ▾
             </button>
