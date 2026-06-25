@@ -463,7 +463,12 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
         prevGroup = c.group;
         return (
           <Fragment key={c.kind}>
-            {needsSep && <span className="conv-rail-chips-sep" aria-hidden="true" />}
+            {/* #228 S4 D7 — a deterministic full-width flex break before the
+                first structural chip (Title), replacing the vertical separator
+                rule. The break is a zero-height `flex-basis:100%` element (CSS),
+                so Title/Files always begin their own line and there's no dangling
+                rule on wrap. */}
+            {needsSep && <span className="conv-rail-chips-break" aria-hidden="true" />}
             <button
               type="button"
               role="radio"

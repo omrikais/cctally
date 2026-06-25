@@ -282,18 +282,21 @@ describe('ConversationRail', () => {
     expect((screen.getByRole('radio', { name: 'Files' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('groups Title/Files after a separator distinct from the content kinds', () => {
-    // 5f — the two structural facets are visually grouped after a subtle
-    // separator. We assert the separator element exists between the content kinds
-    // and the structural facets within the chip row.
+  it('groups Title/Files after a deterministic full-width break (no dangling separator)', () => {
+    // #228 S4 D7 — the vertical separator rule is replaced by a zero-height
+    // full-width flex break before the first structural chip, so Title/Files
+    // always begin their own line and there's no dangling rule on wrap. The old
+    // `.conv-rail-chips-sep` element is gone; the `.conv-rail-chips-break` element
+    // sits between the content kinds and the structural facets in DOM order.
     searchHits = [hit({})];
     searchTotal = 1;
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
     render(<ConversationRail />);
     const group = document.querySelector('[role="radiogroup"]')!;
-    const sep = group.querySelector('.conv-rail-chips-sep');
+    expect(group.querySelector('.conv-rail-chips-sep')).toBeNull();
+    const sep = group.querySelector('.conv-rail-chips-break');
     expect(sep).toBeTruthy();
-    // The separator precedes the Title chip and follows the Thinking chip in DOM order.
+    // The break precedes the Title chip and follows the Thinking chip in DOM order.
     const title = screen.getByRole('radio', { name: 'Title' });
     const thinking = screen.getByRole('radio', { name: 'Thinking' });
     expect(thinking.compareDocumentPosition(sep!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
