@@ -71,3 +71,19 @@ describe('fmt.tokens (#177 S5)', () => {
     expect(fmt.tokens(999_950)).toBe('1M');
   });
 });
+
+describe('fmt.durationCompact', () => {
+  it('drops the 0h prefix and zero-pad for sub-hour durations', () => {
+    expect(fmt.durationCompact(7 * 60)).toBe('7m');
+    expect(fmt.durationCompact(30)).toBe('0m');   // sub-minute floors to 0m
+    expect(fmt.durationCompact(0)).toBe('0m');
+  });
+  it('keeps the "Xh YYm" form (padded minutes) at/above one hour', () => {
+    expect(fmt.durationCompact(3600 + 56 * 60)).toBe('1h 56m');
+    expect(fmt.durationCompact(3600 + 7 * 60)).toBe('1h 07m');
+  });
+  it('renders an em dash for null/undefined (mirrors hhmm)', () => {
+    expect(fmt.durationCompact(null)).toBe('—');
+    expect(fmt.durationCompact(undefined)).toBe('—');
+  });
+});

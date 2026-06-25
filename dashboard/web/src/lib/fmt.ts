@@ -254,6 +254,15 @@ export const fmt = {
     const m = ((v % 3600) / 60) | 0;
     return `${h}h ${pad2(m)}m`;
   },
+  // #228 S5 E6 — like hhmm but drops the "0h " prefix (and the minute zero-pad)
+  // for sub-hour values: "7m" / "0m" / "1h 56m" / "—". Comparison-strip-only;
+  // hhmm itself is unchanged so forecast/blocks keep "0h 07m".
+  durationCompact(v: number | null | undefined): string {
+    if (v == null) return '—';
+    const h = (v / 3600) | 0;
+    const m = ((v % 3600) / 60) | 0;
+    return h === 0 ? `${m}m` : `${h}h ${pad2(m)}m`;
+  },
   // #166: subagent wall-clock. Sub-minute -> "10.7s"; >= 60s -> "2m 5s"
   // (trailing "0s" dropped). Distinct from hhmm (seconds -> "Xh YYm").
   durationMs(v: number | null | undefined): string {
