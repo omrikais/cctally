@@ -6,7 +6,7 @@ import { ExpandedPrompt } from './ExpandedPrompt';
 // (chosen by `wide`, from useIsWide): a two-column side-by-side grid on desktop,
 // a unified single column below 1100px. Clicking any row toggles a lazy
 // full-text expand panel beneath it. Divergence is conveyed by the ⚡ DIVERGENCE
-// bar + the ◆ markers + the add/del classes — NEVER color alone (a11y).
+// bar + the −/+/= row markers + the add/del classes — NEVER color alone (a11y).
 
 export interface ComparisonDiffProps {
   rows: AlignmentRow[];

@@ -8767,7 +8767,7 @@ mark.current {
    sets `.conv-cmp--wide` / `.conv-cmp--unified` on the root; the `@media
    (max-width: 1100px)` safety block at the end reflows a STALE wide render so
    the layout never overflows on a slow viewport change. Divergence is conveyed
-   by the ⚡ bar + ◆ markers + add/del classes — never color alone.
+   by the ⚡ bar + the −/+/= row markers + add/del classes — never color alone.
    ==================================================================== */
 
 /* The comparison view occupies the reader column of .conv-view (the rail stays
@@ -8935,11 +8935,18 @@ mark.current {
   font-size: var(--fs-eyebrow);
   color: var(--text-dim);
 }
-/* #228 S5 E1 — the semantic state lives on the delta element itself: a compound
-   `.conv-cmp-metric-delta.sem-improve|regress|neutral` (two classes) beats this
-   base rule's own colour and cascades to the child `.conv-cmp-metric-dir`
-   glyph. A green ▼ improvement is now matched by a red ▲ regression (was a
-   one-sided green-only `conv-cmp-metric-down` rule, removed). */
+/* #228 S5 E1 — the semantic state lives on the delta element itself. The
+   compound selectors below (specificity 0,2,0) beat the base rule above (0,1,0)
+   AND come later in source order, so a green ▼ improvement and a red ▲
+   regression both override the neutral grey; the colour cascades to the child
+   `.conv-cmp-metric-dir` glyph (which has no own colour rule). Replaces the
+   removed one-sided green-only `conv-cmp-metric-down`. NB the bare `.sem-*`
+   rules alone are NOT enough here — they are single-class (0,1,0) and
+   `.conv-cmp-metric-delta` is defined later, so it would win on source order
+   (the ui-qa-caught regression). */
+.conv-cmp-metric-delta.sem-improve { color: var(--intent-improve); }
+.conv-cmp-metric-delta.sem-regress { color: var(--intent-regress); }
+.conv-cmp-metric-delta.sem-neutral { color: var(--intent-neutral); }
 
 /* ---- The diff legend (E8) ---------------------------------------------- */
 .conv-cmp-legend {
