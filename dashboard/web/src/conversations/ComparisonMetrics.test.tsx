@@ -13,37 +13,54 @@ const M = (over: Partial<Metrics> = {}): Metrics => ({
   ...over,
 });
 
+const deltaOf = (c: HTMLElement, k: string) =>
+  c.querySelector(`[data-metric="${k}"] .conv-cmp-metric-delta`) as HTMLElement | null;
+
 describe('ComparisonMetrics', () => {
-  it('marks a lower-is-better metric (cost) as improved when B < A', () => {
-    const { container } = render(
-      <ComparisonMetrics a={M({ cost: 0.42 })} b={M({ cost: 0.31 })} />,
-    );
-    const cell = container.querySelector('[data-metric="cost"]') as HTMLElement;
-    expect(cell.className).toContain('conv-cmp-metric-down');
+  it('an improving lower-is-better metric (cost, B<A) → sem-improve + ▼ + SR "improved"', () => {
+    const { container } = render(<ComparisonMetrics a={M({ cost: 0.42 })} b={M({ cost: 0.31 })} />);
+    const d = deltaOf(container, 'cost')!;
+    expect(d.className).toContain('sem-improve');
+    expect(d.textContent).toContain('▼');
+    expect(d.textContent).toContain('improved');
   });
 
-  it('does NOT color a neutral metric (tokens) even when B differs', () => {
-    const { container } = render(
-      <ComparisonMetrics a={M({ tokens: 100 })} b={M({ tokens: 120 })} />,
-    );
-    const cell = container.querySelector('[data-metric="tokens"]') as HTMLElement;
-    expect(cell.className).not.toContain('conv-cmp-metric-down');
+  it('a worsening lower-is-better metric (cost, B>A) → sem-regress + ▲ + SR "regression"', () => {
+    const { container } = render(<ComparisonMetrics a={M({ cost: 0.31 })} b={M({ cost: 0.42 })} />);
+    const d = deltaOf(container, 'cost')!;
+    expect(d.className).toContain('sem-regress');
+    expect(d.textContent).toContain('▲');
+    expect(d.textContent).toContain('regression');
   });
 
-  it('does NOT mark cost down when B is higher (a regression, not an improvement)', () => {
-    const { container } = render(
-      <ComparisonMetrics a={M({ cost: 0.31 })} b={M({ cost: 0.42 })} />,
-    );
-    const cell = container.querySelector('[data-metric="cost"]') as HTMLElement;
-    expect(cell.className).not.toContain('conv-cmp-metric-down');
+  it('a neutral metric (tokens) → sem-neutral with a directional arrow, never improve/regress', () => {
+    const { container } = render(<ComparisonMetrics a={M({ tokens: 100 })} b={M({ tokens: 120 })} />);
+    const d = deltaOf(container, 'tokens')!;
+    expect(d.className).toContain('sem-neutral');
+    expect(d.className).not.toContain('sem-improve');
+    expect(d.className).not.toContain('sem-regress');
+    expect(d.textContent).toMatch(/[▲▼]/);
   });
 
-  it('renders an em dash for a null duration', () => {
+  it('renders no delta block for a flat metric (A === B)', () => {
+    const { container } = render(<ComparisonMetrics a={M({ errors: 5 })} b={M({ errors: 5 })} />);
+    expect(deltaOf(container, 'errors')).toBeNull();
+  });
+
+  it('renders an em dash for a null duration value, no delta', () => {
     const { container } = render(
       <ComparisonMetrics a={M({ durationSeconds: null })} b={M({ durationSeconds: null })} />,
     );
     const cell = container.querySelector('[data-metric="duration"]') as HTMLElement;
     expect(cell.textContent).toContain('—');
+    expect(deltaOf(container, 'duration')).toBeNull();
+  });
+
+  it('a sub-hour duration delta renders compact ("−7m"), not "−0h 07m"', () => {
+    const { container } = render(
+      <ComparisonMetrics a={M({ durationSeconds: 14 * 60 })} b={M({ durationSeconds: 7 * 60 })} />,
+    );
+    expect(deltaOf(container, 'duration')!.textContent).toContain('−7m');
   });
 
   it('renders all six metric cells', () => {

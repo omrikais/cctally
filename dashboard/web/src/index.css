@@ -8912,9 +8912,11 @@ mark.current {
   font-size: var(--fs-eyebrow);
   color: var(--text-dim);
 }
-/* Improvement (lower-is-better metric, B<A): a subtle green ▼ + value. */
-.conv-cmp-metric-down .conv-cmp-metric-delta { color: var(--accent-green); }
-.conv-cmp-metric-dir { color: var(--accent-green); }
+/* #228 S5 E1 — the semantic state lives on the delta element itself: a compound
+   `.conv-cmp-metric-delta.sem-improve|regress|neutral` (two classes) beats this
+   base rule's own colour and cascades to the child `.conv-cmp-metric-dir`
+   glyph. A green ▼ improvement is now matched by a red ▲ regression (was a
+   one-sided green-only `conv-cmp-metric-down` rule, removed). */
 
 /* ---- The aligned diff -------------------------------------------------- */
 .conv-cmp-diff { display: flex; flex-direction: column; padding: var(--space-2) 0; }
