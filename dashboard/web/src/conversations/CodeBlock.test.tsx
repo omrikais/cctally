@@ -1,7 +1,8 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { Markdown } from '../components/Markdown';
-import { highlightBody } from './CodeBlock';
+import { CodeBlock, highlightBody } from './CodeBlock';
+import { HighlightContext } from './HighlightContext';
 
 const md = (s: string) => render(<Markdown>{s}</Markdown>).container;
 
@@ -49,5 +50,30 @@ describe('highlightBody (shared primitive)', () => {
     const { container } = render(<pre>{highlightBody('const x = 1;', 'nope')}</pre>);
     expect(container.querySelector('.token')).toBeNull();
     expect(container.textContent).toBe('const x = 1;');
+  });
+});
+
+describe('CodeBlock find highlighting (#236)', () => {
+  it('marks find terms in a registered-language block', () => {
+    const { container } = render(
+      <HighlightContext.Provider value={{ kind: 'terms', terms: ['flock'], caseSensitive: false }}>
+        <CodeBlock lang="js" code={'const flock = 1;'} />
+      </HighlightContext.Provider>,
+    );
+    expect(container.querySelector('mark')?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in an unregistered-language block', () => {
+    const { container } = render(
+      <HighlightContext.Provider value={{ kind: 'terms', terms: ['flock'], caseSensitive: false }}>
+        <CodeBlock lang="unknownlang" code={'plain flock text'} />
+      </HighlightContext.Provider>,
+    );
+    expect(container.querySelector('mark')?.textContent).toBe('flock');
+  });
+
+  it('no context → no marks (unchanged)', () => {
+    const { container } = render(<CodeBlock lang="js" code={'const flock = 1;'} />);
+    expect(container.querySelector('mark')).toBeNull();
   });
 });

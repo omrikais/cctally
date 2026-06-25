@@ -12,7 +12,9 @@ import markdown from 'refractor/markdown';
 import yaml from 'refractor/yaml';
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
 import { Fragment, jsx as _jsx, jsxs as _jsxs } from 'react/jsx-runtime';
+import type { Root } from 'hast';
 import { CopyButton } from './CopyButton';
+import { applyMarksToHast, splitToReactNodes, useFindSplit, type SplitFn } from './findMark';
 
 // Syntax-highlighted fenced-code renderer (C6). refractor (the Prism
 // tokenizer) produces a hast tree; hast-util-to-jsx-runtime turns that tree
@@ -48,20 +50,29 @@ export function isRegistered(lang: string): boolean {
 // no-dangerouslySetInnerHTML posture holds. Unknown language or a refractor
 // throw degrades to the raw string. Used by CodeBlock (prose) AND the tool
 // I/O panels (REQUEST json, Read RESULT source) — one chokepoint.
-export function highlightBody(code: string, lang: string): React.ReactNode {
+//
+// #236 — optional `split` makes the chokepoint find-highlight-aware. Absent or
+// null → byte-identical to before (no walk, no string split). With a split:
+// registered language runs the refractor hast through applyMarksToHast
+// (skipCode: false — marks ARE wanted inside a code block) before toJsxRuntime;
+// an unregistered language (or a refractor throw) routes through
+// splitToReactNodes so the raw text still marks.
+export function highlightBody(code: string, lang: string, split?: SplitFn | null): React.ReactNode {
   const l = ALIASES[lang] ?? lang;
   if (refractor.registered(l)) {
     try {
-      const tree = refractor.highlight(code, l);
+      const tree = refractor.highlight(code, l) as unknown as Root;
+      if (split) applyMarksToHast(tree, split, { skipCode: false });
       return toJsxRuntime(tree, { Fragment, jsx: _jsx, jsxs: _jsxs });
     } catch {
-      return code;
+      return split ? splitToReactNodes(code, split) : code;
     }
   }
-  return code;
+  return split ? splitToReactNodes(code, split) : code;
 }
 
 export function CodeBlock({ lang, filename, code }: { lang: string; filename?: string; code: string }) {
+  const split = useFindSplit();
   return (
     <div className="codeblock">
       <div className="cb-head">
@@ -69,7 +80,7 @@ export function CodeBlock({ lang, filename, code }: { lang: string; filename?: s
         {filename && <span className="cb-file">{filename}</span>}
         <CopyButton text={code} className="cb-copy" />
       </div>
-      <pre className="conv-code conv-code--hl">{highlightBody(code, lang)}</pre>
+      <pre className="conv-code conv-code--hl">{highlightBody(code, lang, split)}</pre>
     </div>
   );
 }
