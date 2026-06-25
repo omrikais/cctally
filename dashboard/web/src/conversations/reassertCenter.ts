@@ -52,8 +52,8 @@ export async function reassertCenter(d: ReassertDeps): Promise<ReassertResult> {
     if (d.isAborted()) return 'aborted';
     const cur = d.measure();
     if (cur == null) return 'gone';
-    const sameTarget = last != null && Object.is(last.target, cur.target);
-    if (sameTarget && Math.abs(cur.desired - last!.desired) <= d.tol) {
+    const prev = last; // narrow once so the same-target/within-tol test needs no non-null assertion
+    if (prev && Object.is(prev.target, cur.target) && Math.abs(cur.desired - prev.desired) <= d.tol) {
       if (++stable >= d.stableNeeded) return 'settled';
     } else {
       stable = 0;
