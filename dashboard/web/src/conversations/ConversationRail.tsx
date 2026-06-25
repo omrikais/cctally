@@ -7,6 +7,8 @@ import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { pickBannerLabel } from './pickBannerLabel';
+import { allOneProject } from './railDiscovery';
+import { modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import type { ConversationFilters, ConversationSummary, RailSortKey, SearchHit, SearchKind } from '../types/conversation';
 
@@ -198,59 +200,70 @@ export function ConversationRail() {
         </div>
       )}
       <div className="conv-rail-search">
+        {/* #228 S4 C4 — the search header is now two rows: a full-width input row
+            (with a leading magnifier glyph) over a controls row (Filters + Sort).
+            The single-row layout starved the input so even its placeholder
+            truncated. The input keeps its class so the '/'/'f' focus selector
+            (.conv-rail-search input) and the mobile 16px/44px override keep
+            matching. */}
         <div className="conv-rail-search-bar">
-          <input
-            ref={inputRef}
-            type="search"
-            className="conv-rail-search-input"
-            placeholder="search all conversations…"
-            value={search}
-            onChange={(e) => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: e.target.value })}
-            onFocus={() => dispatch({ type: 'SET_INPUT_MODE', mode: 'search' })}
-            onBlur={() => dispatch({ type: 'SET_INPUT_MODE', mode: null })}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                // #228 S4 D1 — the input owns its own Esc: clear the needle +
-                // blur, and stopPropagation so the Esc never reaches the document
-                // keydown listener (the in-house idiom FindBar already uses). The
-                // view-level Escape binding additionally gates on `inView`, so
-                // this is consistency, not redundant defense.
-                e.stopPropagation();
-                dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
-                inputRef.current?.blur();
-              }
-            }}
-          />
-          {/* #217 S4 / I-2.5 — filters apply to BOTH browse and search (the
-              shared-filter decision), so the button stays enabled in search mode
-              and the popover/chips render in both modes. */}
-          <button
-            type="button"
-            className={`conv-rail-filters-btn${filtersOpen ? ' is-on' : ''}`}
-            aria-expanded={filtersOpen}
-            title="Filter conversations"
-            onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
-          >
-            Filters ▾
-          </button>
-          {/* #217 S4 / I-2.4 — rail sort control. Always visible; the active key
-              threads into the browse `sort` param via useConversations. */}
-          <label className="conv-rail-sort">
-            <span className="conv-rail-sort-label">Sort</span>
-            <select
-              className="conv-rail-sort-select"
-              aria-label="Sort conversations"
-              value={railSort}
-              onChange={(e) => dispatch({
-                type: 'SET_CONVERSATION_RAIL_SORT',
-                sort: e.target.value as RailSortKey,
-              })}
+          <div className="conv-rail-search-inputwrap">
+            <span className="conv-rail-search-mag" aria-hidden="true">⌕</span>
+            <input
+              ref={inputRef}
+              type="search"
+              className="conv-rail-search-input"
+              placeholder="search all conversations…"
+              value={search}
+              onChange={(e) => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: e.target.value })}
+              onFocus={() => dispatch({ type: 'SET_INPUT_MODE', mode: 'search' })}
+              onBlur={() => dispatch({ type: 'SET_INPUT_MODE', mode: null })}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  // #228 S4 D1 — the input owns its own Esc: clear the needle +
+                  // blur, and stopPropagation so the Esc never reaches the document
+                  // keydown listener (the in-house idiom FindBar already uses). The
+                  // view-level Escape binding additionally gates on `inView`, so
+                  // this is consistency, not redundant defense.
+                  e.stopPropagation();
+                  dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
+                  inputRef.current?.blur();
+                }
+              }}
+            />
+          </div>
+          <div className="conv-rail-search-controls">
+            {/* #217 S4 / I-2.5 — filters apply to BOTH browse and search (the
+                shared-filter decision), so the button stays enabled in search mode
+                and the popover/chips render in both modes. */}
+            <button
+              type="button"
+              className={`conv-rail-filters-btn${filtersOpen ? ' is-on' : ''}`}
+              aria-expanded={filtersOpen}
+              title="Filter conversations"
+              onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
             >
-              {SORT_OPTIONS.map((o) => (
-                <option key={o.key} value={o.key}>{o.label}</option>
-              ))}
-            </select>
-          </label>
+              Filters ▾
+            </button>
+            {/* #217 S4 / I-2.4 — rail sort control. Always visible; the active key
+                threads into the browse `sort` param via useConversations. */}
+            <label className="conv-rail-sort">
+              <span className="conv-rail-sort-label">Sort</span>
+              <select
+                className="conv-rail-sort-select"
+                aria-label="Sort conversations"
+                value={railSort}
+                onChange={(e) => dispatch({
+                  type: 'SET_CONVERSATION_RAIL_SORT',
+                  sort: e.target.value as RailSortKey,
+                })}
+              >
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
         </div>
         {filtersOpen && <ConversationFiltersPopover />}
         {chips.length > 0 && (
@@ -357,6 +370,10 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
   // / Codex P2 #6) so the grouping agrees with the recent sort + the date filter.
   let lastBucket: string | null = null;
   const now = Date.now();
+  // #228 S4 D2 — suppress the per-row project label when every loaded row shares
+  // one project (single-project installs). Recomputed each render, so a later
+  // page introducing a second project makes the labels reappear for all rows.
+  const hideProject = allOneProject(rows);
   return (
     <div className="conv-rail-list">
       {degradedNote}
@@ -367,7 +384,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
         return (
           <Fragment key={r.session_id}>
             {isNewBucket && <div className="conv-rail-sec">{bucket}</div>}
-            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} pickAnchor={pickAnchor} />
+            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} pickAnchor={pickAnchor} hideProject={hideProject} />
           </Fragment>
         );
       })}
@@ -388,8 +405,13 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
   );
 }
 
-function BrowseRow({ row, ctx, active, pickAnchor }: { row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: string | null }) {
+function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
+  row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: string | null; hideProject: boolean;
+}) {
   const isAnchor = pickAnchor === row.session_id;
+  // #228 S4 D2 — the model chip cluster from row.models (browse-only; search hits
+  // carry no models). Empty models → no chip.
+  const models = modelChipSummary(row.models);
   return (
     <button
       type="button"
@@ -400,12 +422,25 @@ function BrowseRow({ row, ctx, active, pickAnchor }: { row: ConversationSummary;
       onClick={pickOr(pickAnchor, row.session_id, () => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id }))}
     >
       <div className="conv-rail-row-title">{row.title}</div>
+      {/* #228 S4 D2 — one non-wrapping meta line: a left group ([project ·] branch
+          · when) that ellipsizes, and a right stats cluster (model chip + $cost +
+          msg count). Spacing dots come from CSS gaps (Task 9). */}
       <div className="conv-rail-row-meta">
-        <span className="conv-rail-row-project">{row.project_label || '—'}</span>
-        <span className="conv-rail-row-branch">{row.git_branch ?? '—'}</span>
-        <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
-        <span className="conv-rail-row-cost">{fmt.usd2(row.cost_usd)}</span>
-        <span className="conv-rail-row-msgs">{row.msg_count} msgs</span>
+        <span className="conv-rail-row-metaleft">
+          {!hideProject && <span className="conv-rail-row-project">{row.project_label || '—'}</span>}
+          <span className="conv-rail-row-branch">{row.git_branch ?? '—'}</span>
+          <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
+        </span>
+        <span className="conv-rail-row-cluster">
+          {models.classes.length > 0 && (
+            <span className="conv-rail-row-model">
+              {models.classes.map((c) => <span key={c} className={`chip ${c}`}>{c}</span>)}
+              {models.extra > 0 && <span className="conv-rail-row-model-more">+{models.extra}</span>}
+            </span>
+          )}
+          <span className="conv-rail-row-cost">{fmt.usd2(row.cost_usd)}</span>
+          <span className="conv-rail-row-msgs">{row.msg_count}</span>
+        </span>
       </div>
     </button>
   );

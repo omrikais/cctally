@@ -140,6 +140,44 @@ describe('ConversationRail', () => {
     expect(document.querySelectorAll('.conv-rail-sec').length).toBeGreaterThanOrEqual(2);
   });
 
+  // ---- #228 S4 D2/D3 — browse-row density: project suppression + model chip ----
+
+  it('suppresses the per-row project label when all rows share one project, and restores it when a second project appears (page growth)', () => {
+    // Single project across all rows → the project label is hidden (it says
+    // nothing the install doesn't already imply).
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'A' }),
+      summary({ session_id: 's2', project_label: 'A' }),
+    ];
+    const { unmount } = render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-row-project')).toBeNull();
+    unmount();
+
+    // A later page introduces a second project → every row shows its project
+    // label again (recomputed each render; #217 page-growth, Codex P3-1).
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'A' }),
+      summary({ session_id: 's2', project_label: 'B' }),
+    ];
+    render(<ConversationRail />);
+    const projects = document.querySelectorAll('.conv-rail-row-project');
+    expect(projects.length).toBe(2);
+    expect([...projects].map((p) => p.textContent)).toEqual(['A', 'B']);
+  });
+
+  it('renders a model chip from row.models', () => {
+    browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8'] })];
+    render(<ConversationRail />);
+    const chip = document.querySelector('.conv-rail-row-model .chip.opus');
+    expect(chip).toBeTruthy();
+  });
+
+  it('renders no model chip when row.models is empty', () => {
+    browseRows = [summary({ session_id: 's1', models: [] })];
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-row-model')).toBeNull();
+  });
+
   it('search rows show the title header above the snippet', () => {
     searchHits = [hit({})];
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
