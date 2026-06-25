@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.0] - 2026-06-25
+
 ### Added
 - Conversation viewer: agent/subagent threads now keep a sticky orientation header (and a tinted body wash) so you always know which agent you're reading at any scroll depth, with the pinned header doubling as an always-reachable collapse control; a discoverable expand-all/collapse-all control surfaces the existing `]`/`[` shortcuts. (#228 S2)
 
