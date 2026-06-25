@@ -1117,7 +1117,6 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             return; // wait for the chain to open + re-measure, then re-fire to walk + center
           }
         }
-        const align: 'start' | 'center' = isCardRoot ? 'start' : 'center';
         // #234 §2.2 (R1) — a single estimate-based scrollIntoView hop over hundreds
         // of unmeasured high-variance rows cannot land deterministically: the
         // library briefly reaches the target, then asynchronously re-measures the
@@ -1192,10 +1191,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             if (aborted()) return;
             scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
           } else {
-            scrollNodeIntoView(body, el, align, 'auto');
+            // A member turn (never a card root — those resolve a cardRefs entry and
+            // take the branch above) always CENTERS (#204).
+            scrollNodeIntoView(body, el, 'center', 'auto');
             await waitForQuiesce(targetUuid);
             if (aborted()) return;
-            scrollNodeIntoView(body, el, align, 'auto'); // §2.1 single re-assert
+            scrollNodeIntoView(body, el, 'center', 'auto'); // §2.1 single re-assert
           }
         }
         // result === 'exhausted' → fall through: the jumpedUuid flash still

@@ -224,25 +224,26 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     expect(target!.classList.contains('conv-item--jumped')).toBe(true);
   });
 
-  it('(d) a far jump routes through the CONVERGENT scrollIntoView — the target is the resting node after a re-measure, and real Virtuoso fires `done` (#233)', async () => {
-    // #233 — the jump landing was switched from `scrollToIndex` (no completion signal
-    // → a blind 2-frame rAF second pass) to react-virtuoso's CONVERGENT
-    // `scrollIntoView({ index, align, behavior:'auto', done })`. `done` fires after
-    // the library's measure-and-retry settles, so the within-row second pass runs
-    // AFTER convergence instead of fighting it. The render-all mock tests
-    // (ConversationReader.test.tsx) pin the CALL SHAPE (scrollIntoView with the DATA
-    // array index, never the virtual index) and the done-driven second pass (the mock
-    // fires `done` itself). This real-<Virtuoso> companion proves the genuine library
-    // accepts the new scrollIntoView options (calculateViewLocation + done) without
-    // error and that the target is the FINAL RESTING node — mounted + flashed — and
-    // HOLDS there across a re-window/re-measure.
+  it('(d) a far jump WALKS to the target then direct-centers — the target is the resting node, mounted + flashed, and HOLDS across a re-measure (#234)', async () => {
+    // #234 — the far-jump landing no longer hops through react-virtuoso's library
+    // `scrollIntoView`. A single estimate-based hop over hundreds of unmeasured
+    // high-variance rows cannot land deterministically (the library re-measures the
+    // just-paged-in giant rows out from under the in-flight scroll). Instead the
+    // reader WALKS Virtuoso toward the target in mounted-window steps via
+    // `scrollToIndex` (so the path rows MEASURE), then writes the scroller's
+    // `scrollTop` DIRECTLY to the now-stable measured offset. The render-all mock
+    // tests (ConversationReader.test.tsx) pin the walk + direct-center call shape
+    // (scrollToIndex with the DATA array index, never the virtual index). This
+    // real-<Virtuoso> companion proves the genuine library re-windows under the walk
+    // without error and that the target is the FINAL RESTING node — mounted + flashed
+    // — and HOLDS there across a re-window/re-measure.
     //
     // NB: VirtuosoMockContext uses UNIFORM item heights, so the true
     // estimate-vs-measured DYNAMIC-HEIGHT divergence that strands a far smooth jump in
-    // production is NOT reproducible here (every row is exactly itemHeight), and real
-    // Virtuoso's scroll-completion/`done` does not settle under JSDOM's no-layout
-    // scroller (mirrors (b)'s "the mock-context scroll is a no-op" note). The
-    // pixel-exact landing + real `done` firing are the Playwright ui-qa gate's job.
+    // production is NOT reproducible here (every row is exactly itemHeight), and the
+    // walk's quiesce does not settle under JSDOM's no-layout scroller (mirrors (b)'s
+    // "the mock-context scroll is a no-op" note) — so the test drives the resulting
+    // scroll itself. The pixel-exact landing is the Playwright ui-qa gate's job.
     mockFetchOnce(detail(uuids.map((u) => makeItem(u))));
     const targetIdx = N - 6; // t54 — deep in the tail, unmounted at a head-anchored mount
     const targetUuid = `t${targetIdx}`;
@@ -251,9 +252,9 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     const { container } = renderReader();
 
     await waitFor(() => expect(container.querySelector('[data-uuid="t0"]')).not.toBeNull());
-    // The jump effect resolves the target (already in the one loaded page), calls the
-    // real Virtuoso `scrollIntoView` (the new convergent path — would throw here if the
-    // calculateViewLocation/done options were malformed), and self-clears the jump.
+    // The jump effect resolves the target (already in the one loaded page), walks
+    // Virtuoso toward it via scrollToIndex then direct-writes scrollTop, and
+    // self-clears the jump.
     await waitFor(() => expect(getState().conversationJump).toBeNull());
 
     // NON-VACUITY: the target is genuinely UNMOUNTED at a head-anchored mount.
@@ -326,6 +327,52 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     // resolved to the right top-level card for a SECOND-member hit.
     const forced = container.querySelector('.conv-sidechain--force') as HTMLElement;
     expect(forced.getAttribute('data-uuid')).toBe('sa1');
+  });
+
+  it('(f) #234 R2 — a find/jump hit on a GRANDCHILD member force-opens the WHOLE ancestor chain (isolates resolveJumpOwner subtree recursion from the old flat-find)', async () => {
+    // The force-open must reach a member nested TWO levels deep: a turn owned by a
+    // grandchild subagent (top-level C → nested child G). This is the case (e) above
+    // CANNOT isolate — a top-level SECOND member resolves the same owner key under
+    // both the old flat `detail.items.find((it) => it.member_uuids.includes(uuid))`
+    // and the new render-tree resolveJumpOwner, so (e) would pass under either. A
+    // grandchild member is reachable ONLY via resolveJumpOwner's deepest-first
+    // subtree recursion (ownerInSubagent descending into node.children) PLUS the
+    // ancestorKeys chain force-open: the flat find yields at most ONE owner key (G),
+    // and G's nested card cannot mount until its parent C is ALSO force-open — so the
+    // old path stranded the grandchild in un-accounted overflow. The regression here
+    // is that BOTH C and G surface conv-sidechain--force.
+    const items: ConversationItem[] = [
+      makeItem('m1', { kind: 'human', text: 'kick off the audit' }),
+      // Top-level subagent C (bucket root c1) spawns the nested grandchild G (member g1).
+      makeItem('c1', { is_sidechain: true, subagent_key: 'C', text: 'parent subagent root' }),
+      makeItem('g1', { is_sidechain: true, subagent_key: 'G', text: 'grandchild member — the find hit' }),
+    ];
+    mockFetchOnce(detail(items, {
+      subagent_meta: {
+        C: { kind: 'code-reviewer', parent_subagent_key: null, spawn_uuid: 'm1', spawn_tool_use_id: 'tu_c' },
+        G: { kind: 'grounding', parent_subagent_key: 'C', spawn_uuid: 'c1', spawn_tool_use_id: 'tu_g' },
+      },
+    }));
+
+    // Jump to the GRANDCHILD member uuid (the deep nested find hit) BEFORE mount.
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'g1', expand_details: true } });
+    const { container } = renderReader();
+
+    await waitFor(() => expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull());
+    // The whole ancestor chain force-opens: the top-level card C (data-uuid c1) AND
+    // the nested grandchild card G (data-uuid g1) each carry conv-sidechain--force.
+    // The PARENT (c1) force-opening is the ISOLATING assertion — the old flat-find,
+    // knowing only the single deepest owner G, never opened C, so g1's nested card
+    // could not mount. NON-VACUITY: a collapsed card with no active jump carries
+    // neither class (proven by (e)'s sibling assertion).
+    await waitFor(() => {
+      expect(container.querySelector('.conv-sidechain--force[data-uuid="c1"]')).not.toBeNull();
+      expect(container.querySelector('.conv-sidechain--force[data-uuid="g1"]')).not.toBeNull();
+    });
+    // The grandchild card is genuinely NESTED inside the parent's body (depth >= 1),
+    // confirming the render-tree topology — not a flattened top-level sibling.
+    const grandchild = container.querySelector('.conv-sidechain[data-uuid="g1"]') as HTMLElement;
+    expect(grandchild.classList.contains('conv-sidechain--nested')).toBe(true);
   });
 
   it('(c) firstItemIndex pins an item\'s virtual index across a simulated prepend', async () => {

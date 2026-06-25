@@ -31,16 +31,12 @@ import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
 // most-recently-mounted instance, and the IntersectionObserver-free top/bottom
 // load triggers (startReached/endReached replace the deleted sentinel
 // observers).
-// #233 — react-virtuoso's `scrollIntoView` is the only handle method with a
-// completion callback: `done` fires after the library's convergent retry settles
-// (or immediately if no scroll is needed). The reader's jump landing now routes
-// through it (replacing `scrollToIndex` + a blind rAF second pass), running the
-// within-row centering inside `done`. The render-all mock fires `done`
-// synchronously so that second pass runs deterministically in these tests.
-const fireScrollIntoViewDone = (loc?: { done?: () => void }) => { loc?.done?.(); };
+// #234 — the reader's jump landing WALKS Virtuoso toward the target via
+// `scrollToIndex` (mounted-window steps) then writes the scroller's `scrollTop`
+// directly; it no longer calls the library's `scrollIntoView`. So the shared test
+// handle only needs `scrollToIndex` (plus the captured props the reader reads back).
 const virtuosoTestHandle: {
   scrollToIndex: ReturnType<typeof vi.fn>;
-  scrollIntoView: ReturnType<typeof vi.fn>;
   firstItemIndex: number;
   startReached: (() => void) | null;
   endReached: (() => void) | null;
@@ -49,7 +45,6 @@ const virtuosoTestHandle: {
   followOutput: ((atBottom: boolean) => unknown) | null;
 } = {
   scrollToIndex: vi.fn(),
-  scrollIntoView: vi.fn(fireScrollIntoViewDone),
   firstItemIndex: 0,
   startReached: null,
   endReached: null,
@@ -61,8 +56,7 @@ vi.mock('react-virtuoso', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
   const Virtuoso = React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
     const scrollToIndex = virtuosoTestHandle.scrollToIndex;
-    const scrollIntoView = virtuosoTestHandle.scrollIntoView;
-    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollIntoView, scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex, scrollIntoView]);
+    React.useImperativeHandle(ref, () => ({ scrollToIndex, scrollBy: vi.fn(), scrollTo: vi.fn() }), [scrollToIndex]);
     const data = (props.data as unknown[]) ?? [];
     const itemContent = props.itemContent as (index: number, datum: unknown) => React.ReactNode;
     const computeItemKey = props.computeItemKey as ((index: number, datum: unknown) => React.Key) | undefined;
@@ -190,7 +184,6 @@ beforeEach(() => {
   // #232 — reset the shared Virtuoso test handle so a prior test's scrollToIndex
   // calls / captured callbacks don't bleed across tests.
   virtuosoTestHandle.scrollToIndex = vi.fn();
-  virtuosoTestHandle.scrollIntoView = vi.fn(fireScrollIntoViewDone);
   virtuosoTestHandle.firstItemIndex = 0;
   virtuosoTestHandle.startReached = null;
   virtuosoTestHandle.endReached = null;
