@@ -2,6 +2,7 @@ import { render, fireEvent, act } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BashCard } from './BashCard';
 import { TranscriptContext } from './TranscriptContext';
+import { HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -266,6 +267,21 @@ describe('BashCard full-session copy (#217 S5)', () => {
     expect(copied).toContain('$ echo hi');
     expect(copied).toContain('hi');
     expect(copied).not.toContain('[truncated]');
+  });
+});
+
+// #236 — the Bash command body highlights find matches when find is open.
+describe('BashCard find highlighting (#236)', () => {
+  it('marks find terms in the command', () => {
+    const { container } = render(
+      <TranscriptContext.Provider value={{ sessionId: 's1' }}>
+        <HighlightContext.Provider value={{ kind: 'terms', terms: ['flock'], caseSensitive: false }}>
+          <BashCard call={base({ input: { command: 'flock cache.db.lock' }, result: null, stderr: undefined })} />
+        </HighlightContext.Provider>
+      </TranscriptContext.Provider>,
+    );
+    const mark = container.querySelector('.conv-term-cmd mark');
+    expect(mark?.textContent).toBe('flock');
   });
 });
 

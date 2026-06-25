@@ -8,6 +8,7 @@ import {
 } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { highlightBody } from './CodeBlock';
+import { splitToReactNodes, useFindSplit } from './findMark';
 import { LineNumberedCode } from './LineNumberedCode';
 import { resultLang } from './toolLang';
 import { specialToolRenderer } from './specialTools';
@@ -184,9 +185,15 @@ type ToolResult = { text: string; truncated: boolean; is_error: boolean };
 // Pick the RESULT renderer: a non-error Read whose file resolves to a known
 // language → gutter + highlight; everything else → the existing plain pre.
 function ToolResultBody({ result, name, preview }: { result: ToolResult; name: string | null; preview: string }) {
+  const split = useFindSplit();
   const lang = name === 'Read' && !result.is_error ? resultLang('Read', preview) : '';
   if (lang) return <LineNumberedCode code={result.text} lang={lang} />;
-  return <pre className="conv-code conv-code--result">{result.text}</pre>;
+  // #236 — generic result <pre> is highlight-aware (find-closed → bare text).
+  return (
+    <pre className="conv-code conv-code--result">
+      {split ? splitToReactNodes(result.text, split) : result.text}
+    </pre>
+  );
 }
 
 // One paired request+result disclosure. Collapsed: chevron · tool icon · name ·
@@ -201,6 +208,7 @@ function ToolResultBody({ result, name, preview }: { result: ToolResult; name: s
 // collapsed look the user already sees, so the chip simply becomes the thing
 // that expands. Collapsed by default.
 function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool_call' }> }) {
+  const split = useFindSplit();
   if (call.skill_body != null) {
     return (
       <details className="conv-chip conv-chip--tool conv-chip--skill">
@@ -235,7 +243,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
         <div className="conv-tool-io">
           <div className="conv-tool-io-label">request</div>
           <CopyButton text={call.input_summary} />
-          <pre className="conv-code conv-code--hl">{highlightBody(call.input_summary, 'json')}</pre>
+          <pre className="conv-code conv-code--hl">{highlightBody(call.input_summary, 'json', split)}</pre>
         </div>
         {call.result ? (
           <div className="conv-tool-io">
@@ -271,6 +279,7 @@ function firstLine(s: string): string {
 // Single non-text, non-tool_call block: thinking chip, the tool_use degradation
 // fallback, an orphan tool_result chip, or an inline media/reference span.
 function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid?: string | null }) {
+  const split = useFindSplit();
   switch (block.kind) {
     case 'thinking':
       return (
@@ -294,7 +303,7 @@ function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid
           </summary>
           <div className="conv-chip-body conv-tool-io">
             <CopyButton text={block.input_summary} />
-            <pre className="conv-code">{block.input_summary}</pre>
+            <pre className="conv-code">{split ? splitToReactNodes(block.input_summary, split) : block.input_summary}</pre>
           </div>
         </details>
       );
@@ -310,7 +319,7 @@ function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid
           </summary>
           <div className="conv-chip-body conv-tool-io">
             <CopyButton text={block.text} />
-            <pre className="conv-code">{block.text}</pre>
+            <pre className="conv-code">{split ? splitToReactNodes(block.text, split) : block.text}</pre>
             {/* #177 S4: orphaned tool-result screenshots still render — the
                 kernel keeps `media` + `tool_use_id` on the standalone block. */}
             {block.media?.map((m) => (

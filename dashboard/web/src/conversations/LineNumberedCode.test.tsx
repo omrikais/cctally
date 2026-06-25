@@ -1,6 +1,7 @@
 import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { LineNumberedCode, splitGutter } from './LineNumberedCode';
+import { HighlightContext } from './HighlightContext';
 
 describe('splitGutter', () => {
   it('splits real cat -n lines into {num, content}', () => {
@@ -35,5 +36,26 @@ describe('LineNumberedCode', () => {
     const pre = container.querySelector('pre.conv-code--result');
     expect(pre?.textContent).toBe('File does not exist.');
     expect(container.querySelector('.token')).toBeNull();
+  });
+});
+
+// #236 — Read results highlight find matches when find is open (both the
+// gutter+highlight path and the no-gutter degraded plain <pre>).
+describe('LineNumberedCode find highlighting (#236)', () => {
+  const withTerms = (node: React.ReactElement) =>
+    render(
+      <HighlightContext.Provider value={{ kind: 'terms', terms: ['flock'], caseSensitive: false }}>
+        {node}
+      </HighlightContext.Provider>,
+    );
+
+  it('marks find terms in a gutter+highlight Read result', () => {
+    const { container } = withTerms(<LineNumberedCode code={'   1\tdef flock():'} lang="python" />);
+    expect(container.querySelector('.conv-code--numbered mark')?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in the no-gutter degraded <pre>', () => {
+    const { container } = withTerms(<LineNumberedCode code={'flock not found here'} lang="python" />);
+    expect(container.querySelector('pre.conv-code--result mark')?.textContent).toBe('flock');
   });
 });

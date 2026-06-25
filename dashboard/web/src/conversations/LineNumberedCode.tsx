@@ -1,4 +1,5 @@
 import { highlightBody } from './CodeBlock';
+import { splitToReactNodes, useFindSplit } from './findMark';
 
 // A Read result rendered with a separated line-number gutter. Stored
 // `result.text` is `cat -n` form (`<number>\t<content>`, no leading padding;
@@ -19,16 +20,22 @@ export function splitGutter(text: string): GutterRow[] {
 }
 
 export function LineNumberedCode({ code, lang }: { code: string; lang: string }) {
+  const split = useFindSplit();
   const rows = splitGutter(code);
   if (!rows.some((r) => r.num)) {
-    return <pre className="conv-code conv-code--result">{code}</pre>;
+    // #236 — no-gutter degraded path: highlight-aware (find-closed → bare text).
+    return (
+      <pre className="conv-code conv-code--result">
+        {split ? splitToReactNodes(code, split) : code}
+      </pre>
+    );
   }
   const source = rows.map((r) => r.content).join('\n');
   const gutter = rows.map((r) => r.num).join('\n');
   return (
     <div className="conv-code--numbered">
       <span className="cb-gutter" aria-hidden="true">{gutter}</span>
-      <pre className="conv-code conv-code--hl">{highlightBody(source, lang)}</pre>
+      <pre className="conv-code conv-code--hl">{highlightBody(source, lang, split)}</pre>
     </div>
   );
 }

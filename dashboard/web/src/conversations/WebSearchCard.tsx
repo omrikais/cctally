@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { ConversationBlock } from '../types/conversation';
 import { SearchIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
+import { splitToReactNodes, useFindSplit } from './findMark';
 import { domainOf, isHttpUrl } from './webUrl';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -19,6 +20,7 @@ function queryOf(call: Call): string {
 }
 
 export function WebSearchCard({ call }: { call: Call }) {
+  const split = useFindSplit();
   const query = queryOf(call);
   const links = call.web_search?.links;
   const [showAll, setShowAll] = useState(false);
@@ -67,7 +69,9 @@ export function WebSearchCard({ call }: { call: Call }) {
         ) : call.result?.text ? (
           <div className="conv-tool-io">
             <CopyButton text={call.result.text} />
-            <pre className="conv-code conv-code--result">{call.result.text}</pre>
+            <pre className="conv-code conv-code--result">
+              {split ? splitToReactNodes(call.result.text, split) : call.result.text}
+            </pre>
           </div>
         ) : (
           <div className="conv-tool-io-label conv-tool-io-label--none">no result</div>

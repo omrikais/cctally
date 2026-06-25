@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBlocks } from './MessageBlocks';
 import { AskUserQuestionCard } from './AskUserQuestionCard'; // ensure import resolves
 import { TranscriptContext } from './TranscriptContext';
+import { HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 // #177 S4: MediaFigure reads the session id from TranscriptContext; the media
@@ -739,5 +740,58 @@ describe('MessageBlocks — Session 4 media mount points (Q7-A)', () => {
     (container.querySelector('details.conv-chip--result') as HTMLDetailsElement).open = true;
     const img = container.querySelector('figure.conv-media-figure img')!;
     expect(img.getAttribute('src')).toBe('/api/conversation/s1/media?tool_use_id=tu_orphan&index=0');
+  });
+});
+
+// #236 — the tool I/O panels and plain <pre> find-corpus surfaces highlight
+// find matches when find is open.
+describe('MessageBlocks find highlighting (#236)', () => {
+  const withTerms = (node: React.ReactElement, term = 'flock') =>
+    render(
+      <HighlightContext.Provider value={{ kind: 'terms', terms: [term], caseSensitive: false }}>
+        {node}
+      </HighlightContext.Provider>,
+    );
+
+  it('marks find terms in the JSON request panel', () => {
+    const { container } = withTerms(
+      <MessageBlocks
+        blocks={[call({
+          name: 'Grep',
+          input_summary: '{"pattern": "flock"}',
+          result: { text: 'no matches', truncated: false, is_error: false },
+        })]}
+      />,
+    );
+    const mark = container.querySelector('.conv-tool-io .conv-code--hl mark');
+    expect(mark?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in the generic result <pre>', () => {
+    const { container } = withTerms(
+      <MessageBlocks
+        blocks={[call({
+          name: 'Grep',
+          input_summary: '{}',
+          result: { text: 'found flock in cache.db', truncated: false, is_error: false },
+        })]}
+      />,
+    );
+    const mark = container.querySelector('pre.conv-code--result mark');
+    expect(mark?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in the legacy tool_use <pre>', () => {
+    const { container } = withTerms(
+      <MessageBlocks blocks={[{ kind: 'tool_use', name: 'Bash', input_summary: 'flock cache.db.lock' }]} />,
+    );
+    expect(container.querySelector('.conv-tool-io pre mark')?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in the orphan tool_result <pre>', () => {
+    const { container } = withTerms(
+      <MessageBlocks blocks={[{ kind: 'tool_result', text: 'flock acquired', truncated: false, is_error: false }]} />,
+    );
+    expect(container.querySelector('.conv-chip--result pre mark')?.textContent).toBe('flock');
   });
 });

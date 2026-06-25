@@ -5,6 +5,7 @@ import { CopyButton } from './CopyButton';
 import { AnsiText } from './parseAnsi';
 import { LoadFull } from './LoadFull';
 import { highlightBody } from './CodeBlock';
+import { useFindSplit } from './findMark';
 import { useCopy } from './useCopy';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -61,6 +62,7 @@ function fullSessionText(
 }
 
 export function BashCard({ call }: { call: Call }) {
+  const split = useFindSplit();
   const { copied: copiedFull, copy: copyFull } = useCopy();
   // The full output loaded on demand when result.truncated (#178); supersedes
   // the bounded result.text for rendering. The load-full result payload carries
@@ -147,7 +149,7 @@ export function BashCard({ call }: { call: Call }) {
           <span className="conv-term-prompt" aria-hidden="true">
             ${' '}
           </span>
-          {highlightBody(command, 'bash')}
+          {highlightBody(command, 'bash', split)}
         </pre>
         {result && (
           <>

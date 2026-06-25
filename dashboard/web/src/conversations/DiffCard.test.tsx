@@ -2,6 +2,7 @@ import { render, fireEvent, act } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DiffCard } from './DiffCard';
 import { TranscriptContext } from './TranscriptContext';
+import { HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -312,5 +313,37 @@ describe('DiffCard .patch download', () => {
     expect(text).toContain('+++ b/new.py');
     expect(text).toContain('+a');
     expect(text).toContain('+b');
+  });
+});
+
+// #236 — diff rows highlight find matches when find is open: context lines
+// (which route through highlightBody) AND unpaired add/del rows (plain text).
+describe('DiffCard find highlighting (#236)', () => {
+  const withTerms = (call: Call, term = 'flock') =>
+    render(
+      <TranscriptContext.Provider value={{ sessionId: 's1' }}>
+        <HighlightContext.Provider value={{ kind: 'terms', terms: [term], caseSensitive: false }}>
+          <DiffCard call={call} />
+        </HighlightContext.Provider>
+      </TranscriptContext.Provider>,
+    );
+
+  it('marks find terms in a context (unchanged) line', () => {
+    // "flock keep" is unchanged context; "x" is the only changed line.
+    const call = base({
+      input: { file_path: '/a/x.ts', old_string: 'flock keep\nx', new_string: 'flock keep\ny' },
+    });
+    const { container } = withTerms(call);
+    expect(container.querySelector('.conv-diff-row--context mark')?.textContent).toBe('flock');
+  });
+
+  it('marks find terms in an unpaired add row', () => {
+    // A pure insertion (no del to pair) → an add row with no word segments,
+    // so it routes through the plain-text find surface.
+    const call = base({
+      input: { file_path: '/a/x.ts', old_string: 'keep', new_string: 'keep\nflock added' },
+    });
+    const { container } = withTerms(call);
+    expect(container.querySelector('.conv-diff-row--add mark')?.textContent).toBe('flock');
   });
 });

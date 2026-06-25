@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { WebSearchCard } from './WebSearchCard';
+import { HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -94,5 +95,15 @@ describe('WebSearchCard', () => {
     expect(status.classList.contains('conv-web-status--err')).toBe(true);
     // The `· error` span still renders alongside the count.
     expect(container.querySelector('.conv-chip-status')!.textContent).toContain('error');
+  });
+
+  // #236 — the plain-text fallback panel highlights find matches when find is on.
+  it('marks find terms in the plain fallback panel', () => {
+    const { container } = render(
+      <HighlightContext.Provider value={{ kind: 'terms', terms: ['flock'], caseSensitive: false }}>
+        <WebSearchCard call={call({ result: { text: 'found flock in the result', truncated: false, is_error: false } })} />
+      </HighlightContext.Provider>,
+    );
+    expect(container.querySelector('pre.conv-code--result mark')?.textContent).toBe('flock');
   });
 });
