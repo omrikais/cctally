@@ -1566,9 +1566,17 @@ mark.current {
   color: #000;
 }
 /* #238 R5 — the current find match in the conversation reader. Scoped + renamed
-   so it does not collide with the sessions-table mark.current; the regular marks
-   stay translucent so the current one reads as the saturated hit. */
-.conv-reader mark.conv-mark--current { background: var(--accent-amber); color: #000; }
+   so it does not collide with the sessions-table mark.current. NOTE: reader marks
+   are NOT translucent — `.conv-view mark` (search-hit highlight) already paints
+   them solid var(--accent-amber), so the current match must differ by more than
+   shade: a distinct ORANGE fill + a theme-adaptive ring (var(--text)) so it pops
+   out of the amber field and is distinguishable without relying on hue alone
+   (a11y). Wins the cascade over `.conv-view mark` by specificity (0,2,1 > 0,1,1). */
+.conv-reader mark.conv-mark--current {
+  background: var(--accent-orange);
+  color: #1a1400;
+  box-shadow: 0 0 0 2px var(--text);
+}
 
 /* Rows that contain a search-match get a soft highlight so the `/` +
    n/N navigation is visible without replacing the cell-level <mark>

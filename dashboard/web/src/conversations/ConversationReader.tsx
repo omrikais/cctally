@@ -1205,6 +1205,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             await waitForQuiesce(targetUuid);
             if (aborted()) return;
             scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
+            // #238 R5 — a card-root landing has no single "the" match, but it must
+            // still clear the prior step's stale highlight (else it lingers
+            // off-screen) and, best-effort, mark the first landable match shown in
+            // the aligned card. Feed an actual <mark> only, never the card root.
+            markCurrent(convFindOpenRef.current ? firstLandableMark(card) : null);
           } else if (jump.expand_details && convFindOpenRef.current) {
             // #237 — an auto-expanded disclosure settles to a SHORTER height over
             // ~150ms AFTER the open (content-visibility / lazy layout). With
