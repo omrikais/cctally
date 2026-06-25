@@ -288,13 +288,18 @@ describe('Conversations workspace integration', () => {
     expect(getState().view).toBe('conversations');
     expect(convTab).toHaveAttribute('aria-pressed', 'true');
 
-    // Rail mounts with its search input + the browsed conversation row.
+    // Rail mounts with its search input + the browsed conversation row. #228 S4
+    // D2 — the single-project label is suppressed when every loaded row shares
+    // one project (the fixture has one), so assert the row mounted via its model
+    // chip (claude-opus-4 → an `opus` chip) rather than the now-hidden project
+    // label.
     await waitFor(() => {
       expect(document.querySelector('.conv-rail')).not.toBeNull();
       expect(document.querySelector('.conv-rail-search-input')).not.toBeNull();
     });
     await waitFor(() => {
-      expect(screen.getByText('repo-a')).not.toBeNull();
+      expect(document.querySelector('.conv-rail-row')).not.toBeNull();
+      expect(document.querySelector('.conv-rail-row-model .chip.opus')).not.toBeNull();
     });
   });
 

@@ -6028,10 +6028,17 @@ mark.current {
   outline: none;
   box-shadow: var(--focus-ring-inset);
 }
+/* #228 S4 D3 — stronger you-are-here: a 3px left accent bar + brighter
+   background + brighter/bolder title, replacing the faint full 1px border. The
+   negative padding compensation keeps the row content from shifting when the
+   left bar appears. Applies to BOTH browse rows and search-result rows. */
 .conv-rail-row.is-active {
   background: var(--panel-bg-2);
-  border-color: var(--accent-blue);
+  border-color: transparent;
+  border-left: 3px solid var(--accent-blue);
+  padding-left: calc(var(--space-2) - 3px);
 }
+.conv-rail-row.is-active .conv-rail-row-title { color: var(--text); font-weight: 700; }
 .conv-rail-sec {
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
@@ -6062,14 +6069,38 @@ mark.current {
   font-size: 11px;
   white-space: nowrap;
 }
+/* #228 S4 D2 — one non-wrapping meta line: a left group ([project ·] branch ·
+   when) that ellipsizes inside the row, and a right stats cluster (model chip +
+   $cost + msg count) that keeps its width. */
 .conv-rail-row-meta {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: baseline;
-  gap: var(--space-1) var(--space-2);
+  gap: var(--space-2);
+  min-width: 0;
   font-size: 11px;
   color: var(--text-dim);
+  white-space: nowrap;
 }
+.conv-rail-row-metaleft {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+.conv-rail-row-metaleft > span { overflow: hidden; text-overflow: ellipsis; }
+.conv-rail-row-cluster {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.conv-rail-row-model { display: inline-flex; align-items: center; gap: 3px; }
+.conv-rail-row-model .chip { font-size: 9.5px; padding: 1px 5px; }
+.conv-rail-row-model-more { color: var(--text-faint); font-size: var(--fs-eyebrow); }
 .conv-rail-row-cost { color: var(--accent-green); }
 .conv-rail-row-snippet {
   margin-top: var(--space-1);
@@ -6124,17 +6155,12 @@ mark.current {
   border-color: var(--accent-blue);
 }
 .conv-rail-chip:disabled { opacity: 0.4; cursor: default; }
-/* #217 S4 / I-3.2 — subtle in-row separator dividing the content kinds (All …
-   Thinking) from the two structural facets (Title / Files). A thin vertical rule
-   with a touch of horizontal breathing room; it shrinks to 0 height alongside
-   the wrapping chips on a narrow rail. */
-.conv-rail-chips-sep {
-  flex: 0 0 auto;
-  align-self: stretch;
-  width: 1px;
-  margin: 1px var(--space-1);
-  background: var(--border-soft);
-}
+/* #228 S4 D7 — a deterministic full-width flex break dividing the content kinds
+   (All … Thinking) from the two structural facets (Title / Files), replacing the
+   old vertical separator rule. A zero-height `flex-basis:100%` element forces
+   Title/Files onto their own line at any width, so the grouping is robust on
+   wrap and never leaves a dangling rule. */
+.conv-rail-chips-break { flex-basis: 100%; height: 0; }
 .conv-rail-count {
   font-family: var(--font-mono);
   font-size: var(--fs-eyebrow);
@@ -6143,6 +6169,30 @@ mark.current {
   color: var(--text-faint);
   padding: 2px 6px 6px;
 }
+/* #228 S4 D4 — richer zero-result state: a query echo plus a "Search all
+   conversations" escape (narrow facet) and a "Clear search" action. */
+.conv-rail-noresults {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.conv-rail-noresults-q { color: var(--text); }
+.conv-rail-noresults-action {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: none;
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-radius: 5px;
+  padding: 3px var(--space-2);
+  cursor: pointer;
+}
+.conv-rail-noresults-action:hover { border-color: var(--accent-blue); }
 /* Search-hit title row: a flex line so the badge group rides top-right OUTSIDE
    the clamp box. Without this, badges nested in the clamped title (-webkit-line-
    clamp: 2; overflow: hidden) became the clipped third line on long titles and
@@ -6175,7 +6225,10 @@ mark.current {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent-blue);
-  border: 1px solid var(--border-soft);
+  /* #228 S4 D6 — a faint filled wash so the badge reads as a real chip rather
+     than near-invisible bordered text (the old ghost border). */
+  background: color-mix(in srgb, var(--panel-bg) 80%, var(--accent-blue));
+  border: 1px solid transparent;
   border-radius: 3px;
   padding: 1px var(--space-1);
   line-height: 1.4;
@@ -6199,12 +6252,34 @@ mark.current {
 }
 
 /* ---- filters spec §4: browse-list filters (button, popover, chips) ---- */
+/* #228 S4 C4 — the search header is two rows: a full-width input row (with a
+   leading magnifier glyph) over a controls row (Filters + Sort). The old single
+   horizontal row starved the input so even its placeholder truncated. */
 .conv-rail-search-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+.conv-rail-search-inputwrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.conv-rail-search-mag {
+  position: absolute;
+  left: 8px;
+  color: var(--text-faint);
+  font-size: 13px;
+  pointer-events: none;
+}
+.conv-rail-search-inputwrap .conv-rail-search-input { width: 100%; padding-left: 26px; }
+.conv-rail-search-controls {
   display: flex;
   align-items: stretch;
   gap: 6px;
 }
-.conv-rail-search-bar .conv-rail-search-input { flex: 1 1 auto; }
+.conv-rail-search-controls .conv-rail-sort { margin-left: auto; }
 .conv-rail-filters-btn {
   flex: 0 0 auto;
   appearance: none;
@@ -6519,15 +6594,40 @@ mark.current {
 }
 .conv-findbar-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-findbar-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+/* #228 S4 D8 — strengthen the pressed toggle (bolder than the old faint accent
+   fill) so the on-state is unmistakable. */
 .conv-findbar-toggle[aria-pressed='true'] {
   color: var(--bg-base);
   background: var(--accent-blue);
   border-color: var(--accent-blue);
+  font-weight: 700;
 }
-/* Narrow viewports: shrink the input so the pill still floats without overflow. */
+/* #228 S4 D8 — the always-visible mode tag (regex / case / regex · case). */
+.conv-findbar-mode {
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+/* #228 S4 C3 — mobile find bar. The bar is absolutely positioned with only
+   `right` + a `max-width`, so it shrink-wraps to content and `flex:1 1 100%`
+   alone would NOT make the input span the row. Pin both `left` and `right` (and
+   `max-width: none`) to give it a definite full-viewport width, then flex-wrap so
+   the full-width input takes the first line and the toggles + mode tag + counter
+   + nav + close wrap beneath. The `#root` prefix beats the desktop
+   `.conv-findbar` / `.conv-findbar-input` rules at the specificity floor. */
 @media (max-width: 640px) {
-  .conv-findbar { gap: var(--space-1); padding: var(--space-1) var(--space-1); }
-  .conv-findbar-input { width: 110px; min-width: 70px; }
+  #root .conv-findbar {
+    left: 12px;
+    right: 12px;
+    max-width: none;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-1);
+  }
+  #root .conv-findbar-input { flex: 1 1 100%; width: 100%; min-width: 0; }
 }
 /* Touch targets: the toggles inherit the same ≥44px floor as the input on
    coarse pointers (mirrors the #205 mobile pass). */
