@@ -9,6 +9,7 @@ import { computeSequenceDiff, type SpinePrompt } from './sessionAlign';
 import { metricsFromOutline } from './comparisonMetricsCalc';
 import { ComparisonHeader, type SideHeader } from './ComparisonHeader';
 import { ComparisonMetrics } from './ComparisonMetrics';
+import { ComparisonLegend } from './ComparisonLegend';
 import { ComparisonDiff } from './ComparisonDiff';
 import type { ConversationOutline } from '../types/conversation';
 
@@ -118,6 +119,7 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
         onClose={onClose}
       />
       {mA && mB && <ComparisonMetrics a={mA} b={mB} />}
+      <ComparisonLegend wide={wide} />
       <ComparisonDiff
         rows={rows}
         wide={wide}

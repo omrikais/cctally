@@ -8930,6 +8930,24 @@ mark.current {
    glyph. A green ▼ improvement is now matched by a red ▲ regression (was a
    one-sided green-only `conv-cmp-metric-down` rule, removed). */
 
+/* ---- The diff legend (E8) ---------------------------------------------- */
+.conv-cmp-legend {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 6px var(--space-4);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  font-family: var(--font-mono); font-size: var(--fs-eyebrow); color: var(--text-dim);
+}
+.conv-cmp-legend-key { color: var(--text-faint); letter-spacing: 0.07em; text-transform: uppercase; }
+.conv-cmp-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.conv-cmp-legend-g { font-weight: 700; }
+.conv-cmp-legend-g--div { color: var(--accent-amber); }
+.conv-cmp-legend-gap {
+  display: inline-block; width: 16px; height: 11px; border-radius: 2px;
+  border: 1px solid var(--border-soft);
+  background: repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255, 255, 255, 0.08) 3px, rgba(255, 255, 255, 0.08) 6px);
+}
+
 /* ---- The aligned diff -------------------------------------------------- */
 .conv-cmp-diff { display: flex; flex-direction: column; padding: var(--space-2) 0; }
 
