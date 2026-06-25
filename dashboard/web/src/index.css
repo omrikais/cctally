@@ -8784,17 +8784,28 @@ mark.current {
 .conv-view--compare.conv-view--mobile { display: block; }
 
 /* ---- "Compare with…" reader-head control (mirrors .conv-outline-toggle) -- */
+/* #228 S5 E4 — surfaced with a blue accent + a button-owned leading divider so
+   it reads as a distinct affordance. The divider is a ::before on the button
+   itself (NOT a standalone flex node) because .conv-reader-controls wraps —
+   a separate spacer could wrap onto its own line or detach (Codex P2). */
 .conv-compare-with {
   appearance: none;
-  border: 1px solid var(--border-soft);
-  background: var(--panel-bg);
+  border: 1px solid rgba(96, 165, 250, 0.40);
+  background: rgba(96, 165, 250, 0.08);
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11px;
   padding: var(--space-1) var(--space-2);
   border-radius: 5px;
   cursor: pointer;
+  margin-left: var(--space-2);
+  position: relative;
 }
+.conv-compare-with::before {
+  content: ""; position: absolute; left: calc(-1 * var(--space-1));
+  top: 4px; bottom: 4px; width: 1px; background: var(--border-soft);
+}
+.conv-compare-with-glyph { color: var(--accent-blue); font-weight: 700; }
 .conv-compare-with:hover { color: var(--text); border-color: var(--accent-blue); }
 .conv-compare-with:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 

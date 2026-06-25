@@ -2469,7 +2469,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             aria-label="Compare this session with another"
             title="Compare with another session"
             onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
-          >⟷ Compare with…</button>
+          ><span className="conv-compare-with-glyph" aria-hidden="true">⟷ </span>Compare with…</button>
           {/* #205 S2 (F3) — Find toggle. Mirrors the outline toggle's
               aria-pressed semantics + chrome; gives the `/` shortcut a visible,
               tappable counterpart (the only find affordance on touch). */}
