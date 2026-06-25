@@ -8968,7 +8968,15 @@ mark.current {
   word-break: break-word;
   color: var(--reader-ink, var(--text));
 }
-.conv-cmp-cell--match { color: var(--text-dim); border-left-color: var(--border-soft); }
+/* #228 S5 E3 — match cells read as a deliberate "these agreed" state (faint
+   container + `=` marker), not stray grey text. */
+.conv-cmp-cell--match {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.022);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--text-faint);
+}
+.conv-cmp-cell--match .conv-cmp-cell-marker { color: var(--text-faint); }
 .conv-cmp-cell--del {
   background: rgba(239, 68, 68, 0.08);
   border-left-color: var(--accent-red);
@@ -9020,7 +9028,14 @@ mark.current {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.conv-cmp-uline--match { color: var(--text-dim); border-left-color: var(--border-soft); }
+/* #228 S5 E3 — the unified match line gets the same agreed-state container. */
+.conv-cmp-uline--match {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.022);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--text-faint);
+}
+.conv-cmp-uline--match .conv-cmp-uline-sign { color: var(--text-faint); }
 .conv-cmp-uline--del { background: rgba(239, 68, 68, 0.08); border-left-color: var(--accent-red); }
 .conv-cmp-uline--add { background: rgba(61, 220, 132, 0.08); border-left-color: var(--accent-green); }
 .conv-cmp-uline-sign { font-weight: 700; }

@@ -86,4 +86,22 @@ describe('ComparisonDiff', () => {
     expect(container.querySelector('.conv-cmp-cell--gap')).not.toBeNull();
     expect(screen.queryByText(/divergence/i)).toBeNull();
   });
+
+  it('wide mode uses −/+/= markers (no ◆) and a match container', () => {
+    const r: AlignmentRow[] = [
+      { kind: 'match', a: { uuid: 'm1', label: 'shared' }, b: { uuid: 'm2', label: 'shared' }, divergence: false },
+      { kind: 'replace', a: { uuid: 'a2', label: 'fix mock' }, b: { uuid: 'b2', label: 'use fixtures' }, divergence: true },
+      { kind: 'aOnly', a: { uuid: 'a3', label: 'only in A' }, b: null, divergence: false },
+    ];
+    const { container } = render(
+      <ComparisonDiff rows={r} wide expandedKey={null} onToggleRow={() => {}}
+        promptsA={{}} promptsB={{}} onOpenInReader={() => {}} />,
+    );
+    const markers = [...container.querySelectorAll('.conv-cmp-cell-marker')].map((e) => e.textContent?.trim());
+    expect(markers).toContain('=');
+    expect(markers).toContain('−');
+    expect(markers).toContain('+');
+    expect(markers).not.toContain('◆');
+    expect(container.querySelector('.conv-cmp-cell--match')).not.toBeNull();
+  });
 });

@@ -99,20 +99,23 @@ function Cell({ side, row }: { side: 'a' | 'b'; row: AlignmentRow }) {
   if (!prompt) {
     return <span className="conv-cmp-cell conv-cmp-cell--gap" aria-hidden="true" />;
   }
-  // del = removed side (A) of a replace; add = added side (B) of a replace.
+  // #228 S5 E3/E7 — glyph carries the state (never colour alone): = match,
+  // − the A side, + the B side.
   let tone = 'conv-cmp-cell--match';
-  let marker: string | null = null;
+  let marker = '=';
   if (row.kind === 'replace') {
     tone = side === 'a' ? 'conv-cmp-cell--del' : 'conv-cmp-cell--add';
-    marker = '◆'; // #227 — same diamond on both sides of a replace (tone carries the side)
+    marker = side === 'a' ? '−' : '+';
   } else if (row.kind === 'aOnly') {
     tone = 'conv-cmp-cell--del';
+    marker = '−';
   } else if (row.kind === 'bOnly') {
     tone = 'conv-cmp-cell--add';
+    marker = '+';
   }
   return (
     <span className={`conv-cmp-cell ${tone}`}>
-      {marker && <span className="conv-cmp-cell-marker" aria-hidden="true">{marker} </span>}
+      <span className="conv-cmp-cell-marker" aria-hidden="true">{marker} </span>
       <span className="conv-cmp-cell-label">{prompt.label}</span>
     </span>
   );
@@ -139,6 +142,7 @@ function UnifiedRow({
     >
       {row.kind === 'match' && row.a && (
         <span className="conv-cmp-uline conv-cmp-uline--match">
+          <span className="conv-cmp-uline-sign" aria-hidden="true">= </span>
           <span className="conv-cmp-uline-label">{row.a.label}</span>
         </span>
       )}
