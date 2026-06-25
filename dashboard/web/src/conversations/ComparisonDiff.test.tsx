@@ -87,6 +87,31 @@ describe('ComparisonDiff', () => {
     expect(screen.queryByText(/divergence/i)).toBeNull();
   });
 
+  it('wide mode renders a column header with A (blue) / B (purple) titles; unified does not', () => {
+    const { container, rerender } = render(
+      <ComparisonDiff rows={rows} wide aTitle="Run Alpha" bTitle="Run Beta"
+        expandedKey={null} onToggleRow={() => {}} promptsA={{}} promptsB={{}} onOpenInReader={() => {}} />,
+    );
+    const a = container.querySelector('.conv-cmp-colhead--a') as HTMLElement;
+    const b = container.querySelector('.conv-cmp-colhead--b') as HTMLElement;
+    expect(a.textContent).toContain('Run Alpha');
+    expect(b.textContent).toContain('Run Beta');
+    rerender(
+      <ComparisonDiff rows={rows} wide={false} aTitle="Run Alpha" bTitle="Run Beta"
+        expandedKey={null} onToggleRow={() => {}} promptsA={{}} promptsB={{}} onOpenInReader={() => {}} />,
+    );
+    expect(container.querySelector('.conv-cmp-colhead')).toBeNull();
+  });
+
+  it('the expand panel shows an A and a B chip', () => {
+    const { container } = render(
+      <ComparisonDiff rows={rows} wide expandedKey={'a2|b2'} onToggleRow={() => {}}
+        promptsA={{ a2: 'A text' }} promptsB={{ b2: 'B text' }} onOpenInReader={() => {}} />,
+    );
+    expect(container.querySelector('.conv-cmp-expand-chip--a')?.textContent).toBe('A');
+    expect(container.querySelector('.conv-cmp-expand-chip--b')?.textContent).toBe('B');
+  });
+
   it('wide mode uses −/+/= markers (no ◆) and a match container', () => {
     const r: AlignmentRow[] = [
       { kind: 'match', a: { uuid: 'm1', label: 'shared' }, b: { uuid: 'm2', label: 'shared' }, divergence: false },

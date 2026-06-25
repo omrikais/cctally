@@ -47,6 +47,9 @@ function Side({
   const sideLabel = side === 'a' ? 'A' : 'B';
   return (
     <div className={`conv-cmp-expand-side conv-cmp-expand-side--${side}`}>
+      {/* #228 S5 E2 — a visible A/B chip (blue = A, purple = B) anchors which
+          side this text belongs to once the column header has scrolled away. */}
+      <span className={`conv-cmp-expand-chip conv-cmp-expand-chip--${side}`} aria-hidden="true">{sideLabel}</span>
       <div className="conv-cmp-expand-body">
         {text === undefined ? (
           <span className="conv-cmp-expand-loading">loading…</span>

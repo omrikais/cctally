@@ -11,6 +11,10 @@ import { ExpandedPrompt } from './ExpandedPrompt';
 export interface ComparisonDiffProps {
   rows: AlignmentRow[];
   wide: boolean; // from useIsWide()
+  // #228 S5 E2 — the per-side run titles, surfaced in the sticky wide-mode
+  // column header so A/B identity persists once the header scrolls away.
+  aTitle?: string;
+  bTitle?: string;
   expandedKey: string | null; // `${a?.uuid}|${b?.uuid}`
   onToggleRow: (key: string) => void;
   promptsA: Record<string, string>; // uuid -> full text (partial/empty until loaded)
@@ -32,14 +36,29 @@ function DivergenceBar() {
 }
 
 export function ComparisonDiff(props: ComparisonDiffProps) {
-  const { rows, wide, expandedKey, onToggleRow, promptsA, promptsB, onOpenInReader } = props;
+  const { rows, wide, aTitle, bTitle, expandedKey, onToggleRow, promptsA, promptsB, onOpenInReader } = props;
   let prevDivergence = false;
   return (
-    <div
-      className={`conv-cmp-diff ${wide ? 'conv-cmp-diff--wide' : 'conv-cmp-diff--unified'}`}
-      role="list"
-    >
-      {rows.map((row, i) => {
+    <>
+      {/* #228 S5 E2 — the sticky wide-mode column header anchors A/B identity
+          (blue = A, purple = B) above the diff; rendered as a fragment sibling
+          of the role="list" so list semantics stay valid. Unified mode omits
+          it entirely. */}
+      {wide && (
+        <div className="conv-cmp-colhead">
+          <span className="conv-cmp-colhead-cell conv-cmp-colhead--a">
+            A{aTitle ? <span className="conv-cmp-colhead-title"> · {aTitle}</span> : null}
+          </span>
+          <span className="conv-cmp-colhead-cell conv-cmp-colhead--b">
+            B{bTitle ? <span className="conv-cmp-colhead-title"> · {bTitle}</span> : null}
+          </span>
+        </div>
+      )}
+      <div
+        className={`conv-cmp-diff ${wide ? 'conv-cmp-diff--wide' : 'conv-cmp-diff--unified'}`}
+        role="list"
+      >
+        {rows.map((row, i) => {
         const key = rowKey(row);
         const startRegion = row.divergence && !prevDivergence;
         prevDivergence = row.divergence;
@@ -64,7 +83,8 @@ export function ComparisonDiff(props: ComparisonDiffProps) {
           </Fragment>
         );
       })}
-    </div>
+      </div>
+    </>
   );
 }
 

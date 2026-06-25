@@ -104,11 +104,16 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
   const mA = outA.outline ? metricsFromOutline(outA.outline, spineA.length) : null;
   const mB = outB.outline ? metricsFromOutline(outB.outline, spineB.length) : null;
 
+  // #228 S5 E2 — resolve both side headers once and reuse the titles for the
+  // sticky wide-mode column header (ComparisonDiff) so identity is anchored.
+  const ha = headerOf(a, outA.outline, ctx, titles);
+  const hb = headerOf(b, outB.outline, ctx, titles);
+
   return (
     <div className={`conv-cmp ${wide ? 'conv-cmp--wide' : 'conv-cmp--unified'}`}>
       <ComparisonHeader
-        a={headerOf(a, outA.outline, ctx, titles)}
-        b={headerOf(b, outB.outline, ctx, titles)}
+        a={ha}
+        b={hb}
         onSwap={() => dispatch({ type: 'SWAP_COMPARE' })}
         onClose={onClose}
       />
@@ -116,6 +121,8 @@ export function ComparisonView({ a, b }: { a: string; b: string }) {
       <ComparisonDiff
         rows={rows}
         wide={wide}
+        aTitle={ha.title}
+        bTitle={hb.title}
         expandedKey={expandedKey}
         onToggleRow={(k) => setExpandedKey((cur) => (cur === k ? null : k))}
         promptsA={promptsA.byUuid ?? {}}

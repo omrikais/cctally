@@ -8837,6 +8837,18 @@ mark.current {
   text-transform: uppercase;
   color: var(--text-faint);
 }
+
+/* #228 S5 E2 — anchored A/B identity (A = --ab-a blue, B = --ab-b purple),
+   carried on the header side-tags + the expand-panel chips. */
+.conv-cmp-head-side-tag--a,
+.conv-cmp-expand-chip--a { color: var(--ab-a); background: rgba(96, 165, 250, 0.13); border: 1px solid rgba(96, 165, 250, 0.40); }
+.conv-cmp-head-side-tag--b,
+.conv-cmp-expand-chip--b { color: var(--ab-b); background: rgba(192, 132, 252, 0.13); border: 1px solid rgba(192, 132, 252, 0.40); }
+.conv-cmp-head-side-tag--a, .conv-cmp-head-side-tag--b,
+.conv-cmp-expand-chip--a, .conv-cmp-expand-chip--b {
+  width: max-content; padding: 1px 7px; border-radius: 4px;
+}
+.conv-cmp-expand-chip { font-size: var(--fs-eyebrow); font-weight: 700; align-self: flex-start; }
 .conv-cmp-head-side-name {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -9049,6 +9061,37 @@ mark.current {
   color: var(--text-faint);
   margin-right: var(--space-1);
 }
+/* #228 S5 E2 — tint the unified A/B tags to the A/B accent (del row = A blue,
+   add row = B purple) so identity is consistent with the wide colhead. */
+.conv-cmp-uline--del .conv-cmp-uline-tag { color: var(--ab-a); }
+.conv-cmp-uline--add .conv-cmp-uline-tag { color: var(--ab-b); }
+
+/* #228 S5 E2 — the sticky wide-mode column header (A blue / B purple), aligned
+   to the diff's two columns. */
+.conv-cmp-colhead {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  padding: 6px var(--space-4);
+  background: var(--panel-bg); border-bottom: 1px solid var(--border-soft);
+}
+.conv-cmp-colhead-cell {
+  font-family: var(--font-mono); font-size: var(--fs-eyebrow); font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  padding-left: 9px; border-left: 3px solid transparent;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.conv-cmp-colhead--a { color: var(--ab-a); border-left-color: var(--ab-a); }
+.conv-cmp-colhead--b { color: var(--ab-b); border-left-color: var(--ab-b); }
+.conv-cmp-colhead-title { color: var(--text-faint); font-weight: 400; letter-spacing: 0; text-transform: none; }
+
+/* #228 S5 E2 (Codex P1) — ≥1101px: the colhead pins; the wide head goes static
+   so a single element pins per scroll (no dynamic dual-offset). Gated on the
+   media query (not the .conv-cmp--wide class) so a stale wide render during a
+   slow matchMedia swap in the tablet/unified band never pins a 2-col header
+   over a non-sticky head. */
+@media (min-width: 1101px) {
+  .conv-cmp--wide .conv-cmp-head { position: static; }
+  .conv-cmp--wide .conv-cmp-colhead { position: sticky; top: 0; z-index: 2; }
+}
 
 /* ---- The lazy expand panel --------------------------------------------- */
 .conv-cmp-expand {
@@ -9156,6 +9199,11 @@ mark.current {
   .conv-cmp-row { grid-template-columns: 1fr; }
   .conv-cmp-row .conv-cmp-cell--gap { display: none; }
   .conv-cmp--wide .conv-cmp-expand { grid-template-columns: 1fr; }
+  /* #228 S5 E2 (Codex P1) — a stale .conv-cmp--wide render must not show the
+     2-col header in the tablet/unified band; the head stays sticky by default
+     here. */
+  .conv-cmp-colhead { display: none; }
+  .conv-cmp--wide .conv-cmp-head { position: sticky; top: 0; }
 }
 @media (max-width: 640px) {
   .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
