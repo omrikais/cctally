@@ -219,6 +219,27 @@ describe('FindBar', () => {
     expect(url).toContain('case=1');
   });
 
+  // #228 S4 D8 — an always-visible mode tag spells out the active toggles, so
+  // the meaning of an on `.*`/`Aa` is never silent. Pure render from the toggle
+  // state — no new persistence, survives typing (unlike a placeholder cue).
+  it('shows an always-visible mode tag reflecting the active regex/case toggles', () => {
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    // No toggle on → no mode tag.
+    expect(document.querySelector('.conv-findbar-mode')).toBeNull();
+    // Regex on → "regex".
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /regular expression/i })); });
+    const tag = document.querySelector('.conv-findbar-mode')!;
+    expect(tag).toBeTruthy();
+    expect(tag.textContent).toBe('regex');
+    // Case on too → "regex · case".
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /case-sensitive/i })); });
+    expect(document.querySelector('.conv-findbar-mode')!.textContent).toBe('regex · case');
+    // Both off → the tag is gone again.
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /regular expression/i })); });
+    act(() => { fireEvent.click(screen.getByRole('button', { name: /case-sensitive/i })); });
+    expect(document.querySelector('.conv-findbar-mode')).toBeNull();
+  });
+
   it('seeds the toggle state from localStorage on mount', () => {
     localStorage.setItem('cctally.conv.find.regex', '1');
     localStorage.setItem('cctally.conv.find.case', '1');

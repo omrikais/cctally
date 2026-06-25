@@ -159,6 +159,11 @@ export function FindBar({
   const has = anchors.length > 0;
   const current = has ? anchors[cursor] : null;
   const counter = `${has ? cursor + 1 : 0} / ${total}`;
+  // #228 S4 D8 — an always-visible mode tag spelling out the active toggles
+  // (regex / case / regex · case). It survives typing (unlike a placeholder cue)
+  // and answers "what does `.*`/`Aa` mean?" Pure render from the existing
+  // regex/caseSensitive state — no new persistence, no new data.
+  const modeLabel = [regex && 'regex', caseSensitive && 'case'].filter(Boolean).join(' · ');
 
   return (
     <div
@@ -194,6 +199,9 @@ export function FindBar({
         title="Case-sensitive (Aa)"
         onClick={toggleCase}
       >Aa</button>
+      {modeLabel && (
+        <span className="conv-findbar-mode" aria-label={`search mode: ${modeLabel}`}>{modeLabel}</span>
+      )}
       <span className="conv-findbar-count" aria-live="polite">
         {counter}
         {truncated && <span className="conv-findbar-note"> · first 500</span>}
