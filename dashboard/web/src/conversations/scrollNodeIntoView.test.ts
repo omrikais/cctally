@@ -2,7 +2,32 @@
 // so the DOM wrapper scrollNodeIntoView and pixel-exact landing are verified by
 // the Playwright ui-qa gate, not here; only the offset/clamp math is unit-tested.
 import { describe, expect, it } from 'vitest';
-import { computeAlignScrollTop } from './scrollNodeIntoView';
+import { alignScrollTop, computeAlignScrollTop } from './scrollNodeIntoView';
+
+function fakeEl(rect: { top: number; height: number }): HTMLElement {
+  return { getBoundingClientRect: () => ({ top: rect.top, height: rect.height }) } as unknown as HTMLElement;
+}
+function fakeScroller(o: { top: number; scrollTop: number; clientHeight: number; scrollHeight: number }): HTMLElement {
+  return {
+    getBoundingClientRect: () => ({ top: o.top }),
+    scrollTop: o.scrollTop, clientHeight: o.clientHeight, scrollHeight: o.scrollHeight,
+  } as unknown as HTMLElement;
+}
+
+describe('alignScrollTop', () => {
+  it('measures the rects and matches computeAlignScrollTop (center + start)', () => {
+    const scroller = fakeScroller({ top: 0, scrollTop: 1000, clientHeight: 800, scrollHeight: 100000 });
+    const el = fakeEl({ top: 500, height: 100 });
+    expect(alignScrollTop(scroller, el, 'center')).toBe(1150); // 1500 - (800-100)/2
+    expect(alignScrollTop(scroller, el, 'start')).toBe(1500);
+  });
+
+  it('honors a non-zero scrollerTop', () => {
+    const scroller = fakeScroller({ top: 200, scrollTop: 1000, clientHeight: 800, scrollHeight: 100000 });
+    const el = fakeEl({ top: 500, height: 100 });
+    expect(alignScrollTop(scroller, el, 'start')).toBe(1300); // 500 - 200 + 1000
+  });
+});
 
 describe('computeAlignScrollTop', () => {
   // el is 100px tall, currently 500px below the scroller's top edge; scroller is

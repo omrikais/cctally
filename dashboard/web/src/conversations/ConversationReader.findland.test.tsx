@@ -16,9 +16,17 @@ import type { ConversationItem } from '../types/conversation';
 // independent of layout).
 
 const scrollCalls: HTMLElement[] = [];
+// #237 — only the convergent re-center loop reads the desired offset via
+// alignScrollTop (its measure() calls it every frame); the #236 fallback center
+// path never does. Recording invocations here lets the branch test prove the
+// expand_details find-jump actually ROUTED THROUGH the loop, not just that the
+// center target was the mark (both branches center the same mark — without this
+// the routing assertion would be vacuous).
+const alignCalls: HTMLElement[] = [];
 vi.mock('./scrollNodeIntoView', () => ({
   scrollNodeIntoView: (_scroller: HTMLElement, el: HTMLElement) => { scrollCalls.push(el); },
   computeAlignScrollTop: () => 0,
+  alignScrollTop: (_scroller: HTMLElement, el: HTMLElement) => { alignCalls.push(el); return 0; },
 }));
 
 const sentinelMark = document.createElement('mark');
@@ -121,6 +129,7 @@ beforeEach(() => {
   _idByUuid.clear();
   _nextItemId = 1;
   scrollCalls.length = 0;
+  alignCalls.length = 0;
   if (typeof Element.prototype.scrollTo !== 'function') {
     Element.prototype.scrollTo = () => {};
   }
@@ -162,6 +171,10 @@ describe('#236 find-jump lands on the matched word', () => {
 
     // Every center call targeted the sentinel mark, not the turn root.
     expect(scrollCalls.every((el) => el === sentinelMark)).toBe(true);
+    // A non-expand_details find-jump takes the #236 fallback center path, NOT the
+    // #237 convergent loop — so alignScrollTop is never consulted here. (Locks the
+    // routing distinction from the other side so the #237 assertion isn't vacuous.)
+    expect(alignCalls.length).toBe(0);
   });
 
   it('centers the turn root when find is CLOSED (firstLandableMark not consulted)', async () => {
@@ -179,5 +192,31 @@ describe('#236 find-jump lands on the matched word', () => {
     expect(scrollCalls.some((el) => el === sentinelMark)).toBe(false);
     const turn = container.querySelector('[data-uuid="targetMember"]') as HTMLElement;
     expect(scrollCalls).toContain(turn);
+  });
+
+  it('#237 — an expand_details find-jump routes through the convergent loop and centers the mark', async () => {
+    mockFetchOnce(detail(items()));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="m1"]')).not.toBeNull());
+
+    act(() => { dispatch({ type: 'OPEN_CONV_FIND' }); });
+    await waitFor(() => expect(getState().convFindOpen).toBe(true));
+
+    act(() => {
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's',
+        jump: { session_id: 's', uuid: 'targetMember', expand_details: true } });
+    });
+
+    await waitFor(() => expect(scrollCalls.length).toBeGreaterThan(0));
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+
+    // The convergent loop's apply() centers the landable mark, never the turn root.
+    expect(scrollCalls.every((el) => el === sentinelMark)).toBe(true);
+    // Proof the jump ROUTED THROUGH the convergent loop (not the #236 fallback):
+    // only the loop's measure() reads alignScrollTop, so a non-zero call count is
+    // the signature of the new expand_details branch — and it measured the mark.
+    expect(alignCalls.length).toBeGreaterThan(0);
+    expect(alignCalls.every((el) => el === sentinelMark)).toBe(true);
   });
 });

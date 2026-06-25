@@ -21,6 +21,21 @@ export function computeAlignScrollTop(a: AlignArgs): number {
 }
 
 /**
+ * Measure `el` + `scroller` and return the scrollTop that aligns `el` to
+ * `start`/`center` — the exact math `scrollNodeIntoView` writes. Split out (#237)
+ * so the convergent re-center loop can read the live desired offset each frame
+ * WITHOUT writing, sharing ONE measurement+compute path with the writer.
+ */
+export function alignScrollTop(scroller: HTMLElement, el: HTMLElement, align: 'start' | 'center'): number {
+  const er = el.getBoundingClientRect();
+  const sr = scroller.getBoundingClientRect();
+  return computeAlignScrollTop({
+    elTop: er.top, elHeight: er.height, scrollerTop: sr.top, scrollTop: scroller.scrollTop,
+    viewportHeight: scroller.clientHeight, maxScrollTop: scroller.scrollHeight - scroller.clientHeight, align,
+  });
+}
+
+/**
  * Land `el` precisely inside the Virtuoso scroller by writing scrollTop directly
  * (spec §2.1). NOT `el.scrollIntoView` — that is inert inside the library-managed
  * absolute-positioned row (measured 0px). Jump/find landings pass behavior:'auto'
@@ -33,12 +48,7 @@ export function scrollNodeIntoView(
   scroller: HTMLElement, el: HTMLElement,
   align: 'start' | 'center', behavior: ScrollBehavior = 'auto',
 ): void {
-  const er = el.getBoundingClientRect();
-  const sr = scroller.getBoundingClientRect();
-  const top = computeAlignScrollTop({
-    elTop: er.top, elHeight: er.height, scrollerTop: sr.top, scrollTop: scroller.scrollTop,
-    viewportHeight: scroller.clientHeight, maxScrollTop: scroller.scrollHeight - scroller.clientHeight, align,
-  });
+  const top = alignScrollTop(scroller, el, align);
   // JSDOM (the vitest env) does not implement Element.prototype.scrollTo; guard
   // it so the jump effect can run end-to-end under test, falling back to a direct
   // scrollTop write. Real browsers always have scrollTo (this is the precision path).

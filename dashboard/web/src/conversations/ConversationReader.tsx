@@ -24,9 +24,10 @@ import { TranscriptContext } from './TranscriptContext';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
-import { scrollNodeIntoView } from './scrollNodeIntoView';
+import { scrollNodeIntoView, alignScrollTop } from './scrollNodeIntoView';
 import { firstLandableMark } from './findMark';
 import { walkToTarget } from './walkToTarget';
+import { reassertCenter } from './reassertCenter';
 import { resolveJumpOwner } from './resolveJumpOwner';
 import { isLayoutStable, type LayoutSnapshot } from './layoutStable';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
@@ -48,6 +49,10 @@ import type { ConversationItem, ConversationOutline, OpenIntent, SubagentMeta } 
 // `^…$` + the unrolled-lazy body match the server `fullmatch`).
 const CMD_FAMILY_RE = /^\s*(?:<((?:local-)?command-[a-z-]+)>(?:(?!<\/\1>)[\s\S])*<\/\1>\s*)+$/;
 const looksLikeCommandPlumbing = (t: string): boolean => CMD_FAMILY_RE.test(t);
+
+// #237 — convergent re-center bounds for an expand_details disclosure find-jump.
+const REASSERT_STABLE_FRAMES = 4;  // consecutive same-target within-tol frames = settled
+const REASSERT_BUDGET_MS = 800;    // wall-clock fallback ceiling (refresh-rate-independent)
 
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
@@ -1191,6 +1196,40 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
             await waitForQuiesce(targetUuid);
             if (aborted()) return;
             scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
+          } else if (jump.expand_details && convFindOpenRef.current) {
+            // #237 — an auto-expanded disclosure settles to a SHORTER height over
+            // ~150ms AFTER the open (content-visibility / lazy layout). With
+            // scrollTop pinned by a single center+re-assert, the content above the
+            // matched <mark> collapsing pulls the word UP (measured up to ~640px
+            // above center on a tall turn); the turn-anchored quiesce can't catch
+            // it (the turn top never moves, only the mark rides up) and
+            // false-settles on a 2-frame lull. Re-center the matched mark every
+            // frame until the computed center offset stops changing, so the word
+            // stays pinned at center through the collapse and lands dead-center.
+            // The target is re-resolved EACH frame (Codex P2-2/P2-3): the live turn
+            // from itemRefs/DOM (robust to Virtuoso recycling) → its first landable
+            // mark, returned so apply() re-centers that exact element; a target
+            // swap restarts the stable count and a disconnect aborts the loop.
+            const probeTarget = (): HTMLElement | null => {
+              const turn = (itemRefs.current.get(targetUuid)
+                ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+              if (!turn || !turn.isConnected) return null;
+              return (convFindOpenRef.current ? firstLandableMark(turn) : null) ?? turn;
+            };
+            await reassertCenter({
+              measure: () => {
+                const t = probeTarget();
+                return t ? { desired: alignScrollTop(body, t, 'center'), target: t } : null;
+              },
+              apply: (f) => scrollNodeIntoView(body, f.target as HTMLElement, 'center', 'auto'),
+              nextFrame: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
+              now: () => performance.now(),
+              isAborted: aborted,
+              tol: 1,
+              stableNeeded: REASSERT_STABLE_FRAMES,
+              budgetMs: REASSERT_BUDGET_MS,
+            });
+            if (aborted()) return;
           } else {
             // #236 — land on the matched WORD: center the turn's first LANDABLE
             // <mark> when find is open, re-querying before each scroll (robust to
