@@ -180,6 +180,7 @@ describe('ConversationRail', () => {
 
   it('search rows show the title header above the snippet', () => {
     searchHits = [hit({})];
+    searchTotal = 1;
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
     render(<ConversationRail />);
     const row = document.querySelector('.conv-rail-row--hit')!;
@@ -323,18 +324,24 @@ describe('ConversationRail', () => {
     expect(document.querySelector('.conv-rail-hint')).toBeNull();
   });
 
-  it('folds "· indexing…" into the count line when an active split-needing kind is prose-only', () => {
+  it('folds "· indexing…" into the no-results state when an active split-needing kind is prose-only', () => {
     // #177 S6 M1 — Tools/Thinking selected while the split index is still
     // backfilling (prose-only). The chip greys out but the hook still renders an
     // empty/degraded list; the inline note explains it (the disabled chip's
-    // title="indexing…" is hover-only and keyboard-unreachable).
+    // title="indexing…" is hover-only and keyboard-unreachable). #228 S4 D4 — a
+    // zero-result search now renders the richer no-results block, so the
+    // indexing note rides the query-echo line there (not the old count line).
     searchHits = [];
     searchTotal = 0;
     searchDepth = 'prose-only';
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'npm' });
     dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'tools' });
     render(<ConversationRail />);
-    expect(document.querySelector('.conv-rail-count')!.textContent).toBe('No results · indexing…');
+    expect(document.querySelector('.conv-rail-count')).toBeNull();
+    const q = document.querySelector('.conv-rail-noresults-q')!;
+    expect(q).toBeTruthy();
+    expect(q.textContent).toContain('No results for “npm”');
+    expect(q.textContent).toContain('· indexing…');
   });
 
   it('does NOT add "· indexing…" for a non-split kind under prose-only', () => {
@@ -359,12 +366,15 @@ describe('ConversationRail', () => {
     expect(document.querySelector('.conv-rail-count')!.textContent).toBe('4 results');
   });
 
-  it('count line shows "No results" when total is 0', () => {
+  it('shows the richer no-results state (query echo) when total is 0', () => {
+    // #228 S4 D4 — a zero-result search replaces the bare "No results" count line
+    // with the no-results block that echoes the query.
     searchHits = [];
     searchTotal = 0;
     dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'zzz' });
     render(<ConversationRail />);
-    expect(document.querySelector('.conv-rail-count')!.textContent).toBe('No results');
+    expect(document.querySelector('.conv-rail-count')).toBeNull();
+    expect(document.querySelector('.conv-rail-noresults-q')!.textContent).toContain('No results for “zzz”');
   });
 
   // ---- #177 S6: match-kind badges ----
@@ -407,9 +417,11 @@ describe('ConversationRail', () => {
 
   // ---- #217 S4 / I-3.3: Title + File hit rendering ----
 
-  it('renders a title hit with a "title" badge and the matched-title snippet', () => {
+  it('renders a title hit with the matched-title snippet; the echoed "title" badge is suppressed in the Title facet', () => {
     // kind=title → session-level hit, snippet = the matched title (FTS [..]
-    // markers), match_kinds:["title"]. The badge map renders "title".
+    // markers), match_kinds:["title"]. #228 S4 D5 — in the single-kind Title
+    // facet the badge that merely echoes the facet header is suppressed (it says
+    // nothing the facet doesn't), so no badge renders here.
     searchHits = [hit({
       uuid: 'first-turn',
       title: 'how does the lock work',
@@ -421,17 +433,19 @@ describe('ConversationRail', () => {
     dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'title' });
     render(<ConversationRail />);
     const row = document.querySelector('.conv-rail-row--hit')!;
-    const badges = [...row.querySelectorAll('.conv-rail-kindb')].map((b) => b.textContent);
-    expect(badges).toEqual(['title']);
+    // The redundant facet-echoing "title" badge is gone.
+    expect(row.querySelector('.conv-rail-kindb')).toBeNull();
     // The snippet renders the matched title (with the [..] highlight stripped to a mark).
     const snippet = row.querySelector('.conv-rail-row-snippet')!;
     expect(snippet.textContent).toContain('how does the lock work');
   });
 
-  it('renders a file hit with the path prominently + a "file" badge + secondary title', () => {
+  it('renders a file hit with the path prominently + secondary title; the echoed "file" badge is suppressed in the Files facet', () => {
     // kind=files → file-path-prominent: the path is the primary line (file
     // styling), the session title is secondary, snippet = the plain path,
-    // match_kinds:["file"], badge "file".
+    // match_kinds:["file"]. #228 S4 D5 (Codex gate P1-1) — the file-path layout
+    // keys on the RAW match_kinds, so it survives even though the echoed "file"
+    // badge is suppressed in the single-kind Files facet.
     searchHits = [hit({
       uuid: 'touch-anchor',
       title: 'the session about caching',
@@ -451,9 +465,9 @@ describe('ConversationRail', () => {
     const secondary = row.querySelector('.conv-rail-row-filetitle')!;
     expect(secondary).toBeTruthy();
     expect(secondary.textContent).toContain('the session about caching');
-    // The "file" badge renders.
-    const badges = [...row.querySelectorAll('.conv-rail-kindb')].map((b) => b.textContent);
-    expect(badges).toEqual(['file']);
+    // The redundant facet-echoing "file" badge is suppressed (D5) — but the
+    // file-path layout (keyed on the raw match_kinds) is intact (above).
+    expect(row.querySelector('.conv-rail-kindb')).toBeNull();
     // #217 S4 QA fix — the bottom snippet row is SUPPRESSED for a file hit: its
     // snippet IS the path, already shown on the filepath line, so it must not
     // render twice. Assert no .conv-rail-row-snippet AND the path appears once.
@@ -461,6 +475,81 @@ describe('ConversationRail', () => {
     const pathOccurrences =
       row.textContent!.split('bin/_lib_conversation_query.py').length - 1;
     expect(pathOccurrences).toBe(1);
+  });
+
+  // ---- #228 S4 D3/D4/D5 — search you-are-here, no-results, badge/cost de-noise ----
+
+  it('marks the search row whose session matches the open conversation as active', () => {
+    searchHits = [
+      hit({ session_id: 'open-sess', uuid: 'u1' }),
+      hit({ session_id: 'other-sess', uuid: 'u2' }),
+    ];
+    searchTotal = 2;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    act(() => dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'open-sess' }));
+    render(<ConversationRail />);
+    const rows = document.querySelectorAll('.conv-rail-row--hit');
+    expect(rows[0].classList.contains('is-active')).toBe(true);
+    expect(rows[1].classList.contains('is-active')).toBe(false);
+  });
+
+  it('keeps the file-path layout for a files-facet hit even though the echoed "file" badge is suppressed', () => {
+    searchHits = [hit({
+      uuid: 'touch-anchor',
+      title: 'the session about caching',
+      snippet: 'bin/_lib_conversation_query.py',
+      match_kinds: ['file'],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'conversation_query' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'files' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    // The file-path layout (keyed on the RAW match_kinds) survives…
+    expect(row.querySelector('.conv-rail-row-filepath')).toBeTruthy();
+    expect(row.querySelector('.conv-rail-row-filetitle')).toBeTruthy();
+    // …but the redundant "file" badge that just echoes the Files facet is gone.
+    expect(row.querySelector('.conv-rail-kindb')).toBeNull();
+  });
+
+  it('does not render a per-hit cost on search rows', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    expect(row.querySelector('.conv-rail-row-cost')).toBeNull();
+  });
+
+  it('renders a richer no-results state with the query echo, a Search-all action (narrow facet), and a Clear-search action', () => {
+    searchHits = [];
+    searchTotal = 0;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'zzz-no-match' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'tools' });
+    render(<ConversationRail />);
+    const block = document.querySelector('.conv-rail-noresults')!;
+    expect(block).toBeTruthy();
+    expect(block.querySelector('.conv-rail-noresults-q')!.textContent).toContain('zzz-no-match');
+    // Search-all (narrow facet active) → kind 'all'.
+    const searchAll = screen.getByRole('button', { name: /search all conversations/i });
+    fireEvent.click(searchAll);
+    expect(getState().conversationSearchKind).toBe('all');
+    // Clear search → empties the needle.
+    const clear = screen.getByRole('button', { name: /clear search/i });
+    fireEvent.click(clear);
+    expect(getState().conversationSearch).toBe('');
+  });
+
+  it('omits the Search-all action when the facet is already All', () => {
+    searchHits = [];
+    searchTotal = 0;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'zzz-no-match' });
+    // kind defaults to 'all'
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-noresults')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /search all conversations/i })).toBeNull();
+    // Clear search is still offered.
+    expect(screen.getByRole('button', { name: /clear search/i })).toBeTruthy();
   });
 
   it('MATCH_KIND_LABELS has an explicit entry for every badge kind', () => {

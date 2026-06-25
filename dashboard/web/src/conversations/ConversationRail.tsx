@@ -7,7 +7,7 @@ import { renderSnippet } from '../lib/snippet';
 import { railDateBucket } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { pickBannerLabel } from './pickBannerLabel';
-import { allOneProject } from './railDiscovery';
+import { allOneProject, visibleBadges } from './railDiscovery';
 import { modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import type { ConversationFilters, ConversationSummary, RailSortKey, SearchHit, SearchKind } from '../types/conversation';
@@ -291,7 +291,7 @@ export function ConversationRail() {
         )}
       </div>
       {isSearching
-        ? <SearchList needle={search} kind={kind} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />
+        ? <SearchList needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
         : <BrowseList selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
     </aside>
   );
@@ -482,7 +482,7 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
   );
 }
 
-function SearchList({ needle, kind, ctx, pickAnchor }: { needle: string; kind: SearchKind; ctx: RailCtx; pickAnchor: string | null }) {
+function SearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: string; kind: SearchKind; ctx: RailCtx; selectedId: string | null; pickAnchor: string | null }) {
   const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore } =
     useConversationSearch(needle, kind);
   const proseOnly = searchDepth === 'prose-only';
@@ -501,6 +501,11 @@ function SearchList({ needle, kind, ctx, pickAnchor }: { needle: string; kind: S
   const countText =
     (total === 0 ? 'No results' : `${total} results${mode === 'like' ? ' · basic search' : ''}`) +
     (indexing ? ' · indexing…' : '');
+  // #228 S4 D4 — a zero-result search shows a richer state block: it echoes the
+  // (truncated) query, offers "Search all conversations" when a narrow facet is
+  // active (no speculative second query for an All count — YAGNI), and a "Clear
+  // search" action.
+  const isEmpty = total === 0 && !loading && !error;
   return (
     <div className="conv-rail-list">
       <KindChips kind={kind} proseOnly={proseOnly} />
@@ -514,42 +519,77 @@ function SearchList({ needle, kind, ctx, pickAnchor }: { needle: string; kind: S
         ? <div className="conv-rail-empty" role="alert">{error}</div>
         : loading && hits.length === 0
           ? <div className="conv-rail-empty" role="status">Searching…</div>
-          : (
-            <>
-              <div className="conv-rail-count" aria-live="polite">{countText}</div>
-              {hits.map((h, i) => (
-                <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} pickAnchor={pickAnchor} />
-              ))}
-              {hits.length < total && (
+          : isEmpty
+            ? (
+              <div className="conv-rail-noresults" role="status">
+                {/* keep the inline indexing note discoverable in the empty state */}
+                <div className="conv-rail-noresults-q">
+                  No results for “{needle.length > 40 ? needle.slice(0, 40) + '…' : needle}”
+                  {indexing ? ' · indexing…' : ''}
+                </div>
+                {kind !== 'all' && (
+                  <button
+                    type="button"
+                    className="conv-rail-noresults-action"
+                    onClick={() => dispatch({ type: 'SET_CONVERSATION_SEARCH_KIND', kind: 'all' })}
+                  >
+                    Search all conversations
+                  </button>
+                )}
                 <button
                   type="button"
-                  className="conv-rail-more"
-                  disabled={loadingMore}
-                  onClick={() => loadMore()}
+                  className="conv-rail-noresults-action"
+                  onClick={() => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' })}
                 >
-                  Load {Math.min(50, remaining)} more ({remaining} remaining)
+                  Clear search
                 </button>
-              )}
-            </>
-          )}
+              </div>
+            )
+            : (
+              <>
+                <div className="conv-rail-count" aria-live="polite">{countText}</div>
+                {hits.map((h, i) => (
+                  <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} kind={kind} selectedId={selectedId} pickAnchor={pickAnchor} />
+                ))}
+                {hits.length < total && (
+                  <button
+                    type="button"
+                    className="conv-rail-more"
+                    disabled={loadingMore}
+                    onClick={() => loadMore()}
+                  >
+                    Load {Math.min(50, remaining)} more ({remaining} remaining)
+                  </button>
+                )}
+              </>
+            )}
     </div>
   );
 }
 
-function SearchRow({ hit, ctx, pickAnchor }: { hit: SearchHit; ctx: RailCtx; pickAnchor: string | null }) {
-  const badges = hit.match_kinds ?? [];
+function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit; ctx: RailCtx; kind: SearchKind; selectedId: string | null; pickAnchor: string | null }) {
+  // #228 S4 D5 (Codex gate P1-1) — keep the RAW match_kinds for behavioral checks
+  // (the file-hit layout switch), and feed only the DISPLAYED badge group through
+  // visibleBadges (which drops the badge that merely echoes a single-kind facet).
+  // Suppressing the 'file' badge in the Files facet must NOT strip the file-path
+  // layout, so isFileHit reads rawBadges.
+  const rawBadges = hit.match_kinds ?? [];
+  const isFileHit = rawBadges.includes('file');
+  const shownBadges = visibleBadges(rawBadges, kind);
   const isAnchor = pickAnchor === hit.session_id;
-  // #217 S4 / I-3.3 — a kind=files hit (`match_kinds` includes 'file') renders
-  // the FILE PATH prominently (primary line, file styling) with the session
-  // title secondary; its snippet IS the plain path. Every other hit keeps the
-  // #177 S6 title-prominent layout. Click navigates to `hit.uuid` for both —
-  // the first-turn anchor for a title hit, the most-recent-touch anchor for a
-  // file hit — same as content hits.
-  const isFileHit = badges.includes('file');
+  // #228 S4 D3 — you-are-here: a hit from the open conversation is highlighted
+  // (multiple hits from the same session all highlight — they're all "in the
+  // conversation you're reading").
+  const active = hit.session_id === selectedId;
+  // #217 S4 / I-3.3 — a kind=files hit renders the FILE PATH prominently (primary
+  // line, file styling) with the session title secondary; its snippet IS the
+  // plain path. Every other hit keeps the #177 S6 title-prominent layout. Click
+  // navigates to `hit.uuid` for both — the first-turn anchor for a title hit, the
+  // most-recent-touch anchor for a file hit — same as content hits.
   return (
     <button
       type="button"
-      className={`conv-rail-row conv-rail-row--hit${isFileHit ? ' conv-rail-row--filehit' : ''}${pickAnchor ? ' conv-rail-row--pick' : ''}${isAnchor ? ' conv-rail-row--anchor' : ''}`}
+      className={`conv-rail-row conv-rail-row--hit${active ? ' is-active' : ''}${isFileHit ? ' conv-rail-row--filehit' : ''}${pickAnchor ? ' conv-rail-row--pick' : ''}${isAnchor ? ' conv-rail-row--anchor' : ''}`}
       disabled={isAnchor}
       aria-disabled={isAnchor || undefined}
       title={isAnchor ? 'This is the anchor session' : undefined}
@@ -568,7 +608,7 @@ function SearchRow({ hit, ctx, pickAnchor }: { hit: SearchHit; ctx: RailCtx; pic
         <>
           <div className="conv-rail-row-title conv-rail-row-title--hit">
             <span className="conv-rail-row-filepath conv-rail-row-title-text">{hit.snippet}</span>
-            {badges.length > 0 && <KindBadges badges={badges} />}
+            {shownBadges.length > 0 && <KindBadges badges={shownBadges} />}
           </div>
           <div className="conv-rail-row-filetitle">{hit.title}</div>
         </>
@@ -578,13 +618,15 @@ function SearchRow({ hit, ctx, pickAnchor }: { hit: SearchHit; ctx: RailCtx; pic
         // the clamp box so a long title can never clip it off as a third line.
         <div className="conv-rail-row-title conv-rail-row-title--hit">
           <span className="conv-rail-row-title-text">{hit.title}</span>
-          {badges.length > 0 && <KindBadges badges={badges} />}
+          {shownBadges.length > 0 && <KindBadges badges={shownBadges} />}
         </div>
       )}
+      {/* #228 S4 D5 — the per-hit $cost is dropped from search rows (it read
+          $0.00 on most hits and the browse list + open reader already carry
+          cost). Search-row meta is now project · when. */}
       <div className="conv-rail-row-meta">
         <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
         <span className="conv-rail-row-when">{fmt.startedShort(hit.ts, ctx, { noSuffix: true })}</span>
-        <span className="conv-rail-row-cost">{fmt.usd2(hit.cost_usd)}</span>
       </div>
       {/* #217 S4 QA fix — suppress the bottom snippet row for a file hit: its
           `snippet` IS the path, already shown prominently on the filepath line
