@@ -52,12 +52,19 @@ export async function reassertCenter(d: ReassertDeps): Promise<ReassertResult> {
     if (d.isAborted()) return 'aborted';
     const cur = d.measure();
     if (cur == null) return 'gone';
+    // #237 — re-center EVERY frame, not just when `desired` moves > tol. A
+    // jump-opened disclosure collapses to its settled height via a sub-pixel tail
+    // (each frame's shift is ≤ tol), so an apply-on-change-only loop stops
+    // re-centering once `desired` reads "stable" while the tail keeps creeping the
+    // mark up — measured ~30–38px of uncorrected residual, vs a single fresh
+    // center on the settled layout landing it at 0. Applying every frame keeps the
+    // word pinned through the tail; the stable counter only decides WHEN to exit.
+    d.apply(cur);
     const prev = last; // narrow once so the same-target/within-tol test needs no non-null assertion
     if (prev && Object.is(prev.target, cur.target) && Math.abs(cur.desired - prev.desired) <= d.tol) {
       if (++stable >= d.stableNeeded) return 'settled';
     } else {
       stable = 0;
-      d.apply(cur);
     }
     last = cur;
     await d.nextFrame();

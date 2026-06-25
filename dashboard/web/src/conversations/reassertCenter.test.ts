@@ -31,7 +31,24 @@ describe('reassertCenter', () => {
       { desired: 880 }, { desired: 880 }, { desired: 880 }, { desired: 880 }];
     const { deps, applied } = driver(seq);
     expect(await reassertCenter(deps)).toBe('settled');
-    expect(applied().map((f) => f.desired)).toEqual([1000, 950, 900, 880]); // re-applied each changing frame, not the holds
+    // #237 — re-centers EVERY frame (the collapse AND the stable tail), so the last
+    // apply lands on the settled layout; settles after stableNeeded stable frames.
+    expect(applied().map((f) => f.desired)).toEqual([1000, 950, 900, 880, 880, 880, 880, 880]);
+  });
+
+  it('#237 — re-centers on within-tol (stable) frames too, so a sub-pixel collapse tail stays tracked', async () => {
+    // The disclosure collapse decays via a sub-pixel tail where each frame moves
+    // <= tol. An apply-on-change-only loop would re-apply only on frame 0 and let
+    // that tail creep the mark ~30px uncorrected (the gate-found residual); applying
+    // every frame re-centers through the creep. This test fails on apply-on-change
+    // (applied would be just [1000]).
+    const seq = [{ desired: 1000 }, { desired: 999 }, { desired: 998 }, { desired: 998 },
+      { desired: 998 }, { desired: 998 }, { desired: 998 }];
+    const { deps, applied } = driver(seq);
+    expect(await reassertCenter(deps)).toBe('settled');
+    expect(applied().map((f) => f.desired)).toContain(999); // a within-tol frame WAS re-applied
+    expect(applied().map((f) => f.desired)).toContain(998);
+    expect(applied().length).toBeGreaterThanOrEqual(5);
   });
 
   it('a 2-frame lull then resume does NOT settle early', async () => {
@@ -39,7 +56,9 @@ describe('reassertCenter', () => {
       { desired: 900 }, { desired: 900 }, { desired: 900 }, { desired: 900 }];
     const { deps, applied } = driver(seq);
     expect(await reassertCenter(deps)).toBe('settled');
-    expect(applied().map((f) => f.desired)).toEqual([1000, 900]); // the resume reset the stable count + re-applied
+    // the lull's three 1000s only reach stable=2, then the 900 resets; settles only
+    // after four stable 900s — re-centering every frame throughout.
+    expect(applied().map((f) => f.desired)).toEqual([1000, 1000, 1000, 900, 900, 900, 900, 900]);
   });
 
   it('a target-identity swap resets the stable counter and re-applies', async () => {
@@ -48,7 +67,9 @@ describe('reassertCenter', () => {
       { desired: 500, target: 'B' }, { desired: 500, target: 'B' }];
     const { deps, applied } = driver(seq);
     expect(await reassertCenter(deps)).toBe('settled');
-    expect(applied().map((f) => f.target)).toEqual(['A', 'B']); // applied once per distinct target run, despite equal desired
+    // the A-run reaches only stable=2 before the identity swap to B resets it (despite
+    // equal desired); settles only after four stable B frames.
+    expect(applied().map((f) => f.target)).toEqual(['A', 'A', 'A', 'B', 'B', 'B', 'B', 'B']);
   });
 
   it('returns "gone" when measure() yields null (target recycled mid-loop)', async () => {
