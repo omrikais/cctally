@@ -215,8 +215,16 @@ const CONVERSATIONS_BINDINGS = [
     },
   },
   {
+    // #228 S4 D1 — gate Escape on the shared `inView` guard (mirroring '/' and
+    // 'f'), not the old `!openModal`-only guard. Escape is a NAMED key, so the
+    // keymap dispatcher does NOT auto-suppress it while an input is focused; the
+    // old guard let a rail-search Escape fire BOTH the input's own clear-and-blur
+    // AND this global binding — which then saw the now-empty needle and ejected
+    // the whole workspace to the dashboard. `inView` excludes inputMode !== null
+    // and an open filters popover, so Esc-while-typing no longer reaches here; Esc
+    // with nothing focused keeps the intended two-step (clear-then-exit).
     key: 'Escape', scope: 'global' as const, view: 'conversations' as const,
-    when: () => !getState().openModal,
+    when: inView,
     action: () => {
       if (getState().conversationSearch) { dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' }); return; }
       dispatch({ type: 'SET_VIEW', view: 'dashboard' });

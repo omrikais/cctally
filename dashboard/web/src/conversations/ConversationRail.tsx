@@ -210,6 +210,12 @@ export function ConversationRail() {
             onBlur={() => dispatch({ type: 'SET_INPUT_MODE', mode: null })}
             onKeyDown={(e) => {
               if (e.key === 'Escape') {
+                // #228 S4 D1 — the input owns its own Esc: clear the needle +
+                // blur, and stopPropagation so the Esc never reaches the document
+                // keydown listener (the in-house idiom FindBar already uses). The
+                // view-level Escape binding additionally gates on `inView`, so
+                // this is consistency, not redundant defense.
+                e.stopPropagation();
                 dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
                 inputRef.current?.blur();
               }

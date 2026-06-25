@@ -403,6 +403,49 @@ describe('Conversations workspace integration', () => {
     expect(getState().openModal).not.toBeNull();
   });
 
+  // #228 S4 D1 (production-path) — Esc in the FOCUSED rail search must clear the
+  // needle and blur but NOT eject the workspace. Before the fix the global Esc
+  // binding gated only on `!openModal`, so with the rail input focused the Esc
+  // bubbled to the document listener AND fired the global binding; by the time
+  // the global action ran the needle was already cleared, so it fell through to
+  // SET_VIEW 'dashboard' and the whole workspace ejected. The fix swaps the
+  // binding's guard to the shared `inView` (so it's inert while inputMode !==
+  // null) and adds e.stopPropagation() to the input's own Esc handler.
+  it('6b: Esc in the focused rail search clears the needle and blurs but stays in the workspace; a second Esc with nothing focused exits', async () => {
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+
+    const input = await waitFor(() => {
+      const el = document.querySelector<HTMLInputElement>('.conv-rail-search-input');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+
+    // Mirror the input's own focus/change handlers: focus the input (inputMode
+    // 'search'), type a needle.
+    act(() => {
+      input.focus();
+      dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'abc' });
+      dispatch({ type: 'SET_INPUT_MODE', mode: 'search' });
+    });
+    expect(getState().conversationSearch).toBe('abc');
+    expect(document.activeElement).toBe(input);
+
+    // Esc on the focused input: the input's own onKeyDown clears the needle and
+    // blurs; the global Esc is suppressed (inputMode 'search'), so we stay put.
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(getState().conversationSearch).toBe('');
+    expect(getState().view).toBe('conversations');
+    expect(document.activeElement).not.toBe(input);
+
+    // The blur clears inputMode; now Esc with an empty needle exits to the
+    // dashboard — the intended two-step is unchanged.
+    act(() => { dispatch({ type: 'SET_INPUT_MODE', mode: null }); });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().view).toBe('dashboard');
+  });
+
   it('7: mobile shows rail-only until a conversation is selected; Back returns to the rail', async () => {
     stubMobileMedia(true);
     updateSnapshot(baseEnvelope(true));
