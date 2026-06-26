@@ -5,8 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
+## [1.56.0] - 2026-06-26
 
+### Fixed
 - Conversation viewer: the reader-header control toolbar no longer overflows or hides controls (Compare / Find / outline toggle / Latest / Export) at laptop and tablet widths — it now wraps onto its own full-width row at all sizes (#238).
 - Conversation viewer: the reader-header overflow, export, and focus menus now close when you click outside them, not only on Escape or a focus change (#238).
 - Conversation viewer: a long subagent-card title is now recoverable in full via a hover tooltip (#238).
