@@ -815,6 +815,17 @@ describe('Conversations workspace integration', () => {
     await waitFor(() => expect(document.activeElement).toBe(trigger));
     expect(document.activeElement).not.toBe(document.body);
   });
+
+  // C2 (#238 S3, Codex gate #1) — OPEN_COMPARE must clear convFiltersOpen so the
+  // inView-gated Escape binding can fire while a comparison is open.
+  it('C2: OPEN_COMPARE clears an open filters popover', () => {
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+    expect(getState().convFiltersOpen).toBe(true);
+    dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' });
+    expect(getState().convFiltersOpen).toBe(false);
+    expect(getState().compare).toEqual({ a: 'sess-1', b: 'sess-2' });
+  });
 });
 
 // #228 S3 F1 — the outline lives as a slide-over SHEET across the whole

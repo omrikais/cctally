@@ -1187,6 +1187,12 @@ export function dispatch(action: Action): void {
         selectedConversationId: action.a,
         conversationJump: null,
         comparePick: null,
+        // C2 (#238 S3, Codex gate #1) — entering a comparison must present a
+        // clean, Escape-reachable state. The conversations Escape binding gates
+        // on inView (which excludes convFiltersOpen); a filters popover left open
+        // when the comparison opens would otherwise suppress Esc-to-close. Scoped
+        // here, NOT in DISMISSED_ON_VIEW_SWITCH, to leave other transitions alone.
+        convFiltersOpen: false,
         compare: { a: action.a, b: action.b },
       };
       break;
