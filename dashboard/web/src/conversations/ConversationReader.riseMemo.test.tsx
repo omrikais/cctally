@@ -8,10 +8,11 @@
 // turn's rise decision per uuid so its className/style identity is stable across
 // commits. This test drives a real prepend (#232: via Virtuoso's startReached)
 // and asserts the already-mounted turns are NOT re-rendered.
-import { act, render, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _resetForTests, dispatch } from '../store/store';
 import { clearReadingPositions } from '../store/readingPosition';
+import { SUBAGENT_WINDOW_CAP } from './subagentWindow';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 
 // #232 — render-all react-virtuoso mock (mirrors ConversationReader.test.tsx):
@@ -92,6 +93,15 @@ function turn(uuid: string): ConversationItem {
     anchor: { session_id: 's', uuid, id: _id++ },
     member_uuids: [uuid], ts: 't', text: uuid, blocks: [],
     is_sidechain: false, subagent_key: null, parent_uuid: null,
+  } as ConversationItem;
+}
+// #239 — a sidechain (subagent-thread) member for the windowing memo test.
+function sideTurn(uuid: string): ConversationItem {
+  return {
+    kind: 'human',
+    anchor: { session_id: 's', uuid, id: _id++ },
+    member_uuids: [uuid], ts: 't', text: uuid, blocks: [],
+    is_sidechain: true, subagent_key: 'A', parent_uuid: null,
   } as ConversationItem;
 }
 function pageBody(items: ConversationItem[], prev_before: number | null) {
@@ -193,5 +203,53 @@ describe('#231 — a reverse-page prepend does not re-render already-mounted tur
     // constant number of times regardless of window size.
     const worst = Math.max(...tail.map((t) => h.renders.get(t.anchor.uuid) ?? 0));
     expect(worst).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('#239 — revealing a windowed subagent does not re-render retained members', () => {
+  it('grows the window without churning the already-mounted members (memo holds)', async () => {
+    const { ConversationReader } = await import('./ConversationReader');
+    // An over-cap subagent thread: head window mounts CAP members; revealing
+    // "later" appends the next chunk WITHOUT re-rendering the retained head rows
+    // (slicing changes mount/unmount only — the #231 prop-churn invariant).
+    const N = SUBAGENT_WINDOW_CAP + 120;
+    const main = turn('h0');
+    const thread = Array.from({ length: N }, (_, i) => sideTurn(`s${i}`));
+    mockFetchOnce(pageBody([main, ...thread], null));
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('details.conv-sidechain')).not.toBeNull());
+    await flush();
+
+    // Open the thread so its body (and the reveal controls) render; the refs
+    // attach on open, so SETTLE before snapshotting render counts.
+    const det = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    await act(async () => {
+      det.open = true;
+      fireEvent(det, new Event('toggle', { bubbles: false }));
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-uuid="s0"]')).not.toBeNull());
+    await flush();
+
+    const headUuids = thread.slice(0, SUBAGENT_WINDOW_CAP).map((t) => t.anchor.uuid);
+    expect(headUuids.every((u) => h.renders.has(u))).toBe(true);
+    // The tail past the head window is NOT mounted yet.
+    expect(container.querySelector(`[data-uuid="s${SUBAGENT_WINDOW_CAP}"]`)).toBeNull();
+    const before = new Map(h.renders);
+
+    // Click "↓ Show N later" — the first reveal button in the after-bar.
+    const laterBtn = container.querySelector('.conv-window-reveal-bar--after .conv-window-reveal') as HTMLButtonElement;
+    expect(laterBtn).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(laterBtn);
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+    await flush();
+
+    // The reveal really grew the window: a previously-hidden member mounted.
+    expect(container.querySelector(`[data-uuid="s${SUBAGENT_WINDOW_CAP}"]`)).not.toBeNull();
+    // THE REGRESSION GUARD: not one retained head member re-rendered on the reveal.
+    const rerendered = headUuids.filter((u) => (h.renders.get(u) ?? 0) > (before.get(u) ?? 0));
+    expect(rerendered).toEqual([]);
   });
 });

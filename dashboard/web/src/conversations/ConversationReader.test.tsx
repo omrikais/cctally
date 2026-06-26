@@ -14,6 +14,7 @@ import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia'
 import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
+import { SUBAGENT_WINDOW_CAP } from './subagentWindow';
 
 // #232 — render-all react-virtuoso mock (Codex P2-1). Real Virtuoso needs real
 // layout (ResizeObserver / offsetHeight / scrollHeight) which JSDOM reports as
@@ -651,6 +652,33 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
     await waitFor(() => expect(container.querySelector('[data-uuid="sa2"]')!.classList.contains('conv-item--jumped')).toBe(true));
     await waitFor(() => expect(getState().conversationJump).toBeNull());
+  });
+
+  // #239 — a deep-link jump into a member of a GIANT subagent thread must render
+  // only a windowed slice CENTERED on the target. The reader derives
+  // windowAnchorUuid (the in-flight jump target) and threads it to the
+  // SidechainGroup so the windowed body centers on the target in the SAME commit
+  // the card force-opens — the head member stays windowed out, the target mounts.
+  it('#239: a deep-link into a giant subagent renders a windowed slice incl. the target (head trimmed)', async () => {
+    const N = SUBAGENT_WINDOW_CAP + 300;          // over cap → windowed
+    const thread = Array.from({ length: N }, (_, i) =>
+      makeItem({ uuid: `a${i}`, is_sidechain: true, subagent_key: 'A', text: `member ${i}` } as never));
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), ...thread]));
+    spyScrollTo();
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+
+    // Target a deep member (thread index CAP+200) and an early body member (a10),
+    // neither of which is the bucket root (a0 → the card's own data-uuid).
+    const targetUuid = `a${SUBAGENT_WINDOW_CAP + 200}`;
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: targetUuid } });
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    // The thread force-opens, the window centers on the target → the target is
+    // mounted (its data-uuid is a body MessageItem).
+    await waitFor(() => expect(container.querySelector(`[data-uuid="${targetUuid}"]`)).not.toBeNull());
+    // An early member far above the centered window is NOT mounted (windowed out).
+    // (a10 is a plain body member — no card reuses its uuid, unlike the a0 root.)
+    expect(container.querySelector('[data-uuid="a10"]')).toBeNull();
   });
 
   // #188 B2 — the jump effect pins where it landed. The pin drives the outline's

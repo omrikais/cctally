@@ -274,6 +274,12 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
   // forward press steps strictly past where the last jump LANDED (#188 B5 / #187).
   const currentTurnUuid = currentTurnUuidEarly;
   const convPinnedUuid = convPinnedUuidEarly;
+  // #239 — the active window anchor for giant-subagent internal windowing: the
+  // in-flight jump target (available in render, not cleared until after landing)
+  // or the pinned turn. Threaded to every SidechainGroup so the windowed body
+  // centers on the member the reader is trying to reach, keeping it mounted for
+  // the existing force-open + walk-to-mount land. Null => head-anchored.
+  const windowAnchorUuid = jumpUuidForSession ?? convPinnedUuid;
   // #217 S6 F4 — the current session's bookmarks, threaded into the reader's
   // buildOutlineTargets memo so the `bookmark` jump list (the i/I keys) stays in
   // lock-step with the OutlinePanel cluster. A toggle re-derives the targets.
@@ -2197,6 +2203,11 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
           // MessageItem (threaded down through childCtx). Replaces the old
           // imperative classList.add, which can't reach an unmounted off-screen row.
           flashedUuid={jumpedUuid}
+          // #239 — the active window anchor (in-flight jump target / pinned turn)
+          // so the windowed body centers on the target member in the SAME commit
+          // the card force-opens — the deep-link target is mounted for the existing
+          // walk-to-mount + direct-scroll land. Threaded down to nested cards too.
+          windowAnchorUuid={windowAnchorUuid}
           // #232 — the bulk [/] sweep state (data-model expand/collapse-all).
           bulkSweep={bulkSweep}
           // #232 (Codex P1-4) — re-pin this depth-0 card through Virtuoso on a
@@ -2273,7 +2284,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         flashed={jumpedUuid != null && g.item.member_uuids.includes(jumpedUuid)}
       />
     );
-  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId, jumpedUuid, cursorUuid, bulkSweep]);
+  }, [detail, sessionId, riseFor, getItemRef, getCardRef, handleSubagentOpenChange, forcedOpenKeys, isMobile, childCtx, suppressToolUseIds, spawnKindByToolUseId, jumpedUuid, windowAnchorUuid, cursorUuid, bulkSweep]);
 
   // #232 — Virtuoso's itemsRendered callback. On a genuine rendered-range MOVE
   // (the first/last mounted index changed), bump `renderedRangeRev` so the
