@@ -1,9 +1,10 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { MessageItem } from './MessageItem';
 import { sidechainIndentClass } from './sidechainIndent';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
+import { planSubagentWindow, centeredWindow, resolveSubagentAnchorIndex, SUBAGENT_WINDOW_CAP, SUBAGENT_WINDOW_CHUNK } from './subagentWindow';
 import type { ConversationItem, SubagentMeta } from '../types/conversation';
 import type { SubagentNode } from './groupSidechains';
 
@@ -109,6 +110,7 @@ export function SidechainGroup({
   childCtx,
   isMobile,
   flashedUuid = null,
+  windowAnchorUuid = null,
   cursored = false,
   bulkSweep,
   pinToSelf,
@@ -155,6 +157,11 @@ export function SidechainGroup({
   // cards receive it via renderChild. Unmount-safe (a class derived in render,
   // not an imperative add against a possibly-absent element).
   flashedUuid?: string | null;
+  // #239 — the uuid the reader is currently targeting (in-flight jump target or
+  // pinned turn). When it matches a member of THIS thread (or a descendant), the
+  // windowed body centers on it so the target mounts in the same commit the card
+  // force-opens. Threaded down to nested cards via renderChild (like flashedUuid).
+  windowAnchorUuid?: string | null;
   // #232 — the render-driven keyboard cursor ring (Codex P1-1): true when THIS
   // top-level card is at the cursor's nodes-array index. Adds `conv-item--focused`
   // to the root <details> (only top-level cards are cursor stops; nested cards are
@@ -268,6 +275,67 @@ export function SidechainGroup({
       trailingChildren.push(child);
     }
   }
+  // #239 — internal windowing of a large thread's rendered members. The window
+  // is the centered cap-window (path-aware anchor) UNIONed with manual reveals.
+  // detail.items / the data model are untouched (the summary line still reduces
+  // over ALL `items`); only which members the body MOUNTS changes.
+  const anchorIndex = resolveSubagentAnchorIndex(items, kids, windowAnchorUuid) ?? 0;
+  // Seed `revealed` at the centered window for the initial anchor.
+  const [revealed, setRevealed] = useState<{ start: number; end: number }>(() =>
+    centeredWindow(items.length, anchorIndex, SUBAGENT_WINDOW_CAP),
+  );
+  // Re-center when the anchor moves to a member OUTSIDE the current window
+  // (find/jump into a windowed-out member) — adjust-state-during-render pattern
+  // (same as the bulkSweep latch above). Use the fresh value locally THIS render.
+  const lastAnchorRef = useRef(anchorIndex);
+  let effRevealed = revealed;
+  if (anchorIndex !== lastAnchorRef.current) {
+    lastAnchorRef.current = anchorIndex;
+    if (anchorIndex < revealed.start || anchorIndex >= revealed.end) {
+      effRevealed = centeredWindow(items.length, anchorIndex, SUBAGENT_WINDOW_CAP);
+      setRevealed(effRevealed);
+    }
+  }
+  const win = planSubagentWindow({
+    itemCount: items.length,
+    anchorIndex,
+    cap: SUBAGENT_WINDOW_CAP,
+    revealedStart: effRevealed.start,
+    revealedEnd: effRevealed.end,
+  });
+  const windowItems = win.windowed ? items.slice(win.start, win.end) : items;
+
+  // Scroll-stability for "Show earlier": preserve the currently-first window
+  // member's viewport position when height is inserted above it (Codex P1).
+  const bodyDivRef = useRef<HTMLDivElement>(null);
+  const scrollFixRef = useRef<{ uuid: string; top: number } | null>(null);
+  const revealEarlier = () => {
+    const firstUuid = items[win.start]?.anchor.uuid;
+    const el = firstUuid
+      ? (bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(firstUuid)}"]`) as HTMLElement | null)
+      : null;
+    scrollFixRef.current = firstUuid && el ? { uuid: firstUuid, top: el.getBoundingClientRect().top } : null;
+    setRevealed((r) => ({ ...r, start: Math.max(0, r.start - SUBAGENT_WINDOW_CHUNK) }));
+  };
+  const revealLater = () => setRevealed((r) => ({ ...r, end: Math.min(items.length, r.end + SUBAGENT_WINDOW_CHUNK) }));
+  const showAll = () => setRevealed({ start: 0, end: items.length });
+  useLayoutEffect(() => {
+    const fix = scrollFixRef.current;
+    if (!fix) return;
+    scrollFixRef.current = null;
+    const scroller = bodyDivRef.current?.closest('.conv-reader-body') as HTMLElement | null;
+    const el = bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(fix.uuid)}"]`) as HTMLElement | null;
+    if (!scroller || !el) return;
+    const apply = () => {
+      const delta = el.getBoundingClientRect().top - fix.top;
+      if (delta !== 0) scroller.scrollTop += delta;
+    };
+    apply();
+    // One rAF re-assert to survive the outer Virtuoso ResizeObserver re-measure.
+    requestAnimationFrame(apply);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [win.start]);
+
   // Render one nested child <SidechainGroup>, threading the reader's per-key
   // machinery from childCtx (its own meta / force flag / refs / open-state).
   const renderChild = (child: SubagentNode) => (
@@ -283,6 +351,9 @@ export function SidechainGroup({
       forceOpen={childCtx?.forcedOpenKeys?.has(child.subagentKey) ?? false}
       isMobile={childCtx?.isMobile}
       flashedUuid={flashedUuid}
+      // #239 — thread the window anchor to every nesting level (like flashedUuid),
+      // so a nested card centers its own windowed body on the target member.
+      windowAnchorUuid={windowAnchorUuid}
       bulkSweep={childCtx?.bulkSweep}
       children={child.children}
       depth={child.depth}
@@ -387,12 +458,31 @@ export function SidechainGroup({
           <span className="conv-chev" aria-hidden="true" />
         </span>
       </summary>
-      <div className="conv-sidechain-body">
-        {items.map((item) => {
+      <div className="conv-sidechain-body" ref={bodyDivRef}>
+        {/* #239 — "earlier" reveal bar above the window (only when members are
+            hidden above it). data-conv-marker so j/k + the focus-class effect
+            skip the buttons (never a keyboard stop), mirroring the hidden-run pill. */}
+        {open && win.windowed && win.hiddenBefore > 0 && (
+          <div className="conv-window-reveal-bar conv-window-reveal-bar--before">
+            <button
+              type="button" className="conv-window-reveal" data-conv-marker=""
+              aria-label={`Show ${Math.min(SUBAGENT_WINDOW_CHUNK, win.hiddenBefore)} earlier messages`}
+              onClick={revealEarlier}
+            >↑ Show {Math.min(SUBAGENT_WINDOW_CHUNK, win.hiddenBefore)} earlier</button>
+            <button
+              type="button" className="conv-window-reveal conv-window-reveal--all" data-conv-marker=""
+              aria-label={`Show all ${items.length} messages`} onClick={showAll}
+            >Show all {items.length}</button>
+          </div>
+        )}
+        {windowItems.map((item) => {
           // §5 — interleave each child subagent thread AFTER its spawn anchor
           // item, recursively. Rendered only while THIS thread is open (its
           // members are visible). No wrapper div (a Fragment) so the body's
           // child structure / spine CSS is unchanged in the common leaf case.
+          // #239 — a child interleaves only when its spawn-anchor member is in
+          // the current window (childrenByAnchor keys on the member uuid, and
+          // windowItems is the in-window slice).
           const after = open ? childrenByAnchor.get(item.anchor.uuid) : undefined;
           return (
             <Fragment key={item.anchor.uuid}>
@@ -417,6 +507,21 @@ export function SidechainGroup({
             </Fragment>
           );
         })}
+        {/* #239 — "later" reveal bar below the window (only when members are
+            hidden below it). */}
+        {open && win.windowed && win.hiddenAfter > 0 && (
+          <div className="conv-window-reveal-bar conv-window-reveal-bar--after">
+            <button
+              type="button" className="conv-window-reveal" data-conv-marker=""
+              aria-label={`Show ${Math.min(SUBAGENT_WINDOW_CHUNK, win.hiddenAfter)} later messages`}
+              onClick={revealLater}
+            >↓ Show {Math.min(SUBAGENT_WINDOW_CHUNK, win.hiddenAfter)} later</button>
+            <button
+              type="button" className="conv-window-reveal conv-window-reveal--all" data-conv-marker=""
+              aria-label={`Show all ${items.length} messages`} onClick={showAll}
+            >Show all {items.length}</button>
+          </div>
+        )}
         {/* §5 — children with no resolvable spawn anchor append at the body end
             (never dropped). Also only while open. */}
         {open && trailingChildren.map(renderChild)}

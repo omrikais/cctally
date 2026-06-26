@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { SidechainGroup, subagentSummaryLabel } from './SidechainGroup';
+import { SUBAGENT_WINDOW_CAP, SUBAGENT_WINDOW_CHUNK } from './subagentWindow';
 import type { SubagentNode } from './groupSidechains';
 import type { ConversationItem } from '../types/conversation';
 
@@ -495,6 +496,109 @@ describe('SidechainGroup title tooltip (#238 R4)', () => {
         meta={{ kind: 'general-purpose', description: desc }} />,
     );
     expect(container.querySelector('.conv-sidechain-title')!.getAttribute('title')).toBe(desc);
+  });
+});
+
+describe('SidechainGroup windowing (#239)', () => {
+  // N human members for one subagent thread; uuid u<i>, text "member <i>".
+  // Member PRESENCE is asserted via data-uuid (MessageItem stamps data-uuid on
+  // every variant root), NOT prose text — the card title is derived from
+  // items[0].text, so a text query for the head member would also match the
+  // (always-rendered) title span.
+  function bigThread(n: number): ConversationItem[] {
+    return Array.from({ length: n }, (_, i) => member(`u${i}`, { text: `member ${i}` }));
+  }
+  const has = (c: HTMLElement, uuid: string) => c.querySelector(`.conv-sidechain-body [data-uuid="${uuid}"]`) != null;
+
+  it('renders all members at/under cap (no reveal controls)', () => {
+    const its = bigThread(SUBAGENT_WINDOW_CAP);
+    const { container } = render(<SidechainGroup subagentKey="k" items={its} forceOpen />);
+    expect(has(container, 'u0')).toBe(true);
+    expect(has(container, `u${SUBAGENT_WINDOW_CAP - 1}`)).toBe(true);
+    expect(screen.queryByRole('button', { name: /earlier|later|Show all/ })).toBeNull();
+  });
+
+  it('windows an over-cap thread to a head slice + "later"/"all" controls', () => {
+    const n = SUBAGENT_WINDOW_CAP + 200;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen />);
+    // head-anchored: first CAP members rendered, the tail not.
+    expect(has(container, 'u0')).toBe(true);
+    expect(has(container, `u${n - 1}`)).toBe(false);
+    expect(screen.getByRole('button', { name: new RegExp(`Show ${SUBAGENT_WINDOW_CHUNK} later`) })).toBeTruthy();
+    expect(screen.getByRole('button', { name: new RegExp(`Show all ${n}`) })).toBeTruthy();
+    // no "earlier" at the head.
+    expect(screen.queryByRole('button', { name: /Show .* earlier/ })).toBeNull();
+  });
+
+  it('centers the window on a deep windowAnchorUuid (own member)', () => {
+    const n = SUBAGENT_WINDOW_CAP + 400;
+    const targetIdx = SUBAGENT_WINDOW_CAP + 250;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen windowAnchorUuid={`u${targetIdx}`} />);
+    expect(has(container, `u${targetIdx}`)).toBe(true); // target mounted
+    expect(has(container, 'u0')).toBe(false);           // head trimmed
+    expect(screen.getByRole('button', { name: /earlier/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /later/ })).toBeTruthy();
+  });
+
+  it('"Show all" reveals every member', () => {
+    const n = SUBAGENT_WINDOW_CAP + 200;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen />);
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(`Show all ${n}`) }));
+    expect(has(container, `u${n - 1}`)).toBe(true);
+  });
+
+  it('"Show later" grows the window by CHUNK', () => {
+    const n = SUBAGENT_WINDOW_CAP + 200;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen />);
+    expect(has(container, `u${SUBAGENT_WINDOW_CAP}`)).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(`Show ${SUBAGENT_WINDOW_CHUNK} later`) }));
+    expect(has(container, `u${SUBAGENT_WINDOW_CAP}`)).toBe(true); // first hidden-after now shown
+  });
+
+  it('reveal buttons carry data-conv-marker (j/k skips them)', () => {
+    render(<SidechainGroup subagentKey="k" items={bigThread(SUBAGENT_WINDOW_CAP + 10)} forceOpen />);
+    const btn = screen.getByRole('button', { name: /later/ });
+    expect(btn.getAttribute('data-conv-marker')).toBe('');
+  });
+
+  it('mounts a nested child card when a grandchild anchor sits past the parent head window', () => {
+    // Parent of n members; a child spawns after a member OUTSIDE the head window;
+    // the anchor lives in the child. The child card must still mount (P0) because
+    // the parent re-centers its window on the child's spawn-anchor member.
+    const n = SUBAGENT_WINDOW_CAP + 300;
+    const parent = bigThread(n);
+    const childSpawn = parent[SUBAGENT_WINDOW_CAP + 100].anchor.uuid;
+    const childItems = Array.from({ length: 20 }, (_, i) => member(`c${i}`, { text: `child ${i}`, subagent_key: 'k2' } as Partial<ConversationItem>));
+    const child: SubagentNode = {
+      kind: 'subagent', subagentKey: 'k2', items: childItems, nested: true, depth: 1, spawnAnchorUuid: childSpawn, children: [],
+    };
+    const { container } = render(
+      <SidechainGroup
+        subagentKey="k" items={parent} forceOpen
+        windowAnchorUuid="c10"
+        // force the child open too (the reader force-opens the whole ancestor chain)
+        childCtx={{ forcedOpenKeys: new Set(['k2']) }}
+        children={[child]}
+      />,
+    );
+    // The child card mounted because the parent centered on the child's spawn member.
+    expect(container.querySelector('[data-uuid="c10"]')).not.toBeNull();
+    // Sanity: head member trimmed (the parent IS windowed past the head).
+    expect(has(container, 'u0')).toBe(false);
+  });
+
+  it('keeps a retained member as the SAME DOM node when the window grows (memo non-regression #231)', () => {
+    // Slicing changes mount/unmount only — a retained MessageItem's props must NOT
+    // churn. Growing the window via "Show later" keeps the head member's element
+    // referentially identical (React reused it: no remount, no key/prop churn that
+    // would have forced a replace).
+    const n = SUBAGENT_WINDOW_CAP + 200;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen />);
+    const m0a = container.querySelector('[data-uuid="u0"]');
+    expect(m0a).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(`Show ${SUBAGENT_WINDOW_CHUNK} later`) }));
+    const m0b = container.querySelector('[data-uuid="u0"]');
+    expect(m0b).toBe(m0a);
   });
 });
 
