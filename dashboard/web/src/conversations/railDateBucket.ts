@@ -1,5 +1,7 @@
 // Relative date-section label for a browse rail row (#165 Q5). Pure: computed
 // in the display tz against an injected `now` (testable). Browse-only.
+import type { ConversationSummary, RailSortKey } from '../types/conversation';
+
 const MS_DAY = 86_400_000;
 
 function ymdInTz(ms: number, tz: string): { y: number; m: number; d: number } {
@@ -24,4 +26,23 @@ export function railDateBucket(startedUtc: string, tz: string, now: number): str
   if (a.y === b.y && a.m === b.m) return 'This Month';
   return new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', year: 'numeric' })
     .format(new Date(t));
+}
+
+// Section-header label for a browse rail row, keyed off the EFFECTIVE sort
+// (#238 S2 D1). Recent/Oldest → date bucket; Project → the project label;
+// Cost/Messages → null (flat list, no headers). Pure; caller passes the
+// effective sort (sortDegraded ? 'recent' : railSort).
+export function railSectionLabel(
+  sort: RailSortKey,
+  row: ConversationSummary,
+  tz: string,
+  now: number,
+): string | null {
+  if (sort === 'recent' || sort === 'oldest') {
+    return railDateBucket(row.last_activity_utc, tz, now);
+  }
+  if (sort === 'project') {
+    return row.project_label || '—';
+  }
+  return null; // cost / messages → no section headers
 }
