@@ -861,7 +861,13 @@ describe('ConversationRail', () => {
     ];
     dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' });
     render(<ConversationRail />);
-    expect(document.querySelectorAll('.conv-rail-sec').length).toBe(1);
+    const secs = document.querySelectorAll('.conv-rail-sec');
+    expect(secs.length).toBe(1);
+    // Assert the header is the PROJECT label (first row's), not a coincidental
+    // single date header — so this also fails a full revert, not just the
+    // missing-.toLowerCase() boundary-key regression.
+    expect(secs[0].textContent).toBe('App');
+    expect(secs[0].classList.contains('conv-rail-sec--project')).toBe(true);
   });
 
   it('falls back to DATE headers (not project) when project sort is degraded', () => {
