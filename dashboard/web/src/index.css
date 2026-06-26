@@ -9388,12 +9388,15 @@ mark.current {
   .conv-cmp--wide .conv-cmp-head { position: sticky; top: 0; }
 }
 /* ---- C1 (#238 S3) tablet-band metrics reflow --------------------------- */
-/* The 641–1100 band keeps the rail mounted on desktop, so the metrics
+/* The 901–1100 band keeps the rail mounted on desktop, so the metrics
    container is far narrower than the viewport (~380px at 768px); 3 columns clip
    the "→ B" value (the comparison's whole point). Drop to 2 columns through the
    narrow sub-band so each A → B pair fits. Source-ordered AFTER the 1100px block
-   so 2-col wins where both match; ≤640 keeps its own 2-col rule. */
-@media (max-width: 850px) {
+   so 2-col wins where both match; ≤640 keeps its own 2-col rule. Breakpoint is
+   900px (not the originally-proposed 850px): the ui-qa gate found a residual
+   851–857px 3-col clip on the widest real A→B pairs, so the 2-col band was
+   raised to cover the full sub-zone with margin (3-col stays clean at ≥~858px). */
+@media (max-width: 900px) {
   .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 640px) {
