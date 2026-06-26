@@ -561,10 +561,10 @@ describe('SidechainGroup windowing (#239)', () => {
     expect(btn.getAttribute('data-conv-marker')).toBe('');
   });
 
-  it('mounts a nested child card when a grandchild anchor sits past the parent head window', () => {
+  it('mounts a nested DIRECT-CHILD card when its anchor sits past the parent head window', () => {
     // Parent of n members; a child spawns after a member OUTSIDE the head window;
-    // the anchor lives in the child. The child card must still mount (P0) because
-    // the parent re-centers its window on the child's spawn-anchor member.
+    // the anchor lives in the direct child. The child card must still mount (P0)
+    // because the parent centers its window on the child's spawn-anchor member.
     const n = SUBAGENT_WINDOW_CAP + 300;
     const parent = bigThread(n);
     const childSpawn = parent[SUBAGENT_WINDOW_CAP + 100].anchor.uuid;
@@ -599,6 +599,61 @@ describe('SidechainGroup windowing (#239)', () => {
     fireEvent.click(screen.getByRole('button', { name: new RegExp(`Show ${SUBAGENT_WINDOW_CHUNK} later`) }));
     const m0b = container.querySelector('[data-uuid="u0"]');
     expect(m0b).toBe(m0a);
+  });
+
+  it('mounts a nested GRANDCHILD card when its anchor sits deep in the tree (P0 recursive)', () => {
+    // parent k (over-cap) -> child k2 (spawns PAST the parent head window) ->
+    // grandchild k3 (member g10 is the anchor). The parent must center on k2's
+    // spawn member; k2 (sub-cap, renders all) mounts k3; k3 centers on g10. This
+    // exercises the full recursive resolveSubagentAnchorIndex path, not just a
+    // direct child (the pure helper covers the math; this proves the wiring).
+    const n = SUBAGENT_WINDOW_CAP + 300;
+    const parent = bigThread(n);
+    const childSpawn = parent[SUBAGENT_WINDOW_CAP + 100].anchor.uuid;
+    const childItems = Array.from({ length: 20 }, (_, i) => member(`c${i}`, { text: `child ${i}`, subagent_key: 'k2' } as Partial<ConversationItem>));
+    const grandItems = Array.from({ length: 30 }, (_, i) => member(`g${i}`, { text: `grand ${i}`, subagent_key: 'k3' } as Partial<ConversationItem>));
+    const grand: SubagentNode = { kind: 'subagent', subagentKey: 'k3', items: grandItems, nested: true, depth: 2, spawnAnchorUuid: 'c5', children: [] };
+    const child: SubagentNode = { kind: 'subagent', subagentKey: 'k2', items: childItems, nested: true, depth: 1, spawnAnchorUuid: childSpawn, children: [grand] };
+    const { container } = render(
+      <SidechainGroup
+        subagentKey="k" items={parent} forceOpen
+        windowAnchorUuid="g10"
+        childCtx={{ forcedOpenKeys: new Set(['k2', 'k3']) }}
+        children={[child]}
+      />,
+    );
+    // The grandchild's own member is mounted: the whole ancestor path centered.
+    expect(container.querySelector('[data-uuid="g10"]')).not.toBeNull();
+    expect(has(container, 'u0')).toBe(false); // parent head trimmed
+  });
+
+  it('re-centers when the anchor CHANGES to a windowed-out member (adjust-state-on-prop-change)', () => {
+    // The change's riskiest line: the re-center fires IN RENDER when
+    // windowAnchorUuid changes. Mount head-anchored (deep member trimmed), then
+    // rerender with the anchor on a windowed-out member and assert it re-centers.
+    const n = SUBAGENT_WINDOW_CAP + 400;
+    const targetIdx = SUBAGENT_WINDOW_CAP + 250;
+    const its = bigThread(n);
+    const { container, rerender } = render(<SidechainGroup subagentKey="k" items={its} forceOpen />);
+    expect(has(container, `u${targetIdx}`)).toBe(false); // windowed out at the head
+    expect(has(container, 'u0')).toBe(true);
+    rerender(<SidechainGroup subagentKey="k" items={its} forceOpen windowAnchorUuid={`u${targetIdx}`} />);
+    expect(has(container, `u${targetIdx}`)).toBe(true);  // re-centered: target now mounted
+    expect(has(container, 'u0')).toBe(false);            // head dropped
+  });
+
+  it('keeps a retained member the SAME DOM node when "Show earlier" inserts above it (memo #231)', () => {
+    // The true analog of the #231 prepend cascade: content inserted ABOVE shifts
+    // every retained member's position, but keys are item.anchor.uuid and props
+    // are item-derived, so React reuses the elements (no remount).
+    const n = SUBAGENT_WINDOW_CAP + 400;
+    const targetIdx = SUBAGENT_WINDOW_CAP + 250;
+    const { container } = render(<SidechainGroup subagentKey="k" items={bigThread(n)} forceOpen windowAnchorUuid={`u${targetIdx}`} />);
+    const ta = container.querySelector(`[data-uuid="u${targetIdx}"]`);
+    expect(ta).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /earlier/ }));
+    const tb = container.querySelector(`[data-uuid="u${targetIdx}"]`);
+    expect(tb).toBe(ta); // same node across an insert-above reveal
   });
 });
 

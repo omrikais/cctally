@@ -332,7 +332,11 @@ export function SidechainGroup({
     };
     apply();
     // One rAF re-assert to survive the outer Virtuoso ResizeObserver re-measure.
-    requestAnimationFrame(apply);
+    // Cancel it on unmount so a reveal-then-unmount within a single frame can't
+    // run apply() against a detached element (rect 0 → a spurious scrollTop
+    // write on the scroller). Codex P3 hardening.
+    const raf = requestAnimationFrame(apply);
+    return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [win.start]);
 
