@@ -826,6 +826,55 @@ describe('Conversations workspace integration', () => {
     expect(getState().convFiltersOpen).toBe(false);
     expect(getState().compare).toEqual({ a: 'sess-1', b: 'sess-2' });
   });
+
+  // C2 (#238 S3) — Escape inside an open comparison closes it back to the reader
+  // (mirroring ✕ Close → CLOSE_COMPARE), NOT eject to the dashboard.
+  it('C2: Escape in an open comparison closes it (CLOSE_COMPARE), not eject to dashboard', async () => {
+    updateSnapshot(baseEnvelope(true));
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(getState().compare).toBeNull();
+    expect(getState().compareCloseFocusPending).toBe(true);
+    expect(getState().view).toBe('conversations'); // stayed in the workspace
+  });
+
+  // C2 ordering (resolved Q1) — comparison-close wins over rail-search-clear: one
+  // Escape closes the comparison and LEAVES the needle intact.
+  it('C2: Escape closes the comparison before clearing a leftover rail-search needle', async () => {
+    updateSnapshot(baseEnvelope(true));
+    act(() => {
+      dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'abc' });
+      dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' });
+    });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(getState().compare).toBeNull();
+    expect(getState().conversationSearch).toBe('abc'); // needle untouched
+  });
+
+  // C2 + Codex gate #1 — with the filters popover opened before the comparison,
+  // a single Escape still closes the comparison (convFiltersOpen was cleared, so
+  // inView is true and the binding fires).
+  it('C2: a single Escape closes the comparison even if the filters popover was open at entry', async () => {
+    updateSnapshot(baseEnvelope(true));
+    act(() => {
+      dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+      dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' });
+    });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+    expect(getState().convFiltersOpen).toBe(false);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().compare).toBeNull();
+  });
 });
 
 // #228 S3 F1 — the outline lives as a slide-over SHEET across the whole

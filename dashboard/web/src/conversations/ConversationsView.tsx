@@ -226,6 +226,15 @@ const CONVERSATIONS_BINDINGS = [
     key: 'Escape', scope: 'global' as const, view: 'conversations' as const,
     when: inView,
     action: () => {
+      // #238 S3 (C2) — a comparison is the dominant foreground overlay, so Escape
+      // dismisses it FIRST, back to the reader (NOT the dashboard). Mirror ✕ Close
+      // exactly: CLOSE_COMPARE clears `compare` AND arms compareCloseFocusPending
+      // so the reader returns focus to #conv-compare-with. Ordering (resolved Q1):
+      // comparison-close wins over rail-search-clear — which also fixes mobile,
+      // where the rail/search is hidden during a comparison so clearing a stale
+      // needle would look like a no-op and leave the comparison open. OPEN_COMPARE
+      // clears convFiltersOpen, so inView is true here and this branch can fire.
+      if (getState().compare) { dispatch({ type: 'CLOSE_COMPARE' }); return; }
       if (getState().conversationSearch) { dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' }); return; }
       dispatch({ type: 'SET_VIEW', view: 'dashboard' });
     },
