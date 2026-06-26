@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: large subagent threads now render an internally windowed slice (centered on a deep-linked / found / pinned turn) instead of mounting the entire thread, with "Show N earlier/later" and "Show all" controls to grow it on demand — a deep-link into a giant subagent no longer renders a ~106k-node DOM (#239).
+
 ## [1.56.0] - 2026-06-26
 
 ### Fixed

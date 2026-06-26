@@ -5874,6 +5874,31 @@ mark.current {
 }
 .conv-hidden-run:hover { color: var(--text-dim); border-color: var(--accent-blue); }
 
+/* ---- Subagent internal-windowing reveal controls (#239) ---------- */
+/* "↑ Show N earlier" / "↓ Show N later" / "Show all M" affordances at the
+   window edges of a large subagent thread. Mirrors the .conv-hidden-run pill:
+   muted, dashed, data-conv-marker (never a keyboard stop). */
+.conv-window-reveal-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 0;
+}
+.conv-window-reveal {
+  appearance: none;
+  border: 1px dashed var(--border-soft);
+  background: transparent;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  padding: 2px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.conv-window-reveal:hover { color: var(--text-dim); border-color: var(--accent-blue); }
+.conv-window-reveal--all { opacity: 0.8; }
+
 /* ---- In-card "Jump to" chip row (#177 S5 §4 / #186 §4.1) ---------- */
 /* Now MERGED INTO the stats card (#186): a top-divider + "Jump to" label above
    a wrapping row of labeled chips. */
