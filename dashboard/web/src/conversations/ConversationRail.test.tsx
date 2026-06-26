@@ -877,6 +877,32 @@ describe('ConversationRail', () => {
     const secs = [...document.querySelectorAll('.conv-rail-sec')].map((s) => s.textContent);
     expect(secs).toContain('April 2026');
   });
+
+  // ---- #238 S2 D2/D4 — meta-line: timestamp is a protected sibling, not inside
+  // the overflow-hidden metaleft box ----
+
+  it('renders the browse-row timestamp as a direct child of meta (outside metaleft)', () => {
+    browseRows = [summary({ session_id: 's1' })];
+    render(<ConversationRail />);
+    const meta = document.querySelector('.conv-rail-row-meta')!;
+    const when = meta.querySelector('.conv-rail-row-when')!;
+    expect(when).toBeTruthy();
+    expect(when.parentElement).toBe(meta);                                  // sibling of metaleft, not inside it
+    expect(meta.querySelector('.conv-rail-row-metaleft .conv-rail-row-when')).toBeNull();
+  });
+
+  it('wraps the search-row project in metaleft with the timestamp as a protected sibling', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const meta = document.querySelector('.conv-rail-row--hit .conv-rail-row-meta')!;
+    const metaleft = meta.querySelector('.conv-rail-row-metaleft')!;
+    expect(metaleft).toBeTruthy();
+    expect(metaleft.querySelector('.conv-rail-row-project')).toBeTruthy();   // project ellipsizes inside metaleft
+    const when = meta.querySelector('.conv-rail-row-when')!;
+    expect(when.parentElement).toBe(meta);                                   // when is the protected sibling
+  });
 });
 
 describe('ConversationRail browse-list error state (#205 S3 F8)', () => {

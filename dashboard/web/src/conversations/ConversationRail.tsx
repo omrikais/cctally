@@ -451,8 +451,11 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
         <span className="conv-rail-row-metaleft">
           {!hideProject && <span className="conv-rail-row-project">{row.project_label || '—'}</span>}
           <span className="conv-rail-row-branch">{row.git_branch ?? '—'}</span>
-          <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
         </span>
+        {/* #238 S2 D4 — timestamp is a protected sibling (flex:0 0 auto), OUTSIDE
+            the overflow-hidden metaleft, so project/branch ellipsize first and the
+            time is never clipped. */}
+        <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
         <span className="conv-rail-row-cluster">
           {models.classes.length > 0 && (
             <span className="conv-rail-row-model">
@@ -652,7 +655,12 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
           $0.00 on most hits and the browse list + open reader already carry
           cost). Search-row meta is now project · when. */}
       <div className="conv-rail-row-meta">
-        <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
+        {/* #238 S2 D2 — project ellipsizes inside metaleft; #238 S2 D4 — the
+            timestamp is the protected sibling so a long project label can't push
+            it off the rail edge (no clip, no horizontal scrollbar). */}
+        <span className="conv-rail-row-metaleft">
+          <span className="conv-rail-row-project">{hit.project_label || '—'}</span>
+        </span>
         <span className="conv-rail-row-when">{fmt.startedShort(hit.ts, ctx, { noSuffix: true })}</span>
       </div>
       {/* #217 S4 QA fix — suppress the bottom snippet row for a file hit: its

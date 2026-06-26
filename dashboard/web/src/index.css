@@ -6092,6 +6092,10 @@ mark.current {
   font-size: 11px;
   white-space: nowrap;
 }
+/* #238 S2 D4 — the timestamp never shrinks; combined with being a direct child
+   of .conv-rail-row-meta (outside the overflow-hidden metaleft) it can be
+   clipped by neither sibling-shrink nor parent-overflow. */
+.conv-rail-row-when { flex: 0 0 auto; }
 /* #228 S4 D2 — one non-wrapping meta line: a left group ([project ·] branch ·
    when) that ellipsizes inside the row, and a right stats cluster (model chip +
    $cost + msg count) that keeps its width. */
