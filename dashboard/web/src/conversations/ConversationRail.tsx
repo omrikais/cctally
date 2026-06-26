@@ -4,7 +4,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useConversations } from '../hooks/useConversations';
 import { useConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
-import { railDateBucket } from './railDateBucket';
+import { railSectionLabel } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { pickBannerLabel } from './pickBannerLabel';
 import { allOneProject, visibleBadges } from './railDiscovery';
@@ -327,6 +327,7 @@ interface RailCtx { tz: string; offsetLabel: string }
 function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null; ctx: RailCtx; pickAnchor: string | null }) {
   const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry } = useConversations();
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
+  const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
   // filters spec §1 dual-branch parity — a one-line muted note when the
   // project/cost/rebuild axes couldn't apply (rollup non-authoritative). Rendered
   // above the list so it shows even on a degraded empty result. #217 S4 / I-2.3 —
@@ -374,25 +375,37 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
     }
     return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">No conversations.</div></div>;
   }
-  // rows are date-desc; the bucket label changes monotonically as you scroll.
-  // Buckets group on last_activity_utc (filters spec §4 last-activity-everywhere
-  // / Codex P2 #6) so the grouping agrees with the recent sort + the date filter.
-  let lastBucket: string | null = null;
+  // #238 S2 D1 — section off the EFFECTIVE sort: a degraded cost/project sort
+  // fell back to recent order, so it gets DATE headers (not repeating project
+  // headers over recent-ordered rows).
+  const effectiveSort = sortDegraded ? 'recent' : railSort;
+  const isProjectSort = effectiveSort === 'project';
+  // boundary key is case-insensitive (backend orders project labels COLLATE
+  // NOCASE, so 'App'/'app' sort adjacent and must coalesce under one header).
+  let lastKey: string | null = null;
   const now = Date.now();
-  // #228 S4 D2 — suppress the per-row project label when every loaded row shares
-  // one project (single-project installs). Recomputed each render, so a later
-  // page introducing a second project makes the labels reappear for all rows.
-  const hideProject = allOneProject(rows);
+  // #228 S4 D2 — suppress the per-row project label on single-project installs;
+  // #238 S2 D1 — and under Project sort, where the section header already names
+  // the project (so the row meta doesn't echo it).
+  const hideProject = allOneProject(rows) || isProjectSort;
   return (
     <div className="conv-rail-list">
       {degradedNote}
       {rows.map((r) => {
-        const bucket = railDateBucket(r.last_activity_utc, ctx.tz, now);
-        const isNewBucket = bucket !== lastBucket;
-        if (isNewBucket) lastBucket = bucket;
+        const label = railSectionLabel(effectiveSort, r, ctx.tz, now);
+        const key = label === null ? null : label.toLowerCase();
+        const showHeader = label !== null && key !== lastKey;
+        if (key !== null) lastKey = key;
         return (
           <Fragment key={r.session_id}>
-            {isNewBucket && <div className="conv-rail-sec">{bucket}</div>}
+            {showHeader && (
+              <div
+                className={`conv-rail-sec${isProjectSort ? ' conv-rail-sec--project' : ''}`}
+                title={isProjectSort ? (label ?? undefined) : undefined}
+              >
+                {label}
+              </div>
+            )}
             <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} pickAnchor={pickAnchor} hideProject={hideProject} />
           </Fragment>
         );

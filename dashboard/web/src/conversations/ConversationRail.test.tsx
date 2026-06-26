@@ -815,6 +815,68 @@ describe('ConversationRail', () => {
     expect(getState().conversationFilters.rebuildMin).toBeNull();
     expect(getState().conversationFilters.projects).toEqual([]);
   });
+
+  // ---- #238 S2 D1 — sort-aware section headers ----
+
+  it('renders no section headers under cost sort', () => {
+    browseRows = [
+      summary({ session_id: 's1', last_activity_utc: '2026-06-09T01:00:00Z' }),
+      summary({ session_id: 's2', last_activity_utc: '2026-04-15T10:00:00Z' }),
+    ];
+    dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'cost' });
+    render(<ConversationRail />);
+    expect(document.querySelector('.conv-rail-sec')).toBeNull();
+  });
+
+  it('renders project-name headers under project sort (one per boundary, adjacent coalesce)', () => {
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'alpha' }),
+      summary({ session_id: 's2', project_label: 'alpha' }),
+      summary({ session_id: 's3', project_label: 'beta' }),
+    ];
+    dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' });
+    render(<ConversationRail />);
+    const secs = [...document.querySelectorAll('.conv-rail-sec')].map((s) => s.textContent);
+    expect(secs).toEqual(['alpha', 'beta']);            // adjacent 'alpha' rows coalesce
+    expect(document.querySelector('.conv-rail-sec--project')).toBeTruthy();
+    // per-row project label suppressed under project sort (header owns it)
+    expect(document.querySelector('.conv-rail-row-project')).toBeNull();
+  });
+
+  it('still renders a single project header when only one project is loaded', () => {
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'solo' }),
+      summary({ session_id: 's2', project_label: 'solo' }),
+    ];
+    dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' });
+    render(<ConversationRail />);
+    const secs = [...document.querySelectorAll('.conv-rail-sec')].map((s) => s.textContent);
+    expect(secs).toEqual(['solo']);
+  });
+
+  it('coalesces case-variant project labels under one header (COLLATE NOCASE order)', () => {
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'App' }),
+      summary({ session_id: 's2', project_label: 'app' }),
+    ];
+    dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' });
+    render(<ConversationRail />);
+    expect(document.querySelectorAll('.conv-rail-sec').length).toBe(1);
+  });
+
+  it('falls back to DATE headers (not project) when project sort is degraded', () => {
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'alpha', last_activity_utc: '2026-06-09T01:00:00Z' }),
+      summary({ session_id: 's2', project_label: 'beta', last_activity_utc: '2026-04-15T10:00:00Z' }),
+    ];
+    sortDegraded = true;
+    dispatch({ type: 'SET_CONVERSATION_RAIL_SORT', sort: 'project' });
+    render(<ConversationRail />);
+    // No project-name modifier header; date buckets instead.
+    expect(document.querySelector('.conv-rail-sec--project')).toBeNull();
+    const secs = [...document.querySelectorAll('.conv-rail-sec')].map((s) => s.textContent);
+    expect(secs).toContain('April 2026');
+  });
 });
 
 describe('ConversationRail browse-list error state (#205 S3 F8)', () => {

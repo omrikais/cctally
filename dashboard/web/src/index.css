@@ -6058,6 +6058,17 @@ mark.current {
   text-transform: uppercase;
   color: var(--text-faint);
   padding: var(--space-3) var(--space-2) var(--space-1);
+  /* #238 S2 D1 — long project-name headers must not wrap/overflow the rail. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* #238 S2 D1 — project-name section headers preserve case + tighten tracking
+   so technical/worktree names stay scannable (date headers keep the uppercase
+   eyebrow above). */
+.conv-rail-sec--project {
+  text-transform: none;
+  letter-spacing: 0.02em;
 }
 .conv-rail-row-title {
   font-family: var(--font-prose);
