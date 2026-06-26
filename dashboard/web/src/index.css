@@ -6120,15 +6120,35 @@ mark.current {
   align-items: baseline;
 }
 .conv-rail-row-metaleft > span { overflow: hidden; text-overflow: ellipsis; }
+/* #238 S2 (ui-qa) — once D4 made the timestamp a non-shrinking sibling, the
+   widest browse rows (3 model chips + 3-digit cost + 5-digit msg count)
+   overflowed the fixed ~340px rail and clipped the msg-count. Fix: the
+   model-chip group is its OWN shrinkable meta item (flex 0 1 auto + min-width:0
+   + overflow:hidden) so it collapses as the overflow valve; the stats cluster
+   holds ONLY cost + msg-count and stays rigid (flex:0 0 auto). Keeping the model
+   group INSIDE the cluster made the cluster's own min-content include the chips
+   (~113px), so min-width:auto floored it there and it couldn't shrink — the
+   numbers spilled past the rail edge (the two prior attempts). With the chips
+   out, the row's hard floor (when + cost + msgs + gaps ≈ 225px) sits well inside
+   the 338px rail, so the numbers never spill; metaleft (project/branch) and the
+   model group both yield before anything clips a number. Normal-width rows never
+   shrink; search rows carry neither model nor cluster. */
+.conv-rail-row-model {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.conv-rail-row-model .chip { font-size: 9.5px; padding: 1px 5px; }
+.conv-rail-row-model-more { color: var(--text-faint); font-size: var(--fs-eyebrow); }
 .conv-rail-row-cluster {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
 }
-.conv-rail-row-model { display: inline-flex; align-items: center; gap: 3px; }
-.conv-rail-row-model .chip { font-size: 9.5px; padding: 1px 5px; }
-.conv-rail-row-model-more { color: var(--text-faint); font-size: var(--fs-eyebrow); }
 .conv-rail-row-cost { color: var(--accent-green); }
 .conv-rail-row-snippet {
   margin-top: var(--space-1);

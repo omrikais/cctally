@@ -456,13 +456,17 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
             the overflow-hidden metaleft, so project/branch ellipsize first and the
             time is never clipped. */}
         <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
+        {/* #238 S2 (ui-qa) — the model-chip group is its OWN shrinkable meta item,
+            NOT inside the stats cluster, so it can collapse (overflow valve)
+            without inflating the cluster's min-content and forcing the cost/msg
+            numbers to spill off the fixed-width rail. */}
+        {models.classes.length > 0 && (
+          <span className="conv-rail-row-model">
+            {models.classes.map((c) => <span key={c} className={`chip ${c}`}>{c}</span>)}
+            {models.extra > 0 && <span className="conv-rail-row-model-more">+{models.extra}</span>}
+          </span>
+        )}
         <span className="conv-rail-row-cluster">
-          {models.classes.length > 0 && (
-            <span className="conv-rail-row-model">
-              {models.classes.map((c) => <span key={c} className={`chip ${c}`}>{c}</span>)}
-              {models.extra > 0 && <span className="conv-rail-row-model-more">+{models.extra}</span>}
-            </span>
-          )}
           <span className="conv-rail-row-cost">{fmt.usd2(row.cost_usd)}</span>
           <span className="conv-rail-row-msgs">{row.msg_count}</span>
         </span>
