@@ -12,6 +12,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Conversation viewer: a long subagent-card title is now recoverable in full via a hover tooltip (#238).
 - Conversation viewer: the current in-conversation find match is now visually distinct from the other matches while you step through results (#238).
 - Conversation viewer discovery rail (#238 S2): section headers are now sort-aware — Recent/Oldest keep date dividers, Cost/Messages show a flat list, and Project sort groups by project name; the search-row meta no longer clips the timestamp or shows a horizontal scrollbar on long project labels, the browse-row timestamp is protected from truncation, and the Filters/Sort controls match the search-input height on desktop with an explicit 44px tap target on mobile.
+- Conversation comparison view (#238 S3): the A→B metrics strip now reflows to two columns through the full tablet width band so the "B" value is never clipped (it previously truncated the B-side number — the whole point of the comparison — at ~641–900px while the rail kept the strip narrow), and pressing Escape in an open comparison now closes it back to the single reader (restoring focus to "Compare with…", identical to the ✕ Close button) instead of ejecting the whole workspace to the dashboard.
 
 ## [1.55.0] - 2026-06-25
 
