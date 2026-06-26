@@ -874,6 +874,12 @@ describe('Conversations workspace integration', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(getState().compare).toBeNull();
+    // Discriminate close-to-reader from eject-to-dashboard: the eject path ALSO
+    // nulls `compare`, so `compare===null` alone is vacuous for the C2 branch.
+    // These two prove the comparison closed back to the reader (CLOSE_COMPARE),
+    // not that the workspace ejected.
+    expect(getState().view).toBe('conversations');
+    expect(getState().compareCloseFocusPending).toBe(true);
   });
 });
 
