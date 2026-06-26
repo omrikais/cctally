@@ -6316,7 +6316,7 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11.5px;
-  padding: 0 10px;
+  padding: 6px 10px;
   border-radius: 5px;
   cursor: pointer;
   white-space: nowrap;
@@ -6400,8 +6400,8 @@ mark.current {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 11.5px;
-  padding: 0 6px;
-  height: 100%;
+  padding: 6px 6px;
+  box-sizing: border-box;
   border-radius: 5px;
   cursor: pointer;
 }
@@ -8657,6 +8657,7 @@ mark.current {
 
   /* §4D browse rail */
   #root .conv-rail-filters-btn { min-height: 44px; }
+  #root .conv-rail-sort-select { min-height: 44px; }
   #root .conv-rail-filters-activechip,
   #root .conv-rail-filters-clearall,
   #root .conv-rail-chip,
