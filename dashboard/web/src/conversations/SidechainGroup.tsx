@@ -5,10 +5,20 @@ import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
 import { planSubagentWindow, centeredWindow, resolveSubagentAnchorIndex, SUBAGENT_WINDOW_CAP, SUBAGENT_WINDOW_CHUNK } from './subagentWindow';
+import { reassertCenter } from './reassertCenter';
 import type { ConversationItem, SubagentMeta } from '../types/conversation';
 import type { SubagentNode } from './groupSidechains';
 
 const LABEL_MAX = 60;
+// #239 — convergence bounds for the reveal scroll-anchor pin. Matched to the
+// reader's giant-row jump-land (REASSERT_STABLE_FRAMES / REASSERT_BUDGET_MS): a
+// reveal grows this single Virtuoso item by tens of thousands of px and Virtuoso
+// re-measures it over several frames, so the pin must re-apply EVERY frame until
+// the offset stabilizes (a single write is clamped to the stale scroll range and
+// then overwritten by Virtuoso's re-anchor — the #239 fling). Time-bounded, not
+// frame-bounded, so it's refresh-rate-independent.
+const REVEAL_REASSERT_STABLE_FRAMES = 4;
+const REVEAL_REASSERT_BUDGET_MS = 800;
 // #205 S3 (F7) — a roomier cap on mobile so the 2-line CSS clamp on
 // .conv-sidechain-title governs the visible truncation, not this slice.
 const MOBILE_LABEL_MAX = 120;
@@ -305,40 +315,73 @@ export function SidechainGroup({
   });
   const windowItems = win.windowed ? items.slice(win.start, win.end) : items;
 
-  // Scroll-stability for "Show earlier": preserve the currently-first window
-  // member's viewport position when height is inserted above it (Codex P1).
+  // #239 — reveal scroll-stability. A reveal grows this ONE Virtuoso item by
+  // tens of thousands of px. At commit time Virtuoso's virtual scroll space is
+  // still the STALE (pre-reveal) card height, so a single `scrollTop +=` write is
+  // clamped to that range and then overwritten when Virtuoso's ResizeObserver
+  // re-measures the card over the next several frames and re-anchors its own way
+  // (the fling the ui-qa gate caught — up to ~34k px). Pin the member that was
+  // first in the window at its captured viewport top with a CONVERGENT reassert
+  // (the #237 every-frame-apply loop), so the correction grows as the scroll
+  // range opens and re-wins after each Virtuoso re-anchor until it settles.
   const bodyDivRef = useRef<HTMLDivElement>(null);
-  const scrollFixRef = useRef<{ uuid: string; top: number } | null>(null);
-  const revealEarlier = () => {
-    const firstUuid = items[win.start]?.anchor.uuid;
-    const el = firstUuid
-      ? (bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(firstUuid)}"]`) as HTMLElement | null)
+  const pendingReanchorRef = useRef<{ uuid: string; top: number } | null>(null);
+  // Bumped on each reveal + on unmount; the in-flight reassert aborts when its
+  // captured token is superseded (a new reveal) or the card unmounts.
+  const reanchorTokenRef = useRef(0);
+  // Capture the current first-window member + its viewport top BEFORE the reveal
+  // mutates the slice. Pinning a member that exists both before AND after holds
+  // the whole view uniformly (inserted content lands above/below it). No-op when
+  // there's no scroller (unit/JSDOM) or the member isn't mounted.
+  const captureReanchor = () => {
+    const uuid = items[win.start]?.anchor.uuid;
+    const scroller = bodyDivRef.current?.closest('.conv-reader-body') as HTMLElement | null;
+    const el = uuid
+      ? (bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(uuid)}"]`) as HTMLElement | null)
       : null;
-    scrollFixRef.current = firstUuid && el ? { uuid: firstUuid, top: el.getBoundingClientRect().top } : null;
+    pendingReanchorRef.current = uuid && scroller && el
+      ? { uuid, top: el.getBoundingClientRect().top }
+      : null;
+  };
+  const revealEarlier = () => {
+    captureReanchor();
     setRevealed((r) => ({ ...r, start: Math.max(0, r.start - SUBAGENT_WINDOW_CHUNK) }));
   };
-  const revealLater = () => setRevealed((r) => ({ ...r, end: Math.min(items.length, r.end + SUBAGENT_WINDOW_CHUNK) }));
-  const showAll = () => setRevealed({ start: 0, end: items.length });
+  const revealLater = () => {
+    captureReanchor();
+    setRevealed((r) => ({ ...r, end: Math.min(items.length, r.end + SUBAGENT_WINDOW_CHUNK) }));
+  };
+  const showAll = () => {
+    captureReanchor();
+    setRevealed({ start: 0, end: items.length });
+  };
   useLayoutEffect(() => {
-    const fix = scrollFixRef.current;
-    if (!fix) return;
-    scrollFixRef.current = null;
+    const fix = pendingReanchorRef.current;
+    if (!fix) return;                 // not a reveal (e.g. a jump re-center) → leave scroll to the reader
+    pendingReanchorRef.current = null;
     const scroller = bodyDivRef.current?.closest('.conv-reader-body') as HTMLElement | null;
-    const el = bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(fix.uuid)}"]`) as HTMLElement | null;
-    if (!scroller || !el) return;
-    const apply = () => {
-      const delta = el.getBoundingClientRect().top - fix.top;
-      if (delta !== 0) scroller.scrollTop += delta;
-    };
-    apply();
-    // One rAF re-assert to survive the outer Virtuoso ResizeObserver re-measure.
-    // Cancel it on unmount so a reveal-then-unmount within a single frame can't
-    // run apply() against a detached element (rect 0 → a spurious scrollTop
-    // write on the scroller). Codex P3 hardening.
-    const raf = requestAnimationFrame(apply);
-    return () => cancelAnimationFrame(raf);
+    if (!scroller) return;            // no scroller (JSDOM) → nothing to hold
+    const token = ++reanchorTokenRef.current;
+    void reassertCenter({
+      measure: () => {
+        const el = bodyDivRef.current?.querySelector(`[data-uuid="${CSS.escape(fix.uuid)}"]`) as HTMLElement | null;
+        if (!el || !el.isConnected) return null;
+        // desired scrollTop that returns the member to its captured viewport top.
+        const cur = el.getBoundingClientRect().top;
+        return { desired: scroller.scrollTop + (cur - fix.top), target: el };
+      },
+      apply: (f) => { scroller.scrollTop = f.desired; },
+      nextFrame: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
+      now: () => performance.now(),
+      isAborted: () => reanchorTokenRef.current !== token,
+      tol: 1,
+      stableNeeded: REVEAL_REASSERT_STABLE_FRAMES,
+      budgetMs: REVEAL_REASSERT_BUDGET_MS,
+    });
+    // Abort the in-flight reassert on unmount / before the next reveal's run.
+    return () => { reanchorTokenRef.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [win.start]);
+  }, [win.start, win.end]);
 
   // Render one nested child <SidechainGroup>, threading the reader's per-key
   // machinery from childCtx (its own meta / force flag / refs / open-state).
