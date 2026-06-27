@@ -59,7 +59,7 @@ describe('CodexCard', () => {
     const { container } = withSession(<CodexCard call={call({ result: { text: errEnvelope, truncated: false, is_error: true } })} />);
     expect(container.querySelector('.conv-codex--error')).not.toBeNull();
     expect(container.querySelector('.conv-codex-error-msg')!.textContent).toContain('model not supported');
-    expect(container.querySelector('.conv-chip-preview') && container.textContent).toContain('✗ 400');
+    expect(container.querySelector('.conv-codex-summary-status')!.textContent).toContain('✗ 400');
   });
 
   it('treats an is_error result with a non-envelope body as an error', () => {
@@ -68,14 +68,24 @@ describe('CodexCard', () => {
     expect(container.querySelector('.conv-codex-error-msg')!.textContent).toContain('boom (not json)');
   });
 
+  it('degrades a malformed non-error result to raw <pre> without erroring', () => {
+    const { container } = withSession(<CodexCard call={call({ result: { text: 'not json at all', truncated: false, is_error: false } })} />);
+    const pre = container.querySelector('pre.conv-code--result');
+    expect(pre).not.toBeNull();
+    expect(pre!.textContent).toContain('not json at all');
+    expect(container.querySelector('.conv-codex--error')).toBeNull();
+  });
+
   it('shows "no result" for a request-only call (result null)', () => {
     const { container } = withSession(<CodexCard call={call({ result: null })} />);
     expect(container.textContent).toContain('no result');
   });
 
-  it('shows a thread chip and no model pill for codex-reply', () => {
+  it('shows a thread chip and suppresses the model pill for codex-reply', () => {
+    // Fixture carries BOTH threadId AND model so the null model pill proves the
+    // threadId branch *suppresses* it (non-vacuous), not that model was absent.
     const { container } = withSession(
-      <CodexCard call={call({ name: 'mcp__codex__codex-reply', input: { prompt: 'follow up', threadId: '019ed760' } })} />,
+      <CodexCard call={call({ name: 'mcp__codex__codex-reply', input: { prompt: 'follow up', threadId: '019ed760', model: 'gpt-5.2-codex' } })} />,
     );
     expect(container.querySelector('.conv-codex-thread')!.textContent).toContain('d760');
     expect(container.querySelector('.conv-codex-model')).toBeNull();

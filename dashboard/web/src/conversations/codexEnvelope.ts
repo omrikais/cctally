@@ -23,8 +23,11 @@ export function parseCodexEnvelope(text: string): CodexEnvelope {
   if (obj === null || typeof obj !== 'object') return { kind: 'raw', text };
   const o = obj as Record<string, unknown>;
 
-  // Error envelope: { type: 'error', status, error: { type, message } }.
-  if (o.type === 'error' || (o.error && typeof o.error === 'object')) {
+  // Error envelope: { type: 'error', status, error: { type, message } }. An
+  // explicit type:'error' always wins; an `error` object alone counts only when
+  // there's no `content` string (so a success envelope that happens to carry an
+  // `error`-shaped key still decodes as ok).
+  if (o.type === 'error' || (typeof o.content !== 'string' && o.error && typeof o.error === 'object')) {
     const err = (o.error && typeof o.error === 'object') ? (o.error as Record<string, unknown>) : {};
     const message =
       typeof err.message === 'string' ? err.message

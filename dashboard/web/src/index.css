@@ -8950,10 +8950,11 @@ mark.current {
 .conv-codex-model,
 .conv-codex-thread {
   font-size: 10.5px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border-soft);
+  flex: 0 0 auto;   /* rigid pills — let .conv-chip-preview absorb the shrink (#243) */
 }
 .conv-codex-model { color: #bdf3e6; border-color: rgba(16,163,127,.5); background: rgba(16,163,127,.14); }
 .conv-codex-thread { color: #cdbdf6; border-color: rgba(192,132,252,.4); background: rgba(192,132,252,.12); }
-.conv-codex-summary-status { font-size: 11px; color: var(--accent-green); }
+.conv-codex-summary-status { font-size: 11px; color: var(--accent-green); flex: 0 0 auto; }
 .conv-codex-summary-status--err { color: var(--accent-red); }
 
 .conv-codex-body { padding: 0; }

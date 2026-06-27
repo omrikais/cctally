@@ -92,12 +92,18 @@ export function CodexCard({ call }: { call: Call }) {
           </div>
         )}
 
-        <CodexResponse />
+        {renderResponse()}
       </div>
     </details>
   );
 
-  function CodexResponse() {
+  // Plain render helper — NOT a nested component. Calling it inlines the JSX into
+  // the body so children (LoadFull/CopyButton state, the <Markdown> tree) survive
+  // parent re-renders; a `<CodexResponse />` element would get a fresh identity
+  // each render and remount the whole subtree (resetting an in-flight load and
+  // re-parsing Markdown on every Virtuoso scroll). It reads parent state via
+  // closure and owns no hooks, so the function-call form is safe.
+  function renderResponse() {
     if (result == null) {
       return <div className="conv-tool-io-label conv-tool-io-label--none">no result</div>;
     }
@@ -109,6 +115,17 @@ export function CodexCard({ call }: { call: Call }) {
         </div>
       );
     }
+    // result is non-null past the guard above. The result LoadFull is identical
+    // across the raw + ok branches, so build it once.
+    const resultLoadFull = result.truncated && fullResultText == null && call.tool_use_id ? (
+      <LoadFull
+        toolUseId={call.tool_use_id}
+        which="result"
+        fullLength={result.full_length ?? null}
+        label="load full response"
+        onLoaded={(p: FullPayload) => { if (p.which === 'result') setFullResultText(p.text); }}
+      />
+    ) : null;
     if (parsed.kind === 'raw') {
       if (isError) {
         return (
@@ -123,15 +140,7 @@ export function CodexCard({ call }: { call: Call }) {
           {result.truncated && fullResultText == null
             ? <div className="conv-codex-truncated">Response truncated — load the full response below.</div>
             : <pre className="conv-code conv-code--result">{parsed.text}</pre>}
-          {result.truncated && fullResultText == null && call.tool_use_id && (
-            <LoadFull
-              toolUseId={call.tool_use_id}
-              which="result"
-              fullLength={result.full_length ?? null}
-              label="load full response"
-              onLoaded={(p: FullPayload) => { if (p.which === 'result') setFullResultText(p.text); }}
-            />
-          )}
+          {resultLoadFull}
         </>
       );
     }
@@ -149,15 +158,7 @@ export function CodexCard({ call }: { call: Call }) {
             <button type="button" onClick={() => setResponseExpanded(true)}>Show full response ↓</button>
           </div>
         )}
-        {result.truncated && fullResultText == null && call.tool_use_id && (
-          <LoadFull
-            toolUseId={call.tool_use_id}
-            which="result"
-            fullLength={result.full_length ?? null}
-            label="load full response"
-            onLoaded={(p: FullPayload) => { if (p.which === 'result') setFullResultText(p.text); }}
-          />
-        )}
+        {resultLoadFull}
       </>
     );
   }
