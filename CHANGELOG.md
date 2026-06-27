@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.57.0] - 2026-06-27
+
 ### Added
 - Conversation viewer: Codex tool calls (`mcp__codex__codex` / `codex-reply`) now render as a dedicated card — the prompt and the response render as Markdown (the response was previously a raw JSON blob), with an OpenAI-green "agent run" header showing model / reasoning effort / sandbox, a clamped response with show-full, a dedicated error block, and reply-thread chips.
 
