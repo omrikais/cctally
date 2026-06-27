@@ -1,5 +1,5 @@
 import ReactMarkdown from 'react-markdown';
-import type { ExtraProps } from 'react-markdown';
+import type { ExtraProps, Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useMemo } from 'react';
 import type { ComponentPropsWithoutRef } from 'react';
@@ -14,7 +14,7 @@ import { applyMarksPlugin, splitToReactNodes, useFindSplit } from '../conversati
 // CodeBlock (refractor → hast → React ELEMENTS — never an HTML string);
 // no-language and unknown-language fences stay plain monospace <pre>.
 // No dangerouslySetInnerHTML anywhere.
-function MdLink({ href, children, ...rest }: ComponentPropsWithoutRef<'a'>) {
+export function MdLink({ href, children, ...rest }: ComponentPropsWithoutRef<'a'>) {
   return (
     <a {...rest} href={href} target="_blank" rel="noopener noreferrer">
       {children}
@@ -55,7 +55,7 @@ function PreBlock({ node, children }: ComponentPropsWithoutRef<'pre'> & ExtraPro
   );
 }
 
-export function Markdown({ children }: { children: string }) {
+export function Markdown({ children, components }: { children: string; components?: Components }) {
   const split = useFindSplit();
   const rehypePlugins = useMemo(
     () => (split ? [[applyMarksPlugin, split] as [typeof applyMarksPlugin, typeof split]] : []),
@@ -66,7 +66,7 @@ export function Markdown({ children }: { children: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={rehypePlugins}
-        components={{ a: MdLink, pre: PreBlock }}
+        components={{ a: MdLink, pre: PreBlock, ...components }}
       >
         {children}
       </ReactMarkdown>

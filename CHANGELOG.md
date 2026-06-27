@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Conversation viewer: Codex tool calls (`mcp__codex__codex` / `codex-reply`) now render as a dedicated card — the prompt and the response render as Markdown (the response was previously a raw JSON blob), with an OpenAI-green "agent run" header showing model / reasoning effort / sandbox, a clamped response with show-full, a dedicated error block, and reply-thread chips.
+
 ### Fixed
 - Model chips no longer mislabel or miscolour Fable and unrecognized models. A conversation whose main model was `claude-fable-5` previously rendered a browse-rail chip literally labelled "sonnet" in the sonnet green (the rail chip's text is its class name), and any unrecognized model — including the internal `<synthetic>` placeholder — silently borrowed that same "sonnet" identity across every chip surface. Fable now gets its own dedicated rose chip everywhere (the conversation rail and reader, the Sessions panel, the session/block/projects modals, and the Weekly/Monthly model-cost bars and detail cards), and a genuinely-unrecognized model now gets a neutral grey "other" chip — labelled in the rail by the model's own abbreviation — instead of impersonating sonnet (#244).
 

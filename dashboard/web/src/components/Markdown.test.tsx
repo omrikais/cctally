@@ -1,6 +1,6 @@
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
-import { Markdown } from './Markdown';
+import { Markdown, MdLink } from './Markdown';
 import { HighlightContext } from '../conversations/HighlightContext';
 
 describe('Markdown', () => {
@@ -182,5 +182,34 @@ describe('Markdown', () => {
     const { container } = renderWithTerms(['cache', 'cache.db'], 'open cache.db now');
     const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
     expect(marks).toEqual(['cache.db']);
+  });
+});
+
+describe('Markdown components override', () => {
+  it('exports MdLink that opens in a new tab', () => {
+    render(<MdLink href="https://x.com">x</MdLink>);
+    const a = screen.getByText('x') as HTMLAnchorElement;
+    expect(a.tagName).toBe('A');
+    expect(a.target).toBe('_blank');
+    expect(a.rel).toContain('noopener');
+  });
+
+  it('lets a caller override the link renderer', () => {
+    render(
+      <Markdown components={{ a: ({ children }) => <span data-testid="cite">{children}</span> }}>
+        {'see [spec:69](</abs/path:69>)'}
+      </Markdown>,
+    );
+    expect(screen.getByTestId('cite').textContent).toBe('spec:69');
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('overriding only `a` keeps fenced code blocks rendering as <pre>', () => {
+    const { container } = render(
+      <Markdown components={{ a: ({ children }) => <span>{children}</span> }}>
+        {'```\nplain fence\n```'}
+      </Markdown>,
+    );
+    expect(container.querySelector('pre')).not.toBeNull();
   });
 });

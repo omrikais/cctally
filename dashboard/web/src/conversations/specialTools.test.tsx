@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { specialToolRenderer } from './specialTools';
+import { CodexCard } from './CodexCard';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -72,5 +73,33 @@ describe('specialToolRenderer dispatch (#177 S3)', () => {
     expect(specialToolRenderer(call({ name: 'WebFetch', input: { url: 42 } }))).toBeNull();
     expect(specialToolRenderer(call({ name: 'WebSearch', input: null }))).toBeNull();
     expect(specialToolRenderer(call({ name: 'WebSearch', input: { query: 42 } }))).toBeNull();
+  });
+});
+
+const codexCall = (over: Partial<Call>): Call =>
+  ({ kind: 'tool_call', name: 'mcp__codex__codex', input_summary: '{}',
+     input: { prompt: 'do a review' }, preview: 'do a review', tool_use_id: 't1',
+     result: { text: '{"threadId":"t","content":"ok"}', truncated: false, is_error: false }, ...over } as Call);
+
+describe('specialToolRenderer — codex', () => {
+  it('dispatches mcp__codex__codex to CodexCard', () => {
+    const el = specialToolRenderer(codexCall({}));
+    expect(el!.type).toBe(CodexCard);
+  });
+  it('dispatches mcp__codex__codex-reply to CodexCard', () => {
+    const el = specialToolRenderer(codexCall({ name: 'mcp__codex__codex-reply', input: { prompt: 'p', threadId: 'x' } }));
+    expect(el!.type).toBe(CodexCard);
+  });
+  it('is case-insensitive', () => {
+    const el = specialToolRenderer(codexCall({ name: 'MCP__CODEX__CODEX' }));
+    expect(el!.type).toBe(CodexCard);
+  });
+  it('renders the card even when result is null (request-only)', () => {
+    const el = specialToolRenderer(codexCall({ result: null }));
+    expect(el!.type).toBe(CodexCard);
+  });
+  it('falls through to the generic chip when there is no usable prompt', () => {
+    const el = specialToolRenderer(codexCall({ input: { threadId: 'x' } }));
+    expect(el).toBeNull();
   });
 });

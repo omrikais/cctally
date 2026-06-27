@@ -32,6 +32,7 @@
   --accent-cyan: #22d3ee;
   --accent-indigo: #818cf8;
   --accent-teal: #2dd4bf;          /* spec 2026-05-21 §1 — 11th panel */
+  --accent-codex: #10a37f;   /* Codex (OpenAI) brand — dedicated card accent */
   --chip-sonnet: #1f6d3a;
   --chip-opus:   #6d28d9;
   --chip-haiku:  #1d4ed8;
@@ -8939,6 +8940,59 @@ mark.current {
 .conv-web-link { margin: 6px 0; }
 .conv-web-link-domain { display: block; font-size: 11.5px; color: var(--text-dim); }
 .conv-web-copy { position: absolute; top: 8px; right: 8px; }
+
+/* ── Codex card (mcp__codex__codex / -reply) ───────────────────────────── */
+.conv-codex { border-left: 3px solid var(--accent-codex); }
+.conv-codex--error { border-left-color: var(--accent-red); }
+.conv-codex > summary { color: var(--accent-codex); }
+.conv-codex-brand { font-weight: 700; color: var(--accent-codex); }
+.conv-codex--error .conv-codex-brand { color: var(--accent-red); }
+.conv-codex-model,
+.conv-codex-thread {
+  font-size: 10.5px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border-soft);
+}
+.conv-codex-model { color: #bdf3e6; border-color: rgba(16,163,127,.5); background: rgba(16,163,127,.14); }
+.conv-codex-thread { color: #cdbdf6; border-color: rgba(192,132,252,.4); background: rgba(192,132,252,.12); }
+.conv-codex-summary-status { font-size: 11px; color: var(--accent-green); }
+.conv-codex-summary-status--err { color: var(--accent-red); }
+
+.conv-codex-body { padding: 0; }
+.conv-codex-bar {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  padding: 8px 12px; font-size: 11px; color: var(--text-dim);
+  border-bottom: 1px solid var(--border-soft);
+  background: linear-gradient(90deg, rgba(16,163,127,.16), rgba(16,163,127,0));
+}
+.conv-codex--error .conv-codex-bar { background: linear-gradient(90deg, rgba(239,68,68,.14), rgba(239,68,68,0)); }
+.conv-codex-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-codex); box-shadow: 0 0 0 3px rgba(16,163,127,.18); flex: 0 0 auto; }
+.conv-codex--error .conv-codex-dot { background: var(--accent-red); box-shadow: 0 0 0 3px rgba(239,68,68,.16); }
+.conv-codex-bar-model { color: #bdf3e6; }
+.conv-codex-bar-cwd { margin-left: auto; color: var(--text-faint); font-size: 10.5px; }
+
+.conv-codex-prompt { border-bottom: 1px solid var(--border-soft); background: var(--panel-bg-2); }
+.conv-codex-prompt-toggle {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 12px; background: none; border: 0; cursor: pointer;
+  font: inherit; color: var(--text-dim); text-align: left;
+}
+.conv-codex-prompt-tag { color: var(--accent-codex); font-size: 10.5px; flex: 0 0 auto; }
+.conv-codex-prompt-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-codex-prompt-md { padding: 0 12px 10px; }
+
+.conv-codex-reslabel { display: flex; align-items: center; gap: 6px; padding: 10px 12px 0; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); }
+.conv-codex-md { padding: 6px 12px 12px; }
+.conv-codex-md--clamp { max-height: 320px; overflow: hidden; -webkit-mask-image: linear-gradient(#000 78%, transparent); mask-image: linear-gradient(#000 78%, transparent); }
+.conv-codex-more { padding: 0 12px 10px; }
+.conv-codex-more button { background: none; border: 0; color: var(--accent-cyan); font: inherit; font-size: 11px; cursor: pointer; }
+.conv-codex-truncated { padding: 10px 12px; color: var(--text-faint); font-size: 12px; }
+
+/* citation chip — link text without the dead file:line href */
+.conv-codex-cite { font-size: .92em; padding: 0 5px; border-radius: 4px; background: var(--panel-bg); color: #9fd6c6; border: 1px solid rgba(16,163,127,.25); }
+
+/* error block */
+.conv-codex-error { margin: 10px 12px 12px; border: 1px solid rgba(239,68,68,.4); background: rgba(239,68,68,.07); border-radius: 6px; padding: 10px 12px; }
+.conv-codex-error-head { display: flex; align-items: center; gap: 7px; color: #ff9a9a; font-size: 11px; font-weight: 700; margin-bottom: 6px; }
+.conv-codex-error-msg { color: #ffd9d9; font-size: 12px; line-height: 1.5; }
 
 /* ====================================================================
    #217 S7 F10 — session comparison (side-by-side prompt diff).

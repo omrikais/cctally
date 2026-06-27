@@ -7,6 +7,7 @@ import { DiffCard } from './DiffCard';
 import { BashCard } from './BashCard';
 import { WebFetchCard } from './WebFetchCard';
 import { WebSearchCard } from './WebSearchCard';
+import { CodexCard } from './CodexCard';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -46,6 +47,12 @@ function hasWebFetchInput(c: Call): boolean {
 function hasWebSearchInput(c: Call): boolean {
   return typeof (c.input as { query?: unknown } | null | undefined)?.query === 'string';
 }
+// Codex (mcp__codex__codex / -reply). Guard on a usable prompt (Codex P1.2);
+// does NOT require a result — a request-only/active call has result:null and
+// must still render the card.
+function hasCodexInput(c: Call): boolean {
+  return typeof (c.input as { prompt?: unknown } | null | undefined)?.prompt === 'string';
+}
 
 // Name-keyed dispatch to a dedicated renderer. Returns null when the tool has
 // no special card (→ the generic chip). This is the extension point Sessions
@@ -66,6 +73,11 @@ export function specialToolRenderer(call: Call): ReactElement | null {
     // through to the generic chip instead of vanishing the tool.
     case 'webfetch': return hasWebFetchInput(call) ? <WebFetchCard call={call} /> : null;
     case 'websearch': return hasWebSearchInput(call) ? <WebSearchCard call={call} /> : null;
+    // Codex MCP — dedicated card. Guard on a usable prompt; result may be null
+    // (request-only/active call) and must still render the card.
+    case 'mcp__codex__codex':
+    case 'mcp__codex__codex-reply':
+      return hasCodexInput(call) ? <CodexCard call={call} /> : null;
     default: return null;
   }
 }
