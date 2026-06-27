@@ -799,19 +799,51 @@ def _session_cost_map(conn, session_ids):
     return costs
 
 
+def _models_main_first(rows):
+    """Order distinct non-null models so MAIN-SESSION models sort first, then
+    models that appear ONLY in subagent / sidechain threads; alphabetical within
+    each group. ``rows`` is an iterable of ``(model, source_path, is_sidechain)``.
+
+    A model is "main" iff it appears in at least one row that is neither a
+    subagent file (``_subagent_key(source_path) is None``) nor a sidechain
+    (``not is_sidechain``) — the exact negation of the subagent/sidechain
+    predicate used elsewhere in this module. A model used in BOTH the main
+    session AND a subagent counts as MAIN (it's a model the user actually drove
+    the session with). This is what makes the reader header + browse-rail chip
+    surface the real primary model (e.g. opus) first when the main session
+    spawned haiku subagents, rather than the alphabetical-first model — pre-fix
+    a plain ``sorted()`` ranked ``haiku`` ahead of ``opus`` (#243)."""
+    main, sub = set(), set()
+    for model, source_path, is_sidechain in rows:
+        if not model:
+            continue
+        if _subagent_key(source_path) is None and not is_sidechain:
+            main.add(model)
+        else:
+            sub.add(model)
+    return sorted(main) + sorted(sub - main)
+
+
 def _session_models_map(conn, session_ids):
-    """{session_id: sorted distinct non-null models}."""
+    """{session_id: models ordered MAIN-session-first (subagent/sidechain-only
+    models last), alphabetical within each group — see _models_main_first}."""
     out = {sid: [] for sid in session_ids}
     if not session_ids:
         return out
     placeholders = ",".join("?" for _ in session_ids)
     sql = (
-        "SELECT DISTINCT session_id, model FROM conversation_messages "
-        "WHERE session_id IN (%s) AND model IS NOT NULL AND model != '' "
-        "ORDER BY model" % placeholders
+        "SELECT DISTINCT session_id, model, source_path, is_sidechain "
+        "FROM conversation_messages "
+        "WHERE session_id IN (%s) AND model IS NOT NULL AND model != ''"
+        % placeholders
     )
-    for sid, model in conn.execute(sql, list(session_ids)):
-        out.setdefault(sid, []).append(model)
+    per_session = {}
+    for sid, model, source_path, is_sidechain in conn.execute(
+            sql, list(session_ids)):
+        per_session.setdefault(sid, []).append(
+            (model, source_path, is_sidechain))
+    for sid, rows in per_session.items():
+        out[sid] = _models_main_first(rows)
     return out
 
 
@@ -1764,7 +1796,9 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
             "started_utc": logical[0][2],
             "last_activity_utc": logical[-1][2],
             "cost_usd": header_cost,
-            "models": sorted({r[6] for r in logical if r[6]}),
+            # #243: main-session models first (r[6]=model, r[12]=source_path,
+            # r[9]=is_sidechain) so opus outranks a haiku subagent, not sorted().
+            "models": _models_main_first((r[6], r[12], r[9]) for r in logical),
             "last_anchor": last_anchor,
             "items": [],
             "subagent_meta": subagent_meta,
@@ -1814,7 +1848,9 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
 
     first = logical[0]
     last = logical[-1]
-    models = sorted({r[6] for r in logical if r[6]})
+    # #243: main-session models first (r[6]=model, r[12]=source_path,
+    # r[9]=is_sidechain) so opus outranks a haiku subagent, not sorted().
+    models = _models_main_first((r[6], r[12], r[9]) for r in logical)
     return {
         "session_id": session_id,
         "title": _title,

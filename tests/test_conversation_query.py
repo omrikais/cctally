@@ -4303,3 +4303,88 @@ def test_session_latest_meta_map_matches_reference_scan():
          timestamp_utc="2026-06-02T00:00:00Z", entry_type="human")
     sids = ["s1", "s2", "s3"]
     assert cq._session_latest_meta_map(c, sids) == _reference_latest_meta(c, sids)
+
+
+# ---------------------------------------------------------------------------
+# #243: main-session-first model ordering. The conversation `models` list (rail
+# chip + reader header) must rank the MAIN-session model first, not the
+# alphabetical-first one — opus driving haiku subagents must read "opus", not
+# "haiku". A plain sorted() ranked haiku ahead of opus pre-fix.
+# ---------------------------------------------------------------------------
+def test_models_main_first_orders_main_then_subagent():
+    # opus drove the main session; haiku ran only in a subagent (agent-*.jsonl,
+    # is_sidechain=1). Main first regardless of alphabet (haiku < opus).
+    rows = [
+        ("claude-opus-4-8", "/p/sess.jsonl", 0),
+        ("claude-haiku-4-5-20251001", "/p/agent-ab12.jsonl", 1),
+    ]
+    assert cq._models_main_first(rows) == [
+        "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+
+def test_models_main_first_dual_use_model_counts_as_main():
+    # a model used in BOTH the main session and a subagent is MAIN (it's a model
+    # the user actually drove the session with).
+    rows = [
+        ("claude-opus-4-8", "/p/sess.jsonl", 0),
+        ("claude-opus-4-8", "/p/agent-ab12.jsonl", 1),
+        ("claude-haiku-4-5-20251001", "/p/agent-ab12.jsonl", 1),
+    ]
+    assert cq._models_main_first(rows) == [
+        "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+
+def test_models_main_first_inline_sidechain_is_subagent():
+    # old-format inline sidechain: haiku turns share the MAIN file's source_path
+    # but carry is_sidechain=1 → still subagent; opus (non-sidechain) is main.
+    rows = [
+        ("claude-haiku-4-5-20251001", "/p/sess.jsonl", 1),
+        ("claude-opus-4-8", "/p/sess.jsonl", 0),
+    ]
+    assert cq._models_main_first(rows) == [
+        "claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+
+def test_models_main_first_main_only_alphabetical_within_group():
+    # two main-session models (no subagents) stay alphabetical within the group.
+    rows = [
+        ("claude-opus-4-8", "/p/sess.jsonl", 0),
+        ("claude-sonnet-4-6", "/p/sess.jsonl", 1),  # sonnet here is a sidechain
+        ("claude-haiku-4-5-20251001", "/p/sess.jsonl", 0),  # main
+    ]
+    # main = {opus, haiku} sorted -> [haiku, opus]; sub-only = {sonnet}.
+    assert cq._models_main_first(rows) == [
+        "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-4-6"]
+
+
+def _seed_main_opus_subagent_haiku(c, sid="sx"):
+    """A session whose MAIN file ran opus and whose subagent (agent-*.jsonl,
+    is_sidechain=1) ran haiku — the #243 reproduction (matches the real
+    eb36d017 session shape: one main opus file + one haiku Explore subagent)."""
+    main = f"{sid}.jsonl"
+    agent = "agent-ab12cd34.jsonl"
+    _msg(c, session_id=sid, uuid="h1", source_path=main, byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="go",
+         cwd="/home/u/proj")
+    _msg(c, session_id=sid, uuid="a1", source_path=main, byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:01Z", entry_type="assistant",
+         text="on it", model="claude-opus-4-8", msg_id="m1", req_id="r1")
+    _msg(c, session_id=sid, uuid="s1", source_path=agent, byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:02Z", entry_type="assistant",
+         text="explored", model="claude-haiku-4-5-20251001", msg_id="m2",
+         req_id="r2", is_sidechain=1)
+
+
+def test_list_conversations_models_main_session_first():
+    c = _conn()
+    _seed_main_opus_subagent_haiku(c)
+    row = _list_conversations(c, sort="recent", limit=50)["conversations"][0]
+    # opus (main) first, haiku (subagent) second — NOT alphabetical.
+    assert row["models"] == ["claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+
+def test_get_conversation_models_main_session_first():
+    c = _conn()
+    _seed_main_opus_subagent_haiku(c)
+    out = cq.get_conversation(c, "sx", after=None, limit=500)
+    assert out["models"] == ["claude-opus-4-8", "claude-haiku-4-5-20251001"]

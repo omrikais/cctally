@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: the browse-rail model chip is no longer truncated mid-glyph by the adjacent cost/message-count — it previously clipped "opus" to "opu"/"op" when the fixed-width rail ran short of room; the rail now shows a single rigid primary-model chip plus a "+N" counter for any additional models, and the project/branch text ellipsizes first so the chip and the cost/message numbers always render in full (#243).
+- Conversation viewer: a conversation whose main session ran one model but spawned subagents on another (e.g. opus driving haiku code-explorers) now shows the main-session model as the primary one — both the rail chip and the reader header now list the main model first ("opus, haiku") instead of alphabetically ("haiku, opus"), which previously made a haiku subagent look like the conversation's main model (#243).
+
 ## [1.56.1] - 2026-06-27
 
 ### Fixed

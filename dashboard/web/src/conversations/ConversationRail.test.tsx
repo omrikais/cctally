@@ -178,6 +178,22 @@ describe('ConversationRail', () => {
     expect(document.querySelector('.conv-rail-row-model')).toBeNull();
   });
 
+  it('#243 — caps the rail to ONE primary chip + a "+N" counter (row.models is main-first)', () => {
+    // row.models arrives main-session-first from the backend, so the primary
+    // model is opus (the haiku is a subagent). cap=1 shows ONLY the opus chip
+    // plus a "+1" — never a second (haiku) chip that could be clipped.
+    browseRows = [summary({
+      session_id: 's1',
+      models: ['claude-opus-4-8', 'claude-haiku-4-5-20251001'],
+    })];
+    render(<ConversationRail />);
+    const chips = document.querySelectorAll('.conv-rail-row-model .chip');
+    expect(chips.length).toBe(1);
+    expect(document.querySelector('.conv-rail-row-model .chip.opus')).toBeTruthy();
+    expect(document.querySelector('.conv-rail-row-model .chip.haiku')).toBeNull();
+    expect(document.querySelector('.conv-rail-row-model-more')?.textContent).toBe('+1');
+  });
+
   it('search rows show the title header above the snippet', () => {
     searchHits = [hit({})];
     searchTotal = 1;

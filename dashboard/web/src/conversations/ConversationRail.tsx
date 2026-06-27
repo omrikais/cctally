@@ -431,9 +431,13 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
   row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: string | null; hideProject: boolean;
 }) {
   const isAnchor = pickAnchor === row.session_id;
-  // #228 S4 D2 — the model chip cluster from row.models (browse-only; search hits
-  // carry no models). Empty models → no chip.
-  const models = modelChipSummary(row.models);
+  // #228 S4 D2 — the model chip from row.models (browse-only; search hits carry
+  // no models). Empty models → no chip. #243: cap=1 — show ONLY the PRIMARY
+  // model chip (row.models is now main-session-first, so this is opus, not a
+  // haiku subagent) + a "+N" counter for the rest. One chip keeps the group
+  // narrow enough to stay rigid (never clipped); the full list lives in the
+  // reader header.
+  const models = modelChipSummary(row.models, 1);
   return (
     <button
       type="button"
@@ -456,10 +460,12 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
             the overflow-hidden metaleft, so project/branch ellipsize first and the
             time is never clipped. */}
         <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
-        {/* #238 S2 (ui-qa) — the model-chip group is its OWN shrinkable meta item,
-            NOT inside the stats cluster, so it can collapse (overflow valve)
-            without inflating the cluster's min-content and forcing the cost/msg
-            numbers to spill off the fixed-width rail. */}
+        {/* #238 S2 / #243 — the model chip is its OWN meta item, NOT inside the
+            stats cluster, so it never inflates the cluster's min-content and
+            forces the cost/msg numbers off the fixed-width rail. With the #243
+            cap=1 it holds a single rigid chip (+ optional "+N"); metaleft
+            (project/branch) is the sole shrink valve, so the chip is never
+            clipped mid-glyph. */}
         {models.classes.length > 0 && (
           <span className="conv-rail-row-model">
             {models.classes.map((c) => <span key={c} className={`chip ${c}`}>{c}</span>)}
