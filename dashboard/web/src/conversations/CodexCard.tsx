@@ -46,6 +46,12 @@ export function CodexCard({ call }: { call: Call }) {
       ? (parsed.kind === 'error' && parsed.status ? `✗ ${parsed.status}` : '✗ error')
       : '✓ ok';
 
+  // The "agent run" status bar only earns its space when it has at least one
+  // field. A bare codex-reply carries just prompt + threadId, which would leave
+  // a lone dot — hide the bar entirely in that case (the thread chip already
+  // lives in the summary).
+  const hasBarMeta = !!(meta.model || meta.effort || meta.sandbox || meta.approval || meta.cwdBase);
+
   return (
     <details className={`conv-chip conv-codex${isError ? ' conv-codex--error' : ''}`}>
       <summary>
@@ -60,14 +66,16 @@ export function CodexCard({ call }: { call: Call }) {
       </summary>
 
       <div className="conv-codex-body">
-        <div className="conv-codex-bar">
-          <span className="conv-codex-dot" aria-hidden="true" />
-          {meta.model && <span className="conv-codex-bar-model">{meta.model}</span>}
-          {meta.effort && <span className="conv-codex-bar-item">effort {meta.effort}</span>}
-          {meta.sandbox && <span className="conv-codex-bar-item">{meta.sandbox}</span>}
-          {meta.approval && <span className="conv-codex-bar-item">approval {meta.approval}</span>}
-          {meta.cwdBase && <span className="conv-codex-bar-cwd">{meta.cwdBase}</span>}
-        </div>
+        {hasBarMeta && (
+          <div className="conv-codex-bar">
+            <span className="conv-codex-dot" aria-hidden="true" />
+            {meta.model && <span className="conv-codex-bar-model">{meta.model}</span>}
+            {meta.effort && <span className="conv-codex-bar-item">effort {meta.effort}</span>}
+            {meta.sandbox && <span className="conv-codex-bar-item">{meta.sandbox}</span>}
+            {meta.approval && <span className="conv-codex-bar-item">approval {meta.approval}</span>}
+            {meta.cwdBase && <span className="conv-codex-bar-cwd">{meta.cwdBase}</span>}
+          </div>
+        )}
 
         {prompt && (
           <div className="conv-codex-prompt">

@@ -91,6 +91,16 @@ describe('CodexCard', () => {
     expect(container.querySelector('.conv-codex-model')).toBeNull();
   });
 
+  it('hides the status bar for a bare codex-reply with no run metadata', () => {
+    // A real codex-reply input is just prompt + threadId — no model/sandbox/etc.
+    // The status bar would otherwise be a lone dot, so it must not render.
+    const { container } = withSession(
+      <CodexCard call={call({ name: 'mcp__codex__codex-reply', input: { prompt: 'follow up', threadId: '019ed760' } })} />,
+    );
+    expect(container.querySelector('.conv-codex-bar')).toBeNull();
+    expect(container.querySelector('.conv-codex-thread')).not.toBeNull();
+  });
+
   it('clamps a long response and reveals it on "show full"', () => {
     const long = JSON.stringify({ threadId: 't', content: 'para\n'.repeat(40) });
     const { container } = withSession(<CodexCard call={call({ result: { text: long, truncated: false, is_error: false } })} />);
