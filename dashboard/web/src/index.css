@@ -35,6 +35,8 @@
   --chip-sonnet: #1f6d3a;
   --chip-opus:   #6d28d9;
   --chip-haiku:  #1d4ed8;
+  --chip-fable:  #9d174d;   /* #244 — Fable's own chip colour (rose), distinct
+                              from the cool opus/haiku/sonnet trio. */
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
                "DejaVu Sans Mono", monospace;
   --font-prose: "Newsreader", Georgia, serif;
@@ -806,6 +808,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .chip.sonnet { background: var(--chip-sonnet); color: #b6f7cc; }
 .chip.opus   { background: var(--chip-opus);   color: #e0cfff; }
 .chip.haiku  { background: var(--chip-haiku);  color: #cfdcff; }
+.chip.fable  { background: var(--chip-fable);  color: #fbcfe8; }
+/* #244 — neutral chip for unrecognized models (gpt-*, <synthetic>, future ids);
+   matches the existing `.detail-card .chip.other` / `.model-stack > span.other`
+   convention so an unknown model never borrows another family's colour. */
+.chip.other  { background: var(--surface-faint); color: var(--text); }
 /* Freshness chips on the Current Week panel header (spec §3.4).
    `fresh` renders no chip — these classes only appear for `aging` / `stale`. */
 .chip.chip-aging {
@@ -1421,6 +1428,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .msess-costm .bar .seg.opus   { background: var(--chip-opus); }
 .msess-costm .bar .seg.sonnet { background: var(--chip-sonnet); }
 .msess-costm .bar .seg.haiku  { background: var(--chip-haiku); }
+.msess-costm .bar .seg.fable  { background: var(--chip-fable); }
+.msess-costm .bar .seg.other  { background: var(--surface-faint); }
 .msess-costm .legend {
   display: flex; flex-wrap: wrap; gap: 14px 20px;
   margin-top: 10px; font-size: 12px;
@@ -1430,6 +1439,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .msess-costm .legend .sw.opus   { background: var(--chip-opus); }
 .msess-costm .legend .sw.sonnet { background: var(--chip-sonnet); }
 .msess-costm .legend .sw.haiku  { background: var(--chip-haiku); }
+.msess-costm .legend .sw.fable  { background: var(--chip-fable); }
+.msess-costm .legend .sw.other  { background: var(--surface-faint); }
 .msess-costm .legend .name { color: var(--text); }
 .msess-costm .legend .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .msess-costm .legend .pct { color: var(--text-dim); font-size: 11px; margin-left: 2px; }
@@ -2038,6 +2049,7 @@ mark.current {
 .model-stack > span.opus    { background: var(--chip-opus); }
 .model-stack > span.sonnet  { background: var(--chip-sonnet); }
 .model-stack > span.haiku   { background: var(--chip-haiku); }
+.model-stack > span.fable   { background: var(--chip-fable); }
 .model-stack > span.other   { background: var(--surface-faint); }
 
 /* Weekly / Monthly panel-foot — single line "<n>w total · $324.18" with
@@ -2080,6 +2092,7 @@ mark.current {
 .detail-card .chip.opus    { background: var(--chip-opus); }
 .detail-card .chip.sonnet  { background: var(--chip-sonnet); }
 .detail-card .chip.haiku   { background: var(--chip-haiku); }
+.detail-card .chip.fable   { background: var(--chip-fable); }
 .detail-card .chip.other   { background: var(--surface-faint); color: var(--text); }
 
 .tokens-row {

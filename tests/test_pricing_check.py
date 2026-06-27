@@ -658,3 +658,23 @@ def test_issue_script_bad_payload_exit2(tmp_path):
     r = _sp.run([sys.executable, str(_ISSUE_SCRIPT), "--dry-run", str(f)],
                 capture_output=True, text=True)
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+
+
+# ---- _chip_for_model family bucketing (#244) -------------------------------
+
+@pytest.mark.parametrize("model,chip", [
+    ("claude-opus-4-8", "opus"),
+    ("claude-sonnet-4-6", "sonnet"),
+    ("claude-haiku-4-5-20251001", "haiku"),
+    ("claude-fable-5", "fable"),          # #244 — dedicated family, not 'other'
+    ("CLAUDE-FABLE-5", "fable"),          # case-insensitive
+])
+def test_chip_for_model_known_families(model, chip):
+    assert pricing._chip_for_model(model) == chip
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "<synthetic>", "", None, "mystery-9000"])
+def test_chip_for_model_unknown_is_other_not_sonnet(model):
+    # The regression guard mirroring the frontend modelChipClass: an
+    # unrecognized id must bucket to the neutral 'other', never 'sonnet'.
+    assert pricing._chip_for_model(model) == "other"

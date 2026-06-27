@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Model chips no longer mislabel or miscolour Fable and unrecognized models. A conversation whose main model was `claude-fable-5` previously rendered a browse-rail chip literally labelled "sonnet" in the sonnet green (the rail chip's text is its class name), and any unrecognized model — including the internal `<synthetic>` placeholder — silently borrowed that same "sonnet" identity across every chip surface. Fable now gets its own dedicated rose chip everywhere (the conversation rail and reader, the Sessions panel, the session/block/projects modals, and the Weekly/Monthly model-cost bars and detail cards), and a genuinely-unrecognized model now gets a neutral grey "other" chip — labelled in the rail by the model's own abbreviation — instead of impersonating sonnet (#244).
+
 ## [1.56.2] - 2026-06-27
 
 ### Fixed

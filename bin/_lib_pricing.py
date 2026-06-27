@@ -32,9 +32,11 @@ TIERED_THRESHOLD = 200_000
 def _chip_for_model(name: str) -> str:
     """Bucket a canonical model id into a small chip palette.
 
-    Returns one of 'opus' | 'sonnet' | 'haiku' | 'other'. Used by the
+    Returns one of 'opus' | 'sonnet' | 'haiku' | 'fable' | 'other'. Used by the
     dashboard's Weekly / Monthly panels and modals so per-model
-    coloring stays consistent across the UI.
+    coloring stays consistent across the UI. #244 — `fable` is a dedicated
+    family (Fable is a current first-class model); it must NOT fall through to
+    the neutral 'other' bucket, mirroring the frontend `modelChipClass`.
     """
     n = (name or "").lower()
     if "opus" in n:
@@ -43,6 +45,8 @@ def _chip_for_model(name: str) -> str:
         return "sonnet"
     if "haiku" in n:
         return "haiku"
+    if "fable" in n:
+        return "fable"
     return "other"
 
 

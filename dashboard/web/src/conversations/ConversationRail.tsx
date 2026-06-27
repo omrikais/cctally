@@ -436,7 +436,9 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
   // model chip (row.models is now main-session-first, so this is opus, not a
   // haiku subagent) + a "+N" counter for the rest. One chip keeps the group
   // narrow enough to stay rigid (never clipped); the full list lives in the
-  // reader header.
+  // reader header. #244: each chip carries its own colour class (cls) AND a
+  // text label — a `fable` model renders a fable chip, an unrecognized model an
+  // `other` chip labelled by its abbreviation, neither borrowing sonnet's id.
   const models = modelChipSummary(row.models, 1);
   return (
     <button
@@ -466,9 +468,9 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
             cap=1 it holds a single rigid chip (+ optional "+N"); metaleft
             (project/branch) is the sole shrink valve, so the chip is never
             clipped mid-glyph. */}
-        {models.classes.length > 0 && (
+        {models.chips.length > 0 && (
           <span className="conv-rail-row-model">
-            {models.classes.map((c) => <span key={c} className={`chip ${c}`}>{c}</span>)}
+            {models.chips.map((c) => <span key={c.cls} className={`chip ${c.cls}`}>{c.label}</span>)}
             {models.extra > 0 && <span className="conv-rail-row-model-more">+{models.extra}</span>}
           </span>
         )}

@@ -545,7 +545,7 @@ export interface SessionDetail {
 
 // ---- Weekly / Monthly panels (envelope §1.3) -------------------------
 
-export type ChipKey = 'opus' | 'sonnet' | 'haiku' | 'other';
+export type ChipKey = 'opus' | 'sonnet' | 'haiku' | 'fable' | 'other';  // #244 — fable joins as a dedicated family
 
 export interface ModelCostRow {
   model: string;        // canonical model id, e.g. "claude-opus-4-5-20251101"
