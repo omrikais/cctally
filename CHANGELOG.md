@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.56.1] - 2026-06-27
+
 ### Fixed
 - Conversation viewer: large subagent threads now render an internally windowed slice (centered on a deep-linked / found / pinned turn) instead of mounting the entire thread, with "Show N earlier/later" and "Show all" controls to grow it on demand — a deep-link into a giant subagent no longer renders a ~106k-node DOM (#239).
 - Conversation comparison view: the A→B metrics strip no longer clips the widest "A → B" value pairs (e.g. a high cost or long duration) at desktop widths — on a smaller desktop window the discovery rail stays mounted and narrows the strip, which the previous viewport-based reflow couldn't detect, so the six fixed columns truncated a trailing digit (`$337.05 → $169…`); the strip now reflows on its own width to a clean 3×2 (and 2-up when narrower) so every value stays fully visible (#240).
