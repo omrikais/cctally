@@ -69,4 +69,15 @@ describe('ComparisonMetrics', () => {
       expect(container.querySelector(`[data-metric="${k}"]`)).not.toBeNull();
     }
   });
+
+  // #240 — JSDOM can't evaluate the @container reflow, but the strip MUST stay
+  // nested inside its .conv-cmp-metrics-wrap query container; removing that
+  // wrapper silently disables the container-driven 6→3→2 reflow. Guard the
+  // structure so an accidental unwrap is caught here rather than only in browser.
+  it('nests the strip inside its inline-size container wrapper', () => {
+    const { container } = render(<ComparisonMetrics a={M()} b={M()} />);
+    const strip = container.querySelector('.conv-cmp-metrics');
+    expect(strip).not.toBeNull();
+    expect(strip!.parentElement?.className).toContain('conv-cmp-metrics-wrap');
+  });
 });

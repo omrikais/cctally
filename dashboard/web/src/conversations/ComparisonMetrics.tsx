@@ -50,32 +50,39 @@ export function ComparisonMetrics({ a, b }: { a: Metrics; b: Metrics }) {
   ];
 
   return (
-    <div className="conv-cmp-metrics" role="group" aria-label="Comparison metrics">
-      {rows.map((r) => {
-        const haveBoth = r.a != null && r.b != null;
-        const delta = haveBoth ? (r.b as number) - (r.a as number) : null;
-        const polarity: Polarity = r.lowerBetter ? 'lower-better' : 'neutral';
-        const { direction, intent } = deltaIntent(polarity, r.a, r.b);
-        const pres = semanticState(intent, direction);
-        const showDelta = delta != null && delta !== 0;
-        return (
-          <div key={r.key} className="conv-cmp-metric" data-metric={r.key}>
-            <div className="conv-cmp-metric-label">{r.label}</div>
-            <div className="conv-cmp-metric-vals">
-              <span className="conv-cmp-metric-a">{r.fmtVal(r.a)}</span>
-              <span className="conv-cmp-metric-arrow" aria-hidden="true"> → </span>
-              <span className="conv-cmp-metric-b">{r.fmtVal(r.b)}</span>
-            </div>
-            {showDelta && (
-              <div className={`conv-cmp-metric-delta ${pres.className}`}>
-                {pres.glyph && <span className="conv-cmp-metric-dir" aria-hidden="true">{pres.glyph} </span>}
-                {r.fmtDelta(delta as number)}
-                <span className="sr-only"> ({pres.srLabel})</span>
+    // #240 — the wrapper is the inline-size query container for the strip below.
+    // An element can't @container-query itself, so the grid's 6→3→2 reflow keys
+    // on this wrapper's actual width (NOT the viewport): on desktop the discovery
+    // rail stays mounted and narrows the comparison column while the viewport is
+    // still ≥1100px, a squeeze a viewport media query can't see.
+    <div className="conv-cmp-metrics-wrap">
+      <div className="conv-cmp-metrics" role="group" aria-label="Comparison metrics">
+        {rows.map((r) => {
+          const haveBoth = r.a != null && r.b != null;
+          const delta = haveBoth ? (r.b as number) - (r.a as number) : null;
+          const polarity: Polarity = r.lowerBetter ? 'lower-better' : 'neutral';
+          const { direction, intent } = deltaIntent(polarity, r.a, r.b);
+          const pres = semanticState(intent, direction);
+          const showDelta = delta != null && delta !== 0;
+          return (
+            <div key={r.key} className="conv-cmp-metric" data-metric={r.key}>
+              <div className="conv-cmp-metric-label">{r.label}</div>
+              <div className="conv-cmp-metric-vals">
+                <span className="conv-cmp-metric-a">{r.fmtVal(r.a)}</span>
+                <span className="conv-cmp-metric-arrow" aria-hidden="true"> → </span>
+                <span className="conv-cmp-metric-b">{r.fmtVal(r.b)}</span>
               </div>
-            )}
-          </div>
-        );
-      })}
+              {showDelta && (
+                <div className={`conv-cmp-metric-delta ${pres.className}`}>
+                  {pres.glyph && <span className="conv-cmp-metric-dir" aria-hidden="true">{pres.glyph} </span>}
+                  {r.fmtDelta(delta as number)}
+                  <span className="sr-only"> ({pres.srLabel})</span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

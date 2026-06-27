@@ -9069,12 +9069,35 @@ mark.current {
 .sem-match { color: var(--diff-match); }
 
 /* ---- Metrics-delta strip ----------------------------------------------- */
+/* #240 — the strip reflows on its OWN inline width via a container query, not
+   the viewport. On desktop the discovery rail stays mounted and narrows the
+   comparison column to ~894px while the viewport is ≥1100px, so a viewport
+   media query can't see the squeeze; 6 fixed columns then clip the widest A→B
+   value pair ($337.05 → $169.01 ≈ 123px) with the cell's text-overflow:ellipsis.
+   The .conv-cmp-metrics-wrap parent is the query container (an element can't
+   query itself); `inline-size` containment is safe because the strip's width
+   comes from its block parent, never its contents (mirrors the #208 daily-cell
+   pattern). This container-driven reflow supersedes the #238 C1 viewport
+   breakpoints for the metrics strip (the non-metrics rules in those @media
+   blocks — .conv-cmp-row / .conv-cmp-colhead / .conv-cmp-head — are untouched). */
+.conv-cmp-metrics-wrap { container-type: inline-size; }
 .conv-cmp-metrics {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: var(--space-2);
   padding: 10px var(--space-4);
   border-bottom: 1px solid var(--border-soft);
+}
+/* Each of the 6 cells needs ~141px of track to hold the widest real A→B pair
+   (~123px text + 16px cell padding + 2px border); with gaps + strip padding the
+   6-up grid needs ~918px of container. Below ~920px drop to a clean 3×2; below
+   ~470px (3-up's floor) to 2-up. Cells keep text-overflow:ellipsis as the final
+   safety net for pathological pairs (e.g. 4-digit costs). */
+@container (max-width: 920px) {
+  .conv-cmp-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container (max-width: 470px) {
+  .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 .conv-cmp-metric {
   display: flex;
@@ -9399,8 +9422,9 @@ mark.current {
 }
 
 /* ---- 1100px safety reflow (a stale .conv-cmp--wide render) -------------- */
+/* The metrics strip's own reflow now lives in the @container block above (#240);
+   this @media block only governs the wide-mode diff/header fallbacks. */
 @media (max-width: 1100px) {
-  .conv-cmp-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   /* Force the two-column diff + expand to single-column even if the JS still
      thinks it is wide (a slow matchMedia event). */
   .conv-cmp-row { grid-template-columns: 1fr; }
@@ -9412,20 +9436,11 @@ mark.current {
   .conv-cmp-colhead { display: none; }
   .conv-cmp--wide .conv-cmp-head { position: sticky; top: 0; }
 }
-/* ---- C1 (#238 S3) tablet-band metrics reflow --------------------------- */
-/* The 901–1100 band keeps the rail mounted on desktop, so the metrics
-   container is far narrower than the viewport (~380px at 768px); 3 columns clip
-   the "→ B" value (the comparison's whole point). Drop to 2 columns through the
-   narrow sub-band so each A → B pair fits. Source-ordered AFTER the 1100px block
-   so 2-col wins where both match; ≤640 keeps its own 2-col rule. Breakpoint is
-   900px (not the originally-proposed 850px): the ui-qa gate found a residual
-   851–857px 3-col clip on the widest real A→B pairs, so the 2-col band was
-   raised to cover the full sub-zone with margin (3-col stays clean at ≥~858px). */
-@media (max-width: 900px) {
-  .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
+/* The #238 C1 tablet-band metrics reflow (@media max-width: 900px → 2-col) was
+   removed in #240: the @container block above now keys the strip's reflow on its
+   own width, which subsumes C1 (the 901–1100 rail-narrowed band the viewport
+   media query couldn't measure correctly) and the desktop clip C1 never reached. */
 @media (max-width: 640px) {
-  .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .conv-cmp-head { gap: var(--space-2); }
 }
 
