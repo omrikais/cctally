@@ -135,6 +135,45 @@ describe('installUrlRouting — read path', () => {
   });
 });
 
+describe('installUrlRouting — scroll restoration (#241)', () => {
+  // The deep-link jump pipeline lands by writing the reader scroller's scrollTop;
+  // the browser's default 'auto' scroll-restoration would write a stale scrollTop
+  // on reload that defeats that landing, so install must switch it to 'manual'.
+  let dispose: () => void = () => {};
+  let prev: ScrollRestoration;
+
+  beforeEach(() => {
+    seed('');
+    prev = window.history.scrollRestoration;
+    // Known prior mode so the restore-on-dispose assertion is deterministic
+    // (jsdom leaves scrollRestoration undefined by default).
+    window.history.scrollRestoration = 'auto';
+    vi.spyOn(window.history, 'pushState');
+    vi.spyOn(window.history, 'replaceState');
+  });
+  afterEach(() => {
+    dispose();
+    vi.restoreAllMocks();
+    window.history.scrollRestoration = prev;
+    seed('');
+  });
+
+  it('switches history.scrollRestoration to manual on boot', () => {
+    const { deps } = makeStore({ view: 'dashboard' });
+    dispose = installUrlRouting(deps);
+    expect(window.history.scrollRestoration).toBe('manual');
+  });
+
+  it('restores the prior scroll-restoration mode on dispose', () => {
+    const { deps } = makeStore({ view: 'dashboard' });
+    const d = installUrlRouting(deps);
+    expect(window.history.scrollRestoration).toBe('manual');
+    d();
+    dispose = () => {};
+    expect(window.history.scrollRestoration).toBe('auto');
+  });
+});
+
 describe('installUrlRouting — reflect path (store -> URL)', () => {
   let push: ReturnType<typeof vi.spyOn>;
   let replace: ReturnType<typeof vi.spyOn>;

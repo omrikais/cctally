@@ -156,6 +156,24 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
   subscribeStore: realSubscribeStore,
   dispatch: realDispatch,
 }): () => void {
+  // 0) #241 — opt out of the browser's native scroll restoration. The default
+  // `'auto'` mode restores a session-history entry's saved scroll positions on a
+  // reload, INCLUDING the conversation reader's inner `.conv-reader-body` overflow
+  // scroller. That restore writes a STALE scrollTop (saved while the deep-linked
+  // turn's owning subagent was force-OPEN; on reload it boots collapsed, so the
+  // saved offset points at different content) and commonly lands AFTER the
+  // deep-link jump pipeline's bounded convergence window — which never re-corrects
+  // a post-settle external scroll, so the viewport sticks at the stale offset and
+  // the target is lost (the subagent stays collapsed, never scrolled-to).
+  // `'manual'` removes the ONLY production source of that late write, leaving the
+  // app's own deep-link / restore / tail positioning as the sole driver of the
+  // viewport. Assigned UNCONDITIONALLY (settable on every modern browser AND jsdom;
+  // a bare assignment is harmless on the rare engine lacking the property — no `in`
+  // guard, which would skip jsdom and break the regression test). The prior value
+  // is restored by the disposer below so the install stays test-hermetic.
+  const prevScrollRestoration = window.history.scrollRestoration;
+  window.history.scrollRestoration = 'manual';
+
   // 1) Boot: reflect URL -> store BEFORE attaching listeners.
   applyHashToStore(deps);
 
@@ -244,5 +262,8 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
   return () => {
     window.removeEventListener('hashchange', onHashChange);
     unsubscribe();
+    // #241 — restore the pre-install scroll-restoration mode (test hermeticity;
+    // prod never disposes, so 'manual' persists for the app's lifetime).
+    window.history.scrollRestoration = prevScrollRestoration;
   };
 }
