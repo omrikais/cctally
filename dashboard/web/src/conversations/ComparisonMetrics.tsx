@@ -50,11 +50,13 @@ export function ComparisonMetrics({ a, b }: { a: Metrics; b: Metrics }) {
   ];
 
   return (
-    // #240 — the wrapper is the inline-size query container for the strip below.
-    // An element can't @container-query itself, so the grid's 6→3→2 reflow keys
-    // on this wrapper's actual width (NOT the viewport): on desktop the discovery
-    // rail stays mounted and narrows the comparison column while the viewport is
-    // still ≥1100px, a squeeze a viewport media query can't see.
+    // #240 / #242 — the wrapper is the inline-size query container for the strip
+    // below. An element can't @container-query itself, so the grid's 6→3→2→1
+    // reflow keys on this wrapper's actual width (NOT the viewport): on desktop the
+    // discovery rail stays mounted and narrows the comparison column while the
+    // viewport is still ≥1100px, a squeeze a viewport media query can't see. The
+    // 1-up step (≤340px container) kills the residual Cost/Duration ellipsis in
+    // the rail-mounted 650–720px band and on sub-343px mobile (#242).
     <div className="conv-cmp-metrics-wrap">
       <div className="conv-cmp-metrics" role="group" aria-label="Comparison metrics">
         {rows.map((r) => {

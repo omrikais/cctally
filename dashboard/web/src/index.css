@@ -9091,13 +9091,21 @@ mark.current {
 /* Each of the 6 cells needs ~141px of track to hold the widest real A→B pair
    (~123px text + 16px cell padding + 2px border); with gaps + strip padding the
    6-up grid needs ~918px of container. Below ~920px drop to a clean 3×2; below
-   ~470px (3-up's floor) to 2-up. Cells keep text-overflow:ellipsis as the final
-   safety net for pathological pairs (e.g. 4-digit costs). */
+   ~470px (3-up's floor) to 2-up; below ~340px (2-up's floor, ~322px for the
+   ~123px pair + headroom for 4-digit costs) to a single full-width column so the
+   widest Cost/Duration pairs stop clipping. The 1-up cell gets `container − 32px`
+   of content area — well above the ~141px the widest pair needs — so ellipsis no
+   longer engages in the rail-mounted 650–720px band or on sub-343px mobile (#242).
+   Cells keep text-overflow:ellipsis as the final safety net for truly pathological
+   pairs (e.g. 5-digit costs in a hypothetically narrower strip). */
 @container (max-width: 920px) {
   .conv-cmp-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @container (max-width: 470px) {
   .conv-cmp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 340px) {
+  .conv-cmp-metrics { grid-template-columns: minmax(0, 1fr); }
 }
 .conv-cmp-metric {
   display: flex;
