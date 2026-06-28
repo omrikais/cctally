@@ -49,7 +49,7 @@ For status-line integration and tuning, see [docs/installation.md](docs/installa
 
 ## The live dashboard
 
-`cctally dashboard` serves a single-page app at `localhost:8789`, driven by server-sent events so it updates as you work - no refresh, no polling. Eleven panels cover the whole picture: **current week**, **forecast**, **$/1% trend**, **recent sessions**, **weekly**, **monthly**, **5-hour blocks**, **daily heatmap**, **projects**, **cache report**, and **recent alerts**. Every panel expands into a focused modal (keys `1`-`6` and the panel headers), sessions are filterable (`f`) and searchable (`/`), and a settings drawer (`s`) tunes alerts and display options live. It binds to loopback by default; `--host 0.0.0.0` (or `dashboard.bind = lan`) exposes it to your LAN behind a CSRF-guarded, privacy-gated server.
+`cctally dashboard` serves a web app at `localhost:8789` that updates live as you work - no refresh, no polling. Eleven panels cover the whole picture: **current week**, **forecast**, **$/1% trend**, **recent sessions**, **weekly**, **monthly**, **5-hour blocks**, **daily heatmap**, **projects**, **cache report**, and **recent alerts**. Any panel expands into a focused view, sessions are filterable and searchable, and a settings drawer tunes alerts and display options on the fly. It runs only on your own machine by default; one flag opens it to the other devices on your network when you want that.
 
 <table>
   <tr>
@@ -76,20 +76,19 @@ See [docs/commands/dashboard.md](docs/commands/dashboard.md).
 
 The dashboard's **Conversations** tab is a read-only reader for your Claude Code transcripts - your local session history, rendered the way you'd actually want to review it. A searchable rail lists every conversation with its project, branch, model chips, and cost; the reader shows the full turn-by-turn flow with thinking blocks, tool calls (with diffs and command output), and a per-turn cost-and-token breakdown. Parallel **subagent threads** render as their own nested threads, an outline pane jumps you to any turn, and an in-conversation find bar plus a faceted full-text search (prompts, assistant text, tools, thinking) make a month of sessions navigable. The open conversation **live-tails** as you work, updating within a second.
 
-It is read-only and fail-closed on privacy: loopback-only unless you explicitly opt the LAN in, and the on-disk cache and its sidecars are hardened to `0600`/`0700`.
+It only reads your transcripts - it never changes them - and everything stays on your own machine. Nothing is uploaded, and the viewer is reachable only from your computer unless you choose to share the dashboard with your network.
 
-<table>
-  <tr>
-    <td>
-      <img src="docs/img/conversation-reader.png" alt="Conversation viewer: rail, reader, and outline">
-      <br><em>Rail, threaded reader with tool cards and a subagent thread, and the jump-to outline.</em>
-    </td>
-    <td align="center">
-      <img src="docs/img/conversation-mobile.png" alt="Conversation viewer on phone" width="320">
-      <br><em>The reader on your phone.</em>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/img/conversation-reader.png" alt="Conversation viewer: rail, threaded reader, and outline" width="900">
+  <br>
+  <em>Rail, threaded reader with tool cards and a subagent thread, and the jump-to outline.</em>
+</p>
+
+<p align="center">
+  <img src="docs/img/conversation-mobile.png" alt="Conversation viewer on a phone" width="300">
+  <br>
+  <em>The same reader on your phone.</em>
+</p>
 
 ## Cost per 1% of quota
 
@@ -117,7 +116,7 @@ For dollar budgets, `cctally budget` tracks an equivalent-vs-actual spend target
 
 ## Threshold alerts
 
-Get a native desktop notification the moment you cross a percent milestone, so a runaway week can't sneak up on you. Alerts fire on weekly percent, 5-hour blocks, and budget thresholds, with three severity tiers (info / warn / critical) and cross-platform dispatch - `osascript` on macOS, `notify-send` on Linux, or your own command template. `cctally alerts test` confirms the wiring. See [docs/commands/alerts.md](docs/commands/alerts.md).
+Get a native desktop notification the moment you cross a percent milestone, so a runaway week can't sneak up on you. Alerts fire on weekly percent, 5-hour blocks, and budget thresholds, with three severity levels (info / warn / critical) and native popups on macOS and Linux - or run a command of your own. `cctally alerts test` confirms it's wired up. See [docs/commands/alerts.md](docs/commands/alerts.md).
 
 ## 5-hour analytics
 
@@ -133,7 +132,7 @@ See [docs/commands/blocks.md](docs/commands/blocks.md) and [docs/commands/five-h
 
 ## Live terminal UI
 
-Prefer to stay in the terminal, or working over SSH? `cctally tui` renders the same live data as a refreshing terminal dashboard. It lazy-imports the optional `rich` package, so every other subcommand stays zero-dependency.
+Prefer to stay in the terminal, or working over SSH? `cctally tui` shows the same live data as a refreshing terminal dashboard. It's the one feature that needs the optional `rich` library; every other command runs on a plain Python install with nothing else to set up.
 
 <p align="center">
   <img src="docs/img/cli-tui.svg" alt="cctally tui: live terminal dashboard">
@@ -153,13 +152,13 @@ If you also use OpenAI's Codex CLI, `cctally codex daily / monthly / session` ar
 
 ## Diagnostics & upkeep
 
-`cctally doctor` is a read-only health report - install, hooks, OAuth, database, freshness, pricing, and safety checks - and surfaces in the dashboard as a chip and modal. `cctally pricing-check` flags when the embedded model pricing has gone stale, `cctally db status` / `db recover` manage schema migrations, and `cctally update` keeps the install current. The local SQLite cache (`~/.local/share/cctally/cache.db`) is always safe to delete or rebuild.
+`cctally doctor` gives you a read-only health check - install, hooks, sign-in, database, data freshness, pricing, and safety - and the same status shows up in the dashboard. `cctally pricing-check` warns you when the built-in model pricing is getting stale, `cctally db` manages the local database, and `cctally update` keeps your install current. The local cache is always safe to delete or rebuild.
 
 ## A faster, local-first ccusage
 
 `cctally` started as a local replacement for [`ccusage`](https://github.com/ryoppippi/ccusage) and stays compatible at the level of common flows: `cctally claude <cmd>` is a drop-in for `ccusage claude <cmd>` (and `cctally codex <cmd>` for `ccusage codex <cmd>`), with the flat forms (`cctally daily`, `cctally codex-daily`, …) kept as aliases. Paste your ccusage commands verbatim - then reach for the dashboard, forecast, trend, conversation viewer, and alerts that ccusage doesn't have.
 
-It's also fast. Pricing is embedded and computed at query time from a delta-tail SQLite cache, with no shell-outs. First-table latency on 30 days of session data: **~2.6s (cctally) vs ~31s (ccusage)**, about 12× faster. Measured by `bench/cctally-vs-ccusage.sh` on macOS arm64, 2026-05-05; your numbers will vary.[^bench]
+It's also fast. Pricing is built in and computed in-process from a local SQLite cache, with no external tools to spawn. First table on 30 days of session data: **~2.6s (cctally) vs ~31s (ccusage)**, about 12× faster. Measured by `bench/cctally-vs-ccusage.sh` on macOS arm64, 2026-05-05; your numbers will vary.[^bench]
 
 <!--
   Footnote target uses an absolute URL because GitHub's relative-link
