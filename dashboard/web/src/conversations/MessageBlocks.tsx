@@ -159,21 +159,29 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKin
 // "tool run · N actions" head (label + trailing rule via CSS); a single call
 // renders a bare chip with no head.
 function ToolRun({ calls }: { calls: Extract<ConversationBlock, { kind: 'tool_call' }>[] }) {
-  // A Task* checklist run collapses to ONE card showing the running to-do list
-  // snapshot, suppressing the N generic chips + the "tool run · N actions" head.
+  // A Task* checklist run collapses its LEADING Task* sub-run to ONE card
+  // showing the running to-do list snapshot (the kernel folds the whole run's
+  // ops into the first call's task_snapshot), suppressing those N generic chips
+  // + the "tool run · N actions" head. #245: only the leading Task* sub-run is
+  // collapsed — any trailing tool calls (a Codex error, a generic chip, …) still
+  // render through the normal chip path instead of being discarded.
+  let checklist: ReactNode = null;
+  let rest = calls;
   if (isTaskChecklistRun(calls)) {
-    return (
-      <div className="conv-toolrun">
-        <TaskChecklistCard call={calls[0]} />
-      </div>
-    );
+    let lead = 1;
+    while (lead < calls.length && calls[lead].name != null && TASK_TRIO.has(calls[lead].name!)) {
+      lead++;
+    }
+    checklist = <TaskChecklistCard call={calls[0]} />;
+    rest = calls.slice(lead);
   }
   return (
     <div className="conv-toolrun">
-      {calls.length >= 2 && (
-        <div className="conv-toolrun-head">tool run · {calls.length} actions</div>
+      {checklist}
+      {rest.length >= 2 && (
+        <div className="conv-toolrun-head">tool run · {rest.length} actions</div>
       )}
-      {calls.map((c, i) => (
+      {rest.map((c, i) => (
         <ToolCallChip key={i} call={c} />
       ))}
     </div>

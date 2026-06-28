@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Conversation viewer: a tool call that follows a to-do/checklist update inside the same assistant turn is no longer silently dropped — when an assistant message updated its task checklist and then made a further tool call (for example a Codex agent call that errored), only the checklist card rendered and every tool call after it vanished entirely; the leading checklist now collapses to its card as before and the trailing tool call(s) render normally right after it (#245).
+
 ## [1.57.0] - 2026-06-27
 
 ### Added

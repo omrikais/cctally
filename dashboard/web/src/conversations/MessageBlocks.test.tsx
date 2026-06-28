@@ -666,6 +666,45 @@ describe('MessageBlocks — Task* checklist run collapses to one card', () => {
     expect(container.querySelector('.conv-toolrun-head')).toBeTruthy();
     expect(container.querySelectorAll('.conv-chip--tool').length).toBe(2);
   });
+
+  // #245 — a run whose LEADING calls are a Task* checklist sub-run but which
+  // continues with non-Task tool calls must collapse ONLY the leading Task* sub-
+  // run into the card and still render the trailing calls. The trailing calls
+  // were previously discarded (only calls[0] reached the renderer).
+  it('renders trailing non-Task calls after a leading Task* checklist sub-run (#245)', () => {
+    // Mirrors the repro item: [TaskUpdate(snapshot), TaskUpdate, codex(error)].
+    // The two TaskUpdates collapse to one Tasks card; the trailing Codex error
+    // call still renders through the normal special-tool path.
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'TaskUpdate', tool_use_id: 'u1', task_snapshot: taskSnap,
+             input: { taskId: '1', status: 'completed' } }),
+      call({ name: 'TaskUpdate', tool_use_id: 'u2',
+             input: { taskId: '2', status: 'in_progress' } }),
+      call({ name: 'mcp__codex__codex', tool_use_id: 'cx1',
+             input: { prompt: 'review the diff' },
+             result: { text: 'HTTP 400 from gpt-5.5-codex', truncated: false, is_error: true } }),
+    ]} />);
+    // The leading Task* sub-run collapses to exactly one Tasks card.
+    expect(container.querySelectorAll('.conv-todo')).toHaveLength(1);
+    expect(container.querySelector('.conv-chip-name')?.textContent).toBe('Tasks');
+    // The trailing Codex call is no longer dropped — its card renders.
+    expect(container.querySelector('.conv-codex')).toBeTruthy();
+    expect(container.querySelector('.conv-codex--error')).toBeTruthy();
+  });
+
+  it('renders a trailing generic chip after a single-call Task* checklist sub-run (#245)', () => {
+    // The generic JSON chip was dropped the same way before the Codex card
+    // existed: [TaskList(snapshot), Read] → Tasks card + a Read chip.
+    const { container } = render(<MessageBlocks blocks={[
+      call({ name: 'TaskList', tool_use_id: 'l1', task_snapshot: taskSnap }),
+      call({ name: 'Read', tool_use_id: 't1', preview: '/keep.txt' }),
+    ]} />);
+    expect(container.querySelectorAll('.conv-todo')).toHaveLength(1);
+    expect(container.querySelector('.conv-chip--tool')).toBeTruthy();
+    expect(screen.getByText('/keep.txt')).toBeInTheDocument();
+    // A single trailing chip gets no run head.
+    expect(container.querySelector('.conv-toolrun-head')).toBeNull();
+  });
 });
 
 describe('MessageBlocks — Session 4 MCP chip pill (Q5-A)', () => {
