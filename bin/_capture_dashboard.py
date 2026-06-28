@@ -54,6 +54,10 @@ class Shot:
     # CSS — used to drop the Recent Alerts panel from the marketing
     # shots without forking the dashboard's prefs schema.
     hide_panels: tuple = ()
+    # Optional hash-route suffix appended to the dashboard URL before
+    # navigation — e.g. "#/conversations/<id>" to deep-link straight into
+    # the conversation reader. Empty for the panel-grid shots.
+    hash_route: str = ""
 
 
 # Marketing-shot panels we hide via injected CSS so the dashboard
@@ -76,6 +80,31 @@ def _click_forecast_panel(page) -> None:
     """Open the Forecast modal so dashboard-warn.png shows the WARN verdict."""
     page.click('[data-panel-kind="forecast"]')
     page.wait_for_selector('#modal-root .modal-card', timeout=5000)
+
+
+def _settle_conversation_reader(page) -> None:
+    """Settle the deep-linked conversation reader before capture.
+
+    The conversation shots navigate straight to the hash route
+    ``#/conversations/<id>`` (verified against the running app), so the
+    reader mounts on load. Wait for the virtualized message items to paint,
+    pin the reader scroller to the top so the shot opens on the user's
+    prompt + the first thinking / tool turns, and let it settle.
+    """
+    page.wait_for_selector(".conv-reader-item", timeout=10_000)
+    # The reader is a chat-style virtualized list that opens on the latest
+    # turn. Pin it fully to the bottom so the shot frames the completed work
+    # (the Bash test card + the wrap-up summary) without a mid-scroll
+    # cut-off line at the top edge.
+    page.evaluate(
+        "() => {"
+        "  const list = document.querySelector('[data-testid=\"virtuoso-item-list\"]');"
+        "  let s = list ? list.parentElement : null;"
+        "  while (s && s.scrollHeight <= s.clientHeight) s = s.parentElement;"
+        "  if (s) s.scrollTop = s.scrollHeight;"
+        "}"
+    )
+    page.wait_for_timeout(600)
 
 
 def _shots() -> list[Shot]:
@@ -126,6 +155,28 @@ def _shots() -> list[Shot]:
             # modal during page load — same prefs keeps that consistent
             # with the desktop pass.
             hide_panels=_HIDE_ALERTS_PANEL,
+        ),
+        # Conversation viewer (the flagship new feature). Deep-link straight
+        # to the hero session's reader via the hash route, then settle the
+        # virtualized transcript. Single-viewport (full_page=False) so the
+        # shot frames the rail + reader (+ outline on desktop) as one screen.
+        Shot(
+            name="conversation-reader",
+            viewport={"width": 1440, "height": 900},
+            is_mobile=False,
+            post_open_action=_settle_conversation_reader,
+            wait_for_selector=".conv-reader",
+            full_page=False,
+            hash_route="#/conversations/sess-api-gateway-00",
+        ),
+        Shot(
+            name="conversation-mobile",
+            viewport={"width": 393, "height": 852},  # iPhone 14 Pro CSS px
+            is_mobile=True,
+            post_open_action=_settle_conversation_reader,
+            wait_for_selector=".conv-reader",
+            full_page=False,
+            hash_route="#/conversations/sess-api-gateway-00",
         ),
     ]
 
@@ -186,7 +237,7 @@ def capture_all(*, dashboard_url: str, out_dir: Path) -> None:
                     # SSE stream (15s keep-alive ticks) resets the 500ms
                     # idle timer indefinitely. wait_for_selector below is
                     # the actual readiness signal.
-                    page.goto(dashboard_url, wait_until="domcontentloaded")
+                    page.goto(dashboard_url + shot.hash_route, wait_until="domcontentloaded")
                     page.wait_for_selector(shot.wait_for_selector, timeout=10_000)
                     # Disable first-mount stagger animations. The Daily
                     # panel staggers cell fade-in by 30ms × index across
@@ -198,6 +249,20 @@ def capture_all(*, dashboard_url: str, out_dir: Path) -> None:
                         ".daily-cell.first-mount { "
                         "animation: none !important; opacity: 1 !important; "
                         "}"
+                        # The Doctor chip reports "1 fail" purely because the
+                        # synthetic fixture has no OAuth credential — a real
+                        # authenticated user never sees this. Hide it so the
+                        # marketing header isn't dominated by a red failure pill.
+                        " .doctor-chip { display: none !important; }"
+                        # The Current-Week snapshot-freshness chip + footer show
+                        # a large "…s ago" because the fixture anchors its latest
+                        # snapshot to the week's Thursday (load-bearing for the
+                        # WARN forecast tuning) while the dashboard measures
+                        # freshness against real wall-clock — a fixture-anchoring
+                        # artifact, not a product state. Hide both so the header's
+                        # live "synced …s ago" is the freshness signal.
+                        " [data-freshness] { display: none !important; }"
+                        " .cw-foot { display: none !important; }"
                     ))
                     if shot.hide_panels:
                         # Inject a CSS rule to hide each named PanelHost

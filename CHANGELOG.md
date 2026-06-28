@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Documentation
+- README rewritten as a feature-led landing page: a per-capability tour (live dashboard, conversation viewer, cost-per-1% trend, forecast & budget, threshold alerts, 5-hour analytics, live TUI, shareable reports, Codex parity, diagnostics) replaces the prior single bullet list, with a dedicated conversation-viewer showcase and two new screenshots (desktop reader + mobile phone). All marketing screenshots were regenerated against the current model lineup (Opus 4.8 and Fable 5), and the stale "nine-panel" dashboard description is corrected to the actual eleven panels.
+
 ## [1.57.1] - 2026-06-28
 
 ### Fixed

@@ -124,6 +124,15 @@ echo "[3/5] Capturing CLI SVGs"
 
 FREEZE_OPTS=(--window --background "#0d1117" --padding "20,40" --margin 0)
 
+# NOTE on clean captures: freeze bakes the command's terminal output
+# (stdout+stderr at the PTY) into the SVG and does NOT honor an in-command
+# `2>/dev/null` redirect, so the marketing fixture is kept silent at the
+# SOURCE instead: session_files are seeded with size_bytes=0 (no "[cache]
+# … no longer on disk" orphan warning) and all stats migrations are
+# stamped applied (no one-time "[cctally] Recomputing …" recompute, which
+# would also zero the pre-walk trend weeks). Both live in
+# bin/build-readme-fixtures.py. A cold `cctally report/forecast` against
+# the fixture now emits zero stderr, so no pre-warm is needed.
 freeze "${FREEZE_OPTS[@]}" --execute "cctally report"           --output "$DOCS_IMG/cli-report.svg"
 freeze "${FREEZE_OPTS[@]}" --execute "cctally forecast"         --output "$DOCS_IMG/cli-forecast.svg"
 freeze "${FREEZE_OPTS[@]}" --execute "cctally five-hour-blocks --breakdown=model" --output "$DOCS_IMG/cli-five-hour-blocks.svg"
@@ -178,6 +187,8 @@ EXPECTED=(
     "$DOCS_IMG/dashboard-modal.png"
     "$DOCS_IMG/dashboard-mobile.png"
     "$DOCS_IMG/dashboard-warn.png"
+    "$DOCS_IMG/conversation-reader.png"
+    "$DOCS_IMG/conversation-mobile.png"
     "$DOCS_IMG/cli-report.svg"
     "$DOCS_IMG/cli-forecast.svg"
     "$DOCS_IMG/cli-five-hour-blocks.svg"
@@ -199,4 +210,4 @@ if [[ $MISSING -gt 0 ]]; then
 fi
 
 echo
-echo "All 8 README assets refreshed in $DOCS_IMG"
+echo "All ${#EXPECTED[@]} README assets refreshed in $DOCS_IMG"

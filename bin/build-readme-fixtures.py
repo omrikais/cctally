@@ -44,18 +44,28 @@ from _fixture_builders import (  # noqa: E402
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
+    stamp_all_stats_migrations_applied,
 )
+from _cctally_cache import _recompute_conversation_sessions  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_DIR = REPO_ROOT / "tests/fixtures/readme/home/.local/share/cctally"
 DEFAULT_TUI_SNAPSHOT = REPO_ROOT / "tests/fixtures/readme/tui_snapshot.py"
 
 PROJECTS = ("web-app", "api-gateway", "data-pipeline", "mobile-client")
-MODELS = (
-    "claude-sonnet-4-6",
-    "claude-opus-4-7",
-    "claude-haiku-4-5-20251001",
-)
+# Named model constants — referenced directly by the conversation seeder
+# (so its chips don't depend on positional indices) and assembled into the
+# `MODELS` set + `WALK_CYCLE` that drive the 30-day usage walk and the
+# dashboard / five-hour-blocks per-row model breakdowns.
+SONNET_MODEL = "claude-sonnet-4-6"
+OPUS_MODEL = "claude-opus-4-8"
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+FABLE_MODEL = "claude-fable-5"
+# Canonical set of models this fixture exercises (documentation/order).
+MODELS = (SONNET_MODEL, OPUS_MODEL, HAIKU_MODEL, FABLE_MODEL)
+# The three established models rotate evenly across the usage walk (this is
+# the original, cost-tuned assignment).
+BASE_CYCLE = (SONNET_MODEL, OPUS_MODEL, HAIKU_MODEL)
 
 
 def DEFAULT_AS_OF_FN() -> str:
@@ -64,6 +74,455 @@ def DEFAULT_AS_OF_FN() -> str:
 
 def _iso(d: dt.datetime) -> str:
     return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _insert_conversation_message(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    uuid: str,
+    parent_uuid: Optional[str],
+    source_path: str,
+    byte_offset: int,
+    timestamp_utc: str,
+    entry_type: str,
+    text: str = "",
+    blocks_json: str = "[]",
+    model: Optional[str] = None,
+    msg_id: Optional[str] = None,
+    req_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    git_branch: Optional[str] = None,
+    is_sidechain: int = 0,
+    source_tool_use_id: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+    attribution_skill: Optional[str] = None,
+    attribution_plugin: Optional[str] = None,
+) -> None:
+    """Insert one ``conversation_messages`` row.
+
+    Mirrors the helper in ``bin/build-conversation-fixtures.py`` so the
+    marketing fixture can seed synthetic transcripts the dashboard's
+    read-only conversation reader will render. The AFTER INSERT FTS trigger
+    (created by ``_apply_cache_schema``) indexes ``text`` automatically when
+    FTS5 is available; ``UNIQUE(source_path, byte_offset)`` mirrors prod.
+    """
+    conn.execute(
+        "INSERT INTO conversation_messages "
+        "(session_id, uuid, parent_uuid, source_path, byte_offset, "
+        " timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id, "
+        " cwd, git_branch, is_sidechain, source_tool_use_id, "
+        " stop_reason, attribution_skill, attribution_plugin) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            session_id, uuid, parent_uuid, source_path, byte_offset,
+            timestamp_utc, entry_type, text, blocks_json, model, msg_id, req_id,
+            cwd, git_branch, is_sidechain, source_tool_use_id,
+            stop_reason, attribution_skill, attribution_plugin,
+        ),
+    )
+
+
+# --- Synthetic transcript content for the conversation-viewer screenshot ----
+# All fictional and safe to publish. The hero (api-gateway) session is a full
+# 16-turn token-bucket-rate-limiter flow exercising Grep/Read/Write/Edit/Bash
+# tool cards, a thinking block, and a Haiku subagent thread; three shorter
+# filler sessions populate the rail.
+_HERO_GREP_RESULT = """src/middleware/index.ts:1: export { authHandler } from './auth-handler';
+src/middleware/auth-handler.ts:12: export const authHandler = (req, res, next) => {
+src/index.ts:34: app.use('/api/v1', authHandler, v1Router);
+src/index.ts:35: app.use('/api/legacy', authHandler, legacyRouter);
+src/middleware/error-handler.ts:4: export const errorHandler = (req, res, next) => {"""
+
+_HERO_AUTH_TS = """import { Request, Response, NextFunction } from 'express';
+
+export interface AuthContext {
+  userId: string;
+  userTier: 'free' | 'pro' | 'enterprise';
+  email: string;
+  permissions: string[];
+}
+
+export const authHandler = (req: Request, res: Response, next: NextFunction) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  const payload = verifyToken(token);
+  (req as any).auth = {
+    userId: payload.sub,
+    userTier: payload.tier || 'free',
+    email: payload.email,
+    permissions: payload.scopes,
+  } as AuthContext;
+  next();
+};"""
+
+_HERO_RATELIMITER_TS = """import { Request, Response, NextFunction } from 'express';
+import { AuthContext } from './auth-handler';
+
+interface TokenBucket {
+  tokens: number;
+  lastRefillTime: number;
+}
+
+const TIER_CONFIG: Record<string, { capacity: number; refillRate: number }> = {
+  free: { capacity: 100, refillRate: 100 / 60 },
+  pro: { capacity: 500, refillRate: 500 / 60 },
+  enterprise: { capacity: 5000, refillRate: 5000 / 60 },
+};
+
+export class RateLimiter {
+  private buckets: Map<string, TokenBucket> = new Map();
+
+  tryConsume(userId: string, tier: string, tokensNeeded = 1): boolean {
+    const now = Date.now();
+    const config = TIER_CONFIG[tier] || TIER_CONFIG.free;
+    let bucket = this.buckets.get(userId);
+    if (!bucket) {
+      bucket = { tokens: config.capacity, lastRefillTime: now };
+      this.buckets.set(userId, bucket);
+    }
+    const elapsed = (now - bucket.lastRefillTime) / 1000;
+    bucket.tokens = Math.min(config.capacity, bucket.tokens + elapsed * config.refillRate);
+    bucket.lastRefillTime = now;
+    if (bucket.tokens >= tokensNeeded) {
+      bucket.tokens -= tokensNeeded;
+      return true;
+    }
+    return false;
+  }
+
+  middleware = (req: Request, res: Response, next: NextFunction) => {
+    const auth = (req as any).auth as AuthContext | undefined;
+    if (!auth) return next();
+    if (!this.tryConsume(auth.userId, auth.userTier)) {
+      return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: 60 });
+    }
+    next();
+  };
+}"""
+
+_HERO_EDIT_DIFF = """--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,3 +1,4 @@
+ import { authHandler } from './middleware/auth-handler';
++import { RateLimiter } from './middleware/rate-limiter';
+ import { v1Router } from './routes/v1';
+@@ -32,8 +33,9 @@ app.use(errorHandler);
++const limiter = new RateLimiter();
+-app.use('/api/v1', authHandler, v1Router);
+-app.use('/api/legacy', authHandler, legacyRouter);
++app.use('/api/v1', authHandler, limiter.middleware, v1Router);
++app.use('/api/legacy', authHandler, limiter.middleware, legacyRouter);"""
+
+_HERO_TEST_OUTPUT = """PASS  src/middleware/__tests__/rate-limiter.test.ts
+  RateLimiter
+    ✓ should allow requests within free tier limit (45ms)
+    ✓ should reject requests over free tier limit (12ms)
+    ✓ should allow pro tier higher limits (28ms)
+    ✓ should refill tokens over time (89ms)
+    ✓ should handle concurrent users independently (31ms)
+    ✓ should return 429 when rate limited (19ms)
+    ✓ should include retryAfter header in 429 response (22ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       7 passed, 7 total
+Time:        1.234 s"""
+
+
+def _populate_conversations(
+    cache_conn: sqlite3.Connection, *, as_of: dt.datetime
+) -> None:
+    """Seed synthetic ``conversation_messages`` for the conversation-viewer
+    screenshot, attached to the SAME session ids the fixture already seeds so
+    the rail is coherent with the rest of the marketing data.
+
+    Direct-INSERT (mirrors ``build-conversation-fixtures.py``) — no JSONL on
+    disk, no reingest flags. Deliberately seeds NO new ``session_entries``:
+    the carefully-tuned current-week spend ($28.13 / 53% / ~104% forecast)
+    must not move, and the reader renders thinking blocks, tool cards, the
+    subagent thread, and model chips from ``conversation_messages`` alone —
+    per-turn cost simply renders absent. Caller must invoke
+    ``_recompute_conversation_sessions`` afterward to build the rail rollup.
+    """
+    home = REPO_ROOT / "tests/fixtures/readme/home"
+    OPUS, SONNET, HAIKU, FABLE = OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL, FABLE_MODEL
+    offs: dict[str, int] = {}
+
+    def emit(
+        *, sid, uuid, parent, etype, when, source, cwd, branch,
+        text="", blocks=None, model=None, msg_id=None, req_id=None,
+        sidechain=0,
+    ):
+        off = offs.get(source, 0)
+        offs[source] = off + 1
+        _insert_conversation_message(
+            cache_conn, session_id=sid, uuid=uuid, parent_uuid=parent,
+            source_path=source, byte_offset=off, timestamp_utc=_iso(when),
+            entry_type=etype, text=text,
+            blocks_json=json.dumps(blocks) if blocks is not None else "[]",
+            model=model, msg_id=msg_id, req_id=req_id, cwd=cwd,
+            git_branch=branch, is_sidechain=sidechain,
+        )
+
+    def tool_use(name, tid, *, preview, inp, subagent_type=None):
+        b = {"kind": "tool_use", "name": name, "id": tid,
+             "input": inp, "input_summary": json.dumps(inp),
+             "input_truncated": False, "preview": preview}
+        if subagent_type:
+            b["subagent_type"] = subagent_type
+        return b
+
+    def tool_result(tid, text, *, agent_id=None, meta=None, is_error=False):
+        b = {"kind": "tool_result", "text": text, "truncated": False,
+             "is_error": is_error, "tool_use_id": tid}
+        if agent_id:
+            b["agent_id"] = agent_id
+        if meta:
+            b["subagent_meta"] = meta
+        return b
+
+    # Per-turn cost so the reader / rail / outline show real $ + tokens
+    # (rather than $0.00 / 0 tokens). High line_offsets keep these clear of
+    # the 30-day walk's entries on the same source files. Timestamps land in
+    # each conversation's own window, so the small added spend (~$1.5 total)
+    # stays coherent with the tuned current-week figures and leaves the
+    # usage-% / forecast (snapshot-driven) untouched.
+    loff = [900000]
+
+    def cost(source, mid, rid, model, when, *, inp, out, cc=0, cr=0):
+        seed_session_entry(
+            cache_conn, source_path=source, line_offset=loff[0],
+            timestamp_utc=_iso(when), model=model,
+            input_tokens=inp, output_tokens=out,
+            cache_create=cc, cache_read=cr, msg_id=mid, req_id=rid)
+        loff[0] += 1
+
+    # ===== HERO SESSION: api-gateway token-bucket rate limiter =============
+    proj = "api-gateway"
+    sid = f"sess-{proj}-00"
+    src = f"{home}/.claude/projects/-{proj}/sess-{proj}-00.jsonl"
+    cwd = f"/Users/dev/code/{proj}"
+    branch = "feat/rate-limiting"
+    agent_hash = "7c3f1a08"
+    agent_src = f"{home}/.claude/projects/-{proj}/agent-{agent_hash}.jsonl"
+    # size_bytes=0 keeps this synthetic file out of the orphan-tracked-files
+    # scan (sync_cache only flags non-zero-size tracked paths).
+    seed_session_file(cache_conn, path=agent_src, session_id=sid,
+                      project_path=cwd, size_bytes=0, last_byte_offset=0)
+    b0 = as_of - dt.timedelta(minutes=42)
+
+    def H(i):
+        return b0 + dt.timedelta(minutes=i)
+
+    auth_path = f"{cwd}/src/middleware/auth-handler.ts"
+    rl_path = f"{cwd}/src/middleware/rate-limiter.ts"
+    idx_path = f"{cwd}/src/index.ts"
+
+    emit(sid=sid, uuid="hg00", parent=None, etype="human", when=H(0),
+         source=src, cwd=cwd, branch=branch,
+         text=("We need to add per-user rate limiting to the gateway "
+               "middleware to prevent abuse from high-volume clients. The "
+               "limiter should respect user tier (free/pro/enterprise) and "
+               "reject requests when limits are exceeded."))
+    emit(sid=sid, uuid="hg01", parent="hg00", etype="assistant", when=H(1),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh1",
+         req_id="rh1", blocks=[
+             {"kind": "thinking", "text": (
+                 "I'll locate the existing middleware, understand the auth "
+                 "layer where the user tier lives, then add a token-bucket "
+                 "rate limiter that sits right after auth so it has user "
+                 "context. In-memory buckets for now, with a note to move to "
+                 "Redis for distributed setups, and per-tier limits.")},
+             tool_use("Grep", "tu_grep", preview="middleware in src/",
+                      inp={"pattern": "middleware", "path": "src/",
+                           "glob": "*.ts"})])
+    emit(sid=sid, uuid="hg02", parent="hg01", etype="tool_result", when=H(2),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result("tu_grep", _HERO_GREP_RESULT)])
+    emit(sid=sid, uuid="hg03", parent="hg02", etype="assistant", when=H(3),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh2",
+         req_id="rh2", blocks=[
+             tool_use("Read", "tu_read", preview="src/middleware/auth-handler.ts",
+                      inp={"file_path": auth_path})])
+    emit(sid=sid, uuid="hg04", parent="hg03", etype="tool_result", when=H(4),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result("tu_read", _HERO_AUTH_TS)])
+    plan = ("The auth handler already populates `req.auth` with the user tier "
+            "(free/pro/enterprise), so I'll add a token-bucket rate limiter "
+            "right after the auth middleware. It keeps per-user buckets keyed "
+            "by userId, with capacity and refill rate set per tier — free 100 "
+            "req/min, pro 500 req/min, enterprise 5000 req/min — and rejects "
+            "with a 429 once the bucket is empty. Let me confirm every call "
+            "site first.")
+    emit(sid=sid, uuid="hg05", parent="hg04", etype="assistant", when=H(5),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh3",
+         req_id="rh3", text=plan, blocks=[
+             {"kind": "text", "text": plan},
+             tool_use("Task", "tu_task", preview="Find authHandler call sites",
+                      subagent_type="Explore",
+                      inp={"description": "Find authHandler call sites",
+                           "subagent_type": "Explore",
+                           "prompt": ("Search the api-gateway codebase for all "
+                                      "route files that mount or use the "
+                                      "authHandler middleware; return the file "
+                                      "paths and how it's attached.")})])
+    # --- subagent thread (own agent-<hash>.jsonl, is_sidechain=1, Haiku) ---
+    emit(sid=sid, uuid="sub_h1", parent="hg05", etype="human", when=H(6),
+         source=agent_src, cwd=cwd, branch=branch, sidechain=1,
+         text=("Search the api-gateway codebase for all route files that mount "
+               "or use the authHandler middleware; return the file paths and "
+               "how it's attached."))
+    emit(sid=sid, uuid="sub_a1", parent="sub_h1", etype="assistant", when=H(7),
+         source=agent_src, cwd=cwd, branch=branch, sidechain=1, model=HAIKU,
+         msg_id="ms1", req_id="rs1",
+         text=("Found three mount points across the route layer."),
+         blocks=[
+             {"kind": "thinking", "text": (
+                 "I'll grep for authHandler imports and middleware mounts "
+                 "across the routes directory.")},
+             {"kind": "text", "text": (
+                 "Found three main mount points: src/index.ts mounts "
+                 "authHandler on /api/v1 and /api/legacy at lines 34–35 "
+                 "(app.use); src/routes/websocket-handler.ts calls authHandler "
+                 "before the WebSocket upgrade at line 18; and "
+                 "src/routes/admin-routes.ts uses authHandler with a "
+                 "permission check for admin endpoints at line 9. All three "
+                 "share the same middleware contract, so the rate limiter "
+                 "integrates uniformly.")}])
+    emit(sid=sid, uuid="hg06", parent="hg05", etype="tool_result", when=H(8),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result(
+             "tu_task",
+             ("Found 3 mount points: index.ts (v1 + legacy), "
+              "websocket-handler.ts (WS upgrade), admin-routes.ts (admin)."),
+             agent_id=agent_hash,
+             meta={"total_tokens": 18240, "total_duration_ms": 9120,
+                   "total_tool_use_count": 3, "status": "completed"})])
+    impl = ("Now I'll create the rate-limiter middleware module that hooks "
+            "into the chain after auth — a class that maintains in-memory "
+            "token buckets per user and exposes an Express middleware.")
+    emit(sid=sid, uuid="hg07", parent="hg06", etype="assistant", when=H(9),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh4",
+         req_id="rh4", text=impl, blocks=[
+             {"kind": "text", "text": impl},
+             tool_use("Write", "tu_write",
+                      preview="src/middleware/rate-limiter.ts",
+                      inp={"file_path": rl_path})])
+    emit(sid=sid, uuid="hg08", parent="hg07", etype="tool_result", when=H(10),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result("tu_write", _HERO_RATELIMITER_TS)])
+    emit(sid=sid, uuid="hg09", parent="hg08", etype="assistant", when=H(11),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh5",
+         req_id="rh5", blocks=[
+             tool_use("Edit", "tu_edit", preview="src/index.ts",
+                      inp={"file_path": idx_path})])
+    emit(sid=sid, uuid="hg10", parent="hg09", etype="tool_result", when=H(12),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result("tu_edit", _HERO_EDIT_DIFF)])
+    emit(sid=sid, uuid="hg11", parent="hg10", etype="assistant", when=H(13),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh6",
+         req_id="rh6", blocks=[
+             tool_use("Bash", "tu_bash",
+                      preview="npm test -- rate-limiter",
+                      inp={"command": "npm test -- --testPathPattern=rate-limiter"})])
+    emit(sid=sid, uuid="hg12", parent="hg11", etype="tool_result", when=H(14),
+         source=src, cwd=cwd, branch=branch,
+         blocks=[tool_result("tu_bash", _HERO_TEST_OUTPUT)])
+    summary = ("The token-bucket rate limiter is live in the api-gateway "
+               "middleware. I added a RateLimiter class with tier-aware "
+               "capacity and refill rates (free 100/min, pro 500/min, "
+               "enterprise 5000/min), wired it into the middleware chain after "
+               "auth in src/index.ts, and all 7 unit tests pass. For "
+               "distributed deployments the in-memory store should move to "
+               "Redis so limits hold across gateway instances.")
+    emit(sid=sid, uuid="hg13", parent="hg12", etype="assistant", when=H(15),
+         source=src, cwd=cwd, branch=branch, model=OPUS, msg_id="mh7",
+         req_id="rh7", text=summary,
+         blocks=[{"kind": "text", "text": summary}])
+
+    # Cost for the 7 Opus main turns + the Haiku subagent turn.
+    for i, (mid, rid) in enumerate(
+            [("mh1", "rh1"), ("mh2", "rh2"), ("mh3", "rh3"), ("mh4", "rh4"),
+             ("mh5", "rh5"), ("mh6", "rh6"), ("mh7", "rh7")]):
+        cost(src, mid, rid, OPUS, H(1 + 2 * i),
+             inp=3000, out=1100, cc=1800, cr=14000)
+    cost(agent_src, "ms1", "rs1", HAIKU, H(7), inp=2200, out=620, cr=9000)
+
+    # ===== FILLER SESSIONS (populate the rail) ============================
+    def filler(proj, sess_branch, day_offset, model, turns):
+        s = f"sess-{proj}-00"
+        sp = f"{home}/.claude/projects/-{proj}/sess-{proj}-00.jsonl"
+        cw = f"/Users/dev/code/{proj}"
+        base = as_of - dt.timedelta(days=day_offset, minutes=20)
+        prev = None
+        for i, (uid, etype, who_model, text) in enumerate(turns):
+            when = base + dt.timedelta(minutes=i)
+            emit(sid=s, uuid=uid, parent=prev, etype=etype,
+                 when=when, source=sp, cwd=cw,
+                 branch=sess_branch, text=text, model=who_model,
+                 msg_id=(f"{uid}m" if etype == "assistant" else None),
+                 req_id=(f"{uid}r" if etype == "assistant" else None),
+                 blocks=([{"kind": "text", "text": text}]
+                         if etype == "assistant" else None))
+            if etype == "assistant":
+                cost(sp, f"{uid}m", f"{uid}r", who_model, when,
+                     inp=1600, out=520, cc=700, cr=6000)
+            prev = uid
+
+    filler("web-app", "main", 1, FABLE, [
+        ("f1h1", "human", None,
+         "The modal dialog loses focus trapping when the background content "
+         "updates — users can tab outside the modal and interact with "
+         "elements beneath it. How do I keep focus trapped inside the modal?"),
+        ("f1a1", "assistant", FABLE,
+         "React modals need explicit focus trapping to prevent tab-escape. Use "
+         "`react-focus-lock`, or implement a custom trap with `useEffect` that "
+         "moves focus into the modal container on mount and re-initializes "
+         "when the background updates. Add `aria-modal='true'` and "
+         "`role='dialog'` so assistive tech restricts context, and return "
+         "focus to the trigger element on close."),
+        ("f1h2", "human", None,
+         "Should I use a library or build it myself?"),
+        ("f1a2", "assistant", FABLE,
+         "For production, use `react-focus-lock` or `react-aria`'s Dialog hook "
+         "— they handle nested modals, focus restoration on close, and the "
+         "accessibility edge cases hand-rolled traps miss. A custom `useEffect` "
+         "is fine for a simple solo modal, but you'll keep patching it."),
+    ])
+    filler("data-pipeline", "main", 2, OPUS, [
+        ("f2h1", "human", None,
+         "We're adding a new required field to our event schema, but in-flight "
+         "batches don't have it. How do we migrate without breaking "
+         "downstream consumers?"),
+        ("f2a1", "assistant", OPUS,
+         "Add the field as optional first (nullable or with a default) and "
+         "deploy that, so existing batches pass through unchanged. Then run a "
+         "backfill that reprocesses old events to populate it. Once everything "
+         "is backfilled, make the field required. Keep consumers tolerant of "
+         "both shapes during the window, behind a feature flag so you can roll "
+         "back."),
+        ("f2h2", "human", None,
+         "How do we retry failed batches without re-processing the whole "
+         "pipeline?"),
+        ("f2a2", "assistant", OPUS,
+         "Keep a checkpoint table with batch ID, last-completed stage, and "
+         "timestamp. On failure, push the batch ID + failed stage to a retry "
+         "queue; the worker resumes from that checkpoint instead of the start. "
+         "You only re-process the stage that failed, not the whole lineage."),
+    ])
+    filler("mobile-client", "main", 3, SONNET, [
+        ("f3h1", "human", None,
+         "Users on unreliable networks get stuck with stale data and no idea "
+         "whether a sync succeeded. How do I build reliable offline sync with "
+         "clear feedback?"),
+        ("f3a1", "assistant", SONNET,
+         "Use a local SQLite (or Realm) store as the source of truth while "
+         "offline, and sync to the backend when connectivity returns. A "
+         "`NetworkInfo` listener detects reconnects and triggers a sync worker "
+         "that batches pending mutations. Surface a status badge — synced / "
+         "syncing / failed with a retry — and store the last-sync timestamp "
+         "so you fetch only deltas on reconnect, not the full dataset."),
+    ])
 
 
 def _seed_weekly_cost_snapshot(
@@ -422,7 +881,14 @@ def _populate_session_entries(
     # ends up touching).
     session_paths: dict[tuple[str, int], str] = {}
     for proj in PROJECTS:
-        cwd = f"{home}/code/{proj}"
+        # The session cwd / project_path MUST resolve outside any git repo,
+        # else `_resolve_project_key` walks up to the cctally-dev checkout's
+        # .git and collapses all four projects into a single "cctally-dev"
+        # bucket — which both looks broken AND leaks the private repo name
+        # into the public Projects-panel screenshot. A synthetic absolute
+        # path under a non-existent /Users/dev tree resolves to its own
+        # basename (web-app / api-gateway / …) with git_root=None.
+        cwd = f"/Users/dev/code/{proj}"
         for sess in range(3):
             session_id = f"sess-{proj}-{sess:02d}"
             jsonl_path = f"{home}/.claude/projects/-{proj}/{session_id}.jsonl"
@@ -431,8 +897,15 @@ def _populate_session_entries(
                 path=jsonl_path,
                 session_id=session_id,
                 project_path=cwd,
-                size_bytes=4096,
-                last_byte_offset=4096,
+                # size_bytes=0: these synthetic JSONL paths never exist on
+                # disk, so a non-zero size makes sync_cache's orphan scan emit
+                # "[cache] N tracked file(s) no longer on disk" on every run —
+                # which freeze then bakes into the CLI SVGs. The scan only
+                # flags non-zero-size tracked paths, so 0 silences it at the
+                # source (the walk never finds these absent files to ingest
+                # anyway; session_entries are seeded directly).
+                size_bytes=0,
+                last_byte_offset=0,
             )
             session_paths[(proj, sess)] = jsonl_path
 
@@ -453,19 +926,34 @@ def _populate_session_entries(
             proj = PROJECTS[proj_idx]
             sess_idx = ((days_ago // 7) + k) % 3
             jsonl_path = session_paths[(proj, sess_idx)]
-            model = MODELS[(days_ago + k) % len(MODELS)]
+            # Established three rotate evenly (original cost-tuned mix);
+            # Fable — the newest, ~2x-Opus premium model — substitutes one
+            # entry in nine as a deliberate minority. It stays visible in
+            # every model breakdown without implying a daily workhorse, and
+            # (with the lighter token profile below) keeps current-week
+            # spend on its gentle trend.
+            model = BASE_CYCLE[(days_ago + k) % len(BASE_CYCLE)]
+            if (days_ago * 4 + k) % 9 == 4:
+                model = FABLE_MODEL
             # Space entries across the working day. Step is 90 min so
             # `entries_this_day=6` lands the last one at 16:30, well
             # before any plausible `as_of`.
             ts = day_start + dt.timedelta(minutes=90 * k)
             if ts > as_of:
                 continue
-            seed_session_entry(
-                cache_conn,
-                source_path=jsonl_path,
-                line_offset=line_offset,
-                timestamp_utc=_iso(ts),
-                model=model,
+            if model == FABLE_MODEL:
+                # Fable prices ~2x Opus. Give it a lighter token profile
+                # than the big three (roughly half the cache-read context)
+                # so it reads as a premium model used for the harder,
+                # higher-output calls — and size it so the few Fable entries
+                # land the current-week live spend back on the tuned trend
+                # ($28.1x), matching the seeded weekly_cost_snapshots the
+                # report/dashboard Trend panel renders.
+                inp = 32_000 + 5_000 * k + 2_500 * proj_idx
+                out = 25_000 + 2_500 * k + 1_000 * (days_ago % 5)
+                cc = 10_000 if k % 3 == 0 else 0
+                cr = 105_000 + 10_000 * k + 14_000 * (days_ago % 3)
+            else:
                 # Token counts sized so the per-week live cost adds up
                 # to ~$25-30 (matches the trend's $/1% × ~53% target).
                 # Spread variance so per-row dashboard numbers don't
@@ -477,10 +965,20 @@ def _populate_session_entries(
                 # forecast's "Used 53.0% $28.x" line, and the dashboard's
                 # `current_week.spent_usd`. Pre-scale, the same week
                 # summed to ~$2.81, contradicting the trend's $/1% column.
-                input_tokens=120_000 + 20_000 * k + 8_000 * proj_idx,
-                output_tokens=48_000 + 6_000 * k + 2_000 * (days_ago % 5),
-                cache_create=40_000 if k % 3 == 0 else 0,
-                cache_read=180_000 + 15_000 * k + 25_000 * (days_ago % 3),
+                inp = 120_000 + 20_000 * k + 8_000 * proj_idx
+                out = 48_000 + 6_000 * k + 2_000 * (days_ago % 5)
+                cc = 40_000 if k % 3 == 0 else 0
+                cr = 180_000 + 15_000 * k + 25_000 * (days_ago % 3)
+            seed_session_entry(
+                cache_conn,
+                source_path=jsonl_path,
+                line_offset=line_offset,
+                timestamp_utc=_iso(ts),
+                model=model,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_create=cc,
+                cache_read=cr,
                 msg_id=f"msg_{proj}_{sess_idx}_{days_ago}_{k}",
                 req_id=f"req_{proj}_{sess_idx}_{days_ago}_{k}",
             )
@@ -750,11 +1248,21 @@ def build(
             open_block_resets_at_iso=open_block_resets_at_iso,
         )
         _populate_milestones(stats_conn, as_of=as_of)
+        # Ship as a fully-migrated user so a read command's sync_cache walk
+        # can't trip the #93 upgrade-gate and recompute the seeded
+        # weekly_cost_snapshots / five_hour_blocks / percent_milestones to $0
+        # (the pre-walk trend weeks have no session_entries to recompute
+        # from). This is the same guard the dashboard / share / conversation
+        # render-fixture builders apply; without it `cctally report` zeroes
+        # the three oldest trend rows in cli-report.svg.
+        stamp_all_stats_migrations_applied(stats_conn)
         stats_conn.commit()
 
     with sqlite3.connect(cache_path) as cache_conn:
         cache_conn.execute("PRAGMA journal_mode=WAL")
         _populate_session_entries(cache_conn, as_of=as_of)
+        _populate_conversations(cache_conn, as_of=as_of)
+        _recompute_conversation_sessions(cache_conn)
         cache_conn.commit()
 
     # config.json: pin display.tz so dashboard + CLI render dates in LA

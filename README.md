@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>Claude Code usage tracker and local dashboard for Pro/Max subscription limits - weekly cost-per-percent trend, quota forecasts, threshold alerts. ccusage-compatible.</strong>
+  <strong>Local-first usage tracker for Claude Code on Pro/Max - live dashboard, conversation viewer, weekly cost-per-percent trend, quota forecast, and threshold alerts. ccusage-compatible.</strong>
 </p>
 
 <p align="center">
@@ -16,59 +16,46 @@
   <a href="https://github.com/omrikais/cctally/stargazers"><img src="https://img.shields.io/github/stars/omrikais/cctally.svg" alt="GitHub stars"></a>
 </p>
 
-If you're using `ccusage` to watch Claude Code spend, `cctally` covers the same ground and adds the parts you reach for next: a live web dashboard, a forecast that tells you whether you're going to cap this week, threshold alerts when you cross a percent, and a persistent week-over-week trend of cost per percent of quota. All local, no account, no telemetry.
+Claude Code's Pro/Max plans meter you on a weekly quota, but the only signal you get is a percentage that creeps up until you cap. `cctally` turns that percentage into something you can act on: it reads your local session logs, computes cost in-process, and shows you **how much each percent of quota is actually costing you, whether you're on track to cap this week, and exactly where the spend is going** - across a live web dashboard, a read-only conversation viewer, and a full set of CLI reports. Everything runs locally against your own `~/.claude` data. No account, no API key, no telemetry, nothing leaves your machine.
 
 <p align="center">
   <img src="docs/img/dashboard-desktop.png" alt="cctally dashboard, desktop view" width="900">
 </p>
 
-## Installation
+## Quick start
 
 **Requirements:** Python 3.11+, macOS or Linux, Claude Code installed and run at least once.
 
-### Homebrew (macOS / Linux)
-
 ```bash
-brew install omrikais/cctally/cctally
-cctally setup
+# Homebrew (macOS / Linux)
+brew install omrikais/cctally/cctally && cctally setup
+
+# …or npm
+npm install -g cctally && cctally setup
+
+# …or from source
+git clone https://github.com/omrikais/cctally && cd cctally && ./bin/cctally setup
 ```
 
-### npm
-
-```bash
-npm install -g cctally
-cctally setup
-```
-
-Needs Python 3. If `cctally setup` fails with "python3 not found", install it with `brew install python` (macOS) and try again.
-
-### From source
-
-```bash
-git clone https://github.com/omrikais/cctally
-cd cctally
-./bin/cctally setup
-```
-
-`cctally setup` (any channel) symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (never overwrites existing entries), and bootstraps the local SQLite cache. If `~/.local/bin/` isn't on your PATH, the script prints the line to add.
+`cctally setup` symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (it never overwrites existing entries), and bootstraps the local SQLite cache. If `~/.local/bin/` isn't on your `PATH`, the script prints the line to add. The npm install needs Python 3 on `PATH` - if setup reports "python3 not found", install it (`brew install python` on macOS) and re-run.
 
 ```bash
 cctally setup --status     # verify hooks + symlinks
-cctally daily              # cost-by-day, your first table
+cctally daily              # cost-by-day - your first table
 cctally dashboard          # opens http://127.0.0.1:8789
 ```
 
-For status-line integration, alerts, and configuration, see [docs/installation.md](docs/installation.md) and [docs/configuration.md](docs/configuration.md).
+For status-line integration and tuning, see [docs/installation.md](docs/installation.md) and [docs/configuration.md](docs/configuration.md).
 
-## What it looks like
+## The live dashboard
 
-### Dashboard
+`cctally dashboard` serves a single-page app at `localhost:8789`, driven by server-sent events so it updates as you work - no refresh, no polling. Eleven panels cover the whole picture: **current week**, **forecast**, **$/1% trend**, **recent sessions**, **weekly**, **monthly**, **5-hour blocks**, **daily heatmap**, **projects**, **cache report**, and **recent alerts**. Every panel expands into a focused modal (keys `1`-`6` and the panel headers), sessions are filterable (`f`) and searchable (`/`), and a settings drawer (`s`) tunes alerts and display options live. It binds to loopback by default; `--host 0.0.0.0` (or `dashboard.bind = lan`) exposes it to your LAN behind a CSRF-guarded, privacy-gated server.
 
 <table>
   <tr>
     <td>
       <img src="docs/img/dashboard-modal.png" alt="Dashboard with trend modal open">
-      <br><em>Any panel expands into a focused view. The trend modal shows twelve weeks of cost per percent.</em>
+      <br><em>Any panel expands into a focused view - here, twelve weeks of cost per percent.</em>
     </td>
     <td>
       <img src="docs/img/dashboard-warn.png" alt="Dashboard in warn state">
@@ -78,12 +65,35 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
   <tr>
     <td colspan="2" align="center">
       <img src="docs/img/dashboard-mobile.png" alt="Dashboard on phone" width="350">
-      <br><em>The same dashboard on your phone.</em>
+      <br><em>The same dashboard, reflowed for your phone.</em>
     </td>
   </tr>
 </table>
 
-### CLI tables
+See [docs/commands/dashboard.md](docs/commands/dashboard.md).
+
+## Conversation viewer ⭐
+
+The dashboard's **Conversations** tab is a read-only reader for your Claude Code transcripts - your local session history, rendered the way you'd actually want to review it. A searchable rail lists every conversation with its project, branch, model chips, and cost; the reader shows the full turn-by-turn flow with thinking blocks, tool calls (with diffs and command output), and a per-turn cost-and-token breakdown. Parallel **subagent threads** render as their own nested threads, an outline pane jumps you to any turn, and an in-conversation find bar plus a faceted full-text search (prompts, assistant text, tools, thinking) make a month of sessions navigable. The open conversation **live-tails** as you work, updating within a second.
+
+It is read-only and fail-closed on privacy: loopback-only unless you explicitly opt the LAN in, and the on-disk cache and its sidecars are hardened to `0600`/`0700`.
+
+<table>
+  <tr>
+    <td>
+      <img src="docs/img/conversation-reader.png" alt="Conversation viewer: rail, reader, and outline">
+      <br><em>Rail, threaded reader with tool cards and a subagent thread, and the jump-to outline.</em>
+    </td>
+    <td align="center">
+      <img src="docs/img/conversation-mobile.png" alt="Conversation viewer on phone" width="320">
+      <br><em>The reader on your phone.</em>
+    </td>
+  </tr>
+</table>
+
+## Cost per 1% of quota
+
+The signature view. `cctally report` reframes each subscription week's spend as **dollars per percent of quota used**, so you can see your spending efficiency trend week over week - and whether this week is pulling above or below the line - instead of staring at a raw percentage. Persisted to SQLite, so the comparison survives across runs.
 
 <p align="center">
   <img src="docs/img/cli-report.svg" alt="cctally report: $ per 1% weekly trend">
@@ -91,19 +101,39 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
   <em>Weekly cost as dollars per percent of quota, with the delta against the prior week.</em>
 </p>
 
+See [docs/commands/report.md](docs/commands/report.md).
+
+## Forecast & budget
+
+`cctally forecast` projects where your weekly percentage lands at the next reset - using both a week-average and a recent-24h rate - and tells you the daily $/% budget you'd need to stay under the 100% and 90% ceilings. When the data is thin it says so (`LOW CONF`) rather than guessing.
+
 <p align="center">
   <img src="docs/img/cli-forecast.svg" alt="cctally forecast: will I cap this week?">
   <br>
   <em>Projected percent at the weekly reset, plus the daily budget to stay under the cap.</em>
 </p>
 
+For dollar budgets, `cctally budget` tracks an equivalent-vs-actual spend target over a configurable calendar period - per vendor, for both Claude and Codex - with a pace projection and an `ok`/`warn`/`over` verdict. See [docs/commands/forecast.md](docs/commands/forecast.md) and [docs/commands/budget.md](docs/commands/budget.md).
+
+## Threshold alerts
+
+Get a native desktop notification the moment you cross a percent milestone, so a runaway week can't sneak up on you. Alerts fire on weekly percent, 5-hour blocks, and budget thresholds, with three severity tiers (info / warn / critical) and cross-platform dispatch - `osascript` on macOS, `notify-send` on Linux, or your own command template. `cctally alerts test` confirms the wiring. See [docs/commands/alerts.md](docs/commands/alerts.md).
+
+## 5-hour analytics
+
+Claude Code's quota also runs on rolling 5-hour windows. `cctally blocks` and `cctally five-hour-blocks` break usage down per window - anchored to the real API resets, not a re-sizable guess - with model and project rollups and cross-reset flags, and `cctally five-hour-breakdown` drills into the per-percent milestones inside a single block.
+
 <p align="center">
   <img src="docs/img/cli-five-hour-blocks.svg" alt="cctally five-hour-blocks: 5h analytics with model breakdown">
   <br>
-  <em>Each 5-hour window, broken down by model.</em>
+  <em>Each 5-hour window, with rollup totals and 7-day drift.</em>
 </p>
 
-### Live terminal
+See [docs/commands/blocks.md](docs/commands/blocks.md) and [docs/commands/five-hour-blocks.md](docs/commands/five-hour-blocks.md).
+
+## Live terminal UI
+
+Prefer to stay in the terminal, or working over SSH? `cctally tui` renders the same live data as a refreshing terminal dashboard. It lazy-imports the optional `rich` package, so every other subcommand stays zero-dependency.
 
 <p align="center">
   <img src="docs/img/cli-tui.svg" alt="cctally tui: live terminal dashboard">
@@ -111,29 +141,32 @@ For status-line integration, alerts, and configuration, see [docs/installation.m
   <em>The same data in the terminal, refreshed live.</em>
 </p>
 
-## What cctally adds
+See [docs/commands/tui.md](docs/commands/tui.md).
 
-`cctally` started as a local-first replacement for [`ccusage`](https://github.com/ryoppippi/ccusage), and it stays compatible at the level of common CLI flows (`daily`, `monthly`, `weekly`, `session`, `blocks`). Paste from ccusage verbatim: `cctally claude <cmd>` is a drop-in for `ccusage claude <cmd>` (and `cctally codex <cmd>` for `ccusage codex <cmd>`), with the flat forms (`cctally daily`, `cctally codex-daily`, …) kept as aliases. Beyond that, it adds:
+## Shareable reports
 
-- **Live web dashboard.** Nine-panel SSE-driven view at `localhost:8789` (current week, forecast, trend, sessions, weekly, monthly, blocks, daily, recent alerts), with per-panel modals, a mobile layout, threshold alerts, and a settings drawer.
-- **TUI live mode.** The same data inside your terminal (`cctally tui`; requires the optional `rich` package).
-- **$-per-1% weekly trend.** The `report` table reframes weekly cost as cost-per-percent-of-quota, so spending efficiency is visible week over week.
-- **Forecast.** Projects current-week percent and daily $/% budgets against the 100% and 90% ceilings (`cctally forecast`).
-- **Threshold alerts.** Configurable percent crossings with native macOS popups (`cctally alerts`).
-- **5-hour block analytics.** Per-block usage with model and project breakdowns (`cctally five-hour-blocks --breakdown=model`).
-- **Time-window diff.** Compare two windows with model and project decomposition (`cctally diff`).
-- **Project rollup.** Usage by Git project (`cctally project`).
-- **Codex parity.** `cctally codex daily / monthly / session` are drop-ins for `ccusage codex daily / monthly / session`; the flat `codex-*` forms (drop-ins for the standalone `ccusage-codex` binary) remain as aliases, plus an added `cctally codex weekly` / `cctally codex-weekly` rollup (upstream has no `codex weekly`).
-- **Persistent SQLite.** Week-over-week comparisons survive across runs.
+All eight reporting commands (`report`, `daily`, `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`) can render to shareable Markdown, HTML, or SVG with `--format`, a light/dark `--theme`, and `--output` / `--copy` / `--open`. Project names anonymize by default (`--reveal-projects` opts in), so you can post a snapshot without leaking where you work. See [docs/commands/share.md](docs/commands/share.md).
 
-**On speed.** Pricing is embedded and computed at query time from a delta-tail SQLite cache (`~/.local/share/cctally/cache.db`), with no shell-outs. First-table latency on 30 days of session data: **~2.6s (cctally) vs ~31s (ccusage)**, about 12× faster. Measured by `bench/cctally-vs-ccusage.sh` on macOS arm64, 2026-05-05; your numbers will vary.[^bench]
+## Codex parity
+
+If you also use OpenAI's Codex CLI, `cctally codex daily / monthly / session` are drop-ins for `ccusage codex daily / monthly / session`, reading from `~/.codex/sessions/`. The flat `codex-*` forms (drop-ins for the standalone `ccusage-codex` binary) stay as aliases, and `cctally codex weekly` adds a subscription-week rollup that upstream doesn't have. See [docs/commands/codex.md](docs/commands/codex.md).
+
+## Diagnostics & upkeep
+
+`cctally doctor` is a read-only health report - install, hooks, OAuth, database, freshness, pricing, and safety checks - and surfaces in the dashboard as a chip and modal. `cctally pricing-check` flags when the embedded model pricing has gone stale, `cctally db status` / `db recover` manage schema migrations, and `cctally update` keeps the install current. The local SQLite cache (`~/.local/share/cctally/cache.db`) is always safe to delete or rebuild.
+
+## A faster, local-first ccusage
+
+`cctally` started as a local replacement for [`ccusage`](https://github.com/ryoppippi/ccusage) and stays compatible at the level of common flows: `cctally claude <cmd>` is a drop-in for `ccusage claude <cmd>` (and `cctally codex <cmd>` for `ccusage codex <cmd>`), with the flat forms (`cctally daily`, `cctally codex-daily`, …) kept as aliases. Paste your ccusage commands verbatim - then reach for the dashboard, forecast, trend, conversation viewer, and alerts that ccusage doesn't have.
+
+It's also fast. Pricing is embedded and computed at query time from a delta-tail SQLite cache, with no shell-outs. First-table latency on 30 days of session data: **~2.6s (cctally) vs ~31s (ccusage)**, about 12× faster. Measured by `bench/cctally-vs-ccusage.sh` on macOS arm64, 2026-05-05; your numbers will vary.[^bench]
 
 <!--
   Footnote target uses an absolute URL because GitHub's relative-link
   rewriter doesn't traverse into GFM footnote `<li>` content; on the
   repo home page (`/omrikais/cctally`, no trailing slash) the browser
   would resolve `bench/README.md` against the page URL and produce
-  `/omrikais/bench/README.md` — a broken path. Regular paragraph links
+  `/omrikais/bench/README.md` - a broken path. Regular paragraph links
   are unaffected.
 -->
 [^bench]: Methodology and reproduction: [`bench/README.md`](https://github.com/omrikais/cctally/blob/main/bench/README.md).

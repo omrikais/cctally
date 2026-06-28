@@ -370,3 +370,86 @@ def test_config_json_pins_la_display_tz(tmp_path):
     assert cfg.get("display", {}).get("tz") == "America/Los_Angeles", (
         f"display.tz mismatch in {config_path}: {cfg.get('display')}"
     )
+
+
+def test_conversation_messages_seeded(tmp_path):
+    """The conversation-viewer screenshot needs synthetic transcripts: a
+    multi-turn hero session with a subagent (sidechain) thread plus filler
+    sessions, attached to the existing fixture session ids, with the rail
+    rollup populated."""
+    mod = _load_builder()
+    out = _isolated_build(mod, tmp_path)
+    with sqlite3.connect(out / "cache.db") as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages"
+        ).fetchone()[0]
+        sidechains = conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE is_sidechain = 1"
+        ).fetchone()[0]
+        sessions = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM conversation_messages"
+        ).fetchone()[0]
+        rollup = conn.execute(
+            "SELECT COUNT(*) FROM conversation_sessions"
+        ).fetchone()[0]
+        kinds = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT entry_type FROM conversation_messages"
+            )
+        }
+    assert n >= 12, f"expected >=12 conversation rows, got {n}"
+    assert sidechains >= 1, "expected at least one sidechain (subagent) row"
+    assert sessions >= 4, f"expected >=4 conversation sessions, got {sessions}"
+    assert rollup >= 4, f"expected conversation_sessions rollup, got {rollup}"
+    assert {"human", "assistant", "tool_result"} <= kinds, (
+        f"reader needs human/assistant/tool_result turns; got {kinds}"
+    )
+
+
+def test_conversation_models_main_opus_subagent_haiku(tmp_path):
+    """Model-chip story: the main session runs on Opus (current 4.8 — NOT a
+    stale 4.7), the subagent thread on Haiku, and Fable appears as a current
+    first-class model among the conversation chips (exercises the model-chip
+    ranking #243/#244)."""
+    mod = _load_builder()
+    out = _isolated_build(mod, tmp_path)
+    with sqlite3.connect(out / "cache.db") as conn:
+        main_models = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT model FROM conversation_messages "
+                "WHERE is_sidechain = 0 AND model IS NOT NULL"
+            )
+        }
+        sub_models = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT model FROM conversation_messages "
+                "WHERE is_sidechain = 1 AND model IS NOT NULL"
+            )
+        }
+        all_models = main_models | sub_models
+    assert "claude-opus-4-8" in main_models, main_models
+    assert not any("opus-4-7" in m for m in all_models), (
+        f"stale Opus 4.7 must not appear; got {all_models}"
+    )
+    assert any("haiku" in m for m in sub_models), sub_models
+    assert any("fable" in m for m in all_models), all_models
+
+
+def test_walk_models_current_and_include_fable(tmp_path):
+    """The dashboard / report model breakdowns read session_entries: the
+    usage walk must run on the current Opus 4.8 (never a stale 4.7) and
+    include Fable as a minority model so it surfaces in the per-row chips."""
+    mod = _load_builder()
+    out = _isolated_build(mod, tmp_path)
+    with sqlite3.connect(out / "cache.db") as conn:
+        models = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT model FROM session_entries "
+                "WHERE model IS NOT NULL"
+            )
+        }
+    assert "claude-opus-4-8" in models, models
+    assert "claude-fable-5" in models, models
+    assert not any("opus-4-7" in m for m in models), (
+        f"stale Opus 4.7 must not appear in the walk; got {models}"
+    )
