@@ -108,8 +108,13 @@ function envelopeWithFreshness(label: FreshnessLabel): Envelope {
 describe('#247 S1 freshness single-source (C5)', () => {
   it('shows exactly one freshness surface and no "Last snapshot" foot', () => {
     updateSnapshot(envelopeWithFreshness('fresh'));
-    const { container, queryByText } = render(<CurrentWeekPanel />);
-    expect(queryByText(/Last snapshot:/i)).toBeNull();
+    const { container } = render(<CurrentWeekPanel />);
+    // Robust foot check: the foot's text is split across a bare text node and a
+    // <span>, so queryByText's getNodeText misses it — assert on the element
+    // and on the subtree text directly instead (both detect the foot when it
+    // exists, so these stay non-vacuous).
+    expect(container.querySelector('.panel-foot.cw-foot')).toBeNull();
+    expect(container.textContent).not.toMatch(/Last snapshot:/);
     expect(container.querySelectorAll('[data-freshness]').length).toBe(1);
   });
   it('fresh state renders a quiet neutral chip (not hidden)', () => {
