@@ -577,6 +577,15 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 /* #247 S1 — one overflow rule. Long data cards (Sessions) cap their body and
    scroll internally; the header/foot stay pinned. Grid sizing is S2's job. */
 .panel-body--scroll { max-height: 420px; overflow-y: auto; }
+/* When the capped body scrolls the table internally, keep the column labels
+   pinned (same treatment the collapsed Sessions state already gets) so they
+   don't scroll out of view. */
+.panel-body--scroll .sess-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-bg);
+  z-index: 1;
+}
 
 .panel-foot {
   margin-top: auto;
