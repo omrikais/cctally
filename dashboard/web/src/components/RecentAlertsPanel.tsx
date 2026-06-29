@@ -64,10 +64,10 @@ export function RecentAlertsPanel(): JSX.Element {
         style={{ justifyContent: 'space-between' }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-amber)' }}>
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#bell" />
           </svg>
-          <h2 style={{ color: 'var(--accent-amber)' }}>
+          <h2>
             Recent alerts <span className="sub">(last 10)</span>
           </h2>
         </div>

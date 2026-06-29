@@ -526,6 +526,13 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
     radial-gradient(120% 120% at 0% 0%, rgba(255,255,255,0.025) 0%, transparent 60%),
     linear-gradient(180deg, var(--panel-bg) 0%, var(--panel-bg-2) 100%);
   border-radius: var(--radius-md);
+  /* #247 S1 — neutral chrome, accent = signal. The card border/hover/dividers
+     stay neutral; `--panel-accent` carries the per-panel hue ONLY to the
+     surviving accent consumers (the Now/Active pills via `--pill-bg`).
+     Declared above the min-width comment because that comment embeds a literal
+     brace that the cardChromeTokens ruleBody() slice stops at. */
+  --panel-accent: var(--accent-blue);
+  --pill-bg: color-mix(in srgb, var(--panel-accent) 18%, transparent);
   padding: 16px 22px 14px;
   display: flex;
   flex-direction: column;
@@ -536,19 +543,19 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   min-width: 0;
   transition: box-shadow 120ms ease;
 }
-.panel.accent-green  { border-color: var(--accent-green);  --accent-line: rgba(61,220,132,0.28);  --accent-glow: rgba(61,220,132,0.06); }
-.panel.accent-purple { border-color: var(--accent-purple); --accent-line: rgba(192,132,252,0.30); --accent-glow: rgba(192,132,252,0.06); }
-.panel.accent-amber  { border-color: var(--accent-amber);  --accent-line: rgba(251,191,36,0.26);  --accent-glow: rgba(251,191,36,0.06); }
-.panel.accent-orange { border-color: var(--accent-orange); --accent-line: rgba(251,146,60,0.28);  --accent-glow: rgba(251,146,60,0.06); }
-.panel.accent-cyan   { border-color: var(--accent-cyan);   --accent-line: rgba(34,211,238,0.32);  --accent-glow: rgba(34,211,238,0.06); --pill-bg: rgba(34,211,238,0.18); }
-.panel.accent-pink   { border-color: var(--accent-pink);   --accent-line: rgba(236,72,153,0.32);  --accent-glow: rgba(236,72,153,0.06); --pill-bg: rgba(236,72,153,0.18); }
-.panel.accent-blue   { border-color: var(--accent-blue);   --accent-line: rgba(96,165,250,0.30);  --accent-glow: rgba(96,165,250,0.06);  --pill-bg: rgba(96,165,250,0.18); }
-.panel.accent-indigo { border-color: var(--accent-indigo); --accent-line: rgba(129,140,248,0.30); --accent-glow: rgba(129,140,248,0.06); --pill-bg: rgba(129,140,248,0.18); }
-.panel.accent-magenta { border-color: var(--accent-magenta); --accent-line: rgba(217,70,239,0.30); --accent-glow: rgba(217,70,239,0.06); --pill-bg: rgba(217,70,239,0.18); }
-.panel.accent-teal   { border-color: var(--accent-teal);   --accent-line: rgba(45,212,191,0.28);  --accent-glow: rgba(45,212,191,0.06); --pill-bg: rgba(45,212,191,0.18); }
+.panel.accent-green   { --panel-accent: var(--accent-green); }
+.panel.accent-purple  { --panel-accent: var(--accent-purple); }
+.panel.accent-amber   { --panel-accent: var(--accent-amber); }
+.panel.accent-orange  { --panel-accent: var(--accent-orange); }
+.panel.accent-cyan    { --panel-accent: var(--accent-cyan); }
+.panel.accent-pink    { --panel-accent: var(--accent-pink); }
+.panel.accent-blue    { --panel-accent: var(--accent-blue); }
+.panel.accent-indigo  { --panel-accent: var(--accent-indigo); }
+.panel.accent-magenta { --panel-accent: var(--accent-magenta); }
+.panel.accent-teal    { --panel-accent: var(--accent-teal); }
 
 .panel:hover {
-  box-shadow: inset 0 0 28px var(--accent-glow);
+  box-shadow: var(--shadow-md);
   cursor: pointer;
 }
 
@@ -556,9 +563,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   display: flex; align-items: center; gap: 10px;
   padding-bottom: 10px;
   margin-bottom: 14px;
-  border-bottom: 1px solid var(--accent-line);
+  border-bottom: 1px solid var(--border-soft);
 }
-.panel-header .icon { width: 18px; height: 18px; }
+.panel-header .icon { width: 18px; height: 18px; color: var(--text-dim); }
 .panel-header h2 {
   margin: 0; font-size: 15px; font-weight: 700;
   letter-spacing: 0.2px;
@@ -567,11 +574,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .panel-header h2 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
 
 .panel-body { flex: 1 1 auto; }
+/* #247 S1 — one overflow rule. Long data cards (Sessions) cap their body and
+   scroll internally; the header/foot stay pinned. Grid sizing is S2's job. */
+.panel-body--scroll { max-height: 420px; overflow-y: auto; }
 
 .panel-foot {
   margin-top: auto;
   padding-top: 10px;
-  border-top: 1px solid var(--accent-line);
+  border-top: 1px solid var(--border-soft);
   color: var(--text-dim);
   font-size: 13px;
 }
@@ -1665,25 +1675,14 @@ mark.current {
 /* Suppress the default focus outline but keep the panel focusable.
    `:focus-visible` restores a visible ring only for keyboard-driven
    focus, so mouse clicks on the panel don't show an orphan outline.
-   Each accent shares its border color with the ring for visual
-   continuity. */
+   #247 S1 — one neutral ring for every panel (accent = signal, not
+   chrome); the 4px offset keeps it clearly separated from the 1px
+   neutral panel border so keyboard users see a distinct ring. */
 .panel:focus { outline: none; }
 .panel:focus-visible {
-  /* 4px offset keeps the focus ring clearly separated from the 1px
-     panel border (same hue), so keyboard users see a distinct ring
-     instead of a marginally thicker accent. */
+  outline: 2px solid var(--accent-blue);
   outline-offset: 4px;
 }
-.panel.accent-green:focus-visible  { outline: 2px solid var(--accent-green); }
-.panel.accent-purple:focus-visible { outline: 2px solid var(--accent-purple); }
-.panel.accent-amber:focus-visible  { outline: 2px solid var(--accent-amber); }
-.panel.accent-orange:focus-visible { outline: 2px solid var(--accent-orange); }
-.panel.accent-cyan:focus-visible   { outline: 2px solid var(--accent-cyan); }
-.panel.accent-pink:focus-visible   { outline: 2px solid var(--accent-pink); }
-.panel.accent-blue:focus-visible   { outline: 2px solid var(--accent-blue); }
-.panel.accent-indigo:focus-visible { outline: 2px solid var(--accent-indigo); }
-.panel.accent-magenta:focus-visible { outline: 2px solid var(--accent-magenta); }
-.panel.accent-teal:focus-visible   { outline: 2px solid var(--accent-teal); }
 
 /* ----- Sync chip status text (Phase 11) ----- */
 /* SyncChip renders a span; the parent .topbar-sync <button> is the click
@@ -2378,7 +2377,7 @@ mark.current {
   gap: 24px;
   margin-top: 18px;
   padding-top: 14px;
-  border-top: 1px solid var(--accent-line);
+  border-top: 1px solid var(--border-soft);
 }
 .daily-foot-col {
   display: flex; align-items: center; gap: 14px;

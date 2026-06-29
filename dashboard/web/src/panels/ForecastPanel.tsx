@@ -28,10 +28,10 @@ export function ForecastPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-pink)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#crystal-ball" />
         </svg>
-        <h2 style={{ color: 'var(--accent-pink)' }}>Forecast</h2>
+        <h2>Forecast</h2>
         <ShareIcon
           panel="forecast"
           panelLabel="Forecast"

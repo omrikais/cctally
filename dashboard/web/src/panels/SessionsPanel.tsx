@@ -102,10 +102,10 @@ export function SessionsPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-orange)' }}>
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#clock" />
           </svg>
-          <h2 style={{ color: 'var(--accent-orange)' }}>
+          <h2>
             Recent Sessions <span className="sub">({total} total)</span>
           </h2>
         </div>
@@ -140,7 +140,7 @@ export function SessionsPanel() {
         </div>
       </div>
       {isMobile && <SessionsControls />}
-      <div className="panel-body" id="panel-sessions-body">
+      <div className="panel-body panel-body--scroll" id="panel-sessions-body">
         <table className="sess-table">
           <SortableHeader
             columns={columns}

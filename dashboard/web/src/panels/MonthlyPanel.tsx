@@ -78,10 +78,10 @@ export function MonthlyPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-pink)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#calendar" />
         </svg>
-        <h2 style={{ color: 'var(--accent-pink)' }}>
+        <h2>
           Monthly <span className="sub">(model split · 6 months)</span>
         </h2>
         <ShareIcon

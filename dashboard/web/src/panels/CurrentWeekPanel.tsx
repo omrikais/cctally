@@ -71,10 +71,10 @@ export function CurrentWeekPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-green)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#trending-up" />
         </svg>
-        <h2 style={{ color: 'var(--accent-green)' }}>Current Week</h2>
+        <h2>Current Week</h2>
         {showChip && freshness && (
           <span
             className={

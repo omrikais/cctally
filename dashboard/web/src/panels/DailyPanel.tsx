@@ -113,10 +113,10 @@ export function DailyPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-indigo)' }}>
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#grid" />
           </svg>
-          <h2 style={{ color: 'var(--accent-indigo)' }}>
+          <h2>
             Daily <span className="sub">heatmap · 30 days</span>
           </h2>
         </div>

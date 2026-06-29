@@ -74,10 +74,14 @@ describe('<CurrentWeekPanel />', () => {
     expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#clock');
   });
 
-  it('applies accent-green inline color on the h3', () => {
+  // #247 S1 — neutral card chrome: the header no longer pins a decorative
+  // accent color inline; the <h2> inherits the neutral `.panel-header h2`
+  // color so accent is reserved for state/signal (Cache Report, Forecast
+  // verdict). Broadened from the prior `var(--accent-green)` assertion.
+  it('header <h2> carries no inline decorative accent color', () => {
     render(<CurrentWeekPanel />);
-    const h3 = screen.getByText('Current Week');
-    expect((h3 as HTMLElement).style.color).toBe('var(--accent-green)');
+    const h2 = screen.getByText('Current Week');
+    expect((h2 as HTMLElement).style.color).toBe('');
   });
 
   // ---- Freshness chip (spec §3.4 / OAuth /usage UA bypass plan, Task C5) ----

@@ -34,10 +34,10 @@ export function ProjectsPanel() {
   const header = (
     <div className="panel-header" style={{ justifyContent: 'space-between' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-magenta)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#folder" />
         </svg>
-        <h2 style={{ color: 'var(--accent-magenta)' }}>
+        <h2>
           Projects{' '}
           <span className="sub">
             {isUnavailable ? '(unavailable)' : `(${rows.length} this week)`}

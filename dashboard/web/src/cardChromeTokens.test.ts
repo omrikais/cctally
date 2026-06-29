@@ -50,3 +50,30 @@ describe('#247 S1 token scales defined in :root', () => {
     expect(ruleBody('.panel')).toMatch(/border-radius:\s*var\(--radius-md\)/);
   });
 });
+
+describe('#247 S1 neutral panel chrome', () => {
+  it('base .panel defines --panel-accent and derives --pill-bg via color-mix', () => {
+    const body = ruleBody('.panel');
+    expect(body).toMatch(/--panel-accent:\s*var\(--accent-/);
+    expect(body).toMatch(/--pill-bg:\s*color-mix\(in srgb, var\(--panel-accent\)/);
+  });
+  it('no .panel.accent-* rule sets a decorative border-color or --accent-glow', () => {
+    const accentRules = css.match(/\.panel\.accent-[a-z]+\s*\{[^}]*\}/g) ?? [];
+    expect(accentRules.length, 'expected the .panel.accent-* family to exist').toBeGreaterThanOrEqual(10);
+    for (const r of accentRules) {
+      expect(r, `decorative border-color survived: ${r}`).not.toMatch(/border-color:/);
+      expect(r, `--accent-glow survived: ${r}`).not.toMatch(/--accent-glow:/);
+      expect(r).toMatch(/--panel-accent:/);
+    }
+  });
+  it('one neutral .panel:focus-visible ring, and no per-accent focus outlines', () => {
+    expect(ruleBody('.panel:focus-visible')).toMatch(/outline:\s*2px solid var\(--accent-blue\)/);
+    expect(css).not.toMatch(/\.panel\.accent-[a-z]+:focus-visible/);
+  });
+  it('--pill-bg is still resolvable (Now/Active pill consumers intact)', () => {
+    expect(css).toMatch(/background:\s*var\(--pill-bg\)/);
+  });
+  it('.panel-body--scroll overflow contract exists', () => {
+    expect(css).toMatch(/\.panel-body--scroll\s*\{[^}]*overflow-y:\s*auto/);
+  });
+});

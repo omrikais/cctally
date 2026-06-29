@@ -68,10 +68,10 @@ export function TrendPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-amber)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#bar-chart" />
         </svg>
-        <h2 style={{ color: 'var(--accent-amber)' }}>
+        <h2>
           $/1% Trend <span className="sub">(8 weeks)</span>
         </h2>
         <ShareIcon

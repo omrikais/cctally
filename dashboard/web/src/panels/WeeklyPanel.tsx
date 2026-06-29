@@ -80,10 +80,10 @@ export function WeeklyPanel() {
       }}
     >
       <div className="panel-header">
-        <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-cyan)' }}>
+        <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#bar-chart" />
         </svg>
-        <h2 style={{ color: 'var(--accent-cyan)' }}>
+        <h2>
           Weekly <span className="sub">(model split · 8 weeks)</span>
         </h2>
         <ShareIcon

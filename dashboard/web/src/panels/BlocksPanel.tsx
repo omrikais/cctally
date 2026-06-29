@@ -100,10 +100,10 @@ export function BlocksPanel() {
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg className="icon" aria-hidden="true" style={{ color: 'var(--accent-blue)' }}>
+          <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#layers" />
           </svg>
-          <h2 style={{ color: 'var(--accent-blue)' }}>
+          <h2>
             Blocks <span className="sub">(5h · current week)</span>
           </h2>
         </div>
