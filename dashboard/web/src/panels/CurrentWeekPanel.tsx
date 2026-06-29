@@ -52,7 +52,11 @@ export function CurrentWeekPanel() {
   const cw = env?.current_week ?? null;
   const freshness = cw?.freshness ?? null;
   const fhb = cw?.five_hour_block ?? null;
-  const showChip = freshness !== null && freshness.label !== 'fresh';
+  // #247 S1 (C5) — the header chip is the SINGLE freshness surface (the
+  // duplicate "Last snapshot" foot is gone). `fresh` now renders too, as a
+  // quiet neutral chip — calm when healthy, but always present so the reading
+  // never disappears.
+  const showChip = freshness !== null;
 
   return (
     <section
@@ -78,11 +82,16 @@ export function CurrentWeekPanel() {
         {showChip && freshness && (
           <span
             className={
-              freshness.label === 'aging' ? 'chip chip-aging' : 'chip chip-stale'
+              freshness.label === 'fresh'
+                ? 'chip chip-fresh'
+                : freshness.label === 'aging'
+                  ? 'chip chip-aging'
+                  : 'chip chip-stale'
             }
             data-freshness={freshness.label}
             title={`Captured ${freshness.captured_at}`}
           >
+            {freshness.label === 'stale' ? '⚠ ' : ''}
             as of {formatHHMMSS(freshness.captured_at) ?? freshness.captured_at}
             {' · '}
             {freshness.age_seconds}s ago
@@ -207,12 +216,6 @@ export function CurrentWeekPanel() {
             )}
           </div>
         </div>
-      </div>
-      <div className="panel-foot cw-foot">
-        <svg className="icon" aria-hidden="true">
-          <use href="/static/icons.svg#clock" />
-        </svg>
-        Last snapshot: <span>{fmt.agoSec(cw?.last_snapshot_age_sec)}</span>
       </div>
     </section>
   );

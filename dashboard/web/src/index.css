@@ -654,8 +654,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .cw-kv .sub { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
 .cw-kv .sub .magenta { color: var(--accent-magenta); }
 
-.panel-foot.cw-foot { display: flex; align-items: center; gap: 8px; }
-.panel-foot.cw-foot .icon { width: 14px; height: 14px; color: var(--accent-cyan); }
+/* (#247 S1 C5) The Current Week ".panel-foot.cw-foot" "Last snapshot" line was
+   removed — the header freshness chip is now the single freshness surface. */
 
 /* -------- Forecast panel (tight) -------- */
 .warn-banner {
@@ -856,7 +856,17 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
    convention so an unknown model never borrows another family's colour. */
 .chip.other  { background: var(--surface-faint); color: var(--text); }
 /* Freshness chips on the Current Week panel header (spec §3.4).
-   `fresh` renders no chip — these classes only appear for `aging` / `stale`. */
+   #247 S1 (C5): the chip is now the SINGLE freshness surface — `fresh`,
+   `aging`, and `stale` all render (the duplicate "Last snapshot" foot is
+   gone). `fresh` is quiet/neutral, `aging` slate-grey, `stale` amber. */
+/* #247 S1 — fresh is quiet/neutral (calm when healthy), never hidden now that
+   the duplicate "Last snapshot" foot is gone. */
+.chip.chip-fresh {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+  font-weight: 600;
+}
 .chip.chip-aging {
   background: rgba(148, 163, 184, 0.18);
   color: #cbd5e1;
@@ -3355,8 +3365,10 @@ mark.current {
   .panel-header .icon,
   .panel-header .chip { flex-shrink: 0; }
   .panel-header .chip { white-space: nowrap; }
-  /* Current Week freshness chip (renders only when aging/stale) — CSS cap is
-     the default path (CurrentWeekPanel has no isMobile signal to branch on). */
+  /* Current Week freshness chip — CSS cap is the default path (CurrentWeekPanel
+     has no isMobile signal to branch on). #247 S1 (C5): the chip now also
+     renders for `fresh`, so the width cap covers all three states. */
+  .panel-header .chip.chip-fresh,
   .panel-header .chip.chip-aging,
   .panel-header .chip.chip-stale {
     max-width: 50vw;
@@ -4266,6 +4278,32 @@ mark.current {
   }
   .settings-fs input[type="checkbox"],
   .settings-fs input[type="radio"] { width: 18px; height: 18px; }
+
+  /* #247 S1 (D7) — beat the id-selector specificity floor so every mobile form
+     control computes ≥16px (no iOS auto-zoom). #root .class outranks the
+     bare .class rules that set the smaller sizes (.ctrl-input/.settings-* and
+     the Cache Report popover input all set sub-16px today). Placed late in the
+     block so source order also favors it. */
+  #root .ctrl-input,
+  #root .settings-fs input,
+  #root .settings-select,
+  #root .settings-btn,
+  #root .crm-settings-popover input { font-size: 16px; }
+
+  /* #247 S1 (D7) — primary-data 14px floor (var(--fs-data)). Keep no Sessions
+     data text below 14px on phones: the project name + cost (were 13px,
+     inherited from .sess-table) and the started/dur meta cells (were 12px)
+     all reach the floor; color still de-emphasizes the meta row, so the dense
+     two-line card layout is unchanged. The model-chip cell stays chrome (its
+     own pill sizing). #root outranks the bare-class mobile rules. */
+  #root .sess-table tbody td.project,
+  #root .sess-table tbody td.num,
+  #root .sess-table tbody td.started,
+  #root .sess-table td:nth-child(2) { font-size: var(--fs-data); }
+
+  /* #247 S1 (D7) — Trend values reach the 14px floor (were 13px); the thead
+     stays at its label size (don't bump labels). */
+  #root .trend-table tbody td { font-size: var(--fs-data); }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------
@@ -4316,10 +4354,15 @@ mark.current {
  * implied; the mobile @media override must outrank that or it loses. */
 @media (max-width: 640px) {
   /* #214 M3-5: the name was a fixed 90px while the aria-hidden decorative
-     bar hogged 1fr. Give the name the flexible track; shrink the bar. */
+     bar hogged 1fr. Give the name the flexible track; shrink the bar.
+     #247 S1 (D7): bump the row to the 14px primary-data floor (var(--fs-data))
+     — name (flex track, ellipsis), cost, and pct are all primary data. Shrink
+     the decorative (aria-hidden) bar track and widen the cost/pct tracks so the
+     larger numerics never clip; still the same dense 4-column leaderboard. */
   #root .projects-row {
-    grid-template-columns: minmax(0, 1fr) 48px 50px 36px;
+    grid-template-columns: minmax(0, 1fr) 32px 60px 44px;
     padding: 4px;
+    font-size: var(--fs-data);
   }
 }
 

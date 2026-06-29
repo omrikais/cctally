@@ -87,3 +87,20 @@ describe('#247 S1 neutral panel chrome', () => {
     expect(css).toMatch(/\.panel-body--scroll \.sess-table thead th[^}]*position:\s*sticky/);
   });
 });
+
+describe('#247 S1 mobile form-control & data floor', () => {
+  // css is already comment-stripped at module load.
+  const m = css.match(/@media \(max-width:\s*640px\)\s*\{([\s\S]*)$/);
+  const mobile = m ? m[1] : '';
+  it('mobile block re-asserts inputs at id-strength (#root .class … 16px)', () => {
+    expect(mobile).toMatch(/#root \.ctrl-input\b[^}]*font-size:\s*16px/);
+    expect(mobile).toMatch(/#root \.settings-fs input\b[^}]*font-size:\s*16px/);
+  });
+  it('mobile block re-asserts the Settings select and Cache Report popover input', () => {
+    expect(mobile).toMatch(/#root \.settings-(select|btn)\b[^}]*font-size:\s*16px/);
+    expect(mobile).toMatch(/#root \.crm-settings-popover input\b[^}]*font-size:\s*16px/);
+  });
+  it('mobile primary-data floor uses --fs-data (14px)', () => {
+    expect(mobile).toMatch(/var\(--fs-data\)/);
+  });
+});

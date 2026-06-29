@@ -50,7 +50,9 @@ describe('<CurrentWeekPanel />', () => {
     const uses = document.querySelectorAll('#panel-current-week svg use');
     const hrefs = Array.from(uses).map((u) => u.getAttribute('href'));
     expect(hrefs).toContain('/static/icons.svg#trending-up');
-    expect(hrefs).toContain('/static/icons.svg#clock');
+    // #247 S1 (C5): the `#clock` icon lived in the now-removed "Last snapshot"
+    // foot (the header freshness chip is the single freshness surface). With
+    // the canonical fixture's five_hour_block absent, no clock icon renders.
     expect(hrefs).toContain('/static/icons.svg#dollar');
     expect(hrefs).toContain('/static/icons.svg#refresh');
     expect(document.querySelector('.cw-kv .v.cyan')).not.toBeNull();
@@ -65,13 +67,12 @@ describe('<CurrentWeekPanel />', () => {
     expect(scale?.children.length).toBe(3);
   });
 
-  it('renders the cw-foot with a clock icon and Last snapshot label', () => {
+  // #247 S1 (C5): the duplicate ".panel-foot.cw-foot" "Last snapshot" line was
+  // removed — the header freshness chip is now the SINGLE freshness surface.
+  it('no longer renders a "Last snapshot" foot (single freshness surface)', () => {
     render(<CurrentWeekPanel />);
-    const foot = document.querySelector('.panel-foot.cw-foot');
-    expect(foot).not.toBeNull();
-    expect(foot?.textContent).toMatch(/Last snapshot:/);
-    const useEl = foot?.querySelector('svg use');
-    expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#clock');
+    expect(document.querySelector('.panel-foot.cw-foot')).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Last snapshot:/);
   });
 
   // #247 S1 — neutral card chrome: the header no longer pins a decorative
@@ -87,12 +88,18 @@ describe('<CurrentWeekPanel />', () => {
   // ---- Freshness chip (spec §3.4 / OAuth /usage UA bypass plan, Task C5) ----
 
   describe('freshness chip', () => {
-    it('renders no chip when freshness.label === "fresh"', () => {
+    it('renders a quiet "fresh" chip when freshness.label === "fresh"', () => {
+      // #247 S1 (C5): fresh now renders too — a quiet neutral chip — so the
+      // freshness reading is always present as a single header surface (it
+      // used to render nothing, leaving the removed foot as the only signal).
       _resetForTests();
       updateSnapshot(withFreshness('fresh'));
       render(<CurrentWeekPanel />);
-      // No element should carry the data-freshness attribute when fresh.
-      expect(document.querySelector('[data-freshness]')).toBeNull();
+      const chip = document.querySelector('[data-freshness="fresh"]');
+      expect(chip).not.toBeNull();
+      expect(chip?.classList.contains('chip-fresh')).toBe(true);
+      expect(chip?.classList.contains('chip-aging')).toBe(false);
+      expect(chip?.classList.contains('chip-stale')).toBe(false);
     });
 
     it('renders no chip when freshness is null', () => {

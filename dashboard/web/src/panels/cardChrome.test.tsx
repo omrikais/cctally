@@ -18,7 +18,7 @@ import { SessionsPanel } from './SessionsPanel';
 import { ProjectsPanel } from './ProjectsPanel';
 import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
 import { _resetForTests, updateSnapshot } from '../store/store';
-import type { Envelope } from '../types/envelope';
+import type { Envelope, FreshnessLabel } from '../types/envelope';
 
 // Empty-but-valid envelope — the standard sibling-test mock (mirrors
 // TrendPanel.test.tsx / ProjectsPanel.test.tsx). Every de-colored panel
@@ -79,5 +79,51 @@ describe('#247 S1 card-chrome contract', () => {
     const icon = container.querySelector('.panel-header svg.icon');
     expect(icon, 'expected a .panel-header svg.icon').not.toBeNull();
     expect((icon as unknown as SVGElement & { style: CSSStyleDeclaration }).style.color).toBe('');
+  });
+});
+
+// #247 S1 (C5) — the Current Week freshness reading must be a SINGLE surface:
+// one header chip and NO duplicate "Last snapshot" foot line. `fresh` now
+// renders a quiet neutral chip (it used to render nothing, leaving the foot as
+// the only fresh signal); `stale` keeps the ⚠ glyph. A populated current_week
+// fixture exercises the chip path (the base envelope's current_week is null).
+function envelopeWithFreshness(label: FreshnessLabel): Envelope {
+  const env = baseEnvelope();
+  env.current_week = {
+    used_pct: 42,
+    five_hour_pct: null,
+    five_hour_resets_in_sec: null,
+    spent_usd: 12.5,
+    dollar_per_pct: 0.3,
+    reset_at_utc: '2026-05-20T00:00:00Z',
+    reset_in_sec: 100000,
+    last_snapshot_age_sec: 30,
+    milestones: [],
+    freshness: { label, captured_at: '2026-05-13T09:59:30Z', age_seconds: 30 },
+    five_hour_block: null,
+  };
+  return env;
+}
+
+describe('#247 S1 freshness single-source (C5)', () => {
+  it('shows exactly one freshness surface and no "Last snapshot" foot', () => {
+    updateSnapshot(envelopeWithFreshness('fresh'));
+    const { container, queryByText } = render(<CurrentWeekPanel />);
+    expect(queryByText(/Last snapshot:/i)).toBeNull();
+    expect(container.querySelectorAll('[data-freshness]').length).toBe(1);
+  });
+  it('fresh state renders a quiet neutral chip (not hidden)', () => {
+    updateSnapshot(envelopeWithFreshness('fresh'));
+    const { container } = render(<CurrentWeekPanel />);
+    const chip = container.querySelector('[data-freshness="fresh"]');
+    expect(chip, 'fresh now renders a chip').not.toBeNull();
+    expect(chip?.className).toContain('chip-fresh');
+  });
+  it('stale state carries the ⚠ glyph', () => {
+    updateSnapshot(envelopeWithFreshness('stale'));
+    const { container } = render(<CurrentWeekPanel />);
+    const chip = container.querySelector('[data-freshness="stale"]');
+    expect(chip, 'stale renders a chip').not.toBeNull();
+    expect(chip?.textContent).toContain('⚠');
   });
 });
