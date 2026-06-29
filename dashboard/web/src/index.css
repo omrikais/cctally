@@ -110,17 +110,17 @@
   --radius-pill: 999px;  /* fully-round chips/badges */
   --radius-circle: 50%;  /* dots/avatars */
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);   /* subtle lift */
   --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);   /* cards/popovers */
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);  /* modals/overlays */
   --shadow-xl: 0 14px 40px rgba(0, 0, 0, 0.45); /* peak modal */
 
   --fs-data: 14px;     /* primary data + mobile data floor */
-  --fs-strong: 15px;
-  --fs-title: 17px;
-  --fs-kpi: 22px;
-  --fs-hero: 46px;
-  --fs-display: 72px;
+  --fs-strong: 15px;   /* emphasized labels */
+  --fs-title: 17px;    /* panel/modal headings */
+  --fs-kpi: 22px;      /* KPI numbers */
+  --fs-hero: 46px;     /* Current Week hero (foundation; adopted by a later S1 session) */
+  --fs-display: 72px;  /* Current Week display (foundation; adopted by a later S1 session) */
 }
 
 /* Apply to every panel so scroll anchoring lands the title below the
