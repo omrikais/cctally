@@ -109,10 +109,10 @@ describe('#247 S1 freshness single-source (C5)', () => {
   it('shows exactly one freshness surface and no "Last snapshot" foot', () => {
     updateSnapshot(envelopeWithFreshness('fresh'));
     const { container } = render(<CurrentWeekPanel />);
-    // Robust foot check: the foot's text is split across a bare text node and a
-    // <span>, so queryByText's getNodeText misses it — assert on the element
-    // and on the subtree text directly instead (both detect the foot when it
-    // exists, so these stay non-vacuous).
+    // Robust foot check: assert on the `.panel-foot.cw-foot` element and on the
+    // subtree text directly. Both unambiguously detect the foot when it exists
+    // (so they stay non-vacuous) and are strictly stronger than a queryByText
+    // probe of the split "Last snapshot:" label.
     expect(container.querySelector('.panel-foot.cw-foot')).toBeNull();
     expect(container.textContent).not.toMatch(/Last snapshot:/);
     expect(container.querySelectorAll('[data-freshness]').length).toBe(1);

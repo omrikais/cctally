@@ -56,7 +56,6 @@ export function CurrentWeekPanel() {
   // duplicate "Last snapshot" foot is gone). `fresh` now renders too, as a
   // quiet neutral chip — calm when healthy, but always present so the reading
   // never disappears.
-  const showChip = freshness !== null;
 
   return (
     <section
@@ -79,15 +78,9 @@ export function CurrentWeekPanel() {
           <use href="/static/icons.svg#trending-up" />
         </svg>
         <h2>Current Week</h2>
-        {showChip && freshness && (
+        {freshness && (
           <span
-            className={
-              freshness.label === 'fresh'
-                ? 'chip chip-fresh'
-                : freshness.label === 'aging'
-                  ? 'chip chip-aging'
-                  : 'chip chip-stale'
-            }
+            className={`chip chip-${freshness.label}`}
             data-freshness={freshness.label}
             title={`Captured ${freshness.captured_at}`}
           >

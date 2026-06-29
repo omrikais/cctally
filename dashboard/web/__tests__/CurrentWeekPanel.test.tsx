@@ -53,6 +53,7 @@ describe('<CurrentWeekPanel />', () => {
     // #247 S1 (C5): the `#clock` icon lived in the now-removed "Last snapshot"
     // foot (the header freshness chip is the single freshness surface). With
     // the canonical fixture's five_hour_block absent, no clock icon renders.
+    expect(hrefs).not.toContain('/static/icons.svg#clock');
     expect(hrefs).toContain('/static/icons.svg#dollar');
     expect(hrefs).toContain('/static/icons.svg#refresh');
     expect(document.querySelector('.cw-kv .v.cyan')).not.toBeNull();

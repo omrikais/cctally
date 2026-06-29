@@ -858,9 +858,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 /* Freshness chips on the Current Week panel header (spec §3.4).
    #247 S1 (C5): the chip is now the SINGLE freshness surface — `fresh`,
    `aging`, and `stale` all render (the duplicate "Last snapshot" foot is
-   gone). `fresh` is quiet/neutral, `aging` slate-grey, `stale` amber. */
-/* #247 S1 — fresh is quiet/neutral (calm when healthy), never hidden now that
-   the duplicate "Last snapshot" foot is gone. */
+   gone). `fresh` is quiet/neutral (calm when healthy, never hidden),
+   `aging` slate-grey, `stale` amber. */
 .chip.chip-fresh {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-dim);

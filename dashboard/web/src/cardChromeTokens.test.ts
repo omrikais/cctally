@@ -89,7 +89,11 @@ describe('#247 S1 neutral panel chrome', () => {
 });
 
 describe('#247 S1 mobile form-control & data floor', () => {
-  // css is already comment-stripped at module load.
+  // css is already comment-stripped at module load. This regex greedily
+  // captures from the first 640px @media to EOF, so `mobile` also includes any
+  // later non-media CSS — it's a TEXT tripwire, not a precise block extractor
+  // (JSDOM can't evaluate @media; real verification is the ui-qa gate). Don't
+  // upgrade this to a fragile balanced-brace regex.
   const m = css.match(/@media \(max-width:\s*640px\)\s*\{([\s\S]*)$/);
   const mobile = m ? m[1] : '';
   it('mobile block re-asserts inputs at id-strength (#root .class … 16px)', () => {
