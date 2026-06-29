@@ -16,6 +16,7 @@ import { DailyPanel } from './DailyPanel';
 import { BlocksPanel } from './BlocksPanel';
 import { SessionsPanel } from './SessionsPanel';
 import { ProjectsPanel } from './ProjectsPanel';
+import { CacheReportPanel } from './CacheReportPanel';
 import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
 import { _resetForTests, updateSnapshot } from '../store/store';
 import type { Envelope, FreshnessLabel } from '../types/envelope';
@@ -130,5 +131,66 @@ describe('#247 S1 freshness single-source (C5)', () => {
     const chip = container.querySelector('[data-freshness="stale"]');
     expect(chip, 'stale renders a chip').not.toBeNull();
     expect(chip?.textContent).toContain('⚠');
+  });
+});
+
+// #247 S1 (spec acceptance #6) — uniform header affordance grammar across
+// ALL 11 dashboard panels. The S1 facelift gave every panel header the same
+// chrome shape; the two header affordances are NOT decorative — each is
+// present iff the panel has the underlying capability:
+//
+//   • share icon (`.share-icon`, from components/ShareIcon.tsx) is present
+//     IFF the panel id is in the share-capable set (`SharePanelId` in
+//     share/types.ts, mirrored by `SHARE_CAPABLE_PANELS` in
+//     bin/_lib_share_templates.py): current-week, trend, weekly, daily,
+//     monthly, blocks, forecast, sessions, projects (9). NOT alerts/cache-report.
+//   • collapse toggle (`.panel-collapse-toggle`) is present IFF the panel has
+//     a `*Collapsed` pref in store/store.ts: sessions, blocks, daily, alerts (4).
+//
+// The expected booleans below are the ground truth DERIVED from those two
+// sources — if a panel's rendered affordances stop matching this grammar,
+// that is a real spec violation to surface, not a row to edit.
+const AFFORDANCE_GRAMMAR: Array<[string, ComponentType, boolean, boolean]> = [
+  // [panel id, Component, shareable, collapsible]
+  ['current-week', CurrentWeekPanel, true, false],
+  ['trend', TrendPanel, true, false],
+  ['weekly', WeeklyPanel, true, false],
+  ['daily', DailyPanel, true, true],
+  ['monthly', MonthlyPanel, true, false],
+  ['blocks', BlocksPanel, true, true],
+  ['forecast', ForecastPanel, true, false],
+  ['sessions', SessionsPanel, true, true],
+  ['projects', ProjectsPanel, true, false],
+  ['alerts', RecentAlertsPanel, false, true],
+  ['cache-report', CacheReportPanel, false, false],
+];
+
+describe('#247 S1 uniform header affordance grammar (acceptance #6 — 11 panels)', () => {
+  // The base envelope (no cache_report field) renders CacheReportPanel in its
+  // loading branch, which — like every cache-report state — carries neither a
+  // share icon nor a collapse toggle, so [false, false] holds without a
+  // bespoke fixture.
+  it.each(AFFORDANCE_GRAMMAR)(
+    '%s: share icon iff share-capable, collapse toggle iff collapsible',
+    (_panelId, Panel, shareable, collapsible) => {
+      const { container } = render(<Panel />);
+      expect(
+        container.querySelector('.share-icon') !== null,
+        `expected share icon presence === ${shareable}`,
+      ).toBe(shareable);
+      expect(
+        container.querySelector('.panel-collapse-toggle') !== null,
+        `expected collapse toggle presence === ${collapsible}`,
+      ).toBe(collapsible);
+    },
+  );
+
+  // Guards the table itself: exactly 9 share-capable and 4 collapsible panels
+  // (the audit's "share on 9/11, collapse on 4/11"). A drift in either count
+  // means a panel silently gained/lost an affordance.
+  it('covers all 11 panels with 9 share-capable and 4 collapsible', () => {
+    expect(AFFORDANCE_GRAMMAR.length).toBe(11);
+    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(9);
+    expect(AFFORDANCE_GRAMMAR.filter(([, , , c]) => c).length).toBe(4);
   });
 });
