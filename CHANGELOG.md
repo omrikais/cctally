@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Dashboard cards now wear a calm, neutral chrome: borders, hover elevation, header dividers, the keyboard focus ring, and every panel header title read in one consistent neutral treatment instead of eleven competing accent colours, and accent colour is reserved for genuine state — Cache Report's healthy/anomaly header and the Forecast verdict keep their meaningful hues while healthy cards stay quiet; the look is built on a new radius/shadow/type-scale design-token foundation, and Recent Sessions now caps its height and scrolls internally with its column headers pinned (#247).
+
+### Fixed
+- Dashboard on mobile: form controls (the Recent Sessions filter/search, the Settings inputs and dropdowns, and the Cache Report threshold popover) no longer trigger iOS Safari's auto-zoom on focus, and the smallest primary data text in Sessions, Projects, and Trend is raised to a legible 14px floor (#247).
+- Dashboard Current Week card no longer shows the snapshot freshness twice — the duplicate "Last snapshot" footer is gone and a single header freshness chip is now the one source of truth, rendered in a calm neutral tone when fresh and a loud amber ⚠ only when the data is genuinely stale (#247).
+
 ### Documentation
 - README rewritten as a feature-led landing page: a per-capability tour (live dashboard, conversation viewer, cost-per-1% trend, forecast & budget, threshold alerts, 5-hour analytics, live TUI, shareable reports, Codex parity, diagnostics) replaces the prior single bullet list, with a dedicated conversation-viewer showcase and two new screenshots (desktop reader + mobile phone). All marketing screenshots were regenerated against the current model lineup (Opus 4.8 and Fable 5), and the stale "nine-panel" dashboard description is corrected to the actual eleven panels.
 
