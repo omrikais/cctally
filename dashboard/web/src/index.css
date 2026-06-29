@@ -528,9 +528,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   border-radius: var(--radius-md);
   /* #247 S1 — neutral chrome, accent = signal. The card border/hover/dividers
      stay neutral; `--panel-accent` carries the per-panel hue ONLY to the
-     surviving accent consumers (the Now/Active pills via `--pill-bg`).
-     Declared above the min-width comment because that comment embeds a literal
-     brace that the cardChromeTokens ruleBody() slice stops at. */
+     surviving accent consumers (the Now/Active pills via `--pill-bg`). */
   --panel-accent: var(--accent-blue);
   --pill-bg: color-mix(in srgb, var(--panel-accent) 18%, transparent);
   padding: 16px 22px 14px;
@@ -1684,8 +1682,9 @@ mark.current {
 /* Suppress the default focus outline but keep the panel focusable.
    `:focus-visible` restores a visible ring only for keyboard-driven
    focus, so mouse clicks on the panel don't show an orphan outline.
-   #247 S1 — one neutral ring for every panel (accent = signal, not
-   chrome); the 4px offset keeps it clearly separated from the 1px
+   #247 S1 — one consistent focus ring (blue, the shared focus
+   identity) for every panel, replacing the former per-accent
+   outlines; the 4px offset keeps it clearly separated from the 1px
    neutral panel border so keyboard users see a distinct ring. */
 .panel:focus { outline: none; }
 .panel:focus-visible {
@@ -1979,14 +1978,9 @@ mark.current {
   overflow-y: auto;
   overflow-x: auto; /* #208: scroll, don't clip, the wide table (see #panel-sessions rule) */
 }
-/* Sticky table header inside the scrollable body so column labels
-   stay visible while rows scroll. */
-.panel.sessions-collapsed .sess-table thead th {
-  position: sticky;
-  top: 0;
-  background: var(--panel-bg);
-  z-index: 1;
-}
+/* The sticky-thead rule lives on `.panel-body--scroll .sess-table thead th`
+   (above), which the Sessions body carries unconditionally — so it already
+   covers the collapsed state; no Sessions-only duplicate needed here. */
 
 /* -------- Panel collapse-toggle button -------- */
 .panel-collapse-toggle {

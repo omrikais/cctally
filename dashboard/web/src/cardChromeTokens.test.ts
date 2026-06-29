@@ -8,14 +8,19 @@ import { describe, expect, it } from 'vitest';
 // global no-literal ban (that is the deferred exhaustive issue). Non-vacuity:
 // each assertion pins a concrete selector/token so an empty match fails loudly.
 const cssPath = resolve(process.cwd(), 'src/index.css');
-const css = existsSync(cssPath) ? readFileSync(cssPath, 'utf8') : '';
+// Strip block comments once at load so the rule-body slicer never trips on a
+// `}` embedded in a CSS comment (e.g. the `.panel` rule's min-width note). With
+// comments gone, production declaration order is no longer hostage to this test.
+const css = (existsSync(cssPath) ? readFileSync(cssPath, 'utf8') : '').replace(/\/\*[\s\S]*?\*\//g, '');
 
 // Extract the body { ... } of a CSS rule by exact selector. A selector can carry
 // several rules (e.g. the trivial `.panel { scroll-margin-top }` helper plus the
 // substantive `.panel { ... }` chrome rule); return the LONGEST body — the
 // canonical declaration block — so an assertion targets the real rule, not an
-// incidental one-liner. Safe for the selectors used here: their bodies hold no
-// nested braces, so the first-`{`→first-`}` slice per match is exact.
+// incidental one-liner. Block comments are stripped from `css` at module load,
+// so a rule body holds no stray braces (CSS declaration blocks don't nest and
+// comments were the only brace source here), making the first-`{`→first-`}`
+// slice per match exact.
 function ruleBody(selector: string): string {
   let best: string | null = null;
   for (const needle of [selector + ' {', selector + '{']) {
@@ -73,7 +78,12 @@ describe('#247 S1 neutral panel chrome', () => {
   it('--pill-bg is still resolvable (Now/Active pill consumers intact)', () => {
     expect(css).toMatch(/background:\s*var\(--pill-bg\)/);
   });
-  it('.panel-body--scroll overflow contract exists', () => {
-    expect(css).toMatch(/\.panel-body--scroll\s*\{[^}]*overflow-y:\s*auto/);
+  it('.panel-body--scroll caps height and scrolls internally', () => {
+    const body = ruleBody('.panel-body--scroll');
+    expect(body).toMatch(/max-height:\s*420px/);
+    expect(body).toMatch(/overflow-y:\s*auto/);
+  });
+  it('Sessions scrolled body keeps its column headers pinned (sticky thead)', () => {
+    expect(css).toMatch(/\.panel-body--scroll \.sess-table thead th[^}]*position:\s*sticky/);
   });
 });
