@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.58.0] - 2026-06-30
+
 ### Added
 - Embedded pricing for Claude Sonnet 5 (`claude-sonnet-5`) so its sessions are costed correctly instead of falling back to $0 as an unknown model. The rate is the standard $3/$15 per-MTok price (flat across the full 1M-token context window, identical to Claude Sonnet 4.6) — the durable rate that takes effect after Anthropic's introductory $2/$10 pricing ends 2026-08-31 — and the pricing snapshot date is bumped to 2026-07-01. LiteLLM has no Sonnet 5 entry yet, so the table is simply ahead of it (not flagged as drift by `pricing-check`).
 
