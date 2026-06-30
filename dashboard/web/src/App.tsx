@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { Header } from './components/Header';
+import { HeroStrip } from './components/HeroStrip';
 import { Footer } from './components/Footer';
 import { HelpOverlay } from './components/HelpOverlay';
 import { SettingsOverlay } from './components/SettingsOverlay';
@@ -60,6 +61,10 @@ export function App() {
         ) : (
           <>
             {disconnected && <ConnectionBanner kind="stale" />}
+            {/* At-a-glance hero (#248 §1) — dashboard-only, a sibling ABOVE the
+                reorderable grid. Never mounted in the conversations view or the
+                loading/error branches. It scrolls away on desktop. */}
+            <HeroStrip />
             <PanelGridDnd items={panelOrder}>
               <div className={`grid${disconnected ? ' is-stale' : ''}`}>
                 {panelOrder.map((id, index) => (

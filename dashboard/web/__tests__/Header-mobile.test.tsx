@@ -6,9 +6,9 @@ import fixture from './fixtures/envelope.json';
 import type { Envelope } from '../src/types/envelope';
 
 describe('Header — mobile additions', () => {
-  // Seed a snapshot so the value-gated stats render (#207 B1: the
-  // "vs last week" stat hides when its delta is null; the fixture's
-  // delta is non-null, so the stat — and its data-mobile-keep — renders).
+  // #248 — the five dashboard stats (incl. 5h-percent + "vs last week") left
+  // the header for the HeroStrip, so the mobile data-mobile-keep ordering of
+  // those stats is gone too. What remains here is the action-button chrome.
   beforeEach(() => {
     _resetForTests();
     updateSnapshot(fixture as unknown as Envelope);
@@ -40,13 +40,5 @@ describe('Header — mobile additions', () => {
     fireEvent.click(screen.getByRole('button', { name: /open help/i }));
     document.removeEventListener('keydown', listener);
     expect(events).toContain('?');
-  });
-
-  it('marks 5h-percent and "vs last week" stats as data-mobile-keep="secondary"', () => {
-    const { container } = render(<Header />);
-    const fiveHourStat = container.querySelector('[data-mobile-keep="secondary"][data-stat="five-hour"]');
-    const trendStat = container.querySelector('[data-mobile-keep="secondary"][data-stat="vs-last-week"]');
-    expect(fiveHourStat).toBeTruthy();
-    expect(trendStat).toBeTruthy();
   });
 });

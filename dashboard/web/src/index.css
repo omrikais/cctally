@@ -220,6 +220,81 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 }
 .topbar-actions > .topbar-icon-btn { display: none; }
 
+/* -------- At-a-glance hero strip (#248 §1) -------- */
+/* Dashboard-only, full-width hero. Replaces the five header stats + the
+   Current Week grid card: the weekly Used % dominates, flanked by four
+   spelled-out metrics + a freshness chip. Opens the Current Week modal on
+   click/Enter/Space. Tokens only (S1 foundation) — no new tokens. Desktop
+   hero is NOT sticky (it scrolls away). */
+.hero-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-5);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--panel-bg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-4) var(--space-5);
+  margin-bottom: var(--space-4);
+  cursor: pointer;
+}
+.hero-strip:hover { background: var(--panel-bg-2); }
+.hero-strip:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+.hero-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.hero-eyebrow {
+  font-size: var(--fs-eyebrow);
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.hero-eyebrow .hero-week { color: var(--text-faint); letter-spacing: 0.5px; }
+.hero-num {
+  font-size: var(--fs-hero);
+  font-weight: 800;
+  line-height: 1;
+  color: var(--text);
+}
+.hero-sub { font-size: var(--fs-meta); color: var(--text-dim); }
+.hero-sub span { color: var(--text); font-weight: 600; }
+.hero-main .chip { align-self: flex-start; margin-top: var(--space-1); }
+.hero-metrics {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-5);
+  flex-wrap: wrap;
+}
+.hero-metric { display: flex; flex-direction: column; gap: var(--space-1); }
+.hero-metric-label {
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.3px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.hero-metric-val {
+  font-size: var(--fs-kpi);
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+.hero-metric-val .icon { width: 16px; height: 16px; }
+.hero-metric-val.is-good { color: var(--accent-green); }
+.hero-metric-val.is-warn { color: var(--accent-amber); }
+.hero-metric-val.is-over { color: var(--accent-red); }
+
 /* -------- Grid of panels -------- */
 .grid {
   display: grid;

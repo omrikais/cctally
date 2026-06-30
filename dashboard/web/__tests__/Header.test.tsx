@@ -5,58 +5,36 @@ import { updateSnapshot, _resetForTests } from '../src/store/store';
 import fixture from './fixtures/envelope.json';
 import type { Envelope } from '../src/types/envelope';
 
-describe('<Header />', () => {
+describe('<Header /> (slimmed to chrome — #248)', () => {
   beforeEach(() => {
     _resetForTests();
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders the calendar icon + Week stat', () => {
+  it('renders the cctally brand', () => {
     render(<Header />);
-    expect(screen.getByText('Week')).toBeInTheDocument();
-    // The calendar icon is an <svg><use href="...#calendar"/></svg>
-    const uses = document.querySelectorAll('svg use');
-    const hrefs = Array.from(uses).map((u) => u.getAttribute('href'));
-    expect(hrefs).toContain('/static/icons.svg#calendar');
+    expect(screen.getByText('cctally')).toBeInTheDocument();
   });
 
-  it('renders Used pct1 with hi-green class and 5h sub', () => {
+  it('no longer renders the five dashboard stat blocks (moved to HeroStrip)', () => {
     render(<Header />);
-    expect(screen.getByText('Used')).toBeInTheDocument();
-    // Fixture used_pct=17.4 → "17.4%"
-    const used = screen.getByText('17.4%');
-    expect(used.classList.contains('hi-green')).toBe(true);
-    // 5h subtext — fmt.pct0 renders "42%"
-    expect(screen.getByText(/\(5h/)).toBeInTheDocument();
-    expect(screen.getByText('42%')).toBeInTheDocument();
-  });
-
-  it('renders $/1% usd2 with hi-cyan class', () => {
-    render(<Header />);
-    expect(screen.getByText('$/1%')).toBeInTheDocument();
-    const dpp = screen.getByText('$1.23');
-    expect(dpp.classList.contains('hi-cyan')).toBe(true);
-  });
-
-  it('renders Fcst pct0 with hi-amber class; no warn pill when verdict ok', () => {
-    render(<Header />);
-    expect(screen.getByText('Fcst')).toBeInTheDocument();
-    // Fixture forecast_pct=68.5 → pct0 "69%"
-    const fc = screen.getByText('69%');
-    expect(fc.classList.contains('hi-amber')).toBe(true);
-    // verdict is "ok" in the fixture so no WARN pill
+    // The Week / Used / $/1% / Forecast / vs-last-week stats left the header
+    // for the at-a-glance hero.
+    for (const stat of ['week', 'used', 'dollar-per-pct', 'forecast', 'vs-last-week']) {
+      expect(document.querySelector(`[data-stat="${stat}"]`)).toBeNull();
+    }
+    // And their labels are gone from the chrome bar.
+    expect(screen.queryByText('Week')).toBeNull();
+    expect(screen.queryByText('Used')).toBeNull();
+    expect(screen.queryByText('$/1%')).toBeNull();
+    expect(screen.queryByText('Fcst')).toBeNull();
     expect(document.querySelector('.pill-warn')).toBeNull();
   });
 
-  it('renders the signed vs-last-week delta (#207 B1): fixture delta -0.05 → trending-down + "$0.05 vs last week"', () => {
+  it('keeps the settings + help action buttons', () => {
     render(<Header />);
-    // Fixture header.vs_last_week_delta = -0.05 (cheaper this week) →
-    // direction "down", green, magnitude "$0.05 vs last week".
-    expect(screen.getByText('$0.05 vs last week')).toBeInTheDocument();
-    const stat = document.querySelector('[data-stat="vs-last-week"]') as HTMLElement | null;
-    expect(stat).not.toBeNull();
-    expect(stat?.getAttribute('aria-label')?.toLowerCase()).toContain('down');
-    expect(stat?.querySelector('use')?.getAttribute('href')).toBe('/static/icons.svg#trending-down');
+    expect(document.querySelector('.topbar-settings')).not.toBeNull();
+    expect(document.querySelector('.topbar-help')).not.toBeNull();
   });
 
   it('renders a sync-chip span inside a topbar-sync button wrapper', () => {
