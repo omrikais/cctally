@@ -43,7 +43,7 @@ export function Header() {
   const cw = env?.current_week ?? null;
   const showCondensed = view === 'dashboard' && heroScrolled;
   return (
-    <header className="topbar">
+    <header className={`topbar${showCondensed ? ' is-scrolled' : ''}`}>
       {/* Heading outline root (A3) — visually hidden so the topbar design
           is untouched, but it anchors the page's h1 → h2 (panel) outline. */}
       <h1 className="sr-only">cctally dashboard</h1>

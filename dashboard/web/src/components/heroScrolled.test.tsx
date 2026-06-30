@@ -61,19 +61,24 @@ describe('#248 Task 7 — SET_HERO_SCROLLED store flag', () => {
 });
 
 describe('#248 Task 7 — Header condensed readout gating', () => {
-  it('hidden by default (heroScrolled=false)', () => {
-    const { queryByTestId } = render(<Header />);
+  it('hidden by default (heroScrolled=false), and no is-scrolled class', () => {
+    const { queryByTestId, container } = render(<Header />);
     expect(queryByTestId('topbar-condensed')).toBeNull();
+    // No collapse hook at the top → the mobile @media rule keeps the bar wrapped.
+    expect(container.querySelector('header.topbar.is-scrolled')).toBeNull();
   });
 
-  it('shows the condensed Used%/reset only when view===dashboard && heroScrolled', () => {
-    const { queryByTestId } = render(<Header />);
+  it('shows the condensed Used%/reset + adds is-scrolled only when view===dashboard && heroScrolled', () => {
+    const { queryByTestId, container } = render(<Header />);
     act(() => { dispatch({ type: 'SET_HERO_SCROLLED', scrolled: true }); });
     const node = queryByTestId('topbar-condensed');
     expect(node).not.toBeNull();
     expect(node?.textContent).toContain('11.0%');
     expect(node?.textContent).toContain('resets');
     expect(node?.textContent).toContain('2d 7h'); // ddhh(200000)
+    // The header gains `is-scrolled` so the mobile @media collapse (hide
+    // ViewSwitcher/Doctor/basket → fit the condensed readout valve) can fire.
+    expect(container.querySelector('header.topbar.is-scrolled')).not.toBeNull();
   });
 
   it('hidden in the conversations view even when heroScrolled', () => {

@@ -48,7 +48,10 @@ export function HeroStrip() {
         if (!entry) return;
         dispatch({ type: 'SET_HERO_SCROLLED', scrolled: !entry.isIntersecting });
       },
-      { threshold: 0 },
+      // Negative top rootMargin = the hero is "gone" the moment it slips behind
+      // the ≤64px sticky bar, not only when it fully clears the viewport top —
+      // so the condensed readout reveals in lockstep with the hero hiding.
+      { threshold: 0, rootMargin: '-64px 0px 0px 0px' },
     );
     io.observe(el);
     return () => {
