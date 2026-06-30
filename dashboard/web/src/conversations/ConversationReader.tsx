@@ -1062,6 +1062,14 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
         isLayoutStable({ ...a, anchorTop: 0 }, { ...b, anchorTop: 0 }, 1);
       let prev = snap(); let frames = 0;
       const tick = () => {
+        // #256 — bail the instant the jump is cancelled (unmount) or superseded
+        // by a newer jump. Without this the loop keeps rescheduling after the
+        // reader unmounts; under the test rAF-via-setTimeout shim a leaked frame
+        // calls CSS.escape() in snap() after the jsdom globals are torn down,
+        // throwing "CSS is not defined" and flaking the full parallel run. Every
+        // `await waitForQuiesce(...)` is followed by an `if (aborted()) return`,
+        // so resolving early here is a no-op for the (already-bailing) caller.
+        if (aborted()) { resolve(); return; }
         const cur = snap();
         const mounted = cur.anchorTop != null && prev.anchorTop != null;
         const settled = mounted ? isLayoutStable(prev, cur, 1) : structuralStable(prev, cur);

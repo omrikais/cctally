@@ -1638,6 +1638,60 @@ describe('ConversationReader keyboard navigation (G3)', () => {
   });
 });
 
+describe('ConversationReader jump async-teardown isolation (#256)', () => {
+  it("a cancelled jump's quiesce rAF loop stops firing after unmount — no leaked frames hit jsdom", async () => {
+    // Regression for #256. waitForQuiesce()'s rAF `tick` loop reschedules itself
+    // until the layout settles (or 30 frames). Before the fix it never consulted
+    // the jump's abort flag, so after the reader unmounts the loop kept firing
+    // via the setup.ts setTimeout/rAF shim and called CSS.escape() inside snap()
+    // — which throws "CSS is not defined" once vitest tears the jsdom globals
+    // down between files. That unhandled error fails the full parallel run and
+    // flakes the sibling "does not fire on the dashboard view" test (the symptom
+    // reported in #256). Fake rAF so the loop can be stepped frame-by-frame,
+    // drive a jump so the loop is mid-flight, then unmount and assert it makes
+    // ZERO further CSS.escape calls. CSS.escape is the jsdom-touching call that
+    // throws post-teardown, so "no CSS.escape after unmount" == "no leaked frame".
+    vi.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame'],
+    });
+    try {
+      const escSpy = vi.spyOn(CSS, 'escape');
+      mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'h2' })]));
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'h2' } });
+      const { container, unmount } = render(<ConversationReader sessionId="s" />);
+
+      // Step the pipeline a frame at a time. As soon as the scroll body mounts,
+      // pin a drifting scrollHeight so the quiesce loop never settles — it runs
+      // to its 30-frame bound, guaranteeing it is still mid-flight at unmount
+      // (the post-unmount assertion would be vacuous if the loop had settled).
+      let drift = 1000;
+      let driftPinned = false;
+      for (let i = 0; i < 120 && escSpy.mock.calls.length < 6; i++) {
+        if (!driftPinned) {
+          const body = container.querySelector('.conv-reader-body');
+          if (body) {
+            Object.defineProperty(body, 'scrollHeight', { configurable: true, get: () => (drift += 13) });
+            driftPinned = true;
+          }
+        }
+        await act(async () => { await vi.advanceTimersByTimeAsync(16); });
+      }
+      expect(driftPinned).toBe(true);
+      expect(escSpy.mock.calls.length).toBeGreaterThanOrEqual(6); // loop is actively running
+
+      unmount();
+      const frozenAt = escSpy.mock.calls.length;
+      // Advance far past the 30-frame bound. A leaked (un-aborted) loop keeps
+      // calling CSS.escape; an abort-aware one stops the instant the jump is
+      // cancelled on unmount.
+      for (let i = 0; i < 40; i++) await act(async () => { await vi.advanceTimersByTimeAsync(16); });
+      expect(escSpy.mock.calls.length).toBe(frozenAt);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // #205 S1 / #228 S3 F1 — the ☰ outline toggle is viewport-aware, now keyed on
 // the WIDE breakpoint (≥1101px), not mobile (≤640px): the persistent COLUMN
 // pref (convOutlineOpen) flips only when WIDE; the ephemeral SHEET flag
