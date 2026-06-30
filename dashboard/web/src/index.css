@@ -625,7 +625,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   display: flex;
   flex-direction: column;
   min-height: 320px;
-  /* Pair with `.grid { grid-template-columns: minmax(0, 1fr) ... }`:
+  /* Pair with the `.tile-strip` / `.wide-strip` grid tracks (minmax(0,1fr)):
      without min-width:0 the panel inherits its content's min-content
      and inflates the grid column past its allotted width. */
   min-width: 0;
@@ -2695,7 +2695,7 @@ mark.current {
 /* -------- Card reordering -------- */
 
 /* PanelHost is a wrapper around each .panel; it must NOT introduce extra
-   spacing because the .grid `gap` already controls layout. dnd-kit's
+   spacing because the .tile-strip / .wide-strip `gap` already controls layout. dnd-kit's
    useSortable manages the inline transform/transition for both the dragged
    card (follows the pointer) and the siblings (FLIP-animate to new slots). */
 .panel-host {
@@ -3453,6 +3453,12 @@ mark.current {
      The base .panel{min-height:320px} precedes this block, so this same-
      specificity rule wins by source order — no #root prefix needed. */
   .panel { min-height: 0; }
+  /* #248: the desktop `.tile-strip .panel { min-height: 150px }` (0,2,0)
+     out-specifies the `.panel` rule above (0,1,0), so phones would keep the
+     150px floor and reintroduce dead-space. Re-assert at equal (0,2,0)
+     specificity, later in source, so mobile tiles size to content (1-up
+     stacked needs no uniform height). */
+  .tile-strip .panel { min-height: 0; }
 
   /* #214 M3-2: keep panel headers on one line at phone width.
      Font-shrink does the real work; the ellipsis guard + the nested

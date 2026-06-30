@@ -33,9 +33,13 @@ export function HeroStrip() {
   return (
     <section
       className="hero-strip"
-      role="button"
+      // House pattern (matches all grid panels): a focusable region, NOT
+      // role="button" — a button's accessible name would flatten the KPIs out
+      // of the AT browse tree, defeating the at-a-glance read for SR users. The
+      // region stays keyboard-activatable (Enter/Space) to open the modal.
+      role="region"
       tabIndex={0}
-      aria-label="Open Current Week detail"
+      aria-label="Week usage summary"
       data-hero-strip=""
       onClick={openCurrentWeek}
       onKeyDown={(e) => {

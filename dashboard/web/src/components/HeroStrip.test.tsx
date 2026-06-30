@@ -89,6 +89,26 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip?.className).toContain('chip-fresh');
   });
 
+  it('prefixes the ⚠ glyph on a STALE freshness chip (ported C5 coverage)', () => {
+    const env = heroEnvelope();
+    env.current_week!.freshness = {
+      label: 'stale', captured_at: '2026-06-30T09:00:00Z', age_seconds: 3600,
+    };
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const chip = container.querySelector('[data-freshness="stale"]');
+    expect(chip).not.toBeNull();
+    expect(chip?.className).toContain('chip-stale');
+    expect(chip?.textContent).toContain('⚠');
+  });
+
+  it('tints the Forecast metric value by verdict (ok → is-good)', () => {
+    const { container } = render(<HeroStrip />);
+    const val = container.querySelector('[data-metric="forecast"] .hero-metric-val');
+    expect(val?.className).toContain('is-good');
+  });
+
   it('opens the Current Week modal on click', () => {
     const { container } = render(<HeroStrip />);
     const hero = container.querySelector('.hero-strip') as HTMLElement;
