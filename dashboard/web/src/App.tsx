@@ -18,6 +18,7 @@ import { useConnectionStatus } from './hooks/useConnectionStatus';
 import { deriveAppState } from './lib/appState';
 import { ConnectionBanner } from './components/ConnectionBanner';
 import { SkeletonGrid } from './components/SkeletonGrid';
+import { CARD_TIER } from './lib/panelIds';
 
 export function App() {
   // Stable items array for the sortable grid. dnd-kit's rectSortingStrategy
@@ -55,7 +56,7 @@ export function App() {
         {view === 'conversations' ? (
           <ConversationsView />
         ) : appState === 'loading' ? (
-          <SkeletonGrid count={panelOrder.length} />
+          <SkeletonGrid />
         ) : appState === 'error' ? (
           <ConnectionBanner kind="error" />
         ) : (
@@ -65,13 +66,32 @@ export function App() {
                 reorderable grid. Never mounted in the conversations view or the
                 loading/error branches. It scrolls away on desktop. */}
             <HeroStrip />
-            <PanelGridDnd items={panelOrder}>
-              <div className={`grid${disconnected ? ' is-stale' : ''}`}>
-                {panelOrder.map((id, index) => (
-                  <PanelHost key={id} id={id} index={index} />
-                ))}
-              </div>
-            </PanelGridDnd>
+            {(() => {
+              // Two-tier grid (#248 §2). Partition the single prefs.panelOrder
+              // into a TILE slice (uniform compact summary cards) and a WIDE
+              // slice (full-width content-height data cards), preserving each
+              // tier's relative order. Two PanelGridDnd instances ⇒ two dnd
+              // contexts ⇒ a pointer drag can't cross tiers; each PanelHost is
+              // handed its GLOBAL panelOrder index so REORDER/SWAP stay correct.
+              // The stale-dim class lives on the .dash-grid wrapper now.
+              const tiles = panelOrder.filter((id) => CARD_TIER[id] === 'tile');
+              const wides = panelOrder.filter((id) => CARD_TIER[id] === 'wide');
+              const globalIndex = new Map(panelOrder.map((id, i) => [id, i]));
+              return (
+                <div className={`dash-grid${disconnected ? ' is-stale' : ''}`}>
+                  <PanelGridDnd items={tiles} className="tile-strip">
+                    {tiles.map((id) => (
+                      <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
+                    ))}
+                  </PanelGridDnd>
+                  <PanelGridDnd items={wides} className="wide-strip">
+                    {wides.map((id) => (
+                      <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
+                    ))}
+                  </PanelGridDnd>
+                </div>
+              );
+            })()}
           </>
         )}
       </main>

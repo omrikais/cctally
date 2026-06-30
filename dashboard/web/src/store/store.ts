@@ -13,7 +13,7 @@ import {
   ctxFromEnvelope,
   sessionComparator,
 } from './selectors';
-import { DEFAULT_PANEL_ORDER, type GridPanelId } from '../lib/panelIds';
+import { DEFAULT_PANEL_ORDER, CARD_TIER, type GridPanelId } from '../lib/panelIds';
 import {
   applyPanelOrderMigration,
   CURRENT_PANEL_ORDER_SCHEMA_VERSION,
@@ -1387,11 +1387,22 @@ export function dispatch(action: Action): void {
       break;
     }
     case 'SWAP_PANELS': {
+      // #248 — tier-aware keyboard reorder. Shift+Arrow (PanelHost) dispatches
+      // this with the card's GLOBAL panelOrder index; the swap target is the
+      // previous/next id sharing the dragged card's CARD_TIER, skipping any
+      // intervening other-tier ids. This keeps the two-strip grid coherent: a
+      // keyboard reorder can never cross tiers (matching the pointer path,
+      // where each tier is its own dnd context). Empty/one-item tiers and the
+      // tier boundaries are no-ops.
       const { index, direction } = action;
       const order = state.prefs.panelOrder;
-      const target = index + direction;
-      if (target < 0 || target >= order.length) break;
       if (index < 0 || index >= order.length) break;
+      const tier = CARD_TIER[order[index]];
+      let target = index + direction;
+      while (target >= 0 && target < order.length && CARD_TIER[order[target]] !== tier) {
+        target += direction;
+      }
+      if (target < 0 || target >= order.length) break;
       const next = order.slice();
       [next[index], next[target]] = [next[target], next[index]];
       const prefs = { ...state.prefs, panelOrder: next };

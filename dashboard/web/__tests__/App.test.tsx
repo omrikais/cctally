@@ -20,27 +20,37 @@ describe('<App />', () => {
     vi.unstubAllGlobals();
   });
 
-  it('renders all panels in default order', () => {
-    render(<App />);
-    const hosts = Array.from(document.querySelectorAll('[data-panel-host]')) as HTMLElement[];
-    expect(hosts.map((h) => h.dataset.panelHost)).toEqual(DEFAULT_PANEL_ORDER);
+  // #248 — the grid is partitioned into a TILE strip + a WIDE strip (two dnd
+  // contexts). DOM order is tiles-then-wides; within each strip the relative
+  // order follows prefs.panelOrder.
+  function hostsIn(container: HTMLElement, sel: string): (string | undefined)[] {
+    return Array.from(container.querySelectorAll(`${sel} [data-panel-host]`))
+      .map((h) => (h as HTMLElement).dataset.panelHost);
+  }
+
+  it('renders the default order partitioned into tile + wide strips', () => {
+    const { container } = render(<App />);
+    expect(hostsIn(container, '.tile-strip'))
+      .toEqual(['forecast', 'weekly', 'monthly', 'blocks', 'alerts']);
+    expect(hostsIn(container, '.wide-strip'))
+      .toEqual(['trend', 'sessions', 'projects', 'daily', 'cache-report']);
+    // The two slices together cover the full default order exactly once.
+    const all = Array.from(document.querySelectorAll('[data-panel-host]'))
+      .map((h) => (h as HTMLElement).dataset.panelHost);
+    expect([...all].sort()).toEqual([...DEFAULT_PANEL_ORDER].sort());
   });
 
-  it('re-renders panels in the new order after REORDER_PANELS', () => {
-    render(<App />);
+  it('a within-tier REORDER reflects in that strip and leaves the other tier intact', () => {
+    const { container } = render(<App />);
     act(() => {
-      dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
+      // Move forecast (panelOrder index 0, a tile) to weekly's slot (index 4):
+      // within the tile strip it now sits AFTER weekly.
+      dispatch({ type: 'REORDER_PANELS', from: 0, to: 4 });
     });
-    const hosts = Array.from(document.querySelectorAll('[data-panel-host]')) as HTMLElement[];
-    const order = hosts.map((h) => h.dataset.panelHost);
-    // Default 10-panel grid order (#248 removed 'current-week' — it is the
-    // HeroStrip now): 'forecast' moves from index 0 to index 3 via splice
-    // (remove index 0, insert at index 3 of the remaining 9-list). Assert the
-    // entire array to catch off-by-one or direction regressions.
-    expect(order).toEqual([
-      'trend', 'sessions', 'projects', 'forecast',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-      'cache-report',
-    ]);
+    expect(hostsIn(container, '.tile-strip'))
+      .toEqual(['weekly', 'forecast', 'monthly', 'blocks', 'alerts']);
+    // The wide strip's relative order is preserved.
+    expect(hostsIn(container, '.wide-strip'))
+      .toEqual(['trend', 'sessions', 'projects', 'daily', 'cache-report']);
   });
 });

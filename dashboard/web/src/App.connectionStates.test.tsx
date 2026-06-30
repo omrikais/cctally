@@ -33,7 +33,8 @@ describe('App connection states (B2/B3)', () => {
     updateSnapshot(ENV);
     const { container } = render(<App />);
     expect(container.querySelector('.stale-banner-stale')).not.toBeNull();
-    expect(container.querySelector('.grid.is-stale')).not.toBeNull();
+    // #248 — the stale-dim class moved from `.grid` to the `.dash-grid` wrapper.
+    expect(container.querySelector('.dash-grid.is-stale')).not.toBeNull();
     expect(container.querySelector('.panel.is-skeleton')).toBeNull();
   });
 
@@ -42,6 +43,7 @@ describe('App connection states (B2/B3)', () => {
     updateSnapshot(ENV);
     const { container } = render(<App />);
     expect(container.querySelector('.stale-banner')).toBeNull();
-    expect(container.querySelector('.grid.is-stale')).toBeNull();
+    expect(container.querySelector('.dash-grid')).not.toBeNull();
+    expect(container.querySelector('.dash-grid.is-stale')).toBeNull();
   });
 });

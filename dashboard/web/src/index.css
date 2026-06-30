@@ -295,23 +295,37 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .hero-metric-val.is-warn { color: var(--accent-amber); }
 .hero-metric-val.is-over { color: var(--accent-red); }
 
-/* -------- Grid of panels -------- */
-.grid {
-  display: grid;
-  /* minmax(0, 1fr) instead of plain 1fr: a child's min-content (e.g. a
-     wide, non-wrapping label) otherwise inflates one column on resize,
-     leaving the other narrower than half. */
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-rows: auto auto auto auto; /* fourth row added for Blocks/Daily */
-  gap: 16px;
-  margin-bottom: 16px;
+/* -------- Two-tier grid of panels (#248 §2) -------- */
+/* The flat forced 2-column `.grid` is replaced by a two-tier model: a packed
+   strip of uniform compact summary TILES (auto-fit) above a stacked strip of
+   full-width content-height WIDE data cards. App partitions prefs.panelOrder by
+   CARD_TIER and renders the two strips inside one `.dash-grid` wrapper (which
+   also carries the stale-dim class). This kills the old grid's dead space: the
+   tile strip packs ~5-up wide / 3-4-up at ~1024-1280 / 1-up mobile with equal
+   heights (no padding voids), and wide cards get the full width (no pairing
+   gaps). The old `@media (max-width:1100px)` single-column cliff is gone —
+   auto-fit reflows continuously. body keeps its max-width:1600px cap. */
+.dash-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
-@media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
-/* C2 (#207): the grid stays 2-col for all widths >=1100px. A 3-col rule
-   for wide displays was tried but QA showed it shrinks panels below the
-   Sessions table's intrinsic width (clipping the Cost column), so the
-   body max-width:1600px cap above (centering the shell) is what prevents
-   the "sparse, left-hugging panels" finding instead. */
+.tile-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+}
+.wide-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+}
+/* Grid cards content-size (#248): drop the global .panel 320px floor for grid
+   cards, then give tiles a modest uniform floor. Tiles in one auto-fit row
+   stretch to the tallest (grid align-items:stretch), so the row stays even. */
+.dash-grid .panel { min-height: 0; }
+.tile-strip .panel { min-height: 150px; }
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
 /* Brand cluster: "cctally vX.Y.Z [↑ vA.B.C]" sits at the start of the
@@ -773,7 +787,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 /* Stale dim — a static .55 opacity over the whole grid signals "not live"
    across all panels at once (cheaper than per-panel chips, covers all). No
    transition, so prefers-reduced-motion is moot. */
-.grid.is-stale { opacity: 0.55; }
+.dash-grid.is-stale { opacity: 0.55; }
 
 /* Cold-start skeleton cards (B3). Static muted fills by default; the shimmer
    animation is gated on prefers-reduced-motion: no-preference. */
@@ -797,6 +811,23 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   @keyframes skel-shimmer {
     0% { background-position: 100% 0; }
     100% { background-position: 0 0; }
+  }
+}
+/* #248 — cold-start hero-strip placeholder (echoes the at-a-glance hero). */
+.skel-hero {
+  height: 96px;
+  border-radius: var(--radius-md);
+  background: var(--surface-faint);
+  margin-bottom: var(--space-4);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skel-hero {
+    background: linear-gradient(90deg,
+      var(--surface-faint) 25%,
+      rgba(255, 255, 255, 0.12) 37%,
+      var(--surface-faint) 63%);
+    background-size: 400% 100%;
+    animation: skel-shimmer 1.4s ease-in-out infinite;
   }
 }
 .fc-row {

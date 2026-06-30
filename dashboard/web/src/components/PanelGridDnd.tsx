@@ -50,9 +50,15 @@ export function handleDragCancelAction(): void {
 
 export function PanelGridDnd({
   items,
+  className,
   children,
 }: {
   items: GridPanelId[];
+  // #248 — one strip per instance: App renders TWO PanelGridDnd (a tile strip +
+  // a wide strip), each its own DndContext+SortableContext so a pointer drag
+  // physically cannot cross tiers. `className` is the strip layout class
+  // (`tile-strip` / `wide-strip`).
+  className?: string;
   children: ReactNode;
 }) {
   // delay/tolerance combine to give a long-press feel: a quick click never
@@ -89,7 +95,7 @@ export function PanelGridDnd({
       onDragCancel={() => handleDragCancelAction()}
     >
       <SortableContext items={ids} strategy={rectSortingStrategy}>
-        {children}
+        <div className={className}>{children}</div>
       </SortableContext>
     </DndContext>
   );

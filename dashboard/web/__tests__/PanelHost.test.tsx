@@ -43,7 +43,7 @@ describe('<PanelHost />', () => {
     expect(host.dataset.panelIndex).toBe('3');
   });
 
-  it('Shift+ArrowDown swaps the panel with its successor', async () => {
+  it('Shift+ArrowDown swaps the panel with its next same-tier card (tier-aware)', async () => {
     const user = userEvent.setup();
     renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
     // The wrapper carries the onKeyDown handler; focus the inner panel — the
@@ -51,7 +51,11 @@ describe('<PanelHost />', () => {
     const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     inner.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
-    expect(getState().prefs.panelOrder[1]).toBe('forecast');
+    // #248 — forecast (index 0, a tile) swaps with the NEXT TILE (weekly at
+    // index 4), skipping the intervening wide cards. So forecast lands at
+    // index 4 and weekly at index 0.
+    expect(getState().prefs.panelOrder[4]).toBe('forecast');
+    expect(getState().prefs.panelOrder[0]).toBe('weekly');
   });
 
   it('a quick click on the inner panel still opens its modal', async () => {

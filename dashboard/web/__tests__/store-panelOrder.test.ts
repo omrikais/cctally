@@ -113,20 +113,43 @@ describe('REORDER_PANELS action', () => {
   });
 });
 
-describe('SWAP_PANELS action (immediate-neighbor; tier-awareness lands in Task 3)', () => {
-  // Default grid order (#248): forecast, trend, sessions, projects, weekly, …
-  it('swaps with next neighbor (direction=+1)', () => {
+describe('SWAP_PANELS action (tier-aware — #248)', () => {
+  // Default grid order + tiers:
+  //   0 forecast(tile) 1 trend(wide) 2 sessions(wide) 3 projects(wide)
+  //   4 weekly(tile)   5 monthly(tile) 6 blocks(tile)  7 daily(wide)
+  //   8 alerts(tile)   9 cache-report(wide)
+  // Shift+Arrow keeps dispatching SWAP_PANELS{index, direction}; the reducer
+  // moves the card to the previous/next id sharing its CARD_TIER (skipping the
+  // other tier), so a keyboard reorder can never cross tiers.
+  const WIDES = ['trend', 'sessions', 'projects', 'daily', 'cache-report'];
+
+  it('a tile swaps with the next TILE, skipping wides (forecast → weekly)', () => {
     dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
     const order = getState().prefs.panelOrder;
-    expect(order[0]).toBe('trend');
-    expect(order[1]).toBe('forecast');
+    // forecast (index 0, tile) swaps with weekly (index 4, the next tile) —
+    // the intervening wides (trend/sessions/projects) are skipped.
+    expect(order[0]).toBe('weekly');
+    expect(order[4]).toBe('forecast');
+    // The wide cards keep their relative order.
+    expect(order.filter((id) => WIDES.includes(id))).toEqual(WIDES);
   });
 
-  it('swaps with previous neighbor (direction=-1)', () => {
-    dispatch({ type: 'SWAP_PANELS', index: 1, direction: -1 });
+  it('a tile swaps with the previous TILE (weekly → forecast)', () => {
+    dispatch({ type: 'SWAP_PANELS', index: 4, direction: -1 });
     const order = getState().prefs.panelOrder;
-    expect(order[0]).toBe('trend');
-    expect(order[1]).toBe('forecast');
+    expect(order[0]).toBe('weekly');
+    expect(order[4]).toBe('forecast');
+    expect(order.filter((id) => WIDES.includes(id))).toEqual(WIDES);
+  });
+
+  it('a wide swaps with the next WIDE, skipping tiles (trend → sessions)', () => {
+    dispatch({ type: 'SWAP_PANELS', index: 1, direction: 1 });
+    const order = getState().prefs.panelOrder;
+    expect(order[1]).toBe('sessions');
+    expect(order[2]).toBe('trend');
+    // The tiles keep their relative order.
+    const TILES = ['forecast', 'weekly', 'monthly', 'blocks', 'alerts'];
+    expect(order.filter((id) => TILES.includes(id))).toEqual(TILES);
   });
 
   it('is a no-op at the start (index=0, direction=-1)', () => {
@@ -138,6 +161,14 @@ describe('SWAP_PANELS action (immediate-neighbor; tier-awareness lands in Task 3
   it('is a no-op at the end (index=last, direction=+1)', () => {
     const before = [...getState().prefs.panelOrder];
     dispatch({ type: 'SWAP_PANELS', index: before.length - 1, direction: 1 });
+    expect(getState().prefs.panelOrder).toEqual(before);
+  });
+
+  it('is a no-op for the last tile moving down (no further tile)', () => {
+    // alerts is the last tile (index 8); the only ids after it are wides, so
+    // a tier-aware +1 finds no target and is a no-op.
+    const before = [...getState().prefs.panelOrder];
+    dispatch({ type: 'SWAP_PANELS', index: 8, direction: 1 });
     expect(getState().prefs.panelOrder).toEqual(before);
   });
 });
