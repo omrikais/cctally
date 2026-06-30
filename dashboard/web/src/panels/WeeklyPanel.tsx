@@ -7,7 +7,11 @@ import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
-const VISIBLE_ROWS = 8;
+// #248 §2a — the panel is a uniform summary TILE in the two-tier grid, so the
+// body caps to the 3 most-recent periods (the WeeklyModal keeps the full
+// history). The footer still summarizes the WHOLE window (count + envelope
+// total) so the tile reads "8w total · $X · here are the 3 most recent".
+const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
   const deltaCls =
@@ -44,9 +48,12 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 
 export function WeeklyPanel() {
   const env = useSnapshot();
-  const rows = (env?.weekly?.rows ?? []).slice(0, VISIBLE_ROWS);
+  const allRows = env?.weekly?.rows ?? [];
+  const rows = allRows.slice(0, VISIBLE_ROWS);
   // View-model unification (spec §6.6a): consume the envelope's pre-
-  // computed total instead of re-summing in JS.
+  // computed total instead of re-summing in JS. The footer count uses the
+  // FULL window length (allRows) so it stays structurally consistent with that
+  // total even though the body only paints the 3 most-recent rows (#248 §2a).
   const total = env?.weekly?.total_cost_usd ?? 0;
 
   // First-mount animation: track which row labels we've already painted.
@@ -84,7 +91,7 @@ export function WeeklyPanel() {
           <use href="/static/icons.svg#bar-chart" />
         </svg>
         <h2>
-          Weekly <span className="sub">(model split · 8 weeks)</span>
+          Weekly <span className="sub">(model split · recent)</span>
         </h2>
         <ShareIcon
           panel="weekly"
@@ -103,10 +110,10 @@ export function WeeklyPanel() {
           ))
         )}
       </div>
-      {rows.length > 0 && (
+      {allRows.length > 0 && (
         <div className="panel-foot period-foot">
           <span>
-            {rows.length}w total
+            {allRows.length}w total
             <span className="sep" aria-hidden="true"> · </span>
             <span className="total">{fmt.usd2(total)}</span>
           </span>

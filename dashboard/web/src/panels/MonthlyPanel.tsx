@@ -7,7 +7,9 @@ import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
-const VISIBLE_ROWS = 6;
+// #248 §2a — uniform summary TILE: cap the body to the 3 most-recent months
+// (MonthlyModal keeps the full history). Footer summarizes the whole window.
+const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
   const deltaCls =
@@ -44,11 +46,13 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 
 export function MonthlyPanel() {
   const env = useSnapshot();
-  const rows = (env?.monthly?.rows ?? []).slice(0, VISIBLE_ROWS);
+  const allRows = env?.monthly?.rows ?? [];
+  const rows = allRows.slice(0, VISIBLE_ROWS);
   // View-model unification (spec §6.6a, the canonical "smoking gun"
   // substitution): consume the envelope's pre-computed total instead
   // of re-summing in JS. `?? 0` covers the first-paint window before
-  // sync publishes the field.
+  // sync publishes the field. Footer count uses the FULL window (allRows)
+  // so it stays consistent with that total while the body shows 3 (#248 §2a).
   const total = env?.monthly?.total_cost_usd ?? 0;
 
   // First-mount animation: see WeeklyPanel for full notes. Spec §4.4.
@@ -82,7 +86,7 @@ export function MonthlyPanel() {
           <use href="/static/icons.svg#calendar" />
         </svg>
         <h2>
-          Monthly <span className="sub">(model split · 6 months)</span>
+          Monthly <span className="sub">(model split · recent)</span>
         </h2>
         <ShareIcon
           panel="monthly"
@@ -101,10 +105,10 @@ export function MonthlyPanel() {
           ))
         )}
       </div>
-      {rows.length > 0 && (
+      {allRows.length > 0 && (
         <div className="panel-foot period-foot">
           <span>
-            {rows.length}mo total
+            {allRows.length}mo total
             <span className="sep" aria-hidden="true"> · </span>
             <span className="total">{fmt.usd2(total)}</span>
           </span>

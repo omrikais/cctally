@@ -65,8 +65,13 @@ export function BlocksPanel() {
     subscribeStore,
     () => getState().prefs.blocksCollapsed,
   );
-  const rows = env?.blocks?.rows ?? [];
-  const maxCost = rows.length > 0 ? Math.max(...rows.map((r) => r.cost_usd), 0) : 0;
+  // #248 §2a — uniform summary TILE: the body caps to the 3 most-recent blocks
+  // (each row still opens its own Block modal). `maxCost` is computed over the
+  // FULL week so the 3 shown bars keep their true scale vs the week's peak; the
+  // footer count + total summarize the whole window.
+  const allRows = env?.blocks?.rows ?? [];
+  const rows = allRows.slice(0, 3);
+  const maxCost = allRows.length > 0 ? Math.max(...allRows.map((r) => r.cost_usd), 0) : 0;
   // View-model unification follow-up (issue #56): footer total comes
   // from the typed envelope scalar rather than re-summing rows in JS.
   // The Python sync thread sums over the same visible rows via
@@ -150,10 +155,10 @@ export function BlocksPanel() {
           ))
         )}
       </div>
-      {rows.length > 0 && (
+      {allRows.length > 0 && (
         <div className="panel-foot">
           <span>
-            {rows.length} blocks
+            {allRows.length} blocks
             <span className="sep" aria-hidden="true"> · </span>
             <span className="total">{fmt.usd2(total)}</span>
             {hasHeuristic && (
