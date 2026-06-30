@@ -747,26 +747,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 /* (#247 S1 C5) The Current Week ".panel-foot.cw-foot" "Last snapshot" line was
    removed — the header freshness chip is now the single freshness surface. */
 
-/* -------- Forecast panel (tight) -------- */
-.warn-banner {
-  background: var(--accent-amber);
-  color: #1a1400;
-  padding: 10px 14px;
-  border-radius: var(--radius-sm);
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  font-size: 18px; font-weight: 800;
-  letter-spacing: 1px;
-  margin-bottom: 10px;
-  background-image: radial-gradient(rgba(0,0,0,0.18) 1px, transparent 1px);
-  background-size: 6px 6px;
-  font-family: var(--font-mono);
-}
-/* Verdict-driven color (set by JS: "warn-banner good|warn|over"). The
-   base rule above is the amber "warn" look; `.warn` is redeclared for
-   clarity so the cascade ordering is explicit. */
-.warn-banner.good { background-color: var(--accent-green); color: #0b2a16; }
-.warn-banner.warn { background-color: var(--accent-amber); color: #1a1400; }
-.warn-banner.over { background-color: var(--accent-red);   color: #ffe7e7; }
+/* #248 §4 — the loud `.warn-banner` Forecast banner is retired; the calm
+   verdict tile (`.fc-tile` / `.fc-verdict-chip` / `.fc-accent-edge`) lives
+   below. */
 
 /* #207 B2/B3 — connection feedback (disconnect banner, stale dim, skeleton).
    A distinct `.stale-banner` family so it never collides with the verdict
@@ -830,41 +813,64 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
     animation: skel-shimmer 1.4s ease-in-out infinite;
   }
 }
-.fc-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 6px 0;
+/* -------- Forecast tile (#248 §4) — calm-when-healthy verdict card --------
+   The projected % is the hero; the verdict chip glyph is data-driven
+   (resolveVerdict.glyph). Escalation tints flow from the `fc-esc-*` modifier
+   the panel sets from the verdict class. */
+.fc-body { display: flex; flex-direction: column; gap: var(--space-3); }
+.fc-hero { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+.fc-eyebrow {
+  font-size: var(--fs-eyebrow); color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
 }
-.fc-row .left { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 500; font-size: var(--fs-body); }
-.fc-row .left .icon-box {
-  width: 30px; height: 30px; border-radius: var(--radius-sm);
-  background: rgba(255,255,255,0.02);
-  display: flex; align-items: center; justify-content: center;
+.fc-num {
+  font-size: var(--fs-kpi); font-weight: 800; line-height: 1;
+  font-variant-numeric: tabular-nums; color: var(--text);
 }
-.fc-row .right { text-align: right; font-weight: 700; font-size: var(--fs-data); color: var(--text); }
-.fc-row .right .num { font-size: 18px; font-weight: 800; margin-right: 6px; }
-.fc-row .right .at { color: var(--accent-blue); font-weight: 500; }
-.fc-row.fc-wkavg .icon-box .icon { color: var(--accent-blue); }
-.fc-row.fc-wkavg .right .num { color: var(--accent-green); }
-.fc-row.fc-24h .icon-box .icon { color: var(--accent-red); }
-.fc-row.fc-24h .right .num { color: var(--accent-red); }
-.fc-row.fc-budget-100 .icon-box .icon { color: var(--accent-green); }
-.fc-row.fc-budget-100 .right .num { color: var(--accent-green); }
-.fc-row.fc-budget-90  .icon-box .icon { color: var(--accent-green); }
-.fc-row.fc-budget-90  .right .num { color: var(--accent-green); }
-.fc-row .right .per { color: var(--text-dim); font-weight: 500; font-size: 12.5px; }
+/* OK is calm — the hero number stays neutral; only WARN/OVER tint it. */
+.fc-num.is-warn { color: var(--accent-amber); }
+.fc-num.is-over { color: var(--accent-red); }
 
-.fc-divider { border-top: 1px solid var(--border-soft); margin: 6px 0; }
-
-.panel-foot.fc-conf {
-  display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  font-size: var(--fs-body);
+.fc-verdict-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 10px; border-radius: var(--radius-pill);
+  font-size: var(--fs-eyebrow); font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid transparent;
 }
-.panel-foot.fc-conf .lbl { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
-.panel-foot.fc-conf .lbl .icon { color: var(--accent-pink); width: 14px; height: 14px; }
-.panel-foot.fc-conf .lbl .val { color: var(--accent-pink); font-weight: 700; margin-left: 4px; }
-.panel-foot.fc-conf .dots { display: flex; gap: 4px; }
-.panel-foot.fc-conf .dots .d { width: 14px; height: 8px; border-radius: 1px; background: #262a35; } /* lint-allow: border-radius bespoke chrome (no exact token) */
-.panel-foot.fc-conf .dots .d.on { background: var(--accent-purple); }
+.fc-verdict-glyph { font-size: var(--fs-meta); line-height: 1; }
+/* OK: outlined green (calm). WARN/OVER: filled chips. */
+.fc-verdict-chip.is-good {
+  color: var(--accent-green);
+  border-color: color-mix(in srgb, var(--accent-green) 45%, transparent);
+  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+.fc-verdict-chip.is-warn {
+  color: #1a1400;   /* dark-on-amber, matches the retired warn-banner ink */
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+}
+.fc-verdict-chip.is-over {
+  color: #ffe7e7;   /* light-on-red, matches the retired warn-banner ink */
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+}
+
+/* 4px accent edge — only on the escalated (WARN/OVER) states. The colour
+   tracks the verdict via the `fc-esc-*` modifier. */
+.fc-tile.fc-accent-edge { box-shadow: inset 4px 0 0 var(--accent-amber); }
+.fc-tile.fc-accent-edge.fc-esc-over { box-shadow: inset 4px 0 0 var(--accent-red); }
+
+.fc-budget-foot {
+  display: flex; flex-direction: column; gap: var(--space-1);
+  margin-top: auto; padding-top: var(--space-2);
+  border-top: 1px solid var(--border-soft);
+}
+.fc-foot-line {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: var(--fs-meta);
+}
+.fc-foot-k { color: var(--text-dim); }
+.fc-foot-v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 
 /* -------- Trend panel -------- */
 .trend-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--font-mono); }
