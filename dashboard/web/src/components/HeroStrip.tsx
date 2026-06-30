@@ -1,4 +1,6 @@
+import { useEffect, useRef } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { fmt } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
 import { dispatch } from '../store/store';
@@ -28,10 +30,38 @@ export function HeroStrip() {
   // Forecast metric tint — verdict drives calm-green / amber / red (H1/§4).
   const verdict = resolveVerdict(h?.forecast_verdict ?? null);
 
+  // #248 §6 — mobile-only sticky-collapse. Watch the hero block; once it scrolls
+  // out of the viewport, flip `heroScrolled` so the Header reveals its condensed
+  // Used%/reset readout (keeping the sticky bar one row ≤64px). Guarded for a
+  // missing IntersectionObserver (JSDOM / SSR — mirrors ConversationReader);
+  // disconnects + resets the flag on unmount / view switch (HeroStrip unmounts
+  // when leaving the dashboard view, so the readout never lingers).
+  const heroRef = useRef<HTMLElement>(null);
+  const isMobile = useIsMobile();
+  useEffect(() => {
+    if (!isMobile) return;
+    const el = heroRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        dispatch({ type: 'SET_HERO_SCROLLED', scrolled: !entry.isIntersecting });
+      },
+      { threshold: 0 },
+    );
+    io.observe(el);
+    return () => {
+      io.disconnect();
+      dispatch({ type: 'SET_HERO_SCROLLED', scrolled: false });
+    };
+  }, [isMobile]);
+
   const openCurrentWeek = () => dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
 
   return (
     <section
+      ref={heroRef}
       className="hero-strip"
       // House pattern (matches all grid panels): a focusable region, NOT
       // role="button" — a button's accessible name would flatten the KPIs out

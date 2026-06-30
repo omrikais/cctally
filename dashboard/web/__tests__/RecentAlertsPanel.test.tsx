@@ -75,11 +75,13 @@ describe('<RecentAlertsPanel />', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders empty state when alerts: []', () => {
-    render(<RecentAlertsPanel />);
-    expect(
-      screen.getByText(/No alerts yet/i),
-    ).toBeInTheDocument();
+  it('renders the compact empty tile when alerts: [] (#248 §5)', () => {
+    const { container } = render(<RecentAlertsPanel />);
+    const tile = container.querySelector('.alerts-empty-tile');
+    expect(tile).not.toBeNull();
+    // One-liner: "✓ No alerts · You're at <used%>. Alerts fire at 90% / 95%."
+    expect(tile?.textContent).toMatch(/No alerts/i);
+    expect(tile?.textContent).toMatch(/90% \/ 95%/);
   });
 
   it('renders up to 10 most-recent alerts (slices a 15-alert store)', () => {

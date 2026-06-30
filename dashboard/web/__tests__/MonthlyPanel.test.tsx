@@ -18,11 +18,11 @@ describe('<MonthlyPanel />', () => {
     expect(section?.classList.contains('accent-pink')).toBe(true);
   });
 
-  it('renders the calendar icon and the 6-months subtitle', () => {
+  it('renders the calendar icon and the recent subtitle (#248 compaction)', () => {
     render(<MonthlyPanel />);
     const useEl = document.querySelector('#panel-monthly svg use');
     expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#calendar');
-    expect(screen.getByText(/6 months/i)).toBeInTheDocument();
+    expect(screen.getByText(/recent/i)).toBeInTheDocument();
   });
 
   it('renders one .period block per fixture row (2 rows)', () => {

@@ -18,11 +18,11 @@ describe('<WeeklyPanel />', () => {
     expect(section?.classList.contains('accent-cyan')).toBe(true);
   });
 
-  it('renders the bar-chart icon and the 8-weeks subtitle', () => {
+  it('renders the bar-chart icon and the recent subtitle (#248 compaction)', () => {
     render(<WeeklyPanel />);
     const useEl = document.querySelector('#panel-weekly svg use');
     expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#bar-chart');
-    expect(screen.getByText(/8 weeks/i)).toBeInTheDocument();
+    expect(screen.getByText(/recent/i)).toBeInTheDocument();
   });
 
   it('renders one .period block per fixture row (2 rows)', () => {

@@ -220,6 +220,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 }
 .topbar-actions > .topbar-icon-btn { display: none; }
 
+/* #248 §6 — the mobile-only condensed hero readout. Desktop-hidden by default
+   (the full hero is in view there); the mobile @media block reveals it once
+   `heroScrolled` flips. */
+.topbar-condensed { display: none; }
+
 /* -------- At-a-glance hero strip (#248 §1) -------- */
 /* Dashboard-only, full-width hero. Replaces the five header stats + the
    Current Week grid card: the weekly Used % dominates, flanked by four
@@ -3465,6 +3470,22 @@ mark.current {
     padding-right: max(8px, env(safe-area-inset-right));
   }
 
+  /* #248 §6 — mobile hero dominates: stack hero-main over a 2×2 metric grid,
+     with the Used % number at ~54px so it reads at a glance. */
+  .hero-strip {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+  }
+  .hero-num { font-size: 54px; }
+  .hero-metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+    width: 100%;
+  }
+
   /* #214 M3-1: sparse single-column panels shouldn't reserve the desktop
      320px floor — collapse to content height (kills the dead-space scroll).
      Desktop 2-col keeps its floor; this rule is inside the 640px block.
@@ -3535,51 +3556,24 @@ mark.current {
      migrate to header icon buttons. */
   .footer { display: none; }
 
-  /* Header — two-row sticky, safe-area aware. Row 1 is the week label
-     + action icons (right-aligned via flex); row 2 is the primary
-     stats. Secondary stats (data-mobile-keep="secondary") are hidden.
-     The trio of action buttons (.topbar-actions) is desktop-hidden by
-     default; here it's revealed and sized for thumb taps. */
+  /* #248 §6 — Header is now ONE compact sticky row ≤64px: brand badge +
+     (optional ViewSwitcher) + the condensed Used%/reset readout (the shrink
+     valve) + the action icons, right-aligned. The old two-row layout, the
+     forced `::after` wrap, and every `.stat[data-stat=…]` / `data-mobile-keep`
+     ordering rule are retired now that the five header stats moved to the
+     HeroStrip. `nowrap` keeps it one row; the condensed readout ellipsizes. */
   .topbar {
     position: sticky;
     top: 0;
     z-index: 50;
-    flex-wrap: wrap;
-    gap: 6px 12px;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
     padding: 6px 10px;
     margin-bottom: 8px;
-    /* Safe-area inset on top so the row 1 doesn't hide under the
+    /* Safe-area inset on top so the row doesn't hide under the
        notch / dynamic island. */
     padding-top: max(6px, env(safe-area-inset-top));
-  }
-  .topbar .stat[data-mobile-keep="secondary"] { display: none; }
-  /* Force the documented two-row layout: row 1 = Week + actions,
-     row 2 = primary stats. `order` overrides DOM source order so
-     .topbar-actions (last in DOM) lands beside Week; the ::after
-     pseudo with flex-basis:100% inserts a hard wrap point so the
-     break is independent of stat-cell widths. */
-  /* Two-row mobile header (user spec, 2026-05-13):
-       Row 1: Week + Used + $/1%   (Fcst hidden on mobile)
-       Row 2: Doctor pill (left) ............... ⚙ ? ⟳ (right)
-     `flex: 0 1 auto` on the row-1 stats lets the row reflow at
-     narrow viewports without spilling Used / $/1% to a third row
-     ahead of the action trio. */
-  .topbar .stat[data-stat="brand"]           { order: 0; flex: 0 0 auto; min-width: 0; }
-  .topbar .stat[data-stat="week"]            { order: 1; flex: 0 1 auto; min-width: 0; }
-  .topbar .stat[data-stat="used"]            { order: 2; flex: 0 1 auto; min-width: 0; }
-  .topbar .stat[data-stat="dollar-per-pct"]  { order: 3; flex: 0 1 auto; min-width: 0; }
-  /* Forecast is dropped on mobile to keep row 1 to three stats.
-     Used + $/1% are the two budget-critical numbers; Fcst lives in
-     the dedicated Forecast panel a tap below. */
-  .topbar .stat[data-stat="forecast"]        { display: none; }
-  /* Hard wrap point AFTER the row-1 stats, BEFORE the action trio.
-     `::after` with flex-basis:100% works regardless of how the
-     row-1 stats reflow internally. */
-  .topbar::after {
-    content: "";
-    flex-basis: 100%;
-    height: 0;
-    order: 4;
   }
   /* Row 2 = the action band: doctor pill at the start, basket chip +
      icon trio clustered at the end. Width:100% claims the full row;
@@ -3592,14 +3586,11 @@ mark.current {
      would NOT work here: it would distribute slack between every
      pair of children, spreading the icon trio across the row
      instead of clustering them. */
+  /* Actions cluster at the right edge of the single row. */
   .topbar .topbar-actions {
-    order: 5;
-    margin-left: 0;
-    width: 100%;
+    margin-left: auto;
     gap: 4px;
-  }
-  .topbar .topbar-actions .doctor-chip {
-    margin-right: auto;
+    flex-shrink: 0;
   }
   /* Mobile: drop the "cctally" word + the version since horizontal
      real estate is tight; keep just the update badge if present.
@@ -3614,18 +3605,23 @@ mark.current {
      parent stat has `flex: 0 1 auto` so it shrinks if it ever
      conflicts with the action trio's row 1 budget. Ellipsis remains
      as a fallback for genuinely-overflowing labels. */
-  .topbar .stat[data-stat="week"] .v {
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* #248 §6 — the condensed Used%/reset readout is the single dashboard datum
+     the slimmed Header shows on mobile (revealed by `heroScrolled`). It is the
+     flex shrink valve so the row stays ≤64px; the value ellipsizes if cramped. */
+  .topbar .topbar-condensed {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: var(--fs-data);
+    color: var(--text-dim);
   }
-  /* The calendar icon already conveys "week"; drop the redundant
-     "Week" word so the stat shrinks enough to share row 1 with the
-     action trio at 320 viewport. */
-  .topbar .stat[data-stat="week"] .k { display: none; }
-  /* The 5h sub-stat is nested inside .stat[data-stat="used"]; hide via
-     the inner data-mobile-keep="secondary" descendant. */
-  .topbar .stat .mute[data-mobile-keep="secondary"] { display: none; }
-  /* Pill stays inline next to forecast; just shrink the spacing. */
-  .topbar .pill-warn { font-size: 10px; padding: 1px 6px; }
+  .topbar .topbar-condensed .topbar-condensed-pct { color: var(--text); font-weight: 700; }
+  .topbar .topbar-condensed .topbar-condensed-sep { color: var(--text-faint); }
 
   /* Icon buttons revealed on phones. Wrapper-level layout (flex,
      margin-left: auto, etc.) is set unconditionally at desktop scope. */
@@ -4486,11 +4482,13 @@ mark.current {
   /* #214 M3-5: the name was a fixed 90px while the aria-hidden decorative
      bar hogged 1fr. Give the name the flexible track; shrink the bar.
      #247 S1 (D7): bump the row to the 14px primary-data floor (var(--fs-data))
-     — name (flex track, ellipsis), cost, and pct are all primary data. Shrink
-     the decorative (aria-hidden) bar track and widen the cost/pct tracks so the
-     larger numerics never clip; still the same dense 4-column leaderboard. */
+     — name (flex track, ellipsis), cost, and pct are all primary data.
+     #248 §6: the cost track was a fixed 60px that clipped a >= $1000 value.
+     Make it CONTENT-SIZED (`auto`) and slim the decorative bar to 28px / the
+     pct to 40px so a "$1,234.56" cost renders at full precision; the name
+     (flexible track) keeps absorbing the slack and ellipsizes. */
   #root .projects-row {
-    grid-template-columns: minmax(0, 1fr) 32px 60px 44px;
+    grid-template-columns: minmax(0, 1fr) 28px auto 40px;
     padding: 4px;
     font-size: var(--fs-data);
   }

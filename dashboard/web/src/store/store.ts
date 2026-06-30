@@ -483,6 +483,11 @@ export interface UIState {
   // modals if a future iteration wants that pattern.
   doctor: DoctorAggregate | null;
   doctorModalOpen: boolean;
+  // #248 §6 — TRANSIENT mobile sticky-collapse flag. True once the hero block
+  // has scrolled out of the viewport (set by HeroStrip's mobile-only
+  // IntersectionObserver), which reveals the Header's condensed Used%/reset
+  // readout. NOT persisted — a reload always lands with the hero in view.
+  heroScrolled: boolean;
   /** Depth counter of open component-local chrome overlays (Settings/Help).
    *  Lets the global/sessions key guards suppress hotkeys under those
    *  overlays, which are NOT in `openModal`/`doctorModalOpen` (#207 D2). */
@@ -657,6 +662,8 @@ function loadInitial(): UIState {
     basket: { items: loadBasketFromStorage(), rejectedReason: null },
     doctor: null,
     doctorModalOpen: false,
+    // #248 §6 — transient; starts with the hero in view (not scrolled).
+    heroScrolled: false,
     chromeOverlayOpen: 0,
   };
 }
@@ -936,6 +943,9 @@ export type Action =
   | { type: 'SET_DOCTOR_AGGREGATE'; doctor: DoctorAggregate | null }
   | { type: 'OPEN_DOCTOR_MODAL' }
   | { type: 'CLOSE_DOCTOR_MODAL' }
+  // #248 §6 — mobile sticky-collapse: HeroStrip's IntersectionObserver sets
+  // this as the hero block enters/leaves the viewport (transient, not persisted).
+  | { type: 'SET_HERO_SCROLLED'; scrolled: boolean }
   | { type: 'INCREMENT_CHROME_OVERLAY' }
   | { type: 'DECREMENT_CHROME_OVERLAY' };
 
@@ -1683,6 +1693,13 @@ export function dispatch(action: Action): void {
       break;
     case 'CLOSE_DOCTOR_MODAL':
       state = { ...state, doctorModalOpen: false };
+      break;
+    case 'SET_HERO_SCROLLED':
+      // No-op short-circuit so a stream of identical IntersectionObserver
+      // callbacks doesn't emit() a fresh render every frame.
+      if (state.heroScrolled !== action.scrolled) {
+        state = { ...state, heroScrolled: action.scrolled };
+      }
       break;
     case 'INCREMENT_CHROME_OVERLAY':
       state = { ...state, chromeOverlayOpen: state.chromeOverlayOpen + 1 };

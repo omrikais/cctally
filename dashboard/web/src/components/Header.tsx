@@ -4,6 +4,8 @@ import { DoctorChip } from './DoctorChip';
 import { SyncChip } from './SyncChip';
 import { UpdateBadge } from './UpdateBadge';
 import { ViewSwitcher } from '../conversations/ViewSwitcher';
+import { useSnapshot } from '../hooks/useSnapshot';
+import { fmt } from '../lib/fmt';
 import { triggerSync } from '../store/sync';
 import { getState, subscribeStore } from '../store/store';
 
@@ -29,6 +31,17 @@ export function Header() {
   // state is null (pre-bootstrap) or current_version is missing.
   const update = useSyncExternalStore(subscribeStore, () => getState().update);
   const currentVersion = update.state?.current_version ?? null;
+  // #248 §6 — the mobile-only, dashboard-only condensed hero readout. Gated on
+  // view + heroScrolled (the HeroStrip IO flips the flag once the hero scrolls
+  // past); CSS keeps it desktop-hidden. It reads the same Used% + reset the hero
+  // shows — this is the ONLY dashboard datum the slimmed Header reads, NOT the
+  // H2 full-stat duplication.
+  const view = useSyncExternalStore(subscribeStore, () => getState().view);
+  const heroScrolled = useSyncExternalStore(subscribeStore, () => getState().heroScrolled);
+  const env = useSnapshot();
+  const header = env?.header;
+  const cw = env?.current_week ?? null;
+  const showCondensed = view === 'dashboard' && heroScrolled;
   return (
     <header className="topbar">
       {/* Heading outline root (A3) — visually hidden so the topbar design
@@ -47,7 +60,16 @@ export function Header() {
           chrome is identical for users without the feature. */}
       <ViewSwitcher />
       {/* condensed readout: Task 7 — a mobile-only, dashboard-only condensed
-          Used% / resets-in line gated on heroScrolled lands here. */}
+          Used% / resets-in line, gated on view==='dashboard' && heroScrolled.
+          CSS keeps it desktop-hidden; on mobile it keeps the sticky bar one row
+          ≤64px and the hero number glanceable while scrolling. */}
+      {showCondensed && (
+        <div className="topbar-condensed" data-testid="topbar-condensed">
+          <span className="topbar-condensed-pct">{fmt.pct1(header?.used_pct)}</span>
+          <span className="topbar-condensed-sep" aria-hidden="true"> · </span>
+          <span className="topbar-condensed-reset">resets {fmt.ddhh(cw?.reset_in_sec)}</span>
+        </div>
+      )}
       <div className="topbar-actions">
         {/* Doctor aggregate chip (spec §6.1). Renders nothing until
             the first SSE tick carrying snap.doctor lands. Click +
