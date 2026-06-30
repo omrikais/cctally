@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act } from '@testing-library/react';
-import { CurrentWeekPanel } from '../src/panels/CurrentWeekPanel';
 import { ForecastPanel } from '../src/panels/ForecastPanel';
 import { TrendPanel } from '../src/panels/TrendPanel';
 import { SessionsPanel } from '../src/panels/SessionsPanel';
@@ -29,12 +28,9 @@ beforeEach(() => {
 });
 
 describe('Enter / Space on focused panel opens the matching modal', () => {
-  it('CurrentWeekPanel → current-week', () => {
-    render(<CurrentWeekPanel />);
-    const panel = document.querySelector<HTMLElement>('[data-panel-kind="current-week"]')!;
-    firePanelKey(panel, 'Enter');
-    expect(getState().openModal).toBe('current-week');
-  });
+  // #248 — the Current Week grid card was removed (it is now the HeroStrip,
+  // covered by HeroStrip.test.tsx). The remaining grid panels keep the
+  // Enter/Space → open-modal contract.
   it('ForecastPanel → forecast (Space also works)', () => {
     render(<ForecastPanel />);
     const panel = document.querySelector<HTMLElement>('[data-panel-kind="forecast"]')!;

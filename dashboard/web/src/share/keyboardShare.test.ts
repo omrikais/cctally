@@ -117,7 +117,7 @@ describe('S keybinding (share modal)', () => {
       type: 'SAVE_PREFS',
       patch: {
         panelOrder: [
-          'daily', 'current-week', 'forecast', 'trend',
+          'daily', 'cache-report', 'forecast', 'trend',
           'sessions', 'weekly', 'monthly', 'blocks', 'alerts',
         ],
       },

@@ -4,10 +4,10 @@ import { CSS } from '@dnd-kit/utilities';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { shouldSuppressNextClick } from '../lib/clickSuppression';
 import { useReducedMotion } from '../hooks/useReducedMotion';
-import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
+import { PANEL_REGISTRY, type GridPanelId } from '../lib/panelRegistry';
 
 export interface PanelHostProps {
-  id: PanelId;
+  id: GridPanelId;
   index: number;
 }
 

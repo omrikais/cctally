@@ -33,15 +33,12 @@ describe('<App />', () => {
     });
     const hosts = Array.from(document.querySelectorAll('[data-panel-host]')) as HTMLElement[];
     const order = hosts.map((h) => h.dataset.panelHost);
-    // Full expected order: 'current-week' moves from index 0 to index 3 via splice;
-    // assert the entire array to catch off-by-one or direction regressions.
-    // Default 11-panel order (with 'cache-report' appended per spec
-    // 2026-05-21 §1) with 'current-week' moved from index 0 to index 3:
-    // splice removes index 0, splice inserts at index 3 of the remaining
-    // 10-list, so 'current-week' lands AHEAD of 'projects'.
+    // Default 10-panel grid order (#248 removed 'current-week' — it is the
+    // HeroStrip now): 'forecast' moves from index 0 to index 3 via splice
+    // (remove index 0, insert at index 3 of the remaining 9-list). Assert the
+    // entire array to catch off-by-one or direction regressions.
     expect(order).toEqual([
-      'forecast', 'trend', 'sessions', 'current-week',
-      'projects',
+      'trend', 'sessions', 'projects', 'forecast',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
       'cache-report',
     ]);

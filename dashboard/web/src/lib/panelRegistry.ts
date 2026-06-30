@@ -1,5 +1,4 @@
 import type * as React from 'react';
-import { CurrentWeekPanel } from '../panels/CurrentWeekPanel';
 import { ForecastPanel } from '../panels/ForecastPanel';
 import { TrendPanel } from '../panels/TrendPanel';
 import { SessionsPanel } from '../panels/SessionsPanel';
@@ -15,28 +14,25 @@ import {
   openActiveOrNewestBlockModal,
   openMostRecentSessionModal,
 } from '../store/actions';
-import { DEFAULT_PANEL_ORDER, type PanelId } from './panelIds';
+import { DEFAULT_PANEL_ORDER, type PanelId, type GridPanelId } from './panelIds';
 
 // Re-export for backward compatibility — most callers import from
 // panelRegistry. The underlying definitions live in panelIds.ts to break
 // the circular import with store/store.ts.
 export { DEFAULT_PANEL_ORDER };
-export type { PanelId };
+export type { PanelId, GridPanelId };
 
 export interface PanelDef {
-  id: PanelId;
+  // #248: grid cards are GridPanelId — `current-week` left the grid (it is
+  // the hero), so the registry never carries it. `PanelId` is kept for the
+  // modal/share path (CurrentWeekModal / SharePanelId).
+  id: GridPanelId;
   label: string;
   Component: React.ComponentType;
   openAction: () => void;
 }
 
-export const PANEL_REGISTRY: Record<PanelId, PanelDef> = {
-  'current-week': {
-    id: 'current-week',
-    label: 'Current Week',
-    Component: CurrentWeekPanel,
-    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'current-week' }),
-  },
+export const PANEL_REGISTRY: Record<GridPanelId, PanelDef> = {
   forecast: {
     id: 'forecast',
     label: 'Forecast',

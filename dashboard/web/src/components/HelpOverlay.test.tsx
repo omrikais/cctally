@@ -38,44 +38,44 @@ describe('<HelpOverlay /> positional hotkey rule', () => {
   it('renders <kbd>1..9</kbd> for positions 1..9 and <kbd>0</kbd> for position 10', () => {
     render(<HelpOverlay />);
     openHelp();
-    // After Task B3, DEFAULT_PANEL_ORDER has 11 entries so the help table
-    // includes the 11th row.
+    // #248 — DEFAULT_PANEL_ORDER has exactly 10 grid entries (current-week
+    // left the grid for the HeroStrip), so every panel row gets a digit
+    // 1..9 / 0 and there is no ≥11 em-dash row.
     const kbds = screen.getAllByText(
       (_, el) => el?.tagName === 'KBD',
     );
     // We don't compare the full set (the table includes 'r', 's', '?',
     // 'Esc', 'Shift', '↑', '↓' etc.); just check that the digit keys are
-    // exactly 1..9, 0 — none of them say "11".
+    // exactly 1..9, 0 — none of them say "10" or "11".
     const digitKbds = kbds.filter((k) => /^(0|[1-9])$/.test(k.textContent ?? ''));
     const digitLabels = digitKbds.map((k) => k.textContent).sort();
     expect(digitLabels).toEqual(
       ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'].sort(),
     );
-    // And no <kbd>11</kbd> anywhere.
+    // And no <kbd>10</kbd> / <kbd>11</kbd> anywhere.
+    expect(kbds.find((k) => k.textContent === '10')).toBeUndefined();
     expect(kbds.find((k) => k.textContent === '11')).toBeUndefined();
   });
 
-  it('renders an em-dash (not a <kbd>) for the 11th panel row', () => {
+  it('renders exactly 10 panel rows (no ≥11 em-dash row) for the grid order', () => {
     render(<HelpOverlay />);
     openHelp();
-    // Find the row whose label cell says "Open Cache Report modal" — the
-    // 11th panel by default after Task B3 + B8. (B4 ships before B8, so
-    // the label cell at this point will still read "Open undefined modal"
-    // if PANEL_REGISTRY hasn't been extended. To stay decoupled from B8's
-    // ordering we instead probe by structure: find the 11th <tr> inside
-    // the first <table> and assert its first cell renders an em-dash
-    // span, not a <kbd>.)
+    // #248 — the grid order is exactly 10 long, so the positional ≥11
+    // em-dash branch (still present in HelpOverlay.tsx as a defensive guard
+    // for a future 11th panel) is dormant: every panel row carries a digit.
     const table = document.querySelector('#help-overlay table');
     expect(table).not.toBeNull();
     const rows = Array.from(table?.querySelectorAll('tbody > tr') ?? []);
-    // First 11 rows are the panel slots (DEFAULT_PANEL_ORDER.length).
-    const eleventh = rows[10];
-    expect(eleventh).toBeTruthy();
-    const firstCell = eleventh?.querySelector('td');
-    expect(firstCell).not.toBeNull();
-    // The cell should contain an em-dash and NOT a <kbd>.
-    expect(firstCell?.querySelector('kbd')).toBeNull();
-    expect(firstCell?.textContent).toBe('—');
+    // The first 10 rows are the panel slots; each has a <kbd> in its first cell.
+    for (let i = 0; i < 10; i++) {
+      const firstCell = rows[i]?.querySelector('td');
+      expect(firstCell?.querySelector('kbd'), `panel row ${i + 1} should carry a digit kbd`).not.toBeNull();
+    }
+    // No panel row renders the em-dash placeholder.
+    const emDashCells = rows
+      .slice(0, 10)
+      .filter((r) => r.querySelector('td')?.textContent === '—');
+    expect(emDashCells).toHaveLength(0);
   });
 });
 

@@ -13,7 +13,7 @@ import {
   ctxFromEnvelope,
   sessionComparator,
 } from './selectors';
-import { DEFAULT_PANEL_ORDER, type PanelId } from '../lib/panelIds';
+import { DEFAULT_PANEL_ORDER, type GridPanelId } from '../lib/panelIds';
 import {
   applyPanelOrderMigration,
   CURRENT_PANEL_ORDER_SCHEMA_VERSION,
@@ -203,7 +203,9 @@ export interface Prefs {
   // typically thin; we render it expanded by default. Mirrors the
   // sessions/blocks/daily flags in shape.
   alertsCollapsed: boolean;
-  panelOrder: PanelId[];
+  // #248 — grid cards only (GridPanelId). 'current-week' left the grid (it is
+  // the HeroStrip); the v2→v3 schema migration filters it out of saved orders.
+  panelOrder: GridPanelId[];
   onboardingToastSeen: boolean;
   mobileOnboardingToastSeen: boolean;
   trendSortOverride: SortOverride | null;
@@ -443,7 +445,7 @@ export interface UIState {
   // remains untouched. Committed to prefs on drop (COMMIT_DRAG_PREVIEW)
   // or discarded on Esc / pointer-cancel / window-resize
   // (CLEAR_DRAG_PREVIEW). Never persisted to localStorage directly.
-  dragPreviewOrder: PanelId[] | null;
+  dragPreviewOrder: GridPanelId[] | null;
   // Update subcommand (spec §6). The slice carries both the persisted
   // shape (state + suppress, refreshed via /api/update/status) and the
   // live runtime machine (status, runId, stream, startedAt, errorMessage)
@@ -847,7 +849,7 @@ export type Action =
   | { type: 'RESET_PREFS' }
   | { type: 'RESET_PANEL_ORDER' }
   | { type: 'REORDER_PANELS'; from: number; to: number }
-  | { type: 'SET_DRAG_PREVIEW'; order: PanelId[] }
+  | { type: 'SET_DRAG_PREVIEW'; order: GridPanelId[] }
   | { type: 'COMMIT_DRAG_PREVIEW' }
   | { type: 'CLEAR_DRAG_PREVIEW' }
   | { type: 'SWAP_PANELS'; index: number; direction: -1 | 1 }

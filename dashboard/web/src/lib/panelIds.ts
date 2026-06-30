@@ -21,12 +21,28 @@ export type PanelId =
   | 'alerts'
   | 'cache-report';
 
-export const DEFAULT_PANEL_ORDER: PanelId[] = [
-  'current-week', 'forecast', 'trend', 'sessions',
+// Grid-only ids (#248): `current-week` left the grid — it is now the hero
+// strip (HeroStrip), opened via click/Enter, not a digit. It STAYS a valid
+// `PanelId` so `ModalKind` / `SharePanelId` / the Current Week modal + share
+// path continue to compile. Everything that owns a GRID card — the default
+// order, the registry, the tier map, `openPanelByPosition`, `prefs.panelOrder`
+// — is typed to `GridPanelId` so the grid can never address `current-week`.
+export type GridPanelId = Exclude<PanelId, 'current-week'>;
+
+export const DEFAULT_PANEL_ORDER: GridPanelId[] = [
+  'forecast', 'trend', 'sessions',
   'projects',
   'weekly', 'monthly', 'blocks', 'daily', 'alerts',
   'cache-report',
 ];
+
+// Two-tier grid (#248, spec §2). Compact uniform summary TILES (auto-fit
+// packed) vs full-width content-height WIDE data cards. App partitions
+// `prefs.panelOrder` by this static map into two independent dnd-kit strips.
+export const CARD_TIER: Record<GridPanelId, 'tile' | 'wide'> = {
+  forecast: 'tile', weekly: 'tile', monthly: 'tile', blocks: 'tile', alerts: 'tile',
+  sessions: 'wide', trend: 'wide', projects: 'wide', daily: 'wide', 'cache-report': 'wide',
+};
 
 // Panels for which a share affordance is rendered (spec §6.1, plan §M1.9).
 //

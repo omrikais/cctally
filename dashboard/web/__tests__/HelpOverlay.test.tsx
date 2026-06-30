@@ -33,12 +33,13 @@ describe('<HelpOverlay />', () => {
     expect(card).not.toBeNull();
     // h2 "Keybindings"
     expect(card?.querySelector('h2')?.textContent).toBe('Keybindings');
-    // 26 table rows: 11 panel keys (1-9 + 0 for position 10, em-dash
-    // for position 11 cache-report per spec 2026-05-21) + 12 data-driven
-    // HELP_ROWS single-key rows (#207 D1: r, s, d, S, B, f, /, c, n/N, q,
-    // ?, Esc) + 3 combo/gesture rows (Hold+drag, Shift+arrows, ↑/↓).
+    // 25 table rows: 10 panel keys (1-9 + 0 for position 10 — #248 removed
+    // 'current-week' from the grid, so the order is exactly 10 long with no
+    // ≥11 em-dash row) + 12 data-driven HELP_ROWS single-key rows (#207 D1:
+    // r, s, d, S, B, f, /, c, n/N, q, ?, Esc) + 3 combo/gesture rows
+    // (Hold+drag, Shift+arrows, ↑/↓).
     const rows = card?.querySelectorAll('table tr');
-    expect(rows?.length).toBe(26);
+    expect(rows?.length).toBe(25);
     // Meta line with server URL
     const meta = card?.querySelector('p.meta');
     expect(meta?.textContent).toMatch(/cctally/);
@@ -97,12 +98,12 @@ describe('<HelpOverlay />', () => {
     expect(tens).toHaveLength(0);
   });
 
-  it('lists a Projects modal binding (5 → Projects in default order)', async () => {
-    // Projects sits at index 4 of DEFAULT_PANEL_ORDER → keyboard '5'.
-    // The position-10 binding ('0') maps to whatever is last in the
-    // order (alerts in default), NOT specifically projects — this
-    // assertion only confirms the Projects row appears in the overlay
-    // with some shortcut, not that it's bound to '0'.
+  it('lists a Projects modal binding (4 → Projects in default order)', async () => {
+    // #248 — Projects sits at index 3 of DEFAULT_PANEL_ORDER → keyboard '4'.
+    // The position-10 binding ('0') maps to whatever is last in the order
+    // (cache-report in default), NOT specifically projects — this assertion
+    // only confirms the Projects row appears in the overlay with some
+    // shortcut, not that it's bound to '0'.
     render(<HelpOverlay />);
     const user = userEvent.setup();
     await user.keyboard('?');

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { _resetForTests, loadInitialForTests, getState } from '../src/store/store';
 import { DEFAULT_PANEL_ORDER } from '../src/lib/panelRegistry';
-import type { PanelId } from '../src/lib/panelRegistry';
+import type { PanelId, GridPanelId } from '../src/lib/panelRegistry';
 
 beforeEach(() => {
   localStorage.clear();
@@ -18,11 +18,10 @@ describe('Prefs.panelOrder', () => {
   });
 
   it('reads a previously-persisted custom order (post-migration schema)', () => {
-    // 11 entries — Task B3 (spec 2026-05-21) added 'cache-report' to
-    // DEFAULT_PANEL_ORDER. The persisted order must include it for the
-    // reconciler to round-trip verbatim (missing ids would otherwise be
-    // appended).
-    const custom: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'projects', 'sessions', 'trend', 'forecast', 'current-week', 'alerts', 'cache-report'];
+    // 10 entries — #248 removed 'current-week' from the grid, so a v3-cursor
+    // saved order has no current-week and round-trips verbatim through the
+    // reconciler (missing ids would otherwise be appended).
+    const custom: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
     localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
       sortDefault: 'started desc',
       sessionsPerPage: 100,
@@ -31,18 +30,19 @@ describe('Prefs.panelOrder', () => {
       dailyCollapsed: true,
       panelOrder: custom,
       onboardingToastSeen: true,
-      // Bump cursor past the migration so the saved order round-trips verbatim.
-      panelOrderSchemaVersion: 2,
+      // Bump cursor to CURRENT so the saved order round-trips verbatim.
+      panelOrderSchemaVersion: 3,
     }));
     const initial = loadInitialForTests();
     expect(initial.prefs.panelOrder).toEqual(custom);
     expect(initial.prefs.onboardingToastSeen).toBe(true);
   });
 
-  it('upgrades a v1 saved order by splicing projects at index 4', () => {
-    // v1 = no panelOrderSchemaVersion key, no 'projects' in panelOrder.
-    // The cache-report panel is also missing because the v1 user never
-    // had it; the reconciler appends it to the tail after migration.
+  it('upgrades a v1 saved order: splices projects, drops current-week, appends cache-report', () => {
+    // v1 = no panelOrderSchemaVersion key, no 'projects' in panelOrder, and a
+    // 'current-week' the grid no longer carries (#248). The cumulative
+    // migration splices projects at index 4 then drops current-week; the
+    // reconciler appends cache-report (the v1 user never had it).
     const v1Custom: PanelId[] = [
       'daily', 'blocks', 'monthly', 'weekly',
       'sessions', 'trend', 'forecast', 'current-week', 'alerts',
@@ -55,13 +55,15 @@ describe('Prefs.panelOrder', () => {
     expect(initial.prefs.panelOrder).toEqual([
       'daily', 'blocks', 'monthly', 'weekly',
       'projects',  // spliced at canonical index 4
-      'sessions', 'trend', 'forecast', 'current-week', 'alerts',
+      'sessions', 'trend', 'forecast', 'alerts',  // current-week dropped (#248)
       'cache-report',  // appended by reconciler since not in v1 saved order
     ]);
-    expect(initial.prefs.panelOrderSchemaVersion).toBe(2);
+    expect(initial.prefs.panelOrder).not.toContain('current-week');
+    expect(initial.prefs.panelOrderSchemaVersion).toBe(3);
     // Migration is persisted immediately so a refresh doesn't re-fire it.
     const raw = localStorage.getItem('ccusage.dashboard.prefs');
-    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(2);
+    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(3);
+    expect(JSON.parse(raw!).panelOrder).not.toContain('current-week');
   });
 
   it('reconciles a stale saved order (drops unknown, appends missing)', () => {
@@ -78,11 +80,13 @@ describe('Prefs.panelOrder', () => {
 import { dispatch } from '../src/store/store';
 
 describe('REORDER_PANELS action', () => {
+  // Default grid order (#248): forecast, trend, sessions, projects, weekly, …
   it('moves panel from index 0 to index 3', () => {
     dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
     const order = getState().prefs.panelOrder;
-    expect(order[3]).toBe('current-week');
-    expect(order[0]).toBe('forecast');
+    // 'forecast' moves to index 3; 'trend' shifts up into index 0.
+    expect(order[3]).toBe('forecast');
+    expect(order[0]).toBe('trend');
   });
 
   it('persists to localStorage', () => {
@@ -90,8 +94,8 @@ describe('REORDER_PANELS action', () => {
     const raw = localStorage.getItem('ccusage.dashboard.prefs');
     expect(raw).toBeTruthy();
     const parsed = JSON.parse(raw!) as { panelOrder: string[] };
-    expect(parsed.panelOrder[0]).toBe('forecast');
-    expect(parsed.panelOrder[1]).toBe('current-week');
+    expect(parsed.panelOrder[0]).toBe('trend');
+    expect(parsed.panelOrder[1]).toBe('forecast');
   });
 
   it('is a no-op when from === to', () => {
@@ -109,19 +113,20 @@ describe('REORDER_PANELS action', () => {
   });
 });
 
-describe('SWAP_PANELS action', () => {
+describe('SWAP_PANELS action (immediate-neighbor; tier-awareness lands in Task 3)', () => {
+  // Default grid order (#248): forecast, trend, sessions, projects, weekly, …
   it('swaps with next neighbor (direction=+1)', () => {
     dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
     const order = getState().prefs.panelOrder;
-    expect(order[0]).toBe('forecast');
-    expect(order[1]).toBe('current-week');
+    expect(order[0]).toBe('trend');
+    expect(order[1]).toBe('forecast');
   });
 
   it('swaps with previous neighbor (direction=-1)', () => {
     dispatch({ type: 'SWAP_PANELS', index: 1, direction: -1 });
     const order = getState().prefs.panelOrder;
-    expect(order[0]).toBe('forecast');
-    expect(order[1]).toBe('current-week');
+    expect(order[0]).toBe('trend');
+    expect(order[1]).toBe('forecast');
   });
 
   it('is a no-op at the start (index=0, direction=-1)', () => {
@@ -182,7 +187,7 @@ describe('RESET_PREFS preserves onboardingToastSeen, resets panelOrder', () => {
 describe('drag preview lifecycle', () => {
   it('SET_DRAG_PREVIEW stores a preview order without touching prefs.panelOrder or localStorage', () => {
     const before = [...getState().prefs.panelOrder];
-    const preview: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'current-week'];
+    const preview: GridPanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'cache-report'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     expect(getState().dragPreviewOrder).toEqual(preview);
     expect(getState().prefs.panelOrder).toEqual(before);
@@ -195,7 +200,7 @@ describe('drag preview lifecycle', () => {
   });
 
   it('COMMIT_DRAG_PREVIEW promotes preview to prefs.panelOrder and persists', () => {
-    const preview: PanelId[] = ['forecast', 'current-week', 'trend', 'sessions', 'weekly', 'monthly', 'blocks', 'daily'];
+    const preview: GridPanelId[] = ['forecast', 'cache-report', 'trend', 'sessions', 'weekly', 'monthly', 'blocks', 'daily'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     dispatch({ type: 'COMMIT_DRAG_PREVIEW' });
     expect(getState().dragPreviewOrder).toBeNull();
@@ -214,7 +219,7 @@ describe('drag preview lifecycle', () => {
 
   it('CLEAR_DRAG_PREVIEW discards the preview without changing prefs', () => {
     const before = [...getState().prefs.panelOrder];
-    const preview: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'current-week'];
+    const preview: GridPanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'cache-report'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     dispatch({ type: 'CLEAR_DRAG_PREVIEW' });
     expect(getState().dragPreviewOrder).toBeNull();

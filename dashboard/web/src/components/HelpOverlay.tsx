@@ -3,12 +3,12 @@ import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { dispatch, getState, subscribeStore } from '../store/store';
-import { PANEL_REGISTRY, type PanelId } from '../lib/panelRegistry';
+import { PANEL_REGISTRY, type GridPanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { ModalHeader } from '../modals/ModalHeader';
 
 interface KeyTableProps {
-  panelOrder: readonly PanelId[];
+  panelOrder: readonly GridPanelId[];
 }
 
 // Data-driven non-positional shortcut rows (#207 D1). Single-key

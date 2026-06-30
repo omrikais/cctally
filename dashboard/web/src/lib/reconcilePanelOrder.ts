@@ -1,53 +1,62 @@
-import type { PanelId } from './panelIds';
+import type { PanelId, GridPanelId } from './panelIds';
 
-// Panel-order schema migrations (spec §2.1). The localStorage cursor
-// lives in `prefs.panelOrderSchemaVersion`; this module exports the
+// Panel-order schema migrations (spec §2.1; #248 §3). The localStorage
+// cursor lives in `prefs.panelOrderSchemaVersion`; this module exports the
 // pure migration so the loader (`loadInitial` in store/store.ts) can
 // thread it before `reconcilePanelOrder` runs.
 //
 // Bumping schema version: add a new branch below + bump
 // `CURRENT_PANEL_ORDER_SCHEMA_VERSION`. The migration runs once on
 // first load and the new cursor is persisted alongside prefs.
-export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 2;
+//
+// Versions:
+//   1 → pre-projects schema (9 default panels).
+//   2 → 'projects' spliced at canonical index 4.
+//   3 → (#248) 'current-week' removed from the grid (it is the HeroStrip).
+export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 3;
 // Canonical position of 'projects' in DEFAULT_PANEL_ORDER (spec §2.1).
 const PROJECTS_INSERT_INDEX = 4;
 
 export interface MigrationResult {
-  panels: PanelId[];
+  panels: GridPanelId[];
   newVersion: number;
 }
 
 /**
- * Apply the v1→v2 migration: splice 'projects' at canonical index 4 of
- * the saved order (clamped to the end if saved is shorter). Idempotent:
- * callers on v2+ get their input back unchanged. The 'projects'
- * already-present branch covers users who manually edited their saved
- * order (or had a concurrent tab migrate them first).
+ * Apply the CUMULATIVE panel-order migration up to
+ * `CURRENT_PANEL_ORDER_SCHEMA_VERSION`. Steps are applied in order so a
+ * stale (v1) user is brought all the way forward in a single pass:
  *
- * Run BEFORE `reconcilePanelOrder` — the reconcile pass relies on the
- * canonical set (`DEFAULT_PANEL_ORDER`) which now includes 'projects',
- * so without this splice a v1 user's saved order would just append
- * 'projects' at the END (lossy w.r.t. spec §2.1's canonical position).
+ *   • v1→v2: splice 'projects' at canonical index 4 of the saved order
+ *     (clamped to the end if saved is shorter), unless already present.
+ *     Run BEFORE `reconcilePanelOrder` — the reconcile pass relies on the
+ *     canonical set (`DEFAULT_PANEL_ORDER`), so without this splice a v1
+ *     user's saved order would just append 'projects' at the END (lossy
+ *     w.r.t. spec §2.1's canonical position).
+ *   • v2→v3 (#248): drop 'current-week' — it left the grid (it is the
+ *     hero now). The loader persists the cleaned order back to
+ *     localStorage once, rather than re-filtering in memory every load.
+ *
+ * Idempotent: callers already on CURRENT get their input back unchanged
+ * (typed to GridPanelId — a current-cursor user can't carry 'current-week').
  */
 export function applyPanelOrderMigration(
   saved: PanelId[] | null | undefined,
   currentVersion: number,
 ): MigrationResult {
   if (currentVersion >= CURRENT_PANEL_ORDER_SCHEMA_VERSION) {
-    return { panels: saved ?? [], newVersion: currentVersion };
+    return { panels: (saved ?? []) as GridPanelId[], newVersion: currentVersion };
   }
-  if (!saved || saved.length === 0) {
-    return { panels: [], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
+  let panels: PanelId[] = saved ? [...saved] : [];
+  // v1 → v2: splice 'projects' at its canonical index if missing.
+  if (currentVersion < 2 && panels.length > 0 && !panels.includes('projects')) {
+    panels.splice(Math.min(PROJECTS_INSERT_INDEX, panels.length), 0, 'projects');
   }
-  if (saved.includes('projects')) {
-    // Already-present branch — user (or another tab) is ahead of the
-    // cursor; just advance the version. Don't re-splice or dedup.
-    return { panels: saved, newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
+  // v2 → v3 (#248): drop 'current-week' (removed from the grid).
+  if (currentVersion < 3) {
+    panels = panels.filter((id) => id !== 'current-week');
   }
-  const out = [...saved];
-  const insertAt = Math.min(PROJECTS_INSERT_INDEX, out.length);
-  out.splice(insertAt, 0, 'projects');
-  return { panels: out, newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
+  return { panels: panels as GridPanelId[], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
 }
 
 /**
@@ -57,16 +66,20 @@ export function applyPanelOrderMigration(
  *   3. Append canonical ids missing from saved at the end (panel added),
  *      preserving canonical relative order.
  *
- * If `saved` is null/empty, return a copy of canonical.
+ * If `saved` is null/empty, return a copy of canonical. Generic over the
+ * id type so the runtime backstop preserves the caller's narrowing —
+ * `DEFAULT_PANEL_ORDER` is `GridPanelId[]`, so the store gets
+ * `GridPanelId[]` back (and any 'current-week' in a stale saved order is
+ * dropped here too, since it isn't in the canonical grid set).
  */
-export function reconcilePanelOrder(
-  saved: PanelId[] | null | undefined,
-  canonical: PanelId[],
-): PanelId[] {
+export function reconcilePanelOrder<T extends PanelId>(
+  saved: readonly T[] | null | undefined,
+  canonical: readonly T[],
+): T[] {
   if (!saved || !Array.isArray(saved) || saved.length === 0) return [...canonical];
-  const canonicalSet = new Set(canonical);
-  const seen = new Set<PanelId>();
-  const filtered: PanelId[] = [];
+  const canonicalSet = new Set<T>(canonical);
+  const seen = new Set<T>();
+  const filtered: T[] = [];
   for (const id of saved) {
     if (!canonicalSet.has(id)) continue;
     if (seen.has(id)) continue;

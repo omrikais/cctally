@@ -17,7 +17,7 @@ import {
 import { _resetForTests, getState, updateSnapshot } from '../src/store/store';
 import fixture from './fixtures/envelope.json';
 import type { Envelope } from '../src/types/envelope';
-import type { PanelId } from '../src/lib/panelRegistry';
+import type { GridPanelId } from '../src/lib/panelRegistry';
 
 beforeEach(() => {
   localStorage.clear();
@@ -26,45 +26,45 @@ beforeEach(() => {
   updateSnapshot(fixture as unknown as Envelope);
 });
 
-function renderInDnd(items: PanelId[], ui: ReactNode): RenderResult {
+function renderInDnd(items: GridPanelId[], ui: ReactNode): RenderResult {
   return render(<PanelGridDnd items={items}>{ui}</PanelGridDnd>);
 }
 
 describe('<PanelHost />', () => {
   it('renders the registered component for the given id', () => {
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-    expect(document.querySelector('[data-panel-kind="current-week"]')).toBeTruthy();
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    expect(document.querySelector('[data-panel-kind="forecast"]')).toBeTruthy();
   });
 
   it('attaches data-panel-host + data-panel-index for hit-testing', () => {
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={3} />);
-    const host = document.querySelector('[data-panel-host="current-week"]') as HTMLElement;
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={3} />);
+    const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     expect(host).toBeTruthy();
     expect(host.dataset.panelIndex).toBe('3');
   });
 
   it('Shift+ArrowDown swaps the panel with its successor', async () => {
     const user = userEvent.setup();
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
     // The wrapper carries the onKeyDown handler; focus the inner panel — the
     // keydown bubbles up to the wrapper.
-    const inner = document.querySelector('[data-panel-kind="current-week"]') as HTMLElement;
+    const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     inner.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
-    expect(getState().prefs.panelOrder[1]).toBe('current-week');
+    expect(getState().prefs.panelOrder[1]).toBe('forecast');
   });
 
   it('a quick click on the inner panel still opens its modal', async () => {
     const user = userEvent.setup();
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-    const inner = document.querySelector('[data-panel-kind="current-week"]') as HTMLElement;
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     await user.click(inner);
-    expect(getState().openModal).toBe('current-week');
+    expect(getState().openModal).toBe('forecast');
   });
 
   it('a click is suppressed while the post-drag flag is armed', () => {
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-    const inner = document.querySelector('[data-panel-kind="current-week"]') as HTMLElement;
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
 
     // Simulate the dnd-kit drag-end path arming click suppression. The flag
     // clears on the next macrotask (setTimeout 0) but the synchronous click
@@ -80,8 +80,8 @@ describe('<PanelHost />', () => {
   });
 
   it('does not introduce an extra tab stop alongside the inner panel', () => {
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-    const host = document.querySelector('[data-panel-host="current-week"]') as HTMLElement;
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     // The wrapper must NOT be focusable — the inner panel section owns the
     // tab stop and Enter/Space modal-open behavior. Without this guard,
     // dnd-kit's sortable attributes would put role=button + tabIndex=0 on
@@ -102,8 +102,8 @@ describe('<PanelHost />', () => {
       onchange: null,
     } as unknown as MediaQueryList));
     try {
-      renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-      const host = document.querySelector('[data-panel-host="current-week"]') as HTMLElement;
+      renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+      const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
       // The wrapper's inline style.transition must be empty; otherwise the
       // sortable transform would still animate even with reduced-motion on.
       expect(host.style.transition).toBe('');
@@ -114,8 +114,8 @@ describe('<PanelHost />', () => {
 
   it('Shift+Arrow inside an editable descendant does not reorder', async () => {
     const user = userEvent.setup();
-    renderInDnd(['current-week'], <PanelHost id="current-week" index={0} />);
-    const host = document.querySelector('[data-panel-host="current-week"]') as HTMLElement;
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     // Inject a text input and dispatch Shift+Arrow from there. The wrapper's
     // onKeyDown must skip the swap so the user's text-selection gesture
     // works normally.
@@ -163,7 +163,7 @@ describe('<PanelGridDnd /> store wiring', () => {
   });
 
   it('handleDragEndAction arms click suppression', () => {
-    handleDragEndAction('current-week', null);
+    handleDragEndAction('forecast', null);
     expect(shouldSuppressNextClick()).toBe(true);
   });
 

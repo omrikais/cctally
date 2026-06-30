@@ -12,7 +12,7 @@ import {
 } from '@dnd-kit/sortable';
 import { dispatch, getState } from '../store/store';
 import { armClickSuppression } from '../lib/clickSuppression';
-import type { PanelId } from '../lib/panelRegistry';
+import type { GridPanelId } from '../lib/panelRegistry';
 
 const ACTIVATION_DELAY_MS = 250;
 const ACTIVATION_TOLERANCE_PX = 5;
@@ -29,8 +29,8 @@ export function handleDragStartAction(): void {
 }
 
 export function handleDragEndAction(
-  activeId: PanelId,
-  overId: PanelId | null,
+  activeId: GridPanelId,
+  overId: GridPanelId | null,
 ): void {
   armClickSuppression();
   if (!overId || activeId === overId) {
@@ -52,7 +52,7 @@ export function PanelGridDnd({
   items,
   children,
 }: {
-  items: PanelId[];
+  items: GridPanelId[];
   children: ReactNode;
 }) {
   // delay/tolerance combine to give a long-press feel: a quick click never
@@ -82,8 +82,8 @@ export function PanelGridDnd({
       sensors={sensors}
       onDragStart={() => handleDragStartAction()}
       onDragEnd={(e: DragEndEvent) => {
-        const activeId = e.active.id as PanelId;
-        const overId = e.over ? (e.over.id as PanelId) : null;
+        const activeId = e.active.id as GridPanelId;
+        const overId = e.over ? (e.over.id as GridPanelId) : null;
         handleDragEndAction(activeId, overId);
       }}
       onDragCancel={() => handleDragCancelAction()}
