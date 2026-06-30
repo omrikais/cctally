@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -42,6 +43,7 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
           />
         ))}
       </div>
+      <ModelLegend models={r.models} />
     </div>
   );
 }

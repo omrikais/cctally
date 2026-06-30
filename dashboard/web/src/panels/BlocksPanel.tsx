@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -55,6 +56,7 @@ function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number;
           ))}
         </div>
       </div>
+      <ModelLegend models={r.models} />
     </div>
   );
 }

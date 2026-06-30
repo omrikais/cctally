@@ -221,4 +221,45 @@ describe('<CurrentWeekModal />', () => {
       expect(tenCount).toBe(2);
     });
   });
+
+  // ---- #249 CW-1 — early-week crossing-tick gate -------------------
+  //
+  // `pct` is driven by `current_week.used_pct` (CurrentWeekModal.tsx:
+  // `const pct = clamp0_100(cw?.used_pct)`). Below 15% used the overlay
+  // (#mcw-ticks) is omitted; the big number, fill, marker, and the
+  // 0/25/50/75/100 scale all stay. The milestone shape matches the
+  // `Milestone` envelope interface (crossed_at_utc / cumulative_usd /
+  // marginal_usd / five_hour_pct_at_cross).
+  function envWithPct(pct: number): Envelope {
+    const e = JSON.parse(JSON.stringify(fixture)) as Envelope;
+    const cw = e.current_week!;
+    cw.used_pct = pct;
+    cw.milestones = [
+      {
+        percent: 1,
+        crossed_at_utc: '2026-06-30T00:00:00Z',
+        cumulative_usd: 1,
+        marginal_usd: 1,
+        five_hour_pct_at_cross: null,
+      },
+    ];
+    return e;
+  }
+
+  describe('#249 CW-1 — early-week tick gate', () => {
+    it('hides the crossing-tick overlay below 15% used', () => {
+      _resetForTests();
+      updateSnapshot(envWithPct(11));
+      render(<CurrentWeekModal />);
+      expect(document.getElementById('mcw-ticks')).toBeNull();
+      // the 0/25/50/75/100 scale still renders
+      expect(document.querySelector('.mcw-pscale')?.children.length).toBe(5);
+    });
+    it('shows the crossing-tick overlay at/above 15% used', () => {
+      _resetForTests();
+      updateSnapshot(envWithPct(40));
+      render(<CurrentWeekModal />);
+      expect(document.getElementById('mcw-ticks')).not.toBeNull();
+    });
+  });
 });

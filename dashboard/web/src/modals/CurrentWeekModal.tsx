@@ -5,6 +5,7 @@ import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
 import type { Milestone, FiveHourMilestone, FiveHourCredit } from '../types/envelope';
 
 function clamp0_100(v: number | null | undefined): number {
@@ -134,16 +135,18 @@ export function CurrentWeekModal() {
           <div className="mcw-pbar-wrap">
             <div className="mcw-pbar">
               <div className="fill" id="mcw-fill" style={{ width: pct + '%' }} />
-              <div className="ticks" id="mcw-ticks">
-                {ticks.map((m) => (
-                  <div
-                    key={m.percent}
-                    className="tick"
-                    data-p={String(m.percent)}
-                    style={{ left: clamp0_100(m.percent) + '%' }}
-                  />
-                ))}
-              </div>
+              {shouldShowMilestoneTicks(pct) && (
+                <div className="ticks" id="mcw-ticks">
+                  {ticks.map((m) => (
+                    <div
+                      key={m.percent}
+                      className="tick"
+                      data-p={String(m.percent)}
+                      style={{ left: clamp0_100(m.percent) + '%' }}
+                    />
+                  ))}
+                </div>
+              )}
               <div className="marker" id="mcw-marker" style={{ left: pct + '%' }} />
             </div>
             <div className="mcw-pscale">

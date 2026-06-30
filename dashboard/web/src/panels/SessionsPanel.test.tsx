@@ -49,3 +49,34 @@ describe('SessionsPanel project-cell title (#207 C4)', () => {
     expect(btn).toHaveAttribute('title', long);
   });
 });
+
+describe('#249 C3 — single-model collapse', () => {
+  it('collapses the model column to a caption + ditto cells when all rows share one model', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', model: 'claude-opus-4-8', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 'b', model: 'claude-opus-4-8', project: 'beta', project_key: 'beta' }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    // caption present, model filter chips gone, ditto cells present
+    expect(container.querySelector('.sess-model-caption')?.textContent).toContain('opus-4-8');
+    expect(container.querySelector('.model-chip')).toBeNull();
+    expect(container.querySelectorAll('.model-ditto').length).toBe(2);
+    expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(true);
+  });
+
+  it('keeps per-row model chips and no caption for a multi-model set', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', model: 'claude-opus-4-8' }),
+      sessRow({ session_id: 'b', model: 'claude-sonnet-5' }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('.sess-model-caption')).toBeNull();
+    expect(container.querySelectorAll('.model-chip').length).toBe(2);
+    expect(container.querySelector('.model-ditto')).toBeNull();
+    expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(false);
+  });
+});

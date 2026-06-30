@@ -953,6 +953,28 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .sess-table tbody td.cost-xs   { color: var(--accent-green); }
 .sess-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 
+/* #249 C3 — single-model collapse: one header caption + dimmed ditto cells. */
+.sess-model-caption {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--fs-body); color: var(--text-dim); white-space: nowrap;
+}
+.sess-table tbody td .model-ditto { color: var(--text-faint); }
+.sess-table tbody td.model-ditto-cell { text-align: center; width: 1.5em; }
+
+/* #249 C3 — when the model column is collapsed, give the freed width to the
+   Project column: size to content, WRAP before ellipsize (no last-resort
+   truncation at default width). Scoped to .single-model so the multi-model
+   layout is byte-unchanged. DESKTOP-ONLY (min-width:641px): the mobile card
+   reflow keeps its own one-line ellipsis for the project area, so a single-
+   model phone view stays visually identical to a multi-model one (this
+   override would otherwise outrank the mobile td.project nowrap/ellipsis and
+   wrap names only in single-model mode). Overrides the desktop max-width:220px
+   + nowrap on td.project and the nested .project-cell-link. */
+@media (min-width: 641px) {
+  .sess-table.single-model tbody td.project { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
+  .sess-table.single-model tbody td.project .project-cell-link { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
+}
+
 /* #208: the Sessions columns (Started · Dur · Model · Project · Cost, all
    white-space:nowrap) sum past the panel card at narrow 2-col widths
    (1100–1600px) — the panel has no overflow:hidden, so the Cost column
@@ -1010,6 +1032,12 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   color: var(--text-dim); font-size: 13px;
   flex-wrap: wrap;
 }
+/* #249 F1 — the keyboard-hint strip means nothing on touch. The ≤640px block
+   already hides it on phones; this also covers coarse-pointer devices wider
+   than 640px (touch tablets/laptops). Desktop (fine pointer) keeps the strip —
+   it remains the only Settings/Help discovery until S7 (#253) ships the
+   desktop header icons (HDR-1). */
+@media (pointer: coarse) { .footer { display: none; } }
 .kb { display: inline-flex; align-items: center; gap: 8px; }
 .kb kbd {
   background: var(--panel-bg-2);
@@ -2210,6 +2238,20 @@ mark.current {
 .model-stack > span.fable   { background: var(--chip-fable); }
 .model-stack > span.other   { background: var(--surface-faint); }
 
+/* #249 C6 — inline model-split legend (Weekly/Monthly/Blocks). */
+.model-legend {
+  display: flex; flex-wrap: wrap; gap: 3px 10px;
+  margin-top: 4px; font-size: 11px; color: var(--text-dim);
+}
+.model-legend .ms-leg { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.model-legend .ms-more { color: var(--text-faint); }
+.ms-dot { width: 8px; height: 8px; border-radius: var(--radius-circle); flex: none; }
+.ms-dot.opus { background: var(--chip-opus); }
+.ms-dot.sonnet { background: var(--chip-sonnet); }
+.ms-dot.haiku { background: var(--chip-haiku); }
+.ms-dot.fable { background: var(--chip-fable); }
+.ms-dot.other { background: var(--surface-faint); }
+
 /* Weekly / Monthly panel-foot — single line "<n>w total · $324.18" with
    the dim label, faint dot separator, and bright tabular-nums total.
    Spec §2.5. */
@@ -2744,24 +2786,6 @@ mark.current {
   transition: box-shadow 120ms ease;
 }
 
-/* Hover affordance: faint "hold to rearrange" hint, shown only on hover of the
-   host (no pointer-events so it doesn't block clicks). */
-.panel-grip-hint {
-  position: absolute;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 100ms ease;
-  color: var(--text-dim);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  z-index: 2;
-  bottom: 6px;
-  right: 14px;
-  font-size: 9px;
-  font-style: italic;
-}
-.panel-host:hover .panel-grip-hint {
-  opacity: 0.55;
-}
 .panel-host:hover,
 .panel-host:hover > .panel {
   cursor: pointer;
@@ -2771,14 +2795,15 @@ mark.current {
   cursor: grabbing;
 }
 
-/* Touch-only drag handle, rendered inside each panel's .panel-header next
-   to the chevron (or as the rightmost header element when no chevron is
-   present). Visible only on devices with a coarse pointer. dnd-kit
-   listeners stay on .panel-host; this element exists purely to provide a
-   `touch-action: none` zone so the browser doesn't preempt the long-press
-   as a page-pan on iOS. The pointerdown bubbles up to the panel-host
-   listener and starts the drag; long-press anywhere else lets the page
-   scroll normally. Bare like the chevron — no background, no border. */
+/* Drag handle, rendered inside each panel's .panel-header next to the chevron
+   (or as the rightmost header element when no chevron is present). Persistent
+   on every pointer type since #249 I1 (low-contrast at rest; the
+   `.panel-host:hover` rule below brightens it on desktop so drag-reorder is
+   discoverable without hovering). dnd-kit listeners stay on .panel-host; this
+   element provides a `touch-action: none` zone so the browser doesn't preempt
+   the long-press as a page-pan on iOS. The pointerdown bubbles up to the
+   panel-host listener and starts the drag; long-press anywhere else lets the
+   page scroll normally. Bare like the chevron — no background, no border. */
 .panel-grip {
   display: inline-flex;
   align-items: center;
@@ -2804,9 +2829,9 @@ mark.current {
 .panel-header > .panel-grip {
   margin-left: auto;
 }
-@media (pointer: fine) {
-  .panel-grip { display: none; }
-}
+/* #249 I1 — the grip is now persistent on desktop too (low-contrast at rest);
+   brighten it when the host is hovered so it advertises drag-reorder. */
+.panel-host:hover .panel-grip { color: var(--text); }
 
 /* Layout fieldset in Settings */
 .settings-fs.layout-fs .settings-btn {
@@ -4213,10 +4238,6 @@ mark.current {
     flex: 1 1 auto;
   }
 
-  /* Drag-to-reorder hover hint is meaningless on touch — the toast +
-     help overlay carry the same copy. */
-  .panel-grip-hint { display: none !important; }
-
   /* Generic tap-target floor for the small interactive elements that
      escape the per-component rules above. Selectors restricted to
      classes that actually exist in this codebase. */
@@ -4444,6 +4465,10 @@ mark.current {
   /* #247 S1 (D7) — Trend values reach the 14px floor (were 13px); the thead
      stays at its label size (don't bump labels). */
   #root .trend-table tbody td { font-size: var(--fs-data); }
+
+  /* #249 C6 — the inline model-split legend clears the 14px mobile data floor
+     (desktop renders it at 11px). #root outranks the bare-class rule above. */
+  #root .model-legend { font-size: var(--fs-data); }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------

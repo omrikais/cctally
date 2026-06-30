@@ -15,6 +15,7 @@ import { ShareIcon } from '../components/ShareIcon';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
+import { singleModelLabel } from '../lib/sessionsModel';
 import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { openShareModal } from '../store/shareSlice';
@@ -53,6 +54,13 @@ export function SessionsPanel() {
 
   const isMobile = useIsMobile();
   const total = env?.sessions?.total ?? 0;
+  // C3 (#249): collapse the redundant per-row model column when the WHOLE
+  // session set is one model. Computed over env.sessions.rows (NOT the
+  // filtered/paged `filtered` below) so a project-filtered single-model view
+  // keeps its meaningful model-filter chips.
+  const allSessionRows = env?.sessions?.rows ?? [];
+  const oneModel = singleModelLabel(allSessionRows);
+  const oneModelRaw = oneModel ? (allSessionRows[0]?.model ?? '') : '';
   // Conversation viewer (spec §4 entry). The per-row "open conversation"
   // affordance is shown only when transcripts are enabled for THIS
   // request (loopback, or LAN with dashboard.expose_transcripts). Absent
@@ -108,6 +116,12 @@ export function SessionsPanel() {
           <h2>
             Recent Sessions <span className="sub">({total} total)</span>
           </h2>
+          {oneModel && (
+            <span className="sess-model-caption" title={`All sessions use ${oneModelRaw}`}>
+              <span className={`ms-dot ${modelChipClass(oneModelRaw)}`} aria-hidden="true" />
+              all · {oneModel}
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {!isMobile && <SessionsControls />}
@@ -141,7 +155,7 @@ export function SessionsPanel() {
       </div>
       {isMobile && <SessionsControls />}
       <div className="panel-body panel-body--scroll" id="panel-sessions-body">
-        <table className="sess-table">
+        <table className={'sess-table' + (oneModel ? ' single-model' : '')}>
           <SortableHeader
             columns={columns}
             override={sessionsOverride}
@@ -194,16 +208,22 @@ export function SessionsPanel() {
                     {fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}
                   </td>
                   <td>{r.duration_min}m</td>
-                  <td onClick={(e) => e.stopPropagation()}>
-                    <button
-                      type="button"
-                      className={`chip model-chip ${chipCls}`}
-                      aria-label={chipLabel}
-                      onClick={() => dispatch({ type: 'SET_FILTER', text: r.model })}
-                    >
-                      {r.model}
-                    </button>
-                  </td>
+                  {oneModel ? (
+                    <td className="model-ditto-cell">
+                      <span className="model-ditto" aria-hidden="true">·</span>
+                    </td>
+                  ) : (
+                    <td onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        className={`chip model-chip ${chipCls}`}
+                        aria-label={chipLabel}
+                        onClick={() => dispatch({ type: 'SET_FILTER', text: r.model })}
+                      >
+                        {r.model}
+                      </button>
+                    </td>
+                  )}
                   <td className="project">
                     {r.project_key && r.project_key !== '(unknown)' ? (
                       <button

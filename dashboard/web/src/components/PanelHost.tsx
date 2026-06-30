@@ -91,11 +91,9 @@ export function PanelHost({ id, index }: PanelHostProps) {
       onClickCapture={onClickCapture}
       {...listeners}
     >
-      {/* Hover affordance: "hold to rearrange" hint shown via CSS on hover.
-         The touch-only drag handle (.panel-grip) is rendered inside each
-         panel's own .panel-header so it sits next to the chevron rather
-         than overlapping it; see components/PanelGrip.tsx. */}
-      <span className="panel-grip-hint" aria-hidden="true">hold to rearrange</span>
+      {/* The drag handle (.panel-grip) renders inside each panel's own
+         .panel-header (see components/PanelGrip.tsx). dnd-kit pointer
+         listeners live on this .panel-host wrapper. */}
       <Component />
     </div>
   );

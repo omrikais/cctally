@@ -1,10 +1,10 @@
-// Touch-only drag handle rendered inside each panel's .panel-header.
-// Hidden on devices with a fine pointer (mouse/trackpad) via CSS @media,
-// so desktop users see no chrome change. dnd-kit's pointer listeners
-// live on the surrounding .panel-host wrapper (PanelHost.tsx); the grip's
-// only job is to provide a `touch-action: none` zone where the browser
-// won't preempt the long-press as a page-pan. PointerEvents bubble up to
-// the panel-host listener and start the drag.
+// Drag handle rendered inside each panel's .panel-header. Persistent on ALL
+// pointer types since #249 I1 (low-contrast at rest, brighter on host hover)
+// so desktop users can discover drag-reorder without hovering; on touch it
+// also provides the `touch-action: none` zone the long-press needs so the
+// browser doesn't preempt it as a page-pan. dnd-kit's pointer listeners live
+// on the surrounding .panel-host wrapper (PanelHost.tsx); PointerEvents bubble
+// up to that listener and start the drag.
 export function PanelGrip() {
   return (
     <span className="panel-grip" aria-hidden="true">⋮⋮</span>
