@@ -6,6 +6,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- Dashboard styling is now built entirely on the shared design tokens: every `border-radius`, `box-shadow`, and accent colour across the dashboard chrome (rgba *and* hex) resolves to the radius/shadow/accent token scale instead of a raw literal, with a small documented allowlist for intentional data-viz and bespoke values. A new global lint keeps it that way — it fails the build if any orphan literal creeps back into the dashboard CSS (the conversation viewer, which owns its own token story, is excluded). There is no visible change; this is the maintainability follow-through on the #247 token foundation (#255).
 - Dashboard cards now wear a calm, neutral chrome: borders, hover elevation, header dividers, the keyboard focus ring, and every panel header title read in one consistent neutral treatment instead of eleven competing accent colours, and accent colour is reserved for genuine state — Cache Report's healthy/anomaly header and the Forecast verdict keep their meaningful hues while healthy cards stay quiet; the look is built on a new radius/shadow/type-scale design-token foundation, and Recent Sessions now caps its height and scrolls internally with its column headers pinned (#247).
 
 ### Fixed

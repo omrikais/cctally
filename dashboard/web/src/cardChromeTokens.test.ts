@@ -108,3 +108,165 @@ describe('#247 S1 mobile form-control & data floor', () => {
     expect(mobile).toMatch(/var\(--fs-data\)/);
   });
 });
+
+// ============================================================================
+// #255 — GLOBAL no-orphan-literal lint (border-radius / box-shadow / accent).
+// Promotes the S1 scoped lint to a whole-dashboard ban. Operates on a
+// newline-preserving MASKED copy of index.css (so an index maps 1:1 to a raw
+// line — allow-markers are read from the raw text) and excludes the
+// conversation-viewer (#228 owns its token story) by BOTH the section banner
+// position AND a selector namespace — the two are complementary (see isConvScope).
+// `rawCss` / `root` are reused from the S1 block above.
+// ============================================================================
+const rawCss255 = existsSync(cssPath) ? readFileSync(cssPath, 'utf8') : '';
+// Mask block comments but keep their newlines, so masked indices share line
+// numbers with rawCss255. (S1's `css` collapses lines — do NOT reuse it here.)
+const masked = rawCss255.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''));
+const rawLines255 = rawCss255.split('\n');
+
+// A rule is conversation-viewer scope (excluded) iff its selector is namespaced.
+const CONV_SELECTOR = /\.(conv-|comparison|view-switcher|view-seg|sess-open-conv)\b/;
+// The conversation-viewer region begins at this banner; everything at/after it
+// is #228's token story, excluded by POSITION. This complements the selector
+// predicate: the suffix has conv rules whose selector carries NO conv- prefix
+// (`.codeblock`, `.md code/pre`, a `@keyframes conv-jump-flash` step `0%`), which
+// the selector check alone would miss; the selector check in turn catches conv
+// rules that interleave BEFORE the banner. A missing banner fails loudly (below).
+const convBannerLine = rawLines255.findIndex((l) => l.includes('Conversation viewer (spec §4)')) + 1;
+// A literal at `idx` is conversation-viewer scope (excluded) if it sits at/after
+// the banner OR inside a conv-namespaced rule.
+function isConvScope(idx: number): boolean {
+  return (convBannerLine > 0 && lineAt(idx) >= convBannerLine) || CONV_SELECTOR.test(enclosingSelector(idx));
+}
+
+// Accent colour set, derived from the :root --accent-* definitions themselves —
+// adding a future accent auto-extends the ban (no hand-maintained list).
+const accentHexes = new Set<string>();
+const accentTriples = new Set<string>();
+for (const mm of root.matchAll(/--accent-[a-z]+\s*:\s*#([0-9a-fA-F]{6})\b/g)) {
+  const hex = mm[1].toLowerCase();
+  accentHexes.add(hex);
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  accentTriples.add(`${r},${g},${b}`);
+}
+
+function lineAt(index: number): number {
+  let n = 1;
+  for (let k = 0; k < index; k++) if (masked.charCodeAt(k) === 10) n++;
+  return n;
+}
+// Selector of the rule whose declaration block contains `index` (nearest
+// unmatched `{` going back; @media/@supports wrappers are one level further out).
+function enclosingSelector(index: number): string {
+  let depth = 0, open = -1;
+  for (let j = index - 1; j >= 0; j--) {
+    const c = masked[j];
+    if (c === '}') depth++;
+    else if (c === '{') { if (depth === 0) { open = j; break; } depth--; }
+  }
+  if (open < 0) return '';
+  let start = 0;
+  for (let j = open - 1; j >= 0; j--) if (masked[j] === '{' || masked[j] === '}') { start = j + 1; break; }
+  return masked.slice(start, open).trim();
+}
+// Property name of the declaration containing `index` (text before its first `:`).
+function enclosingProperty(index: number): string {
+  let start = 0;
+  for (let j = index - 1; j >= 0; j--) { const c = masked[j]; if (c === '{' || c === '}' || c === ';') { start = j + 1; break; } }
+  const seg = masked.slice(start, index);
+  const colon = seg.indexOf(':');
+  return (colon >= 0 ? seg.slice(0, colon) : seg).trim();
+}
+function allowMarked(line: number, prop: string): boolean {
+  const m = (rawLines255[line - 1] ?? '').match(/\/\*\s*lint-allow:\s*([a-z-]+)/i);
+  return !!m && m[1].toLowerCase() === prop.toLowerCase();
+}
+
+type V = { line: number; selector: string; detail: string };
+const fmt = (vs: V[]) => '\n' + vs.map((x) => `  ${x.line}: ${x.selector} — ${x.detail}`).join('\n');
+
+function radiusViolations(): V[] {
+  const out: V[] = [];
+  for (const m of masked.matchAll(/border-radius\s*:\s*([^;}]*)/g)) {
+    const idx = m.index ?? 0;
+    if (isConvScope(idx)) continue;
+    // Strip token refs + explicit 0 + inherit; any remaining number/% = raw literal.
+    const stripped = m[1].replace(/var\([^)]*\)/g, '').replace(/\binherit\b/g, '').replace(/\b0\b/g, '').trim();
+    if (!/\d|%/.test(stripped)) continue;
+    const line = lineAt(idx);
+    if (!allowMarked(line, 'border-radius')) out.push({ line, selector: enclosingSelector(idx), detail: `border-radius: ${m[1].trim()}` });
+  }
+  return out;
+}
+function shadowViolations(): V[] {
+  const out: V[] = [];
+  for (const m of masked.matchAll(/box-shadow\s*:\s*([^;}]*)/g)) {
+    const idx = m.index ?? 0;
+    if (isConvScope(idx)) continue;
+    // Strip var() FIRST (so nested color-mix parens collapse), then color-mix();
+    // any remaining rgba()/hex = raw colour term → fail.
+    const stripped = m[1].replace(/var\([^)]*\)/g, '').replace(/color-mix\([^)]*\)/g, '');
+    if (!/rgba?\(|#[0-9a-fA-F]{3,8}/.test(stripped)) continue;
+    const line = lineAt(idx);
+    if (!allowMarked(line, 'box-shadow')) out.push({ line, selector: enclosingSelector(idx), detail: `box-shadow: ${m[1].trim()}` });
+  }
+  return out;
+}
+function accentViolations(): V[] {
+  const out: V[] = [];
+  for (const m of masked.matchAll(/rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/g)) {
+    if (!accentTriples.has(`${+m[1]},${+m[2]},${+m[3]}`)) continue;
+    const idx = m.index ?? 0;
+    if (isConvScope(idx)) continue;
+    if (enclosingProperty(idx).startsWith('--')) continue; // token definition, not a consumer
+    const line = lineAt(idx);
+    if (!allowMarked(line, 'accent')) out.push({ line, selector: enclosingSelector(idx), detail: `accent rgba(${+m[1]},${+m[2]},${+m[3]})` });
+  }
+  for (const m of masked.matchAll(/#([0-9a-fA-F]{6})\b/g)) {
+    if (!accentHexes.has(m[1].toLowerCase())) continue;
+    const idx = m.index ?? 0;
+    if (isConvScope(idx)) continue;
+    if (enclosingProperty(idx).startsWith('--')) continue; // the :root --accent-* definition
+    const line = lineAt(idx);
+    if (!allowMarked(line, 'accent')) out.push({ line, selector: enclosingSelector(idx), detail: `accent #${m[1].toLowerCase()}` });
+  }
+  return out;
+}
+
+describe('#255 global no-orphan-literal lint', () => {
+  it('boundary predicate pins both ends (.panel dashboard, .conv-view conv)', () => {
+    expect(CONV_SELECTOR.test('.panel')).toBe(false);
+    expect(CONV_SELECTOR.test('.conv-view')).toBe(true);
+    expect(CONV_SELECTOR.test('.sess-open-conv')).toBe(true);
+  });
+  it('derives the accent set from :root (≥12 families incl. amber)', () => {
+    expect(accentHexes.size).toBeGreaterThanOrEqual(12);
+    expect(accentTriples.has('251,191,36')).toBe(true);
+  });
+  it('no raw border-radius literal in dashboard-scope rules', () => {
+    const v = radiusViolations();
+    expect(v, fmt(v)).toEqual([]);
+  });
+  it('no raw box-shadow literal in dashboard-scope rules', () => {
+    const v = shadowViolations();
+    expect(v, fmt(v)).toEqual([]);
+  });
+  it('no surviving accent literal (rgba triple or hex) in dashboard-scope rules', () => {
+    const v = accentViolations();
+    expect(v, fmt(v)).toEqual([]);
+  });
+  it('boundary anchor: the conversation-viewer banner is present', () => {
+    expect(convBannerLine, 'conv-viewer banner not found — the region anchor vanished').toBeGreaterThan(0);
+  });
+  it('non-vacuity: the conversion breadth is actually present', () => {
+    expect((masked.match(/var\(--radius-/g) ?? []).length).toBeGreaterThanOrEqual(60);
+    // Only 4 box-shadows are tokenizable per the spec table (--shadow-sm, the
+    // --shadow-md blur snap, --shadow-xl, + 1 pre-existing --shadow-md); every
+    // other shadow is correctly an allow-marked bespoke drop or a color-mix accent.
+    expect((masked.match(/var\(--shadow-/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(/color-mix\(in srgb, var\(--accent-/.test(masked)).toBe(true);
+    expect(/lint-allow:/.test(rawCss255)).toBe(true);
+  });
+});
