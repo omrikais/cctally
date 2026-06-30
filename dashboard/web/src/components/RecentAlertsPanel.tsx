@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { useSnapshot } from '../hooks/useSnapshot';
 import { fmt } from '../lib/fmt';
 import { alertSeverity, AXIS_CHIP_LABEL } from '../lib/alertAxis';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
@@ -24,6 +25,15 @@ export function RecentAlertsPanel(): JSX.Element {
     subscribeStore,
     () => getState().prefs.alertsCollapsed,
   );
+  // #248 §5 — the compact empty tile reads the current Used % (header) and the
+  // configured weekly fire thresholds so the one-liner reflects reality rather
+  // than hardcoding "90% / 95%". Defaults to [90, 95] before the first tick.
+  const env = useSnapshot();
+  const usedPct = env?.header?.used_pct ?? null;
+  const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
+  const fireThresholds = (
+    alertsConfig.weekly_thresholds?.length ? alertsConfig.weekly_thresholds : [90, 95]
+  ).map((t) => `${t}%`).join(' / ');
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Slice newest-first to last 10 for the panel; the modal renders the
@@ -98,8 +108,13 @@ export function RecentAlertsPanel(): JSX.Element {
       </div>
       <div className="panel-body" id="panel-alerts-body">
         {alerts.length === 0 ? (
-          <div className="alerts-empty panel-empty">
-            No alerts yet. Alerts appear when usage crosses 90% or 95%.
+          <div className="alerts-empty-tile">
+            <span className="alerts-empty-glyph" aria-hidden="true">✓</span>
+            <span className="alerts-empty-text">
+              No alerts
+              <span className="sep" aria-hidden="true"> · </span>
+              You're at {fmt.pct1(usedPct)}. Alerts fire at {fireThresholds}.
+            </span>
           </div>
         ) : (
           <ul className="alerts-list">

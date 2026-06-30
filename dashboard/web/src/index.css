@@ -2949,7 +2949,19 @@ mark.current {
 .alert-threshold.warn     { color: var(--accent-amber); }
 .alert-threshold.critical { color: var(--accent-red); }
 .alert-when { color: var(--text-dim); font-size: var(--fs-meta); flex: 1; }
-.alerts-empty { color: var(--text-faint); text-align: center; padding: 32px 0; font-size: 13px; }
+/* #248 §5 — compact empty Alerts tile: a single glanceable one-liner that fits
+   the uniform tile height (replaces the old 32px-padded `.alerts-empty` box
+   with ~200px of dead air). The body centers it vertically via :has. */
+.alerts-empty-tile {
+  display: flex; align-items: baseline; gap: var(--space-2);
+  color: var(--text-dim); font-size: var(--fs-meta);
+}
+.alerts-empty-tile .alerts-empty-glyph { color: var(--accent-green); font-weight: 700; }
+.alerts-empty-tile .alerts-empty-text { line-height: 1.5; }
+.alerts-empty-tile .sep { color: var(--text-faint); }
+.panel-body:has(> .alerts-empty-tile) {
+  display: flex; flex-direction: column; justify-content: center;
+}
 
 /* =========================================================================
    Share modal (spec §6.2). Layered ABOVE the panel-modal layer via a
