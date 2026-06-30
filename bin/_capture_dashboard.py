@@ -114,7 +114,7 @@ def _shots() -> list[Shot]:
             viewport={"width": 1440, "height": 900},
             is_mobile=False,
             post_open_action=None,
-            wait_for_selector='[data-panel-kind="current-week"]',
+            wait_for_selector='.hero-strip',
             hide_panels=_HIDE_ALERTS_PANEL,
             # Default state for both panels is collapsed (max-height
             # 480/520px with internal scroll); the marketing shot wants
@@ -128,7 +128,7 @@ def _shots() -> list[Shot]:
             viewport={"width": 1440, "height": 900},
             is_mobile=False,
             post_open_action=_click_trend_panel,
-            wait_for_selector='[data-panel-kind="current-week"]',
+            wait_for_selector='.hero-strip',
             screenshot_element="#modal-root .modal-card",
             hide_panels=_HIDE_ALERTS_PANEL,
         ),
@@ -137,7 +137,7 @@ def _shots() -> list[Shot]:
             viewport={"width": 393, "height": 852},  # iPhone 14 Pro CSS px
             is_mobile=True,
             post_open_action=None,
-            wait_for_selector='[data-panel-kind="current-week"]',
+            wait_for_selector='.hero-strip',
             full_page=False,  # single-viewport, not full-scroll
             hide_panels=_HIDE_ALERTS_PANEL,
         ),
@@ -146,7 +146,7 @@ def _shots() -> list[Shot]:
             viewport={"width": 1440, "height": 900},
             is_mobile=False,
             post_open_action=_click_forecast_panel,
-            wait_for_selector='[data-panel-kind="current-week"]',
+            wait_for_selector='.hero-strip',
             screenshot_element="#modal-root .modal-card",
             # Hide alerts panel for parity with the desktop shot. The
             # forecast modal renders ON TOP of the panel grid; the
