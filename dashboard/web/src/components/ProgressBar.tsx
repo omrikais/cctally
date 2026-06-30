@@ -12,8 +12,8 @@ interface ProgressBarProps {
 //
 // A5 — this is the one genuine single-value 0–100 gauge, so it exposes
 // `role="progressbar"` with aria-valuenow/min/max + an aria-label. The
-// trend sparkline / ConfidenceDots / Projects leaderboard bar are NOT
-// progressbars (they're role="img" summaries or decorative).
+// trend sparkline / Projects leaderboard bar are NOT progressbars
+// (they're role="img" summaries or decorative).
 export function ProgressBar({ percent, cells = 30, label }: ProgressBarProps) {
   const v = percent ?? 0;
   const on = Math.max(0, Math.min(cells, Math.round((v / 100) * cells)));

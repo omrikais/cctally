@@ -10,7 +10,7 @@ import type { PeriodRow } from '../types/envelope';
 // #248 §2a — the panel is a uniform summary TILE in the two-tier grid, so the
 // body caps to the 3 most-recent periods (the WeeklyModal keeps the full
 // history). The footer still summarizes the WHOLE window (count + envelope
-// total) so the tile reads "8w total · $X · here are the 3 most recent".
+// total) so the tile reads "Nw total · $X · here are the 3 most recent".
 const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {

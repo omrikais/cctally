@@ -47,7 +47,7 @@ export function Header() {
       {/* Heading outline root (A3) — visually hidden so the topbar design
           is untouched, but it anchors the page's h1 → h2 (panel) outline. */}
       <h1 className="sr-only">cctally dashboard</h1>
-      <div className="stat topbar-brand" data-mobile-keep="primary" data-stat="brand">
+      <div className="stat topbar-brand">
         <span className="brand-name">cctally</span>
         {currentVersion ? (
           <span className="brand-version">v{currentVersion}</span>
