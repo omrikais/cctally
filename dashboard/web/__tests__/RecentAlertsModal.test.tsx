@@ -254,9 +254,16 @@ describe('<RecentAlertsModal />', () => {
     expect(context!.textContent ?? '').toMatch(/projected \$312 of \$300/);
   });
 
-  it('renders empty state when no alerts', () => {
+  it('renders the empty-state teaching gauge when used% is known (RA-1)', () => {
+    // The beforeEach snapshot (fixture) carries header.used_pct = 17.4, so the
+    // empty Alerts modal now teaches with a gauge (RA-1) heroing the current %
+    // rather than the bare "No alerts yet" one-liner. The one-liner remains the
+    // fallback ONLY when used% is unknown (covered in
+    // src/components/RecentAlertsModal.test.tsx).
     render(<RecentAlertsModal />);
-    expect(screen.getByText(/No alerts yet/i)).toBeInTheDocument();
+    expect(document.querySelector('.ra-gauge')).toBeTruthy();
+    expect(document.querySelector('.ra-gauge-hero')?.textContent).toBe('17%');
+    expect(screen.queryByText(/No alerts yet/i)).toBeNull();
   });
 
   // Phase B 3-tier severity: the % cell class is keyed off `alertSeverity`,
