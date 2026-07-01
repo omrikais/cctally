@@ -4,7 +4,7 @@
 // legend). The pure `resolvePillLayout` is unit-tested directly (JSDOM-
 // blind chart math); the DOM-mutating range-bar effect is exercised via a
 // full modal render (#250 S4 · plan Tasks 5 & 6).
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import { ForecastModal, resolvePillLayout } from './ForecastModal';
 import { _resetForTests, updateSnapshot } from '../store/store';
@@ -151,5 +151,29 @@ describe('<ForecastModal /> range bar (FC-2)', () => {
   it('omits the now-marker when the current used % is unknown', () => {
     const { container } = renderForecast({ usedPct: null, forecast: fcFixture() });
     expect(container.querySelector('.mfc-now')).toBeNull();
+  });
+
+  it('observes the range wrap for resize and disconnects on unmount', () => {
+    const observed: Element[] = [];
+    let disconnects = 0;
+    class FakeRO {
+      constructor(_cb: ResizeObserverCallback) {}
+      observe(el: Element): void {
+        observed.push(el);
+      }
+      unobserve(): void {}
+      disconnect(): void {
+        disconnects += 1;
+      }
+    }
+    vi.stubGlobal('ResizeObserver', FakeRO); // auto-restored (unstubGlobals)
+
+    const { container, unmount } = renderForecast({ usedPct: 11, forecast: fcFixture() });
+    const wrap = container.querySelector('#mfc-rangewrap');
+    expect(wrap).not.toBeNull();
+    expect(observed).toContain(wrap);
+
+    unmount();
+    expect(disconnects).toBe(1);
   });
 });

@@ -254,7 +254,7 @@ function useRangeBar(
       }
       const wrapWidthPx = wrapEl.clientWidth;
       if (wrapWidthPx <= 0) {
-        rafHandle = requestAnimationFrame(applyLayout);
+        schedule();
         return;
       }
       const pinInputs: PillPin[] = pins.map((p) => ({
@@ -317,9 +317,30 @@ function useRangeBar(
         leadersEl.appendChild(path);
       }
     };
+    function schedule(): void {
+      if (rafHandle != null) cancelAnimationFrame(rafHandle);
+      rafHandle = requestAnimationFrame(() => {
+        rafHandle = null;
+        applyLayout();
+      });
+    }
+
     applyLayout();
+
+    // Reflow immediately on an in-place resize of the open modal, instead of
+    // waiting for the next snapshot tick to re-run the effect (#257). A
+    // ResizeObserver on the wrap supersets a window-resize listener (it fires
+    // on any width change of the wrap). Guarded for runtimes without RO; the
+    // vitest harness polyfills it (__tests__/setup.ts).
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => schedule());
+      ro.observe(wrapEl);
+    }
+
     return () => {
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
+      if (ro) ro.disconnect();
     };
   }, [wrapRef, trackRef, fc, nowPct]);
 }
