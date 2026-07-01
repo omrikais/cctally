@@ -2217,19 +2217,31 @@ mark.current {
    `.modal-card` is max-height:85vh + overflow:hidden with a scrolling
    `.modal-body`, so a scroll context exists on every viewport; pinning Save/
    Cancel keeps them reachable without scrolling to the bottom. The opaque
-   background occludes scrolled fieldsets; the negative margins bleed to the
-   .modal-body 16px/18px padding edges. The mobile block keeps its additive
+   background occludes scrolled fieldsets; the negative side margins bleed over
+   the .modal-body 18px horizontal padding. The bottom is handled by zeroing the
+   Settings scroll container's `padding-bottom` (`#settings-root .modal-body`
+   below) — a sticky footer pins to the container's CONTENT-box bottom, so a
+   non-zero `padding-bottom` would leave a strip below the bar where scrolled
+   content bleeds through (#252 ui-qa). The mobile block keeps its additive
    overrides (safe-area inset, 44px buttons, flex-wrap, -14px bleed). */
 .settings-actions {
   position: sticky;
   bottom: 0;
   display: flex;
   gap: 10px;
-  margin: 16px -18px -16px;
+  margin: 16px -18px 0;
   padding: 12px 18px;
   background: var(--panel-bg);
   border-top: 1px solid var(--border-soft);
 }
+/* Zero the Settings scroll container's bottom padding so the sticky
+   `.settings-actions` bar pins flush to the scrollport bottom and fully
+   occludes scrolled content (no bleed-through strip). Scoped to `#settings-root`
+   (0,1,1) so it wins over both the base `.modal-body` and the mobile
+   `@media .modal-body { padding: 12px 14px }` rule without touching any other
+   modal. The bar supplies its own bottom spacing via its 12px padding (mobile:
+   the safe-area `padding-bottom`). */
+#settings-root .modal-body { padding-bottom: 0; }
 .settings-btn {
   background: var(--panel-bg);
   border: 1px solid var(--border-soft);
@@ -4431,7 +4443,10 @@ mark.current {
     background: var(--panel-bg);
     border-top: 1px solid var(--border-soft);
     padding: 10px 14px;
-    margin: 14px -14px -12px;
+    /* Bottom margin 0 (was -12): `#settings-root .modal-body` now zeroes the
+       container's bottom padding, so the bar pins flush and needs no bottom
+       bleed. -14px horizontal bleed still covers the 14px side padding. */
+    margin: 14px -14px 0;
     /* Honor bottom safe-area so the sticky row clears home-indicator
        hardware on iOS. */
     padding-bottom: max(10px, env(safe-area-inset-bottom));
