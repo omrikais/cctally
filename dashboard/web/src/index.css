@@ -1517,8 +1517,28 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .m-sec .mtr-legend.legend-no-used .sw-used + .sw-lbl { display: none; }
 
 /* Sparkline */
-.mtr-sparkhero { padding: 6px 0 4px; }
+.mtr-sparkhero { padding: 6px 0 4px; position: relative; }
 .mtr-sparkhero svg { display: block; width: 100%; height: 140px; }
+
+/* TR-4 per-week hit-targets + hover/focus tooltip */
+.mtr-hit { fill: transparent; cursor: pointer; }
+.mtr-hit:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: -1px; }
+.mtr-tip {
+  position: absolute; top: 4px;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 4px 8px;
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  font-family: var(--font-mono); font-size: var(--fs-eyebrow);
+  white-space: nowrap; pointer-events: none;
+}
+.mtr-tip .mtr-tip-wk   { color: var(--text); font-weight: 700; }
+.mtr-tip .mtr-tip-dpp  { color: var(--accent-amber); }
+.mtr-tip .mtr-tip-used { color: var(--text-dim); }
 .mtr-sparkaxis {
   display: flex; justify-content: space-between;
   font-size: 10px; color: var(--text-dim);
@@ -1533,6 +1553,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .mtr-axis          { stroke: var(--border-soft); stroke-width: 1; }
 .mtr-hl            { stroke: color-mix(in srgb, var(--accent-purple) 35%, transparent); stroke-dasharray: 2 3; stroke-width: 1; }
 .mtr-ylabel        { fill: var(--text-dim); font-family: var(--font-mono); font-size: 10px; }
+.mtr-ylabel-right  { fill: var(--text-dim); font-family: var(--font-mono); font-size: 10px; text-anchor: start; }
 .mtr-medlabel      { fill: var(--accent-purple); font-family: var(--font-mono); font-size: 10px; }
 .mtr-curlabel      { fill: var(--accent-cyan); font-family: var(--font-mono); font-size: 10px; font-weight: 700; }
 

@@ -1,4 +1,4 @@
-import { Fragment } from 'react';
+import { Fragment, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
@@ -50,16 +50,27 @@ interface SvgPrimitive {
   key: string;
 }
 
+// Sparkline geometry — hoisted so the interactive hit-targets + tooltip
+// anchors (TR-4) share the exact scale the primitives are drawn on.
+// `PAD.right` reserves room for the right-hand used% second axis (TR-3).
+const SPARK_W = 600;
+const SPARK_H = 140;
+const SPARK_PAD = { left: 44, right: 30, top: 12, bottom: 22 };
+const SPARK_INNER_W = SPARK_W - SPARK_PAD.left - SPARK_PAD.right;
+const SPARK_INNER_H = SPARK_H - SPARK_PAD.top - SPARK_PAD.bottom;
+function sparkXi(i: number, n: number): number {
+  return SPARK_PAD.left + (n === 1 ? SPARK_INNER_W : (i / (n - 1)) * SPARK_INNER_W);
+}
+
 function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgPrimitive[] {
   const out: SvgPrimitive[] = [];
   if (!rows.length) return out;
-  const W = 600;
-  const H = 140;
-  const PAD = { left: 44, right: 14, top: 12, bottom: 22 };
-  const INNER_W = W - PAD.left - PAD.right;
-  const INNER_H = H - PAD.top - PAD.bottom;
+  const W = SPARK_W;
+  const H = SPARK_H;
+  const PAD = SPARK_PAD;
+  const INNER_H = SPARK_INNER_H;
   const N = rows.length;
-  const xi = (i: number) => PAD.left + (N === 1 ? INNER_W : (i / (N - 1)) * INNER_W);
+  const xi = (i: number) => sparkXi(i, N);
 
   // Primary scale — $/1%
   const yvalsDpp = rows.map((r) => r.dollar_per_pct).filter((v): v is number => v != null && isFinite(v));
@@ -164,7 +175,7 @@ function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgP
     });
   });
 
-  // 6) Y labels (primary)
+  // 6) Y labels (primary $/1%)
   if (yvalsDpp.length) {
     out.push({
       el: 'text',
@@ -177,6 +188,24 @@ function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgP
       attrs: { class: 'mtr-ylabel', x: 3, y: PAD.top + INNER_H },
       text: '$' + (ymin / 0.96).toFixed(2),
       key: 'ymin',
+    });
+  }
+
+  // 6b) Right second axis (used %). TR-3: label the ACTUAL extremes by
+  // undoing the 0.96/1.04 domain padding — the same way the primary axis
+  // above reports `ymax/1.04` / `ymin/0.96` — NOT the padded domain bounds.
+  if (yvalsUsed.length) {
+    out.push({
+      el: 'text',
+      attrs: { class: 'mtr-ylabel-right', x: W - PAD.right + 2, y: PAD.top + 8 },
+      text: Math.round(umax / 1.04) + '%',
+      key: 'umax',
+    });
+    out.push({
+      el: 'text',
+      attrs: { class: 'mtr-ylabel-right', x: W - PAD.right + 2, y: PAD.top + INNER_H },
+      text: Math.round(umin / 0.96) + '%',
+      key: 'umin',
     });
   }
 
@@ -241,6 +270,10 @@ function deltaKv(delta: number | null): DeltaKv {
 export function TrendModal() {
   const env = useSnapshot();
   const rows = buildTrendHistoryData(env);
+  // TR-4: index of the week whose tooltip is showing (hover OR keyboard
+  // focus). Declared before the empty-state early return to keep hook order
+  // stable.
+  const [hovered, setHovered] = useState<number | null>(null);
 
   // Shared header extras (share-affordance) reused across the early
   // empty-state return and the main return below.
@@ -355,7 +388,8 @@ export function TrendModal() {
             id="mtr-svg"
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
-            aria-hidden="true"
+            role="img"
+            aria-label={`$ per 1% over the last ${N} week${N === 1 ? '' : 's'}, with the used % line overlaid`}
           >
             {svgPrims.map((p) => {
               const { el, attrs, text, key } = p;
@@ -381,7 +415,68 @@ export function TrendModal() {
                 </text>
               );
             })}
+            {/* TR-4: one transparent per-week hit-target. Hover OR keyboard
+                focus reveals that week's exact $/1% + used %. */}
+            {rows.map((r, i) => {
+              const hitW = N > 1 ? SPARK_INNER_W / (N - 1) : SPARK_INNER_W;
+              const k = N - 1 - i;
+              const usedTxt =
+                r.used_pct != null && isFinite(r.used_pct)
+                  ? Math.round(r.used_pct) + '% used'
+                  : 'used —';
+              const dppTxt =
+                r.dollar_per_pct != null && isFinite(r.dollar_per_pct)
+                  ? '$' + r.dollar_per_pct.toFixed(2) + ' / 1%'
+                  : '$— / 1%';
+              return (
+                <rect
+                  key={`hit-${i}`}
+                  className="mtr-hit"
+                  data-testid="mtr-hit"
+                  x={sparkXi(i, N) - hitW / 2}
+                  y={SPARK_PAD.top}
+                  width={hitW}
+                  height={SPARK_INNER_H}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`${historyWlab(r, k)}: ${dppTxt}, ${usedTxt}`}
+                  onMouseEnter={() => setHovered(i)}
+                  onFocus={() => setHovered(i)}
+                  onMouseLeave={() => setHovered(null)}
+                  onBlur={() => setHovered(null)}
+                />
+              );
+            })}
           </svg>
+          {hovered != null && rows[hovered]
+            ? (() => {
+                const r = rows[hovered];
+                const k = N - 1 - hovered;
+                const leftPct = Math.min(
+                  92,
+                  Math.max(8, (sparkXi(hovered, N) / SPARK_W) * 100),
+                );
+                const dppTxt =
+                  r.dollar_per_pct != null && isFinite(r.dollar_per_pct)
+                    ? '$' + r.dollar_per_pct.toFixed(2) + ' / 1%'
+                    : '$— / 1%';
+                const usedTxt =
+                  r.used_pct != null && isFinite(r.used_pct)
+                    ? Math.round(r.used_pct) + '% used'
+                    : 'used —';
+                return (
+                  <div
+                    className="mtr-tip"
+                    role="status"
+                    style={{ left: leftPct + '%' }}
+                  >
+                    <span className="mtr-tip-wk">{historyWlab(r, k)}</span>
+                    <span className="mtr-tip-dpp">{dppTxt}</span>
+                    <span className="mtr-tip-used">{usedTxt}</span>
+                  </div>
+                );
+              })()
+            : null}
           <div className="mtr-sparkaxis" id="mtr-sparkaxis">
             {N > 0 ? (
               <Fragment>
