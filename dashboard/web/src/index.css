@@ -3083,6 +3083,45 @@ mark.current {
   display: flex; flex-direction: column; justify-content: center;
 }
 
+/* RA-1 — empty Recent Alerts modal teaching gauge. Heroes the current weekly
+   used%, a mini bar filled to that %, and one tick per CONFIGURED fire
+   threshold (lowest amber, highest red). Falls back to the .panel-empty
+   one-liner when used% is unknown. */
+.ra-gauge {
+  display: flex; flex-direction: column; gap: var(--space-3);
+  padding: 18px 4px;
+}
+.ra-gauge-head {
+  display: flex; align-items: center; gap: var(--space-2);
+  color: var(--accent-green);
+  font-size: var(--fs-meta); font-weight: 600;
+}
+.ra-gauge-check { font-weight: 700; }
+.ra-gauge-hero {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: var(--fs-hero); font-weight: 700;
+  color: var(--text); line-height: 1;
+}
+.ra-gauge-bar {
+  position: relative; height: 12px;
+  border-radius: var(--radius-pill);
+  background: var(--panel-bg-2);
+}
+.ra-gauge-fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--accent-green) 70%, transparent);
+}
+.ra-gauge-tick {
+  position: absolute; top: -3px;
+  width: 2px; height: 18px;
+  transform: translateX(-1px);
+  border-radius: 1px; /* lint-allow: border-radius data-viz */
+}
+.ra-gauge-tick.tick-amber { background: var(--accent-amber); }
+.ra-gauge-tick.tick-red   { background: var(--accent-red); }
+.ra-gauge-copy { color: var(--text-dim); font-size: var(--fs-meta); }
+
 /* =========================================================================
    Share modal (spec §6.2). Layered ABOVE the panel-modal layer via a
    higher z-index. The overlay handles backdrop + centering; the
