@@ -1,7 +1,7 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { SessionsPanel } from './SessionsPanel';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import type { Envelope, SessionRow } from '../types/envelope';
 
 beforeEach(() => {
@@ -78,5 +78,63 @@ describe('#249 C3 — single-model collapse', () => {
     expect(container.querySelectorAll('.model-chip').length).toBe(2);
     expect(container.querySelector('.model-ditto')).toBeNull();
     expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(false);
+  });
+});
+
+describe('#253 SESS-2 — current-match emphasis + in-cell marks', () => {
+  function threeRowEnv(): Envelope {
+    const env = baseEnvelope();
+    // started_desc render order: s1, s2, s3.
+    env.sessions = { total: 3, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 's1', started_utc: '2026-05-13T09:00:00Z', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 's2', started_utc: '2026-05-13T08:00:00Z', project: 'alphabeta', project_key: 'alphabeta' }),
+      sessRow({ session_id: 's3', started_utc: '2026-05-13T07:00:00Z', project: 'gamma', project_key: 'gamma' }),
+    ] };
+    return env;
+  }
+
+  it('marks exactly one row as aria-current + search-match-current (the searchIndex row)', () => {
+    updateSnapshot(threeRowEnv());
+    dispatch({ type: 'SET_SEARCH', text: 'alpha' });   // matches s1 + s2, index 0 → s1
+    const { container } = render(<SessionsPanel />);
+    const current = container.querySelectorAll('tr[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].getAttribute('data-session-id')).toBe('s1');
+    expect(current[0].classList.contains('search-match-current')).toBe(true);
+    // both matches carry the base wash
+    expect(container.querySelectorAll('tr.session-row.search-match').length).toBe(2);
+  });
+
+  it('moves aria-current when the searchIndex steps', () => {
+    updateSnapshot(threeRowEnv());
+    dispatch({ type: 'SET_SEARCH', text: 'alpha' });
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('tr[aria-current="true"]')?.getAttribute('data-session-id')).toBe('s1');
+    act(() => {
+      dispatch({ type: 'SET_SEARCH_MATCHES', matches: [0, 1], index: 1 });
+    });
+    const current = container.querySelectorAll('tr[aria-current="true"]');
+    expect(current.length).toBe(1);
+    expect(current[0].getAttribute('data-session-id')).toBe('s2');
+  });
+
+  it('has no current row when there are zero matches', () => {
+    updateSnapshot(threeRowEnv());
+    dispatch({ type: 'SET_SEARCH', text: 'zzz-no-match' });
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('tr[aria-current="true"]')).toBeNull();
+    expect(container.querySelector('tr.session-row.search-match-current')).toBeNull();
+    expect(container.querySelector('#sess-rows mark')).toBeNull();
+  });
+
+  it('marks the matched substring in a matched cell but not in a non-matching cell', () => {
+    updateSnapshot(threeRowEnv());
+    dispatch({ type: 'SET_SEARCH', text: 'alpha' });
+    const { container } = render(<SessionsPanel />);
+    const s1Row = container.querySelector('tr[data-session-id="s1"]')!;
+    const s3Row = container.querySelector('tr[data-session-id="s3"]')!;
+    const s1Marks = Array.from(s1Row.querySelectorAll('mark')).map((m) => m.textContent);
+    expect(s1Marks).toContain('alpha');       // project cell "alpha" is marked
+    expect(s3Row.querySelector('mark')).toBeNull();  // "gamma" has no 'alpha'
   });
 });

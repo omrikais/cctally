@@ -19,6 +19,7 @@ import { singleModelLabel } from '../lib/sessionsModel';
 import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { openShareModal } from '../store/shareSlice';
+import { HighlightText } from '../lib/highlightText';
 
 export function SessionsPanel() {
   const env = useSnapshot();
@@ -46,6 +47,8 @@ export function SessionsPanel() {
   useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsPerPage);
   const searchMatches = useSyncExternalStore(subscribeStore, () => getState().searchMatches);
   const searchIndex = useSyncExternalStore(subscribeStore, () => getState().searchIndex);
+  // SESS-2: the live needle drives the in-cell <mark> highlighting.
+  const searchText = useSyncExternalStore(subscribeStore, () => getState().searchText);
   const collapsed = useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsCollapsed);
   const sessionsOverride = useSyncExternalStore(
     subscribeStore,
@@ -77,6 +80,11 @@ export function SessionsPanel() {
       .map((i) => filtered[i]?.session_id)
       .filter((s): s is string => !!s),
   );
+  // SESS-2: the current match (n/N cursor) — same index math as the
+  // scroll-sync effect below — gets the stronger `search-match-current`
+  // emphasis + aria-current. Null when there are no matches / out of range.
+  const currentSessionId =
+    searchIndex >= 0 ? filtered[searchMatches[searchIndex]]?.session_id ?? null : null;
 
   useEffect(() => {
     if (searchIndex < 0) return;
@@ -166,13 +174,19 @@ export function SessionsPanel() {
           <tbody id="sess-rows">
             {filtered.map((r) => {
               const isMatch = r.session_id ? matchedSessionIds.has(r.session_id) : false;
+              const isCurrent = !!r.session_id && r.session_id === currentSessionId;
               const chipCls = modelChipClass(r.model);
               const cCls = costClass(r.cost_usd ?? null);
               const chipLabel = r.model ? `Filter by ${r.model}` : 'Filter by model';
               return (
                 <tr
                   key={r.session_id || `${r.started_utc}-${r.model}`}
-                  className={'session-row' + (isMatch ? ' search-match' : '')}
+                  className={
+                    'session-row'
+                    + (isMatch ? ' search-match' : '')
+                    + (isCurrent ? ' search-match-current' : '')
+                  }
+                  aria-current={isCurrent ? 'true' : undefined}
                   data-session-id={r.session_id}
                   onClick={() =>
                     r.session_id &&
@@ -205,9 +219,12 @@ export function SessionsPanel() {
                         </svg>
                       </button>
                     )}
-                    {fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}
+                    <HighlightText
+                      text={fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}
+                      query={searchText}
+                    />
                   </td>
-                  <td>{r.duration_min}m</td>
+                  <td><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
                   {oneModel ? (
                     <td className="model-ditto-cell">
                       <span className="model-ditto" aria-hidden="true">·</span>
@@ -220,7 +237,7 @@ export function SessionsPanel() {
                         aria-label={chipLabel}
                         onClick={() => dispatch({ type: 'SET_FILTER', text: r.model })}
                       >
-                        {r.model}
+                        <HighlightText text={r.model} query={searchText} />
                       </button>
                     </td>
                   )}
@@ -242,7 +259,7 @@ export function SessionsPanel() {
                           });
                         }}
                       >
-                        {r.project}
+                        <HighlightText text={r.project} query={searchText} />
                       </button>
                     ) : (
                       // Null project_key (session_files row not yet
@@ -251,10 +268,14 @@ export function SessionsPanel() {
                       // null or (unknown), the cell renders plain text
                       // (not clickable) with tooltip 'Project still
                       // resolving'."
-                      <span title="Project still resolving">{r.project}</span>
+                      <span title="Project still resolving">
+                        <HighlightText text={r.project} query={searchText} />
+                      </span>
                     )}
                   </td>
-                  <td className={`num ${cCls}`}>{fmt.usd2(r.cost_usd)}</td>
+                  <td className={`num ${cCls}`}>
+                    <HighlightText text={fmt.usd2(r.cost_usd)} query={searchText} />
+                  </td>
                 </tr>
               );
             })}

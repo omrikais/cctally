@@ -1909,6 +1909,19 @@ mark.current {
   background: color-mix(in srgb, var(--accent-amber) 8%, transparent);
   box-shadow: inset 2px 0 0 var(--accent-amber);
 }
+/* S7 SESS-2: the current search match (n/N cursor) is emphasized above the
+   other matches — brighter wash + a thicker accent bar — and announced via
+   aria-current in the markup. */
+.session-row.search-match-current {
+  background: color-mix(in srgb, var(--accent-amber) 20%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent-amber);
+}
+/* S7 SESS-2: in-cell match highlight inside Sessions rows. Reuses the
+   existing global amber <mark> but strengthens it slightly for legibility
+   over the row wash. The reader's .conv-view mark / .conv-mark--current is a
+   different context and is NOT reused here. */
+#sess-rows mark { background: color-mix(in srgb, var(--accent-amber) 30%, transparent); color: inherit; }
+.session-row.search-match-current mark { background: color-mix(in srgb, var(--accent-amber) 45%, transparent); }
 
 /* ----- Sessions click-through (Phase 9) ----- */
 /* Pointer cursor only on rows with a real session id — rows missing
@@ -4392,9 +4405,14 @@ mark.current {
     content: " · ";
     color: var(--text-faint);
   }
-  /* Search-match highlight stays — uses the existing class. */
+  /* Search-match highlight stays — uses the existing class. S7 SESS-2:
+     unify to amber (was cyan) so the desktop + mobile current-match story
+     reads consistently, and add the mobile current-match emphasis. */
   .sess-table tr.session-row.search-match {
-    background: color-mix(in srgb, var(--accent-cyan) 7%, transparent);
+    background: color-mix(in srgb, var(--accent-amber) 8%, transparent);
+  }
+  .sess-table tr.session-row.search-match-current {
+    background: color-mix(in srgb, var(--accent-amber) 20%, transparent);
   }
 
   /* Daily heatmap — drop the W-column on mobile so the 7 day cells
