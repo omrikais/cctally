@@ -16,6 +16,9 @@ const VW = 400;
 const EXPECTED_LEFT = VW * 0.1; // 40
 const EXPECTED_RIGHT = VW * 0.9; // 360
 
+// Kept deliberately BALANCED (no single project >= 60% of the window
+// total) so it routes through the stacked-area path — the geometry these
+// #68 tests assert. p-a=18, p-b=16 -> 18/34 ~= 0.53 < DOMINANCE_THRESHOLD.
 function buildOneWeekTrend(): ProjectsTrendEnvelope {
   return {
     window_weeks: 1,
@@ -23,7 +26,7 @@ function buildOneWeekTrend(): ProjectsTrendEnvelope {
       {
         week_start_date: '2026-05-13',
         week_label: 'wk0',
-        total_cost_usd: 30,
+        total_cost_usd: 34,
         total_pct: 5,
       },
     ],
@@ -31,7 +34,7 @@ function buildOneWeekTrend(): ProjectsTrendEnvelope {
       {
         key: 'p-a',
         bucket_path: '/repos/p-a',
-        weekly_cost: [20],
+        weekly_cost: [18],
         weekly_pct: [3],
         sessions_per_week: [2],
         first_seen_per_week: ['2026-05-13T01:00:00Z'],
@@ -40,7 +43,7 @@ function buildOneWeekTrend(): ProjectsTrendEnvelope {
       {
         key: 'p-b',
         bucket_path: '/repos/p-b',
-        weekly_cost: [10],
+        weekly_cost: [16],
         weekly_pct: [2],
         sessions_per_week: [1],
         first_seen_per_week: ['2026-05-13T02:00:00Z'],
@@ -121,18 +124,30 @@ describe('<ProjectsTrendChart /> 1-week render (issue #68)', () => {
   });
 
   it('leaves multi-week geometry untouched (weekCount === 4 spans full width)', () => {
+    // Two balanced projects (each ~50% of the total) so this stays on the
+    // stacked-area path (a lone project is 100%-dominant and would render
+    // ranked bars instead of the polygons this test asserts).
     const fourWeek: ProjectsTrendEnvelope = {
       window_weeks: 4,
       weeks: Array.from({ length: 4 }, (_, j) => ({
         week_start_date: `2026-04-${String(j + 1).padStart(2, '0')}`,
         week_label: `wk${j}`,
-        total_cost_usd: 10 + j,
+        total_cost_usd: 20 + 2 * j,
         total_pct: 1 + j,
       })),
       projects: [
         {
           key: 'p-a',
           bucket_path: '/repos/p-a',
+          weekly_cost: [10, 11, 12, 13],
+          weekly_pct: [1, 2, 3, 4],
+          sessions_per_week: [1, 1, 1, 1],
+          first_seen_per_week: [null, null, null, null],
+          last_seen_per_week: [null, null, null, null],
+        },
+        {
+          key: 'p-b',
+          bucket_path: '/repos/p-b',
           weekly_cost: [10, 11, 12, 13],
           weekly_pct: [1, 2, 3, 4],
           sessions_per_week: [1, 1, 1, 1],
@@ -248,5 +263,47 @@ describe('<ProjectsTrendChart /> — desktop legend (non-interactive)', () => {
       '.projects-trend-legend > span.projects-trend-legend-item',
     );
     expect(spans.length).toBe(6);
+  });
+});
+
+// PR-2 conditional swap: a dominant distribution renders ranked bars
+// (not stacked-area polygons); a balanced distribution keeps the stacked
+// area AND now shows y-axis labels.
+function buildDominantTrend(): ProjectsTrendEnvelope {
+  return {
+    window_weeks: 1,
+    weeks: [
+      { week_start_date: '2026-06-01', week_label: 'W0', total_cost_usd: 100, total_pct: 20 },
+    ],
+    projects: [
+      { key: 'cctally-dev', bucket_path: '/repos/cctally-dev', weekly_cost: [92],
+        weekly_pct: [null], sessions_per_week: [1], first_seen_per_week: [null], last_seen_per_week: [null] },
+      { key: 'superpowers', bucket_path: '/repos/superpowers', weekly_cost: [3],
+        weekly_pct: [null], sessions_per_week: [1], first_seen_per_week: [null], last_seen_per_week: [null] },
+      { key: 'misc', bucket_path: '/repos/misc', weekly_cost: [5],
+        weekly_pct: [null], sessions_per_week: [1], first_seen_per_week: [null], last_seen_per_week: [null] },
+    ],
+  };
+}
+
+describe('<ProjectsTrendChart /> — PR-2 conditional swap (#250)', () => {
+  beforeEach(() => stubMobileMedia(false));
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders ranked bars (not stacked-area polygons) under a dominant distribution', () => {
+    const { container } = render(
+      <ProjectsTrendChart trend={buildDominantTrend()} yMode="absolute" windowWeeks={1} />,
+    );
+    expect(container.querySelector('[data-testid="projects-ranked-bars"]')).not.toBeNull();
+    // Non-vacuous: the stacked-area SVG is gone in dominant mode.
+    expect(container.querySelector('polygon')).toBeNull();
+  });
+
+  it('renders the stacked area WITH y-axis labels under a balanced distribution', () => {
+    const { container } = render(
+      <ProjectsTrendChart trend={buildSixProjectTrend()} yMode="absolute" windowWeeks={4} />,
+    );
+    expect(container.querySelector('polygon')).not.toBeNull();
+    expect(container.querySelector('[data-testid="projects-yaxis"]')).not.toBeNull();
   });
 });

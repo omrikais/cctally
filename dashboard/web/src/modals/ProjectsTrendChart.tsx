@@ -21,10 +21,11 @@
 import { useMemo } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
+import { ProjectsRankedBars } from './ProjectsRankedBars';
+import { bucketRankedProjects, isDominant, OTHER_KEY } from './projectsChart';
 
 const SERIES_COLORS = ['#d946ef', '#c084fc', '#60a5fa', '#fbbf24', '#22d3ee'];
 const OTHER_COLOR = '#64748b';
-const TOP_N = 5;
 const VW = 400;
 const VH = 150;
 
@@ -35,12 +36,18 @@ export interface ProjectsTrendChartProps {
   onProjectSelect?: (key: string) => void;
 }
 
-interface PreparedSeries {
-  key: string;
-  weekly: number[];
-  cost: number;
-  color: string;
-}
+// Series color by rank position — top-5 take SERIES_COLORS by descending
+// rank, `(other)` is a muted slate. Shared with ProjectsRankedBars (same
+// palette, same by-position indexing) so the ranked rows and the legend
+// below them agree.
+const colorFor = (key: string, i: number): string =>
+  key === OTHER_KEY ? OTHER_COLOR : (SERIES_COLORS[i] ?? OTHER_COLOR);
+
+// Basename of a project's canonical bucket_path (PR-3) — the mobile
+// legend truncates the disambiguated display `key` mid-word, so we label
+// with the basename and carry the full path on the `title` attr.
+const basenameOf = (bucketPath: string): string =>
+  bucketPath === OTHER_KEY ? OTHER_KEY : (bucketPath.split('/').filter(Boolean).pop() ?? bucketPath);
 
 export function ProjectsTrendChart({
   trend,
@@ -48,34 +55,16 @@ export function ProjectsTrendChart({
   windowWeeks,
   onProjectSelect,
 }: ProjectsTrendChartProps) {
-  const prepared = useMemo(() => {
-    // Window slice — take the trailing `min(windowWeeks, trend.window_weeks)`
-    // weeks (the envelope already capped to window_weeks but the user
-    // may have a smaller pill selected than the snapshot's window).
-    const n = Math.max(0, Math.min(windowWeeks, trend.window_weeks));
-    const weeks = trend.weeks.slice(-n);
-    const projWindow: PreparedSeries[] = trend.projects
-      .map((p) => {
-        const weekly = p.weekly_cost.slice(-n);
-        const cost = weekly.reduce((s, c) => s + c, 0);
-        return { key: p.key, weekly, cost, color: '' };
-      })
-      .sort((a, b) => b.cost - a.cost);
-    const top = projWindow.slice(0, TOP_N).map((p, i) => ({
-      ...p,
-      color: SERIES_COLORS[i] ?? OTHER_COLOR,
-    }));
-    const tail = projWindow.slice(TOP_N);
-    const otherWeekly: number[] = weeks.map((_, j) =>
-      tail.reduce((s, p) => s + (p.weekly[j] ?? 0), 0),
-    );
-    const otherCost = otherWeekly.reduce((s, c) => s + c, 0);
-    const series: PreparedSeries[] = [...top];
-    if (tail.length > 0 && otherCost > 0) {
-      series.push({ key: '(other)', weekly: otherWeekly, cost: otherCost, color: OTHER_COLOR });
-    }
-    return { weeks, series };
-  }, [trend, windowWeeks]);
+  // Build-once bucketing shared by both render modes (PR-2).
+  const prepared = useMemo(
+    () => bucketRankedProjects(trend, windowWeeks),
+    [trend, windowWeeks],
+  );
+  // Dominance is measured over real projects only (excludes `(other)`).
+  const dominant = useMemo(
+    () => isDominant(trend, windowWeeks),
+    [trend, windowWeeks],
+  );
 
   const isMobile = useIsMobile();
 
@@ -109,7 +98,7 @@ export function ProjectsTrendChart({
   // own contribution to `accum`, walking bottom→top across the x-axis.
   const accum = new Array(weekCount).fill(0);
   type Poly = { color: string; key: string; points: string };
-  const polygons: Poly[] = prepared.series.map((p) => {
+  const polygons: Poly[] = prepared.series.map((p, i) => {
     const points: string[] = [];
     // Bottom edge — left → right at current accum. The 1-week degenerate
     // path emits both synthesized edges at the same accum y so each
@@ -139,44 +128,65 @@ export function ProjectsTrendChart({
       }
       points.push(`${xFor(j, 'left').toFixed(2)},${y.toFixed(2)}`);
     }
-    return { color: p.color, key: p.key, points: points.join(' ') };
+    return { color: colorFor(p.key, i), key: p.key, points: points.join(' ') };
   });
 
   const xAxisLabels = prepared.weeks.map((w) => (
     <span key={w.week_start_date}>{w.week_label}</span>
   ));
 
+  // PR-2 y-axis labels for the stacked-area mode: absolute labels $total
+  // (top) / $0 (bottom); share labels 100% / 0%.
+  const yTopLabel = yMode === 'share' ? '100%' : `$${yMax.toFixed(0)}`;
+  const yBotLabel = yMode === 'share' ? '0%' : '$0';
+
   return (
     <div className="projects-trend">
-      <svg
-        viewBox={`0 0 ${VW} ${VH}`}
-        preserveAspectRatio="none"
-        role="img"
-        aria-label={`Stacked area: project ${yMode === 'share' ? 'share %' : 'cost'} over ${weekCount} weeks`}
-      >
-        {polygons.map((p) => {
-          const isOther = p.key === '(other)';
-          return (
-            <polygon
-              key={p.key}
-              fill={p.color}
-              opacity={isOther ? 0.5 : 0.65}
-              points={p.points}
-              data-series-key={p.key}
-              onClick={() => {
-                if (!isOther) onProjectSelect?.(p.key);
-              }}
-              style={{ cursor: isOther ? 'default' : 'pointer' }}
-            />
-          );
-        })}
-      </svg>
-      <div className="projects-trend-xaxis">{xAxisLabels}</div>
+      {dominant ? (
+        // PR-2 conditional swap: under a dominant distribution the stacked
+        // area is an unreadable near-solid block — render ranked bars
+        // instead (skip the SVG + x-axis), keeping the legend below.
+        <ProjectsRankedBars series={prepared.series} onProjectSelect={onProjectSelect} />
+      ) : (
+        <>
+          <div className="projects-trend-plot">
+            <div className="projects-trend-yaxis" data-testid="projects-yaxis">
+              <span>{yTopLabel}</span>
+              <span>{yBotLabel}</span>
+            </div>
+            <svg
+              viewBox={`0 0 ${VW} ${VH}`}
+              preserveAspectRatio="none"
+              role="img"
+              aria-label={`Stacked area: project ${yMode === 'share' ? 'share %' : 'cost'} over ${weekCount} weeks`}
+            >
+              {polygons.map((p) => {
+                const isOther = p.key === OTHER_KEY;
+                return (
+                  <polygon
+                    key={p.key}
+                    fill={p.color}
+                    opacity={isOther ? 0.5 : 0.65}
+                    points={p.points}
+                    data-series-key={p.key}
+                    onClick={() => {
+                      if (!isOther) onProjectSelect?.(p.key);
+                    }}
+                    style={{ cursor: isOther ? 'default' : 'pointer' }}
+                  />
+                );
+              })}
+            </svg>
+          </div>
+          <div className="projects-trend-xaxis">{xAxisLabels}</div>
+        </>
+      )}
       <div className="projects-trend-legend">
-        {prepared.series.map((p) => {
-          const isOther = p.key === '(other)';
-          const swatch = <span className="sw" style={{ background: p.color }} />;
-          const content = <>{swatch}{p.key}</>;
+        {prepared.series.map((p, i) => {
+          const isOther = p.key === OTHER_KEY;
+          const swatch = <span className="sw" style={{ background: colorFor(p.key, i) }} />;
+          const label = basenameOf(p.bucket_path);
+          const content = <>{swatch}{label}</>;
           if (isMobile && !isOther) {
             return (
               <button
@@ -184,6 +194,7 @@ export function ProjectsTrendChart({
                 type="button"
                 className="projects-trend-legend-item"
                 data-series-key={p.key}
+                title={p.bucket_path}
                 onClick={() => onProjectSelect?.(p.key)}
               >
                 {content}
@@ -195,6 +206,7 @@ export function ProjectsTrendChart({
               key={p.key}
               className="projects-trend-legend-item"
               data-series-key={p.key}
+              title={p.bucket_path}
             >
               {content}
             </span>
