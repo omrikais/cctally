@@ -31,6 +31,28 @@ describe('resolvePillLayout', () => {
       Math.abs(bx - ax) - (a.pillWidthPx / 2 + b.pillWidthPx / 2);
     expect(edgeGap).toBeGreaterThanOrEqual(8 - 0.01);
   });
+
+  it('pushes overlapping-but-fitting pills apart to exactly the min-gap', () => {
+    // Two near-overlapping projections (pos 20 & 22) on a 140px wrap: they
+    // physically fit (44 + 8 + 44 = 96 <= 140) so must NOT collapse, but
+    // their true centers are only ~2.5px apart — so the resolver's hard
+    // min-gap push MUST fire. This exercises the resolution branch the
+    // wide-wrap test above skips (there the pins already clear the gap).
+    const close = [
+      { kind: 'wa', pos: 20, raw: 20, pillWidthPx: 44 },
+      { kind: 'r24', pos: 22, raw: 22, pillWidthPx: 44 },
+    ];
+    const r = resolvePillLayout(close as never, /*wrapPx*/ 140, 8);
+    expect(r.collapsed).toBe(false);
+    const [a, b] = r.pins!;
+    // The nudge actually happened (resolved != true) — guards the no-op path
+    // that made the wide-wrap assertion vacuous.
+    expect(a.resolvedXPct).not.toBeCloseTo(a.trueXPct, 3);
+    const ax = (a.resolvedXPct / 100) * 140,
+      bx = (b.resolvedXPct / 100) * 140;
+    const edgeGap = Math.abs(bx - ax) - (a.pillWidthPx / 2 + b.pillWidthPx / 2);
+    expect(edgeGap).toBeCloseTo(8, 5); // exactly the min-gap, not merely >=
+  });
 });
 
 function baseEnvelope(): Envelope {

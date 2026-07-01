@@ -388,7 +388,7 @@ export function TrendModal() {
             id="mtr-svg"
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
-            role="img"
+            role="group"
             aria-label={`$ per 1% over the last ${N} week${N === 1 ? '' : 's'}, with the used % line overlaid`}
           >
             {svgPrims.map((p) => {

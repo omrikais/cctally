@@ -242,13 +242,19 @@ function useRangeBar(
       }
     }
 
+    let rafHandle: number | null = null;
     const applyLayout = (): void => {
+      // Bail (and stop rescheduling) if the wrap has detached — e.g. the
+      // modal unmounted or the effect re-ran while a 0-width rAF was still
+      // pending. Without this the rAF below would self-perpetuate on stale
+      // refs (a detached node keeps reporting clientWidth === 0).
+      if (!wrapEl.isConnected) return;
       for (const p of pins) {
         if (!p.pillEl || !p.pillEl.isConnected) return;
       }
       const wrapWidthPx = wrapEl.clientWidth;
       if (wrapWidthPx <= 0) {
-        requestAnimationFrame(applyLayout);
+        rafHandle = requestAnimationFrame(applyLayout);
         return;
       }
       const pinInputs: PillPin[] = pins.map((p) => ({
@@ -312,6 +318,9 @@ function useRangeBar(
       }
     };
     applyLayout();
+    return () => {
+      if (rafHandle != null) cancelAnimationFrame(rafHandle);
+    };
   }, [wrapRef, trackRef, fc, nowPct]);
 }
 
