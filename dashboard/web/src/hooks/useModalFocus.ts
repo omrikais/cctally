@@ -51,8 +51,14 @@ export interface UseModalFocusOptions {
    * — needed when the first control self-disables on open (a focused element
    * that becomes `disabled` is blurred by the browser, dropping focus to
    * `<body>`). The container is `tabIndex=-1`, so it can never be disabled.
+   * `'heading'` focuses the dialog heading (the `aria-labelledby` target, e.g.
+   * `#modal-title`) so the reader lands on the modal's title/answer rather than
+   * a header affordance (SH-2). The heading must carry `tabIndex={-1}` for
+   * `.focus()` to take — the FOCUSABLE_SELECTOR deliberately excludes
+   * `[tabindex="-1"]`, so heading focus needs this explicit path, and it stays
+   * out of the Tab order. Falls back to `'first'` when no heading is present.
    */
-  initialFocus?: 'first' | 'container';
+  initialFocus?: 'first' | 'container' | 'heading';
 }
 
 /**
@@ -76,6 +82,15 @@ export function useModalFocus(
       if (initialFocus === 'container') {
         // Focus the container itself (tabIndex=-1 so it can't be disabled).
         container.focus();
+      } else if (initialFocus === 'heading') {
+        // Focus the dialog heading (aria-labelledby target). It carries
+        // tabIndex={-1} so `.focus()` takes yet it stays out of the Tab order
+        // and out of getFocusable(). Fall back to the first focusable, then the
+        // container, if no heading exists.
+        const heading = container.querySelector<HTMLElement>(
+          '[data-modal-heading], #modal-title, h2',
+        );
+        (heading ?? getFocusable(container)[0] ?? container).focus();
       } else {
         const focusable = getFocusable(container);
         (focusable[0] ?? container).focus();

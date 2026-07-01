@@ -44,7 +44,10 @@ export function ModalHeader({
 }: ModalHeaderProps) {
   return (
     <header className={className}>
-      <h2 id={titleId}>{title}</h2>
+      {/* tabIndex={-1} so useModalFocus `initialFocus: 'heading'` can `.focus()`
+          the title on open (SH-2). It stays out of the Tab order and out of the
+          FOCUSABLE_SELECTOR (which excludes [tabindex="-1"]). */}
+      <h2 id={titleId} tabIndex={-1}>{title}</h2>
       {headerExtras}
       {onClose ? (
         <ModalCloseButton

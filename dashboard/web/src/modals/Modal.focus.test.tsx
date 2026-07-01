@@ -9,6 +9,7 @@
 // with an empty `alerts` array, so no envelope snapshot is needed.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { act, render } from '@testing-library/react';
+import { Modal } from './Modal';
 import { ModalRoot } from './ModalRoot';
 import {
   _resetForTests,
@@ -58,5 +59,20 @@ describe('<Modal /> focus management (A1)', () => {
     });
     expect(document.querySelector('.modal-card')).toBeNull();
     expect(document.activeElement?.id).toBe('panel-trigger');
+  });
+
+  // SH-2 — on open, focus lands on the dialog heading (#modal-title, which
+  // ModalHeader marks tabIndex={-1} so `.focus()` takes) rather than the first
+  // header focusable (the Share/close affordances). This is the shared modal
+  // grammar entry point for every panel modal that routes through <Modal>.
+  it('lands focus on the dialog heading on open', () => {
+    render(
+      <Modal title="Forecast" accentClass="accent-purple">
+        <p>body</p>
+      </Modal>,
+    );
+    const heading = document.getElementById('modal-title');
+    expect(heading).toBeTruthy();
+    expect(document.activeElement).toBe(heading);
   });
 });

@@ -24,6 +24,13 @@ interface ModalProps {
   headerExtras?: ReactNode;
 }
 
+// Modal grammar (SH-2, a light documented contract — no reorder of shipped
+// modals, they already roughly follow it): a panel modal reads top-to-bottom as
+//   answer/verdict chip → hero KPI → primary visual → supporting tables.
+// On open, focus lands on the dialog heading (initialFocus: 'heading') so the
+// reader starts at the title/answer rather than a header affordance (the Share
+// icon / close button). Panel modals only — the share family manages its own
+// focus in ShareModalRoot and does not route through this hook.
 export function Modal({ title, accentClass, children, headerExtras }: ModalProps) {
   const close = () => dispatch({ type: 'CLOSE_MODAL' });
   const bindings = useMemo(
@@ -39,7 +46,7 @@ export function Modal({ title, accentClass, children, headerExtras }: ModalProps
     subscribeStore,
     () => topmostStoreFocusLayer(getState()) === 'panel',
   );
-  useModalFocus(cardRef, { active: true, trapEnabled });
+  useModalFocus(cardRef, { active: true, trapEnabled, initialFocus: 'heading' });
   // M1-1: lock background page scroll while a panel modal is open. Modal
   // mounts only while open, so the active value is always true here.
   useScrollLock(true);
