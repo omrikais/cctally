@@ -13,13 +13,15 @@
 //     after the asymmetric stretch — an accepted trade for matching
 //     width with the net-bars.
 //   - large: viewBox 800x90 rendered with width="100%" so it shrinks
-//     to fit the modal body at narrow viewports. Axis labels ("100%" /
-//     "0%") live in HTML <span> siblings stacked above/below the SVG
-//     via flex column so the polyline can't collide with the "100%"
-//     text when cache_hit_percent hugs the top. Five faint horizontal
-//     gridlines at 0/25/50/75/100% give the user a visual cue that
-//     the chart is bounded to [0, 100] — without them a polyline
-//     hugging 97-98% reads as a flat line floating in nowhere.
+//     to fit the modal body at narrow viewports. The y-axis AUTO-ZOOMS
+//     (CR-1, #250) via computeAutoZoomDomain — it fits to the data band
+//     plus the median +/-band instead of a fixed 0-100, so a series
+//     clustered at 96-98% shows real day-to-day variation and the
+//     dashed-median band reads clearly. The two HTML <span> axis labels
+//     (top/bottom) show the zoomed domain's hi/lo %, and three faint
+//     horizontal gridlines at hi / mid / lo replace the old fixed
+//     0/25/50/75/100 rules. The `mini` variant keeps the fixed 0-100
+//     scale (a silent zoom on the label-less mini would mislead).
 //   - x-axis: oldest -> newest, evenly spaced. We reverse the
 //     newest-first envelope days[] in-place so the today marker sits at
 //     the right edge.
@@ -36,6 +38,7 @@
 // and BlockTimeline.tsx precedent.
 import type { CacheReportDailyRow } from '../types/envelope';
 import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
+import { computeAutoZoomDomain } from '../lib/chartDomain';
 
 export interface CacheSparklineProps {
   /** Newest-first daily rows from the envelope. Up to 14 entries. */
@@ -59,11 +62,6 @@ const SIZES = {
   large: { width: 800, height: 90, padTop: 6, padBot: 6 },
 } as const;
 
-// Y-axis gridline percentages drawn on the large variant. Includes the
-// outer bounds (0/100) plus quarter marks so the user can read the
-// polyline position by eye without a tooltip.
-const GRIDLINE_PCTS = [0, 25, 50, 75, 100] as const;
-
 export function CacheSparkline({
   days,
   baseline_median_percent,
@@ -74,6 +72,19 @@ export function CacheSparkline({
   const isLarge = size === 'large';
   // Reverse newest-first envelope so the polyline renders oldest -> newest.
   const ordered = [...days].reverse();
+
+  // Auto-zoom the y-domain for the large variant only (CR-1, #250): fit
+  // to the data band + the median +/-band so the polyline shows real
+  // variation instead of pinning to the top edge. The mini variant keeps
+  // the fixed 0-100 scale (a silent zoom on the label-less mini would
+  // mislead). Empty `ordered` degenerates to {lo:0, hi:100}.
+  const domain = isLarge
+    ? computeAutoZoomDomain(
+        ordered.map((d) => d.cache_hit_percent),
+        baseline_median_percent,
+        CACHE_REPORT_BAND_PP,
+      )
+    : { lo: 0, hi: 100 };
 
   // Mini = width:100% + fixed height + preserveAspectRatio="none" so
   // the polyline x-positions stretch the full panel width to match
@@ -99,16 +110,18 @@ export function CacheSparkline({
     );
     return isLarge ? (
       <div className="cr-spark-wrap">
-        <span className="cr-spark-axis cr-spark-axis-top">100%</span>
+        <span className="cr-spark-axis cr-spark-axis-top">{Math.round(domain.hi)}%</span>
         {emptySvg}
-        <span className="cr-spark-axis cr-spark-axis-bot">0%</span>
+        <span className="cr-spark-axis cr-spark-axis-bot">{Math.round(domain.lo)}%</span>
       </div>
     ) : emptySvg;
   }
 
-  // y-axis: 0% at bottom, 100% at top.
+  // y-axis: domain.lo at the bottom, domain.hi at the top. For the mini
+  // variant the domain is a fixed {0, 100} so this is the classic scale.
   const yFor = (pct: number): number => {
-    const t = Math.max(0, Math.min(100, pct)) / 100;
+    const span = domain.hi - domain.lo || 1;
+    const t = (Math.max(domain.lo, Math.min(domain.hi, pct)) - domain.lo) / span;
     return cfg.padTop + (1 - t) * (cfg.height - cfg.padTop - cfg.padBot);
   };
   const xFor = (i: number): number => {
@@ -132,32 +145,35 @@ export function CacheSparkline({
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
       aria-label={`Cache hit % timeline, ${ordered.length} days`}
     >
-      {/* Gridlines (large only) — five horizontal rules at 0/25/50/75/100%
-          so the user can read the polyline's y-position without a
-          tooltip. The 0 and 100 rules are solid white at moderate
-          opacity (they're the y-axis bounds and need to read as
-          structural); the 25/50/75 rules are dashed and fainter so
-          they cue the quarters without competing with the polyline.
+      {/* Gridlines (large only) — three horizontal rules at the zoomed
+          domain's hi / mid / lo so the user can read the polyline's
+          y-position without a tooltip (CR-1, #250). The hi/lo bounds are
+          solid white at moderate opacity (they're the y-axis bounds and
+          need to read as structural); the mid rule is dashed and fainter
+          so it cues the middle without competing with the polyline.
           Theme-token colors like --border-soft were too low-contrast
           against the dark modal background to be visible at all. */}
       {isLarge &&
-        GRIDLINE_PCTS.map((pct) => {
-          const isBound = pct === 0 || pct === 100;
-          return (
-            <line
-              key={`grid-${pct}`}
-              x1={0}
-              x2={cfg.width}
-              y1={yFor(pct)}
-              y2={yFor(pct)}
-              stroke={isBound ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.18)'}
-              strokeWidth={isBound ? 1 : 0.5}
-              strokeDasharray={isBound ? undefined : '4,3'}
-              opacity={1}
-              data-testid={`cr-spark-gridline-${pct}`}
-            />
-          );
-        })}
+        (
+          [
+            { k: 'hi', pct: domain.hi, bound: true },
+            { k: 'mid', pct: (domain.lo + domain.hi) / 2, bound: false },
+            { k: 'lo', pct: domain.lo, bound: true },
+          ] as const
+        ).map(({ k, pct, bound }) => (
+          <line
+            key={`grid-${k}`}
+            x1={0}
+            x2={cfg.width}
+            y1={yFor(pct)}
+            y2={yFor(pct)}
+            stroke={bound ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.18)'}
+            strokeWidth={bound ? 1 : 0.5}
+            strokeDasharray={bound ? undefined : '4,3'}
+            opacity={1}
+            data-testid={`cr-spark-gridline-${k}`}
+          />
+        ))}
       {baseline_median_percent !== null && (
         <>
           {/* Tinted baseline band: ±BAND_PP around the median. */}
@@ -203,9 +219,9 @@ export function CacheSparkline({
 
   return isLarge ? (
     <div className="cr-spark-wrap">
-      <span className="cr-spark-axis cr-spark-axis-top">100%</span>
+      <span className="cr-spark-axis cr-spark-axis-top">{Math.round(domain.hi)}%</span>
       {svg}
-      <span className="cr-spark-axis cr-spark-axis-bot">0%</span>
+      <span className="cr-spark-axis cr-spark-axis-bot">{Math.round(domain.lo)}%</span>
     </div>
   ) : svg;
 }
