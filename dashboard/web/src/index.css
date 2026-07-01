@@ -1996,6 +1996,11 @@ mark.current {
    user sees an affirmative milestone (otherwise "synced 0s ago" is
    visually identical to the prior "synced Xs ago"). */
 .sync-chip.sync-success { color: var(--accent-green); }
+/* S7 SYNC-1: freshness color escalation on the sync chip. Fresh keeps the
+   muted default; aging→amber, stale→red. Only the default (env-driven)
+   branch emits a bucket class — busy/error/success keep their own colors. */
+.sync-chip--aging { color: var(--accent-amber); }
+.sync-chip--stale { color: var(--accent-red); }
 @keyframes sync-pulse { 0%, 100% { opacity: 0.6 } 50% { opacity: 1 } }
 
 /* ----- Refresh icon: state-driven animations ----- */
@@ -3925,6 +3930,24 @@ mark.current {
     white-space: nowrap;
     border: 0;
   }
+  /* S7 SYNC-2: on mobile the chip text is sr-only, so surface a freshness
+     dot on the sync button. Colored by the chip's bucket class via :has()
+     (mirrors the .topbar-sync:has(...) icon-state pattern). Fresh shows no
+     dot (calm); aging→amber, stale→red. Decorative (::after → aria-hidden);
+     the sr-only chip text still carries the accessible name via aria-live. */
+  .topbar-sync { position: relative; }
+  .topbar-sync:has(.sync-chip--aging)::after,
+  .topbar-sync:has(.sync-chip--stale)::after {
+    content: '';
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .topbar-sync:has(.sync-chip--aging)::after { background: var(--accent-amber); }
+  .topbar-sync:has(.sync-chip--stale)::after { background: var(--accent-red); }
 
   /* Modal → full-screen bottom sheet. Slides up; uses 100dvh so iOS
      Safari's collapsing URL bar doesn't clip the bottom on first

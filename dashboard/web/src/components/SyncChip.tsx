@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useConnectionStatus } from '../hooks/useConnectionStatus';
 import { getState, subscribeStore } from '../store/store';
+import { syncFreshness, type SyncBucket } from '../lib/syncFreshness';
 
 // Mirrors dashboard/static/render.js#updateSyncChip + its 1-second tick.
 // Guards: never overwrite "disconnected"; respect the 3-second sync
@@ -28,6 +29,10 @@ export function SyncChip() {
   );
   const [text, setText] = useState('sync paused');
   const [color, setColor] = useState('');
+  // S7 SYNC-1: freshness bucket for the default (env-driven) branch only;
+  // '' when a non-default state (busy/error/paused/disconnected) owns the
+  // chip so those keep their own colors.
+  const [bucket, setBucket] = useState<SyncBucket | ''>('');
   const tickOffset = useRef(0);
   // Nudges the chip to re-evaluate when the error floor expires so the
   // post-floor text/class paint the moment it times out.
@@ -46,21 +51,27 @@ export function SyncChip() {
   // override text/color/class.
   useEffect(() => {
     if (floorActive || successFlashActive) return;
-    if (disconnected) { setText('disconnected'); setColor('var(--accent-red)'); return; }
+    if (disconnected) { setText('disconnected'); setColor('var(--accent-red)'); setBucket(''); return; }
     if (!env) return;
     if (env.last_sync_error) {
       setText('⚠ sync error');
       setColor('var(--accent-red)');
+      setBucket('');
       return;
     }
     if (env.sync_age_s == null) {
       setText('sync paused'); setColor('');
+      setBucket('');
       tickOffset.current = 0;
       return;
     }
     setColor('');
     tickOffset.current = env.sync_age_s | 0;
-    setText(`synced ${tickOffset.current}s ago`);
+    {
+      const f = syncFreshness(tickOffset.current);
+      setText(`synced ${f.text}`);
+      setBucket(f.bucket);
+    }
   }, [env, disconnected, floorActive, successFlashActive]);
 
   // 1-second tick. Also suppressed while the error floor is active.
@@ -70,7 +81,9 @@ export function SyncChip() {
       if (Date.now() < getState().syncErrorFloorUntil) return;
       if (!env || env.sync_age_s == null || env.last_sync_error) return;
       tickOffset.current += 1;
-      setText(`synced ${tickOffset.current}s ago`);
+      const f = syncFreshness(tickOffset.current);
+      setText(`synced ${f.text}`);
+      setBucket(f.bucket);
     }, 1000);
     return () => window.clearInterval(id);
   }, [env, disconnected]);
@@ -158,7 +171,7 @@ export function SyncChip() {
   }
   return (
     <span
-      className="sync-chip mute"
+      className={'sync-chip mute' + (bucket ? ` sync-chip--${bucket}` : '')}
       id="sync-chip"
       aria-live="polite"
       style={{ color }}
