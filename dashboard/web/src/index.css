@@ -205,9 +205,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 
 /* Action icon trio inside .topbar. The wrapper itself stays visible at
    every viewport so the SyncChip cluster (.topbar-sync) keeps its
-   right-floated position; only the new ⚙/? icon buttons are hidden on
-   desktop, where the s/?/r keymap covers them. The mobile @media block
-   reveals the icon buttons. */
+   right-floated position. S7 HDR-1: the gear/help buttons are now shown on
+   desktop too (they already exist in the DOM at all widths and dispatch
+   s/? keydowns); the mobile @media block re-sizes them to the 44px touch
+   target so the #206 topbar height budget doesn't grow on desktop. */
 .topbar-actions {
   margin-left: auto;
   display: flex;
@@ -218,7 +219,32 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
      thumb-tap buttons closer to the 8pt HIG minimum. */
   gap: 10px;
 }
-.topbar-actions > .topbar-icon-btn { display: none; }
+/* S7 HDR-1: desktop Settings/Help discovery — a compact, borderless icon
+   button matching the adjacent .topbar-sync affordance. Scoped to the
+   desktop viewport (min-width:641px) so its (0,2,0) child-combinator
+   specificity can't leak into and defeat the mobile 44px `.topbar-icon-btn`
+   rule (0,1,0) — the id-selector specificity-floor gotcha. The mobile
+   @media block owns the 44px bordered touch treatment. */
+@media (min-width: 641px) {
+  .topbar-actions > .topbar-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+  }
+  .topbar-actions > .topbar-icon-btn:hover { color: var(--text); }
+  .topbar-actions > .topbar-icon-btn:focus-visible {
+    outline: 2px solid var(--accent-purple);
+    outline-offset: 2px;
+  }
+}
 
 /* #248 §6 — the mobile-only condensed hero readout. Desktop-hidden by default
    (the full hero is in view there); the mobile @media block reveals it once
@@ -1043,9 +1069,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 }
 /* #249 F1 — the keyboard-hint strip means nothing on touch. The ≤640px block
    already hides it on phones; this also covers coarse-pointer devices wider
-   than 640px (touch tablets/laptops). Desktop (fine pointer) keeps the strip —
-   it remains the only Settings/Help discovery until S7 (#253) ships the
-   desktop header icons (HDR-1). */
+   than 640px (touch tablets/laptops). Desktop (fine pointer) keeps the strip.
+   S7 (#253) HDR-1 has now shipped the desktop header gear/help icons, so the
+   strip is reinforcement rather than the sole desktop Settings/Help cue. */
 @media (pointer: coarse) { .footer { display: none; } }
 .kb { display: inline-flex; align-items: center; gap: 8px; }
 .kb kbd {
@@ -1086,6 +1112,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 }
 #help-overlay .help-card table { border-collapse: collapse; }
 #help-overlay .help-card td { padding: 4px 12px 4px 0; vertical-align: top; }
+/* S7 HELP-2: tighten the key→description gutter. HTML auto-layout sized
+   column 1 to the widest first cell (the "Shift ↑/↓" combo rows), pushing
+   single-kbd rows far to the right. Pin the key column to its content and
+   right-align the keys so they sit adjacent to their descriptions. */
+#help-overlay .help-card td:first-child {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+  padding-right: 12px;
+}
 #help-overlay .help-card td kbd,
 #help-overlay .help-card .help-gesture-list kbd {
   background: var(--panel-bg-2);
@@ -1847,6 +1883,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   gap: 6px;
 }
 .ctrl-btn:hover { background: rgba(255,255,255,0.04); }
+/* S7 A11Y-1: the Sessions control buttons had no focus-visible rule (fell
+   back to the thin UA ring). Give them the shared 2px accent ring — orange
+   matches the controls cluster (.ctrl-input:focus). */
+.ctrl-btn:focus-visible { outline: 2px solid var(--accent-orange); outline-offset: 2px; }
 .ctrl-btn.as-chip { padding: 2px 8px; }
 .ctrl-btn .chip { font-size: var(--fs-eyebrow); color: var(--accent-orange); }
 .ctrl-btn .chip-x { margin-left: 6px; color: var(--text-dim); }
@@ -3975,7 +4015,7 @@ mark.current {
     right: 6px;
     width: 8px;
     height: 8px;
-    border-radius: 50%;
+    border-radius: 50%; /* lint-allow: border-radius circular freshness dot (no token) */
   }
   .topbar-sync:has(.sync-chip--aging)::after { background: var(--accent-amber); }
   .topbar-sync:has(.sync-chip--stale)::after { background: var(--accent-red); }
@@ -4341,6 +4381,22 @@ mark.current {
      "sort: started desc" label so the trailing button stays square. */
   #panel-sessions > .sessions-ctrls #sort-pill .label { display: none; }
 
+  /* S7 SESS-1: keep the filter chip + sort pill on row 1 and drop the
+     always-mounted search input to a full-width row 2, so a remembered-
+     filter chip can't squeeze the input to a sliver. DOM order is
+     filter → search → sort, so an order-based reflow (search gets the
+     highest order + full basis) wraps search below while filter (order 0)
+     and sort (order 1) share row 1. */
+  #panel-sessions > .sessions-ctrls { flex-wrap: wrap; }
+  #panel-sessions > .sessions-ctrls > #filter-btn,
+  #panel-sessions > .sessions-ctrls > #filter-input { order: 0; }
+  #panel-sessions > .sessions-ctrls > #sort-pill { order: 1; }
+  #panel-sessions > .sessions-ctrls > .search-container {
+    order: 2;
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
   /* Sessions table → dense two-line rows. The 5-column table
      (Started / Dur / Model / Project / Cost) collapses to:
        row 1: project (left, ellipsis) + cost (right, accent color)
@@ -4705,9 +4761,15 @@ mark.current {
   /* .doctor-chip (topbar pill): vertical-only invisible 44px so the #206
      topbar height budget stays intact (a real 44px box would grow the
      topbar). The base .doctor-chip rule has no position, so adding
-     position:relative here wins by source order. */
+     position:relative here wins by source order. S7 HDR-2: widen the hit
+     box horizontally too (inset -8px) so a narrow "Doctor"-only pill still
+     clears 44px wide, and extend the same idiom to .basket-chip. The
+     .topbar.is-scrolled rule sets both chips display:none — a display:none
+     element paints no ::before, so no phantom hit-area leaks. */
   .doctor-chip { position: relative; }
-  .doctor-chip::before { content: ""; position: absolute; inset: -12px 0; }
+  .doctor-chip::before { content: ""; position: absolute; inset: -12px -8px; }
+  .basket-chip { position: relative; }
+  .basket-chip::before { content: ""; position: absolute; inset: -10px -8px; }
 
   /* Settings checkbox/radio rows: a 44px flex label row + an 18px box.
      Scoped via :has() to labels that wrap a checkbox/radio. This INCLUDES

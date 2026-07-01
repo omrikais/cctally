@@ -6,6 +6,10 @@ import { tryQuit } from '../store/actions';
 // state. `q` goes through tryQuit() so non-opener tabs (where
 // window.close() is a silent no-op) still surface the "Can't close this
 // tab" toast fallback.
+//
+// FTR-1 (#253): since S7's HDR-1 ships visible desktop gear/help icons in
+// the topbar, this footer strip is now reinforcement of the Settings/Help
+// shortcuts rather than their sole desktop discovery cue.
 
 export function Footer() {
   return (
