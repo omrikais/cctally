@@ -22,10 +22,14 @@ import { useMemo } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
 import { ProjectsRankedBars } from './ProjectsRankedBars';
-import { bucketRankedProjects, isDominant, OTHER_KEY } from './projectsChart';
+import {
+  bucketRankedProjects,
+  isDominant,
+  OTHER_KEY,
+  colorFor,
+  basenameOf,
+} from './projectsChart';
 
-const SERIES_COLORS = ['#d946ef', '#c084fc', '#60a5fa', '#fbbf24', '#22d3ee'];
-const OTHER_COLOR = '#64748b';
 const VW = 400;
 const VH = 150;
 
@@ -35,19 +39,6 @@ export interface ProjectsTrendChartProps {
   windowWeeks: number;
   onProjectSelect?: (key: string) => void;
 }
-
-// Series color by rank position — top-5 take SERIES_COLORS by descending
-// rank, `(other)` is a muted slate. Shared with ProjectsRankedBars (same
-// palette, same by-position indexing) so the ranked rows and the legend
-// below them agree.
-const colorFor = (key: string, i: number): string =>
-  key === OTHER_KEY ? OTHER_COLOR : (SERIES_COLORS[i] ?? OTHER_COLOR);
-
-// Basename of a project's canonical bucket_path (PR-3) — the mobile
-// legend truncates the disambiguated display `key` mid-word, so we label
-// with the basename and carry the full path on the `title` attr.
-const basenameOf = (bucketPath: string): string =>
-  bucketPath === OTHER_KEY ? OTHER_KEY : (bucketPath.split('/').filter(Boolean).pop() ?? bucketPath);
 
 export function ProjectsTrendChart({
   trend,

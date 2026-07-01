@@ -11,6 +11,23 @@ export const TOP_N = 5;
 export const DOMINANCE_THRESHOLD = 0.60;
 export const OTHER_KEY = '(other)';
 
+// Series palette — top-5 take SERIES_COLORS by descending rank, `(other)`
+// is a muted slate. Single source of truth shared by the stacked-area
+// chart, the ranked bars, and the legend so a palette edit can never
+// desync a bar from its own legend swatch within one modal.
+export const SERIES_COLORS = ['#d946ef', '#c084fc', '#60a5fa', '#fbbf24', '#22d3ee'];
+export const OTHER_COLOR = '#64748b';
+
+// Series color by rank position (top-5 by SERIES_COLORS, `(other)` slate).
+export const colorFor = (key: string, i: number): string =>
+  key === OTHER_KEY ? OTHER_COLOR : (SERIES_COLORS[i] ?? OTHER_COLOR);
+
+// Basename of a project's canonical bucket_path (PR-3) — the mobile legend
+// truncates the disambiguated display `key` mid-word, so we label with the
+// basename and carry the full path on the `title` attr.
+export const basenameOf = (bucketPath: string): string =>
+  bucketPath === OTHER_KEY ? OTHER_KEY : (bucketPath.split('/').filter(Boolean).pop() ?? bucketPath);
+
 export interface PreparedSeries {
   key: string;
   bucket_path: string;

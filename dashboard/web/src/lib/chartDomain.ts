@@ -24,7 +24,7 @@ export function computeAutoZoomDomain(
   if (points.length === 0) return { lo: 0, hi: 100 };
 
   const cands = [...points];
-  if (median != null && isFinite(median)) {
+  if (median != null && Number.isFinite(median)) {
     cands.push(median - bandPp, median + bandPp);
   }
   let lo = Math.min(...cands) - pad;

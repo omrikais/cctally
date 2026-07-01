@@ -6,18 +6,16 @@
 // slivers. This view renders one row per top-5 project + `(other)`,
 // sorted desc, as `label · bar(width ∝ cost/topCost) · "$X · Y%"`.
 //
-// Colors reuse the SERIES_COLORS / OTHER_COLOR palette (identical to
-// ProjectsTrendChart, indexed by series position) so the ranked rows and
-// the legend rendered below them agree. Clicking a real project row
-// drills via onProjectSelect(key); the `(other)` rollup is inert — the
+// Colors + basenames come from the shared `projectsChart` palette
+// (colorFor / basenameOf), the single source of truth also used by the
+// stacked-area chart and the legend below — so a palette edit can never
+// desync a ranked bar from its own legend swatch. Clicking a real project
+// row drills via onProjectSelect(key); the `(other)` rollup is inert — the
 // same drill contract as the stacked-area mode.
 //
 // Vanilla markup, no chart library (stdlib-only ethos).
 import type { PreparedSeries } from './projectsChart';
-import { OTHER_KEY } from './projectsChart';
-
-const SERIES_COLORS = ['#d946ef', '#c084fc', '#60a5fa', '#fbbf24', '#22d3ee'];
-const OTHER_COLOR = '#64748b';
+import { OTHER_KEY, colorFor, basenameOf } from './projectsChart';
 
 export function ProjectsRankedBars({
   series,
@@ -32,12 +30,10 @@ export function ProjectsRankedBars({
     <div className="projects-ranked" data-testid="projects-ranked-bars">
       {series.map((p, i) => {
         const isOther = p.key === OTHER_KEY;
-        const color = isOther ? OTHER_COLOR : (SERIES_COLORS[i] ?? OTHER_COLOR);
+        const color = colorFor(p.key, i);
         const pct = (p.cost / total) * 100;
         const w = Math.max((p.cost / top) * 100, 1.5);
-        const label = isOther
-          ? OTHER_KEY
-          : p.bucket_path.split('/').filter(Boolean).pop();
+        const label = basenameOf(p.bucket_path);
         return (
           <button
             key={p.key}
