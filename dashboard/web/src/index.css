@@ -429,6 +429,15 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .doctor-modal__category-header:hover {
   background: rgba(255, 255, 255, 0.05);
 }
+/* S7 DOC-1: category headers get a disclosure caret matching the per-check
+   "▶/▼ details" affordance. Dim + small; the header's flex gap handles the
+   spacing to the severity glyph. */
+.doctor-modal__category-caret {
+  display: inline-block;
+  width: 0.8em;
+  color: var(--text-dim);
+  font-size: 0.85em;
+}
 .doctor-modal__category--ok   .doctor-modal__glyph { color: var(--accent-green); }
 .doctor-modal__category--warn .doctor-modal__glyph { color: var(--accent-amber); }
 .doctor-modal__category--fail .doctor-modal__glyph { color: var(--accent-red); }

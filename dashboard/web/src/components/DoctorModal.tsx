@@ -83,6 +83,30 @@ export function DoctorModal(): JSX.Element | null {
     if (open) void refresh();
   }, [open, refresh]);
 
+  // DOC-2 (#253): reconcile the SSE-fed Doctor chip to the freshest report.
+  // /api/doctor recomputes fresh (like the SSE block), so a manual fetch can
+  // be newer than the chip's last SSE tick. Feed it back into the store slice
+  // the chip reads. Guard on generated_at so a slow in-flight fetch can't
+  // clobber a newer SSE tick. /api/doctor has no `fingerprint`; nothing on the
+  // client consumes it for display and the next SSE tick overwrites this
+  // transient value, so a synthetic marker is honest and safe.
+  useEffect(() => {
+    if (!report) return;
+    const prev = getState().doctor;
+    const prevAt = prev ? Date.parse(prev.generated_at) : NaN;
+    const nextAt = Date.parse(report.generated_at);
+    if (prev && Number.isFinite(prevAt) && Number.isFinite(nextAt) && nextAt <= prevAt) return;
+    dispatch({
+      type: 'SET_DOCTOR_AGGREGATE',
+      doctor: {
+        severity: report.overall.severity,
+        counts: report.overall.counts,
+        generated_at: report.generated_at,
+        fingerprint: 'client-reconcile',
+      },
+    });
+  }, [report]);
+
   // a11y focus management (#207 A1). Called BEFORE the `!open` early-return so
   // the hook order stays stable (Rules of Hooks). `active: open` drives
   // focus-in/restore; the Tab-trap suspends when a higher store-tracked layer
@@ -168,7 +192,7 @@ function DoctorReportBody({ report }: { report: DoctorReport }): JSX.Element {
   );
 }
 
-function DoctorCategoryRow({
+export function DoctorCategoryRow({
   cat,
   defaultOpen,
 }: { cat: DoctorCategory; defaultOpen: boolean }): JSX.Element {
@@ -181,6 +205,11 @@ function DoctorCategoryRow({
         onClick={() => setOpenCat((s) => !s)}
         aria-expanded={openCat}
       >
+        {/* DOC-1: disclosure caret matching the per-check "▶/▼ details"
+            affordance so the collapsible category reads as expandable. */}
+        <span className="doctor-modal__category-caret" aria-hidden="true">
+          {openCat ? '▾' : '▸'}
+        </span>
         <span className="doctor-modal__glyph" aria-hidden="true">
           {GLYPH[cat.severity]}
         </span>

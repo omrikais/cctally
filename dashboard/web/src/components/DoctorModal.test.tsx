@@ -1,6 +1,22 @@
-import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
-import { DoctorCheckRow } from './DoctorModal';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { DoctorCheckRow, DoctorCategoryRow, DoctorModal } from './DoctorModal';
+import { _resetForTests, dispatch, getState } from '../store/store';
+import type { DoctorReport } from '../hooks/useDoctorReport';
+
+// Control the modal's fresh GET /api/doctor result. `useDoctorReport` is a
+// pure fetch hook; mocking it lets us feed a report with an arbitrary
+// generated_at to exercise the DOC-2 freshness guard without a real fetch.
+let mockDoctorReport: DoctorReport | null = null;
+vi.mock('../hooks/useDoctorReport', () => ({
+  useDoctorReport: () => ({ report: mockDoctorReport, loading: false, error: null, refresh: vi.fn() }),
+}));
+
+beforeEach(() => {
+  localStorage.clear();
+  _resetForTests();
+  mockDoctorReport = null;
+});
 
 // Matches the fallback paragraph by its normalized textContent (the
 // `cctally doctor` <code> splits the string across element boundaries).
@@ -27,5 +43,53 @@ describe('DoctorCheckRow non-OK fallback (#207 D3)', () => {
     render(<DoctorCheckRow c={{ id: 'z', title: 'DB', severity: 'warn', summary: 'x', remediation: 'run db recover', details: {} }} />);
     expect(screen.getByText(/run db recover/)).toBeTruthy();
     expect(screen.queryByText(fallbackMatcher)).toBeNull();
+  });
+});
+
+describe('DoctorCategoryRow caret (DOC-1)', () => {
+  it('renders a caret that reflects and toggles aria-expanded', () => {
+    const cat = { id: 'auth', title: 'Auth', severity: 'ok' as const, checks: [] };
+    const { container, getByRole } = render(<DoctorCategoryRow cat={cat} defaultOpen={false} />);
+    const btn = getByRole('button');
+    expect(btn.getAttribute('aria-expanded')).toBe('false');
+    const caret = container.querySelector('.doctor-modal__category-caret');
+    expect(caret?.textContent).toBe('▸');
+    fireEvent.click(btn);
+    expect(btn.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.doctor-modal__category-caret')?.textContent).toBe('▾');
+  });
+});
+
+describe('Doctor chip reconcile (DOC-2)', () => {
+  it('dispatches SET_DOCTOR_AGGREGATE when the report is newer than the slice', () => {
+    dispatch({
+      type: 'SET_DOCTOR_AGGREGATE',
+      doctor: { severity: 'warn', counts: { ok: 20, warn: 6, fail: 0 }, generated_at: '2026-07-02T10:00:00Z', fingerprint: 'sha1:x' },
+    });
+    dispatch({ type: 'OPEN_DOCTOR_MODAL' });
+    mockDoctorReport = {
+      schema_version: 1, generated_at: '2026-07-02T10:05:00Z', cctally_version: 'x',
+      overall: { severity: 'fail', counts: { ok: 20, warn: 5, fail: 1 } }, categories: [],
+    };
+    render(<DoctorModal />);
+    expect(getState().doctor).toEqual({
+      severity: 'fail', counts: { ok: 20, warn: 5, fail: 1 },
+      generated_at: '2026-07-02T10:05:00Z', fingerprint: 'client-reconcile',
+    });
+  });
+  it('does not dispatch when the report is older-or-equal to the slice', () => {
+    dispatch({
+      type: 'SET_DOCTOR_AGGREGATE',
+      doctor: { severity: 'fail', counts: { ok: 20, warn: 5, fail: 1 }, generated_at: '2026-07-02T10:05:00Z', fingerprint: 'sha1:x' },
+    });
+    dispatch({ type: 'OPEN_DOCTOR_MODAL' });
+    mockDoctorReport = {
+      schema_version: 1, generated_at: '2026-07-02T10:00:00Z', cctally_version: 'x',
+      overall: { severity: 'warn', counts: { ok: 20, warn: 6, fail: 0 } }, categories: [],
+    };
+    render(<DoctorModal />);
+    // Unchanged — the SSE-fed slice is at least as fresh, so the guard skips.
+    expect(getState().doctor?.fingerprint).toBe('sha1:x');
+    expect(getState().doctor?.severity).toBe('fail');
   });
 });
