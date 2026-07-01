@@ -494,7 +494,7 @@ export interface UIState {
   chromeOverlayOpen: number;
 }
 
-function defaultPrefs(): Prefs {
+export function defaultPrefs(): Prefs {
   return {
     sortDefault: 'started desc',
     sessionsPerPage: 100,
