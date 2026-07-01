@@ -48,3 +48,45 @@ describe('SessionModal cache-rebuilds wiring', () => {
     expect(getState().conversationJump?.uuid).toBe('u0');
   });
 });
+
+// SE-2 — a single-model session collapses "Models" + "Cost by model" into one
+// caption; a multi-model session keeps both sections.
+describe('SessionModal single-model collapse (SE-2)', () => {
+  function mountWith(detail: Record<string, unknown>) {
+    global.fetch = vi.fn(async (url: string) => {
+      const body = String(url).includes('/outline') ? OUTLINE : detail;
+      return { ok: true, status: 200, json: async () => body } as Response;
+    }) as never;
+    render(<SessionModal />);
+  }
+
+  it('collapses a single-model session into one caption (no Models / Cost-by-model sections)', async () => {
+    mountWith({
+      ...SESSION_DETAIL,
+      models: [{ name: 'claude-opus-4' }],
+      cost_per_model: [{ model: 'claude-opus-4', cost_usd: 1.0 }],
+    });
+    await waitFor(() =>
+      expect(document.getElementById('msess-model-caption')).toBeTruthy(),
+    );
+    expect(document.querySelector('.sec-mod')).toBeNull();
+    expect(document.querySelector('.sec-costm')).toBeNull();
+    const caption = document.getElementById('msess-model-caption')!;
+    expect(caption.textContent).toContain('claude-opus-4');
+    expect(caption.textContent).toContain('$1.00');
+  });
+
+  it('keeps both sections for a multi-model session', async () => {
+    mountWith({
+      ...SESSION_DETAIL,
+      models: [{ name: 'claude-opus-4' }, { name: 'claude-haiku-4' }],
+      cost_per_model: [
+        { model: 'claude-opus-4', cost_usd: 1.0 },
+        { model: 'claude-haiku-4', cost_usd: 0.2 },
+      ],
+    });
+    await waitFor(() => expect(document.querySelector('.sec-mod')).toBeTruthy());
+    expect(document.querySelector('.sec-costm')).toBeTruthy();
+    expect(document.getElementById('msess-model-caption')).toBeNull();
+  });
+});

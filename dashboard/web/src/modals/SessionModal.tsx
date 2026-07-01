@@ -5,6 +5,7 @@ import { Modal } from './Modal';
 import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
 import { modelChipClass } from '../lib/model';
+import { isSingleModel } from '../lib/sessionModel';
 import type { SessionDetail } from '../types/envelope';
 
 // SSE-driven live updates: the modal subscribes to snapshot.generated_at and
@@ -185,6 +186,15 @@ function SessionContent({ detail }: { detail: SessionDetail }) {
   const emptyModels = !detail.models || detail.models.length === 0;
   const emptyCost = !detail.cost_per_model || detail.cost_per_model.length === 0;
 
+  // SE-2 — a single-model session's "Models" + "Cost by model" sections are
+  // both degenerate (one chip; a 100% bar + one legend row). Collapse them into
+  // one caption line. Multi-model (or empty) keeps the two sections as today.
+  const oneModel = isSingleModel(detail);
+  const soleModelName =
+    detail.models?.[0]?.name ?? detail.cost_per_model?.[0]?.model ?? '—';
+  const soleModelCost =
+    detail.cost_per_model?.[0]?.cost_usd ?? detail.cost_total_usd ?? null;
+
   return (
     <div className="modal-content" id="msess-content">
       <div className="m-chipstrip">
@@ -287,63 +297,77 @@ function SessionContent({ detail }: { detail: SessionDetail }) {
         sessionId={detail.session_id ?? null}
       />
 
-      {!emptyModels ? (
+      {oneModel ? (
+        <div className="msess-model-caption" id="msess-model-caption">
+          <span className={'sw ' + modelChipClass(soleModelName)} aria-hidden="true" />
+          <span className="k">Model</span>
+          <span className="name">{soleModelName}</span>
+          <span className="dot" aria-hidden="true">·</span>
+          <span className="v">
+            {soleModelCost != null ? '$' + soleModelCost.toFixed(2) : '—'}
+          </span>
+        </div>
+      ) : (
         <>
-          <h3 className="m-sec sec-mod">
-            <svg className="icon" aria-hidden="true">
-              <use href="/static/icons.svg#sparkles" />
-            </svg>
-            Models
-          </h3>
-          <div className="m-chipstrip" id="msess-models">
-            {(detail.models || []).map((m) => (
-              <span key={m.name} className={'chip ' + modelChipClass(m.name)}>
-                {m.name}
-              </span>
-            ))}
-          </div>
-        </>
-      ) : null}
+          {!emptyModels ? (
+            <>
+              <h3 className="m-sec sec-mod">
+                <svg className="icon" aria-hidden="true">
+                  <use href="/static/icons.svg#sparkles" />
+                </svg>
+                Models
+              </h3>
+              <div className="m-chipstrip" id="msess-models">
+                {(detail.models || []).map((m) => (
+                  <span key={m.name} className={'chip ' + modelChipClass(m.name)}>
+                    {m.name}
+                  </span>
+                ))}
+              </div>
+            </>
+          ) : null}
 
-      {!emptyCost ? (
-        <>
-          <h3 className="m-sec sec-costm">
-            <svg className="icon" aria-hidden="true">
-              <use href="/static/icons.svg#pie-chart" />
-            </svg>
-            Cost by model
-          </h3>
-          <div className="msess-costm">
-            <div className="bar" id="msess-cost-bar">
-              {(detail.cost_per_model || []).map((c) => {
-                const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
-                return (
-                  <div
-                    key={c.model}
-                    className={'seg ' + modelChipClass(c.model)}
-                    style={{ width: pct + '%' }}
-                  />
-                );
-              })}
-            </div>
-            <div className="legend" id="msess-cost-legend">
-              {(detail.cost_per_model || []).map((c) => {
-                const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
-                return (
-                  <div key={c.model} className="lg">
-                    <span className={'sw ' + modelChipClass(c.model)} />
-                    <span className="name">{c.model}</span>
-                    <span className="v">
-                      {c.cost_usd != null ? '$' + c.cost_usd.toFixed(3) : '—'}
-                    </span>
-                    <span className="pct">{Math.round(pct)}%</span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+          {!emptyCost ? (
+            <>
+              <h3 className="m-sec sec-costm">
+                <svg className="icon" aria-hidden="true">
+                  <use href="/static/icons.svg#pie-chart" />
+                </svg>
+                Cost by model
+              </h3>
+              <div className="msess-costm">
+                <div className="bar" id="msess-cost-bar">
+                  {(detail.cost_per_model || []).map((c) => {
+                    const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
+                    return (
+                      <div
+                        key={c.model}
+                        className={'seg ' + modelChipClass(c.model)}
+                        style={{ width: pct + '%' }}
+                      />
+                    );
+                  })}
+                </div>
+                <div className="legend" id="msess-cost-legend">
+                  {(detail.cost_per_model || []).map((c) => {
+                    const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
+                    return (
+                      <div key={c.model} className="lg">
+                        <span className={'sw ' + modelChipClass(c.model)} />
+                        <span className="name">{c.model}</span>
+                        <span className="v">
+                          {c.cost_usd != null ? '$' + c.cost_usd.toFixed(3) : '—'}
+                        </span>
+                        <span className="pct">{Math.round(pct)}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          ) : null}
         </>
-      ) : null}
+      )}
 
       {paths.length > 0 ? (
         <>

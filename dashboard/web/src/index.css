@@ -1703,6 +1703,35 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .msess-costm .legend .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .msess-costm .legend .pct { color: var(--text-dim); font-size: var(--fs-eyebrow); margin-left: 2px; }
 
+/* SE-2 — single-model session caption. Replaces the degenerate Models +
+   Cost-by-model pair with one line: a model-colored swatch, the label, the
+   model name, and the session cost. */
+.msess-model-caption {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 14px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.msess-model-caption .sw {
+  width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; /* lint-allow: border-radius data-viz */
+}
+.msess-model-caption .sw.opus   { background: var(--chip-opus); }
+.msess-model-caption .sw.sonnet { background: var(--chip-sonnet); }
+.msess-model-caption .sw.haiku  { background: var(--chip-haiku); }
+.msess-model-caption .sw.fable  { background: var(--chip-fable); }
+.msess-model-caption .sw.other  { background: var(--surface-faint); }
+.msess-model-caption .k {
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.msess-model-caption .name { color: var(--text); }
+.msess-model-caption .dot { color: var(--text-faint); }
+.msess-model-caption .v {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+}
+
 /* Source files */
 .msess-src .src-head {
   display: flex; align-items: center; gap: 10px;
