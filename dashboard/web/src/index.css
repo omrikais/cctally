@@ -5002,12 +5002,13 @@ mark.current {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* PR-2 ranked bars on mobile — tighten the label column so the bar +
-   * value still fit; the label ellipsizes with a title-attr fallback. */
+  /* PR-2 ranked bars on mobile — widen the label column and wrap the label
+   * to its full basename (#257) so long project names are readable on touch
+   * (no hover tooltip); the bar + value columns stay legible and .rk-val
+   * never wraps. align-items:center inherits from the base .projects-ranked-row. */
   #root .projects-ranked-row {
     grid-template-columns: minmax(96px, 1.5fr) minmax(36px, 1fr) auto;
     gap: 6px;
-    align-items: center;
   }
   #root .rk-label,
   #root .rk-val {
