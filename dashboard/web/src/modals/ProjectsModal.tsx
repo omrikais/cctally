@@ -433,7 +433,6 @@ export function ProjectsModal() {
                   data-cost={r.windowCost}
                   data-sessions={r.sessionsCount}
                   aria-expanded={selectedKey === r.key}
-                  aria-selected={selectedKey === r.key}
                   className={selectedKey === r.key ? 'selected' : ''}
                   tabIndex={0}
                   onClick={() => onRowClick(r.key)}

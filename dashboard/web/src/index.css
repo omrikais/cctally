@@ -1961,7 +1961,10 @@ mark.current {
    over the row wash. The reader's .conv-view mark / .conv-mark--current is a
    different context and is NOT reused here. */
 #sess-rows mark { background: color-mix(in srgb, var(--accent-amber) 30%, transparent); color: inherit; }
-.session-row.search-match-current mark { background: color-mix(in srgb, var(--accent-amber) 45%, transparent); }
+/* Scoped under #sess-rows so this out-ranks the `#sess-rows mark` rule above
+   (id-selector specificity floor — a bare `.search-match-current mark` would
+   tie on 0 ids and lose to the id rule, leaving the current-match mark at 30%). */
+#sess-rows .search-match-current mark { background: color-mix(in srgb, var(--accent-amber) 45%, transparent); }
 
 /* ----- Sessions click-through (Phase 9) ----- */
 /* Pointer cursor only on rows with a real session id — rows missing

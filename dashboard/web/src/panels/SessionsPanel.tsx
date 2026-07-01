@@ -47,7 +47,10 @@ export function SessionsPanel() {
   useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsPerPage);
   const searchMatches = useSyncExternalStore(subscribeStore, () => getState().searchMatches);
   const searchIndex = useSyncExternalStore(subscribeStore, () => getState().searchIndex);
-  // SESS-2: the live needle drives the in-cell <mark> highlighting.
+  // SESS-2: the live needle drives the in-cell <mark> highlighting. The row
+  // haystack is space-joined across cells and includes project_key, so a query
+  // that spans cells ("foo 5m") or matches only project_key can row-match
+  // (wash + aria-current) without any in-cell mark — an accepted limitation.
   const searchText = useSyncExternalStore(subscribeStore, () => getState().searchText);
   const collapsed = useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsCollapsed);
   const sessionsOverride = useSyncExternalStore(

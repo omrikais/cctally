@@ -34,4 +34,15 @@ describe('SortableHeader rest-state glyph (SESS-4)', () => {
     expect(ths[0].querySelector('.th-caret')?.textContent).toBe('▲');
     expect(ths[1].getAttribute('aria-sort')).toBe('none');
   });
+  it('exposes exactly one tab stop per header (th tabIndex=0, inner button tabIndex=-1)', () => {
+    const { container } = render(
+      <table><SortableHeader columns={COLUMNS} override={null} onChange={vi.fn()} /></table>,
+    );
+    const ths = container.querySelectorAll('th');
+    expect(ths.length).toBe(2);
+    ths.forEach((th) => {
+      expect(th.getAttribute('tabindex')).toBe('0');
+      expect(th.querySelector('button')?.getAttribute('tabindex')).toBe('-1');
+    });
+  });
 });
