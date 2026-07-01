@@ -433,8 +433,19 @@ export function ProjectsModal() {
                   data-cost={r.windowCost}
                   data-sessions={r.sessionsCount}
                   aria-expanded={selectedKey === r.key}
+                  aria-selected={selectedKey === r.key}
                   className={selectedKey === r.key ? 'selected' : ''}
+                  tabIndex={0}
                   onClick={() => onRowClick(r.key)}
+                  onKeyDown={(e) => {
+                    // SH-3: keep the native table `row` role but make the row
+                    // operable — Enter/Space selects, same as a click.
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onRowClick(r.key);
+                    }
+                  }}
                 >
                   <td className="project">{r.key}</td>
                   <td>{r.sessionsCount}</td>

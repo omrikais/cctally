@@ -66,7 +66,17 @@ export function PeriodTable({ rows, variant, accentClass, selectedIndex, onSelec
             className={i === selectedIndex ? 'selected' : undefined}
             aria-rowindex={i + 1}
             aria-selected={i === selectedIndex}
+            tabIndex={0}
             onClick={() => onSelect(i)}
+            onKeyDown={(e) => {
+              // SH-3: keep the native table `row` role but make the row
+              // operable — Enter/Space selects, same as a click.
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
+                onSelect(i);
+              }
+            }}
           >
             <td>{r.label}{i === selectedIndex ? ' ▶' : ''}</td>
             <td><ModelsCell row={r} /></td>

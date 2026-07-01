@@ -2514,6 +2514,11 @@ mark.current {
 .history-table.accent-pink tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent-pink); }
 .history-table tbody td.delta-up   { color: var(--accent-red); }
 .history-table tbody td.delta-down { color: var(--accent-green); }
+/* S7 SH-3: keyboard-reachable Weekly/Monthly + Projects modal rows get the
+   shared 2px accent ring, inset so it stays within the row (mirrors
+   .projects-row:focus-visible). */
+.history-table tbody tr:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+[data-testid="projects-table-row"]:focus-visible { outline: 2px solid var(--accent-magenta); outline-offset: -2px; }
 
 /* Models cell: chip family tokens, deduped, top-3 + overflow. Reuses the
    global `.chip.opus|sonnet|haiku` palette so colors match the rest of
