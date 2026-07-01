@@ -22,6 +22,7 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
 import { useSnapshot } from '../hooks/useSnapshot';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { CacheReportSpotlight } from './CacheReportSpotlight';
 import { CacheSparkline } from './CacheSparkline';
 import { CacheNetBars } from './CacheNetBars';
@@ -32,11 +33,37 @@ import {
   CACHE_REPORT_BAND_PP,
   CACHE_REPORT_MIN_BASELINE_DAYS,
 } from '../lib/cache-report-constants';
+import type { CacheReportDailyRow } from '../types/envelope';
+
+// Shared per-row coloring rules for the daily section (desktop table + mobile
+// cards render from the same derivation, so the two surfaces never diverge):
+//   - hit-bad iff the row's cache_hit_percent sits more than the displayed
+//     ±BAND_PP band below today's baseline median (see the long note at the
+//     desktop table for why this is band-bound, not the anomaly classifier);
+//   - net-neg iff net_usd < 0;
+//   - baselineKnown gates the neutral (uncolored) hit cell when no baseline
+//     exists yet.
+function dailyRowFlags(
+  d: CacheReportDailyRow,
+  baselineMedian: number | null,
+): { baselineKnown: boolean; isHitBad: boolean; isNetNeg: boolean } {
+  const baselineKnown = baselineMedian !== null;
+  const isHitBad =
+    baselineKnown &&
+    baselineMedian !== null &&
+    d.cache_hit_percent < baselineMedian - CACHE_REPORT_BAND_PP;
+  return { baselineKnown, isHitBad, isNetNeg: d.net_usd < 0 };
+}
 
 export function CacheReportModal() {
   const env = useSnapshot();
   const cr = env?.cache_report;
   const [showSettings, setShowSettings] = useState(false);
+  // CR-2/CR-3 — the 8-column daily table reflows into an unlabeled run-on on
+  // mobile, and the long header subtitle crowds the sticky title into "Cache
+  // ⋯". A JS branch (JSDOM-testable, matches the Projects mobile-card
+  // precedent) renders labeled cards + a short subtitle at ≤640w.
+  const isMobile = useIsMobile();
 
   if (!cr) {
     return (
@@ -64,10 +91,12 @@ export function CacheReportModal() {
   const headerExtras = (
     <>
       <span
-        className="sub"
+        className="sub crm-subtitle"
         style={{ marginRight: 12, color: 'var(--text-dim)' }}
       >
-        Last {cr.window_days} days · {cr.anomaly_window_days}d baseline · Claude only
+        {isMobile
+          ? `${cr.window_days}d · Claude`
+          : `Last ${cr.window_days} days · ${cr.anomaly_window_days}d baseline · Claude only`}
       </span>
       <button
         type="button"
@@ -179,88 +208,134 @@ export function CacheReportModal() {
           Daily rows · {cr.window_days} days
           <span className="meta">{cr.days.length} days observed</span>
         </div>
-        <table className="ch-table">
-          <thead>
-            <tr>
-              <th className="c-date">Date</th>
-              <th className="c-hit num">Cache %</th>
-              <th className="c-tokens num">Tok In</th>
-              <th className="c-tokens num">Tok Out</th>
-              <th className="c-saved num">Saved</th>
-              <th className="c-wasted num">Wasted</th>
-              <th className="c-net num">Net</th>
-              <th className="c-flag num">Flag</th>
-            </tr>
-          </thead>
-          <tbody>
+        {/* hit-bad rule: a row is bad iff its cache_hit_percent sits more than
+            CACHE_REPORT_BAND_PP below today's baseline median — i.e. it falls
+            below the SAME tinted ±BAND_PP band the sparkline draws around the
+            median. Earlier rounds tied hit-bad to `d.anomaly_reasons`
+            (cache_drop), but that uses the per-row anomaly classifier with
+            `anomaly_threshold_pp` (default 15) instead of the modal's displayed
+            ±5pp band; days 6-14pp below baseline then rendered green even
+            though they visibly sat outside the highlighted band. Re-binding to
+            BAND_PP (via `dailyRowFlags`) keeps the cell color and the sparkline
+            band in lock-step. The Flag column (`flag-warn`/`flag-ok`) stays tied
+            to each row's own `anomaly_triggered`, so display-band coloring and
+            the per-row anomaly classifier remain independent. `baselineKnown`
+            gates the neutral cell class ('' rather than 'hit-good') when there
+            is nothing to compare against yet. CR-2: the desktop table reflows
+            into an unlabeled run-on on mobile, so at ≤640w we render labeled
+            cards from the same `dailyRowFlags` derivation instead. */}
+        {isMobile ? (
+          <div className="crm-daily-cards">
             {cr.days.map((d) => {
               const isToday = d.date === cr.today.date;
-              // hit-bad rule: a row is bad iff its cache_hit_percent
-              // sits more than CACHE_REPORT_BAND_PP below today's
-              // baseline median — i.e. it falls below the SAME tinted
-              // ±BAND_PP band the sparkline draws around the median.
-              //
-              // Earlier rounds tied hit-bad to `d.anomaly_reasons`
-              // (cache_drop), but that uses the per-row anomaly
-              // classifier with `anomaly_threshold_pp` (default 15)
-              // instead of the modal's displayed ±5pp band. With the
-              // defaults, days 6-14pp below baseline rendered green
-              // even though they visibly sat outside the highlighted
-              // band; raising the threshold widened the gap. Re-binding
-              // to BAND_PP keeps the table cell color and the
-              // sparkline band always in lock-step, regardless of how
-              // the user configures `anomaly_threshold_pp`. The Flag
-              // column (`flag-warn` / `flag-ok` below) remains tied to
-              // each row's own `anomaly_triggered`, so the two signals
-              // — display-band coloring vs. per-row anomaly classifier
-              // — stay independent and each carries its own meaning.
-              //
-              // `baselineKnown` is still gated on today's median: it's
-              // the window-wide "do we have any baseline at all" signal
-              // (the rolling window is shared across rows), and the
-              // neutral cell class — '' rather than 'hit-good' — only
-              // makes sense when there's nothing to compare against.
-              const baselineKnown = cr.today.baseline_median_percent !== null;
-              const isHitBad =
-                baselineKnown &&
-                cr.today.baseline_median_percent !== null &&
-                d.cache_hit_percent <
-                  cr.today.baseline_median_percent - CACHE_REPORT_BAND_PP;
-              const isNetNeg = d.net_usd < 0;
+              const { baselineKnown, isHitBad, isNetNeg } = dailyRowFlags(
+                d,
+                cr.today.baseline_median_percent,
+              );
+              const hitClass = baselineKnown
+                ? isHitBad
+                  ? 'hit-bad'
+                  : 'hit-good'
+                : '';
+              const cells: Array<[string, JSX.Element]> = [
+                [
+                  'Cache %',
+                  <span className={hitClass}>{fmt.pctFloor(d.cache_hit_percent)}%</span>,
+                ],
+                [
+                  'Net',
+                  <span className={isNetNeg ? 'net-neg' : 'net-pos'}>
+                    {fmt.usdSigned(d.net_usd)}
+                  </span>,
+                ],
+                ['Saved', <span>{fmt.usd2(d.saved_usd)}</span>],
+                ['Wasted', <span>{fmt.usd2(d.wasted_usd)}</span>],
+                ['Tok In', <span>{fmt.compact(d.input_tokens, { upper: true })}</span>],
+                ['Tok Out', <span>{fmt.compact(d.output_tokens, { upper: true })}</span>],
+              ];
               return (
-                <tr
+                <div
                   key={d.date}
-                  className={isToday ? 'cur' : ''}
-                  data-testid="crm-daily-row"
+                  className={'crm-daily-card' + (isToday ? ' cur' : '')}
+                  data-testid="crm-daily-card"
                   data-date={d.date}
                 >
-                  <td>{d.date}</td>
-                  <td
-                    className={`num ${
-                      baselineKnown ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
-                    }`.trim()}
-                  >
-                    {fmt.pctFloor(d.cache_hit_percent)}%
-                  </td>
-                  <td className="num">{fmt.compact(d.input_tokens, { upper: true })}</td>
-                  <td className="num">{fmt.compact(d.output_tokens, { upper: true })}</td>
-                  <td className="num">{fmt.usd2(d.saved_usd)}</td>
-                  <td className="num">{fmt.usd2(d.wasted_usd)}</td>
-                  <td className={`num ${isNetNeg ? 'net-neg' : 'net-pos'}`}>
-                    {fmt.usdSigned(d.net_usd)}
-                  </td>
-                  <td
-                    className={`num ${
-                      d.anomaly_triggered ? 'flag-warn' : 'flag-ok'
-                    }`}
-                  >
-                    {d.anomaly_triggered ? '⚠' : '✓'}
-                  </td>
-                </tr>
+                  <div className="crm-daily-card-head">
+                    <span className="cd-date">{d.date}</span>
+                    <span
+                      className={'cd-flag ' + (d.anomaly_triggered ? 'flag-warn' : 'flag-ok')}
+                    >
+                      {d.anomaly_triggered ? '⚠' : '✓'}
+                    </span>
+                  </div>
+                  <div className="crm-daily-card-grid">
+                    {cells.map(([label, value]) => (
+                      <div key={label} className="cd-cell">
+                        <span className="lbl">{label}</span>
+                        <span className="val num">{value}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               );
             })}
-          </tbody>
-        </table>
+          </div>
+        ) : (
+          <table className="ch-table">
+            <thead>
+              <tr>
+                <th className="c-date">Date</th>
+                <th className="c-hit num">Cache %</th>
+                <th className="c-tokens num">Tok In</th>
+                <th className="c-tokens num">Tok Out</th>
+                <th className="c-saved num">Saved</th>
+                <th className="c-wasted num">Wasted</th>
+                <th className="c-net num">Net</th>
+                <th className="c-flag num">Flag</th>
+              </tr>
+            </thead>
+            <tbody>
+              {cr.days.map((d) => {
+                const isToday = d.date === cr.today.date;
+                const { baselineKnown, isHitBad, isNetNeg } = dailyRowFlags(
+                  d,
+                  cr.today.baseline_median_percent,
+                );
+                return (
+                  <tr
+                    key={d.date}
+                    className={isToday ? 'cur' : ''}
+                    data-testid="crm-daily-row"
+                    data-date={d.date}
+                  >
+                    <td>{d.date}</td>
+                    <td
+                      className={`num ${
+                        baselineKnown ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
+                      }`.trim()}
+                    >
+                      {fmt.pctFloor(d.cache_hit_percent)}%
+                    </td>
+                    <td className="num">{fmt.compact(d.input_tokens, { upper: true })}</td>
+                    <td className="num">{fmt.compact(d.output_tokens, { upper: true })}</td>
+                    <td className="num">{fmt.usd2(d.saved_usd)}</td>
+                    <td className="num">{fmt.usd2(d.wasted_usd)}</td>
+                    <td className={`num ${isNetNeg ? 'net-neg' : 'net-pos'}`}>
+                      {fmt.usdSigned(d.net_usd)}
+                    </td>
+                    <td
+                      className={`num ${
+                        d.anomaly_triggered ? 'flag-warn' : 'flag-ok'
+                      }`}
+                    >
+                      {d.anomaly_triggered ? '⚠' : '✓'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* 6. Breakdowns row */}

@@ -5196,6 +5196,18 @@ mark.current {
   .panel.cache-report-collapsed .cr-subline.second {
     display: none;
   }
+  /* CR-3 — the sticky mobile header over-truncated the title to "Cache ⋯"
+     because the long subtitle crowded the row. The subtitle text is already
+     shortened via the useIsMobile() branch; keep it from re-crowding the title
+     (which has flex:1 1 auto + ellipsis, see .modal-header h2 mobile rule) by
+     letting the subtitle shrink and stay on one line. */
+  .crm-subtitle {
+    min-width: 0;
+    flex-shrink: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 /* =========================================================================
@@ -5372,6 +5384,52 @@ mark.current {
 .ch-table tbody td.flag-warn { color: var(--accent-amber); }
 .ch-table tbody td.flag-ok   { color: var(--text-faint); }
 .ch-table tbody tr:hover td  { background: rgba(255,255,255,0.02); }
+
+/* CR-2 — mobile daily-rows cards. Rendered only through the useIsMobile() JS
+   branch (≤640w), so no @media gate is needed; the labeled 2-col grid replaces
+   the 8-column table's unlabeled run-on reflow. Coloring classes mirror the
+   .ch-table cells (hit-bad / net-neg / net-pos / flag). */
+.crm-daily-cards { display: flex; flex-direction: column; gap: 10px; }
+.crm-daily-card {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  background: var(--panel-bg);
+}
+.crm-daily-card.cur {
+  border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+  background: color-mix(in srgb, var(--accent-amber) 7%, transparent);
+}
+.crm-daily-card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.crm-daily-card-head .cd-flag.flag-warn { color: var(--accent-amber); }
+.crm-daily-card-head .cd-flag.flag-ok   { color: var(--text-faint); }
+.crm-daily-card-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px;
+}
+.crm-daily-card-grid .cd-cell {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+}
+.crm-daily-card-grid .cd-cell .lbl {
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.crm-daily-card-grid .cd-cell .val {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.crm-daily-card-grid .cd-cell .val .hit-good { color: var(--accent-cyan); }
+.crm-daily-card-grid .cd-cell .val .hit-bad  { color: var(--accent-amber); }
+.crm-daily-card-grid .cd-cell .val .net-pos  { color: var(--accent-green); }
+.crm-daily-card-grid .cd-cell .val .net-neg  { color: var(--accent-amber); }
 
 /* Breakdown sub-cards */
 .crm-breakdowns {

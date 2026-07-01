@@ -19,6 +19,7 @@ import type {
   CacheReportEnvelope,
   Envelope,
 } from '../types/envelope';
+import { stubMobileMedia } from '../test-utils/mobileMedia';
 
 beforeEach(() => {
   localStorage.clear();
@@ -257,6 +258,75 @@ describe('<CacheReportModal /> daily rows table', () => {
     expect(cells2[1].className).toContain('hit-bad');
     expect(cells2[1].className).not.toContain('hit-good');
     expect(cells2[cells2.length - 1].className).toContain('flag-ok');
+  });
+});
+
+// CR-2 / CR-3 — mobile (≤640w) daily-rows card layout + short header subtitle.
+// JSDOM does not evaluate @media; these cover the useIsMobile() React branch
+// (labeled cards vs the desktop .ch-table, and the shortened subtitle). The
+// CSS reflow itself is verified by the real-browser QA gate.
+describe('<CacheReportModal /> mobile daily cards (CR-2/CR-3)', () => {
+  it('renders labeled mobile cards for the daily rows', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const cards = document.querySelectorAll('[data-testid="crm-daily-card"]');
+    expect(cards.length).toBe(14);
+    const card = cards[0]!;
+    // Every column label rides along in the card (the run-on reflow this fixes).
+    expect(card.textContent).toContain('Cache %');
+    expect(card.textContent).toContain('Net');
+    expect(card.textContent).toContain('Saved');
+    expect(card.textContent).toContain('Wasted');
+    expect(card.textContent).toContain('Tok In');
+    expect(card.textContent).toContain('Tok Out');
+    // Desktop table is absent on mobile.
+    expect(document.querySelector('.ch-table')).toBeNull();
+  });
+
+  it('carries the net-neg / hit-bad coloring into the cards', () => {
+    const cr = makeCacheReport();
+    // Day 3: below-band hit% (67-57=10 > BAND_PP=5) + net-negative.
+    cr.days[3] = {
+      ...cr.days[3],
+      cache_hit_percent: 57,
+      net_usd: -0.40,
+    };
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(cr));
+    render(<CacheReportModal />);
+    const card = document.querySelector(
+      `[data-testid="crm-daily-card"][data-date="${cr.days[3].date}"]`,
+    )!;
+    expect(card).toBeTruthy();
+    expect(card.querySelector('.hit-bad')).toBeTruthy();
+    expect(card.querySelector('.net-neg')).toBeTruthy();
+  });
+
+  it('renders the desktop table on wide viewports', () => {
+    stubMobileMedia(false);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    expect(document.querySelector('.ch-table')).toBeTruthy();
+    expect(document.querySelector('[data-testid="crm-daily-card"]')).toBeNull();
+  });
+
+  it('shortens the header subtitle on mobile so the title keeps priority (CR-3)', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const dialog = screen.getByRole('dialog', { name: /cache report/i });
+    // The long desktop subtitle is dropped; a short one takes its place.
+    expect(dialog.textContent).not.toMatch(/baseline · Claude only/);
+    expect(dialog.textContent).toMatch(/14d · Claude/);
+  });
+
+  it('keeps the long subtitle on desktop', () => {
+    stubMobileMedia(false);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const dialog = screen.getByRole('dialog', { name: /cache report/i });
+    expect(dialog.textContent).toMatch(/14d baseline · Claude only/);
   });
 });
 
