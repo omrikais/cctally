@@ -5005,12 +5005,20 @@ mark.current {
   /* PR-2 ranked bars on mobile — tighten the label column so the bar +
    * value still fit; the label ellipsizes with a title-attr fallback. */
   #root .projects-ranked-row {
-    grid-template-columns: minmax(64px, 96px) 1fr auto;
+    grid-template-columns: minmax(96px, 1.5fr) minmax(36px, 1fr) auto;
     gap: 6px;
+    align-items: center;
   }
   #root .rk-label,
   #root .rk-val {
     font-size: 11px;
+  }
+  #root .rk-label {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+    line-height: 1.25;
   }
 
   /* Table → stacked-card reflow. */

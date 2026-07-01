@@ -10,6 +10,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Dashboard Forecast modal: the two end-of-week projection pills no longer overlap on narrow and mobile widths — a hard pixel min-gap now pushes them apart (collapsing to a single "low–high%" range pill only when they genuinely cannot fit), and the mobile scale labels no longer crowd into "100%110%" (#250).
+- Dashboard modal polish follow-ups to #250: on mobile the Projects ranked-bar view (shown when one project dominates the window) now wraps each bar's label to its full project name instead of truncating it, so long names are readable on touch where there is no hover tooltip; the Forecast range bar reflows its projection pills immediately when the modal is resized instead of waiting for the next data refresh; and the empty Recent Alerts teaching gauge now gives interior thresholds a distinct middle tone (amber → orange → red) when three or more alert thresholds are configured, instead of painting every non-lowest tick red (#257).
 
 ## [1.58.0] - 2026-06-30
 
