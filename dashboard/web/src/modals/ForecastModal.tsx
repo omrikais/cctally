@@ -42,53 +42,96 @@ function pillTextFor(raw: number | null | undefined): string {
   return (+raw).toFixed(1) + '%';
 }
 
-interface RangePin {
+// FC-1 pill-layout model. Pure (px in, layout decision out) so the
+// overlap/collapse math is unit-tested without a browser. Input pins carry
+// the measured pill width; the resolver either returns per-pin resolved
+// x-positions (a true hard min-gap in PIXEL space — the prior percent-space
+// resolver under-corrected and let the two pills still touch) OR a collapse
+// signal when the two pills plus the min-gap physically cannot fit the wrap,
+// in which case the effect renders one centered range pill instead.
+export interface PillPin {
   kind: 'wa' | 'r24';
   pos: number;           // clamped 0..110
   raw: number;           // raw projection for pill text
-  trueXPct: number;
-  resolvedXPct: number;
   pillWidthPx: number;
-  pillEl?: HTMLElement;
 }
 
-function resolvePillPositions(pins: RangePin[], wrapWidthPx: number): void {
-  const MIN_GAP_PX = 8;
-  for (const p of pins) p.trueXPct = (p.pos / 110) * 100;
-  if (pins.length < 2 || wrapWidthPx <= 0) {
-    for (const p of pins) p.resolvedXPct = p.trueXPct;
-    return;
+export interface ResolvedPillPin extends PillPin {
+  trueXPct: number;      // un-adjusted position (leader anchor on the track)
+  resolvedXPct: number;  // overlap-resolved pill center
+}
+
+// Flat (non-discriminated) shape so callers read `collapsed`, `pins`, and
+// `rangeText` without narrowing: `pins` is set iff not collapsed,
+// `rangeText` iff collapsed.
+export interface PillLayout {
+  collapsed: boolean;
+  pins?: ResolvedPillPin[];
+  rangeText?: string;
+}
+
+export function resolvePillLayout(
+  pins: PillPin[],
+  wrapWidthPx: number,
+  minGapPx = 8,
+): PillLayout {
+  const resolved: ResolvedPillPin[] = pins.map((p) => ({
+    ...p,
+    trueXPct: (p.pos / 110) * 100,
+    resolvedXPct: (p.pos / 110) * 100,
+  }));
+
+  if (resolved.length < 2 || wrapWidthPx <= 0) {
+    return { collapsed: false, pins: resolved };
   }
-  const sorted = pins.slice().sort((a, b) => a.trueXPct - b.trueXPct);
+
+  // Collapse when the two pills + the min-gap cannot physically fit.
+  const p0 = pins[0];
+  const p1 = pins[1];
+  const needPx = p0.pillWidthPx + minGapPx + p1.pillWidthPx;
+  if (needPx > wrapWidthPx) {
+    const lo = Math.min(p0.raw, p1.raw);
+    const hi = Math.max(p0.raw, p1.raw);
+    return { collapsed: true, rangeText: `${lo.toFixed(1)}–${hi.toFixed(1)}%` };
+  }
+
+  // Resolve in pixel space with a true hard min-gap (edge-to-edge).
+  const sorted = resolved.slice().sort((a, b) => a.trueXPct - b.trueXPct);
   const a = sorted[0];
   const b = sorted[1];
-  const aHalfWPct = (a.pillWidthPx / 2 / wrapWidthPx) * 100;
-  const bHalfWPct = (b.pillWidthPx / 2 / wrapWidthPx) * 100;
-  const minGapPct = (MIN_GAP_PX / wrapWidthPx) * 100;
-  const overlapThresholdPct = aHalfWPct + bHalfWPct + minGapPct;
-  const resolvedGapPct = 2 * overlapThresholdPct;
-  if (b.trueXPct - a.trueXPct < overlapThresholdPct) {
-    const midpoint = (a.trueXPct + b.trueXPct) / 2;
-    a.resolvedXPct = midpoint - resolvedGapPct / 2;
-    b.resolvedXPct = midpoint + resolvedGapPct / 2;
-    const aMinX = aHalfWPct;
-    const bMaxX = 100 - bHalfWPct;
-    if (a.resolvedXPct < aMinX) {
-      a.resolvedXPct = aMinX;
-      if (b.resolvedXPct - a.resolvedXPct < resolvedGapPct) {
-        b.resolvedXPct = Math.min(bMaxX, a.resolvedXPct + resolvedGapPct);
-      }
+  const aHalf = a.pillWidthPx / 2;
+  const bHalf = b.pillWidthPx / 2;
+  const minCenterDist = aHalf + bHalf + minGapPx;
+  let ax = (a.trueXPct / 100) * wrapWidthPx;
+  let bx = (b.trueXPct / 100) * wrapWidthPx;
+  if (bx - ax < minCenterDist) {
+    const mid = (ax + bx) / 2;
+    ax = mid - minCenterDist / 2;
+    bx = mid + minCenterDist / 2;
+    // Clamp within [aHalf, wrap - bHalf], preserving the min gap. `needPx`
+    // <= wrap guarantees the pair fits inside these bounds.
+    const aMin = aHalf;
+    const bMax = wrapWidthPx - bHalf;
+    if (ax < aMin) {
+      ax = aMin;
+      bx = Math.max(bx, ax + minCenterDist);
     }
-    if (b.resolvedXPct > bMaxX) {
-      b.resolvedXPct = bMaxX;
-      if (b.resolvedXPct - a.resolvedXPct < resolvedGapPct) {
-        a.resolvedXPct = Math.max(aMinX, b.resolvedXPct - resolvedGapPct);
-      }
+    if (bx > bMax) {
+      bx = bMax;
+      ax = Math.min(ax, bx - minCenterDist);
     }
-  } else {
-    a.resolvedXPct = a.trueXPct;
-    b.resolvedXPct = b.trueXPct;
+    if (ax < aMin) ax = aMin;
   }
+  a.resolvedXPct = (ax / wrapWidthPx) * 100;
+  b.resolvedXPct = (bx / wrapWidthPx) * 100;
+  return { collapsed: false, pins: resolved };
+}
+
+interface WorkPin {
+  kind: 'wa' | 'r24';
+  pos: number;   // clamped 0..110
+  raw: number;   // raw projection for pill text
+  pillEl?: HTMLElement;
 }
 
 function useRangeBar(
@@ -96,6 +139,11 @@ function useRangeBar(
   trackRef: React.RefObject<HTMLDivElement>,
   fc: ForecastEnvelope | null,
 ): void {
+  // Whether the last layout collapsed to a single range pill. Read at the
+  // NEXT effect's kind-cleanup so the synthetic `.mfc-pill.range` (whose
+  // `data-kind="range"` is not a live projection kind) is preserved rather
+  // than swept away before applyLayout re-decides.
+  const collapsedRef = useRef(false);
   useEffect(() => {
     const wrapEl = wrapRef.current;
     const trackEl = trackRef.current;
@@ -114,23 +162,20 @@ function useRangeBar(
     if (wa != null && waProj != null) rawPins.push({ kind: 'wa', pos: wa, raw: waProj });
     if (r24 != null && r24Proj != null) rawPins.push({ kind: 'r24', pos: r24, raw: r24Proj });
 
-    // Remove chevs/pills whose kind is no longer present.
-    const wantedKinds = new Set(rawPins.map((p) => p.kind));
+    // Remove chevs/pills whose kind is no longer present. The collapsed
+    // range pill (data-kind="range") is preserved while collapsed.
+    const wantedKinds = new Set<string>(rawPins.map((p) => p.kind));
+    if (collapsedRef.current) wantedKinds.add('range');
     trackEl.querySelectorAll<HTMLElement>('.mfc-chev').forEach((el) => {
       const k = el.dataset.kind;
-      if (!k || !wantedKinds.has(k as 'wa' | 'r24')) el.remove();
+      if (!k || !wantedKinds.has(k)) el.remove();
     });
     pillsEl.querySelectorAll<HTMLElement>('.mfc-pill').forEach((el) => {
       const k = el.dataset.kind;
-      if (!k || !wantedKinds.has(k as 'wa' | 'r24')) el.remove();
+      if (!k || !wantedKinds.has(k)) el.remove();
     });
 
-    const pins: RangePin[] = rawPins.map((p) => ({
-      ...p,
-      trueXPct: 0,
-      resolvedXPct: 0,
-      pillWidthPx: 0,
-    }));
+    const pins: WorkPin[] = rawPins.map((p) => ({ ...p }));
 
     for (const p of pins) {
       const x = (p.pos / 110) * 100;
@@ -183,24 +228,62 @@ function useRangeBar(
         requestAnimationFrame(applyLayout);
         return;
       }
-      for (const p of pins) {
-        const r = p.pillEl!.getBoundingClientRect();
-        p.pillWidthPx = r.width;
+      const pinInputs: PillPin[] = pins.map((p) => ({
+        kind: p.kind,
+        pos: p.pos,
+        raw: p.raw,
+        pillWidthPx: p.pillEl!.getBoundingClientRect().width,
+      }));
+      const layout = resolvePillLayout(pinInputs, wrapWidthPx);
+      collapsedRef.current = layout.collapsed;
+
+      const chevs = trackEl.querySelectorAll<HTMLElement>('.mfc-chev');
+
+      if (layout.collapsed) {
+        // One centered range pill; per-kind pills, chevrons + leaders hide.
+        for (const p of pins) p.pillEl!.style.display = 'none';
+        chevs.forEach((c) => {
+          c.style.display = 'none';
+        });
+        while (leadersEl.firstChild) leadersEl.removeChild(leadersEl.firstChild);
+        let range = pillsEl.querySelector<HTMLElement>('.mfc-pill.range');
+        if (!range) {
+          range = document.createElement('div');
+          range.className = 'mfc-pill range';
+          range.dataset.kind = 'range';
+          pillsEl.appendChild(range);
+        }
+        const rangeText = layout.rangeText ?? '';
+        if (range.textContent !== rangeText) range.textContent = rangeText;
+        range.style.left = '50%';
+        return;
       }
-      resolvePillPositions(pins, wrapWidthPx);
+
+      // Not collapsed — drop any range pill, restore per-kind pills + chevs.
+      pillsEl
+        .querySelectorAll<HTMLElement>('.mfc-pill.range')
+        .forEach((el) => el.remove());
+      for (const p of pins) p.pillEl!.style.display = '';
+      chevs.forEach((c) => {
+        c.style.display = '';
+      });
+
+      const resolved = layout.pins ?? [];
+      const byKind = new Map(resolved.map((r) => [r.kind, r]));
       for (const p of pins) {
-        p.pillEl!.style.left = p.resolvedXPct + '%';
+        const r = byKind.get(p.kind);
+        if (r) p.pillEl!.style.left = r.resolvedXPct + '%';
       }
-      // Rebuild SVG leaders each tick
+      // Rebuild SVG leaders each tick.
       while (leadersEl.firstChild) leadersEl.removeChild(leadersEl.firstChild);
       const SVG_NS = 'http://www.w3.org/2000/svg';
-      for (const p of pins) {
+      for (const r of resolved) {
         const path = document.createElementNS(SVG_NS, 'path');
-        path.setAttribute('class', p.kind);
+        path.setAttribute('class', r.kind);
         path.setAttribute('vector-effect', 'non-scaling-stroke');
         path.setAttribute(
           'd',
-          `M ${p.resolvedXPct} 0 C ${p.resolvedXPct} 10, ${p.trueXPct} 8, ${p.trueXPct} 18`,
+          `M ${r.resolvedXPct} 0 C ${r.resolvedXPct} 10, ${r.trueXPct} 8, ${r.trueXPct} 18`,
         );
         leadersEl.appendChild(path);
       }
