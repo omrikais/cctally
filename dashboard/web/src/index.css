@@ -2160,6 +2160,34 @@ mark.current {
   padding: 3px 0;
   cursor: pointer;
 }
+/* SET-4 (#252) — dim label rows whose PRIMARY control is disabled so an
+   inoperable row reads as disabled (the two Codex toggles when no Codex budget
+   exists; the pinned --tz radios). Scoped to a disabled checkbox/radio, NOT any
+   disabled descendant, so the non-pinned Custom-TZ row (enabled radio + disabled
+   text input) stays at full opacity. :has() support is already relied on by the
+   mobile Settings block. */
+.settings-fs label:has(input[type="checkbox"]:disabled),
+.settings-fs label:has(input[type="radio"]:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* SET-5 (#252) — nested sub-group (indent + subordinate hairline) for the
+   projected-weekly toggle under the threshold master and the budget-domain
+   toggles. */
+.settings-subgroup {
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border-soft);
+}
+/* SET-1 (#252) — per-fieldset changed marker glyph (● in the legend). */
+.settings-fs > legend .fs-changed { color: var(--accent-orange); }
+/* SET-6 (#252) — Restore-defaults rows; a staged (aria-pressed) toggle reads
+   as "will restore on Save" with the accent border/text. */
+.settings-restore-row { margin: 0 0 10px; }
+.settings-restore-row .settings-btn[aria-pressed="true"] {
+  border-color: var(--accent-orange);
+  color: var(--accent-orange);
+}
 .settings-fs input[type="text"],
 .settings-fs input[type="number"] {
   background: transparent;
@@ -2184,10 +2212,23 @@ mark.current {
   font-family: var(--font-mono);
   color: var(--text-dim);
 }
+/* SET-7 (#252) — sticky action bar on desktop too (the mobile @media block
+   already had this; the core treatment is promoted to the base rule).
+   `.modal-card` is max-height:85vh + overflow:hidden with a scrolling
+   `.modal-body`, so a scroll context exists on every viewport; pinning Save/
+   Cancel keeps them reachable without scrolling to the bottom. The opaque
+   background occludes scrolled fieldsets; the negative margins bleed to the
+   .modal-body 16px/18px padding edges. The mobile block keeps its additive
+   overrides (safe-area inset, 44px buttons, flex-wrap, -14px bleed). */
 .settings-actions {
+  position: sticky;
+  bottom: 0;
   display: flex;
   gap: 10px;
-  margin-top: 16px;
+  margin: 16px -18px -16px;
+  padding: 12px 18px;
+  background: var(--panel-bg);
+  border-top: 1px solid var(--border-soft);
 }
 .settings-btn {
   background: var(--panel-bg);
@@ -2935,11 +2976,6 @@ mark.current {
    brighten it when the host is hovered so it advertises drag-reorder. */
 .panel-host:hover .panel-grip { color: var(--text); }
 
-/* Layout fieldset in Settings */
-.settings-fs.layout-fs .settings-btn {
-  margin-top: 6px;
-}
-
 /* Onboarding toast */
 .onboarding-toast {
   position: fixed;
@@ -3026,6 +3062,35 @@ mark.current {
   font-size: var(--fs-meta);
   margin-top: 4px;
 }
+
+/* SET-2 (#252) — dismiss-guard confirm. A centered card over an inset:0 scrim
+   anchored inside `.modal-card` (which is position:relative), rendered as a
+   sibling of the header + body. z-index 2 sits above the (inert) content. */
+.settings-confirm {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 55%, transparent);
+}
+.settings-confirm-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  padding: 16px 18px;
+  max-width: 320px;
+  box-shadow: var(--shadow-md);
+}
+.settings-confirm-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+  justify-content: flex-end;
+}
+/* Destructive framing for the [Discard] button. */
+.settings-btn-danger { border-color: var(--accent-red); }
 
 /* -------- Alerts panel: collapsed state -------- */
 .panel.alerts-collapsed { max-height: 360px; }

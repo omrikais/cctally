@@ -26,20 +26,33 @@ describe('<SettingsOverlay />', () => {
       'input[type="radio"][value="cost desc"]',
     ) as HTMLInputElement;
     await user.click(costRadio);
-    await user.click(screen.getByText('Save'));
+    await user.click(screen.getByRole('button', { name: /^Save/ }));
     expect(getState().prefs.sortDefault).toBe('cost desc');
     expect(getState().sessionsSort).toBe('cost desc');
     uninstallGlobalKeydown();
   });
 
-  it('Reset clears everything', async () => {
+  it('Restore view preferences is deferred — mutates the working copy, persists on Save', async () => {
+    // S6 (#252): the old bottom "Reset view preferences" applied RESET_PREFS
+    // instantly. It is now the deferred "Restore view preferences" control:
+    // clicking it only resets the WORKING copy (sort/perPage/filter); nothing
+    // is persisted until Save (narrowed to the three view fields — it no longer
+    // nukes the whole pref blob).
+    dispatch({ type: 'SAVE_PREFS', patch: { sortDefault: 'cost desc', sessionsPerPage: 250 } });
     render(<SettingsOverlay />);
     const user = userEvent.setup();
     await user.keyboard('s');
-    await user.click(screen.getByText('Reset view preferences'));
-    // RESET_PREFS now persists a fresh prefs object (defaults) instead of
-    // removing the key, so the preserved onboardingToastSeen flag survives
-    // the next page load. Verify the persisted blob equals defaults.
+    await user.click(screen.getByRole('button', { name: /Restore view preferences/i }));
+    // Deferred: the persisted prefs are unchanged until Save.
+    expect(getState().prefs.sortDefault).toBe('cost desc');
+    expect(getState().prefs.sessionsPerPage).toBe(250);
+    // The working-copy sort radio flipped to the default.
+    const startedRadio = document.querySelector(
+      'input[type="radio"][value="started desc"]',
+    ) as HTMLInputElement;
+    expect(startedRadio.checked).toBe(true);
+    // Save persists the restored view defaults.
+    await user.click(screen.getByRole('button', { name: /^Save/ }));
     const raw = localStorage.getItem('ccusage.dashboard.prefs');
     expect(raw).not.toBeNull();
     const parsed = JSON.parse(raw!);
@@ -123,7 +136,7 @@ describe('<SettingsOverlay />', () => {
       ) as HTMLInputElement;
       await user.click(toggle);
       expect(toggle.checked).toBe(true);
-      await user.click(screen.getByText('Save'));
+      await user.click(screen.getByRole('button', { name: /^Save/ }));
       await waitFor(() => {
         expect(fetchMock).toHaveBeenCalledWith(
           '/api/settings',
@@ -294,7 +307,7 @@ describe('<SettingsOverlay />', () => {
         'input[type="checkbox"][name="projected-weekly-enabled"]',
       ) as HTMLInputElement;
       await user.click(weekly);
-      await user.click(screen.getByText('Save'));
+      await user.click(screen.getByRole('button', { name: /^Save/ }));
       await waitFor(() => {
         expect(fetchMock).toHaveBeenCalledWith(
           '/api/settings',
@@ -321,7 +334,7 @@ describe('<SettingsOverlay />', () => {
         'input[type="checkbox"][name="projected-budget-enabled"]',
       ) as HTMLInputElement;
       await user.click(budget);
-      await user.click(screen.getByText('Save'));
+      await user.click(screen.getByRole('button', { name: /^Save/ }));
       await waitFor(() => {
         expect(fetchMock).toHaveBeenCalledWith(
           '/api/settings',
@@ -354,7 +367,7 @@ describe('<SettingsOverlay />', () => {
           'input[type="checkbox"][name="projected-weekly-enabled"]',
         ) as HTMLInputElement,
       );
-      await user.click(screen.getByText('Save'));
+      await user.click(screen.getByRole('button', { name: /^Save/ }));
       await waitFor(() => {
         expect(fetchMock).toHaveBeenCalledWith(
           '/api/settings',
@@ -399,7 +412,7 @@ describe('<SettingsOverlay />', () => {
         'input[type="checkbox"][name="alerts-enabled"]',
       ) as HTMLInputElement;
       await user.click(toggle);
-      await user.click(screen.getByText('Save'));
+      await user.click(screen.getByRole('button', { name: /^Save/ }));
       await waitFor(() => {
         const settingsCalls = fetchMock.mock.calls.filter(
           (c) => c[0] === '/api/settings',

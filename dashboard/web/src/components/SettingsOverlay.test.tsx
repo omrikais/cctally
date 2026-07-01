@@ -202,15 +202,21 @@ describe('<SettingsOverlay /> test-alert axis picker', () => {
   });
 });
 
-describe('<SettingsOverlay /> reset button label (#207 D9)', () => {
-  it('labels the reset button "Reset view preferences" and posts nothing', () => {
+// #207 D9 → S6 (#252): the old bottom "Reset view preferences" button applied
+// RESET_PREFS instantly. It is now the deferred "Restore view preferences"
+// control inside the Restore-defaults fieldset — clicking it mutates the
+// working-copy sort field and persists NOTHING until Save.
+describe('<SettingsOverlay /> restore view preferences button (#207 D9 → #252)', () => {
+  it('Restore view preferences mutates the sort field and posts nothing until Save', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
+    // Seed a non-default sort so the button is enabled and its effect observable.
+    act(() => dispatch({ type: 'SAVE_PREFS', patch: { sortDefault: 'cost desc' } }));
     render(<SettingsOverlay />);
     openSettings();
-    const btn = screen.getByRole('button', { name: /reset view preferences/i });
-    fireEvent.click(btn);
-    expect(fetchMock).not.toHaveBeenCalledWith('/api/settings', expect.anything());
+    fireEvent.click(screen.getByRole('button', { name: /Restore view preferences/i }));
+    expect(fetchMock).not.toHaveBeenCalled();              // deferred — no POST
+    expect(getState().prefs.sortDefault).toBe('cost desc'); // not persisted yet
   });
 });
 
@@ -312,7 +318,7 @@ describe('<SettingsOverlay /> notifier dropdown', () => {
     fireEvent.change(select, { target: { value: 'none' } });
 
     // Save commits the dirty notifier via POST /api/settings.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -343,7 +349,9 @@ describe('<SettingsOverlay /> notifier dropdown', () => {
     openSettings();
 
     // Touch nothing — no block is dirty, so Save makes no POST at all.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // (SET-1: Save is disabled-when-clean by design; the click is a no-op and,
+    // even if it fired, a clean save() builds an empty body and never POSTs.)
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     // No /api/settings call should fire (body would be empty).
     const settingsCall = fetchMock.mock.calls.find(
       ([url]) => url === '/api/settings',
@@ -392,7 +400,7 @@ describe('<SettingsOverlay /> per-project budget alerts toggle', () => {
     expect(toggle.checked).toBe(false); // seeded default
     fireEvent.click(toggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -423,7 +431,8 @@ describe('<SettingsOverlay /> per-project budget alerts toggle', () => {
     openSettings();
 
     // Touch nothing — the toggle matches the server, so Save makes no POST.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // (SET-1: Save is disabled-when-clean; a clean save() builds an empty body.)
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     const settingsCall = fetchMock.mock.calls.find(
       ([url]) => url === '/api/settings',
     );
@@ -508,7 +517,7 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
     expect(alertsToggle.checked).toBe(false); // seeded default
     fireEvent.click(alertsToggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -548,7 +557,7 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
     expect(projectedToggle.checked).toBe(false); // seeded default
     fireEvent.click(projectedToggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -581,7 +590,8 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
     openSettings();
 
     // Touch nothing — both toggles match the server, so Save makes no POST.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // (SET-1: Save is disabled-when-clean; a clean save() builds an empty body.)
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     const settingsCall = fetchMock.mock.calls.find(
       ([url]) => url === '/api/settings',
     );
@@ -630,7 +640,7 @@ describe('<SettingsOverlay /> Codex budget toggles', () => {
     expect(codexToggle.checked).toBe(false); // seeded default
     fireEvent.click(codexToggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -707,7 +717,7 @@ describe('<SettingsOverlay /> cache-failure markers toggle', () => {
     expect(toggle.checked).toBe(true); // seeded ON
     fireEvent.click(toggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -740,7 +750,7 @@ describe('<SettingsOverlay /> cache-failure markers toggle', () => {
     }) as HTMLInputElement;
     expect(toggle.checked).toBe(false);
     fireEvent.click(toggle);
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -766,7 +776,8 @@ describe('<SettingsOverlay /> cache-failure markers toggle', () => {
     openSettings();
 
     // Touch nothing — the toggle matches the server, so Save makes no POST.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // (SET-1: Save is disabled-when-clean; a clean save() builds an empty body.)
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     const settingsCall = fetchMock.mock.calls.find(
       ([url]) => url === '/api/settings',
     );
@@ -838,7 +849,7 @@ describe('<SettingsOverlay /> live-tail toggle', () => {
     expect(toggle.checked).toBe(true); // seeded ON
     fireEvent.click(toggle);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -871,7 +882,7 @@ describe('<SettingsOverlay /> live-tail toggle', () => {
     }) as HTMLInputElement;
     expect(toggle.checked).toBe(false);
     fireEvent.click(toggle);
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -897,7 +908,8 @@ describe('<SettingsOverlay /> live-tail toggle', () => {
     openSettings();
 
     // Touch nothing — the toggle matches the server, so Save makes no POST.
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // (SET-1: Save is disabled-when-clean; a clean save() builds an empty body.)
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     const settingsCall = fetchMock.mock.calls.find(
       ([url]) => url === '/api/settings',
     );
@@ -928,7 +940,7 @@ describe('<SettingsOverlay /> live-tail toggle', () => {
       screen.getByRole('checkbox', { name: /Show cache-failure markers/ }),
     );
     fireEvent.click(screen.getByRole('checkbox', { name: /Live-tail new turns/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
     const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
@@ -967,5 +979,237 @@ describe('<SettingsOverlay /> swallows `0` while open (#156)', () => {
     fireEvent.keyDown(document, { key: '0' });
     expect(opener).not.toHaveBeenCalled();
     expect(getState().openModal).toBeNull();
+  });
+});
+
+// SET-1 (#252): the unified deferred-commit form surfaces its pending-edit
+// count on the Save button and disables Save when nothing is dirty — the
+// missing "unsaved changes" feedback the issue called out. The Task-1 backbone
+// also fixes the Codex blocker: an unrelated Save (e.g. only alerts.notifier)
+// must NOT clobber the user's Recent-Sessions column-click sort.
+describe('<SettingsOverlay /> dirty-state feedback (SET-1)', () => {
+  it('Save reads plain "Save" and is disabled when nothing is dirty', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+    const save = screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement;
+    expect(save.textContent).toBe('Save');
+    expect(save.disabled).toBe(true);
+  });
+
+  it('badges the change count and enables Save as fields dirty', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    const save = () => screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement;
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    expect(save().textContent).toBe('Save · 1 change');
+    expect(save().disabled).toBe(false);
+    // a second, different field (the Conversation-viewer live-tail toggle)
+    fireEvent.click(screen.getByRole('checkbox', { name: /Live-tail new turns/ }));
+    expect(save().textContent).toBe('Save · 2 changes');
+    // revert both → back to disabled plain Save
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'auto' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /Live-tail new turns/ }));
+    expect(save().textContent).toBe('Save');
+    expect(save().disabled).toBe(true);
+  });
+
+  it('does NOT clear the sessions column sort when only a server field is saved', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    // Simulate a user-set Recent Sessions column sort override. SortOverride's
+    // real shape is { column, direction } (src/lib/tableSort.ts) — the plan
+    // skeleton's { key, dir } is not the store type.
+    act(() =>
+      dispatch({
+        type: 'SET_TABLE_SORT',
+        table: 'sessions',
+        override: { column: 'cost', direction: 'desc' },
+      }),
+    );
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    // The override the user never touched must survive an unrelated Save.
+    expect(getState().prefs.sessionsSortOverride).toEqual({ column: 'cost', direction: 'desc' });
+  });
+});
+
+// SET-5 (#252): the flat Alerts fieldset is split into two REAL domains —
+// Threshold (governed by the `alerts.enabled` master) and Budget (gated by a
+// configured budget, INDEPENDENT of the master). Guards against the issue's
+// literal-but-wrong "one master over all" nesting.
+describe('<SettingsOverlay /> alerts two-domain grouping (SET-5)', () => {
+  it('renders distinct Threshold / Budget / Test groups', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ codex_budget_configured: true });
+    openSettings();
+    // Scope to <legend> — the regexes also substring-match control labels
+    // ("Enable threshold alerts", "Codex budget alerts", …).
+    expect(screen.getByText(/Threshold alerts/i, { selector: 'legend' })).toBeInTheDocument();
+    expect(screen.getByText(/Budget alerts/i, { selector: 'legend' })).toBeInTheDocument();
+  });
+
+  it('flipping the threshold master does not disable the budget/Codex toggles', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ codex_budget_configured: true });
+    openSettings();
+    const master = screen.getByRole('checkbox', { name: /Enable threshold alerts/ }) as HTMLInputElement;
+    // Master starts OFF (seed default enabled:false); budget/Codex stay operable.
+    const projBudget = screen.getByRole('checkbox', { name: /Projected budget-\$ pace/ }) as HTMLInputElement;
+    const codex = screen.getByRole('checkbox', { name: /Codex budget alerts/ }) as HTMLInputElement;
+    expect(projBudget.disabled).toBe(false);
+    expect(codex.disabled).toBe(false); // gated only by codex_budget_configured, not the master
+    fireEvent.click(master); // turn threshold master ON
+    expect(projBudget.disabled).toBe(false);
+    expect(codex.disabled).toBe(false);
+  });
+});
+
+// SET-2/SET-6 (#252): the three scattered Reset controls become one deferred
+// "Restore defaults" fieldset. NOTHING applies until Save (closing the old
+// Reset-then-close data-loss trap), and the view-pref restore is narrowed to
+// the three view fields (no bulk RESET_PREFS nuking panelOrder/collapsed/etc.).
+describe('<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2/SET-6)', () => {
+  it('staging Card order does NOT dispatch until Save, and does not drop a pending notifier edit', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    // Reorder panels so RESET_PANEL_ORDER would be observable.
+    const original = [...getState().prefs.panelOrder];
+    act(() => dispatch({ type: 'REORDER_PANELS', from: 0, to: 1 }));
+    const reordered = [...getState().prefs.panelOrder];
+    expect(reordered).not.toEqual(original);
+    openSettings();
+    // Make a pending server edit AND stage a reset.
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.click(screen.getByRole('button', { name: /Card order/i }));
+    // Deferred: nothing applied yet, overlay still open.
+    expect(getState().prefs.panelOrder).toEqual(reordered);
+    expect(screen.getByLabelText('Alert notifier')).toBeInTheDocument(); // still open
+    // Save applies both — the pending notifier survives.
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    const parsed = JSON.parse((call![1] as RequestInit).body as string);
+    expect(parsed.alerts?.notifier).toBe('none');          // pending edit NOT discarded
+    expect(getState().prefs.panelOrder).toEqual(original); // reset applied on Save
+  });
+
+  it('staging Table column sorting is deferred, then clears all overrides on Save', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    render(<SettingsOverlay />);
+    // A trend column override exists so the Table-sort reset button is enabled.
+    act(() =>
+      dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: { column: 'week', direction: 'asc' } }),
+    );
+    // Also dirty a server field so Save is enabled and fires a POST we can await.
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.click(screen.getByRole('button', { name: /Table column sorting/i }));
+    // Deferred: the override is untouched until Save.
+    expect(getState().prefs.trendSortOverride).toEqual({ column: 'week', direction: 'asc' });
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(getState().prefs.trendSortOverride).toBeNull(); // CLEAR_TABLE_SORTS applied on Save
+  });
+
+  it('Restore view preferences resets the sort field only (narrowed), deferred', () => {
+    render(<SettingsOverlay />);
+    // Non-default sort saved AND a non-default panelOrder, so narrowing is non-vacuous.
+    act(() => {
+      dispatch({ type: 'SAVE_PREFS', patch: { sortDefault: 'cost desc' } });
+      dispatch({ type: 'REORDER_PANELS', from: 0, to: 1 });
+    });
+    const panelOrderBefore = [...getState().prefs.panelOrder];
+    openSettings();
+    fireEvent.click(screen.getByRole('button', { name: /Restore view preferences/i }));
+    // The Sort-default working field flips to the default, but nothing is
+    // persisted yet and panelOrder is untouched (proves the narrowing).
+    const startedRadio = screen.getByRole('radio', { name: /Started \(newest first\)/ }) as HTMLInputElement;
+    expect(startedRadio.checked).toBe(true);
+    expect(getState().prefs.sortDefault).toBe('cost desc');        // not yet saved
+    expect(getState().prefs.panelOrder).toEqual(panelOrderBefore); // NOT nuked (old RESET_PREFS would)
+  });
+});
+
+// SET-1 (#252): each section whose fields are dirty gets a per-fieldset
+// `.is-changed` marker (the decorative half of the dirty feedback; the Save
+// badge is the authoritative machine-readable signal).
+describe('<SettingsOverlay /> per-fieldset changed markers (SET-1)', () => {
+  it('marks the Threshold-alerts fieldset changed after a notifier edit, not Sort default', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    // Scope to <legend> so the regex doesn't also match control labels.
+    const thresh = screen.getByText(/Threshold alerts/i, { selector: 'legend' }).closest('fieldset')!;
+    const sortFs = screen.getByText(/Sort default/i, { selector: 'legend' }).closest('fieldset')!;
+    expect(thresh.className).toMatch(/is-changed/);
+    expect(sortFs.className).not.toMatch(/is-changed/);
+  });
+});
+
+// SET-2 (#252) dismiss guard: an accidental Esc/backdrop while dirty raises a
+// contained confirm; the explicit × discards directly. (The `inert` focus
+// containment + the confirm scrim visuals are pure-CSS/real-browser concerns
+// verified at the ui-qa gate — jsdom can't evaluate them — so these unit tests
+// pin only the structural behavior.)
+describe('<SettingsOverlay /> dismiss guard', () => {
+  it('Esc while dirty shows a confirm and keeps the overlay open; Keep editing dismisses it', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument();       // confirm shown
+    expect(screen.getByLabelText('Alert notifier')).toBeInTheDocument(); // still open
+    fireEvent.click(screen.getByRole('button', { name: /Keep editing/i }));
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(screen.getByLabelText('Alert notifier')).toBeInTheDocument(); // still open, edit intact
+  });
+
+  it('Esc while dirty then Discard closes the overlay', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(screen.getByRole('button', { name: /Discard/i }));
+    expect(screen.queryByLabelText('Alert notifier')).toBeNull(); // closed
+  });
+
+  it('Esc while clean closes immediately with no confirm', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(screen.queryByLabelText('Alert notifier')).toBeNull(); // closed
+  });
+
+  it('the × button while dirty closes directly, no confirm', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    // ModalHeader's close button carries aria-label "Close" (ModalCloseButton default).
+    fireEvent.click(screen.getByRole('button', { name: /close/i }));
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(screen.queryByLabelText('Alert notifier')).toBeNull(); // closed directly
   });
 });

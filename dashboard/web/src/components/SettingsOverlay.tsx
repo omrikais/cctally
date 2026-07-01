@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   dispatch,
   getState,
+  defaultPrefs,
   selectMarkersEnabled,
   selectLiveTailEnabled,
   subscribeStore,
@@ -172,6 +173,17 @@ export function SettingsOverlay() {
   // `alerts test --axis projected --metric`); ignored for other axes.
   const [testMetric, setTestMetric] = useState<ProjectedMetric>('weekly_pct');
 
+  // S6 (#252) staged-reset flags for the two field-less "Restore defaults"
+  // scopes. Both default false, re-seed to false on open (never persist across
+  // opens), toggle via aria-pressed buttons, count toward `dirtyCount`, and are
+  // APPLIED (dispatched) only inside save() — closing the old Reset-then-close
+  // data-loss trap by construction.
+  const [resetTableSortStaged, setResetTableSortStaged] = useState(false);
+  const [resetCardOrderStaged, setResetCardOrderStaged] = useState(false);
+  // S6 dismiss guard: an accidental Esc/backdrop-click while dirty raises this
+  // contained confirm instead of discarding. Explicit ×/Cancel still discard.
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+
   // Re-seed the local form whenever the server-side display.tz changes
   // (an SSE tick from another tab's Save, or a `cctally config` write
   // landing while Settings is open). Without this, the radio would
@@ -231,8 +243,11 @@ export function SettingsOverlay() {
       when: () => !getState().openModal,
     },
     // Esc at `modal` scope (z-index 100): SCOPE_ORDER beats the conversations
-    // `global` Esc deterministically (#156).
-    { key: 'Escape', scope: 'modal', action: () => setOpen(false), when: () => open },
+    // `global` Esc deterministically (#156). Routed through the S6 dismiss
+    // guard: while dirty it raises the discard-confirm instead of closing (and
+    // over the confirm it "keeps editing"). The closure is deferred, so it
+    // safely references `requestClose` defined later in render.
+    { key: 'Escape', scope: 'modal', action: () => requestClose(), when: () => open },
     // While Settings is open, swallow the digit modal-openers so they don't
     // mount a dashboard modal on top of the overlay. `0` (the 10th-panel
     // opener) MUST be swallowed too (#156): otherwise it opens the alerts
@@ -265,6 +280,11 @@ export function SettingsOverlay() {
       setCacheMarkers(markersEnabledServer);
       setTestError(null);
       setTestAxis('weekly');
+      // S6 (#252): staged resets + the dismiss-guard confirm never persist
+      // across opens.
+      setResetTableSortStaged(false);
+      setResetCardOrderStaged(false);
+      setConfirmDiscard(false);
     }
   }, [
     open,
@@ -288,6 +308,31 @@ export function SettingsOverlay() {
   // `!open` early-return so the hook order stays stable (Rules of Hooks).
   const cardRef = useRef<HTMLDivElement>(null);
   useModalFocus(cardRef, { active: open });
+
+  // S6 (#252) dismiss guard: land focus on the safe default ("Keep editing")
+  // when the confirm opens. Declared BEFORE the `!open` early-return.
+  const keepEditingRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (confirmDiscard) keepEditingRef.current?.focus();
+  }, [confirmDiscard]);
+
+  // S6 (#252) focus containment: while the discard-confirm is up, mark the
+  // header + scrolling body `inert` so Tab/pointer can't reach the underlying
+  // Settings controls — the confirm renders as their SIBLING inside
+  // `.modal-card`, so the existing card-level focus trap then cycles only the
+  // two confirm buttons (no separate trap needed). We set the DOM `inert`
+  // property imperatively (typed on HTMLElement in lib.dom) rather than as a
+  // JSX prop, because React 18's stable HTMLAttributes types lack `inert`, and
+  // because wrapping header+body in a container div would break the
+  // `.modal-card` flex column that gives `.modal-body` its scroll context.
+  useEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+    const header = card.querySelector<HTMLElement>('.modal-header');
+    const body = card.querySelector<HTMLElement>('.modal-body');
+    if (header) header.inert = confirmDiscard;
+    if (body) body.inert = confirmDiscard;
+  }, [confirmDiscard]);
 
   // M1-1: lock background page scroll while Settings is open. Declared
   // BEFORE the `!open` early-return so the hook order stays stable.
@@ -341,11 +386,39 @@ export function SettingsOverlay() {
   // the option is disabled.
   const notifierDirty = notifier !== (alertsConfig.notifier ?? 'auto');
   const commandConfigured = alertsConfig.command_configured ?? false;
-  // Save is gated when TZ is dirty-but-invalid (custom mode with
-  // unparseable zone) or while a server-side POST is in flight. Non-TZ
-  // dispatches are synchronous local-state updates and can't fail, so
-  // they never gate Save.
-  const saveDisabled = tzSubmitting || (tzDirty && tzMode === 'custom' && !tzCustomValid);
+
+  // S6 (#252): complete the dirty tracking for the three view fields that were
+  // previously committed unconditionally in save(). `safePerPage` mirrors the
+  // clamp save() applies (hoisted so save() reuses it), so an empty/invalid
+  // input that sanitizes back to the current value is not falsely dirty.
+  const safePerPage =
+    Number.isFinite(perPage) && perPage > 0
+      ? Math.min(1000, Math.max(10, Math.round(perPage)))
+      : prefs.sessionsPerPage;
+  const sortDirty = sort !== prefs.sortDefault;
+  const perPageDirty = safePerPage !== prefs.sessionsPerPage;
+  const filterDirty = filter !== filterTerm;
+
+  // S6 (#252) SET-1: the pending-edit count drives the Save badge, the
+  // disabled-when-clean Save, and the per-fieldset changed markers. Every
+  // staged edit — including the two field-less resets — counts here.
+  const dirtyFlags = [
+    tzDirty, alertsDirty, projectedWeeklyDirty, notifierDirty,
+    projectedBudgetDirty, projectAlertsDirty, codexBudgetAlertsDirty, codexProjectedDirty,
+    cacheMarkersDirty, liveTailDirty, sortDirty, perPageDirty, filterDirty,
+    resetTableSortStaged, resetCardOrderStaged,
+  ];
+  const dirtyCount = dirtyFlags.filter(Boolean).length;
+
+  // Save is gated when nothing is dirty (the "unsaved changes" feedback the
+  // issue asked for), when TZ is dirty-but-invalid (custom mode with an
+  // unparseable zone), or while a server-side POST is in flight. Non-TZ
+  // dispatches are synchronous local-state updates and can't fail, so they
+  // never gate Save.
+  const saveDisabled =
+    dirtyCount === 0 ||
+    tzSubmitting ||
+    (tzDirty && tzMode === 'custom' && !tzCustomValid);
 
   const close = () => setOpen(false);
   const save = async () => {
@@ -436,36 +509,83 @@ export function SettingsOverlay() {
       setTzSubmitting(false);
     }
 
-    // 2. Commit non-TZ prefs (existing logic).
-    //    Clamp to the input's declared range. Bare min/max only validates on
-    //    form submit; an empty input becomes Number('') === 0, which would
-    //    empty the Sessions panel until Reset.
-    const safePerPage =
-      Number.isFinite(perPage) && perPage > 0
-        ? Math.min(1000, Math.max(10, Math.round(perPage)))
-        : prefs.sessionsPerPage;
-    dispatch({ type: 'SAVE_PREFS', patch: { sortDefault: sort, sessionsPerPage: safePerPage } });
-    dispatch({ type: 'SET_SORT', key: sort });
-    dispatch({ type: 'SET_FILTER', text: filter });
-    // Clear the sessions header-click override so the freshly-saved Sort
-    // default actually takes effect. Trend has no Settings-side default —
-    // leave its override untouched.
-    dispatch({ type: 'SET_TABLE_SORT', table: 'sessions', override: null });
+    // 2. Commit only the localStorage-backed prefs (and staged resets) that
+    //    actually changed. Under the unified deferred model, an unrelated Save
+    //    (e.g. only alerts.notifier) must NOT silently reset the user's
+    //    sort/filter or wipe their Recent-Sessions column-click sort — so every
+    //    local dispatch is gated on its own dirty/staged flag (`safePerPage` is
+    //    hoisted alongside the dirty derivations above).
+    if (sortDirty || perPageDirty) {
+      dispatch({ type: 'SAVE_PREFS', patch: { sortDefault: sort, sessionsPerPage: safePerPage } });
+    }
+    if (sortDirty) dispatch({ type: 'SET_SORT', key: sort });
+    if (filterDirty) dispatch({ type: 'SET_FILTER', text: filter });
+    // Clear the sessions header-click override only when the saved Sort default
+    // actually changed (so it can take effect) OR when a table-sort reset is
+    // staged. CLEAR_TABLE_SORTS below already clears all three overrides, so
+    // this is redundant-but-harmless when table-sort is staged, and required
+    // when only the sort default changed.
+    if (sortDirty || resetTableSortStaged) {
+      dispatch({ type: 'SET_TABLE_SORT', table: 'sessions', override: null });
+    }
+    if (resetTableSortStaged) dispatch({ type: 'CLEAR_TABLE_SORTS' });
+    if (resetCardOrderStaged) dispatch({ type: 'RESET_PANEL_ORDER' });
     close();
   };
-  const reset = () => {
-    // Reset clears localStorage-backed prefs only; display.tz is
-    // server-persisted and intentionally unchanged here. Reverting it
-    // would require a second POST and likely surprise users who only
-    // wanted to clear sort / filter / per-page.
-    dispatch({ type: 'RESET_PREFS' });
-    dispatch({ type: 'SET_FILTER', text: '' });
+  // S6 (#252): the deferred "Restore view preferences" affordance. Sourced from
+  // the store's canonical defaults (defaultPrefs) so the reset values can't
+  // drift from the store; the remembered-filter default is the literal ''. This
+  // only mutates the WORKING copy — the fields then show as changed and persist
+  // via the normal Save path (no instant RESET_PREFS, no close()).
+  const restoreViewPrefs = () => {
+    const d = defaultPrefs();
+    setSort(d.sortDefault);
+    setPerPage(d.sessionsPerPage);
+    setFilter('');
+  };
+  const viewPrefsAtDefault =
+    sort === defaultPrefs().sortDefault &&
+    safePerPage === defaultPrefs().sessionsPerPage &&
+    filter === '';
+  // The "Table column sorting" reset is only meaningful when SOME table has a
+  // column-click override — check all three (trend + sessions + projects).
+  const tableSortHasOverride =
+    !!prefs.trendSortOverride || !!prefs.sessionsSortOverride || !!prefs.projectsSortOverride;
+  // S6 (#252) dismiss guard: Esc/backdrop route here. Over an open confirm,
+  // treat the gesture as "keep editing" (dismiss the confirm). Otherwise raise
+  // the confirm when dirty, or close outright when clean. The explicit ×/Cancel
+  // buttons bypass this and call close() directly (deliberate discard).
+  const requestClose = () => {
+    if (confirmDiscard) {
+      setConfirmDiscard(false);
+      return;
+    }
+    if (dirtyCount > 0) {
+      setConfirmDiscard(true);
+      return;
+    }
     close();
   };
+  // S6 (#252) SET-1: decorative per-fieldset changed marker (aria-hidden); the
+  // authoritative machine-readable signal is the Save badge count.
+  const changedMark = (dirty: boolean) =>
+    dirty ? (
+      <span className="fs-changed" aria-hidden="true">
+        {' '}
+        ●
+      </span>
+    ) : null;
+  const tzChanged = tzDirty;
+  const threshChanged = alertsDirty || projectedWeeklyDirty || notifierDirty;
+  const budgetChanged =
+    projectedBudgetDirty || projectAlertsDirty || codexBudgetAlertsDirty || codexProjectedDirty;
+  const viewerChanged = cacheMarkersDirty || liveTailDirty;
+  const restoreChanged = resetTableSortStaged || resetCardOrderStaged;
 
   return (
     <div id="settings-root">
-      <div className="modal-backdrop" onClick={close} />
+      {/* Backdrop click routes through the dismiss guard (confirm when dirty). */}
+      <div className="modal-backdrop" onClick={requestClose} />
       <div
         ref={cardRef}
         className="modal-card accent-orange"
@@ -473,10 +593,12 @@ export function SettingsOverlay() {
         aria-modal="true"
         aria-labelledby="settings-title"
       >
+        {/* The header × discards directly (deliberate), so it stays wired to
+            close(); the dismiss guard covers only Esc/backdrop. */}
         <ModalHeader title="Settings" titleId="settings-title" onClose={close} />
         <div className="modal-body">
-          <fieldset className="settings-fs">
-            <legend>Display timezone</legend>
+          <fieldset className={`settings-fs${tzChanged ? ' is-changed' : ''}`}>
+            <legend>Display timezone{changedMark(tzChanged)}</legend>
             {display.pinned && (
               <small>Pinned by --tz flag — restart the server without --tz to change here.</small>
             )}
@@ -528,8 +650,19 @@ export function SettingsOverlay() {
             )}
             {tzError && <div className="modal-error">Failed: {tzError}</div>}
           </fieldset>
-          <fieldset className="settings-fs alerts-fs">
-            <legend>Alerts</legend>
+          {/*
+            SET-5 (#252) — two-domain Alerts grouping. The single flat Alerts
+            fieldset is split into three by REAL server-side enablement (verified
+            against `_budget_alerts_active`): the threshold master
+            (`alerts.enabled`) governs the weekly + 5h axes and the
+            projected-WEEKLY toggle only; the budget/Codex axes are gated by a
+            configured budget + their own `alerts_enabled`, INDEPENDENT of the
+            threshold master — so they get their own domain. Every control keeps
+            its exact `name`/`aria-label`/handler so existing behavior + the test
+            suite bind unchanged.
+          */}
+          <fieldset className={`settings-fs${threshChanged ? ' is-changed' : ''}`}>
+            <legend>Threshold alerts{changedMark(threshChanged)}</legend>
             <label>
               <input
                 type="checkbox"
@@ -540,13 +673,34 @@ export function SettingsOverlay() {
               Enable threshold alerts
             </label>
             {/*
+              Spec §8.1 — read-only summary of the active threshold lists.
+              Sourced from
+              `state.alertsConfig.{weekly,five_hour,budget}_thresholds`,
+              which the SSE handler keeps mirrored from the envelope each
+              tick (INGEST_SNAPSHOT_ALERTS reducer). v1 has no editor; the
+              user mutates these via `cctally config set
+              alerts.weekly_thresholds …` (and `budget.alert_thresholds`
+              for the budget axis) and the new values flow back through
+              this line on the next snapshot. Budget is its OWN config
+              block (issue #19), so its thresholds come from
+              `alertsConfig.budget_thresholds`, not the alerts block.
+            */}
+            <p className="alerts-summary settings-hint">
+              Weekly: {alertsConfig.weekly_thresholds.map((t) => `${t}%`).join(', ')}
+              {' · '}
+              5h-block: {alertsConfig.five_hour_thresholds.map((t) => `${t}%`).join(', ')}
+              {' · '}
+              Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
+            </p>
+            {/*
               Notifier backend selector (Phase B). Seeded from the
               SSE-mirrored `alerts_settings.notifier`. The "Custom command"
               option is disabled unless the server reports a configured
               `command_template` (`command_configured`) — the raw template is
               never sent to the client, so the dashboard can only SELECT the
               command notifier, not author it. The hint line surfaces that
-              the template is edited via the CLI.
+              the template is edited via the CLI. The notifier applies to ALL
+              dispatches (threshold + budget), so it lives with the master.
             */}
             <label className="settings-row">
               Notifier{' '}
@@ -571,104 +725,108 @@ export function SettingsOverlay() {
               </p>
             )}
             {/*
-              Spec §8.1 — read-only summary of the active threshold lists.
-              Sourced from
-              `state.alertsConfig.{weekly,five_hour,budget}_thresholds`,
-              which the SSE handler keeps mirrored from the envelope each
-              tick (INGEST_SNAPSHOT_ALERTS reducer). v1 has no editor; the
-              user mutates these via `cctally config set
-              alerts.weekly_thresholds …` (and `budget.alert_thresholds`
-              for the budget axis) and the new values flow back through
-              this line on the next snapshot. Budget is its OWN config
-              block (issue #19), so its thresholds come from
-              `alertsConfig.budget_thresholds`, not the alerts block.
+              Projected weekly-% pace alerts (issue #121). Nested under the
+              master via `.settings-subgroup` to convey subordination
+              (`alerts.projected_enabled`). Kept ENABLED even when the master is
+              off — the "pre-configure before flipping on" philosophy; nesting
+              alone conveys the relationship.
             */}
-            <p className="alerts-summary settings-hint">
-              Weekly: {alertsConfig.weekly_thresholds.map((t) => `${t}%`).join(', ')}
-              {' · '}
-              5h-block: {alertsConfig.five_hour_thresholds.map((t) => `${t}%`).join(', ')}
-              {' · '}
-              Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
+            <div className="settings-subgroup">
+              <label>
+                <input
+                  type="checkbox"
+                  name="projected-weekly-enabled"
+                  checked={projectedWeekly}
+                  onChange={(e) => setProjectedWeekly(e.target.checked)}
+                />{' '}
+                Projected weekly-% pace alerts
+              </label>
+            </div>
+          </fieldset>
+          {/*
+            BUDGET ALERTS — its own domain (gated by a configured budget, not
+            the threshold master). The two Claude budget toggles stay always-
+            enabled (no reliable "Claude budget configured" client flag exists);
+            the two Codex toggles gate on `codex_budget_configured`.
+          */}
+          <fieldset className={`settings-fs${budgetChanged ? ' is-changed' : ''}`}>
+            <legend>Budget alerts{changedMark(budgetChanged)}</legend>
+            <p className="settings-hint">
+              Fire when a configured budget&apos;s pace or spend crosses a
+              threshold. Set budgets via the CLI (<code>cctally budget set …</code>).
             </p>
-            {/*
-              Projected-pace toggles (issue #121). Two independent opt-ins,
-              both default OFF, each gated server-side behind its parent
-              axis's master switch. `projected_weekly` → `alerts.projected_enabled`;
-              `projected_budget` → `budget.projected_enabled` (its own config
-              block). Values mirror from alerts_settings each tick.
-            */}
-            <label>
-              <input
-                type="checkbox"
-                name="projected-weekly-enabled"
-                checked={projectedWeekly}
-                onChange={(e) => setProjectedWeekly(e.target.checked)}
-              />{' '}
-              Projected weekly-% pace alerts
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                name="projected-budget-enabled"
-                checked={projectedBudget}
-                onChange={(e) => setProjectedBudget(e.target.checked)}
-              />{' '}
-              Projected budget-$ pace alerts
-            </label>
-            {/*
-              Per-project budget alerts (issue #19/#121). A single opt-in,
-              default OFF, routing to `budget.project_alerts_enabled` (its own
-              config block). Gates push alerts only — the per-project display
-              section in `cctally budget` always renders configured projects.
-              Per-project budget AMOUNTS stay CLI-only (cwd-resolved); the
-              dashboard only toggles the axis on/off.
-            */}
-            <label>
-              <input
-                type="checkbox"
-                name="project-alerts-enabled"
-                checked={projectAlerts}
-                onChange={(e) => setProjectAlerts(e.target.checked)}
-              />{' '}
-              Per-project budget alerts
-            </label>
-            {/*
-              Codex budget toggles (#134). Two dashboard-writable sub-leaves of
-              the nested `budget.codex` block: `alerts_enabled` (actual-spend)
-              and `projected_enabled` (projected-pace). Both DISABLED, and an
-              empty-state hint shown, when no Codex budget exists
-              (`codex_budget_configured`, Q2) — amounts stay CLI-only, and the
-              disable structurally prevents the server's null-codex 400. The
-              two toggles are independent in the UI; server-side, Codex
-              projected requires alerts_enabled to fire (mirrors Claude), noted
-              in budget.md rather than enforced as a cross-toggle dependency.
-            */}
-            <label>
-              <input
-                type="checkbox"
-                name="codex-budget-alerts-enabled"
-                checked={codexBudgetAlerts}
-                disabled={!alertsConfig.codex_budget_configured}
-                onChange={(e) => setCodexBudgetAlerts(e.target.checked)}
-              />{' '}
-              Codex budget alerts
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                name="codex-projected-enabled"
-                checked={codexProjected}
-                disabled={!alertsConfig.codex_budget_configured}
-                onChange={(e) => setCodexProjected(e.target.checked)}
-              />{' '}
-              Codex projected-pace alerts
-            </label>
-            {!alertsConfig.codex_budget_configured && (
-              <p className="settings-hint">
-                Set a Codex budget via the CLI first:{' '}
-                <code>cctally budget set 200 --vendor codex</code>
-              </p>
-            )}
+            <div className="settings-subgroup">
+              <label>
+                <input
+                  type="checkbox"
+                  name="projected-budget-enabled"
+                  checked={projectedBudget}
+                  onChange={(e) => setProjectedBudget(e.target.checked)}
+                />{' '}
+                Projected budget-$ pace alerts
+              </label>
+              {/*
+                Per-project budget alerts (issue #19/#121). A single opt-in,
+                default OFF, routing to `budget.project_alerts_enabled` (its own
+                config block). Gates push alerts only — the per-project display
+                section in `cctally budget` always renders configured projects.
+                Per-project budget AMOUNTS stay CLI-only (cwd-resolved); the
+                dashboard only toggles the axis on/off.
+              */}
+              <label>
+                <input
+                  type="checkbox"
+                  name="project-alerts-enabled"
+                  checked={projectAlerts}
+                  onChange={(e) => setProjectAlerts(e.target.checked)}
+                />{' '}
+                Per-project budget alerts
+              </label>
+              {/*
+                Codex budget toggles (#134). Two dashboard-writable sub-leaves of
+                the nested `budget.codex` block: `alerts_enabled` (actual-spend)
+                and `projected_enabled` (projected-pace). Both DISABLED, and an
+                empty-state hint shown, when no Codex budget exists
+                (`codex_budget_configured`, Q2) — amounts stay CLI-only, and the
+                disable structurally prevents the server's null-codex 400. The
+                two toggles are independent in the UI; server-side, Codex
+                projected requires alerts_enabled to fire (mirrors Claude), noted
+                in budget.md rather than enforced as a cross-toggle dependency.
+              */}
+              <label>
+                <input
+                  type="checkbox"
+                  name="codex-budget-alerts-enabled"
+                  checked={codexBudgetAlerts}
+                  disabled={!alertsConfig.codex_budget_configured}
+                  onChange={(e) => setCodexBudgetAlerts(e.target.checked)}
+                />{' '}
+                Codex budget alerts
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  name="codex-projected-enabled"
+                  checked={codexProjected}
+                  disabled={!alertsConfig.codex_budget_configured}
+                  onChange={(e) => setCodexProjected(e.target.checked)}
+                />{' '}
+                Codex projected-pace alerts
+              </label>
+              {!alertsConfig.codex_budget_configured && (
+                <p className="settings-hint">
+                  Set a Codex budget via the CLI first:{' '}
+                  <code>cctally budget set 200 --vendor codex</code>
+                </p>
+              )}
+            </div>
+          </fieldset>
+          {/*
+            TEST — the lone instant action. Fires a synthetic alert through the
+            dispatch pipeline; never mutates settings, never closes the sheet.
+          */}
+          <fieldset className="settings-fs">
+            <legend>Test</legend>
             <div className="alerts-test-row">
               <label>
                 Axis{' '}
@@ -781,8 +939,8 @@ export function SettingsOverlay() {
             independently and committed in the single combined Save POST as
             `dashboard: { cache_failure_markers }`.
           */}
-          <fieldset className="settings-fs">
-            <legend>Conversation viewer</legend>
+          <fieldset className={`settings-fs${viewerChanged ? ' is-changed' : ''}`}>
+            <legend>Conversation viewer{changedMark(viewerChanged)}</legend>
             <label>
               <input
                 type="checkbox"
@@ -811,8 +969,8 @@ export function SettingsOverlay() {
               waiting for the periodic refresh). On by default.
             </p>
           </fieldset>
-          <fieldset className="settings-fs">
-            <legend>Sort default</legend>
+          <fieldset className={`settings-fs${sortDirty ? ' is-changed' : ''}`}>
+            <legend>Sort default{changedMark(sortDirty)}</legend>
             {SESSION_SORT_KEYS.map(({ key, label }) => (
               <label key={key}>
                 <input
@@ -826,8 +984,8 @@ export function SettingsOverlay() {
               </label>
             ))}
           </fieldset>
-          <fieldset className="settings-fs">
-            <legend>Remembered filter term</legend>
+          <fieldset className={`settings-fs${filterDirty ? ' is-changed' : ''}`}>
+            <legend>Remembered filter term{changedMark(filterDirty)}</legend>
             <input
               type="text"
               placeholder="(none)"
@@ -835,8 +993,8 @@ export function SettingsOverlay() {
               onChange={(e) => setFilter(e.target.value)}
             />
           </fieldset>
-          <fieldset className="settings-fs">
-            <legend>Sessions per page</legend>
+          <fieldset className={`settings-fs${perPageDirty ? ' is-changed' : ''}`}>
+            <legend>Sessions per page{changedMark(perPageDirty)}</legend>
             <input
               type="number"
               min={10}
@@ -845,53 +1003,112 @@ export function SettingsOverlay() {
               onChange={(e) => setPerPage(Number(e.target.value))}
             />
           </fieldset>
-          <fieldset className="settings-fs sorting-fs">
-            <legend>Table sorting</legend>
-            <button
-              className="settings-btn"
-              type="button"
-              disabled={!prefs.trendSortOverride && !prefs.sessionsSortOverride}
-              onClick={() => {
-                dispatch({ type: 'CLEAR_TABLE_SORTS' });
-                close();
-              }}
-            >
-              Reset table sorting
-            </button>
-            <p className="settings-hint">
-              Clears column-click sorting on the $/1% Trend and Recent Sessions tables.
-            </p>
-          </fieldset>
-          <fieldset className="settings-fs layout-fs">
-            <legend>Layout</legend>
-            <button
-              className="settings-btn"
-              type="button"
-              onClick={() => {
-                dispatch({ type: 'RESET_PANEL_ORDER' });
-                close();
-              }}
-            >
-              Reset card order
-            </button>
+          {/*
+            SET-6 (#252) — one "Restore defaults" affordance replacing the three
+            scattered, overlapping Reset controls (Reset table sorting / Reset
+            card order / bottom "Reset view preferences"). Each row has an
+            explicit, NON-overlapping scope; all three are deferred (staged /
+            working-copy) and only apply on Save.
+          */}
+          <fieldset className={`settings-fs${restoreChanged ? ' is-changed' : ''}`}>
+            <legend>Restore defaults{changedMark(restoreChanged)}</legend>
+            <div className="settings-restore-row">
+              <button
+                className="settings-btn"
+                type="button"
+                onClick={restoreViewPrefs}
+                disabled={viewPrefsAtDefault}
+              >
+                Restore view preferences
+              </button>
+              <p className="settings-hint">
+                Sort default, sessions-per-page &amp; remembered filter.
+              </p>
+            </div>
+            <div className="settings-restore-row">
+              <button
+                className="settings-btn"
+                type="button"
+                aria-pressed={resetTableSortStaged}
+                onClick={() => setResetTableSortStaged((v) => !v)}
+                disabled={!tableSortHasOverride && !resetTableSortStaged}
+              >
+                {resetTableSortStaged ? 'Table column sorting — staged ✓' : 'Table column sorting'}
+              </button>
+              <p className="settings-hint">
+                Clears $/1% Trend, Recent Sessions &amp; Projects column-click sorting.
+              </p>
+            </div>
+            <div className="settings-restore-row">
+              <button
+                className="settings-btn"
+                type="button"
+                aria-pressed={resetCardOrderStaged}
+                onClick={() => setResetCardOrderStaged((v) => !v)}
+              >
+                {resetCardOrderStaged ? 'Card order — staged ✓' : 'Card order'}
+              </button>
+              <p className="settings-hint">Restores the default panel arrangement.</p>
+            </div>
           </fieldset>
           <div className="settings-actions">
             <button
               className="settings-btn"
+              id="settings-save"
               type="button"
               onClick={save}
               disabled={saveDisabled}
             >
-              {tzSubmitting ? 'Saving…' : 'Save'}
-            </button>
-            <button className="settings-btn" type="button" onClick={reset}>
-              Reset view preferences
+              {tzSubmitting
+                ? 'Saving…'
+                : dirtyCount === 0
+                  ? 'Save'
+                  : `Save · ${dirtyCount} change${dirtyCount === 1 ? '' : 's'}`}
             </button>
             <button className="settings-btn" type="button" onClick={close}>
               Cancel
             </button>
           </div>
         </div>
+        {/*
+          SET-2 (#252) dismiss-guard confirm. Rendered as a SIBLING of the
+          header + body inside `.modal-card` (which is position:relative), so the
+          existing card-level `useModalFocus` trap contains focus; while it is up
+          the header + body are marked `inert` (effect above) so Tab cycles only
+          the two confirm buttons. [Discard] closes; [Keep editing] dismisses the
+          confirm. Focus lands on the safe default (Keep editing).
+        */}
+        {confirmDiscard && (
+          <div
+            className="settings-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="settings-confirm-title"
+          >
+            <div className="settings-confirm-card">
+              <p id="settings-confirm-title">
+                Discard {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}?
+              </p>
+              <div className="settings-confirm-actions">
+                <button
+                  ref={keepEditingRef}
+                  className="settings-btn"
+                  type="button"
+                  onClick={() => setConfirmDiscard(false)}
+                >
+                  Keep editing
+                </button>
+                <button
+                  className="settings-btn settings-btn-danger"
+                  type="button"
+                  onClick={close}
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
