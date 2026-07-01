@@ -138,6 +138,7 @@ function useRangeBar(
   wrapRef: React.RefObject<HTMLDivElement>,
   trackRef: React.RefObject<HTMLDivElement>,
   fc: ForecastEnvelope | null,
+  nowPct: number | null,
 ): void {
   // Whether the last layout collapsed to a single range pill. Read at the
   // NEXT effect's kind-cleanup so the synthetic `.mfc-pill.range` (whose
@@ -219,6 +220,28 @@ function useRangeBar(
       rangeBandEl.hidden = !show;
     }
 
+    // "now" marker — the current weekly used %, on the same 0–110 scale as
+    // the projections. Positioned independently of the pill overlap pass
+    // (it never collides with the pills, which sit above the track).
+    {
+      let nowEl = trackEl.querySelector<HTMLElement>('.mfc-now');
+      const nowClamped = clamp0_110(nowPct);
+      if (nowClamped == null) {
+        if (nowEl) nowEl.remove();
+      } else {
+        if (!nowEl) {
+          nowEl = document.createElement('div');
+          nowEl.className = 'mfc-now';
+          const glyph = document.createElement('span');
+          glyph.className = 'mfc-now-glyph';
+          glyph.textContent = '▸';
+          nowEl.appendChild(glyph);
+          trackEl.appendChild(nowEl);
+        }
+        nowEl.style.left = (nowClamped / 110) * 100 + '%';
+      }
+    }
+
     const applyLayout = (): void => {
       for (const p of pins) {
         if (!p.pillEl || !p.pillEl.isConnected) return;
@@ -289,7 +312,7 @@ function useRangeBar(
       }
     };
     applyLayout();
-  }, [wrapRef, trackRef, fc]);
+  }, [wrapRef, trackRef, fc, nowPct]);
 }
 
 export function ForecastModal() {
@@ -300,7 +323,10 @@ export function ForecastModal() {
     | null;
   const wrapRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-  useRangeBar(wrapRef, trackRef, fc);
+  // "now" anchor for the range bar — the current weekly used %. Prefer the
+  // header value, fall back to current_week; null hides the marker.
+  const nowPct = env?.header?.used_pct ?? env?.current_week?.used_pct ?? null;
+  useRangeBar(wrapRef, trackRef, fc, nowPct);
 
   const headerExtras = (
     <ShareIcon
@@ -396,6 +422,22 @@ export function ForecastModal() {
           </svg>
           Range vs. caps
         </h3>
+        {/* Legend — swatch colors MUST match the rendered pill/chev colors
+            (week-avg is blue, recent-24h is amber throughout the modal). */}
+        <div className="mfc-legend" id="mfc-legend">
+          <span className="mfc-leg-item">
+            <span className="mfc-leg-sw wa" />
+            week-avg
+          </span>
+          <span className="mfc-leg-item">
+            <span className="mfc-leg-sw r24" />
+            recent-24h
+          </span>
+          <span className="mfc-leg-item">
+            <span className="mfc-leg-now">▸</span>
+            now
+          </span>
+        </div>
         <div className="mfc-rangewrap" id="mfc-rangewrap" ref={wrapRef}>
           <div className="mfc-pills" id="mfc-pills" />
           <svg
@@ -410,11 +452,17 @@ export function ForecastModal() {
             <div className="mfc-zone warn" />
             <div className="mfc-zone over" />
             <div className="mfc-rangeband" id="mfc-rangeband" hidden />
+            <div className="mfc-bound b0">
+              <div className="lbl">0%</div>
+            </div>
             <div className="mfc-bound b90">
               <div className="lbl">90%</div>
             </div>
             <div className="mfc-bound b100">
               <div className="lbl">100%</div>
+            </div>
+            <div className="mfc-bound b110">
+              <div className="lbl">110%</div>
             </div>
           </div>
         </div>
