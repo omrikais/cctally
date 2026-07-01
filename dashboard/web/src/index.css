@@ -3136,6 +3136,7 @@ mark.current {
 }
 .ra-gauge-tick.tick-amber { background: var(--accent-amber); }
 .ra-gauge-tick.tick-red   { background: var(--accent-red); }
+.ra-gauge-tick.tick-mid   { background: var(--accent-orange); }
 .ra-gauge-copy { color: var(--text-dim); font-size: var(--fs-meta); }
 
 /* =========================================================================

@@ -71,6 +71,17 @@ describe('RecentAlertsModal empty teaching gauge (RA-1)', () => {
     expect(ticks[1].className).toContain('tick-red'); // higher (95)
   });
 
+  it('gives interior thresholds a distinct mid tone when 3+ are configured', () => {
+    seed(11, [80, 90, 95]);
+    const { container } = render(<RecentAlertsModal />);
+    const ticks = [...container.querySelectorAll('.ra-gauge-tick')];
+    expect(ticks[0].className).toContain('tick-amber'); // lowest (80)
+    expect(ticks[1].className).toContain('tick-mid');   // middle (90)
+    expect(ticks[2].className).toContain('tick-red');   // highest (95)
+    expect(ticks[1].className).not.toContain('tick-amber');
+    expect(ticks[1].className).not.toContain('tick-red');
+  });
+
   it('shows the reassuring header when used% is below the lowest threshold', () => {
     seed(11, [80, 95]);
     const { container } = render(<RecentAlertsModal />);

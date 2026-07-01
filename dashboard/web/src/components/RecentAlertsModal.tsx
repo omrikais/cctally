@@ -202,6 +202,7 @@ export function RecentAlertsModal(): JSX.Element {
       );
     }
     const lowest = Math.min(...weeklyThresholds);
+    const highest = Math.max(...weeklyThresholds);
     const fillPct = Math.max(0, Math.min(usedPct, 100));
     return (
       <Modal title="Recent alerts" accentClass="accent-amber">
@@ -218,7 +219,10 @@ export function RecentAlertsModal(): JSX.Element {
             {weeklyThresholds.map((th, i) => (
               <span
                 key={`${th}-${i}`}
-                className={'ra-gauge-tick ' + (th === lowest ? 'tick-amber' : 'tick-red')}
+                className={
+                  'ra-gauge-tick ' +
+                  (th === lowest ? 'tick-amber' : th === highest ? 'tick-red' : 'tick-mid')
+                }
                 data-th={String(th)}
                 style={{ left: `${th}%` }}
               />
