@@ -1126,6 +1126,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   padding: 12px 18px; border-bottom: 1px solid var(--border-soft);
 }
 .modal-header h2 { margin: 0; font-size: 18px; font-weight: 500; }
+/* SH-2 (#250): focus-on-open lands on the dialog heading (tabindex=-1). Suppress
+   the default outline but restore a keyboard-only ring via :focus-visible — the
+   shared blue focus identity — so keyboard users reliably see where focus landed
+   on open, while mouse-opened modals show no orphan ring. */
+.modal-header h2:focus { outline: none; }
+.modal-header h2:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 3px;
+  border-radius: var(--radius-xs);
+}
 .modal-close {
   background: none; border: none; color: inherit;
   font-size: 24px; line-height: 1; cursor: pointer; padding: 4px 8px;
@@ -1388,6 +1398,12 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 /* 0 / 110 scale extremes anchor to the track edges, not their divider center */
 .mfc-bound.b0   .lbl { left: 0;    transform: none; color: var(--text-dim); }
 .mfc-bound.b110 .lbl { left: auto; right: 0; transform: none; color: var(--text-dim); }
+/* At mobile widths the 100% cap and the 110% domain-extreme labels crowd into
+   "100%110%"; drop the less-informative 110% label so the 100% cap stays clear
+   (the bar still visibly ends at the 110% track edge). */
+@media (max-width: 640px) {
+  .mfc-bound.b110 .lbl { display: none; }
+}
 
 /* Range band (gradient strip on top of track between the two chevs) */
 .mfc-rangeband {
