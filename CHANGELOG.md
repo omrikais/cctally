@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Dashboard detail modals now scale their charts and tables to the real data instead of collapsing on it. The Cache Report hit-% timeline auto-zooms its y-axis to the data band, so a line clustered at 96–98% shows real day-to-day variation and the ±5pp median band is visible instead of pinning flat to the top of a fixed 0–100% axis. The Projects chart switches from an unreadable near-solid stacked area to a ranked top-N + "(other)" horizontal-bar view when one project dominates the window (each bar still drills into that project), and the stacked-area mode gains y-axis labels. The Forecast range bar gets brighter, outlined zones, a 0→110% scale, a "now ▸" marker at the current weekly usage, and a legend. The Trend chart's secondary "used %" line gains its own right-hand axis, and the whole chart becomes interactive with hover- and keyboard-focus tooltips (week · $/1% · used %). A single-model session collapses its redundant "Models" and "Cost by model" sections into one "Model · … · $…" line, and the empty Recent Alerts state becomes a teaching gauge showing current usage against the configured fire thresholds. On mobile, the Cache Report daily table reflows into labeled cards instead of unlabeled number run-ons and its header no longer truncates to "Cache ⋯". Every panel modal now lands keyboard and screen-reader focus on its heading when it opens (#250).
+
+### Fixed
+- Dashboard Forecast modal: the two end-of-week projection pills no longer overlap on narrow and mobile widths — a hard pixel min-gap now pushes them apart (collapsing to a single "low–high%" range pill only when they genuinely cannot fit), and the mobile scale labels no longer crowd into "100%110%" (#250).
+
 ## [1.58.0] - 2026-06-30
 
 ### Added
