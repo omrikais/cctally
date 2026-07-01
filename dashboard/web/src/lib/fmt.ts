@@ -346,6 +346,11 @@ export const fmt = {
   // paths").
   weekStart:      (s: string | null | undefined, _ctx: FmtCtx): string | null =>
     fmtCalendarDateShort(s),
+  // #251 CR-5 — calendar-date formatter for YYYY-MM-DD inputs that
+  // represent a CALENDAR DAY (cache daily/today dates), not a clock
+  // instant. Same helper as weekStart, semantically-honest name.
+  calDate:        (s: string | null | undefined): string | null =>
+    fmtCalendarDateShort(s),
   timeOnly:       fmtTimeHHmm,
   // Threshold-actions T10/T11: relative-time formatter for the Recent
   // alerts panel/modal (and any future "X ago" surface). Goes through

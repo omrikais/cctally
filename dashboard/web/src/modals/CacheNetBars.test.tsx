@@ -125,7 +125,7 @@ describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
     expect(container.querySelector('.crm-chart-frame.netbars')).toBeTruthy();
   });
 
-  it('renders 14 bars with M-D / "Today" axis labels', () => {
+  it('renders 14 bars with "Mon DD" / "Today" axis labels (CR-5)', () => {
     const { container } = render(
       <CacheNetBars days={sampleDays()} size="large" />,
     );
@@ -134,8 +134,10 @@ describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
       container.querySelectorAll('svg text'),
     ).map((t) => t.textContent);
     expect(texts).toContain('Today');
-    // First (oldest) day in the reversed order is 2026-05-07 → "05-07".
-    expect(texts).toContain('05-07');
+    // First (oldest) day in the reversed order is 2026-05-07 → fmt.calDate
+    // renders "May 07" (CR-5 unification), never the raw "05-07" slice.
+    expect(texts).toContain('May 07');
+    expect(texts).not.toContain('05-07');
   });
 
   it('shows the empty placeholder copy when days is empty', () => {

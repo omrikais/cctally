@@ -72,7 +72,7 @@ export function TrendPanel() {
           <use href="/static/icons.svg#bar-chart" />
         </svg>
         <h2>
-          $/1% Trend <span className="sub">(8 weeks)</span>
+          $/1% Trend <span className="sub">({data.length} week{data.length === 1 ? '' : 's'})</span>
         </h2>
         <ShareIcon
           panel="trend"

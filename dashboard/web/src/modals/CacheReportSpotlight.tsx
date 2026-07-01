@@ -65,7 +65,7 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
       <div className="crm-section-head crm-sh-spotlight">
         Today's spotlight
         <span className="meta">
-          {cr.today.date} · {cr.days.length} days observed
+          {fmt.calDate(cr.today.date)} · {cr.days.length} days observed
         </span>
       </div>
       <div className={`crm-spotlight${anomalous ? ' anom' : ''}`}>

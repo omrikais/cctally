@@ -72,6 +72,18 @@ describe('fmt.tokens (#177 S5)', () => {
   });
 });
 
+describe('fmt.calDate (S5 CR-5)', () => {
+  it('formats a YYYY-MM-DD calendar date as "Mon DD" with no tz shift', () => {
+    expect(fmt.calDate('2026-06-29')).toBe('Jun 29');
+    expect(fmt.calDate('2026-01-05')).toBe('Jan 05');
+  });
+  it('returns null on null/invalid input', () => {
+    expect(fmt.calDate(null)).toBeNull();
+    expect(fmt.calDate(undefined)).toBeNull();
+    expect(fmt.calDate('not-a-date')).toBeNull();
+  });
+});
+
 describe('fmt.durationCompact', () => {
   it('drops the 0h prefix and zero-pad for sub-hour durations', () => {
     expect(fmt.durationCompact(7 * 60)).toBe('7m');

@@ -61,6 +61,7 @@ export function SortableHeader<T>({ columns, override, onChange, accentVar }: So
               aria-sort={ariaSort(active, dir)}
               tabIndex={0}
               data-col={col.id}
+              title={col.title}
               style={style}
               onClick={onClick(col)}
               onKeyDown={onKey(col)}

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
 import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
+import { fmt, type FmtCtx } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
 import { isSingleModel } from '../lib/sessionModel';
 import type { SessionDetail } from '../types/envelope';
@@ -44,6 +46,8 @@ function useGeneratedAt(): string {
 export function SessionModal() {
   const sessionId = useSyncExternalStore(subscribeStore, () => getState().openSessionId);
   const generatedAt = useGeneratedAt();
+  const display = useDisplayTz();
+  const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const [data, setData] = useState<SessionDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -157,13 +161,13 @@ export function SessionModal() {
           </div>
         ) : null}
 
-        {!loading && !error && data ? <SessionContent detail={data} /> : null}
+        {!loading && !error && data ? <SessionContent detail={data} ctx={ctx} /> : null}
       </section>
     </Modal>
   );
 }
 
-function SessionContent({ detail }: { detail: SessionDetail }) {
+function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx }) {
   const paths = Array.isArray(detail.source_paths) ? detail.source_paths : [];
   const primary: string[] = [];
   const subagents: string[] = [];
@@ -253,13 +257,13 @@ function SessionContent({ detail }: { detail: SessionDetail }) {
         <div>
           <span className="k">started</span>
           <span className="v" id="msess-started">
-            {detail.started_utc ?? '—'}
+            {fmt.datetimeShort(detail.started_utc, ctx)}
           </span>
         </div>
         <div>
           <span className="k">last activity</span>
           <span className="v" id="msess-last">
-            {detail.last_activity_utc ?? '—'}
+            {fmt.datetimeShort(detail.last_activity_utc, ctx)}
           </span>
         </div>
       </div>

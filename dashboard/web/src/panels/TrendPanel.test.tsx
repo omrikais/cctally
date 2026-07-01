@@ -43,6 +43,22 @@ function envWithTrend(weekCount: number): Envelope {
   return env;
 }
 
+describe('TrendPanel card week count (TR-1 / #251)', () => {
+  it('renders the real week count in the card sub, never hardcoded "8 weeks"', () => {
+    updateSnapshot(envWithTrend(6));
+    render(<TrendPanel />);
+    const sub = document.querySelector('#panel-trend .sub') as HTMLElement;
+    expect(sub.textContent).toBe('(6 weeks)');
+  });
+
+  it('singularizes the count for a one-week stub', () => {
+    updateSnapshot(envWithTrend(1));
+    render(<TrendPanel />);
+    const sub = document.querySelector('#panel-trend .sub') as HTMLElement;
+    expect(sub.textContent).toBe('(1 week)');
+  });
+});
+
 describe('TrendPanel sparkline track count (#207 C6)', () => {
   it('declares exactly one grid track per trend week (8)', () => {
     updateSnapshot(envWithTrend(8));

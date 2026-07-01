@@ -67,6 +67,61 @@ function renderTrend(history: TrendRow[]) {
   return render(<TrendModal />);
 }
 
+// 10 rows with varied $/1% so the median label + count assertions are sharp
+// and N=10 differs from any hardcoded "12" / "8".
+function history10(): TrendRow[] {
+  const dpp = [1.0, 1.4, 1.1, 1.6, 1.2, 1.8, 1.3, 1.5, 1.7, 1.9];
+  return dpp.map((v, i) => ({
+    label: i === dpp.length - 1 ? 'Now' : `W-${dpp.length - 1 - i}`,
+    used_pct: 10 + i * 3,
+    dollar_per_pct: v,
+    delta: i === 0 ? null : v - dpp[i - 1],
+    is_current: i === dpp.length - 1,
+  }));
+}
+
+// TR-1 — every week count (title, section head) derives from rows.length; the
+// hardcoded "12-week" contradiction is gone.
+describe('<TrendModal /> derives the week count from N (TR-1)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('states the real N in the title + section head, never "12-week"', () => {
+    const { container } = renderTrend(history10());
+    expect(container.textContent).not.toContain('12-week');
+    expect(container.textContent).toContain('10-week history');
+    expect(container.textContent).toContain('Trend — last 10 weeks');
+  });
+
+  it('renders the empty-state title as bare "Trend" (no misleading count)', () => {
+    renderTrend([]);
+    expect(document.getElementById('mtr-empty')).not.toBeNull();
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+    expect(dialog.textContent).toContain('Trend');
+    expect(dialog.textContent).not.toContain('12-week');
+    expect(dialog.textContent).not.toContain('0-week');
+  });
+});
+
+// TR-2 — the chart median reference line states its basis ("10-wk median $X"),
+// disambiguating it from the hero KV's "4-week median".
+describe('<TrendModal /> median label states its basis (TR-2)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('labels the chart median with its window, not a bare "median"', () => {
+    const { container } = renderTrend(history10());
+    const med = container.querySelector('.mtr-medlabel') as SVGTextElement;
+    expect(med).not.toBeNull();
+    expect(med.textContent).toMatch(/^10-wk median \$/);
+    expect(med.textContent).not.toMatch(/^median \$/);
+  });
+});
+
 describe('<TrendModal /> second axis + tooltips (TR-3/TR-4)', () => {
   beforeEach(() => {
     localStorage.clear();

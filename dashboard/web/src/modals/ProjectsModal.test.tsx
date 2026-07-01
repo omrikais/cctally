@@ -807,15 +807,20 @@ describe('<ProjectsModal />', () => {
     // showed `total_cost / weekly_used_pct` independent of the project.
     // Replaced with a per-row `% of week` = cost[p] / sum(cost) over the
     // active window, which IS differential across rows (spec §3.4).
-    it("replaces the '$/1%' header with '% of week' (header count unchanged)", () => {
+    it("replaces the '$/1%' header with 'Cost share' (header count unchanged)", () => {
+      // The #72 derivation renamed the column, and #251 PR-1 renamed the
+      // label again ("% of week" → "Cost share"); both old labels are gone.
       vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
       updateSnapshot(buildProjectsEnvelope({ windowWeeks: 1, projectCount: 3 }));
       render(<ProjectsModal />);
       expect(
-        screen.getByRole('columnheader', { name: '% of week' }),
+        screen.getByRole('columnheader', { name: 'Cost share' }),
       ).toBeInTheDocument();
       expect(
         screen.queryByRole('columnheader', { name: '$/1%' }),
+      ).toBeNull();
+      expect(
+        screen.queryByRole('columnheader', { name: '% of week' }),
       ).toBeNull();
       // Column count stays at 7 — old shape, new label/derivation.
       expect(screen.getAllByRole('columnheader')).toHaveLength(7);
@@ -851,6 +856,25 @@ describe('<ProjectsModal />', () => {
     const svgShare = document.querySelector('svg[role="img"]');
     expect(svgShare?.getAttribute('aria-label')).toContain('share %');
     expect(svgShare?.getAttribute('aria-label')).not.toContain('cost');
+  });
+});
+
+// PR-1 (#251) — the two Projects percent columns are renamed to state what
+// they actually measure, and carry disambiguating native tooltips on the <th>.
+describe('<ProjectsModal /> percent column labels (PR-1)', () => {
+  it('renames the columns to "Used pp" / "Cost share" and tooltips them', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    const usedTh = document.querySelector('th[data-col="used_pct"]') as HTMLElement;
+    const shareTh = document.querySelector('th[data-col="share_of_window"]') as HTMLElement;
+    expect(usedTh.textContent).toContain('Used pp');
+    expect(shareTh.textContent).toContain('Cost share');
+    expect(usedTh.getAttribute('title')).toMatch(/percentage-points|attributed/i);
+    expect(shareTh.getAttribute('title')).toMatch(/share of total project spend/i);
+    // The misleading old labels are gone.
+    expect(usedTh.textContent).not.toContain('Used %');
+    expect(shareTh.textContent).not.toContain('% of week');
   });
 });
 

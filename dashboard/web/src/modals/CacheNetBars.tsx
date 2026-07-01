@@ -25,6 +25,7 @@
 // render oldest -> newest so the rightmost bar is today (matches the
 // sparkline above it on the panel).
 import type { CacheReportDailyRow } from '../types/envelope';
+import { fmt } from '../lib/fmt';
 
 export interface CacheNetBarsProps {
   days: CacheReportDailyRow[];   // newest-first; render oldest-first
@@ -160,7 +161,7 @@ export function CacheNetBars({ days, size }: CacheNetBarsProps) {
             {ordered.map((d, i) => {
               const x = cfg.padX + i * (barWidth + cfg.barGap) + barWidth / 2;
               const isLast = i === ordered.length - 1;
-              const label = isLast ? 'Today' : d.date.slice(5);
+              const label = isLast ? 'Today' : fmt.calDate(d.date);
               return (
                 <text
                   key={`l-${d.date}`}

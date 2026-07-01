@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
-import { fmt } from '../lib/fmt';
+import { useDisplayTz } from '../hooks/useDisplayTz';
+import { fmt, type FmtCtx } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
 import { dispatch } from '../store/store';
 
@@ -27,6 +28,8 @@ export function HeroStrip() {
   const h = env?.header;
   const cw = env?.current_week ?? null;
   const freshness = cw?.freshness ?? null;
+  const display = useDisplayTz();
+  const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Forecast metric tint — verdict drives calm-green / amber / red (H1/§4).
   const verdict = resolveVerdict(h?.forecast_verdict ?? null);
 
@@ -97,7 +100,7 @@ export function HeroStrip() {
           <span
             className={`chip chip-${freshness.label}`}
             data-freshness={freshness.label}
-            title={`Captured ${freshness.captured_at}`}
+            title={`Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`}
           >
             {freshness.label === 'stale' ? '⚠ ' : ''}
             as of {formatHHMMSS(freshness.captured_at) ?? freshness.captured_at}

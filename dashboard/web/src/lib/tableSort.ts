@@ -11,6 +11,10 @@ export interface TableColumn<T> {
   className?: string;
   numeric?: boolean;
   sortable?: boolean;
+  // Optional native-tooltip text rendered on the <th> (SortableHeader).
+  // Used to disambiguate columns whose short label can't carry the full
+  // definition (e.g. Projects "Used pp" / "Cost share", #251 PR-1).
+  title?: string;
   // Optional null-detection hook. When present, `applyTableSort` parks
   // rows whose `nullKey(row)` is null/undefined at the END of the result
   // unconditionally — regardless of asc/desc direction. The column's

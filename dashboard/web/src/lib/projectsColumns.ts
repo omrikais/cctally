@@ -74,7 +74,8 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
   },
   {
     id: 'used_pct',
-    label: 'Used %',
+    label: 'Used pp',
+    title: "Sum of each week's attributed usage-% over the selected window (percentage-points; can exceed 100 across multiple weeks).",
     defaultDirection: 'desc',
     numeric: true,
     nullKey: (r) => r.windowPct,
@@ -82,7 +83,8 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
   },
   {
     id: 'share_of_window',
-    label: '% of week',
+    label: 'Cost share',
+    title: "This project's share of total project spend in the selected window.",
     defaultDirection: 'desc',
     numeric: true,
     nullKey: (r) => r.shareOfWindow,

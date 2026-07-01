@@ -165,8 +165,10 @@ describe('<CacheReportModal /> daily rows table', () => {
     const rows = document.querySelectorAll('.ch-table tbody tr');
     const curRow = Array.from(rows).find((r) => r.classList.contains('cur'));
     expect(curRow).toBeTruthy();
-    // today.date = 2026-05-20; today row should include that text
-    expect(curRow?.textContent).toContain('2026-05-20');
+    // today.date = 2026-05-20; CR-5 renders the date cell via fmt.calDate
+    // ("May 20") while the raw date survives on the data-date attribute.
+    expect(curRow?.textContent).toContain('May 20');
+    expect(curRow?.getAttribute('data-date')).toBe('2026-05-20');
   });
 
   it('renders 14 daily rows', () => {
@@ -327,6 +329,39 @@ describe('<CacheReportModal /> mobile daily cards (CR-2/CR-3)', () => {
     render(<CacheReportModal />);
     const dialog = screen.getByRole('dialog', { name: /cache report/i });
     expect(dialog.textContent).toMatch(/14d baseline · Claude only/);
+  });
+});
+
+// CR-5 — every cache calendar date routes through fmt.calDate ("May 20"),
+// never the raw YYYY-MM-DD. data-date / key attributes keep the raw value.
+describe('<CacheReportModal /> localizes cache dates (CR-5)', () => {
+  it('renders desktop daily-row dates as "Mon DD", never raw YYYY-MM-DD', () => {
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const row = document.querySelector(
+      '[data-testid="crm-daily-row"][data-date="2026-05-07"]',
+    ) as HTMLElement;
+    expect(row).toBeTruthy();
+    expect(row.textContent).toContain('May 07');
+    expect(row.textContent).not.toContain('2026-');
+  });
+
+  it('renders the spotlight today date via fmt.calDate', () => {
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const meta = document.querySelector('.crm-sh-spotlight .meta') as HTMLElement;
+    expect(meta.textContent).toContain('May 20');
+    expect(meta.textContent).not.toContain('2026-');
+  });
+
+  it('renders mobile daily-card dates via fmt.calDate', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const card = document.querySelector(
+      '[data-testid="crm-daily-card"][data-date="2026-05-07"]',
+    ) as HTMLElement;
+    expect(card.querySelector('.cd-date')?.textContent).toBe('May 07');
   });
 });
 

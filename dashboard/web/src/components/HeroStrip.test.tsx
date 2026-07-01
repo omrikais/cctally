@@ -103,6 +103,20 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip?.textContent).toContain('⚠');
   });
 
+  it('localizes the freshness tooltip (SH-1)', () => {
+    const env = heroEnvelope();
+    env.current_week!.freshness = {
+      label: 'aging', captured_at: '2026-06-29T17:12:25Z', age_seconds: 120,
+    };
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const chip = container.querySelector('[data-freshness]') as HTMLElement;
+    expect(chip.title).toContain('Captured Jun 29');
+    expect(chip.title).not.toContain('Z');
+    expect(chip.title).not.toMatch(/T\d\d:\d\d:\d\dZ/);
+  });
+
   it('tints the Forecast metric value by verdict (ok → is-good)', () => {
     const { container } = render(<HeroStrip />);
     const val = container.querySelector('[data-metric="forecast"] .hero-metric-val');

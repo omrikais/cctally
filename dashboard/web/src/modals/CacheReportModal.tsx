@@ -261,7 +261,7 @@ export function CacheReportModal() {
                   data-date={d.date}
                 >
                   <div className="crm-daily-card-head">
-                    <span className="cd-date">{d.date}</span>
+                    <span className="cd-date">{fmt.calDate(d.date)}</span>
                     <span
                       className={'cd-flag ' + (d.anomaly_triggered ? 'flag-warn' : 'flag-ok')}
                     >
@@ -308,7 +308,7 @@ export function CacheReportModal() {
                     data-testid="crm-daily-row"
                     data-date={d.date}
                   >
-                    <td>{d.date}</td>
+                    <td>{fmt.calDate(d.date)}</td>
                     <td
                       className={`num ${
                         baselineKnown ? (isHitBad ? 'hit-bad' : 'hit-good') : ''

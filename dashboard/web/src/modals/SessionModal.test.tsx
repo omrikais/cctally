@@ -49,6 +49,22 @@ describe('SessionModal cache-rebuilds wiring', () => {
   });
 });
 
+// SE-1 — STARTED / LAST ACTIVITY localize through fmt.datetimeShort instead of
+// rendering the raw `*_utc` ISO. The store has no snapshot (useDisplayTz falls
+// back to Etc/UTC), so the two cells render "Mon DD HH:MM UTC".
+describe('SessionModal localizes timestamps (SE-1)', () => {
+  it('renders STARTED / LAST ACTIVITY via fmt, not raw ISO', async () => {
+    render(<SessionModal />);
+    const started = await screen.findByText((t) => t.includes('Jun 01') && t.includes('00:00'));
+    const last = await screen.findByText((t) => t.includes('Jun 01') && t.includes('01:00'));
+    expect(started.textContent).not.toMatch(/T\d\d:\d\d:\d\dZ/);
+    expect(last.textContent).not.toMatch(/T\d\d:\d\d:\d\dZ/);
+    // no raw trailing Z anywhere in the two cells
+    expect(started.textContent).not.toContain('Z');
+    expect(last.textContent).not.toContain('Z');
+  });
+});
+
 // SE-2 — a single-model session collapses "Models" + "Cost by model" into one
 // caption; a multi-model session keeps both sections.
 describe('SessionModal single-model collapse (SE-2)', () => {

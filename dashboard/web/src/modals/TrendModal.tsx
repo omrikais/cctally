@@ -122,7 +122,7 @@ function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgP
       out.push({
         el: 'text',
         attrs: { class: 'mtr-medlabel', x: PAD.left + 2, y: yDpp(med) - 3 },
-        text: 'median $' + med.toFixed(2),
+        text: `${N}-wk median $` + med.toFixed(2),
         key: 'med-label',
       });
     }
@@ -289,7 +289,7 @@ export function TrendModal() {
   if (!rows.length) {
     return (
       <Modal
-        title="Trend — 12-week history"
+        title="Trend"
         accentClass="accent-amber"
         headerExtras={headerExtras}
       >
@@ -324,7 +324,7 @@ export function TrendModal() {
 
   return (
     <Modal
-      title="Trend — 12-week history"
+      title={`Trend — last ${N} weeks`}
       accentClass="accent-amber"
       headerExtras={headerExtras}
     >
@@ -375,7 +375,7 @@ export function TrendModal() {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#trending-down" />
           </svg>
-          12-week history · $/1%
+          {N}-week history · $/1%
           <span className={'mtr-legend' + (hasUsed ? '' : ' legend-no-used')} aria-hidden="true">
             <span className="sw sw-dpp" />
             <span className="sw-lbl">$/1%</span>

@@ -205,7 +205,7 @@ function BlockContent({
               <div className="lbl">
                 Projected
                 {detail.projection
-                  ? ` · ${detail.projection.remaining_minutes}m left`
+                  ? ` · ${detail.projection.remaining_minutes} min left`
                   : ''}
               </div>
             </div>
