@@ -1213,3 +1213,62 @@ describe('<SettingsOverlay /> dismiss guard', () => {
     expect(screen.queryByLabelText('Alert notifier')).toBeNull(); // closed directly
   });
 });
+
+// #252 review fixes.
+describe('<SettingsOverlay /> discards uncommitted edits on reopen (review P2)', () => {
+  // The on-open effect must re-seed EVERY working field so a discarded edit
+  // never survives Cancel + reopen. Live-tail is the witness — its dedicated
+  // SSE effect only re-fires when the SERVER value changes, so before the fix
+  // the toggle stayed at the discarded value on reopen and read as a phantom
+  // "Save · 1 change". tzMode/tzCustom ride the same on-open re-seed line.
+  it('re-seeds the live-tail toggle from the server after Cancel + reopen', () => {
+    render(<SettingsOverlay />);
+    seedLiveTailPref(true); // server: live-tail ON
+    openSettings();
+    const toggle = () =>
+      screen.getByRole('checkbox', { name: /Live-tail new turns/ }) as HTMLInputElement;
+    expect(toggle().checked).toBe(true);
+    fireEvent.click(toggle()); // user turns it OFF → dirty
+    expect(toggle().checked).toBe(false);
+    expect(
+      (screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement).textContent,
+    ).toBe('Save · 1 change');
+    // Cancel (a deliberate discard) then reopen — the edit must NOT resurface.
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    openSettings();
+    expect(toggle().checked).toBe(true); // re-seeded from the server value
+    const save = screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement;
+    expect(save.textContent).toBe('Save');
+    expect(save.disabled).toBe(true);
+  });
+
+  // The inert precondition for the focus-containment fix (useModalFocus now
+  // skips [inert] subtrees). The actual Tab-escape prevention is a real-browser
+  // ui-qa item — jsdom can't drive a trusted Tab through native inert — so this
+  // pins only that the confirm marks the body inert / clears it.
+  it('marks the modal body inert while the discard confirm is open', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.keyDown(document, { key: 'Escape' }); // dirty → confirm up
+    const body = document.querySelector('.modal-body') as HTMLElement;
+    expect(body.inert).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /Keep editing/i }));
+    expect(body.inert).toBe(false);
+  });
+});
+
+describe('<SettingsOverlay /> Card-order restore gating (review P3)', () => {
+  it('disables the Card order toggle at the default panel order, enables it after a reorder', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+    const cardBtn = () =>
+      screen.getByRole('button', { name: /^Card order/ }) as HTMLButtonElement;
+    // Fresh state → default panel order → nothing to restore.
+    expect(cardBtn().disabled).toBe(true);
+    // A user reorder makes the reset meaningful → the toggle enables.
+    act(() => dispatch({ type: 'REORDER_PANELS', from: 0, to: 1 }));
+    expect(cardBtn().disabled).toBe(false);
+  });
+});

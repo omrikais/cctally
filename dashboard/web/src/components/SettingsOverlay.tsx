@@ -19,6 +19,7 @@ import type {
   ProjectedMetric,
 } from '../types/envelope';
 import { AXIS_TITLE_LABEL } from '../lib/alertAxis';
+import { DEFAULT_PANEL_ORDER } from '../lib/panelIds';
 import { ModalHeader } from '../modals/ModalHeader';
 
 // Notifier dispatch backends (Phase B). The union mirrors
@@ -265,11 +266,18 @@ export function SettingsOverlay() {
   ]);
 
   // Fix I1: resync form state to current prefs every time the overlay opens.
+  // Re-seeds EVERY working field (incl. tzMode/tzCustom + liveTail) so a
+  // discarded edit never survives a Cancel/×/Esc + reopen. Their dedicated SSE
+  // effects only fire when the SERVER value changes, so without re-seeding here
+  // an uncommitted TZ or live-tail edit would resurface on reopen as a phantom
+  // "Save · N changes" (#252 review).
   useEffect(() => {
     if (open) {
       setSort(prefs.sortDefault);
       setPerPage(prefs.sessionsPerPage);
       setFilter(filterTerm);
+      setTzMode(modeFromTz(display.tz));
+      setTzCustom(modeFromTz(display.tz) === 'custom' ? display.tz : '');
       setAlertsEnabled(alertsConfig.enabled);
       setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
       setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
@@ -278,7 +286,9 @@ export function SettingsOverlay() {
       setCodexProjected(alertsConfig.codex_projected_enabled ?? false);
       setNotifier(alertsConfig.notifier ?? 'auto');
       setCacheMarkers(markersEnabledServer);
+      setLiveTail(liveTailServer);
       setTestError(null);
+      setTestOk(false);
       setTestAxis('weekly');
       // S6 (#252): staged resets + the dismiss-guard confirm never persist
       // across opens.
@@ -291,6 +301,7 @@ export function SettingsOverlay() {
     prefs.sortDefault,
     prefs.sessionsPerPage,
     filterTerm,
+    display.tz,
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
     alertsConfig.projected_budget_enabled,
@@ -299,6 +310,7 @@ export function SettingsOverlay() {
     alertsConfig.codex_projected_enabled,
     alertsConfig.notifier,
     markersEnabledServer,
+    liveTailServer,
   ]);
 
   // a11y focus management (#207 A1). Settings is a local-state surface; it is
@@ -420,7 +432,13 @@ export function SettingsOverlay() {
     tzSubmitting ||
     (tzDirty && tzMode === 'custom' && !tzCustomValid);
 
-  const close = () => setOpen(false);
+  // Clear the discard-confirm on every close path (Cancel / × / Discard /
+  // clean-Esc) so it can't paint for a frame on the next open before the
+  // on-open effect resets it, and so the inert flag is never left stale (#252).
+  const close = () => {
+    setConfirmDiscard(false);
+    setOpen(false);
+  };
   const save = async () => {
     // 1. If any server-persisted block is dirty, commit it via POST
     //    /api/settings BEFORE dispatching local prefs. Combined body
@@ -543,14 +561,22 @@ export function SettingsOverlay() {
     setPerPage(d.sessionsPerPage);
     setFilter('');
   };
+  const viewPrefDefaults = defaultPrefs();
   const viewPrefsAtDefault =
-    sort === defaultPrefs().sortDefault &&
-    safePerPage === defaultPrefs().sessionsPerPage &&
+    sort === viewPrefDefaults.sortDefault &&
+    safePerPage === viewPrefDefaults.sessionsPerPage &&
     filter === '';
   // The "Table column sorting" reset is only meaningful when SOME table has a
   // column-click override — check all three (trend + sessions + projects).
   const tableSortHasOverride =
     !!prefs.trendSortOverride || !!prefs.sessionsSortOverride || !!prefs.projectsSortOverride;
+  // "Card order" reset is only meaningful when the panel order differs from the
+  // canonical default — gate the toggle the same way as the other two restores
+  // so it can't stage a no-op reset (a phantom "1 change" + pointless
+  // RESET_PANEL_ORDER on Save).
+  const panelOrderIsDefault =
+    prefs.panelOrder.length === DEFAULT_PANEL_ORDER.length &&
+    prefs.panelOrder.every((id, i) => id === DEFAULT_PANEL_ORDER[i]);
   // S6 (#252) dismiss guard: Esc/backdrop route here. Over an open confirm,
   // treat the gesture as "keep editing" (dismiss the confirm). Otherwise raise
   // the confirm when dirty, or close outright when clean. The explicit ×/Cancel
@@ -1045,6 +1071,7 @@ export function SettingsOverlay() {
                 type="button"
                 aria-pressed={resetCardOrderStaged}
                 onClick={() => setResetCardOrderStaged((v) => !v)}
+                disabled={panelOrderIsDefault && !resetCardOrderStaged}
               >
                 {resetCardOrderStaged ? 'Card order — staged ✓' : 'Card order'}
               </button>

@@ -14,14 +14,20 @@ const FOCUSABLE_SELECTOR = [
 // `offsetParent`/`getClientRects()` (both report 0/empty under jsdom — the
 // repo's known no-layout test gap), which would make every focusable element
 // look hidden in tests. Instead we reject only elements that are explicitly
-// hidden: the `hidden` attribute, `aria-hidden="true"`, or a computed
-// `display:none`/`visibility:hidden` (jsdom honors getComputedStyle for
-// inline + stylesheet rules). A `display:none` ancestor also zeroes the
-// child's computed `display`, so an off-screen subtree is still excluded.
+// hidden: the `hidden` attribute, `aria-hidden="true"`, an `inert` subtree,
+// or a computed `display:none`/`visibility:hidden` (jsdom honors
+// getComputedStyle for inline + stylesheet rules). A `display:none` ancestor
+// also zeroes the child's computed `display`, so an off-screen subtree is
+// still excluded. `inert` is included so a nested confirm/alertdialog that
+// marks the rest of the dialog `inert` (e.g. SettingsOverlay's discard guard,
+// #252) leaves getFocusable returning ONLY the confirm's controls — the
+// card-level trap then cycles just those, matching native `inert` focus
+// removal. The `el.inert` IDL property reflects to the `[inert]` attribute, so
+// the `closest('[inert]')` match covers imperatively-set inert nodes too.
 function isHidden(el: HTMLElement): boolean {
   if (el.hasAttribute('hidden')) return true;
   if (el.getAttribute('aria-hidden') === 'true') return true;
-  if (el.closest('[hidden],[aria-hidden="true"]')) return true;
+  if (el.closest('[hidden],[aria-hidden="true"],[inert]')) return true;
   const style =
     typeof window !== 'undefined' && typeof window.getComputedStyle === 'function'
       ? window.getComputedStyle(el)
