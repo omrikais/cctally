@@ -13,7 +13,7 @@ interface SortableHeaderProps<T> {
 }
 
 function caret(active: boolean, dir: 'asc' | 'desc' | null): string {
-  if (!active || !dir) return '';
+  if (!active || !dir) return '↕';        // rest: advertise sortability (dimmed via CSS)
   return dir === 'asc' ? '▲' : '▼';
 }
 
@@ -68,7 +68,10 @@ export function SortableHeader<T>({ columns, override, onChange, accentVar }: So
             >
               <button type="button" className="th-sort-btn" tabIndex={-1}>
                 <span className="th-label">{col.label}</span>
-                <span className="th-caret" aria-hidden="true">{caret(active, dir)}</span>
+                <span
+                  className={'th-caret' + (active ? '' : ' th-caret--rest')}
+                  aria-hidden="true"
+                >{caret(active, dir)}</span>
               </button>
             </th>
           );

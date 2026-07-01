@@ -3058,6 +3058,10 @@ mark.current {
   min-width: 0.7em;
   font-size: 0.85em;
 }
+/* S7 SESS-4: at-rest sortable headers advertise sortability with a dim
+   neutral glyph; the active column's bright arrow is unchanged (the
+   .is-sorted .th-caret rule below colors it). */
+.th-caret--rest { opacity: 0.35; font-weight: 400; }
 .th-sortable.is-sorted .th-label {
   color: var(--th-accent, var(--accent-cyan));
   font-weight: 700;
