@@ -63,6 +63,29 @@ describe('RecentAlertsModal empty teaching gauge (RA-1)', () => {
     expect(ticks[1].style.left).toBe('95%');
   });
 
+  it('marks the lowest threshold amber and the higher one red', () => {
+    seed(11, [80, 95]);
+    const { container } = render(<RecentAlertsModal />);
+    const ticks = [...container.querySelectorAll('.ra-gauge-tick')];
+    expect(ticks[0].className).toContain('tick-amber'); // lowest (80)
+    expect(ticks[1].className).toContain('tick-red'); // higher (95)
+  });
+
+  it('shows the reassuring header when used% is below the lowest threshold', () => {
+    seed(11, [80, 95]);
+    const { container } = render(<RecentAlertsModal />);
+    expect(container.querySelector('.ra-gauge-head')).not.toBeNull();
+    expect(container.textContent).toContain('well under the line');
+  });
+
+  it('omits the reassuring header when used% is at/above the lowest threshold', () => {
+    seed(88, [80, 95]);
+    const { container } = render(<RecentAlertsModal />);
+    // still a teaching gauge (used% known), just without the "well under" header
+    expect(container.querySelector('.ra-gauge')).not.toBeNull();
+    expect(container.querySelector('.ra-gauge-head')).toBeNull();
+  });
+
   it('falls back to the one-liner when used% is unknown', () => {
     seed(null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);

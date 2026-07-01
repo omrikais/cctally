@@ -215,9 +215,9 @@ export function RecentAlertsModal(): JSX.Element {
           <div className="ra-gauge-hero">{Math.round(usedPct)}%</div>
           <div className="ra-gauge-bar">
             <div className="ra-gauge-fill" style={{ width: `${fillPct}%` }} />
-            {weeklyThresholds.map((th) => (
+            {weeklyThresholds.map((th, i) => (
               <span
-                key={th}
+                key={`${th}-${i}`}
                 className={'ra-gauge-tick ' + (th === lowest ? 'tick-amber' : 'tick-red')}
                 data-th={String(th)}
                 style={{ left: `${th}%` }}
