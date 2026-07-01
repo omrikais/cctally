@@ -1272,3 +1272,85 @@ describe('<SettingsOverlay /> Card-order restore gating (review P3)', () => {
     expect(cardBtn().disabled).toBe(false);
   });
 });
+
+// #258 — re-seed conflict guard. A concurrent same-field write via SSE while
+// the overlay is open must NOT overwrite the user's pending edit to that field.
+// Same-field keep is witnessed only on multi-value fields (notifier/TZ) — a
+// boolean same-field test is vacuous (see the spec's witness-value caution).
+describe('<SettingsOverlay /> re-seed conflict guard (#258)', () => {
+  it('keeps a pending notifier edit when a concurrent same-field tick arrives', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    const select = screen.getByLabelText('Alert notifier') as HTMLSelectElement;
+    expect(select.value).toBe('auto');
+    // User edits the field → pending 'none'.
+    fireEvent.change(select, { target: { value: 'none' } });
+    expect(select.value).toBe('none');
+    // A concurrent write (another tab / CLI) ticks the SAME field to a THIRD
+    // value. 'keep' (stays 'none') and 'adopt' (becomes 'osascript') are
+    // distinguishable.
+    act(() => seedAlertsConfig({ notifier: 'osascript' }));
+    expect(select.value).toBe('none'); // pending edit kept, not clobbered
+    // Still dirty ('none' !== server 'osascript') → the Save badge persists.
+    expect(
+      (screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement).textContent,
+    ).toBe('Save · 1 change');
+  });
+
+  it('keeps a pending boolean edit when an UNRELATED field ticks (on-open clobber site)', () => {
+    render(<SettingsOverlay />);
+    // live-tail server ON; also seed alerts so the unrelated tick is observable.
+    seedLiveTailPref(true);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    const liveTail = () =>
+      screen.getByRole('checkbox', { name: /Live-tail new turns/ }) as HTMLInputElement;
+    // User flips live-tail OFF (dirty: false !== server true).
+    fireEvent.click(liveTail());
+    expect(liveTail().checked).toBe(false);
+    // An UNRELATED mirrored field ticks. Against today's broad-deps on-open
+    // effect this re-fires and hard-seeds live-tail back to ON — the second
+    // clobber site. The guard must keep it OFF.
+    act(() => seedAlertsConfig({ notifier: 'osascript' }));
+    expect(liveTail().checked).toBe(false); // pending edit kept
+  });
+
+  it('adopts a concurrent write to a DIFFERENT field while holding a pending edit', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto', enabled: false });
+    openSettings();
+    const select = screen.getByLabelText('Alert notifier') as HTMLSelectElement;
+    const master = () =>
+      screen.getByRole('checkbox', { name: /Enable threshold alerts/ }) as HTMLInputElement;
+    // Pending edit on notifier.
+    fireEvent.change(select, { target: { value: 'none' } });
+    expect(master().checked).toBe(false);
+    // A concurrent write flips a DIFFERENT field (the master) ON. The seed
+    // helper replaces alertsConfig wholesale, so re-send the pending-edit
+    // field at its ORIGINAL server value ('auto') to model a single-field
+    // external change.
+    act(() => seedAlertsConfig({ notifier: 'auto', enabled: true }));
+    expect(master().checked).toBe(true);  // untouched field adopted
+    expect(select.value).toBe('none');    // pending edit still held
+  });
+
+  it('re-adopts after the user manually rejoins the new server value (ref updates in keep branch)', () => {
+    render(<SettingsOverlay />);
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    const select = screen.getByLabelText('Alert notifier') as HTMLSelectElement;
+    // Edit → pending 'none'.
+    fireEvent.change(select, { target: { value: 'none' } });
+    // Concurrent tick to 'osascript' is KEPT (stays 'none'); ref advances to 'osascript'.
+    act(() => seedAlertsConfig({ notifier: 'osascript' }));
+    expect(select.value).toBe('none');
+    // User manually rejoins the current server value → local === server (clean).
+    fireEvent.change(select, { target: { value: 'osascript' } });
+    expect(select.value).toBe('osascript');
+    // A later tick must now ADOPT (proves the ref advanced in the keep branch;
+    // a stale ref stuck at 'auto' would hold 'osascript' forever).
+    act(() => seedAlertsConfig({ notifier: 'notify-send' }));
+    expect(select.value).toBe('notify-send');
+  });
+});

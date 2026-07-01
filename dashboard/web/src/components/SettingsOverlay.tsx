@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import {
   dispatch,
   getState,
@@ -37,6 +38,22 @@ const PROJECTED_METRIC_LABEL: Record<ProjectedMetric, string> = {
   budget_usd: 'Budget $',
   codex_budget_usd: 'Codex $',
 };
+
+// #258 — reconcile an SSE-mirrored working-copy field against an incoming
+// server tick. Adopt the new server value ONLY when the field is untouched
+// since the last sync (`prev === lastSeen`); a pending edit is kept. The old
+// ref value is captured BEFORE the overwrite so the (possibly batched)
+// functional updater compares against the correct baseline — overwriting first
+// would make an untouched field compare against the NEW value and never adopt.
+function reconcile<T>(
+  setter: Dispatch<SetStateAction<T>>,
+  ref: MutableRefObject<T>,
+  serverValue: T,
+): void {
+  const lastSeen = ref.current;
+  ref.current = serverValue;
+  setter((prev) => (prev === lastSeen ? serverValue : prev));
+}
 
 // IANA-zone validator. `Intl.DateTimeFormat` throws RangeError on
 // unknown zones; we treat that as the negative answer rather than
@@ -185,28 +202,60 @@ export function SettingsOverlay() {
   // contained confirm instead of discarding. Explicit ×/Cancel still discard.
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
-  // Re-seed the local form whenever the server-side display.tz changes
-  // (an SSE tick from another tab's Save, or a `cctally config` write
-  // landing while Settings is open). Without this, the radio would
-  // appear stuck at the prior selection and Save would re-POST identical
-  // bytes.
+  // #258 last-seen-server refs — one per SSE-mirrored working-copy field. Each
+  // is initialized to the SAME normalized value as the field's useState seed so
+  // an untouched field adopts its first real tick (a raw `undefined` baseline
+  // would read as touched). `reconcile` advances these; the on-open edge re-
+  // baselines them. `wasOpen` makes the on-open hard-seed edge-triggered.
+  const lastSeenTz = useRef<string>(display.tz);
+  const lastSeenAlertsEnabled = useRef<boolean>(alertsConfig.enabled);
+  const lastSeenProjWeekly = useRef<boolean>(alertsConfig.projected_weekly_enabled ?? false);
+  const lastSeenProjBudget = useRef<boolean>(alertsConfig.projected_budget_enabled ?? false);
+  const lastSeenProjectAlerts = useRef<boolean>(alertsConfig.project_alerts_enabled ?? false);
+  const lastSeenCodexAlerts = useRef<boolean>(alertsConfig.codex_budget_alerts_enabled ?? false);
+  const lastSeenCodexProj = useRef<boolean>(alertsConfig.codex_projected_enabled ?? false);
+  const lastSeenNotifier = useRef<NotifierKind>(alertsConfig.notifier ?? 'auto');
+  const lastSeenMarkers = useRef<boolean>(markersEnabledServer);
+  const lastSeenLiveTail = useRef<boolean>(liveTailServer);
+  const wasOpen = useRef<boolean>(false);
+
+  // #258 — the current TZ *target* the two local states encode, mirrored into a
+  // ref so the TZ tick effect (below) can read the latest value without a stale
+  // closure. Matches the existing `tzTargetValue` derivation exactly.
+  const tzTarget =
+    tzMode === 'local' ? 'local'
+    : tzMode === 'utc' ? 'utc'
+    : tzCustom.trim();
+  const tzTargetRef = useRef<string>(tzTarget);
+  tzTargetRef.current = tzTarget;
+
+  // #258 — guarded TZ re-seed. Adopt the new server tz only if the local target
+  // is untouched since last sync; a pending edit (custom zone mid-type,
+  // switched radio) is kept. Empty/invalid custom values simply don't equal the
+  // last-seen tz, so they count as touched and are held.
   useEffect(() => {
-    setTzMode(modeFromTz(display.tz));
-    setTzCustom(modeFromTz(display.tz) === 'custom' ? display.tz : '');
+    const lastSeen = lastSeenTz.current;
+    lastSeenTz.current = display.tz;
+    if (tzTargetRef.current === lastSeen) {
+      setTzMode(modeFromTz(display.tz));
+      setTzCustom(modeFromTz(display.tz) === 'custom' ? display.tz : '');
+    }
+    // tzTargetRef/lastSeenTz are refs (stable); react only to server tz changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [display.tz]);
 
-  // Re-seed the alerts toggle whenever the server-side alertsConfig
-  // changes (the SSE tick after another tab's Save lands, or the
-  // background T15 wire-up applies a fresh envelope). Same pattern as
-  // the TZ re-seed above: without it the toggle would appear stuck.
+  // #258 — guarded alerts re-seed. Each of the seven fields reconciles
+  // INDEPENDENTLY against its own last-seen ref, so a concurrent change to one
+  // sub-field is adopted while a pending edit on another is held. Normalization
+  // (`?? false` / `?? 'auto'`) matches each field's useState seed + dirty check.
   useEffect(() => {
-    setAlertsEnabled(alertsConfig.enabled);
-    setProjectedWeekly(alertsConfig.projected_weekly_enabled ?? false);
-    setProjectedBudget(alertsConfig.projected_budget_enabled ?? false);
-    setProjectAlerts(alertsConfig.project_alerts_enabled ?? false);
-    setCodexBudgetAlerts(alertsConfig.codex_budget_alerts_enabled ?? false);
-    setCodexProjected(alertsConfig.codex_projected_enabled ?? false);
-    setNotifier(alertsConfig.notifier ?? 'auto');
+    reconcile(setAlertsEnabled, lastSeenAlertsEnabled, alertsConfig.enabled);
+    reconcile(setProjectedWeekly, lastSeenProjWeekly, alertsConfig.projected_weekly_enabled ?? false);
+    reconcile(setProjectedBudget, lastSeenProjBudget, alertsConfig.projected_budget_enabled ?? false);
+    reconcile(setProjectAlerts, lastSeenProjectAlerts, alertsConfig.project_alerts_enabled ?? false);
+    reconcile(setCodexBudgetAlerts, lastSeenCodexAlerts, alertsConfig.codex_budget_alerts_enabled ?? false);
+    reconcile(setCodexProjected, lastSeenCodexProj, alertsConfig.codex_projected_enabled ?? false);
+    reconcile(setNotifier, lastSeenNotifier, alertsConfig.notifier ?? 'auto');
   }, [
     alertsConfig.enabled,
     alertsConfig.projected_weekly_enabled,
@@ -217,18 +266,14 @@ export function SettingsOverlay() {
     alertsConfig.notifier,
   ]);
 
-  // cache-failure-markers spec §5 — re-seed the markers toggle on each SSE tick
-  // (same pattern as the TZ/alerts re-seed above): a server flip (CLI write /
-  // another tab's Save) flows through dashboard_prefs and repaints the toggle.
+  // #258 — guarded cache-markers re-seed (was: unconditional setCacheMarkers).
   useEffect(() => {
-    setCacheMarkers(markersEnabledServer);
+    reconcile(setCacheMarkers, lastSeenMarkers, markersEnabledServer);
   }, [markersEnabledServer]);
 
-  // live-tail spec §4.2 — re-seed the live-tail toggle on each SSE tick (same
-  // pattern as the markers re-seed above): a server flip (CLI write / another
-  // tab's Save) flows through dashboard_prefs and repaints the toggle.
+  // #258 — guarded live-tail re-seed (was: unconditional setLiveTail).
   useEffect(() => {
-    setLiveTail(liveTailServer);
+    reconcile(setLiveTail, lastSeenLiveTail, liveTailServer);
   }, [liveTailServer]);
 
   useKeymap([
@@ -272,7 +317,7 @@ export function SettingsOverlay() {
   // an uncommitted TZ or live-tail edit would resurface on reopen as a phantom
   // "Save · N changes" (#252 review).
   useEffect(() => {
-    if (open) {
+    if (open && !wasOpen.current) {
       setSort(prefs.sortDefault);
       setPerPage(prefs.sessionsPerPage);
       setFilter(filterTerm);
@@ -295,7 +340,20 @@ export function SettingsOverlay() {
       setResetTableSortStaged(false);
       setResetCardOrderStaged(false);
       setConfirmDiscard(false);
+      // #258 — re-baseline the last-seen refs to the current server values, so a
+      // stale local edit discarded here can be re-adopted by the next tick.
+      lastSeenTz.current = display.tz;
+      lastSeenAlertsEnabled.current = alertsConfig.enabled;
+      lastSeenProjWeekly.current = alertsConfig.projected_weekly_enabled ?? false;
+      lastSeenProjBudget.current = alertsConfig.projected_budget_enabled ?? false;
+      lastSeenProjectAlerts.current = alertsConfig.project_alerts_enabled ?? false;
+      lastSeenCodexAlerts.current = alertsConfig.codex_budget_alerts_enabled ?? false;
+      lastSeenCodexProj.current = alertsConfig.codex_projected_enabled ?? false;
+      lastSeenNotifier.current = alertsConfig.notifier ?? 'auto';
+      lastSeenMarkers.current = markersEnabledServer;
+      lastSeenLiveTail.current = liveTailServer;
     }
+    wasOpen.current = open;
   }, [
     open,
     prefs.sortDefault,
@@ -362,10 +420,7 @@ export function SettingsOverlay() {
 
   if (!open) return null;
 
-  const tzTargetValue =
-    tzMode === 'local' ? 'local'
-    : tzMode === 'utc' ? 'utc'
-    : tzCustom.trim();
+  const tzTargetValue = tzTarget;
   const tzCustomValid = tzMode !== 'custom' || isValidIANA(tzCustom.trim());
   const tzDirty = tzTargetValue !== display.tz;
   const alertsDirty = alertsEnabled !== alertsConfig.enabled;
