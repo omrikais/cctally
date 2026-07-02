@@ -1286,6 +1286,27 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 @media (max-width: 1024px) {
   .period-two-pane { grid-template-columns: minmax(0, 1fr); }
 }
+/* #264 S2 (ui-qa P2): at desktop widths where the two-pane is side-by-side,
+   pin the navigator + KeyHintFooter and let the TABLE pane scroll INTERNALLY,
+   so a full 12-week Weekly history fills the modal without pushing the whole
+   modal body into a scroll at a short viewport (e.g. 1440×900). `.modal-body`
+   becomes a flex column (nav auto · two-pane flex:1 · footer auto); the grid
+   panes stretch to the bounded two-pane height and scroll within. Gated to
+   ≥1025px — below that the two-pane is single-column and the modal keeps its
+   natural full-sheet scroll (fine on mobile). Scoped to `.modal-wide`
+   (Weekly/Monthly only); Daily and every other modal are untouched. */
+@media (min-width: 1025px) {
+  .modal-card.modal-wide .modal-body {
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  }
+  .modal-card.modal-wide .period-two-pane {
+    flex: 1 1 auto; min-height: 0; align-items: stretch;
+  }
+  .modal-card.modal-wide .period-two-pane > .period-detail-pane,
+  .modal-card.modal-wide .period-two-pane > .period-table-pane {
+    min-height: 0; overflow: auto;
+  }
+}
 /* Decorative drag-handle — shown only at the mobile breakpoint. */
 .modal-handle { display: none; }
 .modal-header {
