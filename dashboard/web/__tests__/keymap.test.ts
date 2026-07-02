@@ -191,29 +191,29 @@ describe('keymap dispatcher', () => {
 
   // S8 (#254): weekly/monthly/daily modal kinds are gone (one History modal
   // replaces them). These synthetic bindings just exercise the keymap dispatch
-  // for single-char keys, so they route to the current 'history' kind.
+  // for single-char keys, so they route to the current 'daily' kind.
   it('"5" dispatches a panel-open (history) via its registered binding', () => {
     registerKeymap([
-      { key: '5', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
+      { key: '5', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
     ]);
     keyDown('5');
-    expect(getState().openModal).toBe('history');
+    expect(getState().openModal).toBe('daily');
   });
 
   it('"6" dispatches a panel-open (history) via its registered binding', () => {
     registerKeymap([
-      { key: '6', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
+      { key: '6', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
     ]);
     keyDown('6');
-    expect(getState().openModal).toBe('history');
+    expect(getState().openModal).toBe('daily');
   });
 
   it('pressing 8 dispatches OPEN_MODAL { kind: "history" }', () => {
     registerKeymap([
-      { key: '8', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
+      { key: '8', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
     ]);
     keyDown('8');
-    expect(getState().openModal).toBe('history');
+    expect(getState().openModal).toBe('daily');
     expect(getState().openDailyDate).toBeNull();
   });
 

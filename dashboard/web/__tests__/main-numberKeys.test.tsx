@@ -17,8 +17,9 @@ beforeEach(() => {
   updateSnapshot(SNAP);
 });
 
-// Default grid order (#264 S1 bento): sessions(1), trend(2), projects(3),
-// history(4), cache-report(5), forecast(6), blocks(7), alerts(8).
+// Default grid order (#264 S2 bento): sessions(1), trend(2), projects(3),
+// daily(4), cache-report(5), weekly(6), monthly(7), forecast(8), blocks(9),
+// alerts(10 → key '0').
 describe('openPanelByPosition', () => {
   it('uses the registered openAction (Sessions at position 1 has a special opener that does NOT just OPEN_MODAL kind=session)', () => {
     // Sessions (position 1) uses openMostRecentSessionModal, which resolves a
@@ -46,9 +47,9 @@ describe('openPanelByPosition', () => {
     expect(getState().openModal).toBe('projects');
   });
 
-  it('opens the panel currently at position 4 (history in the default order)', () => {
+  it('opens the panel currently at position 4 (daily in the default order)', () => {
     openPanelByPosition(4);
-    expect(getState().openModal).toBe('history');
+    expect(getState().openModal).toBe('daily');
   });
 
   it('opens the panel currently at position 5 (cache-report in the default order)', () => {
@@ -56,8 +57,13 @@ describe('openPanelByPosition', () => {
     expect(getState().openModal).toBe('cache-report');
   });
 
-  it('opens the panel currently at position 6 (forecast in the default order)', () => {
+  it('opens the panel currently at position 6 (weekly in the default order)', () => {
     openPanelByPosition(6);
-    expect(getState().openModal).toBe('forecast');
+    expect(getState().openModal).toBe('weekly');
+  });
+
+  it('opens the panel currently at position 7 (monthly in the default order)', () => {
+    openPanelByPosition(7);
+    expect(getState().openModal).toBe('monthly');
   });
 });

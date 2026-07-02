@@ -25,13 +25,13 @@ async function open(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('<HelpOverlay /> reflects panelOrder', () => {
-  it('renders all 8 number keys with their default labels', async () => {
+  it('renders all 10 number keys with their default labels', async () => {
     const user = userEvent.setup();
     render(<HelpOverlay />);
     await open(user);
-    // S8 #254 — weekly/monthly/daily collapsed into the single 'History'
-    // card; the grid is now 8 labels (Cache Report at the tail).
-    for (const label of ['Forecast', 'Trend', 'Sessions', 'Projects', 'Blocks', 'History', 'Recent alerts', 'Cache Report']) {
+    // #264 S2 — the History card is split back into Daily/Weekly/Monthly, so
+    // the grid is 10 labels.
+    for (const label of ['Forecast', 'Trend', 'Sessions', 'Projects', 'Blocks', 'Daily', 'Weekly', 'Monthly', 'Recent alerts', 'Cache Report']) {
       expect(screen.getByText(`Open ${label} modal`)).toBeTruthy();
     }
   });

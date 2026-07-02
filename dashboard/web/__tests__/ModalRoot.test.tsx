@@ -39,12 +39,22 @@ describe('<ModalRoot />', () => {
     uninstallGlobalKeydown();
   });
 
-  it('renders the HistoryModal when openModal=history (S8 #254 — one modal replaces Daily/Weekly/Monthly)', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
-    render(<ModalRoot />);
-    // The consolidated History modal always renders its Day·Week·Month
-    // radiogroup toggle, whatever period/dataset is active.
-    expect(screen.getByRole('radiogroup', { name: /history period/i })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'Day' })).toBeInTheDocument();
+  it('routes openModal=daily/weekly/monthly to the split period modals, with no History toggle (#264 S2)', () => {
+    // #264 S2 un-merged the S8 History modal into three peer modals. Each kind
+    // renders a modal card, and the former Day·Week·Month radiogroup toggle is
+    // gone entirely (proving the toggle was removed, not just hidden).
+    dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
+    const { rerender } = render(<ModalRoot />);
+    expect(document.querySelector('.modal-card')).toBeTruthy();
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+
+    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    rerender(<ModalRoot />);
+    expect(document.querySelector('.modal-card')).toBeTruthy();
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+
+    dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
+    rerender(<ModalRoot />);
+    expect(document.querySelector('.modal-card')).toBeTruthy();
   });
 });

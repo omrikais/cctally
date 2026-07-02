@@ -48,18 +48,18 @@ describe('<PanelHost />', () => {
 
   it('Shift+ArrowDown swaps the panel with its next same-class card (height-class-aware)', async () => {
     const user = userEvent.setup();
-    // forecast sits at panelOrder index 5 (a short-row card) in the default
-    // bento order; pass that global index so SWAP operates on it.
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={5} />);
+    // forecast sits at panelOrder index 7 (a short-row card) in the #264 S2
+    // bento order (the medium row is now 4 cards); pass that global index.
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={7} />);
     // The wrapper carries the onKeyDown handler; focus the inner panel — the
     // keydown bubbles up to the wrapper.
     const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     inner.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
-    // #264 S1 — forecast (index 5, short) swaps with the NEXT SHORT card
-    // (blocks at index 6). So forecast lands at index 6 and blocks at index 5.
-    expect(getState().prefs.panelOrder[6]).toBe('forecast');
-    expect(getState().prefs.panelOrder[5]).toBe('blocks');
+    // #264 S2 — forecast (index 7, short) swaps with the NEXT SHORT card
+    // (blocks at index 8). So forecast lands at index 8 and blocks at index 7.
+    expect(getState().prefs.panelOrder[8]).toBe('forecast');
+    expect(getState().prefs.panelOrder[7]).toBe('blocks');
   });
 
   it('a quick click on the inner panel still opens its modal', async () => {

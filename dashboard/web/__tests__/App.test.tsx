@@ -33,7 +33,7 @@ describe('<App />', () => {
     expect(hostsIn(container, '.bento-row.row-tall'))
       .toEqual(['sessions', 'trend', 'projects']);
     expect(hostsIn(container, '.bento-row.row-medium'))
-      .toEqual(['history', 'cache-report']);
+      .toEqual(['daily', 'cache-report', 'weekly', 'monthly']);
     expect(hostsIn(container, '.bento-row.row-short'))
       .toEqual(['forecast', 'blocks', 'alerts']);
     // The three slices together cover the full default order exactly once.
@@ -53,7 +53,7 @@ describe('<App />', () => {
       .toEqual(['trend', 'projects', 'sessions']);
     // The medium and short rows keep their relative order.
     expect(hostsIn(container, '.bento-row.row-medium'))
-      .toEqual(['history', 'cache-report']);
+      .toEqual(['daily', 'cache-report', 'weekly', 'monthly']);
     expect(hostsIn(container, '.bento-row.row-short'))
       .toEqual(['forecast', 'blocks', 'alerts']);
   });

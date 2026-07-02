@@ -2,15 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { PANEL_REGISTRY, DEFAULT_PANEL_ORDER } from '../src/lib/panelRegistry';
 
 describe('panelRegistry', () => {
-  it('DEFAULT_PANEL_ORDER has all 8 grid ids in canonical bento order', () => {
-    // #264 S1 — the #248 two-tier order is replaced by the height-matched
-    // bento's left-to-right reading order: tall (sessions·trend·projects) →
-    // medium (history·cache-report) → short (forecast·blocks·alerts).
+  it('DEFAULT_PANEL_ORDER has all 10 grid ids in canonical bento order', () => {
+    // #264 S2 — the History card is split back into Daily/Weekly/Monthly. The
+    // bento reading order: tall (sessions·trend·projects) → medium 2×2
+    // (daily·cache-report / weekly·monthly) → short (forecast·blocks·alerts).
     // Existing users keep their persisted order (reconcile preserves
     // positions); only fresh/reset installs get this default.
     expect(DEFAULT_PANEL_ORDER).toEqual([
       'sessions', 'trend', 'projects',
-      'history', 'cache-report',
+      'daily', 'cache-report', 'weekly', 'monthly',
       'forecast', 'blocks', 'alerts',
     ]);
   });

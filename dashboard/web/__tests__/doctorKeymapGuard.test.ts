@@ -58,7 +58,7 @@ describe('doctor `d` keymap composite guard', () => {
   it('suppresses `d` while a panel modal is open (openModal !== null)', () => {
     const spy = vi.fn();
     registerDoctorBinding(spy);
-    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
     keyDown('d');
     expect(spy).not.toHaveBeenCalled();
   });
@@ -90,7 +90,7 @@ describe('doctor `d` keymap composite guard', () => {
   it('fires `d` after closing the panel modal that suppressed it', () => {
     const spy = vi.fn();
     registerDoctorBinding(spy);
-    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
     keyDown('d');
     expect(spy).not.toHaveBeenCalled();
     dispatch({ type: 'CLOSE_MODAL' });

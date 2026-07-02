@@ -157,7 +157,7 @@ describe('<ShareModalRoot>', () => {
     );
     // Stage the panel modal as "open" so it actually renders chrome.
     await act(async () => {
-      dispatch({ type: 'OPEN_MODAL', kind: 'history' });
+      dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
       dispatch(openShareModal('weekly', null));
     });
     // Sanity: share modal is open (dialog count = 2: one panel modal,

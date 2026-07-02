@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { _resetForTests, defaultPrefs, dispatch, getState } from './store';
 
-// S8 (#254) — the History modal's two persisted prefs:
-//   - historyPeriod: 'day' | 'week' | 'month' (default 'day'), set by
-//     SET_HISTORY_PERIOD, coerced on load (invalid → 'day').
+// S2 (#264) — the Day·Week·Month toggle (and its persisted `historyPeriod`
+// pref + SET_HISTORY_PERIOD action) are gone. The one surviving period pref is
+// the shared Weekly/Monthly table sort override:
 //   - historySortOverride: SortOverride | null (default null), routed by
 //     SET_TABLE_SORT { table: 'history' } and cleared by CLEAR_TABLE_SORTS,
-//     coerced on load via coerceSortOverride.
+//     coerced on load via coerceSortOverride. (The `history` name on the pref
+//     + sort key is retained — renaming it is churn for no behavior change.)
 const PREFS_KEY = 'ccusage.dashboard.prefs';
 
-describe('History modal prefs (historyPeriod + historySortOverride)', () => {
+describe('Weekly/Monthly table sort pref (historySortOverride)', () => {
   beforeEach(() => {
     localStorage.clear();
     _resetForTests();
@@ -19,33 +20,9 @@ describe('History modal prefs (historyPeriod + historySortOverride)', () => {
     _resetForTests();
   });
 
-  it('defaults historyPeriod to "day" and historySortOverride to null', () => {
-    expect(defaultPrefs().historyPeriod).toBe('day');
+  it('defaults historySortOverride to null', () => {
     expect(defaultPrefs().historySortOverride).toBeNull();
-    expect(getState().prefs.historyPeriod).toBe('day');
     expect(getState().prefs.historySortOverride).toBeNull();
-  });
-
-  it('SET_HISTORY_PERIOD persists the toggle', () => {
-    dispatch({ type: 'SET_HISTORY_PERIOD', period: 'week' });
-    expect(getState().prefs.historyPeriod).toBe('week');
-    dispatch({ type: 'SET_HISTORY_PERIOD', period: 'month' });
-    expect(getState().prefs.historyPeriod).toBe('month');
-  });
-
-  it('SET_HISTORY_PERIOD survives a reload (persisted to localStorage)', () => {
-    dispatch({ type: 'SET_HISTORY_PERIOD', period: 'week' });
-    _resetForTests(); // re-reads localStorage
-    expect(getState().prefs.historyPeriod).toBe('week');
-  });
-
-  it('load-coercion: an invalid persisted historyPeriod falls back to "day"', () => {
-    localStorage.setItem(
-      PREFS_KEY,
-      JSON.stringify({ ...defaultPrefs(), historyPeriod: 'decade' }),
-    );
-    _resetForTests();
-    expect(getState().prefs.historyPeriod).toBe('day');
   });
 
   it('SET_TABLE_SORT table:history sets historySortOverride', () => {
@@ -78,5 +55,17 @@ describe('History modal prefs (historyPeriod + historySortOverride)', () => {
     );
     _resetForTests();
     expect(getState().prefs.historySortOverride).toBeNull();
+  });
+
+  it('tolerates a stale retired historyPeriod key in saved prefs (never read)', () => {
+    // A user upgraded from S8 may carry a `historyPeriod` key. It rides along
+    // harmlessly — the Prefs type no longer declares it and nothing reads it.
+    localStorage.setItem(
+      PREFS_KEY,
+      JSON.stringify({ ...defaultPrefs(), historyPeriod: 'week' }),
+    );
+    _resetForTests();
+    expect(getState().prefs.historySortOverride).toBeNull();
+    expect((getState().prefs as unknown as Record<string, unknown>).historyPeriod).toBe('week');
   });
 });

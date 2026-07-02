@@ -431,22 +431,22 @@ describe('<SettingsOverlay />', () => {
     });
   });
 
-  // S8 (#254): the weekly/monthly/daily modal kinds collapsed into 'history';
+  // S8 (#254): the weekly/monthly/daily modal kinds collapsed into 'daily';
   // these synthetic digit bindings route to it. The test still proves the
   // Settings overlay swallows the digit while open and it fires once closed.
   it.each([
-    ['5', 'history' as const],
-    ['6', 'history' as const],
-    ['8', 'history' as const],
+    ['5', 'daily' as const],
+    ['6', 'daily' as const],
+    ['8', 'daily' as const],
   ])(
     'swallows "%s" while open so it does not stack the %s modal',
     async (key, kind) => {
       // Register the same global bindings main.tsx installs so the test
       // exercises the real precedence (modal-scope captures must beat them).
       registerKeymap([
-        { key: '5', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
-        { key: '6', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
-        { key: '8', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }) },
+        { key: '5', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
+        { key: '6', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
+        { key: '8', scope: 'global', action: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }) },
       ]);
       render(<SettingsOverlay />);
       const user = userEvent.setup();

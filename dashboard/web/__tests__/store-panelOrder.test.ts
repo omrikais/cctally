@@ -18,10 +18,9 @@ describe('Prefs.panelOrder', () => {
   });
 
   it('reads a previously-persisted custom order (post-migration schema)', () => {
-    // 8 entries — S8 #254 collapsed weekly/monthly/daily into 'history', so a
-    // v4-cursor saved order round-trips verbatim through the reconciler
-    // (missing ids would otherwise be appended).
-    const custom: PanelId[] = ['history', 'blocks', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
+    // 10 entries (all current grid cards) — a v5-cursor saved order round-trips
+    // verbatim through the reconciler (nothing missing → nothing appended).
+    const custom: PanelId[] = ['daily', 'blocks', 'projects', 'sessions', 'trend', 'weekly', 'monthly', 'forecast', 'alerts', 'cache-report'];
     localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
       sortDefault: 'started desc',
       sessionsPerPage: 100,
@@ -31,18 +30,19 @@ describe('Prefs.panelOrder', () => {
       panelOrder: custom,
       onboardingToastSeen: true,
       // Bump cursor to CURRENT so the saved order round-trips verbatim.
-      panelOrderSchemaVersion: 4,
+      panelOrderSchemaVersion: 5,
     }));
     const initial = loadInitialForTests();
     expect(initial.prefs.panelOrder).toEqual(custom);
     expect(initial.prefs.onboardingToastSeen).toBe(true);
   });
 
-  it('upgrades a v1 saved order: splices projects, drops current-week, collapses period tiles to history, appends cache-report', () => {
+  it('upgrades a v1 saved order: splices projects, drops current-week, un-collapses period tiles to daily/weekly/monthly, appends cache-report', () => {
     // v1 = no panelOrderSchemaVersion key, no 'projects', a 'current-week' the
-    // grid no longer carries (#248), and the weekly/monthly/daily tiles S8
-    // (#254) collapses into one 'history' card. The cumulative migration runs
-    // all steps; the reconciler appends cache-report (never in the v1 order).
+    // grid no longer carries (#248). The weekly/monthly/daily tiles S8 (#254)
+    // collapsed into one 'history' card, which #264 S2 un-collapses back to
+    // daily + weekly + monthly. The cumulative migration runs all steps; the
+    // reconciler appends cache-report (never in the v1 order).
     const v1Custom = [
       'daily', 'blocks', 'monthly', 'weekly',
       'sessions', 'trend', 'forecast', 'current-week', 'alerts',
@@ -54,18 +54,18 @@ describe('Prefs.panelOrder', () => {
     const initial = loadInitialForTests();
     const order = initial.prefs.panelOrder as unknown as string[];
     // Legacy ids gone; every modern grid id present exactly once.
-    for (const gone of ['current-week', 'weekly', 'monthly', 'daily']) {
+    for (const gone of ['current-week', 'history']) {
       expect(order).not.toContain(gone);
     }
-    for (const present of ['projects', 'history', 'cache-report']) {
+    for (const present of ['projects', 'daily', 'weekly', 'monthly', 'cache-report']) {
       expect(order).toContain(present);
     }
     expect(new Set(order)).toEqual(new Set(DEFAULT_PANEL_ORDER as unknown as string[]));
     expect(order).toHaveLength(DEFAULT_PANEL_ORDER.length);
-    expect(initial.prefs.panelOrderSchemaVersion).toBe(4);
+    expect(initial.prefs.panelOrderSchemaVersion).toBe(5);
     // Migration is persisted immediately so a refresh doesn't re-fire it.
     const raw = localStorage.getItem('ccusage.dashboard.prefs');
-    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(4);
+    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(5);
     expect(JSON.parse(raw!).panelOrder).not.toContain('current-week');
   });
 
@@ -83,8 +83,8 @@ describe('Prefs.panelOrder', () => {
 import { dispatch } from '../src/store/store';
 
 describe('REORDER_PANELS action', () => {
-  // Default bento order (#264 S1): sessions, trend, projects, history,
-  // cache-report, forecast, blocks, alerts.
+  // Default bento order (#264 S2): sessions, trend, projects, daily,
+  // cache-report, weekly, monthly, forecast, blocks, alerts.
   it('moves panel from index 0 to index 3', () => {
     dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
     const order = getState().prefs.panelOrder;
@@ -118,15 +118,15 @@ describe('REORDER_PANELS action', () => {
 });
 
 describe('SWAP_PANELS action (height-class-aware — #264 S1)', () => {
-  // Default bento order + rows:
-  //   0 sessions(tall)  1 trend(tall)  2 projects(tall)
-  //   3 history(medium) 4 cache-report(medium)
-  //   5 forecast(short) 6 blocks(short) 7 alerts(short)
+  // Default bento order + rows (#264 S2 — medium is a 4-card 2×2 row):
+  //   0 sessions(tall)   1 trend(tall)         2 projects(tall)
+  //   3 daily(medium)    4 cache-report(medium) 5 weekly(medium)  6 monthly(medium)
+  //   7 forecast(short)  8 blocks(short)        9 alerts(short)
   // Shift+Arrow keeps dispatching SWAP_PANELS{index, direction}; the reducer
   // moves the card to the previous/next id sharing its CARD_LAYOUT row
   // (skipping other classes), so a keyboard reorder can never cross classes.
   const TALL = ['sessions', 'trend', 'projects'];
-  const MEDIUM = ['history', 'cache-report'];
+  const MEDIUM = ['daily', 'cache-report', 'weekly', 'monthly'];
   const SHORT = ['forecast', 'blocks', 'alerts'];
 
   it('a tall card swaps with the next tall card (sessions → trend)', () => {
@@ -140,28 +140,45 @@ describe('SWAP_PANELS action (height-class-aware — #264 S1)', () => {
   });
 
   it('a short card swaps with the previous short card (blocks → forecast)', () => {
-    dispatch({ type: 'SWAP_PANELS', index: 6, direction: -1 });
+    // blocks is index 8, forecast index 7 (short row starts at 7 now).
+    dispatch({ type: 'SWAP_PANELS', index: 8, direction: -1 });
     const order = getState().prefs.panelOrder;
-    expect(order[5]).toBe('blocks');
-    expect(order[6]).toBe('forecast');
+    expect(order[7]).toBe('blocks');
+    expect(order[8]).toBe('forecast');
     // The tall row keeps its relative order.
     expect(order.filter((id) => TALL.includes(id))).toEqual(TALL);
   });
 
+  it('a medium card swaps linearly along the panelOrder subsequence, not geometrically (#264 S2 finding 5)', () => {
+    // Medium subsequence: daily(3) cache-report(4) weekly(5) monthly(6). In the
+    // visual 2×2 (daily|cache / weekly|monthly), weekly sits BELOW daily — but
+    // SWAP_PANELS is LINEAR over panelOrder, so Shift-down from daily steps to
+    // the next id in the subsequence (cache-report), NOT the geometric neighbor.
+    dispatch({ type: 'SWAP_PANELS', index: 3, direction: 1 });
+    const order = getState().prefs.panelOrder;
+    expect(order[3]).toBe('cache-report');
+    expect(order[4]).toBe('daily');
+    expect(order[5]).toBe('weekly');
+    expect(order[6]).toBe('monthly');
+    // Tall + short rows keep their relative order.
+    expect(order.filter((id) => TALL.includes(id))).toEqual(TALL);
+    expect(order.filter((id) => SHORT.includes(id))).toEqual(SHORT);
+  });
+
   it('skips an interleaved other-class card to reach the next same-class id', () => {
-    // Interleave a medium card between two tall cards: move history (index 3,
-    // medium) up to index 1 → [sessions, history, trend, projects, …].
+    // Interleave a medium card between two tall cards: move daily (index 3,
+    // medium) up to index 1 → [sessions, daily, trend, projects, …].
     dispatch({ type: 'REORDER_PANELS', from: 3, to: 1 });
     expect(getState().prefs.panelOrder.slice(0, 4))
-      .toEqual(['sessions', 'history', 'trend', 'projects']);
+      .toEqual(['sessions', 'daily', 'trend', 'projects']);
     // sessions (index 0, tall) + Shift-down: the next TALL is trend at index 2,
-    // skipping the intervening medium 'history' at index 1.
+    // skipping the intervening medium 'daily' at index 1.
     dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
     const order = getState().prefs.panelOrder;
     expect(order[0]).toBe('trend');
     expect(order[2]).toBe('sessions');
     // The medium card stayed put (only sessions↔trend swapped).
-    expect(order[1]).toBe('history');
+    expect(order[1]).toBe('daily');
   });
 
   it('is a no-op at the start (index=0, direction=-1)', () => {
@@ -230,7 +247,7 @@ describe('RESET_PREFS preserves onboardingToastSeen, resets panelOrder', () => {
 describe('drag preview lifecycle', () => {
   it('SET_DRAG_PREVIEW stores a preview order without touching prefs.panelOrder or localStorage', () => {
     const before = [...getState().prefs.panelOrder];
-    const preview: GridPanelId[] = ['history', 'blocks', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
+    const preview: GridPanelId[] = ['daily', 'blocks', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     expect(getState().dragPreviewOrder).toEqual(preview);
     expect(getState().prefs.panelOrder).toEqual(before);
@@ -243,7 +260,7 @@ describe('drag preview lifecycle', () => {
   });
 
   it('COMMIT_DRAG_PREVIEW promotes preview to prefs.panelOrder and persists', () => {
-    const preview: GridPanelId[] = ['forecast', 'cache-report', 'trend', 'sessions', 'projects', 'blocks', 'history', 'alerts'];
+    const preview: GridPanelId[] = ['forecast', 'cache-report', 'trend', 'sessions', 'projects', 'blocks', 'daily', 'alerts'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     dispatch({ type: 'COMMIT_DRAG_PREVIEW' });
     expect(getState().dragPreviewOrder).toBeNull();
@@ -262,7 +279,7 @@ describe('drag preview lifecycle', () => {
 
   it('CLEAR_DRAG_PREVIEW discards the preview without changing prefs', () => {
     const before = [...getState().prefs.panelOrder];
-    const preview: GridPanelId[] = ['history', 'blocks', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
+    const preview: GridPanelId[] = ['daily', 'blocks', 'projects', 'sessions', 'trend', 'forecast', 'alerts', 'cache-report'];
     dispatch({ type: 'SET_DRAG_PREVIEW', order: preview });
     dispatch({ type: 'CLEAR_DRAG_PREVIEW' });
     expect(getState().dragPreviewOrder).toBeNull();

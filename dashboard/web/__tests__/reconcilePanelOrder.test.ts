@@ -7,16 +7,17 @@ import {
 import { DEFAULT_PANEL_ORDER } from '../src/lib/panelIds';
 import type { PanelId } from '../src/lib/panelRegistry';
 
-// Legacy ids (current-week / weekly / monthly / daily) are no longer PanelId
-// members but may sit in a stale saved order; the migration must still
-// handle them. Type such fixtures as string[] and downcast at the call.
+// Legacy ids ('history' after the #264 S2 un-collapse; 'current-week' after
+// #248) may still sit in a stale saved order; the migration must handle them.
+// Type such fixtures as string[] and downcast at the call. The generic
+// reconcile tests below use 'daily' (a current PanelId) as a representative id.
 const asPanelIds = (a: string[]): PanelId[] => a as unknown as PanelId[];
 
 // A valid-current-PanelId canonical for the generic reconcile-algorithm
 // tests (they exercise the pure set operations, not the S8 ids specifically).
 const DEFAULT: PanelId[] = [
   'current-week', 'forecast', 'trend', 'sessions',
-  'projects', 'history', 'blocks', 'alerts',
+  'projects', 'daily', 'blocks', 'alerts',
 ];
 
 describe('reconcilePanelOrder', () => {
@@ -33,19 +34,19 @@ describe('reconcilePanelOrder', () => {
   });
 
   it('preserves a non-default-but-complete saved order', () => {
-    const saved: PanelId[] = ['history', 'blocks', 'alerts', 'projects', 'sessions', 'trend', 'forecast', 'current-week'];
+    const saved: PanelId[] = ['daily', 'blocks', 'alerts', 'projects', 'sessions', 'trend', 'forecast', 'current-week'];
     expect(reconcilePanelOrder(saved, DEFAULT)).toEqual(saved);
   });
 
   it('drops unknown ids that are not in canonical', () => {
-    const saved: PanelId[] = ['current-week', 'unknown' as PanelId, 'forecast', 'trend', 'sessions', 'projects', 'history', 'blocks', 'alerts'];
+    const saved: PanelId[] = ['current-week', 'unknown' as PanelId, 'forecast', 'trend', 'sessions', 'projects', 'daily', 'blocks', 'alerts'];
     expect(reconcilePanelOrder(saved, DEFAULT)).toEqual(DEFAULT);
   });
 
   it('appends canonical ids missing from saved at end (preserves saved relative order)', () => {
-    const saved: PanelId[] = ['history', 'blocks', 'forecast'];
+    const saved: PanelId[] = ['daily', 'blocks', 'forecast'];
     const result = reconcilePanelOrder(saved, DEFAULT);
-    expect(result.slice(0, 3)).toEqual(['history', 'blocks', 'forecast']);
+    expect(result.slice(0, 3)).toEqual(['daily', 'blocks', 'forecast']);
     expect(result.slice(3)).toEqual(['current-week', 'trend', 'sessions', 'projects', 'alerts']);
   });
 
