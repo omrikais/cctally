@@ -1,6 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import { fmt } from './fmt';
 
+describe('fmt.usd0 (#264 S1 — whole-dollar hero)', () => {
+  it('rounds to whole dollars with a leading $', () => {
+    expect(fmt.usd0(254.27)).toBe('$254');
+    expect(fmt.usd0(254.6)).toBe('$255');
+    expect(fmt.usd0(0)).toBe('$0');
+  });
+  it('renders an em-dash for null/undefined (never NaN or a bare $)', () => {
+    expect(fmt.usd0(null)).toBe('—');
+    expect(fmt.usd0(undefined)).toBe('—');
+  });
+});
+
 describe('fmt.durationMs', () => {
   it('formats sub-minute as X.Xs', () => {
     expect(fmt.durationMs(10668)).toBe('10.7s');

@@ -215,6 +215,12 @@ export const fmt = {
   usd2(v: number | null | undefined): string {
     return v == null ? '—' : `$${(+v).toFixed(2)}`;
   },
+  // #264 S1 — whole-dollar money hero (the hero's "SPENT THIS WEEK" number
+  // reads "$254", low-noise, while the $/1% sub keeps 2dp via usd2). Guards
+  // null → "—" so a missing spend never renders "$NaN" or a bare "$".
+  usd0(v: number | null | undefined): string {
+    return v == null ? '—' : `$${Math.round(+v)}`;
+  },
   // "+$1.20" / "−$0.42" — signed USD with Unicode U+2212 minus on
   // negatives, matching the dashboard's typographic standard
   // (see `delta` / `deltaPct` / `pp`).
