@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Modal } from './Modal';
 import { PeriodDetailCard } from './PeriodDetailCard';
 import { PeriodTable } from './PeriodTable';
+import { keyOf } from './periodNav';
 import { ShareIcon } from '../components/ShareIcon';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { registerKeymap } from '../store/keymap';
@@ -54,6 +55,14 @@ export function WeeklyModal() {
   }
 
   const row = rows[Math.min(selectedIndex, rowCount - 1)];
+  // S8: PeriodTable is now key-based. This modal keeps its index-based
+  // state + ↑/↓ keymap; adapt at the boundary (index ↔ key). Removed
+  // wholesale in Milestone B when HistoryModal supersedes it.
+  const selectedKey = row ? keyOf(row, 'week') : null;
+  const onSelectKey = (key: string): void => {
+    const i = rows.findIndex((r) => keyOf(r, 'week') === key);
+    if (i >= 0) setSelectedIndex(i);
+  };
 
   return (
     <Modal
@@ -66,8 +75,8 @@ export function WeeklyModal() {
         rows={rows}
         variant="weekly"
         accentClass="accent-cyan"
-        selectedIndex={selectedIndex}
-        onSelect={setSelectedIndex}
+        selectedKey={selectedKey}
+        onSelect={onSelectKey}
       />
     </Modal>
   );
