@@ -89,8 +89,16 @@ describe('panel-order migration (cumulative → v4)', () => {
     expect(out).not.toContain('monthly');
     expect(out).not.toContain('daily');
     expect(out.filter((p) => p === 'history')).toHaveLength(1);
-    // Exactly the canonical default order (history spliced at index 5).
-    expect(out).toEqual([...DEFAULT_PANEL_ORDER] as unknown as string[]);
+    // The migration preserves the saved within-class order and splices
+    // 'history' at HISTORY_INSERT_INDEX (5). Since #264 S1 the bento is
+    // order-independent (each card's row + span is static per id), so the
+    // migration deliberately does NOT reproduce the new bento
+    // DEFAULT_PANEL_ORDER — reconcile keeps this legacy permutation and the
+    // board still renders every card in its correct row at its correct span.
+    expect(out).toEqual([
+      'forecast', 'trend', 'sessions', 'projects',
+      'blocks', 'history', 'alerts', 'cache-report',
+    ]);
   });
 
   it('does not duplicate history when a v3 order already contains it', () => {

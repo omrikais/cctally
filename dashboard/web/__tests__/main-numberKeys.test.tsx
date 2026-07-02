@@ -17,13 +17,22 @@ beforeEach(() => {
   updateSnapshot(SNAP);
 });
 
-// Default grid order (S8 #254 — weekly/monthly/daily collapsed to history):
-// forecast(1), trend(2), sessions(3), projects(4), blocks(5), history(6),
-// alerts(7), cache-report(8).
+// Default grid order (#264 S1 bento): sessions(1), trend(2), projects(3),
+// history(4), cache-report(5), forecast(6), blocks(7), alerts(8).
 describe('openPanelByPosition', () => {
-  it('opens the panel currently at position 1 (1-indexed)', () => {
+  it('uses the registered openAction (Sessions at position 1 has a special opener that does NOT just OPEN_MODAL kind=session)', () => {
+    // Sessions (position 1) uses openMostRecentSessionModal, which resolves a
+    // session id from the snapshot before dispatching. The seeded snapshot has
+    // EMPTY sessions, so there's no id to resolve and the opener is a safe
+    // no-op (openModal stays null). The point is no crash — and that the
+    // registered openAction is used, not a bare OPEN_MODAL kind=session.
     openPanelByPosition(1);
-    expect(getState().openModal).toBe('forecast');
+    expect(getState().openModal).toBeNull();
+  });
+
+  it('opens the panel currently at position 2 (trend)', () => {
+    openPanelByPosition(2);
+    expect(getState().openModal).toBe('trend');
   });
 
   it('follows the saved order — after a reorder, position 1 opens the new occupant', () => {
@@ -32,28 +41,23 @@ describe('openPanelByPosition', () => {
     expect(getState().openModal).toBe('trend');
   });
 
-  it('uses the registered openAction (Sessions has a special opener that does NOT just OPEN_MODAL kind=session)', () => {
-    // Sessions panel registry uses openMostRecentSessionModal which still
-    // dispatches OPEN_MODAL kind=session, but only after resolving an id
-    // from the current snapshot. The seeded snapshot has EMPTY sessions, so
-    // there's no id to resolve and the opener is a safe no-op (openModal
-    // stays null). The point is no crash. Sessions is position 3 now.
+  it('opens the projects panel at position 3 in the default order', () => {
     openPanelByPosition(3);
-    expect(getState().openModal).toBeNull();
+    expect(getState().openModal).toBe('projects');
   });
 
-  it('opens the panel currently at position 6 (history in the default order)', () => {
-    openPanelByPosition(6);
+  it('opens the panel currently at position 4 (history in the default order)', () => {
+    openPanelByPosition(4);
     expect(getState().openModal).toBe('history');
   });
 
-  it('opens the panel currently at position 8 (cache-report in the default order)', () => {
-    openPanelByPosition(8);
+  it('opens the panel currently at position 5 (cache-report in the default order)', () => {
+    openPanelByPosition(5);
     expect(getState().openModal).toBe('cache-report');
   });
 
-  it('opens the projects panel at position 4 in the default order', () => {
-    openPanelByPosition(4);
-    expect(getState().openModal).toBe('projects');
+  it('opens the panel currently at position 6 (forecast in the default order)', () => {
+    openPanelByPosition(6);
+    expect(getState().openModal).toBe('forecast');
   });
 });
