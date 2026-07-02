@@ -137,7 +137,9 @@ html, body {
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
-body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto; }
+/* #264 S1: fluid to 2100px — extra width buys bento density, not side-margin
+   (fixes the ~320px dead margins the old 1600px cap left at 1920). */
+body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto; }
 * { box-sizing: border-box; }
 
 /* Utility — referenced from dashboard.html for secondary / parenthetical text. */
@@ -326,37 +328,61 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .hero-metric-val.is-warn { color: var(--accent-amber); }
 .hero-metric-val.is-over { color: var(--accent-red); }
 
-/* -------- Two-tier grid of panels (#248 §2) -------- */
-/* The flat forced 2-column `.grid` is replaced by a two-tier model: a packed
-   strip of uniform compact summary TILES (auto-fit) above a stacked strip of
-   full-width content-height WIDE data cards. App partitions prefs.panelOrder by
-   CARD_TIER and renders the two strips inside one `.dash-grid` wrapper (which
-   also carries the stale-dim class). This kills the old grid's dead space: the
-   tile strip packs ~5-up wide / 3-4-up at ~1024-1280 / 1-up mobile with equal
-   heights (no padding voids), and wide cards get the full width (no pairing
-   gaps). The old `@media (max-width:1100px)` single-column cliff is gone —
-   auto-fit reflows continuously. body keeps its max-width:1600px cap. */
+/* -------- Bento board (#264 S1) -------- */
+/* The #248 two-tier tile/wide model is replaced by a height-matched 12-col
+   bento. App partitions prefs.panelOrder into three height-class rows
+   (tall/medium/short) by CARD_LAYOUT and renders three PanelGridDnd instances
+   inside one `.dash-grid` wrapper (which also carries the stale-dim class).
+   Mobile-first: each row is a single column; the desktop media block promotes
+   it to a 12-col grid with per-card spans + fixed row heights, so <900px
+   naturally stacks 1-up (no inline-style override to fight). Because cards
+   share a row only with equal-height cards, a wide card can never strand a
+   small tile beside it. */
 .dash-grid {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
   margin-bottom: var(--space-4);
 }
-.tile-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: var(--space-4);
-}
-.wide-strip {
+.bento-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
 }
-/* Grid cards content-size (#248): drop the global .panel 320px floor for grid
-   cards, then give tiles a modest uniform floor. Tiles in one auto-fit row
-   stretch to the tallest (grid align-items:stretch), so the row stays even. */
-.dash-grid .panel { min-height: 0; }
-.tile-strip .panel { min-height: 150px; }
+/* Flex chain (Codex finding 3): min-height:0 through panel-host → panel →
+   panel-body so a fixed-height bento card sizes its scrollable body within the
+   card (the .panel-body--scroll 420px ceiling becomes non-binding) instead of
+   overflowing the row. Drops the old global .panel 320px floor for grid cards. */
+.dash-grid .panel { min-height: 0; height: 100%; }
+.dash-grid .panel .panel-body { min-height: 0; }
+
+@media (min-width: 900px) {
+  .bento-row { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  /* Row heights are targets, finalized at the ui-qa gate against real content.
+     Short grows to fit Blocks (its height-setter); Forecast/Alerts stretch to
+     match via the grid's align-items:stretch default. */
+  .bento-row.row-tall   { grid-auto-rows: 296px; }
+  .bento-row.row-medium { grid-auto-rows: 196px; }
+  .bento-row.row-short  { grid-auto-rows: minmax(140px, auto); }
+  .bento-row .panel-host { min-height: 0; height: 100%; }
+  .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
+  .bento-row .panel-host[data-span="4"] { grid-column: span 4; }
+  .bento-row .panel-host[data-span="6"] { grid-column: span 6; }
+  .bento-row .panel-host[data-span="8"] { grid-column: span 8; }
+}
+
+/* #264 S1: History (the Daily heatmap) re-homes into the bento medium row.
+   Make its body a flex column and let the calendar grid grow with flexible
+   cell rows (GitHub-contribution-graph style) so it fills the card height and
+   reads at-a-glance instead of overflowing into a scroll viewport. Scoped to
+   the History card body (id) + a bento row so the History MODAL and other
+   panels are untouched. Medium-row height is finalized at the ui-qa gate. */
+.bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
+.bento-row #panel-daily-body .daily-cal-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-auto-rows: minmax(0, 1fr);
+}
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
 /* Brand cluster: "cctally vX.Y.Z [↑ vA.B.C]" sits at the start of the
@@ -665,9 +691,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   display: flex;
   flex-direction: column;
   min-height: 320px;
-  /* Pair with the `.tile-strip` / `.wide-strip` grid tracks (minmax(0,1fr)):
-     without min-width:0 the panel inherits its content's min-content
-     and inflates the grid column past its allotted width. */
+  /* Pair with the `.bento-row` grid tracks (minmax(0,1fr)): without
+     min-width:0 the panel inherits its content's min-content and inflates
+     the grid column past its allotted span. */
   min-width: 0;
   transition: box-shadow 120ms ease;
 }
@@ -2955,7 +2981,7 @@ mark.current {
 /* -------- Card reordering -------- */
 
 /* PanelHost is a wrapper around each .panel; it must NOT introduce extra
-   spacing because the .tile-strip / .wide-strip `gap` already controls layout. dnd-kit's
+   spacing because the `.bento-row` `gap` already controls layout. dnd-kit's
    useSortable manages the inline transform/transition for both the dragged
    card (follows the pointer) and the siblings (FLIP-animate to new slots). */
 .panel-host {
@@ -3792,12 +3818,11 @@ mark.current {
      The base .panel{min-height:320px} precedes this block, so this same-
      specificity rule wins by source order — no #root prefix needed. */
   .panel { min-height: 0; }
-  /* #248: the desktop `.tile-strip .panel { min-height: 150px }` (0,2,0)
-     out-specifies the `.panel` rule above (0,1,0), so phones would keep the
-     150px floor and reintroduce dead-space. Re-assert at equal (0,2,0)
-     specificity, later in source, so mobile tiles size to content (1-up
-     stacked needs no uniform height). */
-  .tile-strip .panel { min-height: 0; }
+  /* #264 S1: the desktop bento's per-row fixed heights only apply in the
+     @media(min-width:900px) block; below that each `.bento-row` is a 1-col
+     stack of content-height cards, and `.dash-grid .panel { min-height: 0 }`
+     (base, 0,2,0) already removes the old tile floor at every width — so no
+     mobile-specific grid-panel floor override is needed here. */
 
   /* #214 M3-2: keep panel headers on one line at phone width.
      Font-shrink does the real work; the ellipsis guard + the nested
