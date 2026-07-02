@@ -26,7 +26,7 @@ import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
-import { SyncChip } from '../components/SyncChip';
+import { KeyHintFooter } from '../components/KeyHintFooter';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -484,23 +484,17 @@ export function ProjectsModal() {
           <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
         )}
 
-        <div
+        <KeyHintFooter
           className="projects-modal-footer-hint"
           data-testid="projects-modal-footer-hint"
-          aria-live="off"
-        >
-          <span><kbd>1</kbd>/<kbd>4</kbd>/<kbd>8</kbd>/<kbd>0</kbd> window</span>
-          <span className="sep" aria-hidden="true">·</span>
-          <span><kbd>↑↓</kbd> row</span>
-          <span className="sep" aria-hidden="true">·</span>
-          <span><kbd>Enter</kbd> drill</span>
-          <span className="sep" aria-hidden="true">·</span>
-          <span><kbd>s</kbd> share/$</span>
-          <span className="sep" aria-hidden="true">·</span>
-          <span><kbd>Esc</kbd> close</span>
-          <span className="sep" aria-hidden="true">·</span>
-          <SyncChip />
-        </div>
+          hints={[
+            { keys: <><kbd>1</kbd>/<kbd>4</kbd>/<kbd>8</kbd>/<kbd>0</kbd></>, label: 'window' },
+            { keys: <kbd>↑↓</kbd>, label: 'row' },
+            { keys: <kbd>Enter</kbd>, label: 'drill' },
+            { keys: <kbd>s</kbd>, label: 'share/$' },
+            { keys: <kbd>Esc</kbd>, label: 'close' },
+          ]}
+        />
       </div>
     </Modal>
   );
