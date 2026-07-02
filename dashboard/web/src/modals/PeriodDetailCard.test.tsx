@@ -22,8 +22,12 @@ describe('PeriodDetailCard', () => {
     render(<PeriodDetailCard row={periodRow()} variant="weekly" accentClass="accent-cyan" />);
     const rows = document.querySelectorAll('.drill-bar-row');
     expect(rows).toHaveLength(2);
-    expect(screen.getByText('claude-opus-4-8')).toBeInTheDocument();
-    expect(screen.getByText('claude-haiku-4-5')).toBeInTheDocument();
+    // Chip text is the friendly `display` name (not the raw canonical id),
+    // so a dated id doesn't overflow the 110px chip column and the card
+    // stays consistent with the table's short family key.
+    expect(screen.getByText('opus-4-8')).toBeInTheDocument();
+    expect(screen.getByText('haiku-4-5')).toBeInTheDocument();
+    expect(screen.queryByText('claude-opus-4-8')).toBeNull();
     // The former thin .model-stack bar is gone (swapped for ModelCostBars).
     expect(document.querySelector('.model-stack')).toBeNull();
   });

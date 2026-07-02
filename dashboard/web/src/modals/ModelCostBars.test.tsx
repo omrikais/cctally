@@ -27,4 +27,16 @@ describe('ModelCostBars', () => {
     const bar = document.querySelector('.drill-bar') as HTMLElement;
     expect(bar.style.getPropertyValue('--w')).toBe('0%');
   });
+
+  it('renders the friendly label as chip text when provided, falling back to the raw model id', () => {
+    render(<ModelCostBars rows={[
+      { model: 'claude-opus-4-5-20251101', cost_usd: 10, label: 'opus-4-5' },
+      { model: 'claude-haiku-4-5', cost_usd: 5 },
+    ]} />);
+    // labelled row shows the friendly text, not the dated canonical id
+    expect(screen.getByText('opus-4-5')).toBeInTheDocument();
+    expect(screen.queryByText('claude-opus-4-5-20251101')).toBeNull();
+    // unlabelled row falls back to the raw model id
+    expect(screen.getByText('claude-haiku-4-5')).toBeInTheDocument();
+  });
 });

@@ -47,7 +47,7 @@ export function PeriodDetailCard({ row, variant, accentClass }: Props) {
           Subscription window: {fmtSubscriptionWindow(row.week_start_at, row.week_end_at)}
         </div>
       )}
-      <ModelCostBars rows={row.models} />
+      <ModelCostBars rows={row.models.map((m) => ({ model: m.model, cost_usd: m.cost_usd, label: m.display }))} />
 
       <div className="tokens-row">
         <div className="t"><span className="k">Input</span><span className="v">{fmt.compact(row.input_tokens)}</span></div>
