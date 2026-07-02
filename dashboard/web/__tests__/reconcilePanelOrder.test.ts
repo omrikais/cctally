@@ -72,67 +72,66 @@ describe('reconcilePanelOrder', () => {
 // collapses 'weekly'/'monthly'/'daily' into ONE 'history' card at its
 // canonical index. The store loader runs this BEFORE `reconcilePanelOrder`.
 
-describe('panel-order migration (cumulative → v4)', () => {
-  it('current schema version is 4 (S8 #254)', () => {
-    expect(CURRENT_PANEL_ORDER_SCHEMA_VERSION).toBe(4);
+describe('panel-order migration (cumulative → v5)', () => {
+  it('current schema version is 5 (S2 #264)', () => {
+    expect(CURRENT_PANEL_ORDER_SCHEMA_VERSION).toBe(5);
   });
 
-  it('v3→v4 collapses weekly/monthly/daily into ONE history at its canonical index', () => {
+  it('a v3 order flows through the v3→v4 collapse then the v4→v5 un-collapse', () => {
     const OLD_V3 = [
       'forecast', 'trend', 'sessions', 'projects',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts', 'cache-report',
     ];
     const r = applyPanelOrderMigration(asPanelIds(OLD_V3), 3);
     const out = r.panels as unknown as string[];
-    expect(r.newVersion).toBe(4);
-    expect(out).not.toContain('weekly');
-    expect(out).not.toContain('monthly');
-    expect(out).not.toContain('daily');
-    expect(out.filter((p) => p === 'history')).toHaveLength(1);
-    // The migration preserves the saved within-class order and splices
-    // 'history' at HISTORY_INSERT_INDEX (5). Since #264 S1 the bento is
-    // order-independent (each card's row + span is static per id), so the
-    // migration deliberately does NOT reproduce the new bento
-    // DEFAULT_PANEL_ORDER — reconcile keeps this legacy permutation and the
-    // board still renders every card in its correct row at its correct span.
+    expect(r.newVersion).toBe(5);
+    // v3→v4 collapses weekly/monthly/daily into 'history' at index 5; v4→v5
+    // renames it to 'daily' and re-adds the weekly/monthly pair after
+    // cache-report (which sits at the tail of this legacy permutation).
+    expect(out).not.toContain('history');
+    expect(out.filter((p) => p === 'daily')).toHaveLength(1);
     expect(out).toEqual([
       'forecast', 'trend', 'sessions', 'projects',
-      'blocks', 'history', 'alerts', 'cache-report',
+      'blocks', 'daily', 'alerts', 'cache-report', 'weekly', 'monthly',
     ]);
   });
 
-  it('does not duplicate history when a v3 order already contains it', () => {
+  it('does not duplicate daily when a v3 order already contains history', () => {
     const r = applyPanelOrderMigration(asPanelIds(['forecast', 'history', 'trend']), 3);
-    expect((r.panels as unknown as string[]).filter((p) => p === 'history')).toHaveLength(1);
+    const out = r.panels as unknown as string[];
+    expect(out.filter((p) => p === 'daily')).toHaveLength(1);
+    expect(out).not.toContain('history');
+    // weekly/monthly reinstated right after the renamed daily.
+    expect(out).toEqual(['forecast', 'daily', 'weekly', 'monthly', 'trend']);
   });
 
-  it('a full v1 user is migrated: projects splice + current-week drop + history collapse', () => {
+  it('a full v1 user is migrated: projects splice + current-week drop + history un-collapse', () => {
     const v1 = [
       'current-week', 'forecast', 'trend', 'sessions',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
     ];
     const r = applyPanelOrderMigration(asPanelIds(v1), 1);
     const out = r.panels as unknown as string[];
-    expect(r.newVersion).toBe(4);
+    expect(r.newVersion).toBe(5);
     expect(out).not.toContain('current-week');
-    expect(out).not.toContain('weekly');
-    expect(out).not.toContain('monthly');
-    expect(out).not.toContain('daily');
+    expect(out).not.toContain('history');
     expect(out).toContain('projects');
-    expect(out).toContain('history');
+    expect(out).toContain('daily');
+    expect(out).toContain('weekly');
+    expect(out).toContain('monthly');
   });
 
-  it('is idempotent — no change when version is already 4', () => {
+  it('is idempotent — no change when version is already 5', () => {
     const saved = [...DEFAULT_PANEL_ORDER];
-    const out = applyPanelOrderMigration(saved, 4);
+    const out = applyPanelOrderMigration(saved, 5);
     expect(out.panels).toEqual(DEFAULT_PANEL_ORDER);
-    expect(out.newVersion).toBe(4);
+    expect(out.newVersion).toBe(5);
   });
 
   it('returns empty when saved is null/empty (cursor still advances)', () => {
     const out = applyPanelOrderMigration(null, 1);
     expect(out.panels).toEqual([]);
-    expect(out.newVersion).toBe(4);
+    expect(out.newVersion).toBe(5);
   });
 
   it('migration → reconcile composition lands a complete default-order set', () => {
@@ -145,5 +144,54 @@ describe('panel-order migration (cumulative → v4)', () => {
     expect(final).not.toContain('current-week' as never);
     expect(new Set(final)).toEqual(new Set(DEFAULT_PANEL_ORDER));
     expect(final.length).toBe(DEFAULT_PANEL_ORDER.length);
+  });
+});
+
+describe('v4→v5 period un-collapse (#264 S2)', () => {
+  it('CURRENT_PANEL_ORDER_SCHEMA_VERSION is 5', () => {
+    expect(CURRENT_PANEL_ORDER_SCHEMA_VERSION).toBe(5);
+  });
+
+  it('renames a saved history→daily and inserts weekly,monthly after cache-report', () => {
+    const saved = ['sessions', 'trend', 'projects', 'history', 'cache-report', 'forecast', 'blocks', 'alerts'];
+    const { panels, newVersion } = applyPanelOrderMigration(saved as any, 4);
+    expect(newVersion).toBe(5);
+    expect(panels).toEqual([
+      'sessions', 'trend', 'projects',
+      'daily', 'cache-report', 'weekly', 'monthly',
+      'forecast', 'blocks', 'alerts',
+    ]);
+  });
+
+  it('inserts after daily when cache-report is absent', () => {
+    const { panels } = applyPanelOrderMigration(['history', 'forecast'] as any, 4);
+    expect(panels).toEqual(['daily', 'weekly', 'monthly', 'forecast']);
+  });
+
+  it('does not duplicate weekly/monthly already present, keeps weekly before monthly', () => {
+    const { panels } = applyPanelOrderMigration(['daily', 'cache-report', 'monthly'] as any, 4);
+    // weekly missing → inserted after cache-report; monthly already present → not re-added
+    expect(panels.filter((p) => p === 'monthly')).toHaveLength(1);
+    expect(panels.filter((p) => p === 'weekly')).toHaveLength(1);
+    expect(panels.indexOf('weekly')).toBeLessThan(panels.indexOf('monthly'));
+  });
+
+  it('migrates a stale v3 order (weekly/monthly/daily tiles) all the way to v5', () => {
+    const saved = ['sessions', 'weekly', 'monthly', 'daily', 'cache-report'];
+    const { panels, newVersion } = applyPanelOrderMigration(saved as any, 3);
+    expect(newVersion).toBe(5);
+    // v3→v4 collapses the three tiles into 'history' at index 5 (clamped), v4→v5
+    // renames it to 'daily' and re-adds weekly/monthly after cache-report.
+    expect(panels).toContain('daily');
+    expect(panels).toContain('weekly');
+    expect(panels).toContain('monthly');
+    expect(panels).not.toContain('history');
+  });
+
+  it('is idempotent for a v5 order', () => {
+    const saved = ['daily', 'cache-report', 'weekly', 'monthly'];
+    const { panels, newVersion } = applyPanelOrderMigration(saved as any, 5);
+    expect(newVersion).toBe(5);
+    expect(panels).toEqual(saved);
   });
 });

@@ -15,7 +15,9 @@ import type { PanelId, GridPanelId } from './panelIds';
 //   3 → (#248) 'current-week' removed from the grid (it is the HeroStrip).
 //   4 → (#254 S8) 'weekly'/'monthly'/'daily' collapsed into one 'history'
 //       card at its canonical index.
-export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 4;
+//   5 → (#264 S2) 'history' renamed to 'daily'; 'weekly'+'monthly' reinstated
+//       as an ordered pair right after 'cache-report'.
+export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 5;
 // Canonical position of 'projects' in DEFAULT_PANEL_ORDER (spec §2.1).
 const PROJECTS_INSERT_INDEX = 4;
 // Canonical position of 'history' in DEFAULT_PANEL_ORDER (S8 #254).
@@ -46,6 +48,10 @@ export interface MigrationResult {
  *     'history' card at its canonical index (not a bare append), so a saved
  *     order carrying the three legacy tiles migrates to the single card in
  *     the right position and the advanced version is written back.
+ *   • v4→v5 (#264 S2): un-collapse — rename a saved 'history' back to
+ *     'daily' and reinstate the ordered pair 'weekly'+'monthly' right after
+ *     'cache-report' (or after 'daily' if cache-report is absent), guarded
+ *     like the splices above so neither id is duplicated or reversed.
  *
  * Idempotent: callers already on CURRENT get their input back unchanged
  * (typed to GridPanelId — a current-cursor user can't carry 'current-week'
@@ -80,6 +86,26 @@ export function applyPanelOrderMigration(
     // reconcile backstop fills the full canonical default (history included).
     if (panels.length > 0 && !panels.includes('history')) {
       panels.splice(Math.min(HISTORY_INSERT_INDEX, panels.length), 0, 'history');
+    }
+  }
+  // v4 → v5 (#264 S2): un-collapse — rename a saved 'history' back to 'daily'
+  // and reinstate 'weekly'+'monthly' as an ORDERED PAIR right after
+  // 'cache-report' (or after 'daily' if cache-report is absent). Guarded like
+  // the splices above: only within a non-empty saved order, skip any id already
+  // present, preserve weekly-before-monthly. reconcilePanelOrder backstops gaps.
+  if (currentVersion < 5) {
+    panels = panels.map((id) => (id === 'history' ? 'daily' : id));
+    if (panels.length > 0) {
+      const anchor = panels.includes('cache-report')
+        ? panels.indexOf('cache-report')
+        : panels.indexOf('daily');
+      let insertAt = anchor >= 0 ? anchor + 1 : panels.length;
+      for (const id of ['weekly', 'monthly'] as const) {
+        if (!panels.includes(id)) {
+          panels.splice(insertAt, 0, id);
+          insertAt += 1;
+        }
+      }
     }
   }
   return { panels: panels as unknown as GridPanelId[], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
