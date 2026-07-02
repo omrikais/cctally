@@ -4,6 +4,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
+import { humanizeAge } from '../lib/syncFreshness';
 import { dispatch } from '../store/store';
 
 // HeroStrip (#248, spec §1) — the dashboard's full-width at-a-glance hero. It
@@ -105,7 +106,9 @@ export function HeroStrip() {
             {freshness.label === 'stale' ? '⚠ ' : ''}
             as of {formatHHMMSS(freshness.captured_at) ?? freshness.captured_at}
             {' · '}
-            {freshness.age_seconds}s ago
+            {/* #259 — humanize the raw-seconds age ("97928s ago" → "1d 3h ago")
+                so this pill reads consistently with the humanized sync chip. */}
+            {humanizeAge(freshness.age_seconds)}
           </span>
         )}
       </div>

@@ -16,6 +16,13 @@ describe('humanizeAge', () => {
     expect(humanizeAge(3600)).toBe('1h ago');       // exact hour drops 0m
     expect(humanizeAge(3720)).toBe('1h 2m ago');
     expect(humanizeAge(7260)).toBe('2h 1m ago');
+    expect(humanizeAge(86399)).toBe('23h 59m ago'); // last second before the days tier
+  });
+  it('formats days and hours (#259 — >24h idle surfaces)', () => {
+    expect(humanizeAge(86400)).toBe('1d ago');       // exact day drops 0h
+    expect(humanizeAge(90000)).toBe('1d 1h ago');    // 25h
+    expect(humanizeAge(97928)).toBe('1d 3h ago');    // ~27h — the reported case
+    expect(humanizeAge(266400)).toBe('3d 2h ago');   // minutes elided at this magnitude
   });
   it('clamps negative / NaN to 0s', () => {
     expect(humanizeAge(-5)).toBe('0s ago');

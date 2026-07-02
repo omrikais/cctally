@@ -103,6 +103,20 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip?.textContent).toContain('⚠');
   });
 
+  it('humanizes the freshness age on the "as of" pill (#259)', () => {
+    const env = heroEnvelope();
+    // ~27h old — the reported case that previously rendered raw "97928s ago".
+    env.current_week!.freshness = {
+      label: 'stale', captured_at: '2026-06-29T06:47:52Z', age_seconds: 97928,
+    };
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const chip = container.querySelector('[data-freshness="stale"]') as HTMLElement;
+    expect(chip.textContent).toContain('1d 3h ago');
+    expect(chip.textContent).not.toContain('97928s ago');
+  });
+
   it('localizes the freshness tooltip (SH-1)', () => {
     const env = heroEnvelope();
     env.current_week!.freshness = {

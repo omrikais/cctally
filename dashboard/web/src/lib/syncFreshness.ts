@@ -22,9 +22,19 @@ export function humanizeAge(ageS: number): string {
   const s = safeAge(ageS);
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return m === 0 ? `${h}h ago` : `${h}h ${m}m ago`;
+  if (s < 86400) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return m === 0 ? `${h}h ago` : `${h}h ${m}m ago`;
+  }
+  // Days tier (#259): raw ">24h" ages read poorly as "27h 9m ago" — the
+  // reported freshness surfaces idle for a full day-plus. Drop to "1d 3h ago"
+  // (minutes elided at this magnitude). Coarser than the hour tier by design.
+  // The fresh/aging/stale buckets cap at 30min, so this text-only tier never
+  // affects syncFreshness() bucketing.
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  return h === 0 ? `${d}d ago` : `${d}d ${h}h ago`;
 }
 
 export function syncFreshness(ageS: number): SyncFreshness {

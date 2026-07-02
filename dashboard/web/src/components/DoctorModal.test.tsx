@@ -46,6 +46,55 @@ describe('DoctorCheckRow non-OK fallback (#207 D3)', () => {
   });
 });
 
+describe('DoctorCheckRow humanizes Latest snapshot age (#259)', () => {
+  it('renders the humanized age instead of the raw server "Ns ago" summary', () => {
+    const { container } = render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.latest_snapshot_age',
+          title: 'Latest snapshot',
+          severity: 'warn',
+          summary: '97765s ago',
+          details: { latest_snapshot_at: '2026-06-29T06:47:52Z', latest_snapshot_age_s: 97765 },
+        }}
+      />
+    );
+    // 97765s ≈ 27h → "1d 3h ago"; the raw seconds must NOT leak into the line.
+    const line = container.querySelector('.doctor-modal__check > p') as HTMLElement;
+    expect(line.textContent).toContain('1d 3h ago');
+    expect(line.textContent).not.toContain('97765s ago');
+  });
+  it('falls back to the server summary when the age detail is absent ("none recorded")', () => {
+    render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.latest_snapshot_age',
+          title: 'Latest snapshot',
+          severity: 'warn',
+          summary: 'none recorded',
+          details: { latest_snapshot_at: null },
+        }}
+      />
+    );
+    expect(screen.getByText(/none recorded/)).toBeTruthy();
+  });
+  it('does NOT humanize other checks that carry raw "Ns ago" summaries', () => {
+    render(
+      <DoctorCheckRow
+        c={{
+          id: 'hooks.last_fire_age',
+          title: 'Last hook fire',
+          severity: 'ok',
+          summary: '42s ago',
+          details: { last_fire_age_s: 42 },
+        }}
+      />
+    );
+    // Out of #259's scope — this surface stays verbatim.
+    expect(screen.getByText(/42s ago/)).toBeTruthy();
+  });
+});
+
 describe('DoctorCategoryRow caret (DOC-1)', () => {
   it('renders a caret that reflects and toggles aria-expanded', () => {
     const cat = { id: 'auth', title: 'Auth', severity: 'ok' as const, checks: [] };

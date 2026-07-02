@@ -37,6 +37,7 @@ import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ModalCloseButton } from '../modals/ModalCloseButton';
+import { humanizeAge } from '../lib/syncFreshness';
 import {
   useDoctorReport,
   type DoctorCategory,
@@ -225,13 +226,23 @@ export function DoctorCategoryRow({
 export function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
   const [showDetails, setShowDetails] = useState(false);
   const hasDetails = c.details && Object.keys(c.details).length > 0;
+  // #259 — the "Latest snapshot" summary is baked server-side as raw seconds
+  // (`{age_s}s ago`), which reads inconsistently against the humanized sync
+  // chip. Humanize it client-side from the raw age in `details` (leaving the
+  // CLI `cctally doctor` output and its goldens untouched). Falls back to the
+  // server summary when the age detail is absent (e.g. "none recorded").
+  const summary =
+    c.id === 'data.latest_snapshot_age' &&
+    typeof c.details?.latest_snapshot_age_s === 'number'
+      ? humanizeAge(c.details.latest_snapshot_age_s)
+      : c.summary;
   return (
     <div className={`doctor-modal__check doctor-modal__check--${c.severity}`}>
       <p>
         <span className="doctor-modal__glyph" aria-label={c.severity}>
           {GLYPH[c.severity]}
         </span>{' '}
-        <strong>{c.title}</strong>: {c.summary}
+        <strong>{c.title}</strong>: {summary}
       </p>
       {c.remediation && (
         <p className="doctor-modal__remediation">→ {c.remediation}</p>
