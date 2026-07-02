@@ -15,7 +15,7 @@ import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
 import { costClass } from '../lib/cost';
-import type { CSSProperties } from 'react';
+import { ModelCostBars } from './ModelCostBars';
 
 export interface ProjectsDrillPanelProps {
   projectKey: string;
@@ -45,8 +45,6 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
   if (error && !data) return <div className="panel-empty">{error}</div>;
   if (!data) return null;
 
-  const topModelCost = data.models[0]?.cost_usd ?? 0;
-  const denom = topModelCost > 0 ? topModelCost : 1;
   const remaining = Math.max(0, data.sessions_total - data.sessions.length);
 
   return (
@@ -64,17 +62,7 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
           {data.models.length === 0 ? (
             <div className="muted">No model data for this window.</div>
           ) : (
-            data.models.map((m) => {
-              const widthPct = (m.cost_usd / denom) * 100;
-              const style = { '--w': `${widthPct}%` } as CSSProperties;
-              return (
-                <div className="drill-bar-row" key={m.model}>
-                  <span className={`chip ${modelChipClass(m.model)}`}>{m.model}</span>
-                  <div className="drill-bar" style={style} />
-                  <span className={`cost ${costClass(m.cost_usd)}`}>{fmt.usd2(m.cost_usd)}</span>
-                </div>
-              );
-            })
+            <ModelCostBars rows={data.models} />
           )}
         </div>
         <div>
