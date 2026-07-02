@@ -5,24 +5,20 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
 import { humanizeAge } from '../lib/syncFreshness';
+import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { dispatch } from '../store/store';
 
-// HeroStrip (#248, spec §1) — the dashboard's full-width at-a-glance hero. It
-// replaces the five header `.stat` blocks and the Current Week grid card: the
-// single most important number (weekly Used %) dominates, flanked by four
-// spelled-out metrics. The hero opens the (rich) Current Week modal on
-// click/Enter/Space. Mounted only on the dashboard branch of App.tsx — never in
-// the conversations view, nor the loading/error branches.
-
-// "14:32:05" — clock-only freshness stamp (ported from the retired
-// CurrentWeekPanel so the card's freshness reading lands here unchanged).
-function formatHHMMSS(iso: string | null | undefined): string | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return null;
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
+// HeroStrip (#264 S1, spec §4) — the dashboard's full-width at-a-glance hero,
+// rebuilt into THREE zones that answer the two questions users actually ask —
+// "how much have I used?" and "how much have I spent?" — with two dominant
+// numbers instead of the #248 flex band's empty centre:
+//   • usage  — WEEK USAGE big % + paired 5-HOUR + reset countdown
+//   • spent  — SPENT THIS WEEK whole-$ hero + $/1% sub
+//   • support— Forecast @ reset · $/1% vs last week · Snapshot age
+// The hero opens the (rich) Current Week modal on click/Enter/Space. Mounted
+// only on the dashboard branch of App.tsx — never in the conversations view,
+// nor the loading/error branches. Freshness is de-alarmed client-side
+// (heroFreshnessLabel) so a benign 8-minute snapshot reads calm (FRESH-1).
 
 export function HeroStrip() {
   const env = useSnapshot();
@@ -33,6 +29,10 @@ export function HeroStrip() {
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Forecast metric tint — verdict drives calm-green / amber / red (H1/§4).
   const verdict = resolveVerdict(h?.forecast_verdict ?? null);
+  // #264 S1 (FRESH-1/HERO-4) — re-derive the freshness tint from the
+  // already-shipped age_seconds with dashboard-appropriate thresholds; the
+  // server `freshness.label` is untouched (shared with TUI + refresh-usage).
+  const heroLabel = heroFreshnessLabel(freshness?.age_seconds);
 
   // #248 §6 — mobile-only sticky-collapse. Watch the hero block; once it scrolls
   // out of the viewport, flip `heroScrolled` so the Header reveals its condensed
@@ -86,59 +86,51 @@ export function HeroStrip() {
         }
       }}
     >
-      <div className="hero-main">
-        <div className="hero-eyebrow">
-          WEEK USAGE
-          {h?.week_label ? <span className="hero-week"> · {h.week_label}</span> : null}
-        </div>
-        <div className="hero-num">{fmt.pct1(h?.used_pct)}</div>
-        <div className="hero-sub">
-          resets in <span>{fmt.ddhh(cw?.reset_in_sec)}</span>
-          {' · '}
-          <span>{fmt.usd2(cw?.spent_usd)}</span> spent
-        </div>
-        {freshness && (
-          <span
-            className={`chip chip-${freshness.label}`}
-            data-freshness={freshness.label}
-            title={`Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`}
-          >
-            {freshness.label === 'stale' ? '⚠ ' : ''}
-            as of {formatHHMMSS(freshness.captured_at) ?? freshness.captured_at}
-            {' · '}
-            {/* #259 — humanize the raw-seconds age ("97928s ago" → "1d 3h ago")
-                so this pill reads consistently with the humanized sync chip. */}
-            {humanizeAge(freshness.age_seconds)}
-          </span>
-        )}
-      </div>
-      <div className="hero-metrics">
-        <div className="hero-metric" data-metric="cost-per-pct">
-          <div className="hero-metric-label">cost / 1%</div>
-          <div className="hero-metric-val">{fmt.usd2(h?.dollar_per_pct)}</div>
-        </div>
-        <div className="hero-metric" data-metric="forecast">
-          <div className="hero-metric-label">Forecast</div>
-          <div className={`hero-metric-val${verdict ? ` is-${verdict.cls}` : ''}`}>
-            {fmt.pct0(h?.forecast_pct)}
+      <div className="hero-zone hero-usage">
+        <div className="hu-block">
+          <div className="hu-label">
+            WEEK USAGE
+            {h?.week_label ? <span className="hu-week"> · {h.week_label}</span> : null}
           </div>
+          <div className="hu-num">{fmt.pct1(h?.used_pct)}</div>
         </div>
-        <div className="hero-metric" data-metric="five-hour">
-          <div className="hero-metric-label">5-hour</div>
-          <div className="hero-metric-val">{fmt.pct0(h?.five_hour_pct)}</div>
+        <div className="hu-block">
+          <div className="hu-label">5-HOUR</div>
+          <div className="hu-num hu-num--sm">{fmt.pct0(h?.five_hour_pct)}</div>
+        </div>
+        <div className="hu-reset">
+          resets in <span>{fmt.ddhh(cw?.reset_in_sec)}</span>
+        </div>
+      </div>
+
+      <div className="hero-zone hero-spent">
+        <div className="hs-label">SPENT THIS WEEK</div>
+        <div className="hs-big">{fmt.usd0(cw?.spent_usd)}</div>
+        <div className="hs-sub">
+          <span>{fmt.usd2(h?.dollar_per_pct)}</span> / 1% used
+        </div>
+      </div>
+
+      <div className="hero-zone hero-support">
+        <div className="sup-row">
+          <span className="sup-l">Forecast @ reset</span>
+          <span className={`sup-v${verdict ? ` is-${verdict.cls}` : ''}`}>
+            {fmt.pct0(h?.forecast_pct)}
+          </span>
         </div>
         {/* "vs last week" $/1% delta. The SVG icon is the ONLY arrow — the
             visible value shows the magnitude; direction is conveyed by the
             icon, its color, and the aria-label (never a duplicated text arrow)
             so color-blind / screen-reader users get the direction without hue.
-            Logic ported verbatim from the retired Header IIFE (#207 B1). */}
+            Logic ported verbatim from the #248 hero metric (originally the
+            retired Header IIFE, #207 B1); re-wrapped as a support row. */}
         {(() => {
           const d = h?.vs_last_week_delta;
           if (d == null) {
             return (
-              <div className="hero-metric" data-metric="vs-last-week">
-                <div className="hero-metric-label">vs last week</div>
-                <div className="hero-metric-val">—</div>
+              <div className="sup-row" data-metric="vs-last-week">
+                <span className="sup-l">$/1% vs last week</span>
+                <span className="sup-v">—</span>
               </div>
             );
           }
@@ -154,17 +146,32 @@ export function HeroStrip() {
             ? '$/1% flat versus last week'
             : `$/1% ${dirWord} ${mag} versus last week`;
           return (
-            <div className="hero-metric" data-metric="vs-last-week" aria-label={aria}>
-              <div className="hero-metric-label">vs last week</div>
-              <div className="hero-metric-val">
+            <div className="sup-row" data-metric="vs-last-week" aria-label={aria}>
+              <span className="sup-l">$/1% vs last week</span>
+              <span className="sup-v">
                 <svg className="icon" aria-hidden="true" style={{ color }}>
                   <use href={`/static/icons.svg#${icon}`} />
                 </svg>
                 <span>{flat ? 'flat' : mag}</span>
-              </div>
+              </span>
             </div>
           );
         })()}
+        {freshness && (
+          <div className="sup-row">
+            <span className="sup-l">Snapshot</span>
+            <span
+              className={`sup-v sup-fresh chip-${heroLabel}`}
+              data-freshness={heroLabel}
+              title={`Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`}
+            >
+              {heroLabel === 'stale' ? '⚠ ' : ''}
+              {/* #259 — humanize the raw-seconds age ("97928s ago" → "1d 3h
+                  ago") so this reads consistently with the sync chip. */}
+              {humanizeAge(freshness.age_seconds)}
+            </span>
+          </div>
+        )}
       </div>
     </section>
   );

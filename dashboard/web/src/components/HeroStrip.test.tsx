@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, act } from '@testing-library/react';
 import { HeroStrip } from './HeroStrip';
 import { _resetForTests, updateSnapshot, getState } from '../store/store';
 import type { Envelope } from '../types/envelope';
@@ -49,37 +49,55 @@ beforeEach(() => {
   updateSnapshot(heroEnvelope());
 });
 
-describe('<HeroStrip /> (#248)', () => {
-  it('renders the Used % as the hero number (header.used_pct → 11.0%)', () => {
-    render(<HeroStrip />);
-    expect(screen.getByText('11.0%')).toBeInTheDocument();
-  });
-
-  it('renders the week eyebrow with the week label', () => {
+describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
+  it('usage zone: Used % is the big number (header.used_pct → 11.0%)', () => {
     const { container } = render(<HeroStrip />);
-    expect(container.textContent).toContain('WEEK USAGE');
-    expect(container.textContent).toContain('wk Jun 30');
+    const usage = container.querySelector('.hero-usage') as HTMLElement;
+    expect(usage).not.toBeNull();
+    expect(usage.textContent).toContain('WEEK USAGE');
+    expect(usage.textContent).toContain('wk Jun 30');
+    expect(usage.textContent).toContain('11.0%');
   });
 
-  it('renders the resets/spent sub-line from current_week', () => {
+  it('usage zone: 5-HOUR renders header.five_hour_pct (→ 8%)', () => {
     const { container } = render(<HeroStrip />);
-    // reset_in_sec 200000 → ddhh "2d 7h"; spent_usd 14.2 → "$14.20".
-    expect(container.textContent).toContain('2d 7h');
-    expect(container.textContent).toContain('$14.20');
+    const usage = container.querySelector('.hero-usage') as HTMLElement;
+    expect(usage.textContent).toContain('5-HOUR');
+    expect(usage.textContent).toContain('8%');
   });
 
-  it('renders the four spelled-out metric labels (H3)', () => {
-    render(<HeroStrip />);
-    expect(screen.getByText('cost / 1%')).toBeInTheDocument();
-    expect(screen.getByText('Forecast')).toBeInTheDocument();
-    expect(screen.getByText('5-hour')).toBeInTheDocument();
-    expect(screen.getByText('vs last week')).toBeInTheDocument();
+  it('usage zone: reset countdown from current_week.reset_in_sec (→ 2d 7h)', () => {
+    const { container } = render(<HeroStrip />);
+    const usage = container.querySelector('.hero-usage') as HTMLElement;
+    expect(usage.textContent).toContain('2d 7h');
   });
 
-  it('renders the metric values (cost/1% and forecast)', () => {
-    render(<HeroStrip />);
-    expect(screen.getByText('$23.40')).toBeInTheDocument();
-    expect(screen.getByText('31%')).toBeInTheDocument();
+  it('spent zone: whole-dollar hero from current_week.spent_usd (→ $14) + $/1% sub', () => {
+    const { container } = render(<HeroStrip />);
+    const spent = container.querySelector('.hero-spent') as HTMLElement;
+    expect(spent).not.toBeNull();
+    expect(spent.textContent).toContain('SPENT THIS WEEK');
+    // usd0(14.2) → "$14" (whole dollars; NOT "$14.20").
+    expect((container.querySelector('.hs-big') as HTMLElement).textContent).toBe('$14');
+    // $/1% sub keeps 2dp.
+    expect(spent.textContent).toContain('$23.40');
+    expect(spent.textContent).toContain('/ 1% used');
+  });
+
+  it('support zone: Forecast @ reset tinted by verdict (ok → is-good)', () => {
+    const { container } = render(<HeroStrip />);
+    const support = container.querySelector('.hero-support') as HTMLElement;
+    expect(support.textContent).toContain('Forecast @ reset');
+    const val = support.querySelector('.sup-v.is-good');
+    expect(val).not.toBeNull();
+    expect(val?.textContent).toContain('31%');
+  });
+
+  it('support zone: renders the vs-last-week and Snapshot rows', () => {
+    const { container } = render(<HeroStrip />);
+    const support = container.querySelector('.hero-support') as HTMLElement;
+    expect(support.textContent).toContain('$/1% vs last week');
+    expect(support.textContent).toContain('Snapshot');
   });
 
   it('renders a freshness chip from current_week.freshness', () => {
@@ -89,10 +107,32 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip?.className).toContain('chip-fresh');
   });
 
-  it('prefixes the ⚠ glyph on a STALE freshness chip (ported C5 coverage)', () => {
+  // FRESH-1 non-vacuous guard: the server marks an 8-minute snapshot "stale"
+  // (OAuth-tuned 30s/90s), but the hero re-derives its tint client-side and
+  // must read it as CALM (fresh), never amber-⚠. Pin the exact attribute the
+  // buggy (trust-server-label) vs fixed (client-derive) paths differ on.
+  it('de-alarms an 8-minute snapshot to fresh even when the server says stale', () => {
     const env = heroEnvelope();
     env.current_week!.freshness = {
-      label: 'stale', captured_at: '2026-06-30T09:00:00Z', age_seconds: 3600,
+      label: 'stale', captured_at: '2026-06-30T09:52:00Z', age_seconds: 8 * 60,
+    };
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const chip = container.querySelector('.sup-fresh') as HTMLElement;
+    expect(chip).not.toBeNull();
+    expect(chip.getAttribute('data-freshness')).toBe('fresh');
+    expect(chip.className).toContain('chip-fresh');
+    expect(chip.className).not.toContain('chip-stale');
+    expect(chip.textContent).not.toContain('⚠');
+    // A stale-labeled query must find nothing — the tint is de-escalated.
+    expect(container.querySelector('[data-freshness="stale"]')).toBeNull();
+  });
+
+  it('prefixes ⚠ on a genuinely stale (>60m) snapshot (HERO-4 escalation)', () => {
+    const env = heroEnvelope();
+    env.current_week!.freshness = {
+      label: 'stale', captured_at: '2026-06-30T08:00:00Z', age_seconds: 3600 + 1,
     };
     _resetForTests();
     updateSnapshot(env);
@@ -103,7 +143,7 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip?.textContent).toContain('⚠');
   });
 
-  it('humanizes the freshness age on the "as of" pill (#259)', () => {
+  it('humanizes the freshness age on the Snapshot row (#259)', () => {
     const env = heroEnvelope();
     // ~27h old — the reported case that previously rendered raw "97928s ago".
     env.current_week!.freshness = {
@@ -131,12 +171,6 @@ describe('<HeroStrip /> (#248)', () => {
     expect(chip.title).not.toMatch(/T\d\d:\d\d:\d\dZ/);
   });
 
-  it('tints the Forecast metric value by verdict (ok → is-good)', () => {
-    const { container } = render(<HeroStrip />);
-    const val = container.querySelector('[data-metric="forecast"] .hero-metric-val');
-    expect(val?.className).toContain('is-good');
-  });
-
   it('opens the Current Week modal on click', () => {
     const { container } = render(<HeroStrip />);
     const hero = container.querySelector('.hero-strip') as HTMLElement;
@@ -155,9 +189,9 @@ describe('<HeroStrip /> (#248)', () => {
   });
 });
 
-// The "vs last week" $/1% delta (#207 B1) moved out of Header into the hero
-// metric grid verbatim (icon-only direction + color + aria; never a duplicated
-// text arrow). Full direction coverage lives here now.
+// The "vs last week" $/1% delta (#207 B1) — icon-only direction + color + aria,
+// never a duplicated text arrow. Full direction coverage lives here; the row
+// keeps its `data-metric="vs-last-week"` hook across the #264 3-zone rebuild.
 describe('<HeroStrip /> vs last week metric (#207 B1)', () => {
   function metricFor(d: number | null): HTMLElement | null {
     const env = heroEnvelope();
