@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Dashboard board and hero redesigned to fix the wasted space the previous facelift left behind. The board is now a content-aware **bento grid** — cards sit in height-matched rows sized to their content and the layout goes full-width (fluid up to 2100px) instead of capping at 1600px — so a wide screen fills with data instead of stranding a tall column of half-empty full-width cards, roughly halving the page height, while still collapsing to a single column on mobile and keeping drag-to-reorder within each row. The hero is rebuilt into three zones so the two questions you actually ask each get a dominant number: weekly usage % (with 5-hour usage paired beside it and the reset countdown) and dollars spent this week (with $/1% as its sub-line), alongside a compact support column for the end-of-week forecast, the week-over-week $/1% trend, and a snapshot-freshness reading that now stays calm for a normal few-minute-old snapshot and only turns amber, then red, once the data is genuinely stale. Every card also gains a consistent ⤢ expand control in its header to open its detail view (previously some cards signalled "open" only via the share icon, and the Blocks card had no click-to-open at all), the Forecast card gains a pace bar toward its 100% cap, and the empty Alerts card shows a teaching gauge of your current usage against the configured alert thresholds (#264).
+
 ## [1.59.0] - 2026-07-02
 
 ### Changed
