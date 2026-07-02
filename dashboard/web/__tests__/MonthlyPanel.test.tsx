@@ -31,11 +31,11 @@ describe('<MonthlyPanel />', () => {
     expect(periods.length).toBe(2);
   });
 
-  it('opens the monthly modal on click', async () => {
+  it('opens the History modal on click (S8 #254 — Monthly rolls into History)', async () => {
     const { container } = render(<MonthlyPanel />);
     (container.querySelector('#panel-monthly') as HTMLElement).click();
     const { getState } = await import('../src/store/store');
-    expect(getState().openModal).toBe('monthly');
+    expect(getState().openModal).toBe('history');
   });
 
   it('renders the foot total (361.71 = 182.50 + 179.21)', () => {

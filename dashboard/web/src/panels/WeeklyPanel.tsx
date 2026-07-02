@@ -9,9 +9,12 @@ import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
 // #248 §2a — the panel is a uniform summary TILE in the two-tier grid, so the
-// body caps to the 3 most-recent periods (the WeeklyModal keeps the full
+// body caps to the 3 most-recent periods (the History modal keeps the full
 // history). The footer still summarizes the WHOLE window (count + envelope
 // total) so the tile reads "Nw total · $X · here are the 3 most recent".
+//
+// S8 (#254): this panel left the default grid (the History card supersedes it);
+// the component + tests remain, and its open action now opens the History modal.
 const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
@@ -80,11 +83,11 @@ export function WeeklyPanel() {
       role="region"
       aria-label="Weekly usage panel"
       data-panel-kind="weekly"
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' })}
+      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'history' })}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+          dispatch({ type: 'OPEN_MODAL', kind: 'history' });
         }
       }}
     >

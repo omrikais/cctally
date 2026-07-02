@@ -178,7 +178,7 @@ describe('S keybinding (share modal)', () => {
 
   it('does nothing when a panel modal is open (openModal !== null)', () => {
     focusPanel('current-week');
-    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
     fireS();
     expect(getState().shareModal).toBeNull();
   });

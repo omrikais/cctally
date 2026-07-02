@@ -2,12 +2,12 @@ import { fmt } from '../lib/fmt';
 import { stepPeriod } from './periodNav';
 
 // PeriodMiniBars — the shared mini-bar navigator for the History modal
-// (S8, issue #254, WM-2). Generalized from DailyMiniBars so Day, Week,
-// and Month all get a bar-strip navigator. Reuses the existing
-// `.daily-modal-bars*` / `.bar` CSS so it renders byte-identically to the
-// former Daily strip (Milestone B may rename/generalize those selectors).
+// (S8, issue #254, WM-2). Generalized from the former Daily mini-bar strip
+// so Day, Week, and Month all get a bar-strip navigator. Reuses the existing
+// `.daily-modal-bars*` / `.bar` CSS so it renders byte-identically to that
+// former strip.
 //
-// Behavior ported from DailyMiniBars:
+// Behavior ported from the former Daily mini-bar strip:
 //   - rows arrive newest-first (envelope order); reversed internally so
 //     the strip reads oldest-left → newest-right.
 //   - bar height is linear in cost/max(cost); zero-cost ("empty") bars get

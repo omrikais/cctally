@@ -59,10 +59,10 @@ describe('<WeeklyPanel />', () => {
     expect(foot?.textContent).toMatch(/\$92\.31/);
   });
 
-  it('opens the weekly modal on click', async () => {
+  it('opens the History modal on click (S8 #254 — Weekly rolls into History)', async () => {
     const { container } = render(<WeeklyPanel />);
     (container.querySelector('#panel-weekly') as HTMLElement).click();
     const { getState } = await import('../src/store/store');
-    expect(getState().openModal).toBe('weekly');
+    expect(getState().openModal).toBe('history');
   });
 });

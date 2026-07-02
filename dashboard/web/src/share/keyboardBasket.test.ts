@@ -83,7 +83,7 @@ describe('B keybinding (composer)', () => {
     // panel modal — confusing focus ownership and breaking the
     // global-hotkey-modal-guard convention codified at
     // `project_global_hotkeys_modal_guard`.
-    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
     fireB();
     expect(getState().composerModal).toBeNull();
   });

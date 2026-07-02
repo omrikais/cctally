@@ -10,7 +10,7 @@ import { keyOf } from './periodNav';
  * Adapt a DailyPanelRow into a PeriodRow shape for the detail card.
  * Computes Δ% vs the prior (older) day inline. used_pct / dollar_per_pct
  * stay null (the detail card gates that stats row to the weekly variant).
- * Moved here from the former DailyModal (removed in S8 Milestone B).
+ * Moved here from the former Daily modal (removed in S8 Milestone B).
  */
 export function dailyToPeriodRow(row: DailyPanelRow, prior?: DailyPanelRow): PeriodRow {
   const delta =

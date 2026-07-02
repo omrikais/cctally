@@ -780,27 +780,27 @@ describe('alerts store (T8)', () => {
   });
 });
 
-describe('OPEN_MODAL kind=daily', () => {
+describe('OPEN_MODAL kind=history', () => {
   beforeEach(() => {
     _resetForTests();
   });
 
-  it('OPEN_MODAL with kind=daily and dailyDate sets both slices', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: '2026-04-22' });
+  it('OPEN_MODAL with kind=history and dailyDate sets both slices', () => {
+    dispatch({ type: 'OPEN_MODAL', kind: 'history', dailyDate: '2026-04-22' });
     const s = getState();
-    expect(s.openModal).toBe('daily');
+    expect(s.openModal).toBe('history');
     expect(s.openDailyDate).toBe('2026-04-22');
   });
 
-  it('OPEN_MODAL with kind=daily and no dailyDate leaves openDailyDate null', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
+  it('OPEN_MODAL with kind=history and no dailyDate leaves openDailyDate null', () => {
+    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
     const s = getState();
-    expect(s.openModal).toBe('daily');
+    expect(s.openModal).toBe('history');
     expect(s.openDailyDate).toBeNull();
   });
 
   it('CLOSE_MODAL clears openDailyDate alongside the other slices', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: '2026-04-22' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'history', dailyDate: '2026-04-22' });
     dispatch({ type: 'CLOSE_MODAL' });
     const s = getState();
     expect(s.openModal).toBeNull();
@@ -809,11 +809,11 @@ describe('OPEN_MODAL kind=daily', () => {
     expect(s.openBlockStartAt).toBeNull();
   });
 
-  it('switching from another modal to daily clears its bound id', () => {
+  it('switching from another modal to history clears its bound id', () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: 'abc-123' });
-    dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: '2026-04-22' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'history', dailyDate: '2026-04-22' });
     const s = getState();
-    expect(s.openModal).toBe('daily');
+    expect(s.openModal).toBe('history');
     expect(s.openSessionId).toBeNull();
     expect(s.openDailyDate).toBe('2026-04-22');
   });

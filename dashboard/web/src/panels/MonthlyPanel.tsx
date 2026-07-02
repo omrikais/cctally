@@ -9,7 +9,10 @@ import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
 // #248 §2a — uniform summary TILE: cap the body to the 3 most-recent months
-// (MonthlyModal keeps the full history). Footer summarizes the whole window.
+// (the History modal keeps the full history). Footer summarizes the whole
+// window. S8 (#254): this panel left the default grid (the History card
+// supersedes it); the component + tests remain and its open action opens the
+// History modal.
 const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
@@ -75,11 +78,11 @@ export function MonthlyPanel() {
       role="region"
       aria-label="Monthly usage panel"
       data-panel-kind="monthly"
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' })}
+      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'history' })}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
+          dispatch({ type: 'OPEN_MODAL', kind: 'history' });
         }
       }}
     >

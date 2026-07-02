@@ -51,10 +51,9 @@ const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on fir
 // blob). Read in loadInitial with try/catch, persisted on TOGGLE_CONV_OUTLINE.
 const CONV_OUTLINE_OPEN_KEY = 'cctally.conv.outlineOpen';
 
-// S8 (#254): 'history' is ADDED alongside 'weekly'|'monthly'|'daily' in
-// Milestone A (kept green/additive); the three per-period kinds are
-// removed in Milestone B once HistoryModal supersedes them.
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'weekly' | 'monthly' | 'block' | 'daily' | 'history' | 'alerts' | 'update' | 'projects' | 'cache-report';
+// S8 (#254): the per-period 'weekly'|'monthly'|'daily' kinds are removed —
+// the single 'history' kind (HistoryModal) supersedes all three.
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'block' | 'history' | 'alerts' | 'update' | 'projects' | 'cache-report';
 
 // S8 (#254): the History modal's Day·Week·Month toggle, persisted in
 // prefs.historyPeriod (default 'day', coerced on load).
