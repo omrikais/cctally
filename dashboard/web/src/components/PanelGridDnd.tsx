@@ -54,10 +54,10 @@ export function PanelGridDnd({
   children,
 }: {
   items: GridPanelId[];
-  // #248 — one strip per instance: App renders TWO PanelGridDnd (a tile strip +
-  // a wide strip), each its own DndContext+SortableContext so a pointer drag
-  // physically cannot cross tiers. `className` is the strip layout class
-  // (`tile-strip` / `wide-strip`).
+  // #264 S1 — one row per instance: App renders THREE PanelGridDnd, one per
+  // height class (tall/medium/short), each its own DndContext+SortableContext
+  // so a pointer drag physically cannot cross classes. `className` is the row
+  // layout class (`bento-row row-tall` / `row-medium` / `row-short`).
   className?: string;
   children: ReactNode;
 }) {

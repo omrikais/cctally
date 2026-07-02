@@ -83,12 +83,13 @@ describe('Prefs.panelOrder', () => {
 import { dispatch } from '../src/store/store';
 
 describe('REORDER_PANELS action', () => {
-  // Default grid order (#248): forecast, trend, sessions, projects, weekly, …
+  // Default bento order (#264 S1): sessions, trend, projects, history,
+  // cache-report, forecast, blocks, alerts.
   it('moves panel from index 0 to index 3', () => {
     dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
     const order = getState().prefs.panelOrder;
-    // 'forecast' moves to index 3; 'trend' shifts up into index 0.
-    expect(order[3]).toBe('forecast');
+    // 'sessions' moves to index 3; 'trend' shifts up into index 0.
+    expect(order[3]).toBe('sessions');
     expect(order[0]).toBe('trend');
   });
 
@@ -98,7 +99,7 @@ describe('REORDER_PANELS action', () => {
     expect(raw).toBeTruthy();
     const parsed = JSON.parse(raw!) as { panelOrder: string[] };
     expect(parsed.panelOrder[0]).toBe('trend');
-    expect(parsed.panelOrder[1]).toBe('forecast');
+    expect(parsed.panelOrder[1]).toBe('sessions');
   });
 
   it('is a no-op when from === to', () => {
@@ -116,42 +117,51 @@ describe('REORDER_PANELS action', () => {
   });
 });
 
-describe('SWAP_PANELS action (tier-aware — #248 / S8 #254)', () => {
-  // Default grid order + tiers (S8 #254):
-  //   0 forecast(tile) 1 trend(wide)  2 sessions(wide) 3 projects(wide)
-  //   4 blocks(tile)   5 history(wide) 6 alerts(tile)  7 cache-report(wide)
+describe('SWAP_PANELS action (height-class-aware — #264 S1)', () => {
+  // Default bento order + rows:
+  //   0 sessions(tall)  1 trend(tall)  2 projects(tall)
+  //   3 history(medium) 4 cache-report(medium)
+  //   5 forecast(short) 6 blocks(short) 7 alerts(short)
   // Shift+Arrow keeps dispatching SWAP_PANELS{index, direction}; the reducer
-  // moves the card to the previous/next id sharing its CARD_TIER (skipping the
-  // other tier), so a keyboard reorder can never cross tiers.
-  const WIDES = ['trend', 'sessions', 'projects', 'history', 'cache-report'];
-  const TILES = ['forecast', 'blocks', 'alerts'];
+  // moves the card to the previous/next id sharing its CARD_LAYOUT row
+  // (skipping other classes), so a keyboard reorder can never cross classes.
+  const TALL = ['sessions', 'trend', 'projects'];
+  const MEDIUM = ['history', 'cache-report'];
+  const SHORT = ['forecast', 'blocks', 'alerts'];
 
-  it('a tile swaps with the next TILE, skipping wides (forecast → blocks)', () => {
+  it('a tall card swaps with the next tall card (sessions → trend)', () => {
     dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
     const order = getState().prefs.panelOrder;
-    // forecast (index 0, tile) swaps with blocks (index 4, the next tile) —
-    // the intervening wides (trend/sessions/projects) are skipped.
-    expect(order[0]).toBe('blocks');
-    expect(order[4]).toBe('forecast');
-    // The wide cards keep their relative order.
-    expect(order.filter((id) => WIDES.includes(id))).toEqual(WIDES);
-  });
-
-  it('a tile swaps with the previous TILE (blocks → forecast)', () => {
-    dispatch({ type: 'SWAP_PANELS', index: 4, direction: -1 });
-    const order = getState().prefs.panelOrder;
-    expect(order[0]).toBe('blocks');
-    expect(order[4]).toBe('forecast');
-    expect(order.filter((id) => WIDES.includes(id))).toEqual(WIDES);
-  });
-
-  it('a wide swaps with the next WIDE, skipping tiles (trend → sessions)', () => {
-    dispatch({ type: 'SWAP_PANELS', index: 1, direction: 1 });
-    const order = getState().prefs.panelOrder;
+    expect(order[0]).toBe('trend');
     expect(order[1]).toBe('sessions');
-    expect(order[2]).toBe('trend');
-    // The tiles keep their relative order.
-    expect(order.filter((id) => TILES.includes(id))).toEqual(TILES);
+    // The medium + short rows keep their relative order.
+    expect(order.filter((id) => MEDIUM.includes(id))).toEqual(MEDIUM);
+    expect(order.filter((id) => SHORT.includes(id))).toEqual(SHORT);
+  });
+
+  it('a short card swaps with the previous short card (blocks → forecast)', () => {
+    dispatch({ type: 'SWAP_PANELS', index: 6, direction: -1 });
+    const order = getState().prefs.panelOrder;
+    expect(order[5]).toBe('blocks');
+    expect(order[6]).toBe('forecast');
+    // The tall row keeps its relative order.
+    expect(order.filter((id) => TALL.includes(id))).toEqual(TALL);
+  });
+
+  it('skips an interleaved other-class card to reach the next same-class id', () => {
+    // Interleave a medium card between two tall cards: move history (index 3,
+    // medium) up to index 1 → [sessions, history, trend, projects, …].
+    dispatch({ type: 'REORDER_PANELS', from: 3, to: 1 });
+    expect(getState().prefs.panelOrder.slice(0, 4))
+      .toEqual(['sessions', 'history', 'trend', 'projects']);
+    // sessions (index 0, tall) + Shift-down: the next TALL is trend at index 2,
+    // skipping the intervening medium 'history' at index 1.
+    dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
+    const order = getState().prefs.panelOrder;
+    expect(order[0]).toBe('trend');
+    expect(order[2]).toBe('sessions');
+    // The medium card stayed put (only sessions↔trend swapped).
+    expect(order[1]).toBe('history');
   });
 
   it('is a no-op at the start (index=0, direction=-1)', () => {
@@ -166,11 +176,11 @@ describe('SWAP_PANELS action (tier-aware — #248 / S8 #254)', () => {
     expect(getState().prefs.panelOrder).toEqual(before);
   });
 
-  it('is a no-op for the last tile moving down (no further tile)', () => {
-    // alerts is the last tile (index 6); the only id after it is a wide
-    // (cache-report), so a tier-aware +1 finds no target and is a no-op.
+  it('is a no-op at a class boundary with no further same-class card', () => {
+    // projects is the last tall card (index 2); every id after it is
+    // medium/short, so a class-aware +1 finds no target and is a no-op.
     const before = [...getState().prefs.panelOrder];
-    dispatch({ type: 'SWAP_PANELS', index: 6, direction: 1 });
+    dispatch({ type: 'SWAP_PANELS', index: 2, direction: 1 });
     expect(getState().prefs.panelOrder).toEqual(before);
   });
 });

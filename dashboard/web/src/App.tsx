@@ -18,7 +18,7 @@ import { useConnectionStatus } from './hooks/useConnectionStatus';
 import { deriveAppState } from './lib/appState';
 import { ConnectionBanner } from './components/ConnectionBanner';
 import { SkeletonGrid } from './components/SkeletonGrid';
-import { CARD_TIER } from './lib/panelIds';
+import { CARD_LAYOUT } from './lib/panelIds';
 
 export function App() {
   // Stable items array for the sortable grid. dnd-kit's rectSortingStrategy
@@ -44,18 +44,23 @@ export function App() {
   const env = useSnapshot();
   const { disconnected, bootstrapError } = useConnectionStatus();
   const appState = deriveAppState(env, bootstrapError);
-  // Two-tier grid partition (#248 §2) — memoized on the store-stable
-  // `panelOrder` reference so an SSE tick mid-drag (App re-renders on every
-  // snapshot) doesn't hand PanelGridDnd a fresh `items` identity and bust its
-  // drag-stability useMemo. Only an actual reorder (new panelOrder ref)
-  // recomputes the slices. Two PanelGridDnd instances ⇒ two dnd contexts ⇒ a
-  // pointer drag can't cross tiers; each PanelHost is handed its GLOBAL
-  // panelOrder index so REORDER/SWAP stay correct.
-  const { tiles, wides, globalIndex } = useMemo(() => {
-    const tiles = panelOrder.filter((id) => CARD_TIER[id] === 'tile');
-    const wides = panelOrder.filter((id) => CARD_TIER[id] === 'wide');
-    const globalIndex = new Map(panelOrder.map((id, i) => [id, i]));
-    return { tiles, wides, globalIndex };
+  // Bento partition (#264 S1) — split panelOrder into the three height-class
+  // rows by CARD_LAYOUT[id].row. Memoized on the store-stable `panelOrder`
+  // reference so an SSE tick mid-drag (App re-renders on every snapshot)
+  // doesn't hand PanelGridDnd a fresh `items` identity and bust its
+  // drag-stability useMemo — only an actual reorder (new panelOrder ref)
+  // recomputes the slices. Three PanelGridDnd instances ⇒ three dnd contexts
+  // ⇒ a pointer drag can't cross height classes; each PanelHost is handed its
+  // GLOBAL panelOrder index so REORDER/SWAP stay correct.
+  const { tall, medium, short, globalIndex } = useMemo(() => {
+    const byRow = (r: 'tall' | 'medium' | 'short') =>
+      panelOrder.filter((id) => CARD_LAYOUT[id].row === r);
+    return {
+      tall: byRow('tall'),
+      medium: byRow('medium'),
+      short: byRow('short'),
+      globalIndex: new Map(panelOrder.map((id, i) => [id, i])),
+    };
   }, [panelOrder]);
   return (
     <>
@@ -79,17 +84,23 @@ export function App() {
                 reorderable grid. Never mounted in the conversations view or the
                 loading/error branches. It scrolls away on desktop. */}
             <HeroStrip />
-            {/* Two-tier grid (#248 §2). The tile/wide slices + global index are
-                memoized above (drag-stable). The stale-dim class lives on the
-                .dash-grid wrapper. */}
+            {/* Bento board (#264 S1). The three height-class slices + global
+                index are memoized above (drag-stable). Each row is its own
+                DndContext so a pointer drag can't cross height classes. The
+                stale-dim class lives on the .dash-grid wrapper. */}
             <div className={`dash-grid${disconnected ? ' is-stale' : ''}`}>
-              <PanelGridDnd items={tiles} className="tile-strip">
-                {tiles.map((id) => (
+              <PanelGridDnd items={tall} className="bento-row row-tall">
+                {tall.map((id) => (
                   <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
                 ))}
               </PanelGridDnd>
-              <PanelGridDnd items={wides} className="wide-strip">
-                {wides.map((id) => (
+              <PanelGridDnd items={medium} className="bento-row row-medium">
+                {medium.map((id) => (
+                  <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
+                ))}
+              </PanelGridDnd>
+              <PanelGridDnd items={short} className="bento-row row-short">
+                {short.map((id) => (
                   <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
                 ))}
               </PanelGridDnd>

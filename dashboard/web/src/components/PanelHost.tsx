@@ -5,6 +5,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { shouldSuppressNextClick } from '../lib/clickSuppression';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { PANEL_REGISTRY, type GridPanelId } from '../lib/panelRegistry';
+import { CARD_LAYOUT } from '../lib/panelIds';
 
 export interface PanelHostProps {
   id: GridPanelId;
@@ -86,6 +87,11 @@ export function PanelHost({ id, index }: PanelHostProps) {
       className={`panel-host${isDragging ? ' is-dragging' : ''}`}
       data-panel-host={id}
       data-panel-index={index}
+      // #264 S1: the bento CSS drives `grid-column: span N` from this
+      // attribute (not an inline style — an inline gridColumn would beat the
+      // mobile 1-col media override; an attribute selector keeps mobile the
+      // default and desktop the enhancement).
+      data-span={CARD_LAYOUT[id].span}
       aria-label={`Reorder ${label}`}
       onKeyDown={onKeyDown}
       onClickCapture={onClickCapture}

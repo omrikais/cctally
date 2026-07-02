@@ -20,39 +20,41 @@ describe('<App />', () => {
     vi.unstubAllGlobals();
   });
 
-  // #248 — the grid is partitioned into a TILE strip + a WIDE strip (two dnd
-  // contexts). DOM order is tiles-then-wides; within each strip the relative
-  // order follows prefs.panelOrder.
+  // #264 S1 — the grid is partitioned into three height-class rows (tall /
+  // medium / short), each its own dnd context. DOM order is tall→medium→short;
+  // within each row the relative order follows prefs.panelOrder.
   function hostsIn(container: HTMLElement, sel: string): (string | undefined)[] {
     return Array.from(container.querySelectorAll(`${sel} [data-panel-host]`))
       .map((h) => (h as HTMLElement).dataset.panelHost);
   }
 
-  it('renders the default order partitioned into tile + wide strips', () => {
+  it('renders the default order partitioned into the three bento rows', () => {
     const { container } = render(<App />);
-    // S8 #254 — weekly/monthly left the grid; the daily heatmap became the
-    // wide "history" card. Tiles: forecast, blocks, alerts.
-    expect(hostsIn(container, '.tile-strip'))
+    expect(hostsIn(container, '.bento-row.row-tall'))
+      .toEqual(['sessions', 'trend', 'projects']);
+    expect(hostsIn(container, '.bento-row.row-medium'))
+      .toEqual(['history', 'cache-report']);
+    expect(hostsIn(container, '.bento-row.row-short'))
       .toEqual(['forecast', 'blocks', 'alerts']);
-    expect(hostsIn(container, '.wide-strip'))
-      .toEqual(['trend', 'sessions', 'projects', 'history', 'cache-report']);
-    // The two slices together cover the full default order exactly once.
+    // The three slices together cover the full default order exactly once.
     const all = Array.from(document.querySelectorAll('[data-panel-host]'))
       .map((h) => (h as HTMLElement).dataset.panelHost);
     expect([...all].sort()).toEqual([...DEFAULT_PANEL_ORDER].sort());
   });
 
-  it('a within-tier REORDER reflects in that strip and leaves the other tier intact', () => {
+  it('a within-class REORDER reflects in that row and leaves the other rows intact', () => {
     const { container } = render(<App />);
     act(() => {
-      // Move forecast (panelOrder index 0, a tile) to blocks' slot (index 4):
-      // within the tile strip it now sits AFTER blocks.
-      dispatch({ type: 'REORDER_PANELS', from: 0, to: 4 });
+      // Move sessions (panelOrder index 0, a tall card) to projects' slot
+      // (index 2): within the tall row it now sits AFTER trend and projects.
+      dispatch({ type: 'REORDER_PANELS', from: 0, to: 2 });
     });
-    expect(hostsIn(container, '.tile-strip'))
-      .toEqual(['blocks', 'forecast', 'alerts']);
-    // The wide strip's relative order is preserved.
-    expect(hostsIn(container, '.wide-strip'))
-      .toEqual(['trend', 'sessions', 'projects', 'history', 'cache-report']);
+    expect(hostsIn(container, '.bento-row.row-tall'))
+      .toEqual(['trend', 'projects', 'sessions']);
+    // The medium and short rows keep their relative order.
+    expect(hostsIn(container, '.bento-row.row-medium'))
+      .toEqual(['history', 'cache-report']);
+    expect(hostsIn(container, '.bento-row.row-short'))
+      .toEqual(['forecast', 'blocks', 'alerts']);
   });
 });
