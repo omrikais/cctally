@@ -164,6 +164,25 @@ describe('<HistoryModal /> navigator + keyboard selection', () => {
     expect(document.querySelector('.detail-card')?.textContent).toContain('07-01');
   });
 
+  it('ArrowDown steps the chronological navigator order even when the table is sorted the other way (P2)', () => {
+    updateSnapshot(baseEnvelope());
+    openHistory();
+    render(<HistoryModal />);
+    // Switch to Week, then sort the table by cost ASC. Chronological order is
+    // [W27 (newest, $55), W26 ($40)]; cost-asc reverses it to [W26, W27].
+    fireEvent.click(screen.getByRole('radio', { name: 'Week' }));
+    dispatch({ type: 'SET_TABLE_SORT', table: 'history', override: { column: 'cost_usd', direction: 'asc' } });
+    // Default selection = current/first week W27.
+    expect(document.querySelector('.detail-card')?.textContent).toContain('2026-W27');
+    // ArrowDown = one step OLDER in chronological order → W26 (the adjacent
+    // bar), regardless of the table rendering W26 first under the sort. Under
+    // the pre-fix sorted-order stepping, W27 was the LAST sorted row so
+    // ArrowDown would have been a no-op — so this assertion fails RED on the
+    // old behavior.
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(document.querySelector('.detail-card')?.textContent).toContain('2026-W26');
+  });
+
   it('ArrowRight switches the toggle and persists via SET_HISTORY_PERIOD', () => {
     updateSnapshot(baseEnvelope());
     openHistory();

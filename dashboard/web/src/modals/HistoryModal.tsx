@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from 'react';
+import { useState } from 'react';
 import { Modal } from './Modal';
 import { PeriodMiniBars, type PeriodNavRow } from './PeriodMiniBars';
 import { PeriodDetailCard } from './PeriodDetailCard';
@@ -8,10 +8,8 @@ import { ShareIcon } from '../components/ShareIcon';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { keyOf, stepPeriod, type PeriodVariant } from './periodNav';
-import { dailyToPeriodRow, decorateHistoryRows } from './historyData';
-import { historyColumns, type HistoryVariant } from '../lib/historyColumns';
-import { applyTableSort } from '../lib/tableSort';
-import { dispatch, getState, subscribeStore, type HistoryPeriod } from '../store/store';
+import { dailyToPeriodRow } from './historyData';
+import { dispatch, getState, type HistoryPeriod } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import type { Envelope, PeriodRow } from '../types/envelope';
 import type { SharePanelId } from '../share/types';
@@ -70,10 +68,6 @@ function buildKeyed(period: HistoryPeriod, env: Envelope | null): Keyed[] {
 
 export function HistoryModal() {
   const env = useSnapshot();
-  const sortOverride = useSyncExternalStore(
-    subscribeStore,
-    () => getState().prefs.historySortOverride,
-  );
 
   // Period seed (once, on mount) — deep-link forces Day, else prefs.
   const [period, setPeriodState] = useState<HistoryPeriod>(() =>
@@ -102,18 +96,15 @@ export function HistoryModal() {
     selectedKey != null && keySet.has(selectedKey) ? selectedKey : firstKey;
   const selectedRow = keyed.find((k) => k.key === effectiveKey)?.period ?? null;
 
-  // The ↑/↓ ordered key list == the VISIBLE order. For week/month that is
-  // the SORTED table order (so ↑/↓ agrees with the rendered table, not the
-  // envelope order — the interim Weekly/Monthly wrinkle this modal must not
-  // inherit). Day has no table, so it steps the chronological envelope order.
-  const orderedKeys: { key: string }[] =
-    period === 'day'
-      ? navRows.map((n) => ({ key: n.key }))
-      : applyTableSort(
-          decorateHistoryRows(periodRows, unit as HistoryVariant),
-          historyColumns(unit as HistoryVariant),
-          sortOverride,
-        ).map((r) => ({ key: r.key }));
+  // ↑/↓ steps the NAVIGATOR's chronological order for ALL periods — the
+  // same order PeriodMiniBars' ‹/› buttons and the bar layout use — so the
+  // two steppers and the bars always agree, and ↑/↓ behaves identically
+  // whether or not a table sort is active. (Day has only the navigator. A
+  // week/month table sort changes only the table's row DISPLAY order, which
+  // stays selectable via its SH-3 focusable rows / click. Binding ↑/↓ to the
+  // sorted table instead would desync it from the always-chronological
+  // navigator under an active sort — Milestone-B review P2.)
+  const orderedKeys = navRows.map((n) => ({ key: n.key }));
 
   // Keymap: one registration, gated on the topmost layer (openModal ===
   // 'history' AND no share/composer overlay above it — Codex finding 6).
