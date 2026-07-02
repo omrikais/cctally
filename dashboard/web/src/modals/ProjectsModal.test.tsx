@@ -304,6 +304,36 @@ describe('<ProjectsModal />', () => {
     });
   });
 
+  it('drill Models bars render short abbreviated chip labels, not raw canonical ids (#263)', async () => {
+    // Regression for #263: the drill passed `data.models` straight into
+    // ModelCostBars with no `label`, so the chip fell back to the raw
+    // canonical id (e.g. `claude-sonnet-4-5`), which wrapped to two lines
+    // in the shared 110px chip column. The fix derives a friendly short
+    // label via `abbreviateModel`, matching the other three surfaces.
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    render(<ProjectsModal />);
+    // The leader (project-1) is pre-selected; the drill renders after the
+    // lazy fetch resolves.
+    await screen.findByText(/Models \(this project\)/);
+    // Scope to the Models bars (`.drill-bar-row .chip`) so we don't pick up
+    // the untouched session-row chips (`.drill-session-row .chip`, which
+    // still show `primary_model` raw — out of scope for #263).
+    await waitFor(() => {
+      const barChips = Array.from(
+        document.querySelectorAll('.drill-bar-row .chip'),
+      ).map((el) => el.textContent);
+      // Cost-descending: sonnet 30 > opus 12. Abbreviated, un-prefixed.
+      expect(barChips).toEqual(['sonnet-4-5', 'opus-4-7']);
+    });
+    // And the raw canonical ids must NOT appear as a Models bar chip.
+    const rawBarChips = Array.from(
+      document.querySelectorAll('.drill-bar-row .chip'),
+    ).map((el) => el.textContent);
+    expect(rawBarChips).not.toContain('claude-sonnet-4-5');
+    expect(rawBarChips).not.toContain('claude-opus-4-7');
+  });
+
   it('renders the "Showing N weeks" notice when actual < requested', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     // User has 8w pref but the snapshot only has 3 weeks of history.

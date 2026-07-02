@@ -15,6 +15,7 @@ import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
 import { costClass } from '../lib/cost';
+import { abbreviateModel } from '../lib/modelName';
 import { ModelCostBars } from './ModelCostBars';
 
 export interface ProjectsDrillPanelProps {
@@ -62,7 +63,21 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
           {data.models.length === 0 ? (
             <div className="muted">No model data for this window.</div>
           ) : (
-            <ModelCostBars rows={data.models} />
+            // #263 — the drill's `data.models` rows carry only the canonical
+            // `model` id (no server `display` field, unlike History/Block's
+            // `ModelCostRow`), so a dated id like `claude-opus-4-6-20251101`
+            // wrapped to two lines in the shared 110px chip column. Derive the
+            // friendly short chip label client-side via `abbreviateModel`,
+            // exactly as SessionModal does for its display-field-less
+            // `cost_per_model` rows — one-line chips, parity with the other
+            // three ModelCostBars surfaces, no server/envelope change.
+            <ModelCostBars
+              rows={data.models.map((m) => ({
+                model: m.model,
+                cost_usd: m.cost_usd,
+                label: abbreviateModel(m.model),
+              }))}
+            />
           )}
         </div>
         <div>
