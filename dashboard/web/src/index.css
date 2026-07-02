@@ -5047,15 +5047,19 @@ mark.current {
  * live freshness chip. Muted, 12px, separator dots between groups.
  * Wraps on narrow viewports — each shortcut group is its own inline
  * span so flexbox can break between them. */
-.projects-modal-footer-hint {
+/* Shared modal footer-hint row (S8 #254): the KeyHintFooter component always
+ * renders the generic `.key-hint-footer` class, so the styling lives here and
+ * both the Projects modal (which adds the legacy `.projects-modal-footer-hint`
+ * alias) and the History modal share one recipe. */
+.key-hint-footer {
   display: flex; flex-wrap: wrap; align-items: baseline;
   gap: 4px 8px;
   margin-top: 14px; padding-top: 10px;
   border-top: 1px solid var(--border-soft);
   color: var(--text-dim); font-size: var(--fs-meta);
 }
-.projects-modal-footer-hint .sep { color: var(--border-soft); }
-.projects-modal-footer-hint kbd {
+.key-hint-footer .sep { color: var(--border-soft); }
+.key-hint-footer kbd {
   font-family: inherit; font-size: var(--fs-eyebrow);
   padding: 1px 4px; margin: 0 1px;
   border-radius: 3px; /* lint-allow: border-radius bespoke chrome (no exact token) */
@@ -5065,11 +5069,43 @@ mark.current {
 }
 /* SyncChip in the footer drops its own background/padding — we just
  * want the text reading "synced 3s ago" inline with the hints. */
-.projects-modal-footer-hint .sync-chip {
+.key-hint-footer .sync-chip {
   font-size: var(--fs-meta);
   padding: 0;
   background: none;
   margin-left: auto;
+}
+
+/* History modal (#254) — Day·Week·Month segmented radiogroup. Reuses the
+ * projects-controls pill language but with the single indigo modal accent
+ * (spec: one accent across all toggles). */
+.history-toggle {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  padding: 2px 0 12px;
+}
+.history-toggle .pill {
+  padding: 5px 14px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  font-size: 12px; color: var(--text-dim); cursor: pointer;
+  background: transparent;
+}
+.history-toggle .pill.on {
+  background: color-mix(in srgb, var(--accent-indigo) 18%, transparent);
+  border-color: var(--accent-indigo);
+  color: var(--text);
+}
+.history-toggle .pill:focus-visible {
+  outline: 2px solid var(--accent-indigo); outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  /* Touch floor (#254): each Day/Week/Month segment is a ≥44px tap target,
+   * and the strip may wrap. Same specificity as the desktop rule above, so
+   * source order (this block is later) makes it win — no #root needed. */
+  .history-toggle { gap: 8px; }
+  .history-toggle .pill {
+    min-height: 44px; padding: 10px 18px; font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
 }
 
 .projects-drill {
