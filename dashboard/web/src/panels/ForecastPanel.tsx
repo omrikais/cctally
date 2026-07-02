@@ -71,6 +71,17 @@ export function ForecastPanel() {
             </span>
           )}
         </div>
+        {/* #264 S1 (VOID-1) — pace bar: projection toward the 100% cap, sized
+            to week_avg_projection_pct (clamped 0..100) and verdict-tinted, so
+            the short-row tile fills its matched height instead of leaving a
+            void. Decorative (role="presentation") — the number + verdict chip
+            above already carry the value + status for AT. */}
+        <div className={`fc-pace is-${esc}`} role="presentation">
+          <div
+            className="fc-pace-fill"
+            style={{ width: `${Math.min(100, Math.max(0, fc?.week_avg_projection_pct ?? 0))}%` }}
+          />
+        </div>
         <div className="fc-budget-foot">
           <div className="fc-foot-line">
             <span className="fc-foot-k">Recent-24h</span>

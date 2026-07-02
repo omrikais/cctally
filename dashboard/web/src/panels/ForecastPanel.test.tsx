@@ -98,6 +98,26 @@ describe('#248 Task 5 — Forecast calm tile', () => {
     expect(section?.className).toContain('fc-esc-over');
   });
 
+  // #264 S1 (VOID-1) — the pace bar fills the matched short-row height with a
+  // fill sized to week_avg_projection_pct (clamped 0..100) and tinted by the
+  // resolved verdict, so the sparse tile is no longer a void.
+  it('#264 S1 — renders a verdict-tinted pace bar filled to the week-avg projection', () => {
+    const { container } = renderFor('ok', 88);
+    const pace = container.querySelector('.fc-pace');
+    expect(pace).not.toBeNull();
+    expect(pace?.className).toContain('is-good');
+    const fill = container.querySelector('.fc-pace-fill') as HTMLElement;
+    expect(fill).not.toBeNull();
+    expect(fill.style.width).toBe('88%');
+  });
+
+  it('#264 S1 — clamps the pace fill to 100% when the projection exceeds the cap', () => {
+    const { container } = renderFor('capped', 140);
+    const fill = container.querySelector('.fc-pace-fill') as HTMLElement;
+    expect(fill.style.width).toBe('100%');
+    expect(container.querySelector('.fc-pace')?.className).toContain('is-over');
+  });
+
   it('renders the muted budget foot (recent-24h + per-day budgets)', () => {
     const { container } = renderFor('ok');
     const foot = container.querySelector('.fc-budget-foot');
