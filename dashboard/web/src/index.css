@@ -2485,15 +2485,13 @@ mark.current {
 .detail-card .window { color: var(--text-faint); font-size: var(--fs-eyebrow); margin-bottom: 12px; }
 .detail-card .model-stack { height: 14px; margin: 6px 0 10px; }
 .detail-card .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.detail-card .chip {
-  font-size: var(--fs-eyebrow); padding: 2px 8px; border-radius: var(--radius-pill); color: #fff;
-  font-variant-numeric: tabular-nums;
-}
-.detail-card .chip.opus    { background: var(--chip-opus); }
-.detail-card .chip.sonnet  { background: var(--chip-sonnet); }
-.detail-card .chip.haiku   { background: var(--chip-haiku); }
-.detail-card .chip.fable   { background: var(--chip-fable); }
-.detail-card .chip.other   { background: var(--surface-faint); color: var(--text); }
+/* #262 — the `.detail-card .chip*` visual override (pill radius / #fff text /
+ * fs-eyebrow) was REMOVED so History's shared ModelCostBars chips inherit the
+ * global `.chip` recipe (xs radius, hue-tinted text, mono) like the other three
+ * consumers (Projects drill / Session / Block) and every other chip on the
+ * dashboard. Do NOT re-add a pill/white override here — one recipe is the point.
+ * The `.detail-card .drill-bar-row .chip` LAYOUT rule (#261: widened column +
+ * single-line ellipsis) is separate and intentionally stays. */
 
 .tokens-row {
   display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
