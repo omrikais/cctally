@@ -1353,6 +1353,12 @@ export function dispatch(action: Action): void {
       const fresh = defaultPrefs();
       fresh.onboardingToastSeen = seen;
       fresh.mobileOnboardingToastSeen = mobileSeen;
+      // Pin the schema cursor to CURRENT (mirrors RESET_PANEL_ORDER above).
+      // defaultPrefs() ships the current canonical panelOrder but a v1 baseline
+      // cursor, so without this the next reload would re-run the v1→vN migration
+      // over the already-current order and scramble it — post-#264-S2 the v3→v4
+      // step re-collapses the fresh daily/weekly/monthly ids into 'history'.
+      fresh.panelOrderSchemaVersion = CURRENT_PANEL_ORDER_SCHEMA_VERSION;
       // Persist immediately so the preserved flag survives the next reload.
       localStorage.setItem(PREFS_KEY, JSON.stringify(fresh));
       state = {

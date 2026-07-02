@@ -237,6 +237,24 @@ describe('RESET_PREFS preserves onboardingToastSeen, resets panelOrder', () => {
     expect(getState().prefs.panelOrder).toEqual(DEFAULT_PANEL_ORDER);
   });
 
+  it('persists the CURRENT schema cursor so a RELOAD keeps the default order (#264 S2 regression)', () => {
+    // Regression: RESET_PREFS used to persist defaultPrefs()'s v1 baseline cursor
+    // alongside the CURRENT canonical order. On the next load, applyPanelOrderMigration
+    // re-ran v1→v5 over the already-current order — the v3→v4 step re-collapsed the
+    // fresh daily/weekly/monthly ids into 'history', scrambling the reset order.
+    dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
+    dispatch({ type: 'RESET_PREFS' });
+    const raw = JSON.parse(localStorage.getItem('ccusage.dashboard.prefs')!);
+    expect(raw.panelOrderSchemaVersion).toBe(5);
+    expect(raw.panelOrder).toEqual([...DEFAULT_PANEL_ORDER]);
+    // Simulate a page reload: loadInitial re-runs migration + reconcile over the
+    // persisted prefs. With the correct cursor it is a no-op; with the stale v1
+    // cursor it would scramble the order.
+    const reloaded = loadInitialForTests();
+    expect(reloaded.prefs.panelOrder).toEqual(DEFAULT_PANEL_ORDER);
+    expect(reloaded.prefs.panelOrderSchemaVersion).toBe(5);
+  });
+
   it('onboardingToastSeen is preserved', () => {
     dispatch({ type: 'MARK_ONBOARDING_TOAST_SEEN' });
     dispatch({ type: 'RESET_PREFS' });
