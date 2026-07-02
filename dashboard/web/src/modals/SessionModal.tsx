@@ -7,6 +7,8 @@ import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
+import { abbreviateModel } from '../lib/modelName';
+import { ModelCostBars } from './ModelCostBars';
 import { isSingleModel } from '../lib/sessionModel';
 import type { SessionDetail } from '../types/envelope';
 
@@ -176,7 +178,6 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
     else primary.push(p);
   });
 
-  const costTotal = detail.cost_total_usd ?? 0;
   const tokenTiles: Array<[string, number, string | null]> = (
     [
       ['Input', detail.input_tokens, null],
@@ -187,7 +188,6 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
     ] as Array<[string, number | null | undefined, string | null]>
   ).filter((t): t is [string, number, string | null] => t[1] != null);
 
-  const emptyModels = !detail.models || detail.models.length === 0;
   const emptyCost = !detail.cost_per_model || detail.cost_per_model.length === 0;
 
   // SE-2 — a single-model session's "Models" + "Cost by model" sections are
@@ -312,65 +312,33 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
           </span>
         </div>
       ) : (
-        <>
-          {!emptyModels ? (
-            <>
-              <h3 className="m-sec sec-mod">
-                <svg className="icon" aria-hidden="true">
-                  <use href="/static/icons.svg#sparkles" />
-                </svg>
-                Models
-              </h3>
-              <div className="m-chipstrip" id="msess-models">
-                {(detail.models || []).map((m) => (
-                  <span key={m.name} className={'chip ' + modelChipClass(m.name)}>
-                    {m.name}
-                  </span>
-                ))}
-              </div>
-            </>
-          ) : null}
-
-          {!emptyCost ? (
-            <>
-              <h3 className="m-sec sec-costm">
-                <svg className="icon" aria-hidden="true">
-                  <use href="/static/icons.svg#pie-chart" />
-                </svg>
-                Cost by model
-              </h3>
-              <div className="msess-costm">
-                <div className="bar" id="msess-cost-bar">
-                  {(detail.cost_per_model || []).map((c) => {
-                    const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
-                    return (
-                      <div
-                        key={c.model}
-                        className={'seg ' + modelChipClass(c.model)}
-                        style={{ width: pct + '%' }}
-                      />
-                    );
-                  })}
-                </div>
-                <div className="legend" id="msess-cost-legend">
-                  {(detail.cost_per_model || []).map((c) => {
-                    const pct = costTotal > 0 && c.cost_usd != null ? (c.cost_usd / costTotal) * 100 : 0;
-                    return (
-                      <div key={c.model} className="lg">
-                        <span className={'sw ' + modelChipClass(c.model)} />
-                        <span className="name">{c.model}</span>
-                        <span className="v">
-                          {c.cost_usd != null ? '$' + c.cost_usd.toFixed(3) : '—'}
-                        </span>
-                        <span className="pct">{Math.round(pct)}%</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </>
-          ) : null}
-        </>
+        // #260 — multi-model sessions render the shared `ModelCostBars` under a
+        // single "Cost by model" section (History-card / PeriodDetailCard
+        // parity), replacing the former bespoke segmented-bar + legend AND the
+        // now-redundant standalone "Models" chip strip (ModelCostBars already
+        // renders a `modelChipClass` colour chip per model). Session
+        // `cost_per_model` carries only the canonical id, so the friendly short
+        // chip label comes from `abbreviateModel` (matching History's
+        // server-provided `display`); a null cost coerces to 0 for the
+        // relative-to-top bar. Rows already arrive cost-descending from the
+        // server's `model_breakdowns`, satisfying ModelCostBars' rows[0]=max.
+        !emptyCost ? (
+          <>
+            <h3 className="m-sec sec-costm">
+              <svg className="icon" aria-hidden="true">
+                <use href="/static/icons.svg#pie-chart" />
+              </svg>
+              Cost by model
+            </h3>
+            <ModelCostBars
+              rows={(detail.cost_per_model || []).map((c) => ({
+                model: c.model,
+                cost_usd: c.cost_usd ?? 0,
+                label: abbreviateModel(c.model),
+              }))}
+            />
+          </>
+        ) : null
       )}
 
       {paths.length > 0 ? (

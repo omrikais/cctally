@@ -66,7 +66,9 @@ describe('SessionModal localizes timestamps (SE-1)', () => {
 });
 
 // SE-2 — a single-model session collapses "Models" + "Cost by model" into one
-// caption; a multi-model session keeps both sections.
+// caption. #260 — a multi-model session drops the standalone "Models" chip
+// strip and renders the shared `ModelCostBars` under "Cost by model" (History
+// parity); the bespoke segmented bar + legend are gone.
 describe('SessionModal single-model collapse (SE-2)', () => {
   function mountWith(detail: Record<string, unknown>) {
     global.fetch = vi.fn(async (url: string) => {
@@ -92,17 +94,39 @@ describe('SessionModal single-model collapse (SE-2)', () => {
     expect(caption.textContent).toContain('$1.00');
   });
 
-  it('keeps both sections for a multi-model session', async () => {
+  it('drops the Models strip and renders ModelCostBars for a multi-model session (#260)', async () => {
     mountWith({
       ...SESSION_DETAIL,
-      models: [{ name: 'claude-opus-4' }, { name: 'claude-haiku-4' }],
+      models: [
+        { name: 'claude-opus-4-5-20251101' },
+        { name: 'claude-haiku-4-5-20251001' },
+      ],
       cost_per_model: [
-        { model: 'claude-opus-4', cost_usd: 1.0 },
-        { model: 'claude-haiku-4', cost_usd: 0.2 },
+        { model: 'claude-opus-4-5-20251101', cost_usd: 12.3 },
+        { model: 'claude-haiku-4-5-20251001', cost_usd: 2.1 },
       ],
     });
-    await waitFor(() => expect(document.querySelector('.sec-mod')).toBeTruthy());
-    expect(document.querySelector('.sec-costm')).toBeTruthy();
+    await waitFor(() => expect(document.querySelector('.sec-costm')).toBeTruthy());
+    // No single-model caption (multi-model path).
     expect(document.getElementById('msess-model-caption')).toBeNull();
+    // The standalone "Models" chip strip is gone — ModelCostBars carries the chips now.
+    expect(document.querySelector('.sec-mod')).toBeNull();
+    expect(document.getElementById('msess-models')).toBeNull();
+    // The bespoke segmented bar + legend are gone.
+    expect(document.getElementById('msess-cost-bar')).toBeNull();
+    expect(document.getElementById('msess-cost-legend')).toBeNull();
+    // ModelCostBars rendered one drill-bar row per model, cost-descending.
+    const rows = document.querySelectorAll('.drill-bar-row');
+    expect(rows).toHaveLength(2);
+    // Chip labels are the SHORT abbreviateModel form (not the dated canonical id).
+    expect(screen.getByText('opus-4-5')).toBeTruthy();
+    expect(screen.getByText('haiku-4-5')).toBeTruthy();
+    expect(screen.queryByText('claude-opus-4-5-20251101')).toBeNull();
+    // Costs render via fmt.usd2 (2-dec), not the old 3-dec legend.
+    expect(screen.getByText('$12.30')).toBeTruthy();
+    expect(screen.getByText('$2.10')).toBeTruthy();
+    // Top model bar = 100%, second = ~17% (2.1/12.3), relative to the TOP model.
+    const bars = document.querySelectorAll('.drill-bar');
+    expect((bars[0] as HTMLElement).style.getPropertyValue('--w')).toBe('100%');
   });
 });

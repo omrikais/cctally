@@ -418,34 +418,45 @@ describe('<SessionModal />', () => {
     expect(cacheTile?.querySelector('.bar .fill')).not.toBeNull();
   });
 
-  it('renders Models section with chips using model-family classes', async () => {
+  // #260 — the standalone "Models" chip strip was dropped; ModelCostBars (the
+  // shared History/Block/Projects recipe) carries a model-family colour chip
+  // per row, so the chip coverage moved there.
+  it('drops the standalone Models section; ModelCostBars carries family-class chips (#260)', async () => {
     const sid = (fixture as unknown as Envelope).sessions.rows[0].session_id;
     dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: sid });
     render(<SessionModal />);
-    await waitFor(() => expect(document.getElementById('msess-models')).not.toBeNull(), {
+    await waitFor(() => expect(document.querySelector('.sec-costm')).not.toBeNull(), {
       timeout: 1000,
     });
-    const chips = document.querySelectorAll('#msess-models .chip');
+    // The former standalone "Models" chip strip is gone.
+    expect(document.getElementById('msess-models')).toBeNull();
+    expect(document.querySelector('.m-sec.sec-mod')).toBeNull();
+    // ModelCostBars renders one chip per model with the model-family colour class.
+    const chips = document.querySelectorAll('.drill-bar-row .chip');
     expect(chips.length).toBe(2);
     const classes = Array.from(chips).map((c) => c.className);
     expect(classes.some((c) => c.includes('opus'))).toBe(true);
     expect(classes.some((c) => c.includes('haiku'))).toBe(true);
-    // Section header icon
-    expect(document.querySelector('.m-sec.sec-mod svg use')?.getAttribute('href')).toBe('/static/icons.svg#sparkles');
   });
 
-  it('renders Cost by model stacked bar + legend', async () => {
+  it('renders Cost by model via the shared ModelCostBars (#260)', async () => {
     const sid = (fixture as unknown as Envelope).sessions.rows[0].session_id;
     dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: sid });
     render(<SessionModal />);
-    await waitFor(() => expect(document.getElementById('msess-cost-bar')).not.toBeNull(), {
+    await waitFor(() => expect(document.querySelector('.sec-costm')).not.toBeNull(), {
       timeout: 1000,
     });
-    const segs = document.querySelectorAll('#msess-cost-bar .seg');
-    expect(segs.length).toBe(2);
-    const lgs = document.querySelectorAll('#msess-cost-legend .lg');
-    expect(lgs.length).toBe(2);
-    // pie-chart icon on the section header
+    // The bespoke segmented bar + legend are gone.
+    expect(document.getElementById('msess-cost-bar')).toBeNull();
+    expect(document.getElementById('msess-cost-legend')).toBeNull();
+    // One ModelCostBars row per model, short abbreviateModel labels + fmt.usd2
+    // costs (2-dec), cost-descending.
+    const rows = document.querySelectorAll('.drill-bar-row');
+    expect(rows.length).toBe(2);
+    expect(document.body.textContent).toContain('opus-4-5');
+    expect(document.body.textContent).toContain('$0.95');
+    expect(document.body.textContent).toContain('$0.28');
+    // pie-chart icon on the section header (unchanged).
     expect(document.querySelector('.m-sec.sec-costm svg use')?.getAttribute('href')).toBe('/static/icons.svg#pie-chart');
   });
 

@@ -6,7 +6,7 @@ import { Modal } from './Modal';
 import { BlockTimeline } from './BlockTimeline';
 import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
-import { modelChipClass } from '../lib/model';
+import { ModelCostBars } from './ModelCostBars';
 import type { BlockDetail } from '../types/envelope';
 
 // SSE-driven live updates: same lifecycle as SessionModal.tsx — refetch
@@ -144,7 +144,6 @@ function BlockContent({
 }: {
   detail: BlockDetail; generatedAt: string; ctx: FmtCtx;
 }) {
-  const totalCost = detail.cost_usd ?? 0;
   return (
     <div className="modal-content">
       <div className="m-chipstrip">
@@ -258,31 +257,17 @@ function BlockContent({
             </svg>
             Cost by model
           </h3>
-          <div className="msess-costm">
-            <div className="bar">
-              {detail.models.map((m) => {
-                const pct = totalCost > 0 ? (m.cost_usd / totalCost) * 100 : 0;
-                return (
-                  <div key={m.model}
-                       className={'seg ' + modelChipClass(m.model)}
-                       style={{ width: pct + '%' }} />
-                );
-              })}
-            </div>
-            <div className="legend">
-              {detail.models.map((m) => {
-                const pct = totalCost > 0 ? (m.cost_usd / totalCost) * 100 : 0;
-                return (
-                  <div key={m.model} className="lg">
-                    <span className={'sw ' + modelChipClass(m.model)} />
-                    <span className="name">{m.display}</span>
-                    <span className="v">${m.cost_usd.toFixed(2)}</span>
-                    <span className="pct">{Math.round(pct)}%</span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+          {/* #260 — shared ModelCostBars (History / Session / Projects parity),
+              replacing the bespoke segmented bar + legend. `detail.models` is
+              already a cost-descending ModelCostRow[] carrying the friendly
+              `display`, so it maps straight through. */}
+          <ModelCostBars
+            rows={detail.models.map((m) => ({
+              model: m.model,
+              cost_usd: m.cost_usd,
+              label: m.display,
+            }))}
+          />
         </>
       ) : null}
 

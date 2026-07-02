@@ -1239,8 +1239,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 
 /* Section accents */
 .m-sec.sec-tok   { color: var(--accent-green); }    /* Session tokens */
-.m-sec.sec-mod   { color: var(--accent-purple); }   /* Session models */
-.m-sec.sec-costm { color: var(--accent-magenta); }  /* Session cost-by-model */
+.m-sec.sec-costm { color: var(--accent-magenta); }  /* Session + Block cost-by-model */
 .m-sec.sec-src   { color: var(--accent-blue); }     /* Session source files */
 .m-sec.sec-rebuild { color: var(--accent-amber); }  /* Session cache rebuilds */
 .m-sec.sec-prog  { color: var(--accent-green); }    /* CW progress */
@@ -1678,7 +1677,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
 .msess-ts .v { color: var(--accent-cyan); }
 
 /* Section headers — base rules live on .m-sec (shared primitive); accents
-   (.sec-tok / .sec-mod / .sec-costm / .sec-src) also live on .m-sec. */
+   (.sec-tok / .sec-costm / .sec-src) also live on .m-sec. */
 
 /* Tokens tiles */
 .msess-tok-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
@@ -1734,35 +1733,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 1600px; margin: 0 auto;
   font: inherit; font-family: var(--font-mono); font-size: 12.5px;
 }
 
-/* Models chips — reuses panel .chip.opus|sonnet|haiku. Layout comes from
-   the shared .m-chipstrip primitive. No per-modal rules needed. */
-
-/* Cost by model */
-.msess-costm { margin-top: 4px; }
-.msess-costm .bar {
-  display: flex; height: 22px; border-radius: var(--radius-xs); overflow: hidden;
-  background: var(--border-soft);
-}
-.msess-costm .bar .seg { height: 100%; }
-.msess-costm .bar .seg.opus   { background: var(--chip-opus); }
-.msess-costm .bar .seg.sonnet { background: var(--chip-sonnet); }
-.msess-costm .bar .seg.haiku  { background: var(--chip-haiku); }
-.msess-costm .bar .seg.fable  { background: var(--chip-fable); }
-.msess-costm .bar .seg.other  { background: var(--surface-faint); }
-.msess-costm .legend {
-  display: flex; flex-wrap: wrap; gap: 14px 20px;
-  margin-top: 10px; font-size: var(--fs-meta);
-}
-.msess-costm .legend .lg { display: flex; align-items: center; gap: 8px; }
-.msess-costm .legend .sw { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; } /* lint-allow: border-radius data-viz */
-.msess-costm .legend .sw.opus   { background: var(--chip-opus); }
-.msess-costm .legend .sw.sonnet { background: var(--chip-sonnet); }
-.msess-costm .legend .sw.haiku  { background: var(--chip-haiku); }
-.msess-costm .legend .sw.fable  { background: var(--chip-fable); }
-.msess-costm .legend .sw.other  { background: var(--surface-faint); }
-.msess-costm .legend .name { color: var(--text); }
-.msess-costm .legend .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.msess-costm .legend .pct { color: var(--text-dim); font-size: var(--fs-eyebrow); margin-left: 2px; }
+/* #260 — the Session + Block "Cost by model" visuals now render the shared
+   `ModelCostBars` (`.drill-bar-row` / `.drill-bar`, styled under the projects
+   drill section), so the former bespoke `.msess-costm` segmented-bar + legend
+   rules were removed. The standalone Session "Models" chip strip was dropped
+   at the same time (ModelCostBars renders a colour chip per model). */
 
 /* SE-2 — single-model session caption. Replaces the degenerate Models +
    Cost-by-model pair with one line: a model-colored swatch, the label, the
