@@ -1129,6 +1129,32 @@ describe('<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2
     expect(getState().prefs.trendSortOverride).toBeNull(); // CLEAR_TABLE_SORTS applied on Save
   });
 
+  it('a History table-sort override enables the Table-sort reset and Save clears it (S8 #254)', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    render(<SettingsOverlay />);
+    // Only a History override exists — the reset must still enable (it is the
+    // fourth table axis, alongside trend/sessions/projects).
+    act(() =>
+      dispatch({ type: 'SET_TABLE_SORT', table: 'history', override: { column: 'cost_usd', direction: 'asc' } }),
+    );
+    // Dirty a server field so Save is enabled and fires a POST we can await.
+    seedAlertsConfig({ notifier: 'auto' });
+    openSettings();
+    const resetBtn = screen.getByRole('button', { name: /Table column sorting/i });
+    expect(resetBtn).not.toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
+    fireEvent.click(resetBtn);
+    // Deferred: untouched until Save.
+    expect(getState().prefs.historySortOverride).toEqual({ column: 'cost_usd', direction: 'asc' });
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(getState().prefs.historySortOverride).toBeNull(); // CLEAR_TABLE_SORTS applied on Save
+  });
+
   it('Restore view preferences resets the sort field only (narrowed), deferred', () => {
     render(<SettingsOverlay />);
     // Non-default sort saved AND a non-default panelOrder, so narrowing is non-vacuous.

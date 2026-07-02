@@ -51,11 +51,11 @@ describe('<PanelHost />', () => {
     const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     inner.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
-    // #248 — forecast (index 0, a tile) swaps with the NEXT TILE (weekly at
+    // S8 #254 — forecast (index 0, a tile) swaps with the NEXT TILE (blocks at
     // index 4), skipping the intervening wide cards. So forecast lands at
-    // index 4 and weekly at index 0.
+    // index 4 and blocks at index 0.
     expect(getState().prefs.panelOrder[4]).toBe('forecast');
-    expect(getState().prefs.panelOrder[0]).toBe('weekly');
+    expect(getState().prefs.panelOrder[0]).toBe('blocks');
   });
 
   it('a quick click on the inner panel still opens its modal', async () => {

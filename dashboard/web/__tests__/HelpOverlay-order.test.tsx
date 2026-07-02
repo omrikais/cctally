@@ -25,13 +25,13 @@ async function open(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('<HelpOverlay /> reflects panelOrder', () => {
-  it('renders all 10 number keys with their default labels', async () => {
+  it('renders all 8 number keys with their default labels', async () => {
     const user = userEvent.setup();
     render(<HelpOverlay />);
     await open(user);
-    // #248 — 'Current Week' left the grid (it is the HeroStrip); the 10 grid
-    // labels remain (with 'Cache Report' at the tail).
-    for (const label of ['Forecast', 'Trend', 'Sessions', 'Projects', 'Weekly', 'Monthly', 'Blocks', 'Daily', 'Recent alerts', 'Cache Report']) {
+    // S8 #254 — weekly/monthly/daily collapsed into the single 'History'
+    // card; the grid is now 8 labels (Cache Report at the tail).
+    for (const label of ['Forecast', 'Trend', 'Sessions', 'Projects', 'Blocks', 'History', 'Recent alerts', 'Cache Report']) {
       expect(screen.getByText(`Open ${label} modal`)).toBeTruthy();
     }
   });

@@ -3,9 +3,9 @@ import { ForecastPanel } from '../panels/ForecastPanel';
 import { TrendPanel } from '../panels/TrendPanel';
 import { SessionsPanel } from '../panels/SessionsPanel';
 import { ProjectsPanel } from '../panels/ProjectsPanel';
-import { WeeklyPanel } from '../panels/WeeklyPanel';
-import { MonthlyPanel } from '../panels/MonthlyPanel';
 import { BlocksPanel } from '../panels/BlocksPanel';
+// S8 (#254): the DailyPanel heatmap is the grid card for the consolidated
+// History modal (relabeled "History"); WeeklyPanel/MonthlyPanel left the grid.
 import { DailyPanel } from '../panels/DailyPanel';
 import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
 import { CacheReportPanel } from '../panels/CacheReportPanel';
@@ -57,29 +57,20 @@ export const PANEL_REGISTRY: Record<GridPanelId, PanelDef> = {
     Component: ProjectsPanel,
     openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'projects' }),
   },
-  weekly: {
-    id: 'weekly',
-    label: 'Weekly',
-    Component: WeeklyPanel,
-    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' }),
-  },
-  monthly: {
-    id: 'monthly',
-    label: 'Monthly',
-    Component: MonthlyPanel,
-    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' }),
-  },
   blocks: {
     id: 'blocks',
     label: 'Blocks',
     Component: BlocksPanel,
     openAction: openActiveOrNewestBlockModal,
   },
-  daily: {
-    id: 'daily',
-    label: 'Daily',
+  // S8 (#254): the single History card — the relabeled Daily heatmap. Its
+  // openAction opens the consolidated History modal (default period); a
+  // heatmap-cell click deep-links to that day via OPEN_MODAL { dailyDate }.
+  history: {
+    id: 'history',
+    label: 'History',
     Component: DailyPanel,
-    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }),
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }),
   },
   alerts: {
     id: 'alerts',

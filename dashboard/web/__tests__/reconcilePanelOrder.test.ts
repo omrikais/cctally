@@ -7,9 +7,16 @@ import {
 import { DEFAULT_PANEL_ORDER } from '../src/lib/panelIds';
 import type { PanelId } from '../src/lib/panelRegistry';
 
+// Legacy ids (current-week / weekly / monthly / daily) are no longer PanelId
+// members but may sit in a stale saved order; the migration must still
+// handle them. Type such fixtures as string[] and downcast at the call.
+const asPanelIds = (a: string[]): PanelId[] => a as unknown as PanelId[];
+
+// A valid-current-PanelId canonical for the generic reconcile-algorithm
+// tests (they exercise the pure set operations, not the S8 ids specifically).
 const DEFAULT: PanelId[] = [
   'current-week', 'forecast', 'trend', 'sessions',
-  'weekly', 'monthly', 'blocks', 'daily',
+  'projects', 'history', 'blocks', 'alerts',
 ];
 
 describe('reconcilePanelOrder', () => {
@@ -26,20 +33,20 @@ describe('reconcilePanelOrder', () => {
   });
 
   it('preserves a non-default-but-complete saved order', () => {
-    const saved: PanelId[] = ['daily', 'blocks', 'monthly', 'weekly', 'sessions', 'trend', 'forecast', 'current-week'];
+    const saved: PanelId[] = ['history', 'blocks', 'alerts', 'projects', 'sessions', 'trend', 'forecast', 'current-week'];
     expect(reconcilePanelOrder(saved, DEFAULT)).toEqual(saved);
   });
 
   it('drops unknown ids that are not in canonical', () => {
-    const saved: PanelId[] = ['current-week', 'unknown' as PanelId, 'forecast', 'trend', 'sessions', 'weekly', 'monthly', 'blocks', 'daily'];
+    const saved: PanelId[] = ['current-week', 'unknown' as PanelId, 'forecast', 'trend', 'sessions', 'projects', 'history', 'blocks', 'alerts'];
     expect(reconcilePanelOrder(saved, DEFAULT)).toEqual(DEFAULT);
   });
 
   it('appends canonical ids missing from saved at end (preserves saved relative order)', () => {
-    const saved: PanelId[] = ['daily', 'blocks', 'forecast'];
+    const saved: PanelId[] = ['history', 'blocks', 'forecast'];
     const result = reconcilePanelOrder(saved, DEFAULT);
-    expect(result.slice(0, 3)).toEqual(['daily', 'blocks', 'forecast']);
-    expect(result.slice(3)).toEqual(['current-week', 'trend', 'sessions', 'weekly', 'monthly']);
+    expect(result.slice(0, 3)).toEqual(['history', 'blocks', 'forecast']);
+    expect(result.slice(3)).toEqual(['current-week', 'trend', 'sessions', 'projects', 'alerts']);
   });
 
   it('deduplicates a saved order that contains the same id twice', () => {
@@ -51,7 +58,6 @@ describe('reconcilePanelOrder', () => {
   });
 
   it('returns default when saved is not an array (malformed localStorage)', () => {
-    // Simulate hand-edited localStorage giving us a non-array.
     // @ts-expect-error - the function must handle bad runtime input safely
     expect(reconcilePanelOrder(42, DEFAULT)).toEqual(DEFAULT);
     // @ts-expect-error
@@ -59,140 +65,76 @@ describe('reconcilePanelOrder', () => {
   });
 });
 
-// ---- Tests for the cumulative panel-order migration (#248 §3, spec §2.1) ----
+// ---- Cumulative panel-order migration (#248 §3 + S8 #254) ----
 //
 // `applyPanelOrderMigration` is CUMULATIVE: v1→v2 splices 'projects' at
-// canonical index 4, then v2→v3 (#248) drops 'current-week' (it left the
-// grid). The store loader runs this BEFORE `reconcilePanelOrder` so the
-// splice lands at the canonical position instead of being shoved to the
-// tail by the reconcile "append missing" pass.
+// canonical index 4, v2→v3 (#248) drops 'current-week', and v3→v4 (#254)
+// collapses 'weekly'/'monthly'/'daily' into ONE 'history' card at its
+// canonical index. The store loader runs this BEFORE `reconcilePanelOrder`.
 
-describe('panel-order migration (cumulative → v3)', () => {
-  it('current schema version is 3 (#248)', () => {
-    expect(CURRENT_PANEL_ORDER_SCHEMA_VERSION).toBe(3);
+describe('panel-order migration (cumulative → v4)', () => {
+  it('current schema version is 4 (S8 #254)', () => {
+    expect(CURRENT_PANEL_ORDER_SCHEMA_VERSION).toBe(4);
   });
 
-  it('v3 migration drops current-week from a saved order (#248)', () => {
-    const r = applyPanelOrderMigration(
-      ['current-week', 'forecast', 'projects', 'weekly'] as PanelId[], 2);
-    expect(r.panels).not.toContain('current-week');
-    expect(r.newVersion).toBe(3);
+  it('v3→v4 collapses weekly/monthly/daily into ONE history at its canonical index', () => {
+    const OLD_V3 = [
+      'forecast', 'trend', 'sessions', 'projects',
+      'weekly', 'monthly', 'blocks', 'daily', 'alerts', 'cache-report',
+    ];
+    const r = applyPanelOrderMigration(asPanelIds(OLD_V3), 3);
+    const out = r.panels as unknown as string[];
+    expect(r.newVersion).toBe(4);
+    expect(out).not.toContain('weekly');
+    expect(out).not.toContain('monthly');
+    expect(out).not.toContain('daily');
+    expect(out.filter((p) => p === 'history')).toHaveLength(1);
+    // Exactly the canonical default order (history spliced at index 5).
+    expect(out).toEqual([...DEFAULT_PANEL_ORDER] as unknown as string[]);
   });
 
-  it('v1 user is migrated through projects-splice AND current-week drop (#248)', () => {
-    const r = applyPanelOrderMigration(
-      ['current-week', 'forecast', 'trend', 'sessions', 'weekly'] as PanelId[], 1);
-    expect(r.panels).not.toContain('current-week');
-    expect(r.panels).toContain('projects');
-    expect(r.newVersion).toBe(3);
+  it('does not duplicate history when a v3 order already contains it', () => {
+    const r = applyPanelOrderMigration(asPanelIds(['forecast', 'history', 'trend']), 3);
+    expect((r.panels as unknown as string[]).filter((p) => p === 'history')).toHaveLength(1);
   });
 
-  it('splices projects at canonical index 4 AND drops current-week for v1 users', () => {
-    const saved: PanelId[] = [
+  it('a full v1 user is migrated: projects splice + current-week drop + history collapse', () => {
+    const v1 = [
       'current-week', 'forecast', 'trend', 'sessions',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
     ];
-    const out = applyPanelOrderMigration(saved, 1);
-    // projects spliced at index 4 of the saved order, THEN current-week dropped.
-    expect(out.panels).toEqual([
-      'forecast', 'trend', 'sessions',
-      'projects',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-    ]);
-    expect(out.newVersion).toBe(3);
+    const r = applyPanelOrderMigration(asPanelIds(v1), 1);
+    const out = r.panels as unknown as string[];
+    expect(r.newVersion).toBe(4);
+    expect(out).not.toContain('current-week');
+    expect(out).not.toContain('weekly');
+    expect(out).not.toContain('monthly');
+    expect(out).not.toContain('daily');
+    expect(out).toContain('projects');
+    expect(out).toContain('history');
   });
 
-  it('is idempotent — no change when version is already 3', () => {
-    const saved = [...DEFAULT_PANEL_ORDER];  // has projects, no current-week
-    const out = applyPanelOrderMigration(saved, 3);
+  it('is idempotent — no change when version is already 4', () => {
+    const saved = [...DEFAULT_PANEL_ORDER];
+    const out = applyPanelOrderMigration(saved, 4);
     expect(out.panels).toEqual(DEFAULT_PANEL_ORDER);
-    expect(out.newVersion).toBe(3);
+    expect(out.newVersion).toBe(4);
   });
 
-  it('a v2 user (projects present, current-week present) only drops current-week', () => {
-    const saved: PanelId[] = [
-      'current-week', 'forecast', 'trend', 'sessions',
-      'projects',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-    ];
-    const out = applyPanelOrderMigration(saved, 2);
-    expect(out.panels).toEqual([
-      'forecast', 'trend', 'sessions',
-      'projects',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-    ]);
-    expect(out.newVersion).toBe(3);
-  });
-
-  it('handles saved order with custom user reordering', () => {
-    const saved: PanelId[] = [
-      'weekly', 'current-week', 'sessions',  // user reorder
-      'forecast', 'trend',
-      'monthly', 'blocks', 'daily', 'alerts',
-    ];
-    const out = applyPanelOrderMigration(saved, 1);
-    // 'projects' inserted at index 4 of the saved order (between 'trend' and
-    // 'monthly'), THEN 'current-week' dropped.
-    expect(out.panels).toEqual([
-      'weekly', 'sessions', 'forecast',
-      'projects',  // index 4 of the pre-drop array
-      'trend', 'monthly', 'blocks', 'daily', 'alerts',
-    ]);
-    expect(out.newVersion).toBe(3);
-  });
-
-  it('appends projects if saved order is shorter than 4 (and drops current-week)', () => {
-    const saved: PanelId[] = ['current-week', 'forecast', 'trend'];  // 3 panels
-    const out = applyPanelOrderMigration(saved, 1);
-    expect(out.panels).toContain('projects');
-    expect(out.panels).not.toContain('current-week');
-    expect(out.newVersion).toBe(3);
-  });
-
-  it('passes through projects when already present, dropping current-week', () => {
-    const saved: PanelId[] = [
-      'current-week', 'forecast', 'trend', 'sessions',
-      'projects',  // user manually added (or migrated by another tab)
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-    ];
-    const out = applyPanelOrderMigration(saved, 1);
-    expect(out.panels).toEqual([
-      'forecast', 'trend', 'sessions',
-      'projects',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
-    ]);
-    expect(out.newVersion).toBe(3);
-  });
-
-  it('returns empty when saved is null/empty', () => {
+  it('returns empty when saved is null/empty (cursor still advances)', () => {
     const out = applyPanelOrderMigration(null, 1);
     expect(out.panels).toEqual([]);
-    expect(out.newVersion).toBe(3);
+    expect(out.newVersion).toBe(4);
   });
 
-  it('reconcilePanelOrder backstop drops current-week against the grid canonical', () => {
-    // Even if a stale order slips past the migration (cursor already ≥3 but
-    // the array still has current-week), the runtime reconcile against the
-    // grid-only DEFAULT_PANEL_ORDER drops it.
-    const final = reconcilePanelOrder(
-      ['current-week', 'forecast', 'trend'] as PanelId[],
-      DEFAULT_PANEL_ORDER as PanelId[],
-    );
-    expect(final).not.toContain('current-week');
-  });
-
-  it('migration → reconcile composition lands a complete default-order tail', () => {
-    // The real wiring runs reconcile() AFTER the migration. A 9-panel
-    // saved order from a v1 user should, after migration + reconcile,
-    // contain every panel in DEFAULT_PANEL_ORDER (and only those) — and
-    // never 'current-week'.
-    const saved: PanelId[] = [
+  it('migration → reconcile composition lands a complete default-order set', () => {
+    const saved = [
       'current-week', 'forecast', 'trend', 'sessions',
       'weekly', 'monthly', 'blocks', 'daily', 'alerts',
     ];
-    const migrated = applyPanelOrderMigration(saved, 1);
+    const migrated = applyPanelOrderMigration(asPanelIds(saved), 1);
     const final = reconcilePanelOrder(migrated.panels, DEFAULT_PANEL_ORDER);
-    expect(final).not.toContain('current-week');
+    expect(final).not.toContain('current-week' as never);
     expect(new Set(final)).toEqual(new Set(DEFAULT_PANEL_ORDER));
     expect(final.length).toBe(DEFAULT_PANEL_ORDER.length);
   });

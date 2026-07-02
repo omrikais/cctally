@@ -107,7 +107,7 @@ describe('<DailyPanel />', () => {
   });
 });
 
-describe('<DailyPanel /> click handlers (Daily modal entry points)', () => {
+describe('<DailyPanel /> click handlers (History modal entry points)', () => {
   beforeEach(() => {
     _resetForTests();
     updateSnapshot(fixture as unknown as Envelope);
@@ -120,7 +120,7 @@ describe('<DailyPanel /> click handlers (Daily modal entry points)', () => {
     expect(cell).not.toBeNull();
     await user.click(cell);
     const s = getState();
-    expect(s.openModal).toBe('daily');
+    expect(s.openModal).toBe('history');
     expect(s.openDailyDate).toBe('2026-04-26');
   });
 
@@ -131,7 +131,7 @@ describe('<DailyPanel /> click handlers (Daily modal entry points)', () => {
     expect(peakBtn).not.toBeNull();
     await user.click(peakBtn);
     const s = getState();
-    expect(s.openModal).toBe('daily');
+    expect(s.openModal).toBe('history');
     expect(s.openDailyDate).toBe('2026-04-26');
   });
 

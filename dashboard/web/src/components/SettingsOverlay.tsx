@@ -595,7 +595,7 @@ export function SettingsOverlay() {
     if (filterDirty) dispatch({ type: 'SET_FILTER', text: filter });
     // Clear the sessions header-click override only when the saved Sort default
     // actually changed (so it can take effect) OR when a table-sort reset is
-    // staged. CLEAR_TABLE_SORTS below already clears all three overrides, so
+    // staged. CLEAR_TABLE_SORTS below already clears all four overrides, so
     // this is redundant-but-harmless when table-sort is staged, and required
     // when only the sort default changed.
     if (sortDirty || resetTableSortStaged) {
@@ -622,9 +622,11 @@ export function SettingsOverlay() {
     safePerPage === viewPrefDefaults.sessionsPerPage &&
     filter === '';
   // The "Table column sorting" reset is only meaningful when SOME table has a
-  // column-click override — check all three (trend + sessions + projects).
+  // column-click override — check all four (trend + sessions + projects +
+  // history; the History Weekly/Monthly table is the fourth axis, S8 #254).
   const tableSortHasOverride =
-    !!prefs.trendSortOverride || !!prefs.sessionsSortOverride || !!prefs.projectsSortOverride;
+    !!prefs.trendSortOverride || !!prefs.sessionsSortOverride ||
+    !!prefs.projectsSortOverride || !!prefs.historySortOverride;
   // "Card order" reset is only meaningful when the panel order differs from the
   // canonical default — gate the toggle the same way as the other two restores
   // so it can't stage a no-op reset (a phantom "1 change" + pointless

@@ -35,47 +35,56 @@ afterEach(() => {
 });
 
 describe('<HelpOverlay /> positional hotkey rule', () => {
-  it('renders <kbd>1..9</kbd> for positions 1..9 and <kbd>0</kbd> for position 10', () => {
+  it('renders <kbd>1..8</kbd> for positions 1..8 (S8 collapsed the grid to 8 cards)', () => {
     render(<HelpOverlay />);
     openHelp();
-    // #248 — DEFAULT_PANEL_ORDER has exactly 10 grid entries (current-week
-    // left the grid for the HeroStrip), so every panel row gets a digit
-    // 1..9 / 0 and there is no ≥11 em-dash row.
+    // S8 #254 — DEFAULT_PANEL_ORDER has exactly 8 grid entries (weekly/
+    // monthly/daily collapsed into the single History card), so every panel
+    // row gets a digit 1..8 — no '9', no '0' (position 10), no ≥11 em-dash.
     const kbds = screen.getAllByText(
       (_, el) => el?.tagName === 'KBD',
     );
     // We don't compare the full set (the table includes 'r', 's', '?',
-    // 'Esc', 'Shift', '↑', '↓' etc.); just check that the digit keys are
-    // exactly 1..9, 0 — none of them say "10" or "11".
+    // 'Esc', 'Shift', '↑', '↓', '←', '→' etc.); just check the digit keys.
     const digitKbds = kbds.filter((k) => /^(0|[1-9])$/.test(k.textContent ?? ''));
     const digitLabels = digitKbds.map((k) => k.textContent).sort();
     expect(digitLabels).toEqual(
-      ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'].sort(),
+      ['1', '2', '3', '4', '5', '6', '7', '8'].sort(),
     );
-    // And no <kbd>10</kbd> / <kbd>11</kbd> anywhere.
+    // And no <kbd>0</kbd> / <kbd>9</kbd> / <kbd>10</kbd> / <kbd>11</kbd>.
+    expect(kbds.find((k) => k.textContent === '0')).toBeUndefined();
+    expect(kbds.find((k) => k.textContent === '9')).toBeUndefined();
     expect(kbds.find((k) => k.textContent === '10')).toBeUndefined();
-    expect(kbds.find((k) => k.textContent === '11')).toBeUndefined();
   });
 
-  it('renders exactly 10 panel rows (no ≥11 em-dash row) for the grid order', () => {
+  it('renders exactly 8 panel rows (no ≥11 em-dash row) for the grid order', () => {
     render(<HelpOverlay />);
     openHelp();
-    // #248 — the grid order is exactly 10 long, so the positional ≥11
-    // em-dash branch (still present in HelpOverlay.tsx as a defensive guard
-    // for a future 11th panel) is dormant: every panel row carries a digit.
+    // S8 #254 — the grid order is exactly 8 long: every panel row carries a
+    // digit 1..8; the positional ≥11 em-dash branch stays dormant.
     const table = document.querySelector('#help-overlay table');
     expect(table).not.toBeNull();
     const rows = Array.from(table?.querySelectorAll('tbody > tr') ?? []);
-    // The first 10 rows are the panel slots; each has a <kbd> in its first cell.
-    for (let i = 0; i < 10; i++) {
+    // The first 8 rows are the panel slots; each has a <kbd> in its first cell.
+    for (let i = 0; i < 8; i++) {
       const firstCell = rows[i]?.querySelector('td');
       expect(firstCell?.querySelector('kbd'), `panel row ${i + 1} should carry a digit kbd`).not.toBeNull();
     }
     // No panel row renders the em-dash placeholder.
     const emDashCells = rows
-      .slice(0, 10)
+      .slice(0, 8)
       .filter((r) => r.querySelector('td')?.textContent === '—');
     expect(emDashCells).toHaveLength(0);
+  });
+
+  it('documents the History-modal period/toggle keys in the hand-written rows', () => {
+    render(<HelpOverlay />);
+    openHelp();
+    // The one hand-written ↑/↓ row now reads "History modal" (not the three
+    // legacy Weekly/Monthly/Daily modals), and a ←/→ toggle row is present.
+    expect(screen.getByText(/Select period \(History modal\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Switch Day \/ Week \/ Month/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Weekly\/Monthly\/Daily modal/i)).toBeNull();
   });
 });
 

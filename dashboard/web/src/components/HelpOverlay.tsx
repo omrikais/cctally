@@ -72,7 +72,8 @@ function KeyTable({ panelOrder }: KeyTableProps) {
             stay hand-written and are excluded from the coverage assertion. */}
         <tr><td>Hold + drag a card</td><td>rearrange the dashboard</td></tr>
         <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd></td><td>swap focused card with neighbor</td></tr>
-        <tr><td><kbd>↑</kbd>/<kbd>↓</kbd></td><td>Select period (Weekly/Monthly/Daily modal)</td></tr>
+        <tr><td><kbd>↑</kbd>/<kbd>↓</kbd></td><td>Select period (History modal)</td></tr>
+        <tr><td><kbd>←</kbd>/<kbd>→</kbd></td><td>Switch Day / Week / Month (History modal)</td></tr>
       </tbody>
     </table>
   );

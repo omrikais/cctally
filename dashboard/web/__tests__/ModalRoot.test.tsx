@@ -39,23 +39,12 @@ describe('<ModalRoot />', () => {
     uninstallGlobalKeydown();
   });
 
-  it('renders WeeklyModal when openModal=weekly', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+  it('renders the HistoryModal when openModal=history (S8 #254 — one modal replaces Daily/Weekly/Monthly)', () => {
+    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
     render(<ModalRoot />);
-    expect(screen.getByText(/weekly history · last 12/i)).toBeInTheDocument();
-  });
-
-  it('renders MonthlyModal when openModal=monthly', () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
-    render(<ModalRoot />);
-    expect(screen.getByText(/monthly history · last 12/i)).toBeInTheDocument();
-  });
-
-  it('renders DailyModal when openModal === "daily"', () => {
-    _resetForTests();
-    updateSnapshot(fixture as unknown as Envelope);
-    dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
-    render(<ModalRoot />);
-    expect(screen.getByText(/daily history · last 30/i)).toBeInTheDocument();
+    // The consolidated History modal always renders its Day·Week·Month
+    // radiogroup toggle, whatever period/dataset is active.
+    expect(screen.getByRole('radiogroup', { name: /history period/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Day' })).toBeInTheDocument();
   });
 });

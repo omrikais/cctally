@@ -33,45 +33,35 @@ describe('<HelpOverlay />', () => {
     expect(card).not.toBeNull();
     // h2 "Keybindings"
     expect(card?.querySelector('h2')?.textContent).toBe('Keybindings');
-    // 25 table rows: 10 panel keys (1-9 + 0 for position 10 — #248 removed
-    // 'current-week' from the grid, so the order is exactly 10 long with no
-    // ≥11 em-dash row) + 12 data-driven HELP_ROWS single-key rows (#207 D1:
-    // r, s, d, S, B, f, /, c, n/N, q, ?, Esc) + 3 combo/gesture rows
-    // (Hold+drag, Shift+arrows, ↑/↓).
+    // 24 table rows: 8 panel keys (1-8 — S8 #254 collapsed weekly/monthly/
+    // daily into one History card, so the grid order is exactly 8 long) +
+    // 12 data-driven HELP_ROWS single-key rows (#207 D1: r, s, d, S, B, f, /,
+    // c, n/N, q, ?, Esc) + 4 combo/gesture rows (Hold+drag, Shift+arrows,
+    // ↑/↓ select period, ←/→ switch Day/Week/Month).
     const rows = card?.querySelectorAll('table tr');
-    expect(rows?.length).toBe(25);
+    expect(rows?.length).toBe(24);
     // Meta line with server URL
     const meta = card?.querySelector('p.meta');
     expect(meta?.textContent).toMatch(/cctally/);
     expect(meta?.querySelector('#help-server-url')).not.toBeNull();
   });
 
-  it('lists the 5 -> Weekly binding', async () => {
+  it('lists the History modal binding (S8 #254 — one card replaces Weekly/Monthly/Daily)', async () => {
     render(<HelpOverlay />);
     const user = userEvent.setup();
     await user.keyboard('?');
-    expect(screen.getByText(/open weekly modal/i)).toBeInTheDocument();
+    expect(screen.getByText(/open history modal/i)).toBeInTheDocument();
+    // The three legacy period cards are gone from the grid → no rows for them.
+    expect(screen.queryByText(/open weekly modal/i)).toBeNull();
+    expect(screen.queryByText(/open monthly modal/i)).toBeNull();
+    expect(screen.queryByText(/open daily modal/i)).toBeNull();
   });
 
-  it('lists the 6 -> Monthly binding', async () => {
-    render(<HelpOverlay />);
-    const user = userEvent.setup();
-    await user.keyboard('?');
-    expect(screen.getByText(/open monthly modal/i)).toBeInTheDocument();
-  });
-
-  it('lists the 7 -> Blocks binding', async () => {
+  it('lists the Blocks modal binding', async () => {
     render(<HelpOverlay />);
     const user = userEvent.setup();
     await user.keyboard('?');
     expect(screen.getByText(/open blocks modal/i)).toBeInTheDocument();
-  });
-
-  it('lists the 8 → Daily modal binding', async () => {
-    render(<HelpOverlay />);
-    const user = userEvent.setup();
-    await user.keyboard('?');
-    expect(screen.getByText(/open daily modal/i)).toBeInTheDocument();
   });
 
   it('lists the up/down select-period binding', async () => {
@@ -81,21 +71,23 @@ describe('<HelpOverlay />', () => {
     expect(screen.getByText(/select period/i)).toBeInTheDocument();
   });
 
-  it('renders 0 as the 10th panel shortcut (not "10")', async () => {
+  it('renders exactly 8 panel-digit shortcuts 1..8 (S8 #254 — no 0/9/10)', async () => {
     render(<HelpOverlay />);
     const user = userEvent.setup();
     await user.keyboard('?');
-    // First 10 panel-row <kbd>s should read '1'..'9' then '0' (per
-    // main.tsx's '0' → openPanelByPosition(10) binding).
+    // The 8-card grid binds digits 1..8; there is no position 9/10, so no
+    // '9' and no '0' (the former position-10 key).
     const kbds = Array.from(document.querySelectorAll('table kbd'))
       .map((el) => el.textContent)
       .filter((t): t is string => !!t)
-      .slice(0, 10);
-    expect(kbds).toEqual(['1','2','3','4','5','6','7','8','9','0']);
-    // No "10" anywhere — would point at an unbound key.
-    const tens = Array.from(document.querySelectorAll('table kbd'))
-      .filter((el) => el.textContent === '10');
-    expect(tens).toHaveLength(0);
+      .slice(0, 8);
+    expect(kbds).toEqual(['1','2','3','4','5','6','7','8']);
+    // No "0" / "9" / "10" digit-kbd anywhere — would point at an unbound key.
+    for (const stray of ['0', '9', '10']) {
+      expect(
+        Array.from(document.querySelectorAll('table kbd')).filter((el) => el.textContent === stray),
+      ).toHaveLength(0);
+    }
   });
 
   it('lists a Projects modal binding (4 → Projects in default order)', async () => {

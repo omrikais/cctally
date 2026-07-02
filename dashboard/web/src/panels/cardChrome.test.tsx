@@ -9,8 +9,6 @@ import { render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { TrendPanel } from './TrendPanel';
 import { ForecastPanel } from './ForecastPanel';
-import { WeeklyPanel } from './WeeklyPanel';
-import { MonthlyPanel } from './MonthlyPanel';
 import { DailyPanel } from './DailyPanel';
 import { BlocksPanel } from './BlocksPanel';
 import { SessionsPanel } from './SessionsPanel';
@@ -55,12 +53,12 @@ beforeEach(() => {
 // CacheReport is deliberately excluded — it still pins an inline accent color
 // on its error-state <h2> and is outside the S1 de-color set. #248 — Current
 // Week left the grid (it is the HeroStrip now), so it is no longer in this set.
+// S8 (#254) — Weekly/Monthly left the grid; the Daily heatmap card is
+// relabeled "History" (it is the grid entry for the consolidated modal).
 const PANELS: Array<[string, ComponentType]> = [
   ['Trend', TrendPanel],
   ['Forecast', ForecastPanel],
-  ['Weekly', WeeklyPanel],
-  ['Monthly', MonthlyPanel],
-  ['Daily', DailyPanel],
+  ['History', DailyPanel],
   ['Blocks', BlocksPanel],
   ['Sessions', SessionsPanel],
   ['Recent Alerts', RecentAlertsPanel],
@@ -90,12 +88,15 @@ describe('#247 S1 card-chrome contract', () => {
 //   • share icon (`.share-icon`, from components/ShareIcon.tsx) is present
 //     IFF the panel id is in the share-capable set (`SharePanelId` in
 //     share/types.ts, mirrored by `SHARE_CAPABLE_PANELS` in
-//     bin/_lib_share_templates.py): trend, weekly, daily, monthly, blocks,
-//     forecast, sessions, projects (8 grid panels). NOT alerts/cache-report.
+//     bin/_lib_share_templates.py): trend, history, blocks, forecast,
+//     sessions, projects (6 grid panels post-S8). NOT alerts/cache-report.
 //     (current-week is share-capable too but #248 removed it from the grid —
-//     it shares via the HeroStrip / Current Week modal.)
+//     it shares via the HeroStrip / Current Week modal. S8 #254 collapsed
+//     the weekly/monthly/daily tiles into the single "History" heatmap card,
+//     which shares the daily view.)
 //   • collapse toggle (`.panel-collapse-toggle`) is present IFF the panel has
-//     a `*Collapsed` pref in store/store.ts: sessions, blocks, daily, alerts (4).
+//     a `*Collapsed` pref in store/store.ts: sessions, blocks, history
+//     (dailyCollapsed), alerts (4).
 //
 // The expected booleans below are the ground truth DERIVED from those two
 // sources — if a panel's rendered affordances stop matching this grammar,
@@ -103,9 +104,7 @@ describe('#247 S1 card-chrome contract', () => {
 const AFFORDANCE_GRAMMAR: Array<[string, ComponentType, boolean, boolean]> = [
   // [panel id, Component, shareable, collapsible]
   ['trend', TrendPanel, true, false],
-  ['weekly', WeeklyPanel, true, false],
-  ['daily', DailyPanel, true, true],
-  ['monthly', MonthlyPanel, true, false],
+  ['history', DailyPanel, true, true],
   ['blocks', BlocksPanel, true, true],
   ['forecast', ForecastPanel, true, false],
   ['sessions', SessionsPanel, true, true],
@@ -114,7 +113,7 @@ const AFFORDANCE_GRAMMAR: Array<[string, ComponentType, boolean, boolean]> = [
   ['cache-report', CacheReportPanel, false, false],
 ];
 
-describe('#247 S1 uniform header affordance grammar (acceptance #6 — 10 grid panels)', () => {
+describe('#247 S1 uniform header affordance grammar (acceptance #6 — 8 grid panels)', () => {
   // The base envelope (no cache_report field) renders CacheReportPanel in its
   // loading branch, which — like every cache-report state — carries neither a
   // share icon nor a collapse toggle, so [false, false] holds without a
@@ -134,13 +133,13 @@ describe('#247 S1 uniform header affordance grammar (acceptance #6 — 10 grid p
     },
   );
 
-  // Guards the table itself: exactly 8 share-capable and 4 collapsible GRID
-  // panels (#248 removed current-week from the grid: share-capable went 9→8,
-  // total 11→10). A drift in either count means a panel silently gained/lost
-  // an affordance.
-  it('covers all 10 grid panels with 8 share-capable and 4 collapsible', () => {
-    expect(AFFORDANCE_GRAMMAR.length).toBe(10);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(8);
+  // Guards the table itself: exactly 6 share-capable and 4 collapsible GRID
+  // panels (S8 #254 collapsed weekly/monthly/daily → one History card:
+  // total 10→8, share-capable 8→6). A drift in either count means a panel
+  // silently gained/lost an affordance.
+  it('covers all 8 grid panels with 6 share-capable and 4 collapsible', () => {
+    expect(AFFORDANCE_GRAMMAR.length).toBe(8);
+    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(6);
     expect(AFFORDANCE_GRAMMAR.filter(([, , , c]) => c).length).toBe(4);
   });
 });

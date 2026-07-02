@@ -2,15 +2,17 @@ import { describe, it, expect } from 'vitest';
 import { PANEL_REGISTRY, DEFAULT_PANEL_ORDER } from '../src/lib/panelRegistry';
 
 describe('panelRegistry', () => {
-  it('DEFAULT_PANEL_ORDER has all 10 grid ids in canonical order', () => {
+  it('DEFAULT_PANEL_ORDER has all 8 grid ids in canonical order', () => {
     // 'projects' lands at index 3 (spec §2.1) — guarded by
     // applyPanelOrderMigration so v1 users get the same splice.
     // 'cache-report' lands at the tail per spec 2026-05-21 Task B3.
     // #248 — 'current-week' left the grid (it is the HeroStrip now).
+    // S8 #254 — 'weekly'/'monthly'/'daily' collapsed into one 'history' card
+    // at index 5 (the former daily heatmap slot among the wide cards).
     expect(DEFAULT_PANEL_ORDER).toEqual([
       'forecast', 'trend', 'sessions',
       'projects',
-      'weekly', 'monthly', 'blocks', 'daily', 'alerts',
+      'blocks', 'history', 'alerts',
       'cache-report',
     ]);
   });

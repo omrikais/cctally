@@ -17,9 +17,9 @@ beforeEach(() => {
   updateSnapshot(SNAP);
 });
 
-// Default grid order (#248 — current-week left the grid): forecast(1),
-// trend(2), sessions(3), projects(4), weekly(5), monthly(6), blocks(7),
-// daily(8), alerts(9), cache-report(10).
+// Default grid order (S8 #254 — weekly/monthly/daily collapsed to history):
+// forecast(1), trend(2), sessions(3), projects(4), blocks(5), history(6),
+// alerts(7), cache-report(8).
 describe('openPanelByPosition', () => {
   it('opens the panel currently at position 1 (1-indexed)', () => {
     openPanelByPosition(1);
@@ -42,13 +42,13 @@ describe('openPanelByPosition', () => {
     expect(getState().openModal).toBeNull();
   });
 
-  it('opens the panel currently at position 8 (daily in the default order)', () => {
-    openPanelByPosition(8);
-    expect(getState().openModal).toBe('daily');
+  it('opens the panel currently at position 6 (history in the default order)', () => {
+    openPanelByPosition(6);
+    expect(getState().openModal).toBe('history');
   });
 
-  it('opens the panel currently at position 10 — "0" key (cache-report in default order)', () => {
-    openPanelByPosition(10);
+  it('opens the panel currently at position 8 (cache-report in the default order)', () => {
+    openPanelByPosition(8);
     expect(getState().openModal).toBe('cache-report');
   });
 

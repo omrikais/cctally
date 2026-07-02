@@ -43,7 +43,7 @@
 import type { Binding } from '../store/keymap';
 import { dispatch, getState } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { SHARE_CAPABLE_PANELS, type PanelId } from '../lib/panelIds';
+import { SHARE_CAPABLE_PANELS } from '../lib/panelIds';
 import { MOBILE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { SharePanelId } from './types';
 
@@ -109,7 +109,7 @@ export function buildShareKeyBinding(): Binding {
       }
       // Not a share-capable kind (e.g. 'alerts'): silent ignore. The
       // user clicked a panel, just not a shareable one — no toast.
-      if (!SHARE_CAPABLE_PANELS.has(kind as PanelId)) return;
+      if (!SHARE_CAPABLE_PANELS.has(kind)) return;
       // Translate the focused panel kind to its SharePanelId before the
       // cast (history → daily; identity otherwise), so a share-capable
       // grid card whose id isn't a SharePanelId never dispatches a

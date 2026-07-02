@@ -26,7 +26,7 @@ describe('D2: globals are inert while a chrome overlay is open', () => {
   });
   it('q also suppressed under an open panel modal / input mode', () => {
     const guard = buildGlobalKeyBindings().find((b) => b.key === 'q')!.when!;
-    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'history' });
     expect(guard()).toBe(false);
   });
   it('doctor (d) is suppressed under chromeOverlayOpen', () => {

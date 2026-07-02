@@ -109,6 +109,20 @@ describe('S keybinding (share modal)', () => {
     expect(slot?.triggerId).toBe('weekly-panel');
   });
 
+  it('shares the DAILY view when the focused panel is the History grid card (S8 #254)', () => {
+    // The grid `history` card is share-capable, but `history` is NOT a
+    // SharePanelId — keyboardShare translates it to `daily` before the cast
+    // so global `S` never dispatches a non-existent `panel=history`. The
+    // triggerId keeps the ORIGINAL focused kind (`history-panel`) so
+    // ShareModalRoot restores focus to the actual card on close.
+    focusPanel('history');
+    fireS();
+    const slot = getState().shareModal;
+    expect(slot).not.toBeNull();
+    expect(slot?.panel).toBe('daily');
+    expect(slot?.triggerId).toBe('history-panel');
+  });
+
   it('opens the share modal for the focused panel regardless of panelOrder (user-reorder safe)', () => {
     // Reorder so `daily` lands at index 0. Under DOM-derived focus,
     // panelOrder is irrelevant — only the focused section's
@@ -117,8 +131,8 @@ describe('S keybinding (share modal)', () => {
       type: 'SAVE_PREFS',
       patch: {
         panelOrder: [
-          'daily', 'cache-report', 'forecast', 'trend',
-          'sessions', 'weekly', 'monthly', 'blocks', 'alerts',
+          'history', 'cache-report', 'forecast', 'trend',
+          'sessions', 'blocks', 'alerts',
         ],
       },
     });

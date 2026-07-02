@@ -30,10 +30,12 @@ describe('<App />', () => {
 
   it('renders the default order partitioned into tile + wide strips', () => {
     const { container } = render(<App />);
+    // S8 #254 — weekly/monthly left the grid; the daily heatmap became the
+    // wide "history" card. Tiles: forecast, blocks, alerts.
     expect(hostsIn(container, '.tile-strip'))
-      .toEqual(['forecast', 'weekly', 'monthly', 'blocks', 'alerts']);
+      .toEqual(['forecast', 'blocks', 'alerts']);
     expect(hostsIn(container, '.wide-strip'))
-      .toEqual(['trend', 'sessions', 'projects', 'daily', 'cache-report']);
+      .toEqual(['trend', 'sessions', 'projects', 'history', 'cache-report']);
     // The two slices together cover the full default order exactly once.
     const all = Array.from(document.querySelectorAll('[data-panel-host]'))
       .map((h) => (h as HTMLElement).dataset.panelHost);
@@ -43,14 +45,14 @@ describe('<App />', () => {
   it('a within-tier REORDER reflects in that strip and leaves the other tier intact', () => {
     const { container } = render(<App />);
     act(() => {
-      // Move forecast (panelOrder index 0, a tile) to weekly's slot (index 4):
-      // within the tile strip it now sits AFTER weekly.
+      // Move forecast (panelOrder index 0, a tile) to blocks' slot (index 4):
+      // within the tile strip it now sits AFTER blocks.
       dispatch({ type: 'REORDER_PANELS', from: 0, to: 4 });
     });
     expect(hostsIn(container, '.tile-strip'))
-      .toEqual(['weekly', 'forecast', 'monthly', 'blocks', 'alerts']);
+      .toEqual(['blocks', 'forecast', 'alerts']);
     // The wide strip's relative order is preserved.
     expect(hostsIn(container, '.wide-strip'))
-      .toEqual(['trend', 'sessions', 'projects', 'daily', 'cache-report']);
+      .toEqual(['trend', 'sessions', 'projects', 'history', 'cache-report']);
   });
 });

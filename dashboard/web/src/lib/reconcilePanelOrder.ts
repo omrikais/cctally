@@ -13,9 +13,15 @@ import type { PanelId, GridPanelId } from './panelIds';
 //   1 → pre-projects schema (9 default panels).
 //   2 → 'projects' spliced at canonical index 4.
 //   3 → (#248) 'current-week' removed from the grid (it is the HeroStrip).
-export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 3;
+//   4 → (#254 S8) 'weekly'/'monthly'/'daily' collapsed into one 'history'
+//       card at its canonical index.
+export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 4;
 // Canonical position of 'projects' in DEFAULT_PANEL_ORDER (spec §2.1).
 const PROJECTS_INSERT_INDEX = 4;
+// Canonical position of 'history' in DEFAULT_PANEL_ORDER (S8 #254).
+const HISTORY_INSERT_INDEX = 5;
+// The former period-tile ids collapsed into 'history' by the v3→v4 step.
+const S8_COLLAPSED_IDS = new Set<string>(['weekly', 'monthly', 'daily']);
 
 export interface MigrationResult {
   panels: GridPanelId[];
@@ -36,9 +42,14 @@ export interface MigrationResult {
  *   • v2→v3 (#248): drop 'current-week' — it left the grid (it is the
  *     hero now). The loader persists the cleaned order back to
  *     localStorage once, rather than re-filtering in memory every load.
+ *   • v3→v4 (#254 S8): collapse 'weekly'/'monthly'/'daily' into ONE
+ *     'history' card at its canonical index (not a bare append), so a saved
+ *     order carrying the three legacy tiles migrates to the single card in
+ *     the right position and the advanced version is written back.
  *
  * Idempotent: callers already on CURRENT get their input back unchanged
- * (typed to GridPanelId — a current-cursor user can't carry 'current-week').
+ * (typed to GridPanelId — a current-cursor user can't carry 'current-week'
+ * or a period tile).
  */
 export function applyPanelOrderMigration(
   saved: PanelId[] | null | undefined,
@@ -47,7 +58,10 @@ export function applyPanelOrderMigration(
   if (currentVersion >= CURRENT_PANEL_ORDER_SCHEMA_VERSION) {
     return { panels: (saved ?? []) as GridPanelId[], newVersion: currentVersion };
   }
-  let panels: PanelId[] = saved ? [...saved] : [];
+  // Widened to string[] internally: legacy ids (current-week, weekly,
+  // monthly, daily) are no longer PanelId members but may sit in a stale
+  // saved order.
+  let panels: string[] = saved ? [...(saved as unknown as string[])] : [];
   // v1 → v2: splice 'projects' at its canonical index if missing.
   if (currentVersion < 2 && panels.length > 0 && !panels.includes('projects')) {
     panels.splice(Math.min(PROJECTS_INSERT_INDEX, panels.length), 0, 'projects');
@@ -56,7 +70,19 @@ export function applyPanelOrderMigration(
   if (currentVersion < 3) {
     panels = panels.filter((id) => id !== 'current-week');
   }
-  return { panels: panels as GridPanelId[], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
+  // v3 → v4 (#254 S8): collapse weekly/monthly/daily → one 'history' at its
+  // canonical index. Filter the legacy period tiles out, then splice
+  // 'history' in (unless already present, e.g. a partially-migrated order).
+  if (currentVersion < 4) {
+    panels = panels.filter((id) => !S8_COLLAPSED_IDS.has(id));
+    // Only position 'history' within a non-empty saved order (mirrors the
+    // projects-splice guard). A null/empty order stays empty and the
+    // reconcile backstop fills the full canonical default (history included).
+    if (panels.length > 0 && !panels.includes('history')) {
+      panels.splice(Math.min(HISTORY_INSERT_INDEX, panels.length), 0, 'history');
+    }
+  }
+  return { panels: panels as unknown as GridPanelId[], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };
 }
 
 /**
