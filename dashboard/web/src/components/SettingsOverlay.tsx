@@ -1119,7 +1119,7 @@ export function SettingsOverlay() {
                 {resetTableSortStaged ? 'Table column sorting — staged ✓' : 'Table column sorting'}
               </button>
               <p className="settings-hint">
-                Clears $/1% Trend, Recent Sessions &amp; Projects column-click sorting.
+                Clears $/1% Trend, Recent Sessions, Projects &amp; Weekly/Monthly column-click sorting.
               </p>
             </div>
             <div className="settings-restore-row">

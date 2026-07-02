@@ -22,6 +22,8 @@ interface ModalProps {
   // chrome (e.g. a basket-add toggle in M3) can use the same slot
   // without churning Modal's signature.
   headerExtras?: ReactNode;
+  // S2 #264 — wide two-pane variant for Weekly/Monthly; `min(1040px,94vw)`.
+  wide?: boolean;
 }
 
 // Modal grammar (SH-2, a light documented contract — no reorder of shipped
@@ -31,7 +33,7 @@ interface ModalProps {
 // reader starts at the title/answer rather than a header affordance (the Share
 // icon / close button). Panel modals only — the share family manages its own
 // focus in ShareModalRoot and does not route through this hook.
-export function Modal({ title, accentClass, children, headerExtras }: ModalProps) {
+export function Modal({ title, accentClass, children, headerExtras, wide }: ModalProps) {
   const close = () => dispatch({ type: 'CLOSE_MODAL' });
   const bindings = useMemo(
     () => [{ key: 'Escape', scope: 'modal' as const, action: close }],
@@ -55,7 +57,7 @@ export function Modal({ title, accentClass, children, headerExtras }: ModalProps
       <div className="modal-backdrop" onClick={close} />
       <div
         ref={cardRef}
-        className={`modal-card ${accentClass}`}
+        className={`modal-card ${accentClass}${wide ? ' modal-wide' : ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="modal-title"

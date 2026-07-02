@@ -51,20 +51,11 @@ const LEGACY_SORT_KEY = 'ccusage.dashboard.sort'; // retired — migrated on fir
 // blob). Read in loadInitial with try/catch, persisted on TOGGLE_CONV_OUTLINE.
 const CONV_OUTLINE_OPEN_KEY = 'cctally.conv.outlineOpen';
 
-// S8 (#254): the per-period 'weekly'|'monthly'|'daily' kinds are removed —
-// the single 'history' kind (HistoryModal) supersedes all three.
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'block' | 'history' | 'alerts' | 'update' | 'projects' | 'cache-report';
+// S2 (#264): the single 'history' kind is un-collapsed back into the three
+// per-period modal kinds 'daily' | 'weekly' | 'monthly' (PeriodModal), each
+// opened by its own card. No Day·Week·Month toggle.
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'block' | 'daily' | 'weekly' | 'monthly' | 'alerts' | 'update' | 'projects' | 'cache-report';
 
-// S8 (#254): the History modal's Day·Week·Month toggle, persisted in
-// prefs.historyPeriod (default 'day', coerced on load).
-export type HistoryPeriod = 'day' | 'week' | 'month';
-
-// Defensive load-coercion for a hand-edited / stale persisted value —
-// anything but the three literals falls back to 'day' (the first-open
-// default, matching the heatmap deep-link).
-export function coerceHistoryPeriod(v: unknown): HistoryPeriod {
-  return v === 'week' || v === 'month' ? v : 'day';
-}
 // #217 S6 F4 — 'note' added: the per-turn bookmark note editor sets inputMode
 // 'note' on focus / null on blur+close so the reader's hotkey guard (which gates
 // on inputMode === null) suppresses j/k/i/t/… while the user is typing a note.
@@ -239,11 +230,11 @@ export interface Prefs {
   projectsTrendYMode: 'share' | 'absolute';
   projectsSortOverride: SortOverride | null;
   panelOrderSchemaVersion: number;
-  // S8 (#254): History modal view prefs. `historyPeriod` is the persisted
-  // Day·Week·Month toggle (default 'day'); `historySortOverride` mirrors
-  // the trend/sessions/projects pattern for the Weekly/Monthly sortable
-  // table. Both coerced on load (invalid → 'day' / null).
-  historyPeriod: HistoryPeriod;
+  // S2 (#264): the shared sort override for the Weekly/Monthly period tables
+  // (the `table: 'history'` sort key is retained — renaming it is churn for no
+  // behavior change). Mirrors the trend/sessions/projects pattern; coerced on
+  // load (invalid → null). The former `historyPeriod` toggle pref is gone; a
+  // stale key left in a user's saved prefs rides along harmlessly (never read).
   historySortOverride: SortOverride | null;
 }
 
@@ -534,7 +525,6 @@ export function defaultPrefs(): Prefs {
     panelOrderSchemaVersion: 1,
     // S8 (#254): first-open period is Day (matches the heatmap card +
     // its per-day deep-link); no table sort override by default.
-    historyPeriod: 'day',
     historySortOverride: null,
   };
 }
@@ -585,9 +575,9 @@ function loadInitial(): UIState {
       prefs.trendSortOverride = coerceSortOverride(prefs.trendSortOverride ?? null);
       prefs.sessionsSortOverride = coerceSortOverride(prefs.sessionsSortOverride ?? null);
       prefs.projectsSortOverride = coerceSortOverride(prefs.projectsSortOverride ?? null);
-      // S8 (#254): coerce the History modal prefs defensively (invalid
-      // persisted values → 'day' / null).
-      prefs.historyPeriod = coerceHistoryPeriod(prefs.historyPeriod);
+      // S2 (#264): coerce the shared Weekly/Monthly table sort override
+      // defensively (invalid persisted value → null). A retired `historyPeriod`
+      // key left in saved prefs is tolerated — never read, no strip pass.
       prefs.historySortOverride = coerceSortOverride(prefs.historySortOverride ?? null);
       // Persist the cursor advancement immediately so a tab refresh
       // doesn't re-run the migration on every load.
@@ -923,8 +913,6 @@ export type Action =
   | { type: 'INGEST_DASHBOARD_PREFS'; prefs: DashboardPrefs }
   | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions' | 'projects' | 'history'; override: SortOverride | null }
   | { type: 'CLEAR_TABLE_SORTS' }
-  // S8 (#254): persist the History modal's Day·Week·Month toggle.
-  | { type: 'SET_HISTORY_PERIOD'; period: HistoryPeriod }
   // ---------- Update subcommand actions (spec §6) ----------
   // OPEN_UPDATE_MODAL / CLOSE_UPDATE_MODAL: badge click + Esc / X.
   //   Only sets modalOpen; does NOT reset status/stream so closing a
@@ -1597,14 +1585,6 @@ export function dispatch(action: Action): void {
       const next = { ...state, prefs };
       // Clearing sessionsSortOverride may reorder rendered rows; recompute matches.
       state = { ...next, ..._recomputeSearch(next) };
-      break;
-    }
-    case 'SET_HISTORY_PERIOD': {
-      // S8 (#254): persist the Day·Week·Month toggle via the same path
-      // other view prefs use so it survives a reload.
-      const prefs = { ...state.prefs, historyPeriod: action.period };
-      localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-      state = { ...state, prefs };
       break;
     }
     case 'OPEN_UPDATE_MODAL':

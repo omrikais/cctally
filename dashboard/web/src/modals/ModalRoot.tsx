@@ -4,7 +4,9 @@ import { CurrentWeekModal } from './CurrentWeekModal';
 import { ForecastModal } from './ForecastModal';
 import { TrendModal } from './TrendModal';
 import { SessionModal } from './SessionModal';
-import { HistoryModal } from './HistoryModal';
+import { DailyModal } from './DailyModal';
+import { WeeklyModal } from './WeeklyModal';
+import { MonthlyModal } from './MonthlyModal';
 import { BlockModal } from './BlockModal';
 import { ProjectsModal } from './ProjectsModal';
 import { CacheReportModal } from './CacheReportModal';
@@ -23,8 +25,12 @@ export function ModalRoot() {
       return <TrendModal />;
     case 'session':
       return <SessionModal />;
-    case 'history':
-      return <HistoryModal />;
+    case 'daily':
+      return <DailyModal />;
+    case 'weekly':
+      return <WeeklyModal />;
+    case 'monthly':
+      return <MonthlyModal />;
     case 'block':
       return <BlockModal />;
     case 'projects':

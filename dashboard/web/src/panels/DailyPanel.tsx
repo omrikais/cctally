@@ -70,7 +70,7 @@ function Cell({
       className={`daily-cell h${r.intensity_bucket}${r.is_today ? ' is-today' : ''} first-mount`}
       title={tooltip}
       style={{ ['--daily-stagger' as string]: `${staggerIndex * 30}ms` }}
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'history', dailyDate: r.date })}
+      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: r.date })}
     >
       <span className="d">{dd}</span>
       {/* --c-len feeds the cost-cell's auto-fit font-size formula (#208):
@@ -109,8 +109,8 @@ export function DailyPanel() {
       id="panel-daily"
       tabIndex={0}
       role="region"
-      aria-label="History heatmap panel"
-      data-panel-kind="history"
+      aria-label="Daily heatmap panel"
+      data-panel-kind="daily"
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -118,29 +118,29 @@ export function DailyPanel() {
             <use href="/static/icons.svg#grid" />
           </svg>
           <h2>
-            History <span className="sub">heatmap · 30 days</span>
+            Daily <span className="sub">heatmap · 30 days</span>
           </h2>
         </div>
         <div className="panel-header-actions">
-          {/* The History card shares the daily view; the triggerId matches
-              the S-key path (`${data-panel-kind}-panel` = history-panel) so
-              ShareModalRoot restores focus to this button on close. */}
+          {/* The triggerId matches the S-key path
+              (`${data-panel-kind}-panel` = daily-panel) so ShareModalRoot
+              restores focus to this button on close. */}
           <ShareIcon
             panel="daily"
-            panelLabel="History"
-            triggerId="history-panel"
-            onClick={() => dispatch(openShareModal('daily', 'history-panel'))}
+            panelLabel="Daily"
+            triggerId="daily-panel"
+            onClick={() => dispatch(openShareModal('daily', 'daily-panel'))}
           />
           <ExpandButton
-            label="History"
-            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'history' })}
+            label="Daily"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'daily' })}
           />
           <button
             type="button"
             className="panel-collapse-toggle"
             aria-expanded={!collapsed}
             aria-controls="panel-daily-body"
-            aria-label={collapsed ? 'Expand History' : 'Collapse History'}
+            aria-label={collapsed ? 'Expand Daily' : 'Collapse Daily'}
             title={collapsed ? 'Expand' : 'Collapse'}
             onClick={(e) => {
               e.stopPropagation();
@@ -218,9 +218,9 @@ export function DailyPanel() {
                   type="button"
                   className="daily-foot-col daily-foot-peak"
                   data-peak-trigger
-                  title="Click to open History modal at peak day"
+                  title="Click to open Daily modal at peak day"
                   onClick={() => dispatch({
-                    type: 'OPEN_MODAL', kind: 'history', dailyDate: peak.date,
+                    type: 'OPEN_MODAL', kind: 'daily', dailyDate: peak.date,
                   })}
                 >
                   <svg className="daily-foot-icon icon-peak" aria-hidden="true">

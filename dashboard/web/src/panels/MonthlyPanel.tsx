@@ -1,0 +1,122 @@
+import { useLayoutEffect, useRef, useState } from 'react';
+import { useSnapshot } from '../hooks/useSnapshot';
+import { PanelGrip } from '../components/PanelGrip';
+import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
+import { ModelLegend } from '../components/ModelLegend';
+import { fmt } from '../lib/fmt';
+import { dispatch } from '../store/store';
+import { openShareModal } from '../store/shareSlice';
+import type { PeriodRow } from '../types/envelope';
+
+// #264 S2 — the Monthly summary TILE (restored from the S8 collapse). Body caps
+// to the 3 most-recent months (the Monthly modal keeps the full history); the
+// footer summarizes the whole window. S1 card chrome: the header right-side
+// leaves live in a `.panel-header-actions` cluster with a ⤢ ExpandButton.
+const VISIBLE_ROWS = 3;
+
+function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
+  const deltaCls =
+    r.delta_cost_pct == null ? 'flat' :
+    r.delta_cost_pct > 0 ? 'up' : r.delta_cost_pct < 0 ? 'down' : 'flat';
+  return (
+    <div className="period">
+      <div className="meta">
+        <span className="label">
+          {r.label}
+          {r.is_current && <span className="pill-current">Now</span>}
+        </span>
+        <span className="right">
+          <span className="cost">{fmt.usd2(r.cost_usd)}</span>
+          <span className={`delta ${deltaCls}`}>{fmt.deltaPct(r.delta_cost_pct)}</span>
+        </span>
+      </div>
+      <div className="model-stack" role="presentation">
+        {r.models.map((m) => (
+          <span
+            key={m.model}
+            className={m.chip}
+            style={{ width: isFirstMount ? '0%' : `${m.cost_pct}%` }}
+            title={`${m.display} ${fmt.usd2(m.cost_usd)} (${m.cost_pct.toFixed(0)}%)`}
+          />
+        ))}
+      </div>
+      <ModelLegend models={r.models} />
+    </div>
+  );
+}
+
+export function MonthlyPanel() {
+  const env = useSnapshot();
+  const allRows = env?.monthly?.rows ?? [];
+  const rows = allRows.slice(0, VISIBLE_ROWS);
+  const total = env?.monthly?.total_cost_usd ?? 0;
+
+  const seenLabels = useRef<Set<string>>(new Set());
+  const [, forceRender] = useState(0);
+  useLayoutEffect(() => {
+    const newLabels = rows.filter((r) => !seenLabels.current.has(r.label));
+    if (newLabels.length === 0) return;
+    newLabels.forEach((r) => seenLabels.current.add(r.label));
+    const id = requestAnimationFrame(() => forceRender((n) => n + 1));
+    return () => cancelAnimationFrame(id);
+  }, [rows]);
+
+  return (
+    <section
+      className="panel accent-pink"
+      id="panel-monthly"
+      tabIndex={0}
+      role="region"
+      aria-label="Monthly usage panel"
+      data-panel-kind="monthly"
+      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' })}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
+        }
+      }}
+    >
+      <div className="panel-header">
+        <svg className="icon" aria-hidden="true">
+          <use href="/static/icons.svg#calendar" />
+        </svg>
+        <h2>
+          Monthly <span className="sub">(model split · recent)</span>
+        </h2>
+        <div className="panel-header-actions">
+          <ShareIcon
+            panel="monthly"
+            panelLabel="Monthly"
+            triggerId="monthly-panel"
+            onClick={() => dispatch(openShareModal('monthly', 'monthly-panel'))}
+          />
+          <ExpandButton
+            label="Monthly"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' })}
+          />
+          <PanelGrip />
+        </div>
+      </div>
+      <div className="panel-body">
+        {rows.length === 0 ? (
+          <div className="panel-empty">No usage history yet.</div>
+        ) : (
+          rows.map((r) => (
+            <Row key={r.label} r={r} isFirstMount={!seenLabels.current.has(r.label)} />
+          ))
+        )}
+      </div>
+      {allRows.length > 0 && (
+        <div className="panel-foot period-foot">
+          <span>
+            {allRows.length}mo total
+            <span className="sep" aria-hidden="true"> · </span>
+            <span className="total">{fmt.usd2(total)}</span>
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}

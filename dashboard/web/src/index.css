@@ -413,7 +413,6 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
   .bento-row .panel-host[data-span="4"] { grid-column: span 4; }
   .bento-row .panel-host[data-span="6"] { grid-column: span 6; }
-  .bento-row .panel-host[data-span="8"] { grid-column: span 8; }
 }
 
 /* #264 S1: History (the Daily heatmap) re-homes into the bento medium row as a
@@ -1267,6 +1266,22 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .modal-card.accent-cyan   { border-color: var(--accent-cyan); }
 .modal-card.accent-pink   { border-color: var(--accent-pink); }
 .modal-card.accent-indigo { border-color: var(--accent-indigo); }
+/* #264 S2 — wide two-pane modal for Weekly/Monthly. */
+.modal-card.modal-wide { width: min(1040px, 94vw); }
+.period-two-pane {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+/* Table pane is a scroll container so Weekly's ≤6 columns scroll within the
+   pane instead of blowing out the modal (Codex finding 2). */
+.period-table-pane { min-width: 0; overflow-x: auto; }
+/* Collapse to one column before the 6-col Weekly table gets cramped (≤1024,
+   not the mobile 640 — finding 2). */
+@media (max-width: 1024px) {
+  .period-two-pane { grid-template-columns: minmax(0, 1fr); }
+}
 /* Decorative drag-handle — shown only at the mobile breakpoint. */
 .modal-handle { display: none; }
 .modal-header {
@@ -2672,6 +2687,8 @@ mark.current {
    shared 2px accent ring, inset so it stays within the row (mirrors
    .projects-row:focus-visible). */
 .history-table tbody tr:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+/* #264 S2 — Monthly table focus ring matches its pink accent (finding 3). */
+.history-table.accent-pink tbody tr:focus-visible { outline-color: var(--accent-pink); }
 [data-testid="projects-table-row"]:focus-visible { outline: 2px solid var(--accent-magenta); outline-offset: -2px; }
 
 /* Models cell: chip family tokens, deduped, top-3 + overflow. Reuses the
@@ -5187,38 +5204,6 @@ mark.current {
   padding: 0;
   background: none;
   margin-left: auto;
-}
-
-/* History modal (#254) — Day·Week·Month segmented radiogroup. Reuses the
- * projects-controls pill language but with the single indigo modal accent
- * (spec: one accent across all toggles). */
-.history-toggle {
-  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
-  padding: 2px 0 12px;
-}
-.history-toggle .pill {
-  padding: 5px 14px; border-radius: var(--radius-pill);
-  border: 1px solid var(--border-soft);
-  font-size: 12px; color: var(--text-dim); cursor: pointer;
-  background: transparent;
-}
-.history-toggle .pill.on {
-  background: color-mix(in srgb, var(--accent-indigo) 18%, transparent);
-  border-color: var(--accent-indigo);
-  color: var(--text);
-}
-.history-toggle .pill:focus-visible {
-  outline: 2px solid var(--accent-indigo); outline-offset: 2px;
-}
-@media (max-width: 640px) {
-  /* Touch floor (#254): each Day/Week/Month segment is a ≥44px tap target,
-   * and the strip may wrap. Same specificity as the desktop rule above, so
-   * source order (this block is later) makes it win — no #root needed. */
-  .history-toggle { gap: 8px; }
-  .history-toggle .pill {
-    min-height: 44px; padding: 10px 18px; font-size: 13px;
-    display: inline-flex; align-items: center; justify-content: center;
-  }
 }
 
 .projects-drill {

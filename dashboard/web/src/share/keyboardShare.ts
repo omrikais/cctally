@@ -50,19 +50,11 @@ import type { SharePanelId } from './types';
 export const UNFOCUSED_TOAST_TEXT =
   'Click a panel first, then press S to share it.';
 
-// S8 (#254): the grid `history` card is share-capable but `history` is a
-// PanelId, NOT a SharePanelId (the share backend only knows
-// daily/weekly/monthly/…). `keyboardShare` treats SHARE_CAPABLE_PANELS
-// membership as proof the focused kind is a SharePanelId and casts, so a
-// naive `history ∈ SHARE_CAPABLE_PANELS` would dispatch
-// openShareModal('history') → /api/share/templates?panel=history (no
-// backend). This translation (history → daily, identity otherwise) is
-// applied before the cast so `S` on the History card shares the daily
-// view. The History modal's inline ShareIcon maps period→SharePanelId
-// directly and does not route through here.
-export function gridPanelToSharePanel(id: string): SharePanelId {
-  return id === 'history' ? 'daily' : (id as SharePanelId);
-}
+// S2 (#264): the `history` grid card is gone — daily/weekly/monthly are
+// independent grid tiles again, and each is BOTH a PanelId and a SharePanelId.
+// So the focused `data-panel-kind` a share-capable card carries is already a
+// SharePanelId; SHARE_CAPABLE_PANELS membership proves the cast directly and
+// the old history→daily translation shim is removed.
 
 function isMobileViewport(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
@@ -110,13 +102,11 @@ export function buildShareKeyBinding(): Binding {
       // Not a share-capable kind (e.g. 'alerts'): silent ignore. The
       // user clicked a panel, just not a shareable one — no toast.
       if (!SHARE_CAPABLE_PANELS.has(kind)) return;
-      // Translate the focused panel kind to its SharePanelId before the
-      // cast (history → daily; identity otherwise), so a share-capable
-      // grid card whose id isn't a SharePanelId never dispatches a
-      // non-existent panel. The triggerId keeps the ORIGINAL focused kind
-      // so ShareModalRoot restores focus to the actual panel on close.
-      const sharePanel = gridPanelToSharePanel(kind);
-      dispatch(openShareModal(sharePanel, `${kind}-panel`));
+      // The membership check above proves `kind` is a SharePanelId (S2 #264 —
+      // daily/weekly/monthly are grid ids AND SharePanelIds, no shim needed).
+      // The triggerId keeps the focused kind so ShareModalRoot restores focus
+      // to the actual panel on close.
+      dispatch(openShareModal(kind as SharePanelId, `${kind}-panel`));
     },
   };
 }

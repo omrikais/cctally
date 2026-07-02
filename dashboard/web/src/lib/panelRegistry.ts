@@ -4,9 +4,12 @@ import { TrendPanel } from '../panels/TrendPanel';
 import { SessionsPanel } from '../panels/SessionsPanel';
 import { ProjectsPanel } from '../panels/ProjectsPanel';
 import { BlocksPanel } from '../panels/BlocksPanel';
-// S8 (#254): the DailyPanel heatmap is the grid card for the consolidated
-// History modal (relabeled "History"); WeeklyPanel/MonthlyPanel left the grid.
+// S2 (#264): the three period cards are independent grid tiles again — the
+// DailyPanel heatmap (Daily), plus the restored WeeklyPanel / MonthlyPanel,
+// each opening its own modal at its own period.
 import { DailyPanel } from '../panels/DailyPanel';
+import { WeeklyPanel } from '../panels/WeeklyPanel';
+import { MonthlyPanel } from '../panels/MonthlyPanel';
 import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
 import { CacheReportPanel } from '../panels/CacheReportPanel';
 import { dispatch } from '../store/store';
@@ -63,14 +66,27 @@ export const PANEL_REGISTRY: Record<GridPanelId, PanelDef> = {
     Component: BlocksPanel,
     openAction: openActiveOrNewestBlockModal,
   },
-  // S8 (#254): the single History card — the relabeled Daily heatmap. Its
-  // openAction opens the consolidated History modal (default period); a
-  // heatmap-cell click deep-links to that day via OPEN_MODAL { dailyDate }.
-  history: {
-    id: 'history',
-    label: 'History',
+  // S2 (#264): three independent period cards. Daily is the heatmap (a
+  // heatmap-cell click deep-links to that day via OPEN_MODAL { dailyDate });
+  // Weekly/Monthly are the restored summary tiles, each opening its own
+  // wide two-pane modal.
+  daily: {
+    id: 'daily',
+    label: 'Daily',
     Component: DailyPanel,
-    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'history' }),
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'daily' }),
+  },
+  weekly: {
+    id: 'weekly',
+    label: 'Weekly',
+    Component: WeeklyPanel,
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' }),
+  },
+  monthly: {
+    id: 'monthly',
+    label: 'Monthly',
+    Component: MonthlyPanel,
+    openAction: () => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' }),
   },
   alerts: {
     id: 'alerts',
