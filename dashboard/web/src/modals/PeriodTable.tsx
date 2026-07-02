@@ -2,15 +2,17 @@ import { useSyncExternalStore } from 'react';
 import { fmt } from '../lib/fmt';
 import { SortableHeader } from '../components/SortableHeader';
 import { applyTableSort } from '../lib/tableSort';
-import { historyColumns, type HistoryTableRow } from '../lib/historyColumns';
-import { keyOf } from './periodNav';
+import { historyColumns } from '../lib/historyColumns';
+import { decorateHistoryRows } from './historyData';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import type { ModelCostRow, PeriodRow } from '../types/envelope';
 
 interface Props {
   rows: PeriodRow[];
   variant: 'weekly' | 'monthly';
-  accentClass: 'accent-cyan' | 'accent-pink';
+  // S8: HistoryModal drives all variants with the single indigo accent;
+  // the interim Weekly/Monthly modals still pass cyan/pink until B3.
+  accentClass: 'accent-cyan' | 'accent-pink' | 'accent-indigo';
   // WM-1 / S8: selection is key-based (keyOf) so it survives header
   // re-sorting and SSE churn; the row order in the DOM is the sorted
   // order, not the envelope order.
@@ -61,16 +63,10 @@ export function PeriodTable({ rows, variant, accentClass, selectedKey, onSelect 
 
   // Decorate PeriodRow[] → HistoryTableRow[] (keyed via keyOf), then apply
   // the persisted sort. A null override leaves rows in envelope order
-  // (today's default) — applyTableSort returns the input unchanged.
-  const decorated: HistoryTableRow[] = rows.map((r) => ({
-    key: keyOf(r, hv),
-    label: r.label,
-    cost_usd: r.cost_usd,
-    used_pct: r.used_pct,
-    dollar_per_pct: r.dollar_per_pct,
-    delta_cost_pct: r.delta_cost_pct,
-    models: r.models,
-  }));
+  // (today's default) — applyTableSort returns the input unchanged. Shared
+  // with HistoryModal via decorateHistoryRows so the ↑/↓ ordered key list
+  // and the rendered row order never drift.
+  const decorated = decorateHistoryRows(rows, hv);
   const sorted = applyTableSort(decorated, columns, sortOverride);
 
   return (
