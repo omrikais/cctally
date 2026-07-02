@@ -2467,6 +2467,41 @@ mark.current {
    their own layout and don't get this rule. */
 .modal-header .share-icon { margin-left: auto; }
 
+/* #264 S1 (AFFORD-1) — the normalized panel-header action cluster. Every
+   grid panel wraps its right-side leaves ([Share?][Expand][Collapse?][Grip])
+   in this one right-aligned flex group, so the affordances line up
+   identically across all 8 cards. This replaces the ad-hoc
+   `.panel-header > .panel-grip{margin-left:auto}` and the three panels'
+   inline-styled right `<div>`s — the wrapper now owns right-alignment. */
+.panel-header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+/* ⤢ expand button — the consistent "open this card's detail modal"
+   affordance, distinct from Share. Matches the sibling header buttons
+   (.share-icon / .panel-collapse-toggle): borderless, muted at rest, full
+   contrast + faint background on hover, accent ring on focus-visible. */
+.panel-expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 4px;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  border-radius: var(--radius-xs);
+}
+.panel-expand:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+.panel-expand:focus-visible {
+  outline: 2px solid var(--accent-purple);
+  outline-offset: 2px;
+}
+
 /* Weekly / Monthly panels — "[NOW]" pill on the topmost (current) row. */
 .pill-current {
   display: inline-block; margin-left: 6px; font-size: 9px;
@@ -3097,11 +3132,10 @@ mark.current {
 .panel-host.is-dragging .panel-grip {
   cursor: grabbing;
 }
-/* When grip is a direct child of the header (panels with no right-group),
-   push it to the right edge so it lines up where the chevron would be. */
-.panel-header > .panel-grip {
-  margin-left: auto;
-}
+/* #264 S1 — the grip's right-alignment moved to `.panel-header-actions`
+   (every header now wraps its right-side leaves in that cluster, so the grip
+   is never a direct child of `.panel-header` anymore). The old
+   `.panel-header > .panel-grip{margin-left:auto}` rule is retired. */
 /* #249 I1 — the grip is now persistent on desktop too (low-contrast at rest);
    brighten it when the host is hovered so it advertises drag-reorder. */
 .panel-host:hover .panel-grip { color: var(--text); }
@@ -4625,7 +4659,7 @@ mark.current {
      classes that actually exist in this codebase. */
   .chip, kbd { min-height: 24px; padding: 2px 8px; }
   .model-chip { min-height: 28px; padding: 4px 10px; }
-  .ctrl-btn, .panel-collapse-toggle, .share-icon {
+  .ctrl-btn, .panel-collapse-toggle, .share-icon, .panel-expand {
     min-width: 44px;
     min-height: 44px;
   }
