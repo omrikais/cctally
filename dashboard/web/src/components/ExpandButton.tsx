@@ -1,11 +1,13 @@
 // ExpandButton (#264 S1, AFFORD-1) — the consistent "open this card's modal"
 // affordance rendered in every grid panel's header, distinct from ShareIcon.
 //
-// A dumb leaf (template = ShareIcon.tsx): it owns no store state. The caller
-// wires `onOpen` to the SAME open handler that panel's section-open already
-// uses (per-panel; e.g. Blocks → openActiveOrNewestBlockModal, Sessions →
-// openMostRecentSessionModal, the rest → their OPEN_MODAL dispatch) — panels
-// can't import panelRegistry back, so the wiring lives at each callsite.
+// A dumb leaf (template = ShareIcon.tsx): it owns no store state. Each caller
+// wires `onOpen` to that panel's open handler — the same one its section-open
+// uses where it has one: Blocks → openActiveOrNewestBlockModal (its section has
+// no onClick, so ⤢ is the only general open path), Sessions →
+// openMostRecentSessionModal, Alerts → PANEL_REGISTRY.alerts.openAction, the
+// rest → their OPEN_MODAL dispatch. The wiring lives per-callsite (not here) so
+// each card keeps a single open handler for both its section and its ⤢.
 //
 // stopPropagation mirrors ShareIcon: most panels open their modal on any
 // in-section click, so without the guard this button would double-fire the
