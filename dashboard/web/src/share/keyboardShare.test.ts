@@ -41,7 +41,7 @@ import {
   installGlobalKeydown,
   registerKeymap,
 } from '../store/keymap';
-import { buildShareKeyBinding, UNFOCUSED_TOAST_TEXT } from './keyboardShare';
+import { buildShareKeyBinding, gridPanelToSharePanel, UNFOCUSED_TOAST_TEXT } from './keyboardShare';
 import { openShareModal, openComposer } from '../store/shareSlice';
 import { MOBILE_MEDIA_QUERY } from '../lib/breakpoints';
 
@@ -269,5 +269,21 @@ describe('S keybinding (share modal)', () => {
     expect(buildShareKeyBinding().when?.()).toBe(true);
     fireS();
     expect(getState().shareModal?.panel).toBe('weekly');
+  });
+});
+
+// S8 (#254) — the grid `history` card shares the `daily` view. Since
+// `SHARE_CAPABLE_PANELS` membership is the eligibility gate AND the cast
+// to SharePanelId, `history` (a PanelId that is NOT a SharePanelId) needs
+// a translation applied before the cast so global `S` never dispatches a
+// non-existent `panel=history` share. The pure translation is unit-tested
+// here; the focused-`history` flow lands once B adds `history` to
+// SHARE_CAPABLE_PANELS.
+describe('gridPanelToSharePanel', () => {
+  it('maps history → daily', () => expect(gridPanelToSharePanel('history')).toBe('daily'));
+  it('is identity for real share ids', () => {
+    expect(gridPanelToSharePanel('trend')).toBe('trend');
+    expect(gridPanelToSharePanel('weekly')).toBe('weekly');
+    expect(gridPanelToSharePanel('daily')).toBe('daily');
   });
 });

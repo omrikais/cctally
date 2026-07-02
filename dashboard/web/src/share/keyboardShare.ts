@@ -50,6 +50,20 @@ import type { SharePanelId } from './types';
 export const UNFOCUSED_TOAST_TEXT =
   'Click a panel first, then press S to share it.';
 
+// S8 (#254): the grid `history` card is share-capable but `history` is a
+// PanelId, NOT a SharePanelId (the share backend only knows
+// daily/weekly/monthly/…). `keyboardShare` treats SHARE_CAPABLE_PANELS
+// membership as proof the focused kind is a SharePanelId and casts, so a
+// naive `history ∈ SHARE_CAPABLE_PANELS` would dispatch
+// openShareModal('history') → /api/share/templates?panel=history (no
+// backend). This translation (history → daily, identity otherwise) is
+// applied before the cast so `S` on the History card shares the daily
+// view. The History modal's inline ShareIcon maps period→SharePanelId
+// directly and does not route through here.
+export function gridPanelToSharePanel(id: string): SharePanelId {
+  return id === 'history' ? 'daily' : (id as SharePanelId);
+}
+
 function isMobileViewport(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
   return window.matchMedia(MOBILE_MEDIA_QUERY).matches;
@@ -96,10 +110,13 @@ export function buildShareKeyBinding(): Binding {
       // Not a share-capable kind (e.g. 'alerts'): silent ignore. The
       // user clicked a panel, just not a shareable one — no toast.
       if (!SHARE_CAPABLE_PANELS.has(kind as PanelId)) return;
-      // The membership check above narrows `kind` to the share-capable
-      // subset, which is exactly the SharePanelId literal union.
-      const sharePanel = kind as SharePanelId;
-      dispatch(openShareModal(sharePanel, `${sharePanel}-panel`));
+      // Translate the focused panel kind to its SharePanelId before the
+      // cast (history → daily; identity otherwise), so a share-capable
+      // grid card whose id isn't a SharePanelId never dispatches a
+      // non-existent panel. The triggerId keeps the ORIGINAL focused kind
+      // so ShareModalRoot restores focus to the actual panel on close.
+      const sharePanel = gridPanelToSharePanel(kind);
+      dispatch(openShareModal(sharePanel, `${kind}-panel`));
     },
   };
 }
