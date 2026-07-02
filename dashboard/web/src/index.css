@@ -399,7 +399,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      Short grows to fit Blocks (its height-setter); Forecast/Alerts stretch to
      match via the grid's align-items:stretch default. */
   .bento-row.row-tall   { grid-auto-rows: 296px; }
-  .bento-row.row-medium { grid-auto-rows: 196px; }
+  /* Medium tuned to 220px at the ui-qa gate: 196px left the History heatmap's
+     ~5 week-rows only ~40px of grid area, compressing cells below the label
+     height so the week-range labels overlapped. 220px + the compact card
+     treatment below give legible ~20px color cells. */
+  .bento-row.row-medium { grid-auto-rows: 220px; }
   .bento-row.row-short  { grid-auto-rows: minmax(140px, auto); }
   .bento-row .panel-host { min-height: 0; height: 100%; }
   .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
@@ -408,24 +412,32 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .bento-row .panel-host[data-span="8"] { grid-column: span 8; }
 }
 
-/* #264 S1: History (the Daily heatmap) re-homes into the bento medium row.
-   Make its body a flex column and let the calendar grid grow with flexible
-   cell rows (GitHub-contribution-graph style) so it fills the card height and
-   reads at-a-glance instead of overflowing into a scroll viewport. Scoped to
-   the History card body (id) + a bento row so the History MODAL and other
-   panels are untouched. Medium-row height is finalized at the ui-qa gate.
-   DESKTOP-GATED (min-width:900px, same breakpoint as the bento's definite
-   row heights): below it the card has no definite height, so `minmax(0,1fr)`
-   rows would have no free space to distribute and collapse to content —
-   dropping the base 64px uniform-row guarantee. Mobile therefore keeps the
-   base .daily-cal-grid 64px rows. */
+/* #264 S1: History (the Daily heatmap) re-homes into the bento medium row as a
+   COMPACT color-glance (the mockup's treatment). The full card renders 64px-tall
+   cost cells with per-day "$NN.NN" + 2-line week labels — far too tall for the
+   ~220px medium card, where it compressed to ~8px rows and the labels overlapped
+   into an illegible blob (ui-qa P2). Scoped to the History card body (id) + a
+   bento row, we drop the per-cell cost text, the "month continues" filler, and
+   the "W#" label line so the grid becomes a legible color + day-number heatmap
+   that fills the card. The per-day $ detail is a cell/⤢ click away in the
+   History modal; the card answers "which days ran hot" at a glance.
+   DESKTOP-GATED (min-width:900px, same breakpoint as the bento's definite row
+   heights): below it the card has no definite height, so a flexible fill would
+   drop the base 64px uniform-row guarantee — mobile keeps the full-detail base
+   .daily-cal-grid. The History MODAL and other panels are untouched. */
 @media (min-width: 900px) {
   .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
   .bento-row #panel-daily-body .daily-cal-grid {
     flex: 1 1 auto;
     min-height: 0;
     grid-auto-rows: minmax(0, 1fr);
+    gap: 4px;
   }
+  .bento-row #panel-daily-body .daily-cell { padding: 3px 6px; }
+  .bento-row #panel-daily-body .daily-cell .c { display: none; }
+  .bento-row #panel-daily-body .daily-week-label .wk { display: none; }
+  .bento-row #panel-daily-body .daily-week-label .rng { margin-top: 0; }
+  .bento-row #panel-daily-body .daily-month-continues { display: none; }
 }
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
