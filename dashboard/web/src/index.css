@@ -399,11 +399,15 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      Short grows to fit Blocks (its height-setter); Forecast/Alerts stretch to
      match via the grid's align-items:stretch default. */
   .bento-row.row-tall   { grid-auto-rows: 296px; }
-  /* Medium tuned to 220px at the ui-qa gate: 196px left the History heatmap's
-     ~5 week-rows only ~40px of grid area, compressing cells below the label
-     height so the week-range labels overlapped. 220px + the compact card
-     treatment below give legible ~20px color cells. */
-  .bento-row.row-medium { grid-auto-rows: 220px; }
+  /* Medium tuned to 300px at the ui-qa gate. The History heatmap's fixed chrome
+     — the Total/Peak foot (~59px) + legend (~16px) + margins (~32px) — consumes
+     ~107px of the body, and the flex:1 grid only gets the leftover; at 196/220px
+     that leftover was ~32px, collapsing cells to ~8px so the week-range labels
+     overlapped. Because the chrome is height-invariant, every extra px of row
+     height flows straight to the grid: 300px leaves it ~112px → legible ~22px
+     color cells (a forced-110px grid rendered 19px cells with zero overlaps at
+     the gate). The grid also carries a min-height floor below as insurance. */
+  .bento-row.row-medium { grid-auto-rows: 300px; }
   .bento-row.row-short  { grid-auto-rows: minmax(140px, auto); }
   .bento-row .panel-host { min-height: 0; height: 100%; }
   .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
@@ -429,7 +433,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
   .bento-row #panel-daily-body .daily-cal-grid {
     flex: 1 1 auto;
-    min-height: 0;
+    /* min-height floor (the grid had none — ui-qa root cause): guarantees the
+       ~5 week-rows stay ≥~18px each even if the foot/legend chrome is a touch
+       taller than estimated, so the labels can't re-collapse into an overlap. */
+    min-height: 100px;
     grid-auto-rows: minmax(0, 1fr);
     gap: 4px;
   }
