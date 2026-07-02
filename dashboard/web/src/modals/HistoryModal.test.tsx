@@ -183,15 +183,63 @@ describe('<HistoryModal /> navigator + keyboard selection', () => {
     expect(document.querySelector('.detail-card')?.textContent).toContain('2026-W26');
   });
 
-  it('ArrowRight switches the toggle and persists via SET_HISTORY_PERIOD', () => {
+  // #261 — the toggle is a WAI-ARIA radiogroup with roving tabindex: only the
+  // checked radio is a tab stop, and ←/→ move focus AND selection within the
+  // group (fired ON the radio, native semantics — not via the modal keymap).
+  it('applies roving tabindex — only the checked radio is a tab stop (#261)', () => {
     updateSnapshot(baseEnvelope());
     openHistory();
     render(<HistoryModal />);
+    // Day is checked by default (prefs.historyPeriod = 'day').
+    expect(screen.getByRole('radio', { name: 'Day' })).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('radio', { name: 'Week' })).toHaveAttribute('tabindex', '-1');
+    expect(screen.getByRole('radio', { name: 'Month' })).toHaveAttribute('tabindex', '-1');
+  });
+
+  it('ArrowRight on the focused radio roves focus+selection within the group and persists (#261)', () => {
+    updateSnapshot(baseEnvelope());
+    openHistory();
+    render(<HistoryModal />);
+    const dayRadio = screen.getByRole('radio', { name: 'Day' });
+    dayRadio.focus();
     expect(getState().prefs.historyPeriod).toBe('day');
-    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    // One step only — proves the toggle owns ←/→ (no leftover global handler
+    // that would advance a second time).
+    fireEvent.keyDown(dayRadio, { key: 'ArrowRight' });
     expect(getState().prefs.historyPeriod).toBe('week');
+    const weekRadio = screen.getByRole('radio', { name: 'Week' });
+    // Focus and the single tab stop both moved to the newly-checked radio.
+    expect(document.activeElement).toBe(weekRadio);
+    expect(weekRadio).toHaveAttribute('tabindex', '0');
+    expect(dayRadio).toHaveAttribute('tabindex', '-1');
     // The rendered dataset follows: weekly columns appear.
     expect(screen.getByRole('columnheader', { name: '$/1%' })).toBeInTheDocument();
+  });
+
+  it('ArrowLeft on the focused checked radio wraps to the last period (#261)', () => {
+    updateSnapshot(baseEnvelope());
+    openHistory();
+    render(<HistoryModal />);
+    const dayRadio = screen.getByRole('radio', { name: 'Day' });
+    dayRadio.focus();
+    fireEvent.keyDown(dayRadio, { key: 'ArrowLeft' });
+    expect(getState().prefs.historyPeriod).toBe('month');
+    expect(document.activeElement).toBe(screen.getByRole('radio', { name: 'Month' }));
+  });
+
+  it('ArrowDown steps the navigator (not the toggle) even when a toggle radio is focused (#261)', () => {
+    updateSnapshot(baseEnvelope());
+    openHistory();
+    render(<HistoryModal />);
+    const dayRadio = screen.getByRole('radio', { name: 'Day' });
+    dayRadio.focus();
+    expect(document.querySelector('.detail-card')?.textContent).toContain('07-01');
+    // ↑/↓ are reserved for the navigator: the group does not handle them, so
+    // they bubble to the global keymap and step the selection, leaving the
+    // Day/Week/Month toggle unchanged.
+    fireEvent.keyDown(dayRadio, { key: 'ArrowDown' });
+    expect(getState().prefs.historyPeriod).toBe('day');
+    expect(document.querySelector('.detail-card')?.textContent).toContain('06-30');
   });
 });
 

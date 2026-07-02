@@ -18,7 +18,7 @@ describe('<ShareIcon>', () => {
   });
 
   // The component lives inside panel `<section onClick={open panel modal}>`
-  // elements (e.g. WeeklyPanel.tsx). A regression that drops the internal
+  // elements (e.g. BlocksPanel.tsx). A regression that drops the internal
   // stopPropagation would double-fire (open share modal + open panel
   // modal). Lock the behavior down.
   it('stops click propagation to ancestor handlers', async () => {

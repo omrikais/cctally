@@ -5105,6 +5105,19 @@ mark.current {
   display: grid; grid-template-columns: 110px 1fr 60px; gap: 6px;
   align-items: center; font-size: var(--fs-meta); margin: 3px 0;
 }
+/* #261 — the shared ModelCostBars recipe uses a fixed 110px chip column. In
+ * the History detail card, the longest real model display name ("opus-4-6-
+ * fast", 13 chars) wrapped at a hyphen into two lines, giving that one row an
+ * uneven height. Scoped to the detail card ONLY: widen the chip column and
+ * keep each chip on a single line (ellipsis as a backstop for pathological
+ * names). The Projects drill keeps the shared 110px column untouched. */
+.detail-card .drill-bar-row {
+  grid-template-columns: 132px 1fr 60px;
+}
+.detail-card .drill-bar-row .chip {
+  min-width: 0; max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .drill-bar {
   height: 8px; background: color-mix(in srgb, var(--accent-magenta) 10%, transparent);
   border-radius: 2px; position: relative; /* lint-allow: border-radius data-viz */

@@ -11,7 +11,7 @@
 // The `focusPanel` helper below appends a hidden focusable
 // `<section data-panel-kind="…">` to document.body and focuses it,
 // mirroring the production wiring on every panel (e.g.
-// WeeklyPanel.tsx). Tests can also focus child elements inside that
+// BlocksPanel.tsx). Tests can also focus child elements inside that
 // section to verify the `closest` walk.
 //
 // Implemented contract (see keyboardShare.ts header for the full guard

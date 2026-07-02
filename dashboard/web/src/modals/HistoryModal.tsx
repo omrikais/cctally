@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Modal } from './Modal';
 import { PeriodMiniBars, type PeriodNavRow } from './PeriodMiniBars';
 import { PeriodDetailCard } from './PeriodDetailCard';
@@ -78,6 +78,18 @@ export function HistoryModal() {
     dispatch({ type: 'SET_HISTORY_PERIOD', period: p });
   };
 
+  // #261 — Day·Week·Month is a WAI-ARIA radiogroup with roving tabindex. One
+  // ref per radio (PERIOD_ORDER index) so ←/→ can pull DOM focus to the newly-
+  // checked radio: focus() works before the re-render because tabIndex only
+  // gates Tab navigation, not programmatic focus.
+  const radioRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const movePeriod = (dir: 1 | -1): void => {
+    const idx = PERIOD_ORDER.indexOf(period);
+    const nextIdx = (idx + dir + PERIOD_ORDER.length) % PERIOD_ORDER.length;
+    setPeriod(PERIOD_ORDER[nextIdx]);
+    radioRefs.current[nextIdx]?.focus();
+  };
+
   // Selection key — seeded from a deep-link date (Day) else null.
   const [selectedKey, setSelectedKey] = useState<string | null>(
     () => getState().openDailyDate,
@@ -129,20 +141,10 @@ export function HistoryModal() {
         if (target) setSelectedKey(target);
       },
     },
-    {
-      key: 'ArrowRight', scope: 'modal', when: isHistoryTopmost,
-      action: () => {
-        const idx = PERIOD_ORDER.indexOf(period);
-        setPeriod(PERIOD_ORDER[(idx + 1) % PERIOD_ORDER.length]);
-      },
-    },
-    {
-      key: 'ArrowLeft', scope: 'modal', when: isHistoryTopmost,
-      action: () => {
-        const idx = PERIOD_ORDER.indexOf(period);
-        setPeriod(PERIOD_ORDER[(idx + PERIOD_ORDER.length - 1) % PERIOD_ORDER.length]);
-      },
-    },
+    // ←/→ are NOT bound here anymore (#261): the Day·Week·Month radiogroup
+    // owns them as native roving-tabindex (see the toggle's onKeyDown below),
+    // so they act only when a toggle radio is focused. ↑/↓ stay global so the
+    // navigator steps from anywhere in the modal (the modal's second axis).
   ]);
 
   const sharePanel = SHARE_PANEL[period];
@@ -162,13 +164,34 @@ export function HistoryModal() {
 
   return (
     <Modal title={title} accentClass="accent-indigo" headerExtras={headerExtras}>
-      <div className="history-toggle" role="radiogroup" aria-label="History period">
-        {PERIOD_ORDER.map((p) => (
+      {/* Day·Week·Month — WAI-ARIA radiogroup with roving tabindex (#261):
+          only the checked radio is a tab stop, so Tab enters the group at the
+          active period; ←/→ move focus AND selection within the group (with
+          wraparound). ↑/↓ are deliberately NOT handled here — the modal
+          reserves them for the period NAVIGATOR (its second axis, per the
+          footer), so they bubble to the global keymap even while a radio is
+          focused. This is an intentional divergence from strict APG, which
+          would use all four arrows within the group. */}
+      <div
+        className="history-toggle"
+        role="radiogroup"
+        aria-label="History period"
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+            e.preventDefault();
+            e.stopPropagation();
+            movePeriod(e.key === 'ArrowRight' ? 1 : -1);
+          }
+        }}
+      >
+        {PERIOD_ORDER.map((p, i) => (
           <button
             key={p}
+            ref={(el) => { radioRefs.current[i] = el; }}
             type="button"
             role="radio"
             aria-checked={period === p}
+            tabIndex={period === p ? 0 : -1}
             className={`pill ${period === p ? 'on' : ''}`}
             onClick={() => setPeriod(p)}
           >

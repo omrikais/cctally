@@ -9,7 +9,7 @@
 // Focus resolution is DOM-driven: we walk up from
 // `document.activeElement` via `closest('[data-panel-kind]')` to find
 // the focused panel. Every panel `<section>` carries
-// `data-panel-kind="<panel-id>"` (see WeeklyPanel.tsx, AlertsPanel, et
+// `data-panel-kind="<panel-id>"` (see BlocksPanel.tsx, AlertsPanel, et
 // al.). `closest` correctly resolves the parent panel even when
 // Tab-traversal lands the user on a child element (e.g. the panel's
 // ShareIcon button) — which is the common path.
