@@ -2,9 +2,11 @@ import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { openActiveOrNewestBlockModal } from '../store/actions';
 import { openShareModal } from '../store/shareSlice';
 import type { BlocksPanelRow } from '../types/envelope';
 
@@ -114,13 +116,14 @@ export function BlocksPanel() {
             Blocks <span className="sub">(5h · current week)</span>
           </h2>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <div className="panel-header-actions">
           <ShareIcon
             panel="blocks"
             panelLabel="5-hour blocks"
             triggerId="blocks-panel"
             onClick={() => dispatch(openShareModal('blocks', 'blocks-panel'))}
           />
+          <ExpandButton label="Blocks" onOpen={openActiveOrNewestBlockModal} />
           <button
             type="button"
             className="panel-collapse-toggle"

@@ -6,6 +6,7 @@ import { fmt } from '../lib/fmt';
 import { alertSeverity, AXIS_CHIP_LABEL } from '../lib/alertAxis';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
+import { ExpandButton } from './ExpandButton';
 
 // Recent alerts panel — compact, last-10, severity color, collapsible.
 // Click anywhere on the panel body to open the full-history modal
@@ -81,7 +82,8 @@ export function RecentAlertsPanel(): JSX.Element {
             Recent alerts <span className="sub">(last 10)</span>
           </h2>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <div className="panel-header-actions">
+          <ExpandButton label="Recent alerts" onOpen={openModal} />
           <button
             type="button"
             className="panel-collapse-toggle"

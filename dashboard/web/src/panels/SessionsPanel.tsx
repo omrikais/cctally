@@ -12,6 +12,8 @@ import { SessionsControls } from '../components/SessionsControls';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
+import { openMostRecentSessionModal } from '../store/actions';
 import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
@@ -134,7 +136,7 @@ export function SessionsPanel() {
             </span>
           )}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="panel-header-actions">
           {!isMobile && <SessionsControls />}
           <ShareIcon
             panel="sessions"
@@ -142,6 +144,7 @@ export function SessionsPanel() {
             triggerId="sessions-panel"
             onClick={() => dispatch(openShareModal('sessions', 'sessions-panel'))}
           />
+          <ExpandButton label="Sessions" onOpen={openMostRecentSessionModal} />
           <button
             type="button"
             className="panel-collapse-toggle"

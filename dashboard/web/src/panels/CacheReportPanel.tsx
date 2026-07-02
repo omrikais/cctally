@@ -33,6 +33,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
+import { ExpandButton } from '../components/ExpandButton';
 import { CacheSparkline } from '../modals/CacheSparkline';
 import { CacheNetBars } from '../modals/CacheNetBars';
 import { fmt } from '../lib/fmt';
@@ -90,7 +91,10 @@ export function CacheReportPanel() {
               Cache Report <span className="sub">(loading)</span>
             </h2>
           </div>
-          <PanelGrip />
+          <div className="panel-header-actions">
+            <ExpandButton label="Cache Report" onOpen={openModal} />
+            <PanelGrip />
+          </div>
         </div>
       </section>
     );
@@ -114,7 +118,10 @@ export function CacheReportPanel() {
           <div className="cr-panel-header-inner">
             <h2 style={{ color: TEAL }}>Cache Report</h2>
           </div>
-          <PanelGrip />
+          <div className="panel-header-actions">
+            <ExpandButton label="Cache Report" onOpen={openModal} />
+            <PanelGrip />
+          </div>
         </div>
         <div className="cr-status-row">
           <span className="cr-glyph thin">−</span>
@@ -251,7 +258,10 @@ export function CacheReportPanel() {
             {chromeAmber && <span className="sub">⚠ Today</span>}
           </h2>
         </div>
-        <PanelGrip />
+        <div className="panel-header-actions">
+          <ExpandButton label="Cache Report" onOpen={openModal} />
+          <PanelGrip />
+        </div>
       </div>
 
       <div className="cr-status-row">

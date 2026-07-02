@@ -3,6 +3,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -120,7 +121,7 @@ export function DailyPanel() {
             History <span className="sub">heatmap · 30 days</span>
           </h2>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <div className="panel-header-actions">
           {/* The History card shares the daily view; the triggerId matches
               the S-key path (`${data-panel-kind}-panel` = history-panel) so
               ShareModalRoot restores focus to this button on close. */}
@@ -129,6 +130,10 @@ export function DailyPanel() {
             panelLabel="History"
             triggerId="history-panel"
             onClick={() => dispatch(openShareModal('daily', 'history-panel'))}
+          />
+          <ExpandButton
+            label="History"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'history' })}
           />
           <button
             type="button"

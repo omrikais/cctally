@@ -1,6 +1,7 @@
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
@@ -44,13 +45,19 @@ export function ForecastPanel() {
           <use href="/static/icons.svg#crystal-ball" />
         </svg>
         <h2>Forecast</h2>
-        <ShareIcon
-          panel="forecast"
-          panelLabel="Forecast"
-          triggerId="forecast-panel"
-          onClick={() => dispatch(openShareModal('forecast', 'forecast-panel'))}
-        />
-        <PanelGrip />
+        <div className="panel-header-actions">
+          <ShareIcon
+            panel="forecast"
+            panelLabel="Forecast"
+            triggerId="forecast-panel"
+            onClick={() => dispatch(openShareModal('forecast', 'forecast-panel'))}
+          />
+          <ExpandButton
+            label="Forecast"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' })}
+          />
+          <PanelGrip />
+        </div>
       </div>
       <div className="panel-body fc-body">
         <div className="fc-hero">

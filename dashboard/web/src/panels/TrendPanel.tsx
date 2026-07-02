@@ -4,6 +4,7 @@ import { Sparkline } from '../components/Sparkline';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
@@ -74,13 +75,19 @@ export function TrendPanel() {
         <h2>
           $/1% Trend <span className="sub">({data.length} week{data.length === 1 ? '' : 's'})</span>
         </h2>
-        <ShareIcon
-          panel="trend"
-          panelLabel="Trend"
-          triggerId="trend-panel"
-          onClick={() => dispatch(openShareModal('trend', 'trend-panel'))}
-        />
-        <PanelGrip />
+        <div className="panel-header-actions">
+          <ShareIcon
+            panel="trend"
+            panelLabel="Trend"
+            triggerId="trend-panel"
+            onClick={() => dispatch(openShareModal('trend', 'trend-panel'))}
+          />
+          <ExpandButton
+            label="Trend"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' })}
+          />
+          <PanelGrip />
+        </div>
       </div>
       <div className="panel-body">
         <table className="trend-table">

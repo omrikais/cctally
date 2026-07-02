@@ -15,6 +15,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { openShareModal } from '../store/shareSlice';
 import { fmt } from '../lib/fmt';
 
@@ -44,7 +45,7 @@ export function ProjectsPanel() {
           </span>
         </h2>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <div className="panel-header-actions">
         <ShareIcon
           panel="projects"
           panelLabel="Projects"
@@ -52,6 +53,10 @@ export function ProjectsPanel() {
           onClick={() =>
             dispatch(openShareModal('projects', 'projects-panel'))
           }
+        />
+        <ExpandButton
+          label="Projects"
+          onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'projects' })}
         />
         <PanelGrip />
       </div>
