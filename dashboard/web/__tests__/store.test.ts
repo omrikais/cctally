@@ -780,19 +780,19 @@ describe('alerts store (T8)', () => {
   });
 });
 
-describe('OPEN_MODAL kind=history', () => {
+describe('OPEN_MODAL kind=daily', () => {
   beforeEach(() => {
     _resetForTests();
   });
 
-  it('OPEN_MODAL with kind=history and dailyDate sets both slices', () => {
+  it('OPEN_MODAL with kind=daily and dailyDate sets both slices', () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: '2026-04-22' });
     const s = getState();
     expect(s.openModal).toBe('daily');
     expect(s.openDailyDate).toBe('2026-04-22');
   });
 
-  it('OPEN_MODAL with kind=history and no dailyDate leaves openDailyDate null', () => {
+  it('OPEN_MODAL with kind=daily and no dailyDate leaves openDailyDate null', () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'daily' });
     const s = getState();
     expect(s.openModal).toBe('daily');
@@ -809,7 +809,7 @@ describe('OPEN_MODAL kind=history', () => {
     expect(s.openBlockStartAt).toBeNull();
   });
 
-  it('switching from another modal to history clears its bound id', () => {
+  it('switching from another modal to daily clears its bound id', () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: 'abc-123' });
     dispatch({ type: 'OPEN_MODAL', kind: 'daily', dailyDate: '2026-04-22' });
     const s = getState();

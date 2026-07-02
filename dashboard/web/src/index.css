@@ -415,19 +415,20 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .bento-row .panel-host[data-span="6"] { grid-column: span 6; }
 }
 
-/* #264 S1: History (the Daily heatmap) re-homes into the bento medium row as a
+/* #264 S1 (S2 rename History→Daily): the Daily heatmap card re-homes into the
+   bento medium row as a
    COMPACT color-glance (the mockup's treatment). The full card renders 64px-tall
    cost cells with per-day "$NN.NN" + 2-line week labels — far too tall for the
    ~220px medium card, where it compressed to ~8px rows and the labels overlapped
-   into an illegible blob (ui-qa P2). Scoped to the History card body (id) + a
+   into an illegible blob (ui-qa P2). Scoped to the Daily card body (id) + a
    bento row, we drop the per-cell cost text, the "month continues" filler, and
    the "W#" label line so the grid becomes a legible color + day-number heatmap
    that fills the card. The per-day $ detail is a cell/⤢ click away in the
-   History modal; the card answers "which days ran hot" at a glance.
+   Daily modal; the card answers "which days ran hot" at a glance.
    DESKTOP-GATED (min-width:900px, same breakpoint as the bento's definite row
    heights): below it the card has no definite height, so a flexible fill would
    drop the base 64px uniform-row guarantee — mobile keeps the full-detail base
-   .daily-cal-grid. The History MODAL and other panels are untouched. */
+   .daily-cal-grid. The Daily modal and other panels are untouched. */
 @media (min-width: 900px) {
   .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
   .bento-row #panel-daily-body .daily-cal-grid {
@@ -1277,6 +1278,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 /* Table pane is a scroll container so Weekly's ≤6 columns scroll within the
    pane instead of blowing out the modal (Codex finding 2). */
 .period-table-pane { min-width: 0; overflow-x: auto; }
+/* Detail pane also gets a shrink valve so a long model name / window label
+   can't push the two-pane grid wider than the modal (defensive; text content). */
+.period-detail-pane { min-width: 0; }
 /* Collapse to one column before the 6-col Weekly table gets cramped (≤1024,
    not the mobile 640 — finding 2). */
 @media (max-width: 1024px) {
@@ -5180,7 +5184,7 @@ mark.current {
 /* Shared modal footer-hint row (S8 #254): the KeyHintFooter component always
  * renders the generic `.key-hint-footer` class, so the styling lives here and
  * both the Projects modal (which adds the legacy `.projects-modal-footer-hint`
- * alias) and the History modal share one recipe. */
+ * alias) and the period modals share one recipe. */
 .key-hint-footer {
   display: flex; flex-wrap: wrap; align-items: baseline;
   gap: 4px 8px;

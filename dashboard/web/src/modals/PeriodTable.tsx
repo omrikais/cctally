@@ -10,8 +10,8 @@ import type { ModelCostRow, PeriodRow } from '../types/envelope';
 interface Props {
   rows: PeriodRow[];
   variant: 'weekly' | 'monthly';
-  // S8: HistoryModal drives all variants with the single indigo accent;
-  // the interim Weekly/Monthly modals still pass cyan/pink until B3.
+  // #264 S2: the Weekly modal passes cyan, Monthly pink (Daily renders no
+  // table). 'accent-indigo' stays in the union but is unused on the table now.
   accentClass: 'accent-cyan' | 'accent-pink' | 'accent-indigo';
   // WM-1 / S8: selection is key-based (keyOf) so it survives header
   // re-sorting and SSE churn; the row order in the DOM is the sorted
@@ -64,7 +64,7 @@ export function PeriodTable({ rows, variant, accentClass, selectedKey, onSelect 
   // Decorate PeriodRow[] → HistoryTableRow[] (keyed via keyOf), then apply
   // the persisted sort. A null override leaves rows in envelope order
   // (today's default) — applyTableSort returns the input unchanged. Shared
-  // with HistoryModal via decorateHistoryRows so the ↑/↓ ordered key list
+  // with PeriodModal via decorateHistoryRows so the ↑/↓ ordered key list
   // and the rendered row order never drift.
   const decorated = decorateHistoryRows(rows, hv);
   const sorted = applyTableSort(decorated, columns, sortOverride);

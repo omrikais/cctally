@@ -10,6 +10,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { TrendPanel } from './TrendPanel';
 import { ForecastPanel } from './ForecastPanel';
 import { DailyPanel } from './DailyPanel';
+import { WeeklyPanel } from './WeeklyPanel';
+import { MonthlyPanel } from './MonthlyPanel';
 import { BlocksPanel } from './BlocksPanel';
 import { SessionsPanel } from './SessionsPanel';
 import { ProjectsPanel } from './ProjectsPanel';
@@ -88,17 +90,16 @@ describe('#247 S1 card-chrome contract', () => {
 //   • share icon (`.share-icon`, from components/ShareIcon.tsx) is present
 //     IFF the panel id is in the share-capable set (`SharePanelId` in
 //     share/types.ts, mirrored by `SHARE_CAPABLE_PANELS` in
-//     bin/_lib_share_templates.py): trend, history, blocks, forecast,
-//     sessions, projects (6 grid panels post-S8). NOT alerts/cache-report.
-//     (current-week is share-capable too but #248 removed it from the grid —
-//     it shares via the HeroStrip / Current Week modal. S8 #254 collapsed
-//     the weekly/monthly/daily tiles into the single "History" heatmap card,
-//     which shares the daily view.)
+//     bin/_lib_share_templates.py): trend, daily, weekly, monthly, blocks,
+//     forecast, sessions, projects (8 grid panels post-S2). NOT
+//     alerts/cache-report. (current-week is share-capable too but #248 removed
+//     it from the grid — it shares via the HeroStrip / Current Week modal.
+//     #264 S2 split the S8 "History" heatmap back into Daily/Weekly/Monthly.)
 //   • collapse toggle (`.panel-collapse-toggle`) is present IFF the panel has
-//     a `*Collapsed` pref in store/store.ts: sessions, blocks, history
-//     (dailyCollapsed), alerts (4).
+//     a `*Collapsed` pref in store/store.ts: sessions, blocks, daily
+//     (dailyCollapsed), alerts (4). Weekly/Monthly have no collapse pref.
 //   • expand button (`.panel-expand`, from components/ExpandButton.tsx) is
-//     present on ALL 8 grid panels (#264 S1 AFFORD-1) — the consistent
+//     present on ALL 10 grid panels (#264 S1 AFFORD-1) — the consistent
 //     "open this card's detail modal" affordance, unconditional.
 //
 // The expected booleans below are the ground truth DERIVED from those
@@ -107,7 +108,9 @@ describe('#247 S1 card-chrome contract', () => {
 const AFFORDANCE_GRAMMAR: Array<[string, ComponentType, boolean, boolean, boolean]> = [
   // [panel id, Component, shareable, collapsible, expandable]
   ['trend', TrendPanel, true, false, true],
-  ['history', DailyPanel, true, true, true],
+  ['daily', DailyPanel, true, true, true],
+  ['weekly', WeeklyPanel, true, false, true],
+  ['monthly', MonthlyPanel, true, false, true],
   ['blocks', BlocksPanel, true, true, true],
   ['forecast', ForecastPanel, true, false, true],
   ['sessions', SessionsPanel, true, true, true],
@@ -116,7 +119,7 @@ const AFFORDANCE_GRAMMAR: Array<[string, ComponentType, boolean, boolean, boolea
   ['cache-report', CacheReportPanel, false, false, true],
 ];
 
-describe('#247 S1 uniform header affordance grammar (acceptance #6 — 8 grid panels)', () => {
+describe('#247 S1 uniform header affordance grammar (acceptance #6 — 10 grid panels)', () => {
   // The base envelope (no cache_report field) renders CacheReportPanel in its
   // loading branch, which — like every cache-report state — carries neither a
   // share icon nor a collapse toggle, so [false, false] holds without a
@@ -140,14 +143,14 @@ describe('#247 S1 uniform header affordance grammar (acceptance #6 — 8 grid pa
     },
   );
 
-  // Guards the table itself: exactly 6 share-capable and 4 collapsible GRID
-  // panels (S8 #254 collapsed weekly/monthly/daily → one History card:
-  // total 10→8, share-capable 8→6), and 8 expandable (#264 S1 — every card).
+  // Guards the table itself: exactly 8 share-capable and 4 collapsible GRID
+  // panels (#264 S2 split the History card back into Daily/Weekly/Monthly:
+  // total 8→10, share-capable 6→8), and 10 expandable (#264 S1 — every card).
   // A drift in any count means a panel silently gained/lost an affordance.
-  it('covers all 8 grid panels with 6 share-capable, 4 collapsible, 8 expandable', () => {
-    expect(AFFORDANCE_GRAMMAR.length).toBe(8);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(6);
+  it('covers all 10 grid panels with 8 share-capable, 4 collapsible, 10 expandable', () => {
+    expect(AFFORDANCE_GRAMMAR.length).toBe(10);
+    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(8);
     expect(AFFORDANCE_GRAMMAR.filter(([, , , c]) => c).length).toBe(4);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , , , e]) => e).length).toBe(8);
+    expect(AFFORDANCE_GRAMMAR.filter(([, , , , e]) => e).length).toBe(10);
   });
 });

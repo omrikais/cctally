@@ -623,7 +623,7 @@ describe('<CacheReportModal /> integration (panel click -> modal open)', () => {
     updateSnapshot(envelopeWith(makeCacheReport()));
     render(<App />);
     // Locate the Cache Report panel via its role/name. The panel
-    // exists at the tail of DEFAULT_PANEL_ORDER (position 11).
+    // exists at position 5 of DEFAULT_PANEL_ORDER (the medium row).
     const panel = screen.getByRole('region', { name: /cache report/i });
     fireEvent.click(panel);
     // Modal should now be in the DOM.

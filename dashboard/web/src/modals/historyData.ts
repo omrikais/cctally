@@ -1,7 +1,7 @@
-// Pure data adapters for the History modal (S8, issue #254). Extracted so
-// HistoryModal and PeriodTable share ONE decoration recipe (their ordered
-// key lists must agree — the ↑/↓ keymap steps over the same sorted order
-// the table renders).
+// Pure data adapters for the period modals (S8 #254; #264 S2 split the History
+// modal into the shared PeriodModal). Extracted so PeriodModal and PeriodTable
+// share ONE decoration recipe (their ordered key lists must agree — the ↑/↓
+// keymap steps over the same sorted order the table renders).
 import type { DailyPanelRow, PeriodRow } from '../types/envelope';
 import type { HistoryTableRow, HistoryVariant } from '../lib/historyColumns';
 import { keyOf } from './periodNav';
@@ -37,7 +37,7 @@ export function dailyToPeriodRow(row: DailyPanelRow, prior?: DailyPanelRow): Per
 /**
  * Decorate PeriodRow[] → HistoryTableRow[] (keyed via keyOf) for the
  * sortable Weekly/Monthly table. A null sort override leaves rows in
- * envelope order. Both PeriodTable (render) and HistoryModal (the ↑/↓
+ * envelope order. Both PeriodTable (render) and PeriodModal (the ↑/↓
  * ordered key list) route through this so the visible order and the
  * keyboard-step order can never drift.
  */

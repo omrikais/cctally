@@ -93,6 +93,9 @@ export function applyPanelOrderMigration(
   // 'cache-report' (or after 'daily' if cache-report is absent). Guarded like
   // the splices above: only within a non-empty saved order, skip any id already
   // present, preserve weekly-before-monthly. reconcilePanelOrder backstops gaps.
+  // (A corrupt order carrying BOTH 'history' and 'daily' would rename to two
+  // 'daily' — harmless: reconcilePanelOrder dedups keep-first downstream, and a
+  // legitimate v4 cursor only ever holds 'history', never 'daily'.)
   if (currentVersion < 5) {
     panels = panels.map((id) => (id === 'history' ? 'daily' : id));
     if (panels.length > 0) {
