@@ -376,12 +376,19 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    cell rows (GitHub-contribution-graph style) so it fills the card height and
    reads at-a-glance instead of overflowing into a scroll viewport. Scoped to
    the History card body (id) + a bento row so the History MODAL and other
-   panels are untouched. Medium-row height is finalized at the ui-qa gate. */
-.bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
-.bento-row #panel-daily-body .daily-cal-grid {
-  flex: 1 1 auto;
-  min-height: 0;
-  grid-auto-rows: minmax(0, 1fr);
+   panels are untouched. Medium-row height is finalized at the ui-qa gate.
+   DESKTOP-GATED (min-width:900px, same breakpoint as the bento's definite
+   row heights): below it the card has no definite height, so `minmax(0,1fr)`
+   rows would have no free space to distribute and collapse to content —
+   dropping the base 64px uniform-row guarantee. Mobile therefore keeps the
+   base .daily-cal-grid 64px rows. */
+@media (min-width: 900px) {
+  .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
+  .bento-row #panel-daily-body .daily-cal-grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-auto-rows: minmax(0, 1fr);
+  }
 }
 
 /* -------- Update subcommand: header brand + badge (spec §6) -------- */
