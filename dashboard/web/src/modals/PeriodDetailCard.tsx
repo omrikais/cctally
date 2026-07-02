@@ -1,5 +1,6 @@
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { ModelCostBars } from './ModelCostBars';
 import type { PeriodRow } from '../types/envelope';
 
 interface Props {
@@ -46,18 +47,8 @@ export function PeriodDetailCard({ row, variant, accentClass }: Props) {
           Subscription window: {fmtSubscriptionWindow(row.week_start_at, row.week_end_at)}
         </div>
       )}
-      <div className="model-stack" role="presentation">
-        {row.models.map((m) => (
-          <span key={m.model} className={m.chip} style={{ width: `${m.cost_pct}%` }} />
-        ))}
-      </div>
-      <div className="chips">
-        {row.models.map((m) => (
-          <span key={m.model} className={`chip ${m.chip}`}>
-            {m.display} {Math.round(m.cost_pct)}% · {fmt.usd2(m.cost_usd)}
-          </span>
-        ))}
-      </div>
+      <ModelCostBars rows={row.models} />
+
       <div className="tokens-row">
         <div className="t"><span className="k">Input</span><span className="v">{fmt.compact(row.input_tokens)}</span></div>
         <div className="t"><span className="k">Output</span><span className="v">{fmt.compact(row.output_tokens)}</span></div>
