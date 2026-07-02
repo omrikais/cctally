@@ -31,23 +31,31 @@ export type PanelId =
 // — is typed to `GridPanelId` so the grid can never address `current-week`.
 export type GridPanelId = Exclude<PanelId, 'current-week'>;
 
-// S8 (#254): `history` (the relabeled heatmap card) takes the slot the
-// former `daily` card held among the wide cards; weekly/monthly left the
-// grid. Canonical index 5 — the reconcile v3→v4 migration collapses a
-// saved weekly/monthly/daily set into `history` at this position.
+// #264 S1: bento left-to-right order. Fresh-state / reset installs render
+// tall(sessions·trend·projects) → medium(history·cache-report) →
+// short(forecast·blocks·alerts). Digit-key mapping follows this order, so
+// `1` opens Sessions. Existing users keep their persisted order — reconcile
+// preserves saved positions, and the bento is order-independent (each card's
+// row + span is static per-id in CARD_LAYOUT), so no schema bump is needed.
 export const DEFAULT_PANEL_ORDER: GridPanelId[] = [
-  'forecast', 'trend', 'sessions',
-  'projects',
-  'blocks', 'history', 'alerts',
-  'cache-report',
+  'sessions', 'trend', 'projects',
+  'history', 'cache-report',
+  'forecast', 'blocks', 'alerts',
 ];
 
-// Two-tier grid (#248, spec §2). Compact uniform summary TILES (auto-fit
-// packed) vs full-width content-height WIDE data cards. App partitions
-// `prefs.panelOrder` by this static map into two independent dnd-kit strips.
-export const CARD_TIER: Record<GridPanelId, 'tile' | 'wide'> = {
-  forecast: 'tile', blocks: 'tile', alerts: 'tile',
-  sessions: 'wide', trend: 'wide', projects: 'wide', history: 'wide', 'cache-report': 'wide',
+// #264 S1: the #248 tile/wide two-tier map is replaced by a height-matched
+// 12-col bento. Each card has a fixed row-class + column span (per-row spans
+// sum to 12). App partitions prefs.panelOrder into three DndContext rows by
+// `.row`; the grid places cards by `.span`; SWAP_PANELS skips within a `.row`.
+export const CARD_LAYOUT: Record<GridPanelId, { row: 'tall' | 'medium' | 'short'; span: number }> = {
+  sessions: { row: 'tall', span: 6 },
+  trend:    { row: 'tall', span: 3 },
+  projects: { row: 'tall', span: 3 },
+  history:        { row: 'medium', span: 8 },
+  'cache-report': { row: 'medium', span: 4 },
+  forecast: { row: 'short', span: 4 },
+  blocks:   { row: 'short', span: 4 },
+  alerts:   { row: 'short', span: 4 },
 };
 
 // Panels for which a share affordance is rendered (spec §6.1, plan §M1.9).

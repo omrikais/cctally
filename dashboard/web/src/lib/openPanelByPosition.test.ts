@@ -3,7 +3,13 @@ import { openPanelByPosition } from './openPanelByPosition';
 import { _resetForTests, getState, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
 
-const FAKE_ENV = { header: {} } as unknown as Envelope;
+// #264 S1: position 1 is now Sessions (bento default order). Its openAction
+// (openMostRecentSessionModal) only fires when a session row exists, so seed
+// one so "a digit opens a panel modal once a snapshot exists" stays testable.
+const FAKE_ENV = {
+  header: {},
+  sessions: { rows: [{ session_id: 's1' }] },
+} as unknown as Envelope;
 
 beforeEach(() => { localStorage.clear(); _resetForTests(); });
 
