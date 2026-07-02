@@ -3385,6 +3385,10 @@ mark.current {
 .ra-gauge-tick.tick-red   { background: var(--accent-red); }
 .ra-gauge-tick.tick-mid   { background: var(--accent-orange); }
 .ra-gauge-copy { color: var(--text-dim); font-size: var(--fs-meta); }
+/* #264 S1 (VOID-1) — the empty Alerts PANEL reuses the modal gauge's
+   .ra-gauge-bar/.ra-gauge-fill/.ra-gauge-tick vocabulary; this only adds the
+   spacing under the one-liner so the two stack cleanly in the short-row tile. */
+.alerts-gauge { margin-top: var(--space-3); }
 
 /* =========================================================================
    Share modal (spec §6.2). Layered ABOVE the panel-modal layer via a

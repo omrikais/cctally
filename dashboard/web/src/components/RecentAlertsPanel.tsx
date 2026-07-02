@@ -32,9 +32,15 @@ export function RecentAlertsPanel(): JSX.Element {
   const env = useSnapshot();
   const usedPct = env?.header?.used_pct ?? null;
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
-  const fireThresholds = (
-    alertsConfig.weekly_thresholds?.length ? alertsConfig.weekly_thresholds : [90, 95]
-  ).map((t) => `${t}%`).join(' / ');
+  // #264 S1 (VOID-1) — the raw numeric fire thresholds drive BOTH the teaching
+  // one-liner AND the gauge's tick markers. Defaults to [90, 95] before the
+  // first tick. `lowest`/`highest` colour the ticks (amber floor, red ceiling)
+  // exactly like the RecentAlertsModal empty-state gauge.
+  const gaugeThresholds =
+    alertsConfig.weekly_thresholds?.length ? alertsConfig.weekly_thresholds : [90, 95];
+  const fireThresholds = gaugeThresholds.map((t) => `${t}%`).join(' / ');
+  const lowest = Math.min(...gaugeThresholds);
+  const highest = Math.max(...gaugeThresholds);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Slice newest-first to last 10 for the panel; the modal renders the
@@ -110,14 +116,41 @@ export function RecentAlertsPanel(): JSX.Element {
       </div>
       <div className="panel-body" id="panel-alerts-body">
         {alerts.length === 0 ? (
-          <div className="alerts-empty-tile">
-            <span className="alerts-empty-glyph" aria-hidden="true">✓</span>
-            <span className="alerts-empty-text">
-              No alerts
-              <span className="sep" aria-hidden="true"> · </span>
-              You're at {fmt.pct1(usedPct)}. Alerts fire at {fireThresholds}.
-            </span>
-          </div>
+          <>
+            <div className="alerts-empty-tile">
+              <span className="alerts-empty-glyph" aria-hidden="true">✓</span>
+              <span className="alerts-empty-text">
+                No alerts
+                <span className="sep" aria-hidden="true"> · </span>
+                You're at {fmt.pct1(usedPct)}. Alerts fire at {fireThresholds}.
+              </span>
+            </div>
+            {/* #264 S1 (VOID-1) — teaching gauge: current used% as a fill with a
+                tick per fire threshold, so the sparse empty tile SHOWS the
+                distance to the line. Reuses the RecentAlertsModal gauge's
+                bar/fill/tick classes for a consistent look. Decorative
+                (role="presentation") — the one-liner above states it in words.
+                Omitted when used% is unknown (a null gauge would be broken). */}
+            {usedPct != null && (
+              <div className="ra-gauge-bar alerts-gauge" role="presentation">
+                <div
+                  className="ra-gauge-fill"
+                  style={{ width: `${Math.max(0, Math.min(usedPct, 100))}%` }}
+                />
+                {gaugeThresholds.map((th, i) => (
+                  <span
+                    key={`${th}-${i}`}
+                    className={
+                      'ra-gauge-tick ' +
+                      (th === lowest ? 'tick-amber' : th === highest ? 'tick-red' : 'tick-mid')
+                    }
+                    data-th={String(th)}
+                    style={{ left: `${th}%` }}
+                  />
+                ))}
+              </div>
+            )}
+          </>
         ) : (
           <ul className="alerts-list">
             {alerts.map((a) => {

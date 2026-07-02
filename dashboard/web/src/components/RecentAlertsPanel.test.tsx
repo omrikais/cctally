@@ -8,8 +8,8 @@
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RecentAlertsPanel } from './RecentAlertsPanel';
-import { _resetForTests, dispatch } from '../store/store';
-import type { AlertEntry } from '../types/envelope';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import type { AlertEntry, Envelope } from '../types/envelope';
 import type { AlertsConfig } from '../store/store';
 
 const CONFIG: AlertsConfig = {
@@ -42,6 +42,27 @@ function entry(partial: Partial<AlertEntry>): AlertEntry {
   };
 }
 
+function emptyEnv(usedPct: number | null): Envelope {
+  return {
+    envelope_version: 2,
+    generated_at: '2026-06-30T10:00:00Z',
+    last_sync_at: null, sync_age_s: null, last_sync_error: null,
+    header: {
+      week_label: 'wk Jun 30', used_pct: usedPct, five_hour_pct: null,
+      dollar_per_pct: null, forecast_pct: null, forecast_verdict: 'ok',
+      vs_last_week_delta: null,
+    },
+    current_week: null, forecast: null, trend: null,
+    weekly: { rows: [] }, monthly: { rows: [] }, blocks: { rows: [] },
+    daily: { rows: [], quantile_thresholds: [], peak: null },
+    sessions: { total: 0, sort_key: 'started_desc', rows: [] },
+    projects: null,
+    display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
+    alerts: [],
+    alerts_settings: { enabled: true, weekly_thresholds: [90, 95], five_hour_thresholds: [90, 95], budget_thresholds: [90, 95] },
+  };
+}
+
 beforeEach(() => {
   _resetForTests();
 });
@@ -69,5 +90,43 @@ describe('RecentAlertsPanel severity', () => {
     render(<RecentAlertsPanel />);
     const critCell = screen.getByText('100%');
     expect(critCell.className).toContain('severity-critical');
+  });
+});
+
+// #264 S1 (VOID-1) — the empty Alerts tile gains a teaching gauge below the
+// one-liner (mirrors the RecentAlertsModal empty-state gauge vocabulary): a
+// fill at the current used%, with a tick per configured weekly fire threshold,
+// so "you're at 42%, alerts fire at 90/95" is SHOWN, not just told.
+describe('RecentAlertsPanel empty-state teaching gauge (#264 S1)', () => {
+  function seed(usedPct: number | null) {
+    act(() => {
+      updateSnapshot(emptyEnv(usedPct));
+      dispatch({
+        type: 'INGEST_SNAPSHOT_ALERTS',
+        alerts: [],
+        alertsSettings: CONFIG,
+        isFirstTick: true,
+      });
+    });
+  }
+
+  it('renders a gauge filled to used_pct with one tick per weekly threshold', () => {
+    seed(42);
+    const { container } = render(<RecentAlertsPanel />);
+    const fill = container.querySelector('.ra-gauge-fill') as HTMLElement;
+    expect(fill).not.toBeNull();
+    expect(fill.style.width).toBe('42%');
+    const ticks = container.querySelectorAll('.ra-gauge-tick');
+    expect(Array.from(ticks).map((t) => (t as HTMLElement).style.left)).toEqual([
+      '90%',
+      '95%',
+    ]);
+  });
+
+  it('omits the gauge when used_pct is unknown (keeps the one-liner)', () => {
+    seed(null);
+    const { container } = render(<RecentAlertsPanel />);
+    expect(container.querySelector('.ra-gauge-fill')).toBeNull();
+    expect(container.querySelector('.alerts-empty-tile')).not.toBeNull();
   });
 });
