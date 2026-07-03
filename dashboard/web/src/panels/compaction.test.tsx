@@ -1,8 +1,9 @@
-// #248 Task 4 — Blocks compaction. The two-tier grid puts the Blocks tile in
-// the uniform summary row, so its body caps to the ~3 most-recent rows while
-// the envelope (and the drill-in Block modal) keep the full history. The cap
-// is the PANEL's, not the data's — this test feeds 8 rows and asserts the body
-// renders ≤3 while the store snapshot still carries all 8.
+// #264 S4 (A2) — Blocks UNCAP. This file previously codified the #248 Task 4
+// 3-row summary cap (`slice(0,3)`); the S4 desktop-bento repair removes that cap
+// so the bento Blocks card renders EVERY block and scrolls in-card (the Recent
+// Sessions inner-scroll model), which is how "see all blocks" is reached. This
+// test now feeds 8 rows and asserts all 8 render, in envelope (head) order, with
+// the store snapshot carrying all 8 — the inverse of the old cap.
 //
 // (S8 #254 removed the Weekly/Monthly grid tiles — the consolidated History
 // modal supersedes them — so their former compaction cases left with the
@@ -58,19 +59,18 @@ beforeEach(() => {
   updateSnapshot(env());
 });
 
-describe('#248 Task 4 — Blocks compacts to ≤3 rows', () => {
-  it('BlocksPanel renders ≤3 .blocks-row rows while the envelope carries 8', () => {
+describe('#264 S4 (A2) — Blocks renders every row (no cap)', () => {
+  it('BlocksPanel renders all 8 .blocks-row rows from the 8-row envelope', () => {
     const { container } = render(<BlocksPanel />);
-    expect(container.querySelectorAll('.blocks-row').length).toBeLessThanOrEqual(3);
-    // The data is untouched — the modal drill still gets the full history.
+    expect(container.querySelectorAll('.blocks-row').length).toBe(8);
     expect(getState().snapshot?.blocks?.rows?.length).toBe(8);
   });
 
-  it('the compacted panel renders the 3 MOST-RECENT rows (slice from the head)', () => {
+  it('renders every row in envelope (head) order — all reachable via in-card scroll', () => {
     const { container } = render(<BlocksPanel />);
     const labels = Array.from(container.querySelectorAll('.blocks-row .label')).map((n) =>
       (n.textContent ?? '').trim(),
     );
-    expect(labels).toEqual(['B0', 'B1', 'B2']);
+    expect(labels).toEqual(['B0', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
   });
 });

@@ -91,6 +91,40 @@ describe('#264 SESS-1 — single-model drops the Model column entirely', () => {
   });
 });
 
+describe('#264 S4 (MOB-1/B2) — class-based mobile Sessions card cells', () => {
+  // Codex pre-plan P1: the mobile card grid must key off STABLE cell classes,
+  // not nth-child. In single-model mode the model <td> isn't rendered, so an
+  // nth-child(3)-keyed layout shifts the model grid-area onto the Session cell.
+  // Guard both row shapes: the model cell carries .model.model-chip-cell only
+  // in multi-model, the duration cell always carries .dur, and td.session is
+  // always present as the new primary line.
+  it('multi-model rows tag the model cell with .model.model-chip-cell (class-based, not nth-child)', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', model: 'claude-opus-4-8' }),
+      sessRow({ session_id: 'b', model: 'claude-sonnet-5' }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('td.model.model-chip-cell')).toBeTruthy();
+    expect(container.querySelector('td.dur')).toBeTruthy();
+    expect(container.querySelector('td.session')).toBeTruthy();
+  });
+
+  it('single-model rows omit the model cell entirely; Session + dur cells still present', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', model: 'claude-opus-4-8', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 'b', model: 'claude-opus-4-8', project: 'beta', project_key: 'beta' }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('td.model.model-chip-cell')).toBeNull();
+    expect(container.querySelector('td.session')).toBeTruthy();
+    expect(container.querySelector('td.dur')).toBeTruthy();
+  });
+});
+
 describe('#264 SESS-2 — Session (title) + Cache cells', () => {
   it('renders the title in the Session cell; null title → muted em-dash', () => {
     const env = baseEnvelope();

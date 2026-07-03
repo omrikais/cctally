@@ -124,7 +124,7 @@ export function SessionsPanel() {
       }}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <div className="panel-title-wrap" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#clock" />
           </svg>
@@ -232,9 +232,9 @@ export function SessionsPanel() {
                       query={searchText}
                     />
                   </td>
-                  <td><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
+                  <td className="dur"><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
                   {!oneModel && (
-                    <td onClick={(e) => e.stopPropagation()}>
+                    <td className="model model-chip-cell" onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"
                         className={`chip model-chip ${chipCls}`}

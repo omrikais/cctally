@@ -4,7 +4,15 @@ import { stepMatch, tryQuit } from './actions';
 import { openPanelByPosition } from '../lib/openPanelByPosition';
 import { buildShareKeyBinding } from '../share/keyboardShare';
 import { buildBasketKeyBindings } from '../share/keyboardBasket';
+import { BENTO_MEDIA_QUERY } from '../lib/breakpoints';
 import type { Binding } from './keymap';
+
+// True in the desktop bento (>=900px), where per-card collapse is removed (A3).
+// SSR/JSDOM-safe: no matchMedia → treat as "not bento" so `c` behaves as before.
+function _isDesktopBento(): boolean {
+  return typeof window !== 'undefined' && !!window.matchMedia
+    && window.matchMedia(BENTO_MEDIA_QUERY).matches;
+}
 
 // The always-on dashboard key bindings, extracted out of main.tsx into a
 // side-effect-free builder (#207 D1) so the drift-guard test can register
@@ -87,7 +95,9 @@ export function buildGlobalKeyBindings(): Binding[] {
       scope: 'sessions',
       // scope:'sessions' → default 'dashboard'; the dispatcher gates the view.
       // chromeOverlayOpen === 0 keeps `c` inert under Settings/Help (#207 D2).
-      when: () => !getState().openModal && getState().chromeOverlayOpen === 0,
+      // #264 S4 (A3): !_isDesktopBento() makes `c` inert >=900px, matching the
+      // hidden collapse chevron — desktop `c` must not mutate sessionsCollapsed.
+      when: () => !getState().openModal && getState().chromeOverlayOpen === 0 && !_isDesktopBento(),
       action: () => {
         const cur = getState().prefs.sessionsCollapsed;
         dispatch({ type: 'SAVE_PREFS', patch: { sessionsCollapsed: !cur } });

@@ -69,12 +69,13 @@ export function BlocksPanel() {
     subscribeStore,
     () => getState().prefs.blocksCollapsed,
   );
-  // #248 §2a — uniform summary TILE: the body caps to the 3 most-recent blocks
-  // (each row still opens its own Block modal). `maxCost` is computed over the
-  // FULL week so the 3 shown bars keep their true scale vs the week's peak; the
-  // footer count + total summarize the whole window.
+  // #264 S4 (A2): render ALL blocks; the bento card scrolls internally (A1) so
+  // every block is reachable (the old #248 slice(0,3) summary-cap hid blocks
+  // 4..N with no view for them). `maxCost` still spans the full week so every
+  // bar keeps its true scale vs the week's peak; the footer count + total
+  // already summarize the whole set (each row still opens its own Block modal).
   const allRows = env?.blocks?.rows ?? [];
-  const rows = allRows.slice(0, 3);
+  const rows = allRows;
   const maxCost = allRows.length > 0 ? Math.max(...allRows.map((r) => r.cost_usd), 0) : 0;
   // View-model unification follow-up (issue #56): footer total comes
   // from the typed envelope scalar rather than re-summing rows in JS.

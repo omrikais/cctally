@@ -14,3 +14,10 @@ export const MOBILE_MEDIA_QUERY = `(max-width: ${MOBILE_BREAKPOINT_PX}px)`;
 // the 1100px pixel itself (1101+ === wide; ≤1100 === unified).
 export const WIDE_BREAKPOINT_PX = 1100;
 export const WIDE_MEDIA_QUERY = `(min-width: ${WIDE_BREAKPOINT_PX + 1}px)`;
+
+// Desktop bento breakpoint — the JS twin of the CSS `@media (min-width: 900px)`
+// that promotes the board to the height-matched 12-col bento (index.css:396).
+// Used by the `c`-keymap gate (collapse is a no-op in the bento) and the Daily
+// card's compact-cost mode. Update both sides together if it ever moves.
+export const BENTO_BREAKPOINT_PX = 900;
+export const BENTO_MEDIA_QUERY = `(min-width: ${BENTO_BREAKPOINT_PX}px)`;

@@ -1,6 +1,7 @@
 import { Fragment, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useIsDesktopBento } from '../hooks/useIsDesktopBento';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
@@ -36,29 +37,32 @@ function fmtChunkRange(firstIso: string, lastIso: string): string {
     : `${MONTH_ABBR[m1 - 1]} ${d1} - ${MONTH_ABBR[m2 - 1]} ${d2}`;
 }
 
-// #214 M3-3: mobile collapses to a ceil integer to fit the narrow 7-col grid;
-// the `$` keeps the magnitude unambiguous. Desktop keeps full usd2 precision.
-export function formatDailyCell(costUsd: number, isMobile: boolean): string {
+// #264 S4 (A4): `compact` (was isMobile) = the ceil-int `$NN` form. True for the
+// narrow mobile 7-col grid AND the desktop bento card (short cells → horizontal
+// room), false only in the 640–900 tablet band where the full-detail stacked cell
+// has vertical room and keeps full usd2 precision. The `$` keeps the magnitude
+// unambiguous. (#214 M3-3 origin.)
+export function formatDailyCell(costUsd: number, compact: boolean): string {
   if (costUsd <= 0) return '—';
-  return isMobile ? `$${Math.ceil(costUsd)}` : fmt.usd2(costUsd);
+  return compact ? `$${Math.ceil(costUsd)}` : fmt.usd2(costUsd);
 }
 
 function Cell({
   r,
   staggerIndex,
-  isMobile,
+  compact,
 }: {
   r: DailyPanelRow;
   staggerIndex: number;
-  isMobile: boolean;
+  compact: boolean;
 }) {
   const dd = r.date.slice(8, 10);  // "YYYY-MM-DD" → "DD"
-  // Mobile rounds to the ceiling integer (with a leading "$" so the magnitude
-  // stays unambiguous) so 6-char "$50.27" collapses to "$51" and fits the
-  // narrower 7-col grid (W-col hidden via CSS). Desktop keeps the full
-  // "$NN.NN" precision. Tooltip stays usd2 — title attributes don't fire on
-  // touch anyway, so desktop precision is the only consumer.
-  const cellCost = formatDailyCell(r.cost_usd, isMobile);
+  // Compact (mobile 7-col grid OR the desktop bento card) rounds to the ceiling
+  // integer (with a leading "$" so the magnitude stays unambiguous) so 6-char
+  // "$50.27" collapses to "$51" and fits the narrow cell. The 640–900 tablet band
+  // keeps the full "$NN.NN" precision. Tooltip stays usd2 — title attributes don't
+  // fire on touch anyway, so the precise value is the only consumer.
+  const cellCost = formatDailyCell(r.cost_usd, compact);
   const tooltip = [
     `${r.label} · ${r.cost_usd > 0 ? fmt.usd2(r.cost_usd) : '—'}`,
     ...r.models.map((m) => `${m.display} ${m.cost_pct.toFixed(0)}%`),
@@ -87,6 +91,11 @@ function Cell({
 export function DailyPanel() {
   const env = useSnapshot();
   const isMobile = useIsMobile();
+  const isDesktopBento = useIsDesktopBento();
+  // #264 S4 (A4): the compact ceil-int cost renders on mobile (narrow 7-col grid)
+  // AND the desktop bento card (short cells laid out day+cost inline); only the
+  // 640–900 tablet band keeps the full-precision stacked cell.
+  const compact = isMobile || isDesktopBento;
   const collapsed = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.dailyCollapsed,
@@ -188,7 +197,7 @@ export function DailyPanel() {
                       key={r.date}
                       r={r}
                       staggerIndex={ci * 7 + ri}
-                      isMobile={isMobile}
+                      compact={compact}
                     />
                   ))}
                   {chunk.length < 7 && (

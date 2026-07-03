@@ -408,11 +408,35 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      color cells (a forced-110px grid rendered 19px cells with zero overlaps at
      the gate). The grid also carries a min-height floor below as insurance. */
   .bento-row.row-medium { grid-auto-rows: 300px; }
-  .bento-row.row-short  { grid-auto-rows: minmax(140px, auto); }
+  /* #264 S4 (A2/Codex-P2): the short row was minmax(140px, auto) — an uncapped
+     Blocks list would grow the row and stretch its Forecast/Alerts row-mates
+     under align-items:stretch. Pin a definite height so Blocks scrolls in-card
+     (A1) and the three short cards stay equal-height. START at 200px; TUNE at the
+     ui-qa gate against real data (S1 tuned the medium row to 300px the same way)
+     so Blocks is usefully scrollable without over-stretching Forecast/Alerts. */
+  .bento-row.row-short  { grid-auto-rows: 200px; }
   .bento-row .panel-host { min-height: 0; height: 100%; }
   .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
   .bento-row .panel-host[data-span="4"] { grid-column: span 4; }
   .bento-row .panel-host[data-span="6"] { grid-column: span 6; }
+  /* #264 S4 (A1) — inner-scroll containment. S1 gave each bento row a definite
+     height but only SessionsPanel carried panel-body--scroll; expanded plain-
+     body cards (Trend/Weekly/Monthly/Projects/Cache/Forecast/Alerts) let content
+     taller than the row overflow `visible` and bleed into the card below (Trend's
+     72px sparkline rendered behind Daily). Contain every bento body: it scrolls
+     INSIDE the card within the S1 flex-chain (min-height:0 / height:100% already
+     set), so nothing crosses a card boundary. Sessions keeps its own
+     panel-body--scroll (unaffected); Blocks' .panel-foot is a sibling of the body
+     so it stays pinned; Daily's in-body .daily-foot flexes and never overflows. */
+  .dash-grid .panel .panel-body { overflow-y: auto; overflow-x: hidden; }
+  /* Sessions already scrolls x for its wide table — don't clip it. */
+  .dash-grid #panel-sessions .panel-body { overflow-x: auto; }
+  /* #264 S4 (A3): the per-card collapse chevron is a no-op in the bento (every
+     collapse max-height exceeds the fixed row height) and A1 inner-scroll now
+     covers its only job on desktop. Hide it >=900px (grid-scoped, not the bare
+     global .panel-collapse-toggle). It stays below 900px where cards stack
+     content-height and collapse still caps a tall panel. */
+  .dash-grid .panel-collapse-toggle { display: none; }
 }
 
 /* #264 S1 (S2 rename History→Daily): the Daily heatmap card re-homes into the
@@ -440,8 +464,30 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
     grid-auto-rows: minmax(0, 1fr);
     gap: 4px;
   }
-  .bento-row #panel-daily-body .daily-cell { padding: 3px 6px; }
-  .bento-row #panel-daily-body .daily-cell .c { display: none; }
+  /* #264 S4 (A4): restore per-day $ on the desktop Daily card. Day on top, cost
+     on its OWN line below — so the cost claims the FULL cell width (100cqw) and
+     stays legible even at the narrowest span-6/900px cell (~36px). An inline
+     day+cost row made the two compete for that width and clipped the cost across
+     the 900–1050px band (ui-qa). Compact ceil-int form (DailyPanel `compact`) + a
+     12px font cap keep the two lines inside the short bento row (~35px); the S1
+     "stacked-$NN.NN collapsed to ~8px" trap doesn't recur because the compact
+     ceil-int is one short token, not the full 64px cost cell. Tooltip + Daily
+     modal keep $NN.NN. */
+  .bento-row #panel-daily-body .daily-cell {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 1px;
+    padding: 3px 5px;
+  }
+  .bento-row #panel-daily-body .daily-cell .d { align-self: flex-start; }
+  .bento-row #panel-daily-body .daily-cell .c {
+    /* full cell width so the cost is legible at every bento width; capped at
+       12px so day + cost + padding stay within the ~35px short-row cell. */
+    font-size: clamp(8px, calc(100cqw / (var(--c-len, 4) * 0.62)), 12px);
+    align-self: center;
+    margin-bottom: 0;
+  }
   .bento-row #panel-daily-body .daily-week-label .wk { display: none; }
   .bento-row #panel-daily-body .daily-week-label .rng { margin-top: 0; }
   .bento-row #panel-daily-body .daily-month-continues { display: none; }
@@ -3985,21 +4031,24 @@ mark.current {
     padding-right: max(8px, env(safe-area-inset-right));
   }
 
-  /* #264 S1 — mobile hero: stack the three zones into one column and turn the
-     zone dividers into bottom borders. Basic-but-functional (S4 owns the
-     compact mobile hero card). The big Used % + Spent numbers shrink from the
-     46px desktop --fs-hero so they don't overflow a phone column. */
+  /* #264 S4 (MOB-2): compact mobile hero card — not the 305px desktop 3-zone
+     stacked. Two hero numbers (Week% + $ spent) share row 1 (5h paired under the
+     week %); the support zone becomes a wrapped meta strip on row 2. ~<=160px. */
   .hero-strip {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "usage spent"
+      "support support";
   }
-  .hero-zone {
-    border-right: 0;
-    border-bottom: 1px solid var(--border-soft);
-    padding: var(--space-3) var(--space-4);
-  }
-  .hero-zone:last-child { border-bottom: 0; }
-  .hu-num, .hs-big { font-size: 40px; }
+  .hero-usage   { grid-area: usage; border-right: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
+  .hero-spent   { grid-area: spent; border-right: 0; border-bottom: 1px solid var(--border-soft); }
+  .hero-support { grid-area: support; }
+  .hero-zone { padding: var(--space-3) var(--space-4); }
+  .hu-num, .hs-big { font-size: 34px; }
   .hu-num--sm { font-size: var(--fs-kpi); }
+  /* support zone → a horizontal wrapped meta strip on mobile (was 3 stacked rows) */
+  .hero-support { flex-direction: row; flex-wrap: wrap; gap: var(--space-2) var(--space-4); align-items: baseline; }
+  .hero-support .sup-row { justify-content: flex-start; gap: var(--space-1); }
 
   /* #214 M3-1: sparse single-column panels shouldn't reserve the desktop
      320px floor — collapse to content height (kills the dead-space scroll).
@@ -4405,10 +4454,13 @@ mark.current {
     font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .m-histable#mtr-table td:nth-child(5) {       /* Δ $/1% */
-    order: 2;
+  .m-histable#mtr-table td:nth-child(5) {       /* Δ $/1% — now trailing, next to $/1% (#264 S4 B5) */
+    /* Was order:2 + margin-left:auto, which pushed Δ to the row-1 right edge,
+       visually disconnected from the $/1% value it deltas (order:5). Render it
+       AFTER $/1% so the sequence reads Week · Cost · Used% · $/1% · Δ. */
+    order: 6;
     flex: 0 0 auto;
-    margin-left: auto;
+    margin-left: 0;
     font-weight: 700;
   }
   .m-histable#mtr-table td:nth-child(2) {       /* Cost */
@@ -4523,6 +4575,26 @@ mark.current {
     color: var(--text-faint); font-size: var(--fs-eyebrow);
   }
 
+  /* #264 S4 (MOB-1): the Sessions h2 was starved to clientWidth:0 because the
+     sess-model-caption span wouldn't yield in the flex title-wrapper. Stack the
+     Sessions header: title on row 1 (full width), caption + actions below. The
+     wrapper now carries a stable `.panel-title-wrap` class (SessionsPanel.tsx)
+     so this rule targets a real selector, not brittle inline styles. */
+  #panel-sessions > .panel-header { flex-wrap: wrap; row-gap: 6px; }
+  #panel-sessions > .panel-header > .panel-title-wrap {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  #panel-sessions > .panel-header > .panel-title-wrap h2 {
+    flex: 1 1 auto;            /* the title, not the caption, absorbs the row */
+    min-width: 4rem;          /* never collapse to 0 */
+  }
+  #panel-sessions > .panel-header > .panel-title-wrap .sess-model-caption {
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #panel-sessions > .panel-header > .panel-header-actions { margin-left: auto; }
+
   /* Sessions panel — Q1=B layout. The SessionsControls component is
      hoisted out of .panel-header on mobile (TSX branch on useIsMobile)
      and rendered as a sibling of .panel-header. Style it as a second
@@ -4593,31 +4665,30 @@ mark.current {
     min-width: 0;
   }
 
-  /* Sessions table → dense two-line rows. The 5-column table
-     (Started / Dur / Model / Project / Cost) collapses to:
-       row 1: project (left, ellipsis) + cost (right, accent color)
-       row 2: started · dur · model-chip (dim)
+  /* #264 S4 (MOB-1/decision-5): Sessions table → dense two-line cards that LEAD
+     with the Session title. The desktop 6/7-col table collapses to:
+       row 1: Session title (bold, ellipsis, left) + cost (right, accent color)
+       row 2: started · dur · project · [model chip when multi-model]
      SortableHeader is hidden on mobile — the SET_SORT cycle pill in
-     .sessions-ctrls is the sole sort control. Match-highlight class
-     stays applied at the <tr> level.
+     .sessions-ctrls is the sole sort control. Match-highlight class stays
+     applied at the <tr> level.
 
-     Implementation note: a fixed grid-template-areas (#214 M3-4) pins the
-     deterministic 2-line shape that flex-wrap could not guarantee — the
-     "started dur . chip" row keeps the three meta cells inline via the 1fr
-     spacer column (project + cost on row 1; meta row below).
-  */
+     Codex pre-plan P1: the layout is driven ENTIRELY by stable cell classes
+     (.session/.dur/.started/.project/.num/.model.model-chip-cell/.cache), NEVER
+     by nth-child. In single-model mode the model <td> isn't rendered, so an
+     nth-child-keyed grid-area would shift the model area onto the Session cell
+     (a latent mis-map previously masked only because td.session was hidden).
+     Class-based areas map correctly for BOTH single- and multi-model rows — the
+     `chip` column is simply empty when the model cell is absent. */
   .sess-table { width: 100%; }
   .sess-table thead { display: none; }
   .sess-table tbody, .sess-table tr { display: block; width: 100%; }
-  /* #214 M3-4: pin a deterministic 2-line card so every row reads identically.
-     Flex-wrap couldn't guarantee the 2-then-3 split; grid-template-areas does.
-     CSS-only on the existing <td> DOM (no JSX -> desktop <table> unchanged). */
   .sess-table tr.session-row {
     display: grid;
     grid-template-columns: auto auto 1fr auto;
     grid-template-areas:
-      "project project project cost"
-      "started dur     .       chip";
+      "session session session cost"
+      "started dur     project chip";
     column-gap: 10px;
     row-gap: 2px;
     align-items: baseline;
@@ -4626,52 +4697,36 @@ mark.current {
     cursor: pointer;
   }
   .sess-table tbody td { padding: 0; border: none; white-space: normal; }
-  .sess-table td.project {              /* DOM nth-child(4) */
-    grid-area: project;
-    min-width: 0;
+  /* Row 1 primary line: the Session title (unhidden on mobile) + cost right. */
+  /* `tbody` qualifier (0,2,2) so this ties the desktop base rule
+     `.sess-table tbody td.session{max-width:280px}` (:1154) and wins on later
+     source order — otherwise the bare (0,2,1) rule loses and the mobile title
+     stays capped at 280px, defeating the "lead with the title, fill row 1"
+     intent (mirrors the sibling `td.project` mobile rule below). */
+  .sess-table tbody td.session {
+    grid-area: session; min-width: 0; max-width: none;
     font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  /* C4 (#207): undo the desktop 220px cap on mobile, where the cell
-     truncates via min-width:0 + ellipsis instead. Equal specificity
-     (0,2,2) + later source order beats the new desktop rule. */
-  .sess-table tbody td.project { max-width: none; }
-  .sess-table td.num {                  /* DOM nth-child(5) — cost */
-    grid-area: cost;
-    justify-self: end;
-    font-weight: 700;
-    text-align: right;
+  /* td.num matches both the (hidden) Cache cell and the Cost cell; Cache is
+     display:none below so only Cost occupies the `cost` area (existing pattern). */
+  .sess-table tbody td.num { grid-area: cost; justify-self: end; font-weight: 700; text-align: right; }
+  /* Row 2 meta line: started · dur · project · [model chip when multi-model]. */
+  .sess-table tbody td.started { grid-area: started; color: var(--text-dim); font-size: var(--fs-meta); }
+  .sess-table td.dur { grid-area: dur; color: var(--text-dim); font-size: var(--fs-meta); }
+  .sess-table tbody td.project {
+    grid-area: project; max-width: none; min-width: 0;
+    color: var(--accent-blue); font-size: var(--fs-meta);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  /* `tbody` qualifier ties desktop's .sess-table tbody td.started
-     accent-cyan rule on specificity (0,2,2); source order then wins. */
-  .sess-table tbody td.started {        /* DOM nth-child(1) — has the open-conv button */
-    grid-area: started;
-    color: var(--text-dim); font-size: var(--fs-meta);
-  }
-  .sess-table td:nth-child(2) {         /* duration */
-    grid-area: dur;
-    color: var(--text-dim); font-size: var(--fs-meta);
-  }
-  .sess-table td:nth-child(3) {         /* model chip cell (multi-model) */
-    grid-area: chip;
-    justify-self: end;
-    display: inline-flex; align-items: center;
-  }
-  /* S3 (#264): the new Session + Cache columns are desktop-only for now — the
-     mobile card keeps its existing 2-line shape (project/cost · started·dur·
-     chip). `display:none` removes them from the row grid so the named-area
-     layout above is byte-unchanged. In single-model mode the Session cell is
-     `nth-child(3)`; this `.sess-table td.session` rule ties that nth-child(3)
-     grid-area assignment on specificity and wins on later source order, so a
-     hidden Session cell never lands in the chip slot. Full mobile column
-     tuning is S4 (MOB-*). */
-  .sess-table td.session,
+  .sess-table td.model.model-chip-cell { grid-area: chip; justify-self: end; display: inline-flex; align-items: center; }
+  /* Cache stays hidden on mobile (secondary). Single-model omits the model cell
+     entirely (JSX-conditional) so no chip renders; multi-model keeps it in `chip`. */
   .sess-table td.cache { display: none; }
-  /* keep started->dur separator; drop dur->chip (the 1fr spacer edge-separates the chip) */
-  .sess-table td.started::after {
-    content: " · ";
-    color: var(--text-faint);
-  }
+  /* started->project meta separators; the chip (when present) sits at the row's
+     right edge via justify-self:end, so no trailing separator after project. */
+  .sess-table tbody td.started::after { content: " · "; color: var(--text-faint); }
+  .sess-table tbody td.dur::after { content: " · "; color: var(--text-faint); }
   /* Search-match highlight stays — uses the existing class. S7 SESS-2:
      unify to amber (was cyan) so the desktop + mobile current-match story
      reads consistently, and add the mobile current-match emphasis. */
@@ -4695,6 +4750,12 @@ mark.current {
     grid-template-columns: repeat(7, minmax(0, 1fr));
   }
   .daily-week-label { display: none; }
+
+  /* #264 S4 (MOB-3): the Daily h2 sub ("heatmap · 30 days") overflowed at 390
+     (clientW 126 < scrollW 170), clipping the title. Hide the sub on phones —
+     the card body already shows the heatmap + legend, so the descriptor is
+     redundant. Forecast's h2 already fits (unchanged). */
+  #panel-daily .panel-header h2 .sub { display: none; }
 
   /* Help overlay — full-screen on phones (matches the modal sheet
      pattern). Gesture rows are large enough to be tapped (no functional
@@ -5001,14 +5062,17 @@ mark.current {
   #root .crm-settings-popover input { font-size: 16px; }
 
   /* #247 S1 (D7) — primary-data 14px floor (var(--fs-data)). Keep no Sessions
-     data text below 14px on phones: the project name + cost (were 13px,
-     inherited from .sess-table) and the started/dur meta cells (were 12px)
-     all reach the floor; color still de-emphasizes the meta row, so the dense
-     two-line card layout is unchanged. The model-chip cell stays chrome (its
-     own pill sizing). #root outranks the bare-class mobile rules. */
+     data text below 14px on phones: the Session title (S4 primary line) + the
+     project name + cost (were 13px, inherited from .sess-table) and the
+     started/dur meta cells (were 12px) all reach the floor; color still
+     de-emphasizes the meta row, so the dense two-line card layout is unchanged.
+     The model-chip cell stays chrome (its own pill sizing). #264 S4 (Codex
+     P2/7): td.session joins the floor now that it is the primary line. #root
+     outranks the bare-class mobile rules. */
   #root .sess-table tbody td.project,
   #root .sess-table tbody td.num,
   #root .sess-table tbody td.started,
+  #root .sess-table tbody td.session,
   #root .sess-table td:nth-child(2) { font-size: var(--fs-data); }
 
   /* #247 S1 (D7) — Trend values reach the 14px floor (were 13px); the thead
