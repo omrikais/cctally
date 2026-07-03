@@ -2730,7 +2730,7 @@ def main(argv: list[str] | None = None) -> int:
         # Preview channel (CCTALLY_CHANNEL=preview): append the channel marker
         # so diagnostics reveal a preview-channel binary. Gated → prod output
         # is byte-identical when the marker is unset.
-        if os.environ.get("CCTALLY_CHANNEL") == "preview":
+        if _cctally_core.is_preview_channel():
             base += " (preview)"
         print(base)
         return 0

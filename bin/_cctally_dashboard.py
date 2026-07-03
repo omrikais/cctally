@@ -4503,7 +4503,7 @@ def _resolve_dashboard_port(port_arg):
     so the port default is never exercised there."""
     if port_arg is not None:
         return port_arg
-    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+    if _cctally_core.is_preview_channel():
         return 8790
     return 8789
 
@@ -4512,7 +4512,7 @@ def _channel_env_fragment() -> dict:
     """`{'channel': 'preview'}` under the preview channel, else `{}` — so the
     envelope key is omitted when the marker is unset (additive-optional, keeps
     the dashboard goldens byte-identical). Spliced into the envelope via `**`."""
-    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+    if _cctally_core.is_preview_channel():
         return {"channel": "preview"}
     return {}
 

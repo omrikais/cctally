@@ -160,6 +160,14 @@ def _is_dev_checkout() -> bool:
     return (_repo_root() / ".git").exists()
 
 
+def is_preview_channel() -> bool:
+    """True when running under the maintainer-local preview channel
+    (the `cctally-preview` wrapper sets CCTALLY_CHANNEL=preview). Single
+    source of truth for every preview-marker surface (dashboard port +
+    envelope, TUI header, --version, doctor) so the gate can't drift."""
+    return os.environ.get("CCTALLY_CHANNEL") == "preview"
+
+
 def _real_prod_data_dir() -> pathlib.Path:
     """The REAL user's prod data dir (~/.local/share/cctally), resolved from
     the password database rather than $HOME so it is immune to a faked HOME.

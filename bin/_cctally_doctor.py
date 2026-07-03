@@ -518,7 +518,7 @@ def doctor_gather_state(
         app_dir=str(_cctally_core.APP_DIR),
         is_dev_checkout=_cctally_core._is_dev_checkout(),
         # Preview channel (CCTALLY_CHANNEL=preview): surfaced in install.mode.
-        channel=("preview" if os.environ.get("CCTALLY_CHANNEL") == "preview" else "prod"),
+        channel=("preview" if _cctally_core.is_preview_channel() else "prod"),
         # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
         pricing_coverage=pricing_coverage,
         # Conversation-sessions rollup consistency (#217 S1 / U9).

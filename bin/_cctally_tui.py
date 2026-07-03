@@ -3301,7 +3301,7 @@ def _tui_header_strip_a(
     # token, so no `_TUI_VALID_STYLE_NAMES` change is needed. Empty when the
     # marker is unset → the TUI goldens stay byte-identical.
     preview_prefix = ""
-    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+    if _cctally_core.is_preview_channel():
         preview_prefix = "{warn}PREVIEW{/} {faint}│{/} "
     if cw is None:
         hdr = preview_prefix + (
