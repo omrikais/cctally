@@ -3295,8 +3295,16 @@ def _tui_header_strip_a(
         sync_age = int(time.monotonic() - snap.last_sync_at)
     sync_txt = f"synced {sync_age}s ago" if snap.last_sync_at is not None else "synced —"
     err = snap.last_sync_error
+    # Preview channel (CCTALLY_CHANNEL=preview): a marker-gated PREVIEW segment
+    # so a preview-channel TUI (running against a real-data snapshot) is
+    # unmistakable next to the live prod one. Reuses the existing `{warn}` style
+    # token, so no `_TUI_VALID_STYLE_NAMES` change is needed. Empty when the
+    # marker is unset → the TUI goldens stay byte-identical.
+    preview_prefix = ""
+    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+        preview_prefix = "{warn}PREVIEW{/} {faint}│{/} "
     if cw is None:
-        hdr = (
+        hdr = preview_prefix + (
             f"{{bright.b}}Week — {{/}} {{faint}}│{{/}} "
             f"{{dim}}no data yet — run record-usage first{{/}}"
         )
@@ -3313,7 +3321,7 @@ def _tui_header_strip_a(
             # "Fcst 74% WARN" where the WARN comes from a >=90% high
             # projection, understating risk in the most glanceable line.
             fcst_pct = f"{int(round(fc.final_percent_high))}%"
-        hdr = (
+        hdr = preview_prefix + (
             f"{{bright.b}}Week {format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)}–{format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}} "
             f"{{faint}}│{{/}} Used {{{used_cls}.b}}{cw.used_pct:.1f}%{{/}} "
             f"{{dim}}(5h {int(cw.five_hour_pct or 0)}%){{/}} {{faint}}│{{/}} "
