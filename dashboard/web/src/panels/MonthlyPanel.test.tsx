@@ -1,7 +1,8 @@
-// #264 S2 — restored MonthlyPanel tile with S1 card chrome. Asserts the tile
-// caps to the 3 most-recent months + a whole-window footer total, opens its OWN
-// monthly modal (whole-section click AND the ⤢ ExpandButton), and its ShareIcon
-// dispatches openShareModal('monthly').
+// #264 S2 / #265 — restored MonthlyPanel tile with S1 card chrome. Renders ALL
+// months (the bento card scrolls internally — #265 uncap so the inner scroll is
+// meaningful) + a whole-window footer total, opens its OWN monthly modal
+// (whole-section click AND the ⤢ ExpandButton), and its ShareIcon dispatches
+// openShareModal('monthly').
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MonthlyPanel } from './MonthlyPanel';
@@ -23,7 +24,8 @@ function periodRow(over: Partial<PeriodRow>): PeriodRow {
   };
 }
 
-// 4 rows → proves the VISIBLE_ROWS=3 cap; total_cost_usd is the whole window.
+// 4 rows → all render (scrollable inside the bento card); total_cost_usd is the
+// whole window.
 const MONTHLY: PeriodRow[] = [
   periodRow({ label: '2026-07', cost_usd: 120, delta_cost_pct: 20, is_current: true }),
   periodRow({ label: '2026-06', cost_usd: 200, delta_cost_pct: -10 }),
@@ -63,19 +65,19 @@ afterEach(() => {
 });
 
 describe('<MonthlyPanel /> (#264 S2)', () => {
-  it('renders the pink panel card with the calendar icon and recent subtitle', () => {
+  it('renders the pink panel card with the calendar icon and model-split subtitle', () => {
     render(<MonthlyPanel />);
     const section = document.getElementById('panel-monthly');
     expect(section?.classList.contains('panel')).toBe(true);
     expect(section?.classList.contains('accent-pink')).toBe(true);
     expect(document.querySelector('#panel-monthly svg use')?.getAttribute('href'))
       .toBe('/static/icons.svg#calendar');
-    expect(screen.getByText(/recent/i)).toBeInTheDocument();
+    expect(screen.getByText(/model split/i)).toBeInTheDocument();
   });
 
-  it('caps the body to the 3 most-recent rows with a NOW pill on the current row', () => {
+  it('renders ALL rows (no 3-cap) so the inner scroll is meaningful, with a NOW pill', () => {
     render(<MonthlyPanel />);
-    expect(document.querySelectorAll('#panel-monthly .period').length).toBe(3);
+    expect(document.querySelectorAll('#panel-monthly .period').length).toBe(4);
     expect(document.querySelectorAll('#panel-monthly .pill-current').length).toBe(1);
     expect(document.querySelector('#panel-monthly .model-stack')?.children.length).toBe(3);
   });

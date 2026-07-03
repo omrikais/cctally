@@ -1,7 +1,8 @@
-// #264 S2 — restored WeeklyPanel tile with S1 card chrome. Asserts the tile
-// caps to the 3 most-recent weeks + a whole-window footer total, opens its OWN
-// weekly modal (whole-section click AND the ⤢ ExpandButton), and its ShareIcon
-// dispatches openShareModal('weekly').
+// #264 S2 / #265 — restored WeeklyPanel tile with S1 card chrome. Renders ALL
+// weeks (the bento card scrolls internally — #265 uncap so the inner scroll is
+// meaningful) + a whole-window footer total, opens its OWN weekly modal
+// (whole-section click AND the ⤢ ExpandButton), and its ShareIcon dispatches
+// openShareModal('weekly').
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { WeeklyPanel } from './WeeklyPanel';
@@ -23,7 +24,8 @@ function periodRow(over: Partial<PeriodRow>): PeriodRow {
   };
 }
 
-// 4 rows → proves the VISIBLE_ROWS=3 cap; total_cost_usd is the whole window.
+// 4 rows → all render (scrollable inside the bento card); total_cost_usd is the
+// whole window.
 const WEEKLY: PeriodRow[] = [
   periodRow({ label: '2026-W27', cost_usd: 55, delta_cost_pct: 9, is_current: true }),
   periodRow({ label: '2026-W26', cost_usd: 40, delta_cost_pct: -5 }),
@@ -63,19 +65,19 @@ afterEach(() => {
 });
 
 describe('<WeeklyPanel /> (#264 S2)', () => {
-  it('renders the cyan panel card with the bar-chart icon and recent subtitle', () => {
+  it('renders the cyan panel card with the bar-chart icon and model-split subtitle', () => {
     render(<WeeklyPanel />);
     const section = document.getElementById('panel-weekly');
     expect(section?.classList.contains('panel')).toBe(true);
     expect(section?.classList.contains('accent-cyan')).toBe(true);
     expect(document.querySelector('#panel-weekly svg use')?.getAttribute('href'))
       .toBe('/static/icons.svg#bar-chart');
-    expect(screen.getByText(/recent/i)).toBeInTheDocument();
+    expect(screen.getByText(/model split/i)).toBeInTheDocument();
   });
 
-  it('caps the body to the 3 most-recent rows with a NOW pill on the current row', () => {
+  it('renders ALL rows (no 3-cap) so the inner scroll is meaningful, with a NOW pill', () => {
     render(<WeeklyPanel />);
-    expect(document.querySelectorAll('#panel-weekly .period').length).toBe(3);
+    expect(document.querySelectorAll('#panel-weekly .period').length).toBe(4);
     expect(document.querySelectorAll('#panel-weekly .pill-current').length).toBe(1);
     expect(document.querySelector('#panel-weekly .model-stack')?.children.length).toBe(3);
   });

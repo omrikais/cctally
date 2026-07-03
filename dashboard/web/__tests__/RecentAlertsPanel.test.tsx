@@ -75,13 +75,15 @@ describe('<RecentAlertsPanel />', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders the compact empty tile when alerts: [] (#248 §5)', () => {
+  it('renders the shared compact empty gauge when alerts: [] (#265 A)', () => {
     const { container } = render(<RecentAlertsPanel />);
-    const tile = container.querySelector('.alerts-empty-tile');
-    expect(tile).not.toBeNull();
-    // One-liner: "✓ No alerts · You're at <used%>. Alerts fire at 90% / 95%."
-    expect(tile?.textContent).toMatch(/No alerts/i);
-    expect(tile?.textContent).toMatch(/90% \/ 95%/);
+    const gauge = container.querySelector('.ra-gauge.ra-gauge--compact');
+    expect(gauge).not.toBeNull();
+    // The old .alerts-empty-tile one-liner is retired in favor of the gauge.
+    expect(container.querySelector('.alerts-empty-tile')).toBeNull();
+    // fixture used_pct 17.4 (< lowest 90) → ✓-head + "fire at 90% / 95%" copy.
+    expect(gauge?.textContent).toMatch(/well under the line/i);
+    expect(gauge?.textContent).toMatch(/90% \/ 95%/);
   });
 
   it('renders up to 10 most-recent alerts (slices a 15-alert store)', () => {

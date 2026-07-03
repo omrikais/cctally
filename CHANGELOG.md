@@ -17,6 +17,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Dashboard: the empty **Recent Alerts** card no longer sits bottom-heavy with a band of empty space above it — it now shows the same "you're clear" gauge as the alerts detail view (your current usage against the configured alert thresholds), centered and sized to the card, so it reads as balanced as its Forecast and Blocks neighbours (#265).
 - Dashboard: the **$/1% Trend** card keeps its sparkline and "older ▸ newer" legend pinned in view and scrolls the weekly table beneath them, so with only a few weeks of history the chart is no longer half-hidden below the card's internal scroll fold (#265).
 - Dashboard: the **Blocks** card's expand (⤢) control is now disabled on a week with no activity blocks yet, instead of looking clickable but opening nothing when pressed (#265).
+- Dashboard: the **Weekly** and **Monthly** cards now list every week and month and scroll within the card, instead of showing only the three most recent behind a scrollbar that revealed nothing more — so the whole history is reachable without opening the detail view (#265).
+- Dashboard: the **Daily** heatmap no longer clips the top off each day-of-month number — the card row is a little taller so every day's number and its dollar amount are fully legible (#265).
 
 ## [1.59.0] - 2026-07-02
 

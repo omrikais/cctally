@@ -9,11 +9,12 @@ import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import type { PeriodRow } from '../types/envelope';
 
-// #264 S2 — the Monthly summary TILE (restored from the S8 collapse). Body caps
-// to the 3 most-recent months (the Monthly modal keeps the full history); the
+// #264 S2 / #265 — the Monthly summary TILE (restored from the S8 collapse).
+// Renders ALL months; the bento card scrolls internally (the #264 S4 A1 inner
+// scroll — mirrors the Blocks A2 uncap) so every month is reachable rather than
+// stranding the older ones behind a scrollbar that had nothing to reveal. The
 // footer summarizes the whole window. S1 card chrome: the header right-side
 // leaves live in a `.panel-header-actions` cluster with a ⤢ ExpandButton.
-const VISIBLE_ROWS = 3;
 
 function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
   const deltaCls =
@@ -49,7 +50,7 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 export function MonthlyPanel() {
   const env = useSnapshot();
   const allRows = env?.monthly?.rows ?? [];
-  const rows = allRows.slice(0, VISIBLE_ROWS);
+  const rows = allRows;
   const total = env?.monthly?.total_cost_usd ?? 0;
 
   const seenLabels = useRef<Set<string>>(new Set());
@@ -83,7 +84,7 @@ export function MonthlyPanel() {
           <use href="/static/icons.svg#calendar" />
         </svg>
         <h2>
-          Monthly <span className="sub">(model split · recent)</span>
+          Monthly <span className="sub">(model split)</span>
         </h2>
         <div className="panel-header-actions">
           <ShareIcon

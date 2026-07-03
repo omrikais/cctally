@@ -404,10 +404,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      ~107px of the body, and the flex:1 grid only gets the leftover; at 196/220px
      that leftover was ~32px, collapsing cells to ~8px so the week-range labels
      overlapped. Because the chrome is height-invariant, every extra px of row
-     height flows straight to the grid: 300px leaves it ~112px → legible ~22px
-     color cells (a forced-110px grid rendered 19px cells with zero overlaps at
-     the gate). The grid also carries a min-height floor below as insurance. */
-  .bento-row.row-medium { grid-auto-rows: 300px; }
+     height flows straight to the grid. #265: the S4-A4 cell stacks the day
+     number ON TOP OF the cost (~32px of content), so the old 300px/~112px-grid
+     budget (~19px cells) shaved ~6px off the top of every day number; 368px
+     leaves the grid ~180px → ~33px cells that fit the day+cost stack. The grid
+     also carries a per-row 32px floor below as the hard no-clip guarantee. This
+     row is shared by Cache-report/Weekly/Monthly, which benefit from the extra
+     height too (Weekly/Monthly show more of their now-uncapped rows). */
+  .bento-row.row-medium { grid-auto-rows: 368px; }
   /* #264 S4 (A2/Codex-P2): the short row was minmax(140px, auto) — an uncapped
      Blocks list would grow the row and stretch its Forecast/Alerts row-mates
      under align-items:stretch. Pin a definite height so Blocks scrolls in-card
@@ -465,11 +469,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
   .bento-row #panel-daily-body .daily-cal-grid {
     flex: 1 1 auto;
-    /* min-height floor (the grid had none — ui-qa root cause): guarantees the
-       ~5 week-rows stay ≥~18px each even if the foot/legend chrome is a touch
-       taller than estimated, so the labels can't re-collapse into an overlap. */
-    min-height: 100px;
-    grid-auto-rows: minmax(0, 1fr);
+    /* #265 — per-row 32px floor is the hard no-clip guarantee: the S4-A4 cell
+       stacks day(11px) + cost(≤12px) ≈ 32px of content, so a row shorter than
+       that clipped the day number's top (measured ~6px shaved at the old ~19px
+       rows). minmax(32px,1fr) grows the rows to fill the taller 368px medium
+       card yet never lets one fall below the content height; min-height keeps
+       the 5-week grid ≥176px even if the foot/legend chrome runs tall. */
+    min-height: 176px;
+    grid-auto-rows: minmax(32px, 1fr);
     gap: 4px;
   }
   /* #264 S4 (A4): restore per-day $ on the desktop Daily card. Day on top, cost
