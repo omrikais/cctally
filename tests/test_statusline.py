@@ -53,6 +53,7 @@ def _make_args(**overrides):
         context_low_threshold=50,
         context_medium_threshold=80,
         cctally_extensions=True,
+        usage_only=False,
         color=False,  # tests default to no ANSI — easier to assert
         display_tz_name="UTC",
         debug=False,
@@ -593,6 +594,26 @@ class TestRenderStatusline:
         out = ls.render_statusline(inp, _make_args(color=True), _make_inj(), _FIXED_NOW)
         assert "\033[31m" in out  # red ANSI present
 
+    def test_usage_only_renders_subscription_percentages(self):
+        """Compact mode omits model/cost/burn/context and reset countdowns."""
+        inp = ls.StatuslineInput(
+            model_display_name="Sonnet 4.5",
+            cost_total_usd=4.56,
+            rate_limits_5h_pct=34.0, rate_limits_5h_resets_at=_FIVE_RESETS,
+            rate_limits_7d_pct=42.0, rate_limits_7d_resets_at=_SEVEN_RESETS,
+        )
+        out = ls.render_statusline(
+            inp, _make_args(usage_only=True), _make_inj(), _FIXED_NOW
+        )
+        assert out == "5h 34% · 7d 42%"
+
+    def test_usage_only_empty_when_no_usage_data(self):
+        inp = ls.StatuslineInput(model_display_name="Sonnet 4.5")
+        out = ls.render_statusline(
+            inp, _make_args(usage_only=True), _make_inj(), _FIXED_NOW
+        )
+        assert out == ""
+
 
 # ---- TestConfigPrecedence --------------------------------------------------
 #
@@ -631,6 +652,15 @@ def _statusline_subprocess(args, stdin_json, env_overrides=None):
 _MIN_STDIN = json.dumps({
     "model": {"display_name": "Sonnet 4.5", "id": "claude-sonnet-4-5"},
     "cost": {"total_cost_usd": 0.0},
+})
+
+_USAGE_STDIN = json.dumps({
+    "model": {"display_name": "Sonnet 4.5", "id": "claude-sonnet-4-5"},
+    "cost": {"total_cost_usd": 0.0},
+    "rate_limits": {
+        "five_hour": {"used_percentage": 34.0, "resets_at": _FIVE_RESETS},
+        "seven_day": {"used_percentage": 42.0, "resets_at": _SEVEN_RESETS},
+    },
 })
 
 
@@ -758,6 +788,43 @@ class TestConfigPrecedence:
         # Config: emoji-text → some band visual present
         assert ("🟢" in out or "🟡" in out or "🔴" in out)
         assert ("(Normal)" in out or "(Moderate)" in out or "(High)" in out)
+
+    def test_usage_only_cli_renders_compact_percentages(self, tmp_path):
+        proc = _statusline_subprocess(
+            ["--usage-only"],
+            _USAGE_STDIN,
+            env_overrides={"HOME": str(tmp_path)},
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        assert proc.stdout.decode().strip() == "5h 34% · 7d 42%"
+
+    def test_usage_only_config_and_cli_override(self, tmp_path):
+        data_dir = tmp_path / "share"
+        data_dir.mkdir()
+        (data_dir / "config.json").write_text(json.dumps({
+            "statusline": {"usage_only": True},
+        }))
+        proc = _statusline_subprocess(
+            [],
+            _USAGE_STDIN,
+            env_overrides={
+                "HOME": str(tmp_path),
+                "CCTALLY_DATA_DIR": str(data_dir),
+            },
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        assert proc.stdout.decode().strip() == "5h 34% · 7d 42%"
+
+        proc = _statusline_subprocess(
+            ["--no-usage-only"],
+            _USAGE_STDIN,
+            env_overrides={
+                "HOME": str(tmp_path),
+                "CCTALLY_DATA_DIR": str(data_dir),
+            },
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        assert "🤖 Sonnet 4.5" in proc.stdout.decode()
 
     def test_config_path_override(self, tmp_path):
         """--config PATH reads from PATH for this invocation only."""

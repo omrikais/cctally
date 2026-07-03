@@ -54,6 +54,7 @@ class StatuslineArgs:
     context_low_threshold: int
     context_medium_threshold: int
     cctally_extensions: bool
+    usage_only: bool
     color: bool  # ANSI on/off after auto-detect resolved
     display_tz_name: str  # IANA name; resolved upstream via
                           # get_display_tz_pref(cfg) — defaults to
@@ -372,6 +373,8 @@ def resolve_cctally_extensions(
     inp: StatuslineInput,
     now: datetime,
     inj: StatuslineInjections,
+    *,
+    include_countdowns: bool = True,
 ) -> Optional[str]:
     """Segment 5 — cctally-only `5h X% (...) · 7d Y% (...)`.
 
@@ -411,12 +414,12 @@ def resolve_cctally_extensions(
     parts = []
     if five_pct is not None:
         s = f"5h {int(round(five_pct))}%"
-        if five_resets is not None:
+        if include_countdowns and five_resets is not None:
             s += f" ({_fmt_countdown(five_resets - now_epoch)})"
         parts.append(s)
     if seven_pct is not None:
         s = f"7d {int(round(seven_pct))}%"
-        if seven_resets is not None:
+        if include_countdowns and seven_resets is not None:
             s += f" ({_fmt_countdown(seven_resets - now_epoch)})"
         parts.append(s)
     return " · ".join(parts)
@@ -443,6 +446,19 @@ def _wrap_color(text: str, color: Optional[str], enable: bool) -> str:
 _PERCENT_INT_RE = re.compile(r"(\d+)%")
 
 
+def _colorize_usage_segment(ext: str, args: StatuslineArgs) -> str:
+    """Color a 5h/7d usage segment using the cctally percent bands."""
+    nums = [int(x) for x in _PERCENT_INT_RE.findall(ext)]
+    mx = max(nums) if nums else 0
+    if mx < 60:
+        color = "green"
+    elif mx < 85:
+        color = "yellow"
+    else:
+        color = "red"
+    return _wrap_color(ext, color, args.color)
+
+
 def render_statusline(
     inp: StatuslineInput,
     args: StatuslineArgs,
@@ -453,6 +469,12 @@ def render_statusline(
     None segments (currently only segment 5). See spec §1 for the exact
     layout and §3 for the data flow.
     """
+    if args.usage_only:
+        ext = resolve_cctally_extensions(
+            inp, now, inj, include_countdowns=False
+        )
+        return "" if ext is None else _colorize_usage_segment(ext, args)
+
     seg1 = resolve_model_segment(inp)
 
     # Segment 2: 💰 ... session / ... today / ... block (Xh Ym left)
@@ -486,17 +508,7 @@ def render_statusline(
     if args.cctally_extensions:
         ext = resolve_cctally_extensions(inp, now, inj)
         if ext is not None:
-            # Color by the higher of (5h%, 7d%) using cctally bands:
-            # <60 green, <85 yellow, >=85 red.
-            nums = [int(x) for x in _PERCENT_INT_RE.findall(ext)]
-            mx = max(nums) if nums else 0
-            if mx < 60:
-                color = "green"
-            elif mx < 85:
-                color = "yellow"
-            else:
-                color = "red"
-            seg5 = _wrap_color(ext, color, args.color)
+            seg5 = _colorize_usage_segment(ext, args)
 
     segs = [seg1, seg2, seg3, seg4]
     if seg5 is not None:

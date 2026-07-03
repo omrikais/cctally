@@ -869,6 +869,21 @@ def _build_statusline_parser(subparsers, name, *, help_text, xref):
         help="Suppress cctally 5h%%/7d%% segment.",
     )
     p.add_argument(
+        "--usage-only",
+        dest="usage_only",
+        action="store_true",
+        default=None,
+        help="Render only subscription usage percentages, e.g. "
+             "`5h 36%% · 7d 35%%` (config key statusline.usage_only).",
+    )
+    p.add_argument(
+        "--no-usage-only",
+        dest="usage_only",
+        action="store_false",
+        help="Render the full statusline even when statusline.usage_only "
+             "is enabled in config.",
+    )
+    p.add_argument(
         "--config",
         dest="config",
         default=None,

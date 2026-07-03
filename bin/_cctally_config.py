@@ -309,6 +309,7 @@ ALLOWED_CONFIG_KEYS = (
     "statusline.visual_burn_rate",
     "statusline.cost_source",
     "statusline.cctally_extensions",
+    "statusline.usage_only",
     "budget.weekly_usd",
     "budget.alerts_enabled",
     "budget.alert_thresholds",
@@ -376,6 +377,25 @@ def _validate_statusline_cctally_extensions(value):
             return False
     raise ValueError(
         f"statusline.cctally_extensions must be boolean (got {value!r})"
+    )
+
+
+def _validate_statusline_usage_only(value):
+    """Validate ``statusline.usage_only``.
+
+    Accepts booleans (preferred) or canonical truthy/falsy strings
+    (``true``/``false``/``yes``/``no``/``on``/``off``/``1``/``0``).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lo = value.strip().lower()
+        if lo in ("true", "yes", "on", "1"):
+            return True
+        if lo in ("false", "no", "off", "0"):
+            return False
+    raise ValueError(
+        f"statusline.usage_only must be boolean (got {value!r})"
     )
 
 
@@ -544,6 +564,7 @@ def _config_known_value(config: dict, key: str) -> "object":
         "statusline.visual_burn_rate",
         "statusline.cost_source",
         "statusline.cctally_extensions",
+        "statusline.usage_only",
     ):
         sl_block = config.get("statusline") if isinstance(config, dict) else None
         if not isinstance(sl_block, dict):
@@ -554,6 +575,7 @@ def _config_known_value(config: dict, key: str) -> "object":
             "visual_burn_rate": "off",
             "cost_source": "auto",
             "cctally_extensions": True,
+            "usage_only": False,
         }
         if stored is None:
             return defaults[inner]
@@ -561,6 +583,7 @@ def _config_known_value(config: dict, key: str) -> "object":
             "visual_burn_rate": _validate_statusline_visual_burn_rate,
             "cost_source": _validate_statusline_cost_source,
             "cctally_extensions": _validate_statusline_cctally_extensions,
+            "usage_only": _validate_statusline_usage_only,
         }[inner]
         try:
             return validator(stored)
@@ -987,12 +1010,14 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         "statusline.visual_burn_rate",
         "statusline.cost_source",
         "statusline.cctally_extensions",
+        "statusline.usage_only",
     ):
         inner_key = key.split(".", 1)[1]
         validator = {
             "visual_burn_rate": _validate_statusline_visual_burn_rate,
             "cost_source": _validate_statusline_cost_source,
             "cctally_extensions": _validate_statusline_cctally_extensions,
+            "usage_only": _validate_statusline_usage_only,
         }[inner_key]
         try:
             normalized = validator(raw)
@@ -1390,6 +1415,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "statusline.visual_burn_rate",
         "statusline.cost_source",
         "statusline.cctally_extensions",
+        "statusline.usage_only",
     ):
         inner_key = key.split(".", 1)[1]
         with config_writer_lock():

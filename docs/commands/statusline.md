@@ -34,6 +34,7 @@ cctally statusline [-h]
                    [-O | --no-offline]
                    [--color | --no-color]
                    [--cctally-extensions | --no-cctally-extensions]
+                   [--usage-only | --no-usage-only]
                    [--config PATH]
                    [--single-thread]
                    [-d]
@@ -75,6 +76,16 @@ no data, segment 5 is omitted:
 🤖 Sonnet 4.5 | 💰 ... | 🔥 ... | 🧠 35%
 ```
 
+When `--usage-only` is in effect, cctally renders just the subscription
+usage percentages and omits the ccusage-shaped telemetry segments plus
+reset countdowns:
+
+```
+5h 34% · 7d 42%
+```
+
+If no 5h/7d usage data is available, `--usage-only` writes an empty line.
+
 ## Flag reference
 
 | Flag | Values | Default | Behavior |
@@ -89,6 +100,7 @@ no data, segment 5 is omitted:
 | `-O`, `--offline`, `--no-offline` | bool | offline | **No-op alias.** cctally is always offline. |
 | `--color`, `--no-color` | bool | auto | ANSI on/off. Auto = TTY-attached stdout AND `NO_COLOR` env unset. |
 | `--cctally-extensions`, `--no-cctally-extensions` | bool | on | Append (or suppress) segment 5. Config key `statusline.cctally_extensions`. |
+| `--usage-only`, `--no-usage-only` | bool | off | Render only `5h X% · 7d Y%` subscription usage percentages. Config key `statusline.usage_only`. |
 | `--config PATH` | path | unset | Read config from PATH for this invocation only (no mutation of the persisted default). Missing/unreadable/non-object-JSON PATH exits 2. Parity with the 10 sibling Claude reporting commands. |
 | `--single-thread` | flag | off | **No-op alias.** |
 | `-d`, `--debug` | flag | off | Print pricing-mismatch / config diagnostics on stderr. |
@@ -195,13 +207,14 @@ JSON exits 2 with a clear stderr message.
 
 ## Configuration persistence
 
-Three new keys join `display.tz` in the cctally config:
+Four keys join `display.tz` in the cctally config:
 
 | Key | Values | Default |
 |---|---|---|
 | `statusline.visual_burn_rate` | `off`, `emoji`, `text`, `emoji-text` | `off` |
 | `statusline.cost_source` | `auto`, `cctally`, `cc`, `both` | `auto` |
 | `statusline.cctally_extensions` | `true`, `false` | `true` |
+| `statusline.usage_only` | `true`, `false` | `false` |
 
 Precedence (high → low): CLI flag > config key > built-in default.
 Invalid config values emit a one-shot stderr warning per process and
@@ -214,6 +227,7 @@ via `cctally config unset <key>`.
 ```bash
 cctally config set statusline.visual_burn_rate emoji-text
 cctally config set statusline.cctally_extensions false
+cctally config set statusline.usage_only true
 cctally config get statusline.cost_source
 ```
 
@@ -233,6 +247,9 @@ cctally statusline < /tmp/cc-hook-payload.json
 
 # Strict ccusage shape (drop the cctally extensions)
 cctally statusline --no-cctally-extensions < /tmp/cc-hook-payload.json
+
+# Subscription usage chip only
+cctally statusline --usage-only < /tmp/cc-hook-payload.json
 
 # Side-by-side cc vs. cctally cost
 cctally statusline --cost-source both -B emoji-text < /tmp/cc-hook-payload.json
