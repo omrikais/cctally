@@ -545,6 +545,22 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .badge-update-arrow { display: inline-block; }
 .badge-update-version { display: inline-block; }
 
+/* Preview-channel marker pill (maintainer-local). Sibling of .badge-update —
+   reuses the same amber pill surface (accent-amber wash + border, mono, meta
+   size) so it reads as part of the topbar palette. A static label (not a
+   button), so no hover/focus states. Renders only when the envelope carries
+   channel === 'preview', so a prod dashboard never shows it. */
+.preview-badge {
+  display: inline-flex; align-items: center;
+  padding: 2px 9px; border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+  color: var(--accent-amber);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 45%, transparent);
+  font: inherit; font-size: var(--fs-meta); font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+}
+
 /* -------- Doctor chip (spec §6.1) --------------------------------- */
 /* Sibling of .badge-update. The pill is colorless by default
    (transparent bg + currentColor border) and picks up the severity

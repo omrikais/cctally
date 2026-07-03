@@ -53,6 +53,20 @@ export function Header() {
           <span className="brand-version">v{currentVersion}</span>
         ) : null}
         <UpdateBadge />
+        {/* Preview-channel marker (maintainer-local). Renders only when the
+            envelope carries channel === 'preview' — set exclusively by the
+            `cctally-preview` wrapper (CCTALLY_CHANNEL=preview) — so a normal
+            prod dashboard is byte-identical (no pill). Makes a preview
+            dashboard, running against a data snapshot, unmistakable next to
+            the live prod one. */}
+        {env?.channel === 'preview' ? (
+          <span
+            className="preview-badge"
+            title="Preview channel — running against a real data snapshot, not your live prod dashboard"
+          >
+            PREVIEW
+          </span>
+        ) : null}
       </div>
       {/* Conversation viewer (spec §4) — segmented Dashboard｜Conversations
           workspace switcher. Self-hides until an envelope confirms
