@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import pathlib
 import shutil
 import sqlite3
