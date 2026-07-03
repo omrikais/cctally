@@ -4495,6 +4495,28 @@ def _build_alerts_envelope_array(
     return out[:limit]
 
 
+def _resolve_dashboard_port(port_arg):
+    """Effective dashboard port: an explicit --port always wins; otherwise
+    8790 under the preview channel (CCTALLY_CHANNEL=preview), else 8789.
+    Byte-stable when the marker is unset because any explicit port (incl. 0)
+    short-circuits before the env check — the golden harness passes --port 0,
+    so the port default is never exercised there."""
+    if port_arg is not None:
+        return port_arg
+    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+        return 8790
+    return 8789
+
+
+def _channel_env_fragment() -> dict:
+    """`{'channel': 'preview'}` under the preview channel, else `{}` — so the
+    envelope key is omitted when the marker is unset (additive-optional, keeps
+    the dashboard goldens byte-identical). Spliced into the envelope via `**`."""
+    if os.environ.get("CCTALLY_CHANNEL") == "preview":
+        return {"channel": "preview"}
+    return {}
+
+
 def snapshot_to_envelope(snap: "DataSnapshot", *,
                          now_utc: "dt.datetime",
                          monotonic_now: "float | None" = None,
@@ -5235,6 +5257,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # Doctor aggregate-only block (spec §5.5). Full per-check
         # report fetched lazily via GET /api/doctor.
         "doctor":           doctor_envelope,
+
+        # Preview channel (CCTALLY_CHANNEL=preview): additive-optional
+        # `channel` key. Omitted when the marker is unset so prod payloads
+        # (and the dashboard goldens) stay byte-identical; feeds the header
+        # PREVIEW badge when set.
+        **_channel_env_fragment(),
     }
 
 
@@ -8828,7 +8856,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # HTTP server on its own thread so the main thread can block on signal.
     # `_QuietThreadingHTTPServer` folds in `daemon_threads = True` and silences
     # client-disconnect tracebacks (spec §5).
-    srv = _QuietThreadingHTTPServer((args.host, args.port), DashboardHTTPHandler)
+    resolved_port = _resolve_dashboard_port(args.port)
+    srv = _QuietThreadingHTTPServer((args.host, resolved_port), DashboardHTTPHandler)
 
     bind_host = args.host
     bind_port = srv.server_address[1]

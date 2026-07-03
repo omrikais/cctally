@@ -665,6 +665,26 @@ _cctally_doctor = _load_sibling("_cctally_doctor")
 doctor_gather_state = _cctally_doctor.doctor_gather_state
 cmd_doctor = _cctally_doctor.cmd_doctor
 
+# Maintainer-local preview channel (hidden `__preview` subcommand). The pure
+# kernel `_lib_preview` loads FIRST so `_cctally_preview`'s late-bound `_lp()`
+# accessor resolves it via sys.modules; `cmd_preview` is the parser's
+# `set_defaults(func=c.cmd_preview)` target. Both modules are excluded from the
+# public mirror (maintainer-only, like the release tooling) — but the public
+# `bin/cctally` still carries THESE load lines (the mirror emits full public
+# file content on the next non-skip commit that touches this file). Tolerate
+# the modules being absent so a public npm/brew build never bricks at import:
+# on failure `cmd_preview` is None and the parser skips registering the hidden
+# `__preview` subcommand entirely (see `_cctally_parser.py`'s
+# `getattr(c, "cmd_preview", None)` guard). In the private tree the modules ARE
+# present, so this is a no-op — `cmd_preview` is defined and `__preview`
+# registers and works exactly as before.
+try:
+    _lib_preview = _load_sibling("_lib_preview")
+    _cctally_preview = _load_sibling("_cctally_preview")
+    cmd_preview = _cctally_preview.cmd_preview
+except Exception:
+    cmd_preview = None
+
 # config.json reader/writer/lock + validators + `cctally config` entry point.
 # Eager-loaded with per-symbol re-export so bare-name callers in cctally
 # (dashboard `/api/settings`, `cmd_record_usage` reading `load_config()`,
@@ -2795,6 +2815,12 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # fresh_home) requires skipping the whole hook.
         return
     if command == "repair-symlinks":
+        return
+    if command == "__preview":
+        # Maintainer-local dev tooling: must not load_config()/spawn a
+        # background update-check or write anything outside the preview dir
+        # (it runs before the wrapper sets CCTALLY_DATA_DIR, so APP_DIR is
+        # still cctally-dev at this point). Same rationale class as doctor.
         return
     # Self-heal: reconcile current_version with the running binary's
     # CHANGELOG. Cheap (one CHANGELOG read, write only on the first

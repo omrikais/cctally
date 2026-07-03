@@ -1523,8 +1523,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument(
         "--port",
         type=int,
-        default=8789,
-        help="TCP port to bind (default: 8789).",
+        default=None,
+        help="TCP port to bind (default: 8789; 8790 under the preview channel).",
     )
     dp.add_argument(
         "--host",
@@ -2532,6 +2532,26 @@ def build_parser() -> argparse.ArgumentParser:
     ht.add_argument("--mock-oauth-response", type=str, default=None,
                     help=argparse.SUPPRESS)  # JSON string fed to mock fetch (tests only)
     ht.set_defaults(func=c.cmd_hook_tick)
+
+    # ---- __preview (internal — maintainer-local preview channel) ----
+    # The preview modules are maintainer-only (excluded from the public
+    # mirror). On a public build `c.cmd_preview` is None — its load in
+    # bin/cctally is wrapped in a tolerant try/except — so skip registering
+    # the hidden subcommand entirely rather than wiring a None handler.
+    if getattr(c, "cmd_preview", None) is not None:
+        pv = sub.add_parser("__preview", help=argparse.SUPPRESS,
+                            formatter_class=CLIHelpFormatter,
+                            description="Internal: provision/manage the preview-channel data dir.")
+        pv_sub = pv.add_subparsers(dest="action", required=True)
+        pv_ensure = pv_sub.add_parser("ensure", help=argparse.SUPPRESS)
+        pv_ensure.add_argument("--no-refresh", action="store_true")
+        pv_ensure.add_argument("--reseed", action="store_true")
+        pv_ensure.set_defaults(func=c.cmd_preview)
+        pv_clean = pv_sub.add_parser("clean", help=argparse.SUPPRESS)
+        pv_clean.add_argument("--dry-run", action="store_true")
+        pv_clean.set_defaults(func=c.cmd_preview)
+        pv_status = pv_sub.add_parser("status", help=argparse.SUPPRESS)
+        pv_status.set_defaults(func=c.cmd_preview)
 
     # ---- update (user-facing self-update subcommand; spec §4) ----
     sub_update = sub.add_parser(
