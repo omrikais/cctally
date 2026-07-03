@@ -233,6 +233,74 @@ def test_envelope_quantile_thresholds_consistent_with_helper():
     assert env["daily"]["quantile_thresholds"] == expected_thresholds
 
 
+def _make_sessions_trend_snapshot(ns):
+    """A snapshot carrying one session row + trend/history rows, for freezing
+    the #264 S3 additive envelope keys (``cache_hit_pct``/``title`` on sessions,
+    ``cost_usd`` on trend). Kept separate from ``_make_snapshot`` so the full
+    blocks/daily golden stays stable."""
+    _pin_update_envelope_loaders(ns)
+    DataSnapshot = ns["DataSnapshot"]
+    TuiSessionRow = ns["TuiSessionRow"]
+    TuiTrendRow = ns["TuiTrendRow"]
+    trend = [
+        TuiTrendRow(
+            week_label="Apr 21",
+            week_start_at=dt.datetime(2026, 4, 21, tzinfo=dt.timezone.utc),
+            used_pct=55.0,
+            dollars_per_percent=1.8,
+            delta_dpp=0.3,
+            spark_height=6,
+            is_current=True,
+            weekly_cost_usd=99.0,
+        ),
+    ]
+    return DataSnapshot(
+        current_week=None,
+        forecast=None,
+        trend=trend,
+        sessions=[
+            TuiSessionRow(
+                started_at=dt.datetime(2026, 4, 26, 9, 0, tzinfo=dt.timezone.utc),
+                duration_minutes=42.0,
+                model_primary="claude-opus-4-5-20251101",
+                cost_usd=3.21,
+                cache_hit_pct=94.0,
+                project_label="cctally",
+                session_id="sess-1",
+                title="a seeded title",
+            ),
+        ],
+        last_sync_at=None,
+        last_sync_error=None,
+        generated_at=dt.datetime(2026, 4, 26, 12, 0, tzinfo=dt.timezone.utc),
+        percent_milestones=[],
+        weekly_history=list(trend),
+        weekly_periods=[],
+        monthly_periods=[],
+    )
+
+
+def test_envelope_sessions_trend_additive_keys():
+    """#264 S3: sessions rows gain ``cache_hit_pct`` (always) and trend
+    ``weeks[]``/``history[]`` rows gain ``cost_usd`` (always). The
+    transcript-derived ``title`` is ABSENT under the default (gate-closed)
+    serialization — the same posture the committed dashboard goldens rely on."""
+    ns = load_script()
+    snap = _make_sessions_trend_snapshot(ns)
+    env = ns["snapshot_to_envelope"](
+        snap,
+        now_utc=dt.datetime(2026, 4, 26, 12, 0, tzinfo=dt.timezone.utc),
+        monotonic_now=None,
+    )  # default transcripts_visible=False
+    srow = env["sessions"]["rows"][0]
+    assert "cache_hit_pct" in srow
+    assert srow["cache_hit_pct"] == 94.0
+    assert "title" not in srow  # gate closed -> no transcript content
+    for trow in env["trend"]["weeks"] + env["trend"]["history"]:
+        assert "cost_usd" in trow
+    assert env["trend"]["weeks"][0]["cost_usd"] == 99.0
+
+
 def test_envelope_blocks_daily_full_golden_diff():
     """Full envelope-shape freeze. Update the golden JSON by hand when
     adding fields intentionally; CI diff will surface unintended drift."""

@@ -222,6 +222,7 @@
     "avg_dollars_per_pct": null,
     "history": [
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,
@@ -235,6 +236,7 @@
     ],
     "weeks": [
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,

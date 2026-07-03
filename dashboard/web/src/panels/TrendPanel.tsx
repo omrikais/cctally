@@ -15,6 +15,15 @@ import { openShareModal } from '../store/shareSlice';
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
 
+// S3 (#264, finding 3): the panel renders — AND SORTS BY — a subset of
+// TREND_COLUMNS that omits the modal-only Cost column, derived ONCE at module
+// scope. Passing this same subset to both applyTableSort and SortableHeader
+// means a stale persisted `trendSortOverride.column==='cost_usd'` (set from the
+// modal in an older build, or hand-edited localStorage) can't sort the panel by
+// a hidden column: applyTableSort returns rows unsorted when the override id
+// isn't in the passed set (`columns.find(...) === undefined → return rows`).
+const PANEL_TREND_COLUMNS = TREND_COLUMNS.filter((c) => c.id !== 'cost_usd');
+
 // A5 — accessible summary for the role="img" sparkline. Describes the
 // series span, the latest $/1% value, and its direction vs the prior week
 // (mirrors the table's delta read) without needing the visual bars.
@@ -46,7 +55,7 @@ export function TrendPanel() {
   );
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));
   const tableData = trendOverride
-    ? applyTableSort(decorated, TREND_COLUMNS, trendOverride)
+    ? applyTableSort(decorated, PANEL_TREND_COLUMNS, trendOverride)
     : decorated;
   // A5 — text summary for the sparkline (a multi-point series, so role="img"
   // on the grid wrapper, not progressbar). Covers the weeks span + the
@@ -92,7 +101,7 @@ export function TrendPanel() {
       <div className="panel-body">
         <table className="trend-table">
           <SortableHeader
-            columns={TREND_COLUMNS}
+            columns={PANEL_TREND_COLUMNS}
             override={trendOverride}
             onChange={(next) =>
               dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: next })

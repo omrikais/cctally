@@ -4,8 +4,9 @@
 // hover are ui-qa checks (#250 S4 · plan Task 7).
 import { describe, it, expect, beforeEach } from 'vitest';
 import { fireEvent, render } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { TrendModal } from './TrendModal';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, getState, updateSnapshot } from '../store/store';
 import type { Envelope, TrendRow } from '../types/envelope';
 
 function baseEnvelope(): Envelope {
@@ -163,5 +164,113 @@ describe('<TrendModal /> second axis + tooltips (TR-3/TR-4)', () => {
     const svg = container.querySelector('#mtr-svg');
     expect(svg).not.toBeNull();
     expect(svg!.getAttribute('aria-hidden')).toBeNull();
+  });
+});
+
+// S3 (#264) TREND-KPI — fewer than 4 valid non-current weeks → no median →
+// collapse the 3-tile hero to a 2-tile [Current $/1%] + informational hint.
+function historyFew(): TrendRow[] {
+  return [
+    { label: 'W-2', used_pct: 20, dollar_per_pct: 1.2, delta: null, is_current: false },
+    { label: 'W-1', used_pct: 15, dollar_per_pct: 1.1, delta: -0.1, is_current: false },
+    { label: 'Now', used_pct: 10, dollar_per_pct: 1.5, delta: 0.4, is_current: true },
+  ];
+}
+
+describe('<TrendModal /> median-KPI collapse (TREND-KPI · decision 8)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('collapses to two tiles with an informational hint when <4 non-current weeks', () => {
+    const { container } = renderTrend(historyFew()); // 2 non-current → med == null
+    expect(container.querySelector('.m-hero.cols-2')).not.toBeNull();
+    expect(container.querySelector('.m-hero.cols-3')).toBeNull();
+    const tiles = container.querySelectorAll('.m-hero .m-kv');
+    expect(tiles.length).toBe(2);
+    // Acceptance criterion 4: NO empty "—" KPI tile under 4 weeks — every KV
+    // value reads as real content, not a missing dash.
+    const values = [...container.querySelectorAll('.m-hero .m-kv .v')].map(
+      (v) => (v.textContent ?? '').trim(),
+    );
+    expect(values).not.toContain('—');
+    // The hint reads as informational, not a bare median value.
+    expect(container.textContent).toContain('needs 4 weeks');
+    // The Current $/1% tile still shows a real number.
+    expect(container.querySelector('#mtr-cur')?.textContent).toBe('$1.500');
+  });
+
+  it('keeps the three-tile hero when >=4 non-current weeks (median present)', () => {
+    const { container } = renderTrend(history10()); // 9 non-current → med != null
+    expect(container.querySelectorAll('.m-hero.cols-3 .m-kv').length).toBe(3);
+    expect(container.querySelector('.m-hero.cols-2')).toBeNull();
+    expect(container.textContent).not.toContain('needs 4 weeks');
+  });
+});
+
+// S3 (#264) TREND-COLS — sortable Cost column via TREND_COLUMNS +
+// SortableHeader, with an EPHEMERAL modal-local sort that never reorders the
+// on-board panel; chrono-keyed week labels survive a sort (finding 2).
+// costs (10,50,20,40,30) are non-monotonic so a cost-desc sort visibly
+// reorders and the current row (30) lands mid-table — proving the label + sort.
+function historyWithCost(): TrendRow[] {
+  return [
+    { label: 'W-4', used_pct: 45, dollar_per_pct: 1.2, delta: null, is_current: false, cost_usd: 10 },
+    { label: 'W-3', used_pct: 30, dollar_per_pct: 1.1, delta: -0.1, is_current: false, cost_usd: 50 },
+    { label: 'W-2', used_pct: 20, dollar_per_pct: 1.3, delta: 0.2, is_current: false, cost_usd: 20 },
+    { label: 'W-1', used_pct: 15, dollar_per_pct: 1.05, delta: -0.25, is_current: false, cost_usd: 40 },
+    { label: 'Now', used_pct: 10, dollar_per_pct: 1.4, delta: 0.35, is_current: true, cost_usd: 30 },
+  ];
+}
+
+describe('<TrendModal /> sortable Cost column (TREND-COLS · decisions 6/7)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('renders a sortable Cost header + a Cost cell per row (fmt.usd2)', () => {
+    const { container } = renderTrend(historyWithCost());
+    // SortableHeader → five sortable <th> (Week · Cost · Used% · $/1% · Δ).
+    const ths = container.querySelectorAll('#mtr-table thead th.th-sortable');
+    expect(ths.length).toBe(5);
+    const costTh = container.querySelector('#mtr-table thead th[data-col="cost_usd"]');
+    expect(costTh).not.toBeNull();
+    expect(costTh?.textContent).toContain('Cost');
+    // One Cost cell per row, formatted with fmt.usd2; default order is
+    // chronological (W-4 first, cost 10).
+    const costCells = container.querySelectorAll('#mtr-rows td.c-cost');
+    expect(costCells.length).toBe(5);
+    expect(costCells[0].textContent).toBe('$10.00');
+  });
+
+  it('sorting the modal by Cost does NOT write prefs.trendSortOverride', async () => {
+    const user = userEvent.setup();
+    const { container } = renderTrend(historyWithCost());
+    const before = getState().prefs.trendSortOverride; // panel pref baseline
+    const costTh = container.querySelector(
+      '#mtr-table thead th[data-col="cost_usd"]',
+    ) as HTMLElement;
+    await user.click(costTh);
+    // Non-vacuous: the click DID sort the modal-local table (max cost first).
+    const firstCost = container.querySelector('#mtr-rows tr:first-child td.c-cost');
+    expect(firstCost?.textContent).toBe('$50.00');
+    // …but the panel's PERSISTED sort is untouched (modal uses local state).
+    expect(getState().prefs.trendSortOverride).toEqual(before);
+  });
+
+  it('keeps the current row labelled "Now" after sorting by Cost (finding 2)', async () => {
+    const user = userEvent.setup();
+    const { container } = renderTrend(historyWithCost());
+    const costTh = container.querySelector(
+      '#mtr-table thead th[data-col="cost_usd"]',
+    ) as HTMLElement;
+    await user.click(costTh); // cost-desc: 50,40,30,20,10 → current (30) is 3rd
+    const curRow = container.querySelector('#mtr-rows tr.cur');
+    expect(curRow).not.toBeNull();
+    // Chrono-keyed: the current row still reads "Now …", NOT "W−2 …" (which is
+    // what the sorted map index would mislabel it as).
+    expect(curRow?.querySelector('.wlab')?.textContent ?? '').toMatch(/^Now/);
   });
 });

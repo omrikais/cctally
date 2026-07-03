@@ -402,6 +402,11 @@ export interface TrendRow {
   dollar_per_pct: number | null;
   delta: number | null;
   is_current: boolean;
+  // S3 (#264): additive-optional weekly cost (USD). Present on both weeks[]
+  // (panel sparkline) and history[] (modal); null when the week has no cost
+  // row. The Trend modal's new Cost column reads it; the `?` tolerates older
+  // envelopes that predate the field.
+  cost_usd?: number | null;
 }
 
 export interface SessionsEnvelope {
@@ -424,6 +429,13 @@ export interface SessionRow {
   // clickable button that dispatches OPEN_MODAL with projectKey set.
   project_key: string | null;
   cost_usd: number | null;
+  // S3 (#264): additive-optional. `cache_hit_pct` is a plain number (never
+  // gated) — the per-session cache-hit percentage. `title` is transcript
+  // content — present only when the request's transcript gate is open, else
+  // undefined/null (the Session cell renders a muted em-dash). Consumers
+  // already guard null; the `?` tolerates fixture/older envelopes too.
+  cache_hit_pct?: number | null;
+  title?: string | null;
 }
 
 // ---- Projects panel + modal (spec §5.2) ------------------------------

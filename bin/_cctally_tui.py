@@ -1609,7 +1609,40 @@ def _tui_build_sessions(
     view = c.build_sessions_view(
         entries, now_utc=now_utc, limit=limit, display_tz=None,
     )
-    return list(view.rows)
+    rows = list(view.rows)
+    # Attach human-readable titles for the dashboard/TUI Sessions surface.
+    # Reuses the conversation viewer's title derivation (AI title wins, else
+    # first non-marker human line), which reads the CACHE db
+    # (conversation_messages / conversation_ai_titles). Fail-soft: any cache
+    # failure leaves titles ``None`` -> the client renders an em-dash. One
+    # bounded indexed query (<= `limit` session ids, rides idx_conv_session_ts)
+    # per snapshot build. Titles are stashed unconditionally on this
+    # server-internal row; the privacy gate is applied later, at envelope
+    # serialization (``snapshot_to_envelope(transcripts_visible=...)``).
+    if rows:
+        session_ids = [r.session_id for r in rows if r.session_id]
+        try:
+            conn = c.open_cache_db()
+        except (sqlite3.DatabaseError, OSError):
+            conn = None
+        if conn is not None:
+            try:
+                titles = c._load_sibling(
+                    "_lib_conversation_query"
+                )._session_titles_map(conn, session_ids)
+                rows = [
+                    dataclasses.replace(r, title=titles.get(r.session_id))
+                    if r.session_id in titles else r
+                    for r in rows
+                ]
+            except (sqlite3.DatabaseError, OSError):
+                pass  # fail-soft: leave titles None
+            finally:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    return rows
 
 
 @dataclass

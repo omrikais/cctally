@@ -219,10 +219,13 @@ describe('<SessionsPanel /> sortable header', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders a <SortableHeader> with five sortable <th> elements', () => {
+  it('renders a <SortableHeader> with seven sortable <th> elements (multi-model)', () => {
+    // Fixture is multi-model → Model column present. #264 adds Session +
+    // Cache, so the widest column set is 7 (started, dur, model, session,
+    // project, cache, cost).
     render(<SessionsPanel />);
     const ths = document.querySelectorAll('#panel-sessions table.sess-table thead th.th-sortable');
-    expect(ths.length).toBe(5);
+    expect(ths.length).toBe(7);
   });
 
   it('clicking the Cost header sets sessionsSortOverride to cost desc', async () => {

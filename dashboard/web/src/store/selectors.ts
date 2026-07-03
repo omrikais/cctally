@@ -62,7 +62,7 @@ export function applySessionFilter(rows: SessionRow[], text: string): SessionRow
 }
 
 // Search haystack covers every column the user can see (Started, Dur,
-// Model, Project, Cost), which is broader than the filter's
+// Model, Session-title, Project, Cost), which is broader than the filter's
 // project-OR-model domain. Callers pass the already-filtered+sorted+
 // sliced row list so indices point at the rendered DOM positions.
 //
@@ -80,12 +80,16 @@ export function formatRowHaystack(r: SessionRow, ctx: FmtCtx = FALLBACK_FMT_CTX)
   const cost = r.cost_usd != null ? `$${r.cost_usd.toFixed(2)}` : '';
   // `project_key` is included so search (`/`) matches the disambiguated
   // key the same way `applySessionFilter` does — e.g. `"foo (repos)"`
-  // when two projects collide on basename. Stable ordering: started, dur,
-  // model, project, project_key, cost.
+  // when two projects collide on basename. `title` (S3 #264) lets a query
+  // match a session by its human-readable Session-column title; when the
+  // transcript gate is closed titles are empty/undefined → no title match
+  // (correct — the ungated view carries no titles to match). Stable
+  // ordering: started, dur, model, session-title, project, project_key, cost.
   return [
     started === '—' ? '' : started,
     dur,
     r.model || '',
+    r.title || '',
     r.project || '',
     r.project_key || '',
     cost,
@@ -118,6 +122,7 @@ export interface TrendChartDatum {
   delta: number | null;
   is_current: boolean;
   spark_height?: number;
+  cost_usd?: number | null;   // S3 (#264): weekly cost, for the modal Cost column
 }
 
 export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
@@ -135,6 +140,7 @@ export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
     delta: w.delta,
     is_current: w.is_current,
     spark_height: trend.spark_heights?.[i],
+    cost_usd: w.cost_usd ?? null,
   }));
 }
 
@@ -147,6 +153,7 @@ export function buildTrendHistoryData(env: Envelope | null): TrendChartDatum[] {
     dollar_per_pct: w.dollar_per_pct,
     delta: w.delta,
     is_current: w.is_current,
+    cost_usd: w.cost_usd ?? null,
   }));
 }
 

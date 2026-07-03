@@ -50,8 +50,8 @@ describe('SessionsPanel project-cell title (#207 C4)', () => {
   });
 });
 
-describe('#249 C3 — single-model collapse', () => {
-  it('collapses the model column to a caption + ditto cells when all rows share one model', () => {
+describe('#264 SESS-1 — single-model drops the Model column entirely', () => {
+  it('single-model: no Model header, no ditto, keeps the caption; Session + Cache headers present', () => {
     const env = baseEnvelope();
     env.sessions = { total: 2, sort_key: 'started_desc', rows: [
       sessRow({ session_id: 'a', model: 'claude-opus-4-8', project: 'alpha', project_key: 'alpha' }),
@@ -59,14 +59,22 @@ describe('#249 C3 — single-model collapse', () => {
     ] };
     updateSnapshot(env);
     const { container } = render(<SessionsPanel />);
-    // caption present, model filter chips gone, ditto cells present
+    // Caption stays as the single-model signpost.
     expect(container.querySelector('.sess-model-caption')?.textContent).toContain('opus-4-8');
+    // Model column gone ENTIRELY — no header, no filter chip, no ditto middot.
+    expect(container.querySelector('thead th[data-col="model"]')).toBeNull();
     expect(container.querySelector('.model-chip')).toBeNull();
-    expect(container.querySelectorAll('.model-ditto').length).toBe(2);
-    expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(true);
+    expect(container.querySelector('.model-ditto')).toBeNull();
+    // The dead single-model table class is removed.
+    expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(false);
+    // Session + Cache headers are present regardless.
+    expect(container.querySelector('thead th[data-col="session"]')).not.toBeNull();
+    expect(container.querySelector('thead th[data-col="cache"]')).not.toBeNull();
+    // Six columns rendered (started, dur, session, project, cache, cost).
+    expect(container.querySelectorAll('thead th.th-sortable').length).toBe(6);
   });
 
-  it('keeps per-row model chips and no caption for a multi-model set', () => {
+  it('multi-model: restores the Model column (header + chips), still no ditto', () => {
     const env = baseEnvelope();
     env.sessions = { total: 2, sort_key: 'started_desc', rows: [
       sessRow({ session_id: 'a', model: 'claude-opus-4-8' }),
@@ -75,9 +83,45 @@ describe('#249 C3 — single-model collapse', () => {
     updateSnapshot(env);
     const { container } = render(<SessionsPanel />);
     expect(container.querySelector('.sess-model-caption')).toBeNull();
+    expect(container.querySelector('thead th[data-col="model"]')).not.toBeNull();
     expect(container.querySelectorAll('.model-chip').length).toBe(2);
     expect(container.querySelector('.model-ditto')).toBeNull();
-    expect(container.querySelector('table.sess-table')?.classList.contains('single-model')).toBe(false);
+    // Seven columns (started, dur, model, session, project, cache, cost).
+    expect(container.querySelectorAll('thead th.th-sortable').length).toBe(7);
+  });
+});
+
+describe('#264 SESS-2 — Session (title) + Cache cells', () => {
+  it('renders the title in the Session cell; null title → muted em-dash', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', started_utc: '2026-05-13T09:00:00Z', title: 'Rebuild bundle' }),
+      sessRow({ session_id: 'b', started_utc: '2026-05-13T08:00:00Z', title: null }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    const cells = container.querySelectorAll('td.session');
+    expect(cells.length).toBe(2);
+    // Row a: real title text; title= tooltip set.
+    expect(cells[0].textContent).toContain('Rebuild bundle');
+    expect(cells[0].getAttribute('title')).toBe('Rebuild bundle');
+    // Row b: null title → muted em-dash placeholder, no tooltip.
+    expect(cells[1].querySelector('.sess-title-empty')?.textContent).toBe('—');
+    expect(cells[1].getAttribute('title')).toBeNull();
+  });
+
+  it('renders cache_hit_pct as NN%; null → em-dash', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', started_utc: '2026-05-13T09:00:00Z', cache_hit_pct: 94 }),
+      sessRow({ session_id: 'b', started_utc: '2026-05-13T08:00:00Z', cache_hit_pct: null }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    const cells = container.querySelectorAll('td.cache');
+    expect(cells.length).toBe(2);
+    expect(cells[0].textContent).toBe('94%');
+    expect(cells[1].textContent).toBe('—');
   });
 });
 

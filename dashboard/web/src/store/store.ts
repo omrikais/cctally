@@ -20,7 +20,7 @@ import {
   reconcilePanelOrder,
 } from '../lib/reconcilePanelOrder';
 import { applyTableSort, coerceSortOverride, type SortOverride } from '../lib/tableSort';
-import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
+import { ALL_SESSIONS_COLUMNS } from '../lib/sessionsColumns';
 import {
   initialShareState,
   shareReducer,
@@ -753,7 +753,7 @@ export function getRenderedRows(s: UIState = state): SessionRow[] {
   const filtered = applySessionFilter(rows, s.filterText);
   const override = s.prefs.sessionsSortOverride;
   const sorted = override
-    ? applyTableSort(filtered, SESSIONS_COLUMNS, override)
+    ? applyTableSort(filtered, ALL_SESSIONS_COLUMNS, override)
     : filtered.slice().sort(sessionComparator(s.sessionsSort));
   return sorted.slice(0, s.prefs.sessionsPerPage);
 }

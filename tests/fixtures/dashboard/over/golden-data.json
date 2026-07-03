@@ -2012,6 +2012,7 @@
   "sessions": {
     "rows": [
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 4.28,
         "duration_min": 55,
         "model": "claude-opus-4-7",
@@ -2021,6 +2022,7 @@
         "started_utc": "2026-04-19T02:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2030,6 +2032,7 @@
         "started_utc": "2026-04-18T18:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2039,6 +2042,7 @@
         "started_utc": "2026-04-18T07:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2048,6 +2052,7 @@
         "started_utc": "2026-04-17T20:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2057,6 +2062,7 @@
         "started_utc": "2026-04-17T09:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2066,6 +2072,7 @@
         "started_utc": "2026-04-16T22:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2075,6 +2082,7 @@
         "started_utc": "2026-04-16T11:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2084,6 +2092,7 @@
         "started_utc": "2026-04-16T00:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2093,6 +2102,7 @@
         "started_utc": "2026-04-15T13:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2102,6 +2112,7 @@
         "started_utc": "2026-04-15T02:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2111,6 +2122,7 @@
         "started_utc": "2026-04-14T15:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2120,6 +2132,7 @@
         "started_utc": "2026-04-14T04:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 3.6,
         "duration_min": 40,
         "model": "claude-opus-4-7",
@@ -2129,6 +2142,7 @@
         "started_utc": "2026-04-13T17:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2138,6 +2152,7 @@
         "started_utc": "2026-04-08T06:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2147,6 +2162,7 @@
         "started_utc": "2026-04-01T06:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2156,6 +2172,7 @@
         "started_utc": "2026-03-25T06:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2165,6 +2182,7 @@
         "started_utc": "2026-03-18T06:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2174,6 +2192,7 @@
         "started_utc": "2026-03-11T06:00:00Z"
       },
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 68.0,
         "duration_min": 0,
         "model": "claude-opus-4-7",
@@ -2192,6 +2211,7 @@
     "avg_dollars_per_pct": 0.4358974358974359,
     "history": [
       {
+        "cost_usd": 34.0,
         "delta": null,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2199,6 +2219,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2206,6 +2227,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2213,6 +2235,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2220,6 +2243,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2227,6 +2251,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2234,6 +2259,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,
@@ -2253,6 +2279,7 @@
     ],
     "weeks": [
       {
+        "cost_usd": 34.0,
         "delta": null,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2260,6 +2287,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2267,6 +2295,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2274,6 +2303,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2281,6 +2311,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2288,6 +2319,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": 34.0,
         "delta": 0.0,
         "dollar_per_pct": 0.4358974358974359,
         "is_current": false,
@@ -2295,6 +2327,7 @@
         "used_pct": 78.0
       },
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,

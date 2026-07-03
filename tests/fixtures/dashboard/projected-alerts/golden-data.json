@@ -770,6 +770,7 @@
   "sessions": {
     "rows": [
       {
+        "cache_hit_pct": 0.0,
         "cost_usd": 0.63,
         "duration_min": 0,
         "model": "claude-sonnet-4-6",
@@ -788,6 +789,7 @@
     "avg_dollars_per_pct": null,
     "history": [
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,
@@ -801,6 +803,7 @@
     ],
     "weeks": [
       {
+        "cost_usd": null,
         "delta": null,
         "dollar_per_pct": null,
         "is_current": true,

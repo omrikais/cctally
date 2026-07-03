@@ -2,6 +2,10 @@ import { Fragment, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
+import { SortableHeader } from '../components/SortableHeader';
+import { fmt } from '../lib/fmt';
+import { applyTableSort, type SortOverride } from '../lib/tableSort';
+import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -274,6 +278,12 @@ export function TrendModal() {
   // focus). Declared before the empty-state early return to keep hook order
   // stable.
   const [hovered, setHovered] = useState<number | null>(null);
+  // EPHEMERAL, modal-local sort override (decision 7 / finding 3). Reset to
+  // null on each mount, so opening the modal never inherits or writes the
+  // panel's persisted `prefs.trendSortOverride` — sorting this table by Cost
+  // must NOT reorder the always-visible Trend panel underneath. Declared
+  // before the empty-state early return to keep hook order stable.
+  const [localSort, setLocalSort] = useState<SortOverride | null>(null);
 
   // Shared header extras (share-affordance) reused across the early
   // empty-state return and the main return below.
@@ -322,11 +332,39 @@ export function TrendModal() {
   const hasUsed = rows.some((r) => r.used_pct != null && isFinite(r.used_pct));
   const N = rows.length;
 
+  // Decorate rows with their chronological index (finding 2) BEFORE sorting,
+  // so the "Now / W−1 / W−2" label and the `.cur` highlight follow the row's
+  // identity through any sort — the map index over `tableRows` is the SORTED
+  // position and would relabel rows when sorting by Cost/Used%. `applyTableSort`
+  // returns the input untouched when `localSort` is null, so the default view
+  // stays chronological.
+  const decorated: TrendTableRow[] = rows.map((r, i) => ({ ...r, _chronoIdx: i }));
+  const tableRows = applyTableSort(decorated, TREND_COLUMNS, localSort);
+
+  // Current $/1% hero tile — shared by the 3-tile (median present) and the
+  // collapsed 2-tile (median unavailable) hero layouts.
+  const heroCur = (
+    <div className="m-kv kv-cur">
+      <svg className="icon" aria-hidden="true">
+        <use href="/static/icons.svg#dollar" />
+      </svg>
+      <div>
+        <div className="v" id="mtr-cur">
+          {cur && cur.dollar_per_pct != null
+            ? '$' + cur.dollar_per_pct.toFixed(3)
+            : '—'}
+        </div>
+        <div className="lbl">Current $ / 1%</div>
+      </div>
+    </div>
+  );
+
   return (
     <Modal
       title={`Trend — last ${N} weeks`}
       accentClass="accent-amber"
       headerExtras={headerExtras}
+      wide
     >
       <section className="modal-trend">
         <div className="m-chipstrip">
@@ -335,41 +373,50 @@ export function TrendModal() {
           </span>
         </div>
 
-        <div className="m-hero cols-3">
-          <div className="m-kv kv-cur">
-            <svg className="icon" aria-hidden="true">
-              <use href="/static/icons.svg#dollar" />
-            </svg>
-            <div>
-              <div className="v" id="mtr-cur">
-                {cur && cur.dollar_per_pct != null
-                  ? '$' + cur.dollar_per_pct.toFixed(3)
-                  : '—'}
+        <div className="period-two-pane">
+          <div className="period-detail-pane">
+        {med != null ? (
+          <div className="m-hero cols-3">
+            {heroCur}
+            <div className="m-kv kv-med">
+              <svg className="icon" aria-hidden="true">
+                <use href="/static/icons.svg#minus" />
+              </svg>
+              <div>
+                <div className="v" id="mtr-med">
+                  {'$' + med.toFixed(3)}
+                </div>
+                <div className="lbl">4-week median</div>
               </div>
-              <div className="lbl">Current $ / 1%</div>
             </div>
-          </div>
-          <div className="m-kv kv-med">
-            <svg className="icon" aria-hidden="true">
-              <use href="/static/icons.svg#minus" />
-            </svg>
-            <div>
-              <div className="v" id="mtr-med">
-                {med != null ? '$' + med.toFixed(3) : '—'}
+            <div className={`m-kv kv-delta ${dkv.cls}`} id="mtr-delta-kv">
+              <svg className="icon" aria-hidden="true">
+                <use href={dkv.iconHref} />
+              </svg>
+              <div>
+                <div className="v" id="mtr-delta">{dkv.text}</div>
+                <div className="lbl">vs median</div>
               </div>
-              <div className="lbl">4-week median</div>
             </div>
           </div>
-          <div className={`m-kv kv-delta ${dkv.cls}`} id="mtr-delta-kv">
-            <svg className="icon" aria-hidden="true">
-              <use href={dkv.iconHref} />
-            </svg>
-            <div>
-              <div className="v" id="mtr-delta">{dkv.text}</div>
-              <div className="lbl">vs median</div>
+        ) : (
+          /* TREND-KPI (decision 8): fewer than 4 valid non-current weeks →
+             no median. Collapse cols-3 → cols-2 = [Current $/1%] + one muted
+             hint tile that READS as informational ("needs 4 weeks" as the
+             value, "Median" as the label) rather than an empty "—" KPI. */
+          <div className="m-hero cols-2">
+            {heroCur}
+            <div className="m-kv kv-med kv-hint" id="mtr-med-hint">
+              <svg className="icon" aria-hidden="true">
+                <use href="/static/icons.svg#minus" />
+              </svg>
+              <div>
+                <div className="v">needs 4 weeks</div>
+                <div className="lbl">Median</div>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         <h3 className="m-sec sec-spark">
           <svg className="icon" aria-hidden="true">
@@ -487,7 +534,9 @@ export function TrendModal() {
             ) : null}
           </div>
         </div>
+          </div>{/* /period-detail-pane */}
 
+          <div className="period-table-pane">
         <h3 className="m-sec sec-tbl">
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#hash" />
@@ -503,27 +552,38 @@ export function TrendModal() {
           </span>
         </div>
         <table className="m-histable" id="mtr-table">
-          <thead>
-            <tr>
-              <th>Week</th>
-              <th className="num">Used %</th>
-              <th className="num">$ / 1%</th>
-              <th className="num">Δ $/1%</th>
-            </tr>
-          </thead>
+          {/* Sortable header off the shared TREND_COLUMNS (Week · Cost · Used%
+              · $/1% · Δ). The override is the modal-local, ephemeral `localSort`
+              — NOT the panel's persisted `prefs.trendSortOverride` (decision 7).
+              The <tbody> stays hand-rendered so the modal keeps its week labels,
+              `.cur` highlight, and delta formatting the panel lacks. */}
+          <SortableHeader
+            columns={TREND_COLUMNS}
+            override={localSort}
+            onChange={setLocalSort}
+            accentVar="--accent-amber"
+          />
           <tbody id="mtr-rows">
-            {rows.map((r, i) => {
-              const k = N - 1 - i;
+            {tableRows.map((r) => {
+              // finding 2: the "Now / W−1 / W−2" label keys off the row's
+              // chronological identity (`_chronoIdx`), NOT its (possibly
+              // sorted) render position — so sorting by Cost/Used% never
+              // relabels rows.
+              const k = N - 1 - r._chronoIdx;
               const wlab = historyWlab(r, k);
               const usedTxt = r.used_pct != null ? Math.round(r.used_pct) + '%' : '—';
               const dppTxt =
                 r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : '—';
               const d = renderDelta(r.delta);
               return (
-                <tr key={r.label + '|' + i} className={r.is_current ? 'cur' : undefined}>
+                <tr
+                  key={r.label + '|' + r._chronoIdx}
+                  className={r.is_current ? 'cur' : undefined}
+                >
                   <td>
                     <span className="wlab">{wlab}</span>
                   </td>
+                  <td className="num c-cost">{fmt.usd2(r.cost_usd)}</td>
                   <td className="num usedpct">{usedTxt}</td>
                   <td className="num dpp">{dppTxt}</td>
                   <td className={`num delta ${d.cls}`}>{d.text}</td>
@@ -532,6 +592,8 @@ export function TrendModal() {
             })}
           </tbody>
         </table>
+          </div>{/* /period-table-pane */}
+        </div>{/* /period-two-pane */}
       </section>
     </Modal>
   );

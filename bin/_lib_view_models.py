@@ -264,6 +264,16 @@ class TuiSessionRow:
     # without re-reading ``session_files`` and so the share path can
     # privacy-scrub via ``_lib_share._scrub``.
     project_path: str | None = None
+    # Dashboard/TUI-only: the human-readable session title (AI-generated
+    # title when present, else the first non-marker user prompt). Populated
+    # by the dashboard/TUI snapshot wrapper (``_cctally_tui._tui_build_sessions``)
+    # via ``_lib_conversation_query._session_titles_map``; left ``None`` on the
+    # CLI ``session`` / share paths (they call ``build_sessions_view`` directly).
+    # This is transcript-derived content — it rides the per-request transcript
+    # privacy gate at envelope serialization (never emitted when the gate is
+    # closed). Defaults ``None`` so fixture rows built positionally stay
+    # compatible.
+    title: str | None = None
 
 
 # === Internal helpers ======================================================

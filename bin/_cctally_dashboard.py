@@ -4500,9 +4500,21 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                          monotonic_now: "float | None" = None,
                          oauth_usage_cfg: "dict | None" = None,
                          display_tz_pref_override: "str | None" = None,
-                         runtime_bind: "str | None" = None) -> dict:
+                         runtime_bind: "str | None" = None,
+                         transcripts_visible: bool = False) -> dict:
     """Serialize a DataSnapshot into the JSON envelope consumed by the
     browser (design spec §2.2).
+
+    ``transcripts_visible`` gates the transcript-derived session ``title``
+    (#264 S3): the key is emitted ONLY when the flag is True AND the row has
+    a title, so False (the default) fails closed for any caller that forgets
+    to pass it — no ``title`` key, no leaked prompt content. The two
+    browser-serving emit sites (``GET /api/data`` + the SSE loop) pass the
+    per-request ``_transcripts_visible_to_request()`` — the SAME predicate
+    that drives ``transcriptsEnabled`` and the per-row "open conversation"
+    button; every other caller (share builders, fixtures, tests) keeps the
+    default. ``cache_hit_pct`` (sessions) and ``cost_usd`` (trend) are plain
+    numbers and are never gated.
 
     Pure function — no I/O on the snapshot data path. Reads
     ``config.json`` once for ``display.tz`` and once for the
@@ -5101,6 +5113,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         "dollar_per_pct": w.dollars_per_percent,
                         "delta":          w.delta_dpp,
                         "is_current":     bool(w.is_current),
+                        # #264 S3: additive weekly cost (already on the row via
+                        # build_trend_view); rendered by the Trend modal's Cost
+                        # column. ``getattr`` (like ``project_key`` /
+                        # ``trend_history_median_dpp``) tolerates minimal trend
+                        # shapes — SimpleNamespace test rows / older fixtures —
+                        # that predate this nullable field. ``None`` when the
+                        # week has no cost snapshot.
+                        "cost_usd":       round(_wc, 4) if (_wc := getattr(w, "weekly_cost_usd", None)) is not None else None,
                     }
                     for w in snap.trend
                 ],
@@ -5112,6 +5132,9 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         "dollar_per_pct": w.dollars_per_percent,
                         "delta":          w.delta_dpp,
                         "is_current":     bool(w.is_current),
+                        # #264 S3: additive weekly cost (see weeks[] above; same
+                        # getattr tolerance for minimal/older trend shapes).
+                        "cost_usd":       round(_wc, 4) if (_wc := getattr(w, "weekly_cost_usd", None)) is not None else None,
                     }
                     for w in (snap.weekly_history or [])
                 ],
@@ -5155,6 +5178,20 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     # resolve (the React cell falls back to plain text).
                     "project_key":  getattr(s, "project_key", None),
                     "cost_usd":     round(s.cost_usd, 4) if s.cost_usd is not None else None,
+                    # #264 S3: cache-hit % is a plain metric — always serialized
+                    # (never gated). ``None`` when the row has no denominator.
+                    "cache_hit_pct": round(s.cache_hit_pct, 1) if s.cache_hit_pct is not None else None,
+                    # The session title is transcript-derived content: emit the
+                    # `title` KEY only when the per-request transcript gate is
+                    # open AND a title exists. Omitted (not null) otherwise, so
+                    # a gated-off or untitled session renders the client's
+                    # em-dash fallback and committed goldens (empty conversation
+                    # fixtures -> no title) never carry a `title` key. Default
+                    # transcripts_visible=False therefore fails fully closed.
+                    **({"title": getattr(s, "title", None)}
+                       if (transcripts_visible
+                           and getattr(s, "title", None) is not None)
+                       else {}),
                 }
                 for s in snap.sessions
             ],
@@ -7356,6 +7393,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             cfg_oauth = _get_oauth_usage_config(load_config())
         except OauthUsageConfigError:
             cfg_oauth = dict(sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS)
+        # Resolve the per-request transcript gate ONCE and use it for both the
+        # in-envelope session `title` gate (#264 S3) and the `transcriptsEnabled`
+        # client signal below — one predicate, two consumers, desync impossible.
+        visible = self._transcripts_visible_to_request()
         env = snapshot_to_envelope(
             snap,
             # `_now_utc()` honors CCTALLY_AS_OF for harness determinism;
@@ -7368,6 +7409,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             oauth_usage_cfg=cfg_oauth,
             display_tz_pref_override=type(self).display_tz_pref_override,
             runtime_bind=type(self).cctally_host,
+            transcripts_visible=visible,
         )
         # Conversation viewer (Plan 2, spec §5): inject the client signal
         # PER-REQUEST and Host-aware — NOT inside snapshot_to_envelope (the
@@ -7376,7 +7418,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # request that the transcript GETs would 403 shows
         # transcriptsEnabled=false, never enabled-then-403 (the pass-2 P2
         # finding) — one predicate, two consumers, desync impossible.
-        env["transcriptsEnabled"] = self._transcripts_visible_to_request()
+        env["transcriptsEnabled"] = visible
         body = json.dumps(env, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -8295,6 +8337,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     oauth_usage_cfg=cfg_oauth,
                     display_tz_pref_override=type(self).display_tz_pref_override,
                     runtime_bind=type(self).cctally_host,
+                    # #264 S3: gate the in-envelope session `title` on the same
+                    # connection-scoped predicate that drives transcriptsEnabled.
+                    transcripts_visible=transcripts_enabled,
                 )
                 env["transcriptsEnabled"] = transcripts_enabled
                 msg = (

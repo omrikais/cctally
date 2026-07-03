@@ -1091,38 +1091,48 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .sess-table tbody td.cost-xs   { color: var(--accent-green); }
 .sess-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 
-/* #249 C3 — single-model collapse: one header caption + dimmed ditto cells. */
+/* #249 C3 — single-model caption: the "● all · <model>" signpost that
+   replaces the per-row Model column when the whole set is one model (SESS-1).
+   The Model <th>/<td> are dropped entirely (no ditto middot column). */
 .sess-model-caption {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: var(--fs-body); color: var(--text-dim); white-space: nowrap;
 }
-.sess-table tbody td .model-ditto { color: var(--text-faint); }
-.sess-table tbody td.model-ditto-cell { text-align: center; width: 1.5em; }
 
-/* #249 C3 — when the model column is collapsed, give the freed width to the
-   Project column: size to content, WRAP before ellipsize (no last-resort
-   truncation at default width). Scoped to .single-model so the multi-model
-   layout is byte-unchanged. DESKTOP-ONLY (min-width:641px): the mobile card
-   reflow keeps its own one-line ellipsis for the project area, so a single-
-   model phone view stays visually identical to a multi-model one (this
-   override would otherwise outrank the mobile td.project nowrap/ellipsis and
-   wrap names only in single-model mode). Overrides the desktop max-width:220px
-   + nowrap on td.project and the nested .project-cell-link. */
-@media (min-width: 641px) {
-  .sess-table.single-model tbody td.project { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
-  .sess-table.single-model tbody td.project .project-cell-link { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
-}
+/* S3 (#264) — Session (title) + Cache columns. The Session cell is ALWAYS
+   present; a gated-off / missing title renders a muted em-dash
+   (.sess-title-empty). Content-sized-columns posture: size to content, but
+   cap + ellipsize at a sane max (ellipsis is the last resort) with a native
+   title= tooltip carrying the full text — so Session + Project flex-share the
+   width (including the space the dropped Model column frees in single-model)
+   without the widest title spilling the card (the panel body also scrolls-x).
+   Cache is a narrow right-aligned numeric via the shared `num` class. */
+.sess-table tbody td.session { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.sess-title-empty { color: var(--text-faint); }
 
-/* #208: the Sessions columns (Started · Dur · Model · Project · Cost, all
-   white-space:nowrap) sum past the panel card at narrow 2-col widths
-   (1100–1600px) — the panel has no overflow:hidden, so the Cost column
-   spilled past the card / viewport. Scroll the body horizontally instead
-   (no truncation — every column stays full-width; the scrollbar shows only
-   when the table can't fit). The ID specificity (1,1,0) also governs the
-   collapsed variant below (0,3,0), so both states scroll consistently. The
-   mobile @media reflows the table into per-row cards (width:100%), so this
-   never triggers there. */
+/* #208: the Sessions columns (Started · Dur · Model · Session · Project ·
+   Cache · Cost, all white-space:nowrap) sum past the panel card at narrow
+   2-col widths (1100–1600px) — the panel has no overflow:hidden, so the
+   rightmost column spilled past the card / viewport. Scroll the body
+   horizontally instead (the Session cell ellipsizes at its cap; every other
+   column stays full-width; the scrollbar shows only when the table can't
+   fit). The mobile @media reflows the table into per-row cards (width:100%)
+   and hides Session/Cache, so this never triggers there. */
 #panel-sessions .panel-body { overflow-x: auto; }
+/* S3 (#264) ui-qa P2: at the common 1440 laptop width the Sessions card is a
+   half-width bento cell (~650px body), and the 6 nowrap columns sum to ~825px
+   with the generous 280/220 Session/Project caps — so the NEW Cache + Cost
+   columns fell off the right edge behind the overflow-x valve by default,
+   undercutting SESS-2. Tighten the two flexible text columns below ~1728px so
+   all six fit without scrolling at 1440 (Session keeps its native title=
+   tooltip for the full text); the generous caps stay at ≥1729 where the
+   ~890px body already fits them (verified fitting at 1920). Floored at
+   min-width:641px so this never leaks into the mobile ≤640 block (which hides
+   Session/Cache and sets project max-width:none). */
+@media (min-width: 641px) and (max-width: 1728px) {
+  .sess-table tbody td.session { max-width: 165px; }
+  .sess-table tbody td.project { max-width: 150px; }
+}
 
 .chip {
   display: inline-block; padding: 1px 8px; border-radius: var(--radius-xs);
@@ -1299,6 +1309,19 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .modal-card.modal-wide .modal-body {
     display: flex; flex-direction: column; min-height: 0; overflow: hidden;
   }
+  /* #264 S3: the Trend modal nests `.period-two-pane` inside a
+     `<section class="modal-trend">` wrapper (unlike PeriodModal, which makes
+     the two-pane a direct `.modal-body` child). Without this, `.modal-trend`
+     is a plain block, so `.period-two-pane { flex:1 1 auto }` is inert (its
+     parent isn't a flex container) and the table pane's `overflow:auto` never
+     engages — content would clip under the body's `overflow:hidden`. Make the
+     wrapper a flex column that fills the bounded body so the chain reconnects
+     (modal-body → modal-trend flex:1 col → chipstrip auto + two-pane flex:1 →
+     panes scroll internally). Harmless for Weekly/Monthly (they have no
+     `.modal-trend`). */
+  .modal-card.modal-wide .modal-trend {
+    display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
+  }
   .modal-card.modal-wide .period-two-pane {
     flex: 1 1 auto; min-height: 0; align-items: stretch;
   }
@@ -1370,6 +1393,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   letter-spacing: 0.05em; margin-top: 2px; font-weight: 500;
 }
 .m-kv .sub { color: var(--text-dim); font-size: var(--fs-eyebrow); margin-top: 2px; }
+/* #264 S3: the &lt;4-week median-collapse hint tile. Its value is words
+   ("needs 4 weeks"), not a metric, so mute + downweight it (vs. the 700/kpi
+   real KPI value) — it reads as informational, never as an empty "—" KPI. */
+.m-kv.kv-hint .v { color: var(--text-dim); font-size: var(--fs-body); font-weight: 600; }
 
 /* Section header — icon + uppercase label colored via .sec-<accent>. */
 .m-sec {
@@ -1772,6 +1799,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 #mtr-table .delta.up       { color: var(--accent-red);   font-family: var(--font-mono); }
 #mtr-table .delta.down     { color: var(--accent-green); font-family: var(--font-mono); }
 #mtr-table .delta.flat     { color: var(--text-dim);     font-family: var(--font-mono); }
+/* S3 #264 — Trend Cost column. Modal-only (the panel renders a Cost-less
+   subset), so this only paints inside #mtr-table. `.num` already right-aligns;
+   `.c-cost` restates it defensively (covers the header + any non-`num` reuse). */
+.c-cost                    { text-align: right; }
+#mtr-table .c-cost         { color: var(--text);        font-family: var(--font-mono); }
 
 /* Sessions modal — aggregated detail view (no per-entry table: the
    `/api/session/:id` envelope surfaces 15 summary keys only). The
@@ -4348,9 +4380,10 @@ mark.current {
     gap: 10px;
   }
 
-  /* TrendModal table (.m-histable#mtr-table) — 4 cols (Week, Used %,
-     $/1%, Δ $/1%). 2-line dense rows: top = label + Δ; bottom =
-     Used % · $/1%. */
+  /* TrendModal table (.m-histable#mtr-table) — 5 cols (Week, Cost, Used %,
+     $/1%, Δ $/1% — S3 #264). 2-line dense rows: top = label + Δ; bottom =
+     Cost · Used % · $/1%. Keeps the stacked layout labelling the right cells
+     after the Cost column was inserted (finding 4); full mobile polish is S4. */
   .m-histable#mtr-table { width: 100%; }
   .m-histable#mtr-table thead { display: none; }
   .m-histable#mtr-table tbody,
@@ -4372,20 +4405,25 @@ mark.current {
     font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .m-histable#mtr-table td:nth-child(4) {       /* Δ $/1% */
+  .m-histable#mtr-table td:nth-child(5) {       /* Δ $/1% */
     order: 2;
     flex: 0 0 auto;
     margin-left: auto;
     font-weight: 700;
   }
-  .m-histable#mtr-table td:nth-child(2) {       /* Used % */
+  .m-histable#mtr-table td:nth-child(2) {       /* Cost */
     order: 3;
-    flex: 1 1 50%;
+    flex: 1 1 auto;
     color: var(--text-dim); font-size: var(--fs-meta);
   }
-  .m-histable#mtr-table td:nth-child(3) {       /* $/1% */
+  .m-histable#mtr-table td:nth-child(3) {       /* Used % */
     order: 4;
-    flex: 1 1 50%;
+    flex: 1 1 auto;
+    color: var(--text-dim); font-size: var(--fs-meta);
+  }
+  .m-histable#mtr-table td:nth-child(4) {       /* $/1% */
+    order: 5;
+    flex: 1 1 auto;
     color: var(--text-dim); font-size: var(--fs-meta);
   }
 
@@ -4614,11 +4652,21 @@ mark.current {
     grid-area: dur;
     color: var(--text-dim); font-size: var(--fs-meta);
   }
-  .sess-table td:nth-child(3) {         /* model chip cell */
+  .sess-table td:nth-child(3) {         /* model chip cell (multi-model) */
     grid-area: chip;
     justify-self: end;
     display: inline-flex; align-items: center;
   }
+  /* S3 (#264): the new Session + Cache columns are desktop-only for now — the
+     mobile card keeps its existing 2-line shape (project/cost · started·dur·
+     chip). `display:none` removes them from the row grid so the named-area
+     layout above is byte-unchanged. In single-model mode the Session cell is
+     `nth-child(3)`; this `.sess-table td.session` rule ties that nth-child(3)
+     grid-area assignment on specificity and wins on later source order, so a
+     hidden Session cell never lands in the chip slot. Full mobile column
+     tuning is S4 (MOB-*). */
+  .sess-table td.session,
+  .sess-table td.cache { display: none; }
   /* keep started->dur separator; drop dur->chip (the 1fr spacer edge-separates the chip) */
   .sess-table td.started::after {
     content: " · ";

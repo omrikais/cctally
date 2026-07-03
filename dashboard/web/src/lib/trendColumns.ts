@@ -11,6 +11,16 @@ export const TREND_COLUMNS: TableColumn<TrendTableRow>[] = [
     compare: (a, b) => a._chronoIdx - b._chronoIdx,
     className: 'c-week',
   },
+  // S3 (#264) Cost column. Lives in TREND_COLUMNS as the single source of
+  // truth, but is MODAL-ONLY: the always-visible panel card renders a subset
+  // (PANEL_TREND_COLUMNS below) that omits it so the small tile stays
+  // uncrowded. `nullKey` parks weeks with no cost row (null) at the END
+  // regardless of asc/desc — the comparator never sees a null.
+  { id: 'cost_usd',       label: 'Cost',         defaultDirection: 'desc', numeric: true,
+    nullKey: (r) => r.cost_usd ?? null,
+    compare: (a, b) => (a.cost_usd ?? 0) - (b.cost_usd ?? 0),
+    className: 'c-cost',
+  },
   { id: 'used_pct',       label: 'Used%',        defaultDirection: 'desc', numeric: true,
     compare: (a, b) => (a.used_pct ?? 0) - (b.used_pct ?? 0),
     className: 'c-used',

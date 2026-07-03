@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { TrendPanel } from './TrendPanel';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import type { Envelope, TrendRow } from '../types/envelope';
 
 beforeEach(() => {
@@ -56,6 +56,56 @@ describe('TrendPanel card week count (TR-1 / #251)', () => {
     render(<TrendPanel />);
     const sub = document.querySelector('#panel-trend .sub') as HTMLElement;
     expect(sub.textContent).toBe('(1 week)');
+  });
+});
+
+// S3 (#264 · finding 3): the Cost column lives in TREND_COLUMNS but is
+// MODAL-ONLY. The panel renders — and sorts by — a subset that omits it, so a
+// stale/hand-edited `trendSortOverride.column==='cost_usd'` can't reorder the
+// panel by a column it doesn't show.
+function trendRowCost(label: string, cost: number, isCurrent = false): TrendRow {
+  return { label, used_pct: 20, dollar_per_pct: 1.0, delta: null, is_current: isCurrent, cost_usd: cost };
+}
+
+function envWithCosts(): Envelope {
+  const env = baseEnvelope();
+  // Chronological weeks[] order wk1..wk4; costs are non-monotonic so a
+  // cost-desc sort WOULD reorder them to wk3(4), wk1(3), wk4(2), wk2(1).
+  const weeks = [
+    trendRowCost('wk1', 3.0),
+    trendRowCost('wk2', 1.0),
+    trendRowCost('wk3', 4.0),
+    trendRowCost('wk4', 2.0, true),
+  ];
+  env.trend = { weeks, spark_heights: weeks.map((_, i) => i + 1), history: weeks };
+  return env;
+}
+
+describe('TrendPanel Cost column is modal-only (S3 #264 · finding 3)', () => {
+  it('renders no Cost header — only Week · Used% · $/1% · Δ', () => {
+    updateSnapshot(envWithCosts());
+    render(<TrendPanel />);
+    const cols = Array.from(
+      document.querySelectorAll('#panel-trend table.trend-table thead th'),
+    ).map((th) => th.getAttribute('data-col'));
+    expect(cols).toEqual(['week', 'used_pct', 'dollar_per_pct', 'delta']);
+    expect(cols).not.toContain('cost_usd');
+  });
+
+  it('a stale cost_usd sort override does NOT reorder the panel', () => {
+    updateSnapshot(envWithCosts());
+    // Persisted override points at a column the panel does not render.
+    dispatch({
+      type: 'SET_TABLE_SORT',
+      table: 'trend',
+      override: { column: 'cost_usd', direction: 'desc' },
+    });
+    render(<TrendPanel />);
+    const labels = Array.from(
+      document.querySelectorAll('#panel-trend table.trend-table tbody tr td:first-child'),
+    ).map((td) => td.textContent);
+    // Chronological weeks[] order preserved — NOT cost-desc (wk3, wk1, wk4, wk2).
+    expect(labels).toEqual(['wk1', 'wk2', 'wk3', 'wk4']);
   });
 });
 

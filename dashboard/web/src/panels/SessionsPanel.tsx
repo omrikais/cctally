@@ -14,7 +14,7 @@ import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { openMostRecentSessionModal } from '../store/actions';
-import { SESSIONS_COLUMNS } from '../lib/sessionsColumns';
+import { sessionsColumns } from '../lib/sessionsColumns';
 import { fmt } from '../lib/fmt';
 import { modelChipClass } from '../lib/model';
 import { singleModelLabel } from '../lib/sessionsModel';
@@ -27,20 +27,6 @@ export function SessionsPanel() {
   const env = useSnapshot();
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
-  // F4: render the offset suffix once in the column header so each row
-  // body stays compact ("YYYY-MM-DD HH:MM" without a per-row "UTC" / "PDT"
-  // tail). Build a per-render columns array that overrides the default
-  // "Started" label; everything else (compare, defaultDirection) inherits
-  // from SESSIONS_COLUMNS so sort behavior is unchanged.
-  const columns = useMemo(
-    () =>
-      SESSIONS_COLUMNS.map((col) =>
-        col.id === 'started'
-          ? { ...col, label: `Started (${display.offsetLabel})` }
-          : col,
-      ),
-    [display.offsetLabel],
-  );
   // Re-render on filter/sort/perPage change so the rendered row list
   // stays in sync with getRenderedRows — those slices feed both the
   // table below and the store's search-match recompute.
@@ -76,6 +62,22 @@ export function SessionsPanel() {
   // shared `transcriptsEnabled` selector) so the feature stays invisible
   // for users who can't reach the transcript routes.
   const transcriptsOn = transcriptsEnabled(env);
+  // S3 (#264): build the render columns from the single builder source.
+  // The Model column is dropped entirely when single-model (SESS-1 — the
+  // caption is the signpost); Session + Cache are always present. F4:
+  // override the Started label to carry the tz offset once in the header so
+  // each row body stays compact ("HH:MM" without a per-row "UTC"/"PDT"
+  // tail); everything else (compare, defaultDirection) inherits from the
+  // builder so sort behavior is unchanged.
+  const columns = useMemo(
+    () =>
+      sessionsColumns({ oneModel: !!oneModel, transcriptsOn }).map((col) =>
+        col.id === 'started'
+          ? { ...col, label: `Started (${display.offsetLabel})` }
+          : col,
+      ),
+    [oneModel, transcriptsOn, display.offsetLabel],
+  );
   const filtered = getRenderedRows();
   // Match indices (as produced by the store's _recomputeSearch) are
   // positions into `filtered` — the exact same array we paint below —
@@ -169,7 +171,7 @@ export function SessionsPanel() {
       </div>
       {isMobile && <SessionsControls />}
       <div className="panel-body panel-body--scroll" id="panel-sessions-body">
-        <table className={'sess-table' + (oneModel ? ' single-model' : '')}>
+        <table className="sess-table">
           <SortableHeader
             columns={columns}
             override={sessionsOverride}
@@ -231,11 +233,7 @@ export function SessionsPanel() {
                     />
                   </td>
                   <td><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
-                  {oneModel ? (
-                    <td className="model-ditto-cell">
-                      <span className="model-ditto" aria-hidden="true">·</span>
-                    </td>
-                  ) : (
+                  {!oneModel && (
                     <td onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"
@@ -247,6 +245,13 @@ export function SessionsPanel() {
                       </button>
                     </td>
                   )}
+                  <td className="session" title={r.title ?? undefined}>
+                    {r.title ? (
+                      <HighlightText text={r.title} query={searchText} />
+                    ) : (
+                      <span className="sess-title-empty" aria-hidden="true">—</span>
+                    )}
+                  </td>
                   <td className="project">
                     {r.project_key && r.project_key !== '(unknown)' ? (
                       <button
@@ -278,6 +283,9 @@ export function SessionsPanel() {
                         <HighlightText text={r.project} query={searchText} />
                       </span>
                     )}
+                  </td>
+                  <td className="num cache">
+                    {r.cache_hit_pct == null ? '—' : fmt.pct0(r.cache_hit_pct)}
                   </td>
                   <td className={`num ${cCls}`}>
                     <HighlightText text={fmt.usd2(r.cost_usd)} query={searchText} />
