@@ -18,7 +18,7 @@ describe('Prefs.panelOrder', () => {
   });
 
   it('reads a previously-persisted custom order (post-migration schema)', () => {
-    // 10 entries (all current grid cards) — a v5-cursor saved order round-trips
+    // 10 entries (all current grid cards) — a v6-cursor saved order round-trips
     // verbatim through the reconciler (nothing missing → nothing appended).
     const custom: PanelId[] = ['daily', 'blocks', 'projects', 'sessions', 'trend', 'weekly', 'monthly', 'forecast', 'alerts', 'cache-report'];
     localStorage.setItem('ccusage.dashboard.prefs', JSON.stringify({
@@ -30,7 +30,7 @@ describe('Prefs.panelOrder', () => {
       panelOrder: custom,
       onboardingToastSeen: true,
       // Bump cursor to CURRENT so the saved order round-trips verbatim.
-      panelOrderSchemaVersion: 5,
+      panelOrderSchemaVersion: 6,
     }));
     const initial = loadInitialForTests();
     expect(initial.prefs.panelOrder).toEqual(custom);
@@ -62,10 +62,10 @@ describe('Prefs.panelOrder', () => {
     }
     expect(new Set(order)).toEqual(new Set(DEFAULT_PANEL_ORDER as unknown as string[]));
     expect(order).toHaveLength(DEFAULT_PANEL_ORDER.length);
-    expect(initial.prefs.panelOrderSchemaVersion).toBe(5);
+    expect(initial.prefs.panelOrderSchemaVersion).toBe(6);
     // Migration is persisted immediately so a refresh doesn't re-fire it.
     const raw = localStorage.getItem('ccusage.dashboard.prefs');
-    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(5);
+    expect(JSON.parse(raw!).panelOrderSchemaVersion).toBe(6);
     expect(JSON.parse(raw!).panelOrder).not.toContain('current-week');
   });
 
@@ -117,17 +117,18 @@ describe('REORDER_PANELS action', () => {
   });
 });
 
-describe('SWAP_PANELS action (height-class-aware — #264 S1)', () => {
-  // Default bento order + rows (#264 S2 — medium is a 4-card 2×2 row):
-  //   0 sessions(tall)   1 trend(tall)         2 projects(tall)
-  //   3 daily(medium)    4 cache-report(medium) 5 weekly(medium)  6 monthly(medium)
-  //   7 forecast(short)  8 blocks(short)        9 alerts(short)
+describe('SWAP_PANELS action (height-class-aware — #264 S1 / #266)', () => {
+  // Default bento order + rows (#266 — medium is a 6-card 3×2 row; short holds
+  // only Alerts):
+  //   0 sessions(tall)   1 trend(tall)          2 projects(tall)
+  //   3 daily(medium)    4 cache-report(medium) 5 weekly(medium)   6 monthly(medium)
+  //   7 blocks(medium)   8 forecast(medium)     9 alerts(short)
   // Shift+Arrow keeps dispatching SWAP_PANELS{index, direction}; the reducer
   // moves the card to the previous/next id sharing its CARD_LAYOUT row
   // (skipping other classes), so a keyboard reorder can never cross classes.
   const TALL = ['sessions', 'trend', 'projects'];
-  const MEDIUM = ['daily', 'cache-report', 'weekly', 'monthly'];
-  const SHORT = ['forecast', 'blocks', 'alerts'];
+  const MEDIUM = ['daily', 'cache-report', 'weekly', 'monthly', 'blocks', 'forecast'];
+  const SHORT = ['alerts'];
 
   it('a tall card swaps with the next tall card (sessions → trend)', () => {
     dispatch({ type: 'SWAP_PANELS', index: 0, direction: 1 });
@@ -139,14 +140,20 @@ describe('SWAP_PANELS action (height-class-aware — #264 S1)', () => {
     expect(order.filter((id) => SHORT.includes(id))).toEqual(SHORT);
   });
 
-  it('a short card swaps with the previous short card (blocks → forecast)', () => {
-    // blocks is index 8, forecast index 7 (short row starts at 7 now).
+  it('a medium card swaps with the previous medium card (forecast → blocks)', () => {
+    // blocks is index 7, forecast index 8 (the medium row-3 pair).
     dispatch({ type: 'SWAP_PANELS', index: 8, direction: -1 });
     const order = getState().prefs.panelOrder;
-    expect(order[7]).toBe('blocks');
-    expect(order[8]).toBe('forecast');
+    expect(order[7]).toBe('forecast');
+    expect(order[8]).toBe('blocks');
     // The tall row keeps its relative order.
     expect(order.filter((id) => TALL.includes(id))).toEqual(TALL);
+  });
+
+  it('the lone short card (alerts) has no same-class neighbor — swap is a no-op', () => {
+    const before = [...getState().prefs.panelOrder];
+    dispatch({ type: 'SWAP_PANELS', index: 9, direction: -1 });
+    expect(getState().prefs.panelOrder).toEqual(before);
   });
 
   it('a medium card swaps linearly along the panelOrder subsequence, not geometrically (#264 S2 finding 5)', () => {
@@ -240,19 +247,19 @@ describe('RESET_PREFS preserves onboardingToastSeen, resets panelOrder', () => {
   it('persists the CURRENT schema cursor so a RELOAD keeps the default order (#264 S2 regression)', () => {
     // Regression: RESET_PREFS used to persist defaultPrefs()'s v1 baseline cursor
     // alongside the CURRENT canonical order. On the next load, applyPanelOrderMigration
-    // re-ran v1→v5 over the already-current order — the v3→v4 step re-collapsed the
+    // re-ran v1→v6 over the already-current order — the v3→v4 step re-collapsed the
     // fresh daily/weekly/monthly ids into 'history', scrambling the reset order.
     dispatch({ type: 'REORDER_PANELS', from: 0, to: 3 });
     dispatch({ type: 'RESET_PREFS' });
     const raw = JSON.parse(localStorage.getItem('ccusage.dashboard.prefs')!);
-    expect(raw.panelOrderSchemaVersion).toBe(5);
+    expect(raw.panelOrderSchemaVersion).toBe(6);
     expect(raw.panelOrder).toEqual([...DEFAULT_PANEL_ORDER]);
     // Simulate a page reload: loadInitial re-runs migration + reconcile over the
     // persisted prefs. With the correct cursor it is a no-op; with the stale v1
     // cursor it would scramble the order.
     const reloaded = loadInitialForTests();
     expect(reloaded.prefs.panelOrder).toEqual(DEFAULT_PANEL_ORDER);
-    expect(reloaded.prefs.panelOrderSchemaVersion).toBe(5);
+    expect(reloaded.prefs.panelOrderSchemaVersion).toBe(6);
   });
 
   it('onboardingToastSeen is preserved', () => {

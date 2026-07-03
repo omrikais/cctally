@@ -3,15 +3,15 @@ import { PANEL_REGISTRY, DEFAULT_PANEL_ORDER } from '../src/lib/panelRegistry';
 
 describe('panelRegistry', () => {
   it('DEFAULT_PANEL_ORDER has all 10 grid ids in canonical bento order', () => {
-    // #264 S2 — the History card is split back into Daily/Weekly/Monthly. The
-    // bento reading order: tall (sessions·trend·projects) → medium 2×2
-    // (daily·cache-report / weekly·monthly) → short (forecast·blocks·alerts).
-    // Existing users keep their persisted order (reconcile preserves
-    // positions); only fresh/reset installs get this default.
+    // #264 S2 / #266 — Blocks is promoted to the medium tier. The bento reading
+    // order: tall (sessions·trend·projects) → medium 3×2 (daily·cache-report /
+    // weekly·monthly / blocks·forecast) → short (alerts, full width). Existing
+    // users keep their persisted order (reconcile preserves positions); only
+    // fresh/reset installs get this default.
     expect(DEFAULT_PANEL_ORDER).toEqual([
       'sessions', 'trend', 'projects',
-      'daily', 'cache-report', 'weekly', 'monthly',
-      'forecast', 'blocks', 'alerts',
+      'daily', 'cache-report', 'weekly', 'monthly', 'blocks', 'forecast',
+      'alerts',
     ]);
   });
 

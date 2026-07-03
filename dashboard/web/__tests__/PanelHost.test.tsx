@@ -41,25 +41,25 @@ describe('<PanelHost />', () => {
     const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     expect(host).toBeTruthy();
     expect(host.dataset.panelIndex).toBe('3');
-    // #264 S1 — the bento CSS reads data-span for grid-column: span N.
-    // forecast is a short-row card with span 4.
-    expect(host.dataset.span).toBe('4');
+    // #266 — the bento CSS reads data-span for grid-column: span N. forecast is
+    // now a medium-tier half-width card with span 6.
+    expect(host.dataset.span).toBe('6');
   });
 
   it('Shift+ArrowDown swaps the panel with its next same-class card (height-class-aware)', async () => {
     const user = userEvent.setup();
-    // forecast sits at panelOrder index 7 (a short-row card) in the #264 S2
-    // bento order (the medium row is now 4 cards); pass that global index.
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={7} />);
+    // blocks sits at panelOrder index 7 (a medium-row card) in the #266 bento
+    // order (medium is now a 6-card 3×2); pass that global index.
+    renderInDnd(['blocks'], <PanelHost id="blocks" index={7} />);
     // The wrapper carries the onKeyDown handler; focus the inner panel — the
     // keydown bubbles up to the wrapper.
-    const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
+    const inner = document.querySelector('[data-panel-kind="blocks"]') as HTMLElement;
     inner.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
-    // #264 S2 — forecast (index 7, short) swaps with the NEXT SHORT card
-    // (blocks at index 8). So forecast lands at index 8 and blocks at index 7.
-    expect(getState().prefs.panelOrder[8]).toBe('forecast');
-    expect(getState().prefs.panelOrder[7]).toBe('blocks');
+    // #266 — blocks (index 7, medium) swaps with the NEXT MEDIUM card
+    // (forecast at index 8). So blocks lands at index 8 and forecast at index 7.
+    expect(getState().prefs.panelOrder[8]).toBe('blocks');
+    expect(getState().prefs.panelOrder[7]).toBe('forecast');
   });
 
   it('a quick click on the inner panel still opens its modal', async () => {

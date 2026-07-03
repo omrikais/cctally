@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_PANEL_ORDER, CARD_LAYOUT, SHARE_CAPABLE_PANELS } from './panelIds';
 
-describe('CARD_LAYOUT (#264 S2 bento — period split)', () => {
+describe('CARD_LAYOUT (#264 S2 / #266 bento — Blocks promoted to medium)', () => {
   it('DEFAULT_PANEL_ORDER is the 10 grid cards in bento order', () => {
     expect(DEFAULT_PANEL_ORDER).toEqual([
       'sessions', 'trend', 'projects',
-      'daily', 'cache-report', 'weekly', 'monthly',
-      'forecast', 'blocks', 'alerts',
+      'daily', 'cache-report', 'weekly', 'monthly', 'blocks', 'forecast',
+      'alerts',
     ]);
   });
 
@@ -25,18 +25,18 @@ describe('CARD_LAYOUT (#264 S2 bento — period split)', () => {
     }
   });
 
-  it('tall + short rows sum to 12; the medium 2×2 sums to 24', () => {
+  it('tall + short rows sum to 12; the medium 3×2 sums to 36', () => {
     const sums: Record<string, number> = { tall: 0, medium: 0, short: 0 };
     for (const id of DEFAULT_PANEL_ORDER) sums[CARD_LAYOUT[id].row] += CARD_LAYOUT[id].span;
-    expect(sums).toEqual({ tall: 12, medium: 24, short: 12 });
+    expect(sums).toEqual({ tall: 12, medium: 36, short: 12 });
   });
 
   it('classifies each card into its designed row', () => {
     const byRow = (r: 'tall' | 'medium' | 'short') =>
       DEFAULT_PANEL_ORDER.filter((id) => CARD_LAYOUT[id].row === r).sort();
     expect(byRow('tall')).toEqual(['projects', 'sessions', 'trend']);
-    expect(byRow('medium')).toEqual(['cache-report', 'daily', 'monthly', 'weekly']);
-    expect(byRow('short')).toEqual(['alerts', 'blocks', 'forecast']);
+    expect(byRow('medium')).toEqual(['blocks', 'cache-report', 'daily', 'forecast', 'monthly', 'weekly']);
+    expect(byRow('short')).toEqual(['alerts']);
   });
 
   it('daily/weekly/monthly are share-capable; history is not present', () => {

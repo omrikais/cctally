@@ -396,8 +396,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 @media (min-width: 900px) {
   .bento-row { grid-template-columns: repeat(12, minmax(0, 1fr)); }
   /* Row heights are targets, finalized at the ui-qa gate against real content.
-     Short grows to fit Blocks (its height-setter); Forecast/Alerts stretch to
-     match via the grid's align-items:stretch default. */
+     Each row pins a definite height so its cards scroll in-card (A1) and stay
+     equal-height under the grid's align-items:stretch default. */
   .bento-row.row-tall   { grid-auto-rows: 296px; }
   /* Medium tuned to 300px at the ui-qa gate. The History heatmap's fixed chrome
      — the Total/Peak foot (~59px) + legend (~16px) + margins (~32px) — consumes
@@ -408,21 +408,23 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      number ON TOP OF the cost (~32px of content), so the old 300px/~112px-grid
      budget (~19px cells) shaved ~6px off the top of every day number; 368px
      leaves the grid ~180px → ~33px cells that fit the day+cost stack. The grid
-     also carries a per-row 32px floor below as the hard no-clip guarantee. This
-     row is shared by Cache-report/Weekly/Monthly, which benefit from the extra
-     height too (Weekly/Monthly show more of their now-uncapped rows). */
+     also carries a per-row 32px floor below as the hard no-clip guarantee. #266
+     promotes Blocks + Forecast INTO this row (3×2: Daily|Cache, Weekly|Monthly,
+     Blocks|Forecast), so all six share the height — Weekly/Monthly/Blocks show
+     more of their now-uncapped scrollable rows; Forecast gets room for its full
+     projection band. */
   .bento-row.row-medium { grid-auto-rows: 368px; }
-  /* #264 S4 (A2/Codex-P2): the short row was minmax(140px, auto) — an uncapped
-     Blocks list would grow the row and stretch its Forecast/Alerts row-mates
-     under align-items:stretch. Pin a definite height so Blocks scrolls in-card
-     (A1) and the three short cards stay equal-height. START at 200px; TUNE at the
-     ui-qa gate against real data (S1 tuned the medium row to 300px the same way)
-     so Blocks is usefully scrollable without over-stretching Forecast/Alerts. */
+  /* #264 S4 (A2/Codex-P2) / #266: the short row now holds only Alerts (span 12,
+     full width) — Blocks + Forecast moved up to the medium tier. Keep the
+     definite height so Alerts' body scrolls in-card (A1); 200px suits the compact
+     alert gauge / recent-alerts list without over-stretching. */
   .bento-row.row-short  { grid-auto-rows: 200px; }
   .bento-row .panel-host { min-height: 0; height: 100%; }
   .bento-row .panel-host[data-span="3"] { grid-column: span 3; }
   .bento-row .panel-host[data-span="4"] { grid-column: span 4; }
   .bento-row .panel-host[data-span="6"] { grid-column: span 6; }
+  /* #266: Alerts spans the full 12-col short row. */
+  .bento-row .panel-host[data-span="12"] { grid-column: span 12; }
   /* #264 S4 (A1) — inner-scroll containment. S1 gave each bento row a definite
      height but only SessionsPanel carried panel-body--scroll; expanded plain-
      body cards (Trend/Weekly/Monthly/Projects/Cache/Forecast/Alerts) let content

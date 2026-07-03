@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- The dashboard's 5-hour **Blocks** card is now a full-size half-width card the same size as the **Weekly** and **Monthly** cards, instead of a cramped third-width tile in the short bottom row where only a couple of its blocks were visible at a time. It moves up beside the other period cards — with the **Forecast** card promoted alongside it so the board stays a tidy grid — so you can see far more of the week's activity blocks at a glance, and the **Recent Alerts** card now spans the full width of the bottom row (#266).
+
 ## [1.60.0] - 2026-07-03
 
 ### Changed

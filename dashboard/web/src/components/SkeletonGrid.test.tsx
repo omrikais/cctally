@@ -3,7 +3,7 @@ import { render } from '@testing-library/react';
 import { SkeletonGrid } from './SkeletonGrid';
 
 describe('<SkeletonGrid /> (#264 S1)', () => {
-  it('echoes the bento shape: three height-class rows with 3 / 4 / 3 cards', () => {
+  it('echoes the bento shape: three height-class rows with 3 / 6 / 1 cards', () => {
     const { container } = render(<SkeletonGrid />);
     const tall = container.querySelector('.bento-row.row-tall');
     const medium = container.querySelector('.bento-row.row-medium');
@@ -12,9 +12,10 @@ describe('<SkeletonGrid /> (#264 S1)', () => {
     expect(medium).not.toBeNull();
     expect(short).not.toBeNull();
     expect(tall!.querySelectorAll('.panel.is-skeleton')).toHaveLength(3);
-    // #264 S2 — the medium row is a 4-card 2×2 (daily·cache / weekly·monthly).
-    expect(medium!.querySelectorAll('.panel.is-skeleton')).toHaveLength(4);
-    expect(short!.querySelectorAll('.panel.is-skeleton')).toHaveLength(3);
+    // #266 — the medium row is now a 6-card 3×2 (daily·cache / weekly·monthly /
+    // blocks·forecast); the short row holds only Alerts (full width).
+    expect(medium!.querySelectorAll('.panel.is-skeleton')).toHaveLength(6);
+    expect(short!.querySelectorAll('.panel.is-skeleton')).toHaveLength(1);
   });
 
   it('carries a data-span on each placeholder so the bento CSS can size it', () => {

@@ -17,7 +17,9 @@ import type { PanelId, GridPanelId } from './panelIds';
 //       card at its canonical index.
 //   5 → (#264 S2) 'history' renamed to 'daily'; 'weekly'+'monthly' reinstated
 //       as an ordered pair right after 'cache-report'.
-export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 5;
+//   6 → (#266) 'blocks' promoted to the medium tier; reseat it immediately
+//       before 'forecast' so their medium row-3 pair reads BLOCKS|Forecast.
+export const CURRENT_PANEL_ORDER_SCHEMA_VERSION = 6;
 // Canonical position of 'projects' in DEFAULT_PANEL_ORDER (spec §2.1).
 const PROJECTS_INSERT_INDEX = 4;
 // Canonical position of 'history' in DEFAULT_PANEL_ORDER (S8 #254).
@@ -52,6 +54,12 @@ export interface MigrationResult {
  *     'daily' and reinstate the ordered pair 'weekly'+'monthly' right after
  *     'cache-report' (or after 'daily' if cache-report is absent), guarded
  *     like the splices above so neither id is duplicated or reversed.
+ *   • v5→v6 (#266): 'blocks' is promoted to the medium tier (span 6, 368px).
+ *     Reseat it immediately BEFORE 'forecast' so their shared medium row-3
+ *     pair reads BLOCKS|Forecast. No-op unless BOTH ids are present. The
+ *     card's size/row is driven live by CARD_LAYOUT, so this migration only
+ *     corrects the left/right order for users whose saved v5 order has
+ *     'forecast' ahead of 'blocks'.
  *
  * Idempotent: callers already on CURRENT get their input back unchanged
  * (typed to GridPanelId — a current-cursor user can't carry 'current-week'
@@ -109,6 +117,16 @@ export function applyPanelOrderMigration(
           insertAt += 1;
         }
       }
+    }
+  }
+  // v5 → v6 (#266): reseat 'blocks' immediately before 'forecast' (its medium
+  // row-3 pair) so the pair reads BLOCKS|Forecast. Only when both are present;
+  // splice-out-then-reinsert-at-recomputed-index keeps it a pure move (never a
+  // duplicate). A no-op if blocks already precedes forecast adjacently.
+  if (currentVersion < 6) {
+    if (panels.includes('blocks') && panels.includes('forecast')) {
+      panels.splice(panels.indexOf('blocks'), 1);
+      panels.splice(panels.indexOf('forecast'), 0, 'blocks');
     }
   }
   return { panels: panels as unknown as GridPanelId[], newVersion: CURRENT_PANEL_ORDER_SCHEMA_VERSION };

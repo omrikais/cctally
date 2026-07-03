@@ -32,10 +32,11 @@ describe('<App />', () => {
     const { container } = render(<App />);
     expect(hostsIn(container, '.bento-row.row-tall'))
       .toEqual(['sessions', 'trend', 'projects']);
+    // #266 — medium is a 6-card 3×2; short holds only Alerts (full width).
     expect(hostsIn(container, '.bento-row.row-medium'))
-      .toEqual(['daily', 'cache-report', 'weekly', 'monthly']);
+      .toEqual(['daily', 'cache-report', 'weekly', 'monthly', 'blocks', 'forecast']);
     expect(hostsIn(container, '.bento-row.row-short'))
-      .toEqual(['forecast', 'blocks', 'alerts']);
+      .toEqual(['alerts']);
     // The three slices together cover the full default order exactly once.
     const all = Array.from(document.querySelectorAll('[data-panel-host]'))
       .map((h) => (h as HTMLElement).dataset.panelHost);
@@ -53,8 +54,8 @@ describe('<App />', () => {
       .toEqual(['trend', 'projects', 'sessions']);
     // The medium and short rows keep their relative order.
     expect(hostsIn(container, '.bento-row.row-medium'))
-      .toEqual(['daily', 'cache-report', 'weekly', 'monthly']);
+      .toEqual(['daily', 'cache-report', 'weekly', 'monthly', 'blocks', 'forecast']);
     expect(hostsIn(container, '.bento-row.row-short'))
-      .toEqual(['forecast', 'blocks', 'alerts']);
+      .toEqual(['alerts']);
   });
 });
