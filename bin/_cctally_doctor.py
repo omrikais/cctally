@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -516,6 +517,8 @@ def doctor_gather_state(
         dev_mode=_cctally_core.DEV_MODE,
         app_dir=str(_cctally_core.APP_DIR),
         is_dev_checkout=_cctally_core._is_dev_checkout(),
+        # Preview channel (CCTALLY_CHANNEL=preview): surfaced in install.mode.
+        channel=("preview" if os.environ.get("CCTALLY_CHANNEL") == "preview" else "prod"),
         # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
         pricing_coverage=pricing_coverage,
         # Conversation-sessions rollup consistency (#217 S1 / U9).

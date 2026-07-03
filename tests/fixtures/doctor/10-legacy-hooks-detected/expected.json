@@ -5,6 +5,7 @@
                 {
                     "details": {
                         "app_dir": "$HOME/.local/share/cctally",
+                        "channel": "prod",
                         "dev_mode": false,
                         "is_dev_checkout": false
                     },

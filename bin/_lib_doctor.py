@@ -164,6 +164,11 @@ class DoctorState:
     conv_sessions_rollup_count: Optional[int] = None
     conv_messages_distinct_sessions: Optional[int] = None
     conv_rollup_sync_in_progress: bool = False
+    # Preview channel (CCTALLY_CHANNEL=preview): "preview" when the binary runs
+    # under the preview channel, else "prod". Populated by `doctor_gather_state`
+    # from the env; surfaced in the install.mode check. Defaulted (placed last)
+    # so existing constructors stay valid and the prod path is unchanged.
+    channel: str = "prod"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -359,6 +364,10 @@ def _check_install_dev_mode(s: DoctorState) -> CheckResult:
         summary = "DEV (git checkout, custom data dir via CCTALLY_DATA_DIR)"
     else:
         summary = "installed"
+    # Preview channel (CCTALLY_CHANNEL=preview): note the channel in the
+    # summary. Gated → prod (channel="prod") summary is unchanged.
+    if s.channel == "preview":
+        summary += " · channel: preview"
     return CheckResult(
         id="install.mode", title="Mode",
         severity="ok", summary=summary, remediation=None,
@@ -366,6 +375,7 @@ def _check_install_dev_mode(s: DoctorState) -> CheckResult:
             "dev_mode": s.dev_mode,
             "is_dev_checkout": s.is_dev_checkout,
             "app_dir": s.app_dir,
+            "channel": s.channel,
         },
     )
 

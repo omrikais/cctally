@@ -6,6 +6,7 @@ Install
         dev_mode: False
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
+        channel: prod
   ✓ Symlinks                 13/13 available
       details:
         present: 13

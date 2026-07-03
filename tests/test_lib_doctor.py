@@ -42,6 +42,8 @@ def test_doctor_state_has_required_fields():
         "conv_sessions_rollup_count",
         "conv_messages_distinct_sessions",
         "conv_rollup_sync_in_progress",
+        # Preview channel (CCTALLY_CHANNEL=preview): surfaced in install.mode.
+        "channel",
     }
     assert fields == expected, fields ^ expected
 

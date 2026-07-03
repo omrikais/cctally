@@ -2727,6 +2727,11 @@ def main(argv: list[str] | None = None) -> int:
             base += f" (dev — {_cctally_core.APP_DIR})"
         elif _cctally_core._is_dev_checkout():
             base += f" (dev checkout, custom data dir — {_cctally_core.APP_DIR})"
+        # Preview channel (CCTALLY_CHANNEL=preview): append the channel marker
+        # so diagnostics reveal a preview-channel binary. Gated → prod output
+        # is byte-identical when the marker is unset.
+        if os.environ.get("CCTALLY_CHANNEL") == "preview":
+            base += " (preview)"
         print(base)
         return 0
     if not getattr(args, "func", None):

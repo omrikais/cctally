@@ -6,6 +6,7 @@ Install
         dev_mode: False
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
+        channel: prod
   ⚠ Symlinks                 13/13 available; 2 stale link(s) to clean
       → Run `cctally setup` to clean stale links
       details:
