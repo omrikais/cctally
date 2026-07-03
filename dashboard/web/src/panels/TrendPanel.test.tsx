@@ -124,3 +124,20 @@ describe('TrendPanel sparkline track count (#207 C6)', () => {
     expect(spark.style.gridTemplateColumns).toBe('repeat(1, 1fr)');
   });
 });
+
+describe('TrendPanel layout — chart above scrollable table (#265 B)', () => {
+  it('renders the chart block before the scrollable table wrapper', () => {
+    updateSnapshot(envWithTrend(3));
+    const { container } = render(<TrendPanel />);
+    const body = container.querySelector('#panel-trend .panel-body') as HTMLElement;
+    const chart = body.querySelector('.trend-chart');
+    const tableWrap = body.querySelector('.trend-table-wrap');
+    expect(chart).not.toBeNull();
+    expect(tableWrap).not.toBeNull();
+    expect(tableWrap!.querySelector('table.trend-table')).not.toBeNull();
+    // chart precedes the table wrapper in document order
+    expect(
+      chart!.compareDocumentPosition(tableWrap!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+});

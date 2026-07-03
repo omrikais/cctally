@@ -17,20 +17,28 @@ import type { MouseEvent } from 'react';
 interface Props {
   label: string;
   onOpen: () => void;
+  // #265 D — when there's nothing to open (e.g. Blocks on a week with no
+  // activity blocks), disable the button so it reads inert instead of
+  // clickable-but-dead. Optional + default false, so every other caller is
+  // unaffected.
+  disabled?: boolean;
 }
 
-export function ExpandButton({ label, onOpen }: Props) {
+export function ExpandButton({ label, onOpen, disabled = false }: Props) {
   const handleClick = (e: MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
+    if (disabled) return; // defensive: native `disabled` already blocks clicks
     onOpen();
   };
+  const disabledText = `${label}: nothing to open yet`;
   return (
     <button
       type="button"
       className="panel-expand"
-      aria-label={`Open ${label}`}
-      title="Expand"
+      aria-label={disabled ? disabledText : `Open ${label}`}
+      title={disabled ? disabledText : 'Expand'}
       onClick={handleClick}
+      disabled={disabled}
     >
       <span aria-hidden="true">⤢</span>
     </button>

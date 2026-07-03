@@ -99,44 +99,51 @@ export function TrendPanel() {
         </div>
       </div>
       <div className="panel-body">
-        <table className="trend-table">
-          <SortableHeader
-            columns={PANEL_TREND_COLUMNS}
-            override={trendOverride}
-            onChange={(next) =>
-              dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: next })
-            }
-            accentVar="--accent-amber"
-          />
-          <tbody id="trend-rows">
-            {tableData.map((w) => (
-              <tr key={w.label} className={w.is_current ? 'current' : undefined}>
-                <td>{w.label}</td>
-                <td className="num">{fmt.pct0(w.used_pct)}</td>
-                <td className={'num' + (w.is_current ? '' : ' dollar')}>
-                  {fmt.usd2(w.dollar_per_pct)}
-                </td>
-                <td className={'num ' + fmt.deltaCls(w.delta, w.is_current)}>
-                  {fmt.delta(w.delta)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="trend-spark-title">$/1% trend:</div>
-        <div
-          className="trend-spark"
-          id="trend-spark"
-          role="img"
-          aria-label={sparkLabel}
-          style={{ gridTemplateColumns: `repeat(${Math.max(1, data.length)}, 1fr)` }}
-        >
-          <Sparkline data={data} />
+        {/* #265 B — the chart leads and stays pinned; the table scrolls beneath
+            it (`.trend-table-wrap`), so a thin history no longer pushes the
+            sparkline + legend below the S4 in-card fold. */}
+        <div className="trend-chart">
+          <div className="trend-spark-title">$/1% trend:</div>
+          <div
+            className="trend-spark"
+            id="trend-spark"
+            role="img"
+            aria-label={sparkLabel}
+            style={{ gridTemplateColumns: `repeat(${Math.max(1, data.length)}, 1fr)` }}
+          >
+            <Sparkline data={data} />
+          </div>
+          <div className="trend-spark-legend">
+            <span>older</span>
+            <span className="line"></span>
+            <span>▶ newer</span>
+          </div>
         </div>
-        <div className="trend-spark-legend">
-          <span>older</span>
-          <span className="line"></span>
-          <span>▶ newer</span>
+        <div className="trend-table-wrap">
+          <table className="trend-table">
+            <SortableHeader
+              columns={PANEL_TREND_COLUMNS}
+              override={trendOverride}
+              onChange={(next) =>
+                dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: next })
+              }
+              accentVar="--accent-amber"
+            />
+            <tbody id="trend-rows">
+              {tableData.map((w) => (
+                <tr key={w.label} className={w.is_current ? 'current' : undefined}>
+                  <td>{w.label}</td>
+                  <td className="num">{fmt.pct0(w.used_pct)}</td>
+                  <td className={'num' + (w.is_current ? '' : ' dollar')}>
+                    {fmt.usd2(w.dollar_per_pct)}
+                  </td>
+                  <td className={'num ' + fmt.deltaCls(w.delta, w.is_current)}>
+                    {fmt.delta(w.delta)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </section>

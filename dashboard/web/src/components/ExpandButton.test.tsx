@@ -24,4 +24,13 @@ describe('ExpandButton (#264 S1)', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
     expect(parent).not.toHaveBeenCalled();
   });
+
+  it('when disabled, renders a disabled button and never calls onOpen (#265 D)', () => {
+    const onOpen = vi.fn();
+    render(<ExpandButton label="Blocks" onOpen={onOpen} disabled />);
+    const btn = screen.getByRole('button', { name: 'Blocks: nothing to open yet' });
+    expect(btn).toBeDisabled();
+    fireEvent.click(btn);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
 });

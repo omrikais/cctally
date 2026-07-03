@@ -1,9 +1,10 @@
-// #248 Task 6 — Recent Alerts compact tile (C7).
+// #248 Task 6 — Recent Alerts compact tile (C7); empty state upgraded in #265 A.
 //
-// Empty state collapses from a 540x340 box with ~200px of dead air to a single
-// glanceable line: "✓ No alerts · You're at <used%>. Alerts fire at 90% / 95%."
-// (used% read from header.used_pct). Populated state keeps the top-N rows + the
-// "N of M shown" foot, the collapse chevron, and open-on-click.
+// Empty state renders the shared compact "you're clear" gauge (a ✓-head when
+// under the lowest threshold, the current used% hero, the threshold bar + copy;
+// used% read from header.used_pct), centered in the short-row tile. Populated
+// state keeps the top-N rows + the "N of M shown" foot, the collapse chevron,
+// and open-on-click.
 import { act, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RecentAlertsPanel } from './RecentAlertsPanel';
@@ -62,17 +63,18 @@ beforeEach(() => {
 });
 
 describe('#248 Task 6 — Recent Alerts compact tile', () => {
-  it('empty → one compact line with used% + fire thresholds (no tall .alerts-empty box)', () => {
+  it('empty → compact "you\'re clear" gauge with used% + fire thresholds (#265 A)', () => {
     updateSnapshot(env(11));
     const { container } = render(<RecentAlertsPanel />);
-    const tile = container.querySelector('.alerts-empty-tile');
-    expect(tile, 'expected the compact .alerts-empty-tile').not.toBeNull();
-    const text = tile?.textContent ?? '';
-    expect(text).toContain('No alerts');
-    expect(text).toContain('11.0%');
+    const gauge = container.querySelector('.ra-gauge.ra-gauge--compact');
+    expect(gauge, 'expected the shared compact gauge').not.toBeNull();
+    const text = gauge?.textContent ?? '';
+    expect(text).toContain('well under the line');
+    expect(container.querySelector('.ra-gauge-hero')?.textContent).toBe('11%');
     expect(text).toContain('90% / 95%');
-    // The old 32px-padded `.alerts-empty` box is retired.
+    // The old `.alerts-empty` box and `.alerts-empty-tile` one-liner are retired.
     expect(container.querySelector('.alerts-empty')).toBeNull();
+    expect(container.querySelector('.alerts-empty-tile')).toBeNull();
   });
 
   it('populated → top-N rows + "N of M shown" foot', () => {

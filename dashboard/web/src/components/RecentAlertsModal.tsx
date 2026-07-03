@@ -10,6 +10,7 @@ import {
   budgetPeriodNoun,
   projectedContextText,
 } from '../lib/alertAxis';
+import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 import type { AlertEntry } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -178,11 +179,11 @@ export function RecentAlertsModal(): JSX.Element {
   );
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
-  // RA-1 — the empty state teaches instead of stating a bare line. It reads the
-  // current weekly used% (header) and the CONFIGURED fire thresholds
-  // (alertsConfig.weekly_thresholds, fallback [90, 95]) — mirroring the
-  // already-reviewed RecentAlertsPanel empty tile; never hardcode 90/95. When
-  // used% is unknown we keep the one-liner (a null gauge would be broken).
+  // RA-1 / #265 A — the empty state teaches instead of stating a bare line. It
+  // reads the current weekly used% (header) and the CONFIGURED fire thresholds
+  // (alertsConfig.weekly_thresholds, fallback [90, 95]); never hardcode 90/95.
+  // The gauge markup lives in the shared <AlertsEmptyGauge> so the panel + modal
+  // can't drift; when used% is unknown it renders the one-liner fallback.
   const env = useSnapshot();
   const usedPct = env?.header?.used_pct ?? null;
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
@@ -191,47 +192,9 @@ export function RecentAlertsModal(): JSX.Element {
   const alerts = allAlerts.slice(0, ALERTS_MODAL_CAP);
 
   if (alerts.length === 0) {
-    const thresholdCopy = weeklyThresholds.map((t) => `${t}%`).join(' / ');
-    if (usedPct == null) {
-      return (
-        <Modal title="Recent alerts" accentClass="accent-amber">
-          <div className="panel-empty">
-            No alerts yet. Alerts appear when usage crosses {thresholdCopy}.
-          </div>
-        </Modal>
-      );
-    }
-    const lowest = Math.min(...weeklyThresholds);
-    const highest = Math.max(...weeklyThresholds);
-    const fillPct = Math.max(0, Math.min(usedPct, 100));
     return (
       <Modal title="Recent alerts" accentClass="accent-amber">
-        <div className="ra-gauge">
-          {usedPct < lowest ? (
-            <div className="ra-gauge-head">
-              <span className="ra-gauge-check" aria-hidden="true">✓</span>
-              You're at {Math.round(usedPct)}% — well under the line
-            </div>
-          ) : null}
-          <div className="ra-gauge-hero">{Math.round(usedPct)}%</div>
-          <div className="ra-gauge-bar">
-            <div className="ra-gauge-fill" style={{ width: `${fillPct}%` }} />
-            {weeklyThresholds.map((th, i) => (
-              <span
-                key={`${th}-${i}`}
-                className={
-                  'ra-gauge-tick ' +
-                  (th === lowest ? 'tick-amber' : th === highest ? 'tick-red' : 'tick-mid')
-                }
-                data-th={String(th)}
-                style={{ left: `${th}%` }}
-              />
-            ))}
-          </div>
-          <div className="ra-gauge-copy">
-            Alerts fire when weekly usage crosses {thresholdCopy}.
-          </div>
-        </div>
+        <AlertsEmptyGauge usedPct={usedPct} thresholds={weeklyThresholds} />
       </Modal>
     );
   }

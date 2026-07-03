@@ -124,7 +124,11 @@ export function BlocksPanel() {
             triggerId="blocks-panel"
             onClick={() => dispatch(openShareModal('blocks', 'blocks-panel'))}
           />
-          <ExpandButton label="Blocks" onOpen={openActiveOrNewestBlockModal} />
+          <ExpandButton
+            label="Blocks"
+            onOpen={openActiveOrNewestBlockModal}
+            disabled={allRows.length === 0}
+          />
           <button
             type="button"
             className="panel-collapse-toggle"

@@ -13,6 +13,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Dashboard desktop board fixes that finish the bento redesign. Cards whose content is taller than their row now scroll inside their own frame instead of overflowing and rendering on top of the card below them — previously the $/1% Trend chart could spill over the Daily card beneath it, and the Weekly and Monthly cards did the same. The 5-hour **Blocks** card now shows every block for the week (scroll inside the card to reach them all) instead of only the three most recent with no way to see the rest. The **Daily** heatmap shows each day's dollar amount again on the card, not just in its detail view. And the per-card collapse arrow — which did nothing on desktop once the board became height-matched — is removed there (the ⤢ expand control opens each card's detail); it still works on smaller stacked screens (#264).
 - Dashboard mobile fixes. The **Recent Sessions** panel title is no longer crushed to nothing on a phone; each session in the list now leads with its title (what the session was about) instead of hiding it; the at-a-glance hero is a compact card rather than three tall stacked zones; and the Daily card title no longer clips (#264).
 
+### Fixed
+- Dashboard: the empty **Recent Alerts** card no longer sits bottom-heavy with a band of empty space above it — it now shows the same "you're clear" gauge as the alerts detail view (your current usage against the configured alert thresholds), centered and sized to the card, so it reads as balanced as its Forecast and Blocks neighbours (#265).
+- Dashboard: the **$/1% Trend** card keeps its sparkline and "older ▸ newer" legend pinned in view and scrolls the weekly table beneath them, so with only a few weeks of history the chart is no longer half-hidden below the card's internal scroll fold (#265).
+- Dashboard: the **Blocks** card's expand (⤢) control is now disabled on a week with no activity blocks yet, instead of looking clickable but opening nothing when pressed (#265).
+
 ## [1.59.0] - 2026-07-02
 
 ### Changed

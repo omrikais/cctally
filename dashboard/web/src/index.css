@@ -431,6 +431,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .dash-grid .panel .panel-body { overflow-y: auto; overflow-x: hidden; }
   /* Sessions already scrolls x for its wide table — don't clip it. */
   .dash-grid #panel-sessions .panel-body { overflow-x: auto; }
+  /* #265 B — Trend pins its chart on top and inner-scrolls the table below it,
+     instead of the whole body scrolling (which dropped the sparkline + legend
+     below the fold on a thin history). Scoped to #panel-trend by id so the
+     row-tall siblings (sessions/projects) keep the default body scroll. The
+     min-height:0 lets the wrapper actually shrink + scroll (flex-child gotcha). */
+  .dash-grid #panel-trend .panel-body { overflow: hidden; display: flex; flex-direction: column; }
+  .dash-grid #panel-trend .trend-chart { flex: 0 0 auto; }
+  .dash-grid #panel-trend .trend-table-wrap { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   /* #264 S4 (A3): the per-card collapse chevron is a no-op in the bento (every
      collapse max-height exceeds the fixed row height) and A1 inner-scroll now
      covers its only job on desktop. Hide it >=900px (grid-scoped, not the bare
@@ -1088,6 +1096,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .trend-table tbody td.delta-pos { color: var(--accent-red); }
 .trend-table tbody td.delta-neg { color: var(--accent-green); }
 .trend-spark-title { margin-top: 18px; color: var(--accent-cyan); font-weight: 700; }
+/* #265 B — the title now leads the chart block (it used to sit below the table,
+   hence the 18px top margin); drop that margin so the pinned chart has no dead
+   space above it. */
+#panel-trend .trend-spark-title { margin-top: 0; }
 .trend-spark {
   display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px;
   align-items: end; height: 72px; margin: 10px 0 6px;
@@ -2648,6 +2660,10 @@ mark.current {
   border-radius: var(--radius-xs);
 }
 .panel-expand:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+/* #265 D — a disabled ⤢ (Blocks on an empty week) must read as inert, not
+   hover-reactive; override the :hover background/color above. */
+.panel-expand:disabled,
+.panel-expand:disabled:hover { opacity: 0.4; cursor: default; background: none; color: var(--text-dim); }
 .panel-expand:focus-visible {
   outline: 2px solid var(--accent-purple);
   outline-offset: 2px;
@@ -3471,20 +3487,6 @@ mark.current {
 .alert-threshold.warn     { color: var(--accent-amber); }
 .alert-threshold.critical { color: var(--accent-red); }
 .alert-when { color: var(--text-dim); font-size: var(--fs-meta); flex: 1; }
-/* #248 §5 — compact empty Alerts tile: a single glanceable one-liner that fits
-   the uniform tile height (replaces the old 32px-padded `.alerts-empty` box
-   with ~200px of dead air). The body centers it vertically via :has. */
-.alerts-empty-tile {
-  display: flex; align-items: baseline; gap: var(--space-2);
-  color: var(--text-dim); font-size: var(--fs-meta);
-}
-.alerts-empty-tile .alerts-empty-glyph { color: var(--accent-green); font-weight: 700; }
-.alerts-empty-tile .alerts-empty-text { line-height: 1.5; }
-.alerts-empty-tile .sep { color: var(--text-faint); }
-.panel-body:has(> .alerts-empty-tile) {
-  display: flex; flex-direction: column; justify-content: center;
-}
-
 /* RA-1 — empty Recent Alerts modal teaching gauge. Heroes the current weekly
    used%, a mini bar filled to that %, and one tick per CONFIGURED fire
    threshold (lowest amber, highest red). Falls back to the .panel-empty
@@ -3524,10 +3526,20 @@ mark.current {
 .ra-gauge-tick.tick-red   { background: var(--accent-red); }
 .ra-gauge-tick.tick-mid   { background: var(--accent-orange); }
 .ra-gauge-copy { color: var(--text-dim); font-size: var(--fs-meta); }
-/* #264 S1 (VOID-1) — the empty Alerts PANEL reuses the modal gauge's
-   .ra-gauge-bar/.ra-gauge-fill/.ra-gauge-tick vocabulary; this only adds the
-   spacing under the one-liner so the two stack cleanly in the short-row tile. */
-.alerts-gauge { margin-top: var(--space-3); }
+/* #265 A — the empty Alerts PANEL now renders the same .ra-gauge the modal
+   shows (shared AlertsEmptyGauge), centered in the short-row body. `.ra-gauge`
+   only appears in the Alerts panel body, so this is alerts-scoped by
+   construction; the .panel-empty fallback is already centered by the generic
+   #207 rule (.panel-body:has(> .panel-empty)). */
+.panel-body:has(> .ra-gauge) {
+  display: flex; flex-direction: column; justify-content: center;
+}
+/* Compact variant for the 200px bento short row (~127px body after panel
+   padding + header): trim padding/gaps and drop the hero from 46px (--fs-hero)
+   to 22px (--fs-kpi) so the whole gauge — worst case with the ✓-head — fits
+   without an internal scrollbar. Final values confirmed at the ui-qa gate. */
+.ra-gauge--compact { padding: 6px 4px; gap: var(--space-2); }
+.ra-gauge--compact .ra-gauge-hero { font-size: var(--fs-kpi); }
 
 /* =========================================================================
    Share modal (spec §6.2). Layered ABOVE the panel-modal layer via a

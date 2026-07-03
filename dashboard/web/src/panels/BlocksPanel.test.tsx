@@ -53,3 +53,21 @@ describe('BlocksPanel uncap (#264 S4 A2)', () => {
     expect(screen.getAllByText(/Block \d/)).toHaveLength(6);
   });
 });
+
+describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
+  it('disables the expand button when there are no blocks this week', () => {
+    updateSnapshot(baseEnvelope()); // blocks.rows === []
+    const { container } = render(<BlocksPanel />);
+    const expand = container.querySelector('.panel-expand') as HTMLButtonElement;
+    expect(expand).not.toBeNull();
+    expect(expand.disabled).toBe(true);
+  });
+
+  it('leaves the expand button enabled when the week has blocks', () => {
+    const env = baseEnvelope();
+    env.blocks = { rows: [blockRow({})], total_cost_usd: 2 };
+    updateSnapshot(env);
+    const { container } = render(<BlocksPanel />);
+    expect((container.querySelector('.panel-expand') as HTMLButtonElement).disabled).toBe(false);
+  });
+});
