@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.60.0] - 2026-07-03
+
 ### Changed
 - Dashboard **Recent Sessions** is denser and more useful. When every recent session uses the same model, the redundant per-row model column is dropped entirely — it previously rendered as a column of dots under a still-labelled "Model" header, which read as broken — and a single "all · model" caption in the header says it instead; a mixed set of models still shows the column. Two columns that carry real signal take its place: a **Session** title for each row (its first prompt, or an AI-generated summary when one exists) and a **Cache** hit-rate. The title is private conversation content, so it appears only when transcript viewing is enabled for how you reached the dashboard (on your own machine, or on the LAN only if you have explicitly exposed transcripts) and shows a dash otherwise. All the columns now fit at a common laptop width without sideways scrolling, and a long title shortens with the full text available on hover (#264).
 - Dashboard **$/1% Trend** detail view reads better and gains a cost column. When there is too little history to compute a four-week median, the two formerly-empty "—" median tiles collapse into a single "needs 4 weeks" hint instead of looking broken. The weekly table gains a sortable **Cost** column (what you spent that week) and the whole view opens in a wider two-pane layout — the chart and its headline numbers on the left, the sortable weekly table on the right — so it fills the space instead of stacking tall and scrolling; sorting the table reorders only the pop-up, not the small card behind it (#264).
