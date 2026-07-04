@@ -599,6 +599,17 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
 _REBUILD_LOCK_TIMEOUT_SECONDS = 30.0
 
 
+# Orphan-warning throttle: warn only when the detected orphan set CHANGES,
+# so a long-lived dashboard doesn't re-spam the "[cache] N tracked file(s) no
+# longer on disk" line every ~5s sync tick. Reset in tests.
+_LAST_WARNED_ORPHAN_SET: "frozenset[str]" = frozenset()
+
+
+def _reset_orphan_warning_throttle():
+    global _LAST_WARNED_ORPHAN_SET
+    _LAST_WARNED_ORPHAN_SET = frozenset()
+
+
 # Flags whose presence means the cache is mid-migration / mid-reingest. A
 # targeted (only_paths) ingest DECLINES when any is set and defers to the next
 # full background sync — inserting through a half-migrated FTS shape or skipping
@@ -1194,15 +1205,31 @@ def sync_cache(
                 if size_bytes and p not in on_disk_paths
             ]
             if orphaned_tracked_paths:
-                eprint(
-                    f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
-                    f"longer on disk; invalidating walk-complete marker "
-                    f"(run `cache-sync --rebuild` to prune orphaned entries)"
-                )
-                conn.execute(
-                    "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
-                )
-                conn.commit()
+                # Throttle the warning: emit only when the orphan set CHANGES,
+                # not on every ~5s dashboard tick (a removed worktree persists,
+                # so an unthrottled warn re-spams indefinitely). The marker
+                # invalidation below stays UNCONDITIONAL — throttling the print
+                # must not weaken the D5a invariant.
+                global _LAST_WARNED_ORPHAN_SET
+                cur = frozenset(orphaned_tracked_paths)
+                if cur != _LAST_WARNED_ORPHAN_SET:
+                    eprint(
+                        f"[cache] {len(orphaned_tracked_paths)} tracked file(s) no "
+                        f"longer on disk; invalidating walk-complete marker "
+                        f"(run `cache-sync --prune-orphans` to prune, or "
+                        f"`cache-sync --rebuild`)"
+                    )
+                    _LAST_WARNED_ORPHAN_SET = cur
+                # Idempotent marker invalidation: only DELETE (and commit) when a
+                # prior clean walk actually left the marker behind, so a repeated
+                # orphaned sync doesn't churn a no-op write transaction every tick.
+                if conn.execute(
+                    "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+                ).fetchone() is not None:
+                    conn.execute(
+                        "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+                    )
+                    conn.commit()
                 walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
 
         # Pre-scan for any truncation among tracked files. Under the
