@@ -1882,6 +1882,31 @@ def _tui_build_snapshot(
         blocks_panel: list[BlocksPanelRow] = []
         daily_panel:  list[DailyPanelRow]  = []
         alerts: list[dict] = []
+        # ── Sync-once (spec §4, #268) ──────────────────────────────────
+        # Ingest new JSONL bytes into the cache EXACTLY ONCE at the top of
+        # the rebuild, then read every builder with skip_sync=True (pure
+        # SQLite reads). Before this, each of the ~8 wide builders called
+        # get_entries(..., skip_sync=False) which ran its own sync_cache —
+        # ~8-10 redundant whole-tree globs + per-file stats per rebuild,
+        # the CPU-side cost that pegs a core on a large instance.
+        #
+        # The caller's skip_sync flag expresses the --no-sync intent:
+        # honor it by gating ONLY this top-of-rebuild ingest. Downstream
+        # builders always read pure regardless (skip_sync is reassigned to
+        # True below), so --no-sync means "no ingest, still read".
+        do_ingest = not skip_sync
+        if do_ingest:
+            try:
+                cache_conn = _cctally().open_cache_db()
+                try:
+                    sync_cache(cache_conn)
+                finally:
+                    cache_conn.close()
+            except Exception as exc:
+                errors.append(f"sync-cache: {exc}")
+        # Force pure reads for every view builder below, independent of the
+        # caller's flag: the single ingest above is the only glob per tick.
+        skip_sync = True
         try:
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
