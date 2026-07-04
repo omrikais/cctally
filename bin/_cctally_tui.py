@@ -2134,18 +2134,34 @@ def _tui_build_snapshot(
         # snapshot)`` memo lives in ``_lib_snapshot_cache`` (single-writer here).
         # The signature is computed AFTER the top-of-rebuild ingest so a fresh
         # tail-ingested row is reflected before the idle decision is made.
-        dispatch_sig = None
+        dispatch_key = None
         if precompute_envelope:
+            dispatch_sig = None
             try:
                 dispatch_sig = _tui_compute_dispatch_signature(conn)
             except Exception as exc:
                 errors.append(f"dispatch-signature: {exc}")
                 dispatch_sig = None
             if dispatch_sig is not None:
+                # The idle decision keys on the DB signature AND a render key
+                # that captures the config-derived inputs the composite
+                # signature does NOT cover (spec §3 is DB-only): the resolved
+                # display-tz override + the full raw config (display.tz,
+                # alerts_settings, budget, dashboard prefs). A `POST /api/settings`
+                # edit advances neither `MAX(id)` nor the reset legs, so without
+                # this a settings change would idle-serve the stale envelope; a
+                # render-key change forces a full rebuild that re-buckets the
+                # calendar builders (their Group A cache already keys tz) and
+                # refreshes every config-derived envelope block.
+                render_key = (
+                    display_tz_pref_override,
+                    json.dumps(raw_config, sort_keys=True, default=str),
+                )
+                dispatch_key = (dispatch_sig, render_key)
                 _sc = _cctally()._load_sibling("_lib_snapshot_cache")
-                prior_sig, prior_snap = _sc.dispatch_state()
-                if (prior_snap is not None and prior_sig is not None
-                        and dispatch_sig == prior_sig
+                prior_key, prior_snap = _sc.dispatch_state()
+                if (prior_snap is not None and prior_key is not None
+                        and dispatch_key == prior_key
                         and not _snapshot_period_rolled_over(
                             prior_snap, now_utc, _build_display_tz)):
                     idle_snap = _tui_build_idle_snapshot(
@@ -2153,7 +2169,7 @@ def _tui_build_snapshot(
                         precompute_envelope=precompute_envelope,
                         runtime_bind=runtime_bind, errors=errors,
                     )
-                    _sc.store_dispatch_state(dispatch_sig, idle_snap)
+                    _sc.store_dispatch_state(dispatch_key, idle_snap)
                     return idle_snap
         try:
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
@@ -2526,13 +2542,13 @@ def _tui_build_snapshot(
             doctor_payload=doctor_payload_block,
             envelope_precompute=envelope_precompute_block,
         )
-        # #268 M5.1: record (signature, snapshot) so the next dashboard tick can
-        # idle-short-circuit when nothing changed. Full-build path only sets it
-        # when the signature was computed (precompute_envelope); the TUI path
-        # never touches the dispatch memo.
-        if precompute_envelope and dispatch_sig is not None:
+        # #268 M5.1: record the (signature+render key, snapshot) so the next
+        # dashboard tick can idle-short-circuit when nothing changed. Full-build
+        # path only sets it when the key was computed (precompute_envelope); the
+        # TUI path never touches the dispatch memo.
+        if precompute_envelope and dispatch_key is not None:
             _cctally()._load_sibling("_lib_snapshot_cache").store_dispatch_state(
-                dispatch_sig, snap,
+                dispatch_key, snap,
             )
         return snap
     finally:

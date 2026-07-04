@@ -1431,6 +1431,37 @@ def test_idle_path_off_for_tui_rebuild(monkeypatch, tmp_path):
     assert calls["n"] >= 3, "TUI rebuild must not idle-short-circuit"
 
 
+def test_config_change_forces_full_rebuild_not_idle(monkeypatch, tmp_path):
+    """A config edit (e.g. `POST /api/settings` changing display.tz) advances
+    neither MAX(id) nor the reset legs, so the DB signature is stable — but it
+    changes the rendered envelope + re-buckets the calendar builders. The idle
+    key bundles a render key (resolved tz + config), so a config change forces a
+    full (non-idle) rebuild rather than serving the stale snapshot."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    _seed_multiday_jsonl(tmp_path)
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    # Edit config.json (display.tz) — no DB change at all.
+    ns["CONFIG_PATH"].write_text(json.dumps({"display": {"tz": "Asia/Jerusalem"}}))
+
+    calls = _spy_heavy_builders(monkeypatch)
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC + dt.timedelta(seconds=5), skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] >= 3, (
+        "a config change must force a full (non-idle) rebuild via the render key"
+    )
+
+
 # ===========================================================================
 # M5 Task 5.3 — concurrency invariant: no shared-row mutation (Codex F7)
 # ===========================================================================

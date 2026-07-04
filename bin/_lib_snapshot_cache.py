@@ -672,38 +672,41 @@ def reset_doctor_memo() -> None:
 # never introspects it, keeping the "no dashboard/TUI import" design (the caller
 # in bin/_cctally_tui.py owns the ``DataSnapshot`` type and all patching).
 
-_LAST_DISPATCH_SIGNATURE: "SnapshotSignature | None" = None
+_LAST_DISPATCH_KEY: object = None
 _LAST_PUBLISHED_SNAPSHOT: object = None
 
 
-def dispatch_state() -> "tuple[SnapshotSignature | None, object]":
-    """Return the ``(last signature, last published snapshot)`` pair (spec §3).
+def dispatch_state() -> "tuple[object, object]":
+    """Return the ``(last dispatch key, last published snapshot)`` pair (spec §3).
 
-    ``(None, None)`` before the first rebuild or after a reset. The snapshot is
-    an opaque ``DataSnapshot`` reference the caller owns.
+    ``(None, None)`` before the first rebuild or after a reset. The dispatch key
+    is the caller's opaque hashable — the composite ``SnapshotSignature`` bundled
+    with a render key (resolved display-tz + config) covering the render inputs
+    the DB signature does not; the caller compares it whole. The snapshot is an
+    opaque ``DataSnapshot`` reference the caller owns.
     """
-    return (_LAST_DISPATCH_SIGNATURE, _LAST_PUBLISHED_SNAPSHOT)
+    return (_LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT)
 
 
-def store_dispatch_state(signature: "SnapshotSignature", snapshot: object) -> None:
-    """Record the signature + published snapshot for the next idle short-circuit.
+def store_dispatch_state(dispatch_key: object, snapshot: object) -> None:
+    """Record the dispatch key + published snapshot for the next idle short-circuit.
 
     Called once per rebuild (idle or full) so the next tick compares against the
-    signature the just-published snapshot was built from.
+    key the just-published snapshot was built from.
     """
-    global _LAST_DISPATCH_SIGNATURE, _LAST_PUBLISHED_SNAPSHOT
-    _LAST_DISPATCH_SIGNATURE = signature
+    global _LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT
+    _LAST_DISPATCH_KEY = dispatch_key
     _LAST_PUBLISHED_SNAPSHOT = snapshot
 
 
 def reset_dispatch_state() -> None:
-    """Drop the idle-path ``(signature, snapshot)`` memo (test hook + isolation).
+    """Drop the idle-path ``(key, snapshot)`` memo (test hook + isolation).
 
     A fresh process starts with no memo; tests reset it between rebuilds so a
-    prior test's leftover snapshot can't be idle-served under a matching
-    signature. Not part of the M5.2 prune invalidation — the generation bump
-    (a signature leg) already forces the next rebuild off the idle path.
+    prior test's leftover snapshot can't be idle-served under a matching key. Not
+    part of the M5.2 prune invalidation — the generation bump (a signature leg)
+    already forces the next rebuild off the idle path.
     """
-    global _LAST_DISPATCH_SIGNATURE, _LAST_PUBLISHED_SNAPSHOT
-    _LAST_DISPATCH_SIGNATURE = None
+    global _LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT
+    _LAST_DISPATCH_KEY = None
     _LAST_PUBLISHED_SNAPSHOT = None
