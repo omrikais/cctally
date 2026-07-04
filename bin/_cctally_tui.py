@@ -1083,6 +1083,27 @@ class DataSnapshot:
     # ``CacheReportEnvelope | null`` and the client renders the
     # panel-empty state until the next tick replaces it.
     cache_report: Any | None = None
+    # ---- #268 M4: doctor / config / update-state precompute (spec §6) ----
+    # ``snapshot_to_envelope`` used to fork the `security` keychain subprocess
+    # (via ``doctor_gather_state``) + read ``config.json`` + the update-state
+    # files once PER SSE CLIENT PER TICK. These fields carry those reads,
+    # precomputed ONCE per rebuild on the sync thread (doctor behind a
+    # short-TTL memo), so the envelope stays a pure renderer — mirroring how
+    # ``alerts`` / ``five_hour_milestones`` are already precomputed.
+    #   * ``doctor_payload`` — the small severity/counts/fingerprint envelope
+    #     block (``{severity, counts, generated_at, fingerprint}`` or a
+    #     ``_error`` FAIL block). ``None`` on the first/empty snapshot and on
+    #     fixtures constructed positionally → the envelope falls back to
+    #     computing inline (existing behavior).
+    #   * ``envelope_precompute`` — ``{config, update_state, update_suppress}``
+    #     the envelope derives its ``display`` / ``alerts_settings`` / ``budget``
+    #     / ``dashboard`` / ``update`` blocks from purely. ``None`` → the
+    #     envelope falls back to reading ``config.json`` / the update-state
+    #     files inline.
+    # Both default at the END with ``None`` so positional fixture constructors
+    # keep working, and both are carried forward on a sync crash (Codex F6).
+    doctor_payload: dict | None = None
+    envelope_precompute: dict | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -2003,6 +2024,8 @@ def _tui_build_snapshot(
     now_utc: dt.datetime | None = None,
     skip_sync: bool = False,
     display_tz_pref_override: "str | None" = None,
+    precompute_envelope: bool = False,
+    runtime_bind: "str | None" = None,
 ) -> DataSnapshot:
     """Single-shot build of a DataSnapshot from the DB + cache.
 
@@ -2014,9 +2037,24 @@ def _tui_build_snapshot(
     the lifetime of this build. Used by ``cmd_dashboard`` when ``--tz``
     is supplied so the in-memory zone wins over the persisted config
     without modifying it. ``None`` means "respect config".
+
+    ``precompute_envelope`` (#268 M4, spec §6): when True, precompute the
+    dashboard envelope's doctor / config / update-state reads once here (on
+    the sync thread, doctor behind a short-TTL memo) and attach them to
+    ``DataSnapshot.doctor_payload`` / ``.envelope_precompute`` so
+    ``snapshot_to_envelope`` stays a pure renderer. Set True ONLY by the
+    DASHBOARD callers (the sync-thread rebuild + the initial snapshot); the
+    terminal TUI leaves it False so it never forks the `security` keychain
+    subprocess it doesn't render. ``runtime_bind`` is the actual host the
+    dashboard bound to, threaded into the doctor gather so
+    ``safety.dashboard_bind`` reflects the running state.
     """
     import time
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+    # Read config ONCE per rebuild and reuse it for the display-tz resolution
+    # here AND the envelope precompute below (#268 M4) — the envelope used to
+    # call ``load_config()`` twice per SSE client per tick.
+    raw_config = load_config()
     # Resolve the display tz once per snapshot so labels rendered into
     # BlocksPanelRow / future panel rows share a single zone with the
     # envelope's `display` block. Routed through the shared
@@ -2026,7 +2064,7 @@ def _tui_build_snapshot(
     # into label-FOR-LOOKUP paths like `_aggregate_monthly` keys (out of
     # scope for Task 11).
     _build_display_tz = _resolve_display_tz_obj(
-        _apply_display_tz_override(load_config(), display_tz_pref_override)
+        _apply_display_tz_override(raw_config, display_tz_pref_override)
     )
     conn = open_db()
     try:
@@ -2383,6 +2421,29 @@ def _tui_build_snapshot(
         except Exception as exc:
             errors.append(f"cache-report: {exc}")
 
+        # ---- #268 M4: doctor / config / update-state precompute (spec §6) ----
+        # Precompute the envelope's doctor / config / update-state reads ONCE
+        # here (dashboard callers only), so `snapshot_to_envelope` stays a pure
+        # renderer that never forks `security` / reads config.json per SSE
+        # client per tick. Errors are folded into `errors` (recorded on
+        # `last_sync_error`); the fields stay None on failure → the envelope
+        # falls back to its inline computation, preserving behavior.
+        doctor_payload_block: "dict | None" = None
+        envelope_precompute_block: "dict | None" = None
+        if precompute_envelope:
+            try:
+                doctor_payload_block = _tui_precompute_doctor_payload(
+                    now_utc, runtime_bind,
+                )
+            except Exception as exc:
+                errors.append(f"doctor-precompute: {exc}")
+            try:
+                envelope_precompute_block = _tui_precompute_envelope_config(
+                    raw_config,
+                )
+            except Exception as exc:
+                errors.append(f"envelope-precompute: {exc}")
+
         return DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -2412,9 +2473,87 @@ def _tui_build_snapshot(
             forecast_view=fc_view,
             projects_envelope=projects_envelope_block,
             cache_report=cache_report_block,
+            doctor_payload=doctor_payload_block,
+            envelope_precompute=envelope_precompute_block,
         )
     finally:
         conn.close()
+
+
+def _tui_precompute_doctor_payload(
+    now_utc: dt.datetime,
+    runtime_bind: "str | None",
+) -> dict:
+    """Precompute the dashboard envelope's small doctor block, via the
+    short-TTL memo (#268 M4, spec §6).
+
+    Returns the SAME ``{severity, counts, generated_at, fingerprint}`` dict
+    ``snapshot_to_envelope`` used to build inline (or a synthetic FAIL block
+    with ``_error`` on a doctor gather/checks failure), so moving the
+    computation onto the snapshot is byte-identical for a given
+    ``now_utc``/``runtime_bind``. Guarded by ``doctor_payload_memo`` so
+    back-to-back warm rebuilds don't re-fork the `security` keychain
+    subprocess every tick.
+    """
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+
+    def _compute(now: dt.datetime, bind: "str | None") -> dict:
+        _ld = c._load_sibling("_lib_doctor")
+        try:
+            _doc_state = c.doctor_gather_state(now_utc=now, runtime_bind=bind)
+            _doc_report = _ld.run_checks(_doc_state)
+            return {
+                "severity": _doc_report.overall_severity,
+                "counts": dict(_doc_report.counts),
+                "generated_at": _ld._iso_z(_doc_report.generated_at),
+                "fingerprint": _ld.fingerprint(_doc_report),
+            }
+        except Exception as exc:  # noqa: BLE001 — never crash the rebuild
+            # Mirror `snapshot_to_envelope`'s inline FAIL fallback (dashboard
+            # `_iso_z`: strftime, no microseconds) so a doctor failure serves
+            # the same shape whether computed here or in the envelope.
+            return {
+                "severity": "fail",
+                "counts": {"ok": 0, "warn": 0, "fail": 1},
+                "generated_at": now.astimezone(dt.timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "fingerprint": "sha1:" + ("0" * 40),
+                "_error": f"{type(exc).__name__}: {exc}",
+            }
+
+    return sc.doctor_payload_memo(
+        now_utc, runtime_bind, ttl_s=sc.DOCTOR_MEMO_TTL_S, compute=_compute,
+    )
+
+
+def _tui_precompute_envelope_config(raw_config: dict) -> dict:
+    """Precompute the config / update-state reads `snapshot_to_envelope`
+    needs (#268 M4, spec §6).
+
+    Returns ``{config, update_state, update_suppress}``: the raw
+    ``load_config()`` dict (the envelope layers the display-tz override on it
+    purely and reads the alerts/budget/dashboard blocks off it) plus the
+    update-state / update-suppress payloads with the SAME error sentinels the
+    envelope used inline, so the derived ``update`` block is unchanged.
+    """
+    c = _cctally()
+    try:
+        update_state = c._load_update_state()
+    except c.UpdateError:
+        update_state = {"_error": "update-state.json invalid"}
+    except Exception:
+        update_state = {"_error": "update-state.json read failed"}
+    try:
+        update_suppress = c._load_update_suppress()
+    except Exception:
+        update_suppress = {"skipped_versions": [], "remind_after": None}
+    return {
+        "config": raw_config,
+        "update_state": update_state,
+        "update_suppress": update_suppress,
+    }
 
 
 def _tui_empty_snapshot(now_utc: dt.datetime) -> DataSnapshot:
@@ -2847,6 +2986,13 @@ class _TuiSyncThread:
                     trend_avg_dollars_per_pct=prev.trend_avg_dollars_per_pct,
                     trend_history_median_dpp=prev.trend_history_median_dpp,
                     forecast_view=prev.forecast_view,
+                    # #268 M4 (Codex F6): carry the precomputed doctor payload
+                    # + config/update-state forward so the envelope stays a
+                    # pure renderer (and the doctor chip stays populated)
+                    # across a transient sync crash, instead of dropping to the
+                    # dataclass defaults and re-forking `security` per client.
+                    doctor_payload=prev.doctor_payload,
+                    envelope_precompute=prev.envelope_precompute,
                 ))
             # Wait up to interval, or until forced.
             for _ in range(int(max(1, self._interval * 10))):
@@ -4603,7 +4749,8 @@ def _tui_refresh_interval_type(s: str) -> float:
     return v
 
 
-def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override):
+def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
+                              runtime_bind=None):
     """Return a closure that does the snapshot-rebuild + SSE-publish work.
 
     Caller MUST hold sync_lock around the call. The naming convention
@@ -4614,6 +4761,11 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override)
     callers that already hold ``sync_lock`` (e.g. so they can refresh OAuth
     + rebuild snapshot atomically without releasing between steps) reuse
     this body without recursive-acquire / self-deadlock.
+
+    ``runtime_bind`` (#268 M4) is the dashboard's actual bound host; this is a
+    DASHBOARD-only factory, so every rebuild here precomputes the envelope's
+    doctor / config / update-state onto the snapshot (``precompute_envelope=True``)
+    — keeping ``snapshot_to_envelope`` a pure renderer across all SSE clients.
     """
     def _locked(skip_sync: bool) -> None:
         try:
@@ -4625,6 +4777,7 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override)
             snap = sys.modules["cctally"]._tui_build_snapshot(
                 now_utc=pinned_now, skip_sync=skip_sync,
                 display_tz_pref_override=display_tz_pref_override,
+                precompute_envelope=True, runtime_bind=runtime_bind,
             )
             if skip_sync:
                 # Mirror the startup override: suppress the monotonic sync

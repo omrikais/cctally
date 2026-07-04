@@ -592,3 +592,66 @@ def build_cached_sessions(
     _SESSION_LAST_SEEN["max_id"] = cur_max_id
     _SESSION_LAST_SEEN["extra"] = extra_signature
     return list(_SESSION_CACHE.get_all().values())
+
+
+# === Task 4.2 — doctor payload TTL memo (spec §6) ==========================
+#
+# The dashboard envelope used to re-fork the `security` keychain subprocess
+# (via `doctor_gather_state`) once PER SSE CLIENT PER TICK. §6 moves the
+# doctor gather onto the sync-thread `DataSnapshot` (precomputed once per
+# rebuild). This short-TTL memo further guards against back-to-back WARM
+# rebuilds re-forking `security` every tick — the keychain/symlink/log state
+# it reads changes rarely. The `compute` callable is INJECTED so this module
+# stays decoupled from the doctor I/O layer (no `_cctally_doctor` import).
+# The lazy `GET /api/doctor` endpoint deliberately does NOT route through
+# this memo — an explicit user refresh must be live.
+
+DOCTOR_MEMO_TTL_S = 30.0
+
+_DOCTOR_MEMO_LOCK = threading.Lock()
+_DOCTOR_MEMO: "dict" = {}
+
+
+def doctor_payload_memo(
+    now_utc: dt.datetime,
+    runtime_bind: "str | None",
+    *,
+    ttl_s: float,
+    compute: "Callable[[dt.datetime, str | None], dict]",
+) -> dict:
+    """Return the doctor envelope payload, recomputing via ``compute`` only
+    when the memo is cold — never computed, older than ``ttl_s``, a clock
+    regression (``now_utc`` before the cached instant), or a ``runtime_bind``
+    change (the bind feeds ``safety.dashboard_bind``).
+
+    ``compute(now_utc, runtime_bind) -> dict`` is the injected
+    gather→checks→envelope-dict step; it runs OUTSIDE the lock so the
+    `security` subprocess fork never serializes other readers. In practice
+    only the sync thread calls this, so the (harmless) double-compute a
+    concurrent caller could trigger never happens.
+    """
+    with _DOCTOR_MEMO_LOCK:
+        cached = _DOCTOR_MEMO
+        computed_at = cached.get("computed_at")
+        fresh = (
+            bool(cached)
+            and cached.get("runtime_bind") == runtime_bind
+            and computed_at is not None
+            and now_utc >= computed_at
+            and (now_utc - computed_at).total_seconds() < ttl_s
+        )
+        if fresh:
+            return cached["payload"]
+    payload = compute(now_utc, runtime_bind)
+    with _DOCTOR_MEMO_LOCK:
+        _DOCTOR_MEMO.clear()
+        _DOCTOR_MEMO["payload"] = payload
+        _DOCTOR_MEMO["computed_at"] = now_utc
+        _DOCTOR_MEMO["runtime_bind"] = runtime_bind
+    return payload
+
+
+def reset_doctor_memo() -> None:
+    """Drop the memoized doctor payload (test hook + M5 invalidation entry)."""
+    with _DOCTOR_MEMO_LOCK:
+        _DOCTOR_MEMO.clear()

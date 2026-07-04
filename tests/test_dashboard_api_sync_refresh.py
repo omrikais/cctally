@@ -13,7 +13,10 @@ def test_run_sync_now_locked_callable_when_lock_held(monkeypatch, tmp_path):
     hub = ns["SSEHub"]()
 
     captured = {}
-    def _build(now_utc=None, skip_sync=False, display_tz_pref_override=None):
+    def _build(now_utc=None, skip_sync=False, display_tz_pref_override=None,
+               **kwargs):
+        # `**kwargs` absorbs the #268 M4 additions (precompute_envelope,
+        # runtime_bind) the dashboard `_make_run_sync_now_locked` now passes.
         captured["called"] = True
         return ns["_empty_dashboard_snapshot"]()
     monkeypatch.setitem(ns, "_tui_build_snapshot", _build)

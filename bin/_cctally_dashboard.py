@@ -4992,8 +4992,16 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # process. The override flows in as a canonical tz token; we layer it
     # onto the config dict via _apply_display_tz_override before resolving
     # so every reader downstream sees one zone.
+    # #268 M4: read the config + update-state + doctor from the sync-thread
+    # precompute (spec §6) so this stays a PURE renderer — no config.json read,
+    # no `security` fork, no update-state file read per SSE client per tick.
+    # When the fields are absent (fixtures / the initial empty snapshot /
+    # positionally-constructed DataSnapshots) fall back to the inline reads so
+    # behavior is byte-identical for those callers.
+    _precomp = getattr(snap, "envelope_precompute", None)
+    _raw_config = _precomp["config"] if _precomp is not None else load_config()
     config = _apply_display_tz_override(
-        load_config(), display_tz_pref_override
+        _raw_config, display_tz_pref_override
     )
     display_block = _compute_display_block(config, snap.generated_at)
     resolved_tz_obj = ZoneInfo(display_block["resolved_tz"])
@@ -5268,7 +5276,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # the entire snapshot — fall back to safe defaults and rely on
     # `_warn_alerts_bad_config_once` for the user-visible signal.
     alerts_array = list(getattr(snap, "alerts", []) or [])
-    _cfg_for_alerts = load_config()
+    # #268 M4: reuse the precompute's config (or the fallback load_config()
+    # resolved above) — the envelope used to call load_config() a SECOND time
+    # here. Within one tick both reads returned the same file, so this is
+    # byte-identical.
+    _cfg_for_alerts = _raw_config
     try:
         _alerts_cfg = _get_alerts_config(_cfg_for_alerts)
     except _AlertsConfigError as exc:
@@ -5357,19 +5369,30 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # produce a `null` block so a missing/corrupt state file doesn't
     # 500 the entire envelope; the client falls back to the defensive
     # null-state shape `coerceUpdateState` already understands.
-    try:
-        _update_state_envelope = _load_update_state()
-    except sys.modules["cctally"].UpdateError:
-        # _load_update_state() raises on truly malformed JSON. Surface
-        # an _error sentinel so the client renders "no update info" the
-        # same way it does for unreachable /api/update/status.
-        _update_state_envelope = {"_error": "update-state.json invalid"}
-    except Exception:
-        _update_state_envelope = {"_error": "update-state.json read failed"}
-    try:
-        _update_suppress_envelope = _load_update_suppress()
-    except Exception:
-        _update_suppress_envelope = {"skipped_versions": [], "remind_after": None}
+    #
+    # #268 M4: read from the sync-thread precompute (spec §6) when present so
+    # this stays pure — no update-state file reads per SSE client. The inline
+    # try/except is the fallback for fixtures / the initial snapshot, and keeps
+    # the SAME error sentinels so the derived block is byte-identical.
+    if _precomp is not None:
+        _update_state_envelope = _precomp["update_state"]
+        _update_suppress_envelope = _precomp["update_suppress"]
+    else:
+        try:
+            _update_state_envelope = _load_update_state()
+        except sys.modules["cctally"].UpdateError:
+            # _load_update_state() raises on truly malformed JSON. Surface
+            # an _error sentinel so the client renders "no update info" the
+            # same way it does for unreachable /api/update/status.
+            _update_state_envelope = {"_error": "update-state.json invalid"}
+        except Exception:
+            _update_state_envelope = {"_error": "update-state.json read failed"}
+        try:
+            _update_suppress_envelope = _load_update_suppress()
+        except Exception:
+            _update_suppress_envelope = {
+                "skipped_versions": [], "remind_after": None,
+            }
     update_envelope = {
         "state":    _update_state_envelope,
         "suppress": _update_suppress_envelope,
@@ -5382,24 +5405,37 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # `safety.dashboard_bind` reflects the running state, not just
     # `config.json`. Defensive: never crash the snapshot pipeline on
     # a doctor failure — surface a synthetic FAIL block with `_error`.
-    try:
-        _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")
-        _doc_state = doctor_gather_state(now_utc=now_utc, runtime_bind=runtime_bind)
-        _doc_report = _ld.run_checks(_doc_state)
-        doctor_envelope: "dict" = {
-            "severity":     _doc_report.overall_severity,
-            "counts":       dict(_doc_report.counts),
-            "generated_at": _ld._iso_z(_doc_report.generated_at),
-            "fingerprint":  _ld.fingerprint(_doc_report),
-        }
-    except Exception as exc:  # noqa: BLE001 — never crash SSE on doctor failure
-        doctor_envelope = {
-            "severity":     "fail",
-            "counts":       {"ok": 0, "warn": 0, "fail": 1},
-            "generated_at": _iso_z(now_utc),
-            "fingerprint":  "sha1:" + ("0" * 40),
-            "_error":       f"{type(exc).__name__}: {exc}",
-        }
+    #
+    # #268 M4: read the precomputed doctor block from the snapshot (spec §6)
+    # so this render path never forks the `security` keychain subprocess. The
+    # sync thread computes it ONCE per rebuild via `doctor_payload_memo`
+    # (`_tui_precompute_doctor_payload`). The inline try/except below is the
+    # fallback for fixtures / the initial snapshot / positionally-constructed
+    # DataSnapshots (`doctor_payload=None`) and produces the SAME block, so
+    # moving the computation is byte-identical. The lazy `GET /api/doctor`
+    # endpoint keeps computing LIVE (an explicit user refresh must be fresh).
+    _doctor_payload = getattr(snap, "doctor_payload", None)
+    if _doctor_payload is not None:
+        doctor_envelope: "dict" = _doctor_payload
+    else:
+        try:
+            _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")
+            _doc_state = doctor_gather_state(now_utc=now_utc, runtime_bind=runtime_bind)
+            _doc_report = _ld.run_checks(_doc_state)
+            doctor_envelope = {
+                "severity":     _doc_report.overall_severity,
+                "counts":       dict(_doc_report.counts),
+                "generated_at": _ld._iso_z(_doc_report.generated_at),
+                "fingerprint":  _ld.fingerprint(_doc_report),
+            }
+        except Exception as exc:  # noqa: BLE001 — never crash SSE on doctor failure
+            doctor_envelope = {
+                "severity":     "fail",
+                "counts":       {"ok": 0, "warn": 0, "fail": 1},
+                "generated_at": _iso_z(now_utc),
+                "fingerprint":  "sha1:" + ("0" * 40),
+                "_error":       f"{type(exc).__name__}: {exc}",
+            }
 
     # B1 (#207): the "vs last week" header delta reuses the is_current trend
     # row's delta_dpp ($/1% vs the previous trend row — normally the prior
@@ -9045,6 +9081,13 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
     return sys.modules["cctally"]._tui_build_snapshot(
         now_utc=pinned_now, skip_sync=True,
         display_tz_pref_override=display_tz_pref_override,
+        # #268 M4: precompute doctor / config / update-state on the initial
+        # snapshot too, so the envelope is pure from the very first paint AND
+        # under --no-sync (where no later sync tick would set them). One
+        # `security` fork here is negligible next to the heavy sync #179 moved
+        # to the background thread. ``getattr`` so minimal test ``args``
+        # namespaces (no ``host``) still build an initial snapshot.
+        precompute_envelope=True, runtime_bind=getattr(args, "host", None),
     )
 
 
@@ -9172,6 +9215,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     _run_sync_now_locked = _make_run_sync_now_locked(
         ref=ref, hub=hub, pinned_now=pinned_now,
         display_tz_pref_override=display_tz_pref_override,
+        # #268 M4: the dashboard's bound host, threaded into the sync-thread
+        # doctor precompute so `safety.dashboard_bind` reflects the running
+        # bind and the envelope reads the precomputed doctor block.
+        runtime_bind=args.host,
     )
     _run_sync_now = _make_run_sync_now(
         sync_lock=sync_lock, ref=ref, hub=hub, pinned_now=pinned_now,

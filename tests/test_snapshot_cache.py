@@ -498,3 +498,79 @@ def test_affected_session_keys_tolerates_missing_tables():
         assert affected_session_keys(empty, 0) == set()
     finally:
         empty.close()
+
+
+# ===========================================================================
+# Task 4.2 — doctor payload TTL memo
+# ===========================================================================
+_T0 = dt.datetime(2026, 7, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def _make_compute():
+    calls = {"n": 0}
+
+    def compute(now, bind):
+        calls["n"] += 1
+        return {"severity": "ok", "n": calls["n"], "bind": bind}
+
+    return compute, calls
+
+
+def test_doctor_memo_computes_once_within_ttl():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_doctor_memo()
+    compute, calls = _make_compute()
+    p1 = sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    p2 = sc.doctor_payload_memo(
+        _T0 + dt.timedelta(seconds=5), "127.0.0.1", ttl_s=30, compute=compute,
+    )
+    assert calls["n"] == 1, "back-to-back calls within the TTL must compute ONCE"
+    assert p1 is p2  # same cached object
+
+
+def test_doctor_memo_recomputes_after_ttl():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_doctor_memo()
+    compute, calls = _make_compute()
+    sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    p2 = sc.doctor_payload_memo(
+        _T0 + dt.timedelta(seconds=31), "127.0.0.1", ttl_s=30, compute=compute,
+    )
+    assert calls["n"] == 2 and p2["n"] == 2
+
+
+def test_doctor_memo_recomputes_on_runtime_bind_change():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_doctor_memo()
+    compute, calls = _make_compute()
+    sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    p2 = sc.doctor_payload_memo(_T0, "0.0.0.0", ttl_s=30, compute=compute)
+    assert calls["n"] == 2 and p2["bind"] == "0.0.0.0"
+
+
+def test_doctor_memo_recomputes_on_clock_regression():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_doctor_memo()
+    compute, calls = _make_compute()
+    sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    # A now_utc EARLIER than the cached compute time must recompute (never
+    # serve a "future" cache).
+    sc.doctor_payload_memo(
+        _T0 - dt.timedelta(seconds=5), "127.0.0.1", ttl_s=30, compute=compute,
+    )
+    assert calls["n"] == 2
+
+
+def test_reset_doctor_memo_forces_recompute():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_doctor_memo()
+    compute, calls = _make_compute()
+    sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    sc.reset_doctor_memo()
+    sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
+    assert calls["n"] == 2
