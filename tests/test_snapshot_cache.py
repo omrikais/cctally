@@ -277,3 +277,29 @@ def test_watermark_none_on_empty(tmp_cache):
     from _lib_snapshot_cache import new_min_timestamp
 
     assert new_min_timestamp(tmp_cache, 0) is None
+
+
+# ===========================================================================
+# Task 0.3 — generation counter
+# ===========================================================================
+def test_generation_counter_monotonic():
+    import _lib_snapshot_cache as sc
+
+    start = sc.current_generation()
+    n1 = sc.bump_generation()
+    assert n1 == start + 1
+    assert sc.current_generation() == n1
+    n2 = sc.bump_generation()
+    assert n2 == n1 + 1
+    assert sc.current_generation() == n2
+
+
+def test_generation_feeds_signature(tmp_cache, tmp_stats):
+    """A bump changes the composite signature even with no table change."""
+    import _lib_snapshot_cache as sc
+
+    g0 = sc.current_generation()
+    s0 = sc.compute_signature(tmp_cache, tmp_stats, generation=g0)
+    g1 = sc.bump_generation()
+    s1 = sc.compute_signature(tmp_cache, tmp_stats, generation=g1)
+    assert s1 != s0 and s1.generation == g1

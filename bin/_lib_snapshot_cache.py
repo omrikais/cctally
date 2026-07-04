@@ -170,3 +170,30 @@ def new_min_timestamp(
     # downstream comparisons against UTC bucket boundaries are exact.
     parsed = parse_iso_datetime(row[0], "session_entries.timestamp_utc")
     return parsed.astimezone(dt.timezone.utc)
+
+
+# === Task 0.3 — cache-generation counter ===================================
+#
+# A monotonic counter bumped by any path that deletes/rewrites history in
+# place (orphan prune, `cache-sync --rebuild`). Folded into the composite
+# signature (§3) so a deletion that leaves MAX(id) unchanged still
+# invalidates the caches (spec §7, Codex F4). Guarded by a lock: the
+# counter is bumped from the sync thread and read during signature compute
+# on the same thread, but the lock makes any future off-thread bump safe.
+
+_GENERATION_LOCK = threading.Lock()
+_GENERATION = 0
+
+
+def bump_generation() -> int:
+    """Monotonically advance the cache-generation counter; return the new value."""
+    global _GENERATION
+    with _GENERATION_LOCK:
+        _GENERATION += 1
+        return _GENERATION
+
+
+def current_generation() -> int:
+    """Return the current cache-generation counter."""
+    with _GENERATION_LOCK:
+        return _GENERATION
