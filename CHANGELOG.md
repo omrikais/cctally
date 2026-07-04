@@ -5,8 +5,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `cache-sync --prune-orphans` cleans up cache rows left behind when a session's transcript directory is removed — for example after you delete a git worktree — so stale sessions and projects don't linger in your reports. It's a fast, targeted alternative to a full `cache-sync --rebuild`, and only removes rows it can prove are safe to drop, leaving anything ambiguous in place.
+
 ### Changed
 - The dashboard's 5-hour **Blocks** card is now a full-size half-width card the same size as the **Weekly** and **Monthly** cards, instead of a cramped third-width tile in the short bottom row where only a couple of its blocks were visible at a time. It moves up beside the other period cards — with the **Forecast** card promoted alongside it so the board stays a tidy grid — so you can see far more of the week's activity blocks at a glance, and the **Recent Alerts** card now spans the full width of the bottom row (#266).
+
+### Fixed
+- The dashboard now cleans up cache rows left behind by removed session directories (such as a deleted git worktree) on its own — once at startup and periodically while running — so those stale rows no longer linger until a manual rebuild, and the `[cache] N tracked file(s) no longer on disk` warning no longer repeats every few seconds.
+- `cache-sync --rebuild` now waits for the cache lock (up to 30 seconds) and reports a non-zero exit when it still can't acquire it, instead of silently doing nothing and reporting success while a dashboard is actively syncing.
 
 ## [1.60.0] - 2026-07-03
 

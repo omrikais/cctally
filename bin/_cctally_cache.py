@@ -1166,27 +1166,46 @@ def sync_cache(
         # tracked in session_files (with data already ingested) but no
         # longer present on disk leaves orphaned session_entries rows that
         # the per-file loop below never visits — it iterates only on-disk
-        # `paths`. sync_cache deliberately does NOT prune those orphans
-        # in-place: a deleted file shares the truncation hazard (under the
-        # sticky source_path dedup a surviving file may carry the same
-        # (msg_id, req_id) yet keep its size_bytes, so a per-orphan DELETE
-        # could drop a row the survivor still owns without re-ingesting
-        # it), and a blanket full-reset would wrongly fire on the
-        # legitimate "cache seeded with synthetic source paths" fixture
-        # pattern. Instead we INVALIDATE the walk-complete marker: an
-        # orphaned cache no longer faithfully mirrors disk, so it is — by
-        # the marker's own definition — not a complete walk. We must
-        # actively DELETE any marker a PRIOR clean walk left behind (not
-        # merely withhold THIS run's end-of-loop rewrite — that rewrite is
-        # gated on walk_clean, but a stale marker from a previous sync
-        # would otherwise survive and keep vouching for completeness).
-        # Setting walk_clean=False additionally suppresses the end-of-loop
-        # rewrite so the marker stays absent for this run. With the marker
-        # gone the upgrade gate DEFERs the 008/009/010 recomputes (rather
-        # than certifying aggregates that still include data from files no
-        # longer on disk); the operator clears the orphans by running
-        # `cache-sync --rebuild` (the documented re-derive path), which
-        # re-establishes the marker. Only paths whose row carried ingested
+        # `paths`. sync_cache stays DETECT-ONLY here — it never prunes
+        # orphans in-place. Two reasons it must not delete from this hot,
+        # shared path: (1) the truncation hazard — under the sticky
+        # source_path dedup a surviving file may carry the same
+        # (msg_id, req_id) yet keep its size_bytes, so a naive per-orphan
+        # DELETE could drop a deduped cost row the survivor still owns
+        # without re-ingesting it; (2) fixture safety — a blanket full-reset
+        # would wrongly fire on the legitimate "cache seeded with synthetic
+        # source paths" fixture pattern, and only sync_cache runs against
+        # those fixtures. So detection does two things and no more: it emits
+        # a THROTTLED warning (once per distinct orphan set — a removed
+        # worktree persists, so an unthrottled warn would re-spam every
+        # dashboard tick) and it INVALIDATES the walk-complete marker. An
+        # orphaned cache no longer faithfully mirrors disk, so it is — by the
+        # marker's own definition — not a complete walk. We actively DELETE
+        # any marker a PRIOR clean walk left behind (idempotently — only when
+        # one exists, so a repeated orphaned sync doesn't churn a no-op write
+        # txn every tick); merely withholding THIS run's end-of-loop rewrite
+        # is not enough, since a stale marker from a previous sync would
+        # otherwise survive and keep vouching for completeness. Setting
+        # walk_clean=False additionally suppresses the end-of-loop rewrite so
+        # the marker stays absent for this run. With the marker gone the
+        # upgrade gate DEFERs the 008/009/010 recomputes (rather than
+        # certifying aggregates that still include data from files no longer
+        # on disk). The safe CLEANUP lives OUT of sync_cache, in
+        # _prune_orphaned_cache_entries — it re-derives the safe orphan set
+        # independently and removes the full derived surface under three
+        # gates: A (session-id not shared by a survivor), B (coverage — every
+        # orphan (msg_id, req_id) key has a conversation_messages row under
+        # the orphan's OWN path), and C (disjointness — no key of the orphan
+        # appears in conversation_messages under a surviving path). B + C
+        # together close the truncation hazard soundly: C refuses to delete
+        # any key a survivor physically holds, and B refuses the uuid-less
+        # blind spot where coverage can't be proved (anything failing A/B/C
+        # is left as residual, cleared by `--rebuild`). That helper is
+        # invoked by `cache-sync --prune-orphans` and the dashboard
+        # self-heal, never from here (so fixtures never reach a destructive
+        # delete); `cache-sync --rebuild` remains the whole-cache re-derive.
+        # Both cleanup paths re-establish the marker on the next clean walk.
+        # Only paths whose row carried ingested
         # bytes (size_bytes > 0) count — a size_bytes=0 row holds no
         # session_entries, so its absence leaves no orphan. The DELETE +
         # commit lands BEFORE the per-file read+parse loop, so no write
