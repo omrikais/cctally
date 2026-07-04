@@ -316,7 +316,9 @@ from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
-from _cctally_cache import get_entries, open_cache_db, sync_cache
+from _cctally_cache import (
+    get_entries, open_cache_db, sync_cache, _prune_orphaned_cache_entries,
+)
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -349,6 +351,22 @@ def _make_run_sync_now(*args, **kwargs):
 
 def _make_run_sync_now_locked(*args, **kwargs):
     return sys.modules["cctally"]._make_run_sync_now_locked(*args, **kwargs)
+
+
+def _dashboard_self_heal_orphans(*, skip_sync):
+    """Prune removed-worktree orphans from the cache using a throwaway
+    connection. No-op under frozen (--no-sync) mode. Non-blocking on the
+    cache lock (retries on the next cadence if contended). Never raises."""
+    if skip_sync:
+        return None
+    try:
+        conn = open_cache_db()
+        try:
+            return _prune_orphaned_cache_entries(conn, lock_timeout=None)
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 def _build_forecast_json_payload(*args, **kwargs):
@@ -8762,6 +8780,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         # renders the documented `sync paused` state.
         initial = dataclasses.replace(initial, last_sync_at=None)
 
+    # Self-heal removed-worktree orphans on startup so a stale cache from a
+    # deleted session directory doesn't linger until the first --rebuild.
+    # Gated off under --no-sync (a frozen dashboard mutates nothing).
+    _heal = _dashboard_self_heal_orphans(skip_sync=bool(args.no_sync))
+    if _heal is not None and _heal.pruned_files:
+        print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
+              f"from removed sessions on startup", flush=True)
+
     ref = _SnapshotRef(initial)
     hub = SSEHub()
     hub.publish(initial)  # seed for early subscribers
@@ -8825,8 +8851,17 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     class _DashboardSyncThread(_c_for_subclass._TuiSyncThread):
         def _run(self) -> None:
+            last_heal = _time.monotonic()
             while not self._stop.is_set():
                 _run_sync_now(skip_sync=self._skip_sync)
+                # Self-heal removed-worktree orphans on a ~60s cadence (far
+                # rarer than the sync tick — a deleted worktree is not urgent).
+                # Non-blocking on the flock, so a contended tick just retries
+                # next cadence; gated off under --no-sync.
+                if (not self._skip_sync
+                        and _time.monotonic() - last_heal >= 60.0):
+                    last_heal = _time.monotonic()
+                    _dashboard_self_heal_orphans(skip_sync=self._skip_sync)
                 for _ in range(int(max(1, self._interval * 10))):
                     if self._stop.is_set():
                         return

@@ -1066,6 +1066,7 @@ snapshot_to_envelope = _cctally_dashboard.snapshot_to_envelope
 _session_detail_to_envelope = _cctally_dashboard._session_detail_to_envelope
 _DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS = _cctally_dashboard._DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS
 DashboardHTTPHandler = _cctally_dashboard.DashboardHTTPHandler
+_dashboard_self_heal_orphans = _cctally_dashboard._dashboard_self_heal_orphans
 cmd_dashboard = _cctally_dashboard.cmd_dashboard
 
 
