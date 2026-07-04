@@ -1429,3 +1429,89 @@ def test_idle_path_off_for_tui_rebuild(monkeypatch, tmp_path):
     calls = _spy_heavy_builders(monkeypatch)
     ns["_tui_build_snapshot"](now_utc=NOW_UTC + dt.timedelta(seconds=5), skip_sync=False)
     assert calls["n"] >= 3, "TUI rebuild must not idle-short-circuit"
+
+
+# ===========================================================================
+# M5 Task 5.3 — concurrency invariant: no shared-row mutation (Codex F7)
+# ===========================================================================
+
+
+def test_rebuild_never_mutates_previously_published_rows(monkeypatch, tmp_path):
+    """The SSE client threads read the previously-published DataSnapshot's row
+    objects concurrently while the sync thread rebuilds. So a rebuild must build
+    FRESH row objects and never mutate any object reachable from an
+    already-published snapshot (spec §7 / Codex F7). Capture a published
+    snapshot's daily/weekly rows + doctor payload, run a full recompute, and
+    assert the captured objects are byte-unchanged."""
+    import copy
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    _seed_multiday_jsonl(tmp_path)
+
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    captured_daily = snap1.daily_panel
+    captured_weekly = snap1.weekly_periods
+    captured_doctor = snap1.doctor_payload
+    deep_daily = copy.deepcopy(captured_daily)
+    deep_weekly = copy.deepcopy(captured_weekly)
+    deep_doctor = copy.deepcopy(captured_doctor)
+
+    # A new entry advances the signature → a genuine (non-idle) recompute that
+    # exercises the Group A / session caches' fresh-object discipline.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("z1", "zm", "zr", "z", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
+    ])
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC + dt.timedelta(minutes=1), skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+
+    # The previously-published rows are byte-unchanged (no in-place mutation).
+    assert captured_daily == deep_daily
+    assert captured_weekly == deep_weekly
+    assert captured_doctor == deep_doctor
+    # And the rebuild produced FRESH row containers (new list identity).
+    assert snap2.daily_panel is not captured_daily
+    assert snap2.weekly_periods is not captured_weekly
+
+
+# ===========================================================================
+# M5 additional (a) — bound the SessionCache: aged-out sessions must be DROPPED
+# from the store, not just filtered from the returned view (spec §5.2).
+# ===========================================================================
+
+
+def test_session_cache_drops_aged_out_sessions(monkeypatch, tmp_path):
+    """Under a sliding `now`, a session whose last_activity ages past the
+    365-day window must be evicted from the module store — otherwise the store
+    grows unboundedly over long dashboard uptime."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_session_cache_state()
+    T0 = dt.datetime(2026, 7, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+    # One session, active only on 2026-07-03 — inside [T0-365d, T0].
+    _seed_sessions(tmp_path, {"sess-old": [("2026-07-03T11:00:00Z", "hi")]})
+    _prime_cache(ns)
+
+    # Cold build at T0 populates the store with the session.
+    ns["_tui_build_sessions"](T0, skip_sync=True, use_session_cache=True)
+    assert "sess-old" in sc.session_cache().get_all(), "cold build populated the store"
+
+    # Slide `now` forward 366 days → the session is now BEFORE range_start
+    # (now-365d), i.e. out of the window. A warm tick touches no session.
+    T1 = T0 + dt.timedelta(days=366)
+    ns["_tui_build_sessions"](T1, skip_sync=True, use_session_cache=True)
+    assert "sess-old" not in sc.session_cache().get_all(), (
+        "an aged-out session must be dropped from the store, not just the view"
+    )

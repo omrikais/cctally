@@ -1740,6 +1740,16 @@ def _tui_sessions_cached(
             )
             return _aggregate_claude_sessions(entries)
 
+        # Identity resolution here is the resolved ``session_id`` (via the
+        # session_files join, filename-stem fallback when null). A late
+        # null→session_id backfill on an existing path (the schema migration
+        # that added the column shipped long ago) would re-key an already-cached
+        # session; that is DELIBERATELY NOT handled per-tick (a session_files
+        # rescan every tick would tax the exact hot path #268 optimizes, and
+        # reachability is near-zero because files are named ``<sessionId>.jsonl``
+        # so the stem == the sessionId in the overwhelming majority). Escape
+        # hatches: a dashboard restart, the M5.2 orphan-prune generation bump, or
+        # ``reset_session_cache_state()`` all re-cold-start the cache.
         full = sc.build_cached_sessions(
             cache_conn=cache_conn,
             aggregate_all=_aggregate_all,
@@ -1750,12 +1760,18 @@ def _tui_sessions_cached(
             cache_conn.close()
         except sqlite3.Error:
             pass
-    # Match the from-scratch window under a sliding `now`: a session whose
-    # last_activity has aged out of [range_start, now] is not in the
-    # from-scratch fetch, so exclude it. No-op on a pinned `now` (every
-    # cold-populated session's last_activity is >= range_start by
-    # construction), and cheap (a scalar filter + sort over a few thousand
-    # aggregates, not a 365-day entry re-scan).
+    # #268 M5-additional (a): DROP aged-out sessions from the STORE, not just
+    # from the returned view. Under a sliding `now`, a session whose
+    # last_activity has fallen before range_start is out of [range_start, now]
+    # — the from-scratch fetch wouldn't return it either — so evict it from the
+    # module cache. Without this the store retains every session ever
+    # cold-populated and grows unboundedly over long dashboard uptime. No-op on
+    # a pinned `now` (every cold-populated session's last_activity is >=
+    # range_start by construction), and cheap (a scalar partition over a few
+    # thousand aggregates, not a 365-day entry re-scan).
+    aged_out = {s.session_id for s in full if s.last_activity < range_start}
+    if aged_out:
+        sc.session_cache().drop(aged_out)
     in_window = [s for s in full if s.last_activity >= range_start]
     in_window.sort(key=lambda s: s.last_activity, reverse=True)
     return in_window
