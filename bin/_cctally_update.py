@@ -196,7 +196,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 
@@ -1872,12 +1872,22 @@ class _DashboardUpdateCheckThread(threading.Thread):
     via ``update.check.enabled = false`` is honoured inside the gate
     so the thread becomes a no-op without needing teardown.
 
-    After a successful check, republishes the current snapshot via the
-    SSE hub so long-open dashboard tabs in ``--no-sync`` mode pick up
-    the fresh ``latest_version`` written to ``update-state.json``. The
-    snapshot itself is unchanged — ``snapshot_to_envelope`` re-reads
-    the state file per envelope build, so a bare publish is enough to
-    refresh the badge for every live subscriber.
+    After a successful check (or an out-of-band ``current_version``
+    self-heal), republishes the current snapshot via the SSE hub so
+    long-open dashboard tabs in ``--no-sync`` mode pick up the fresh
+    ``latest_version`` / ``current_version`` written to
+    ``update-state.json``. Since M4 (#268) the SSE envelope reads
+    update-state / update-suppress off the snapshot's
+    ``envelope_precompute`` rather than re-reading the state file per
+    envelope build, so a BARE publish of the held snapshot would surface
+    the stale precompute. The republish therefore rebuilds
+    ``envelope_precompute`` (small config/state JSON I/O, no DB, no
+    module-cache mutation — see :meth:`_republish_with_fresh_envelope`)
+    on a fresh ``dataclasses.replace`` snapshot before publishing, and
+    persists it to the snapshot ref so the held snapshot stays current.
+    Under ``--no-sync`` this thread is the ONLY refresher of that
+    precompute (the data-sync thread that otherwise rebuilds it is
+    disabled).
     """
 
     daemon = True
@@ -1917,14 +1927,14 @@ class _DashboardUpdateCheckThread(threading.Thread):
                 ):
                     snap = self._ref.get()
                     if snap is not None:
-                        self._hub.publish(snap)
+                        self._republish_with_fresh_envelope(snap)
                 config = load_config()
                 if c._is_update_check_due(config):
                     c._do_update_check()
                     if self._hub is not None and self._ref is not None:
                         snap = self._ref.get()
                         if snap is not None:
-                            self._hub.publish(snap)
+                            self._republish_with_fresh_envelope(snap)
             except Exception as e:
                 # Log but never propagate — this thread must keep
                 # ticking so a transient registry hiccup doesn't
@@ -1939,6 +1949,36 @@ class _DashboardUpdateCheckThread(threading.Thread):
                 except Exception:
                     pass
             self._stop_event.wait(c.UPDATE_DASHBOARD_CHECK_POLL_S)
+
+    def _republish_with_fresh_envelope(self, snap) -> None:
+        """Republish ``snap`` with a freshly-rebuilt ``envelope_precompute``.
+
+        Since M4 (#268) the SSE envelope reads update-state / update-suppress
+        off ``snap.envelope_precompute`` rather than re-reading the JSON files
+        per client. ``_do_update_check`` / ``_self_heal_current_version`` write
+        ``update-state.json`` OUT OF BAND (advancing no DB signature and no
+        config render key), so a bare re-publish of the HELD snapshot would
+        surface the stale precompute — freezing the version banner on a
+        ``--no-sync`` dashboard whose data-sync thread (the only other
+        precompute refresher) is disabled.
+
+        ``_tui_precompute_envelope_config`` reads only the config / update-state
+        / update-suppress files and mutates NO module cache, so calling it from
+        this thread is safe (no shared-cache-mutation / Codex F7 hazard).
+        ``dataclasses.replace`` yields a NEW snapshot sharing ``prior``'s
+        immutable rows, so an SSE client serializing the previously-published
+        snapshot can't observe a torn value. The fresh snapshot is persisted to
+        the ref so the held snapshot stays current for the next reader.
+        """
+        c = _cctally()
+        fresh = replace(
+            snap,
+            envelope_precompute=(
+                c._cctally_tui._tui_precompute_envelope_config(load_config())
+            ),
+        )
+        self._ref.set(fresh)
+        self._hub.publish(fresh)
 
 
 def cmd_update(args) -> int:

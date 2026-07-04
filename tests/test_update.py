@@ -2521,6 +2521,169 @@ class TestDashboardUpdateCheckThread:
             stop_event.set()
             t.join(timeout=2.0)
 
+    def test_no_sync_republish_refreshes_envelope_precompute_on_update_due(
+        self, tmp_path, monkeypatch
+    ):
+        """#268 B1 — under ``--no-sync`` the update-check thread is the ONLY
+        refresher of ``envelope_precompute``, so its republish MUST recompute
+        it (a bare republish of the held snapshot froze the version banner).
+
+        Since M4 the SSE envelope reads update-state off
+        ``snap.envelope_precompute`` instead of re-reading ``update-state.json``
+        per client. The data-sync thread that normally rebuilds that precompute
+        is disabled under ``--no-sync``, so after ``_do_update_check`` writes a
+        fresh ``latest_version`` the update-check thread must rebuild the
+        precompute before republishing — else the new version never surfaces.
+        Assert the republished snapshot's ``envelope_precompute["update_state"]``
+        reflects the freshly-written version, not the frozen held ``None``.
+        """
+        import dataclasses
+
+        ns = load_script()
+        monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log"
+        )
+        state_path = tmp_path / "update-state.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", state_path)
+
+        # Held snapshot carries a STALE precompute: no known latest version.
+        stale_precompute = {
+            "config": {},
+            "update_state": None,
+            "update_suppress": {"skipped_versions": [], "remind_after": None},
+        }
+        seed = dataclasses.replace(
+            ns["_empty_dashboard_snapshot"](),
+            envelope_precompute=stale_precompute,
+        )
+        ref = ns["_SnapshotRef"](seed)
+
+        # Self-heal is a no-op so ONLY the update-due site republishes.
+        monkeypatch.setitem(ns, "_self_heal_current_version", lambda: None)
+        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: True)
+
+        def _fake_check():
+            # The real check writes the freshly-discovered version to disk.
+            state_path.write_text(
+                json.dumps({"_schema": 1, "latest_version": "9.9.9"}),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setitem(ns, "_do_update_check", _fake_check)
+        monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
+
+        hub = ns["SSEHub"]()
+        published: list = []
+        original_publish = hub.publish
+
+        def _record_publish(snap):
+            original_publish(snap)
+            published.append(snap)
+
+        hub.publish = _record_publish  # type: ignore[assignment]
+
+        stop_event = threading.Event()
+        t = ns["_DashboardUpdateCheckThread"](
+            stop_event, hub=hub, snapshot_ref=ref,
+        )
+        t.start()
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not published:
+                time.sleep(0.01)
+        finally:
+            stop_event.set()
+            t.join(timeout=2.0)
+
+        assert published, "update-due site never republished"
+        got = published[0].envelope_precompute
+        assert got is not None
+        assert got["update_state"] is not None, (
+            "envelope_precompute frozen — stale None update_state republished"
+        )
+        assert got["update_state"].get("latest_version") == "9.9.9", (
+            "republished snapshot did not reflect the freshly-written version"
+        )
+        # The held snapshot is advanced too, so the next client reads fresh.
+        held = ref.get().envelope_precompute
+        assert held["update_state"]["latest_version"] == "9.9.9"
+
+    def test_no_sync_republish_refreshes_envelope_precompute_on_self_heal(
+        self, tmp_path, monkeypatch
+    ):
+        """#268 B1 (self-heal site) — the out-of-band ``current_version`` heal
+        republish must ALSO recompute ``envelope_precompute`` so the dashboard's
+        brand-version label reflects the healed binary version, not the frozen
+        held value.
+        """
+        import dataclasses
+
+        ns = load_script()
+        monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log"
+        )
+        state_path = tmp_path / "update-state.json"
+        monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", state_path)
+
+        stale_precompute = {
+            "config": {},
+            "update_state": None,
+            "update_suppress": {"skipped_versions": [], "remind_after": None},
+        }
+        seed = dataclasses.replace(
+            ns["_empty_dashboard_snapshot"](),
+            envelope_precompute=stale_precompute,
+        )
+        ref = ns["_SnapshotRef"](seed)
+
+        # The self-heal writes a corrected current_version out of band, so
+        # healed_before != healed_after and the self-heal site republishes.
+        def _fake_heal():
+            state_path.write_text(
+                json.dumps({"_schema": 1, "current_version": "2.0.0"}),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setitem(ns, "_self_heal_current_version", _fake_heal)
+        # Update-due path OFF so ONLY the self-heal site republishes.
+        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: False)
+        monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
+
+        hub = ns["SSEHub"]()
+        published: list = []
+        original_publish = hub.publish
+
+        def _record_publish(snap):
+            original_publish(snap)
+            published.append(snap)
+
+        hub.publish = _record_publish  # type: ignore[assignment]
+
+        stop_event = threading.Event()
+        t = ns["_DashboardUpdateCheckThread"](
+            stop_event, hub=hub, snapshot_ref=ref,
+        )
+        t.start()
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not published:
+                time.sleep(0.01)
+        finally:
+            stop_event.set()
+            t.join(timeout=2.0)
+
+        assert published, "self-heal site never republished"
+        got = published[0].envelope_precompute
+        assert got is not None
+        assert got["update_state"] is not None, (
+            "envelope_precompute frozen — stale None update_state republished"
+        )
+        assert got["update_state"].get("current_version") == "2.0.0", (
+            "self-heal republish did not reflect the healed current_version"
+        )
+
 
 class TestUpdateAPI:
     """HTTP endpoint integration tests — POST /api/update,

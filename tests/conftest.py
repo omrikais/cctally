@@ -147,23 +147,39 @@ def _restore_process_timezone():
 
 @pytest.fixture(autouse=True)
 def _reset_snapshot_dispatch_state():
-    """Clear the #268 idle-path (signature, snapshot) memo before each test.
+    """Clear ALL #268 rebuild-cache module state before each test.
 
-    ``_lib_snapshot_cache`` holds the last published dashboard snapshot + its
-    composite signature as process-global module state (the idle short-circuit).
-    The signature does not encode the DB path, so two tests with structurally
-    identical (e.g. empty) DBs produce the SAME signature — without this reset a
-    prior test's leftover snapshot could be idle-served into a later test's
-    first ``_tui_build_snapshot`` call, returning stale rows from a different
-    tmp DB. Resetting before every test isolates it; a no-op for the vast
-    majority of tests that never build a snapshot. Defensive import so a test
-    run that hasn't loaded the module yet is unaffected.
+    ``_lib_snapshot_cache`` holds several pieces of process-global rebuild state:
+    the idle-path ``(signature, snapshot)`` memo, the Group A ``BucketCache`` +
+    per-builder watermarks, the ``SessionCache`` + its watermark, and the doctor
+    payload memo. NONE of those signatures encode the DB path, so two tests with
+    structurally identical (e.g. empty) DBs produce the SAME keys — without this
+    reset a prior test's leftover snapshot or cached past-bucket could be served
+    into a later test's first ``_tui_build_snapshot`` call, returning stale rows
+    from a different tmp DB. Resetting every cache before each test isolates them;
+    a no-op for the vast majority of tests that never build a snapshot. Each reset
+    is guarded so a run that hasn't loaded the module (or an older module missing a
+    helper) is unaffected. (The monotonic generation counter is intentionally NOT
+    reset — it bears no cached data, and the dispatch-state reset already prevents
+    a stale idle-serve.)
     """
     try:
         import _lib_snapshot_cache as _sc  # bin/ is on sys.path (see top)
-        _sc.reset_dispatch_state()
     except Exception:
-        pass
+        _sc = None
+    if _sc is not None:
+        for _name in (
+            "reset_dispatch_state",
+            "reset_group_a_state",
+            "reset_session_cache_state",
+            "reset_doctor_memo",
+        ):
+            _fn = getattr(_sc, _name, None)
+            if _fn is not None:
+                try:
+                    _fn()
+                except Exception:
+                    pass
     yield
 
 

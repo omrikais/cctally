@@ -407,7 +407,6 @@ def build_cached_group_a(
     fetch_bucket_entries: "Callable[[str], list]",
     aggregate_one: "Callable[[str, list], object | None]",
     extra_signature: object = None,
-    always_recompute: "tuple[str, ...] | set[str]" = (),
 ) -> "list[object]":
     """Stateful Group A assembly: invalidation + watermark + ``cached_buckets``.
 
@@ -418,10 +417,10 @@ def build_cached_group_a(
     ``new_min_timestamp`` (over-estimating the end only over-marks buckets
     dirty, which is safe: it never serves stale past data). ``extra_signature``
     is any hashable value whose change forces a full namespace invalidation
-    (the weekly snapshot/reset legs, or the daily/monthly display-tz label).
-    ``always_recompute`` is an optional set of labels to recompute every tick
-    regardless of the watermark (e.g. a weekly bucket still transitioning
-    through a credit).
+    (the weekly snapshot/reset legs, or the daily/monthly display-tz label) —
+    e.g. a weekly bucket still transitioning through a credit rides the
+    weekly builder's ``extra_signature`` full-invalidate rather than a
+    per-label recompute flag.
 
     Returns the assembled ``BucketUsage`` list (cache hits for clean past
     labels, fresh recompute for current + dirty), in ``all_bucket_labels``
@@ -444,11 +443,8 @@ def build_cached_group_a(
             return True
     else:
         new_min_ts = new_min_timestamp(cache_conn, int(state.get("max_id", 0)))
-        _always = set(always_recompute)
 
         def dirty(label: str) -> bool:
-            if label in _always:
-                return True
             if new_min_ts is None:
                 return False
             end = bucket_end_of(label)
