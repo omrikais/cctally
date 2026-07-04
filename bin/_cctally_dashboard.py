@@ -2494,6 +2494,93 @@ def _compute_intensity_buckets(rows: "list[DailyPanelRow]") -> list[float]:
     return thresholds
 
 
+def _group_a_monthly_buckets(now_utc, *, n, range_start, display_tz):
+    """Assemble the monthly panel's per-month ``BucketUsage`` list via the
+    #268 Group A cache, or ``None`` to fall back to the wide fetch (spec §5.1).
+
+    ``all_bucket_labels`` is the contiguous set of display-tz ``"%Y-%m"``
+    months spanned by the wide window ``[range_start, now_utc]`` — from
+    ``range_start``'s display-tz month (the oldest an entry in the window can
+    bucket into, including the west-of-UTC boundary-spillover month) up to
+    the current display-tz month — in ascending order. ``build_monthly_view``
+    then reverses + caps to ``n``, dropping any spillover month exactly as
+    the from-scratch path does. Each recompute fetches a ±2-day-padded window
+    (clamped to the wide window) and filters ``_aggregate_monthly`` to the
+    target month, so the boundary follows ``display_tz`` and per-bucket
+    first-seen model order matches the wide pass byte-for-byte.
+    """
+    if not _GROUP_A_CACHE_ENABLED:
+        return None
+    try:
+        cache_conn = open_cache_db()
+    except Exception:
+        return None
+    try:
+        def _tz_month(instant):
+            local = (
+                instant.astimezone(display_tz) if display_tz is not None
+                # internal fallback: host-local intentional
+                else instant.astimezone()
+            )
+            return local.year, local.month
+
+        oldest_y, oldest_m = _tz_month(range_start)
+        newest_y, newest_m = _tz_month(now_utc)
+        # Contiguous months oldest → newest (ascending).
+        labels: list[str] = []
+        y, m = oldest_y, oldest_m
+        while (y, m) <= (newest_y, newest_m):
+            labels.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m == 13:
+                m = 1
+                y += 1
+        current_label = f"{newest_y:04d}-{newest_m:02d}"
+        tz_sig = display_tz.key if display_tz is not None else "local"
+
+        def _month_bounds(label):
+            yy, mm = (int(x) for x in label.split("-"))
+            start = dt.datetime(yy, mm, 1, tzinfo=dt.timezone.utc)
+            ny, nm = (yy + 1, 1) if mm == 12 else (yy, mm + 1)
+            nxt = dt.datetime(ny, nm, 1, tzinfo=dt.timezone.utc)
+            return start, nxt
+
+        def _fetch(label):
+            start, nxt = _month_bounds(label)
+            # ±2 days of slack covers the display-tz month boundary for any
+            # offset; clamp to the wide window so nothing after now_utc /
+            # before range_start leaks in.
+            lo = max(start - dt.timedelta(days=2), range_start)
+            hi = min(nxt + dt.timedelta(days=2), now_utc)
+            if hi <= lo:
+                return []
+            return iter_entries(cache_conn, lo, hi)
+
+        def _agg_one(label, entries):
+            for b in _aggregate_monthly(entries, tz=display_tz):
+                if b.bucket == label:
+                    return b
+            return None
+
+        def _end_of(label):
+            _start, nxt = _month_bounds(label)
+            return nxt + dt.timedelta(days=2)
+
+        buckets = build_cached_group_a(
+            "monthly",
+            cache_conn=cache_conn,
+            all_bucket_labels=labels,
+            current_label=current_label,
+            bucket_end_of=_end_of,
+            fetch_bucket_entries=_fetch,
+            aggregate_one=_agg_one,
+            extra_signature=("monthly", tz_sig),
+        )
+        return tuple(buckets)
+    finally:
+        cache_conn.close()
+
+
 def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
                                      now_utc: "dt.datetime",
                                      *, n: int = 12,
@@ -2526,10 +2613,23 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
     range_start = dt.datetime(sy, sm, 1, tzinfo=dt.timezone.utc)
     range_end = now_utc
 
-    entries = get_entries(range_start, range_end, skip_sync=skip_sync)
+    # #268 Group A cache: assemble the per-month BucketUsage list through the
+    # module cache (recompute only the current + watermark-dirty months;
+    # serve immutable past months from memory) and hand it to
+    # build_monthly_view as aggregated_override. Falls back to the
+    # from-scratch wide fetch when disabled / cache DB unavailable.
+    aggregated_override = _group_a_monthly_buckets(
+        now_utc, n=n, range_start=range_start, display_tz=display_tz,
+    )
     c = _cctally()
-    view = c.build_monthly_view(entries, now_utc=now_utc, n=n,
-                                 display_tz=display_tz)
+    if aggregated_override is None:
+        entries = get_entries(range_start, range_end, skip_sync=skip_sync)
+        view = c.build_monthly_view(entries, now_utc=now_utc, n=n,
+                                    display_tz=display_tz)
+    else:
+        view = c.build_monthly_view((), now_utc=now_utc, n=n,
+                                    display_tz=display_tz,
+                                    aggregated_override=aggregated_override)
     return list(view.rows)
 
 

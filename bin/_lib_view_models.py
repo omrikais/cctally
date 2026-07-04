@@ -458,7 +458,8 @@ class MonthlyView:
     display_tz_label: str = ""
 
 
-def build_monthly_view(entries, *, now_utc, n=12, display_tz=None, mode="auto"):
+def build_monthly_view(entries, *, now_utc, n=12, display_tz=None, mode="auto",
+                       aggregated_override=None):
     """Build a ``MonthlyView`` for the trailing ``n`` calendar months
     (spec §5.2).
 
@@ -469,9 +470,21 @@ def build_monthly_view(entries, *, now_utc, n=12, display_tz=None, mode="auto"):
     Totals (``total_cost_usd`` / ``total_tokens``) sum over the
     truncated row set so the React panel sees the same number as the
     CLI table footer would.
+
+    ``aggregated_override`` (#268): when provided (a list/tuple of
+    ``BucketUsage`` in ascending bucket-key order), skip the
+    ``_aggregate_monthly(entries, ...)`` re-costing and build the view over
+    those pre-aggregated buckets. The reverse + cap-to-``n`` +
+    ``delta_cost_pct`` + ``is_current`` presentation still runs over the
+    assembled list, so the current month's delta sees the prior (cached)
+    month (Codex F3). ``None`` preserves the CLI/share/cold behavior
+    byte-identically.
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_monthly(entries, mode=mode, tz=display_tz)
+    if aggregated_override is not None:
+        buckets = list(aggregated_override)
+    else:
+        buckets = _agg._aggregate_monthly(entries, mode=mode, tz=display_tz)
     if not buckets:
         return MonthlyView(
             rows=(), aggregated=(),

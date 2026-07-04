@@ -470,3 +470,130 @@ def test_daily_panel_late_ingest_recomputes_past_day(monkeypatch, tmp_path):
         assert warm == wide, "late-ingest warm rebuild must equal from-scratch"
     finally:
         stats.close()
+
+
+# ===========================================================================
+# M2 Task 2.3 — wire `_dashboard_build_monthly_periods` through the cache.
+#
+# Parity gate incl. delta_cost_pct + is_current: the cached rebuild's
+# MonthlyPeriodRow list must equal the from-scratch build. The
+# current-month-only-new-data case must still see the prior (cached) month
+# so its delta_cost_pct is non-None (Codex F3).
+# ===========================================================================
+
+
+def _seed_multimonth_jsonl(tmp_path, extra=()):
+    """Claude JSONL spanning several months + two models."""
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    rows = [
+        ("m01", "mm1", "mr1", "a", "2025-12-15T08:00:00Z", "claude-sonnet-4-5"),
+        ("m02", "mm2", "mr2", "b", "2026-02-10T09:00:00Z", "claude-opus-4-8"),
+        ("m03", "mm3", "mr3", "c", "2026-04-05T10:00:00Z", "claude-opus-4-8"),
+        ("m04", "mm4", "mr4", "d", "2026-04-06T10:30:00Z", "claude-sonnet-4-5"),
+        ("m05", "mm5", "mr5", "e", "2026-06-20T11:00:00Z", "claude-sonnet-4-5"),
+        ("m06", "mm6", "mr6", "f", "2026-07-02T11:30:00Z", "claude-opus-4-8"),
+        *extra,
+    ]
+    text = "".join(
+        _asst_line(u, m, r, t, ts=ts, model=model) for (u, m, r, t, ts, model) in rows
+    )
+    (proj / "s1.jsonl").write_text(text)
+
+
+def _build_monthly(ns, stats_conn, *, enabled, display_tz=None):
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    sc.reset_group_a_state()
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    dash._GROUP_A_CACHE_ENABLED = enabled
+    try:
+        return ns["_dashboard_build_monthly_periods"](
+            stats_conn, NOW_UTC, n=12, skip_sync=True, display_tz=display_tz
+        )
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def test_monthly_periods_cached_parity(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        cached = _build_monthly(ns, stats, enabled=True)
+        assert sc.group_a_cache().get("monthly", "2026-04") is not None, (
+            "cached monthly build should have populated the Group A cache"
+        )
+        wide = _build_monthly(ns, stats, enabled=False)
+        assert cached == wide, "cached monthly rows must equal from-scratch"
+        # Non-vacuity: real deltas exist across the multi-month set.
+        assert any(r.delta_cost_pct is not None for r in cached)
+        assert any(r.is_current for r in cached)
+    finally:
+        stats.close()
+
+
+def test_monthly_current_delta_sees_prior_cached_month(monkeypatch, tmp_path):
+    """A new entry ONLY in the current month must still compute
+    delta_cost_pct against the prior (cached) month (Codex F3)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        # New entry in the CURRENT month (2026-07); re-ingest.
+        _seed_multimonth_jsonl(tmp_path, extra=[
+            ("wm", "wmm", "wmr", "z", "2026-07-04T09:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        wide = _build_monthly(ns, stats, enabled=False)
+        assert warm == wide, "warm monthly rebuild must equal from-scratch"
+        cur = next(r for r in warm if r.is_current)
+        assert cur.delta_cost_pct is not None, (
+            "current month's delta must see the prior cached month"
+        )
+    finally:
+        stats.close()
+
+
+def test_monthly_late_ingest_recomputes_past_month(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        cold = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        cold_apr = next(r for r in cold if r.label == "2026-04")
+        # Late ingest in a PAST month (2026-04); re-ingest.
+        _seed_multimonth_jsonl(tmp_path, extra=[
+            ("lm", "lmm", "lmr", "late", "2026-04-20T12:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm_apr = next(r for r in warm if r.label == "2026-04")
+        assert warm_apr.cost_usd > cold_apr.cost_usd, (
+            "the late-ingested past month must be recomputed (cost grew)"
+        )
+        wide = _build_monthly(ns, stats, enabled=False)
+        assert warm == wide, "late-ingest monthly rebuild must equal from-scratch"
+    finally:
+        stats.close()
