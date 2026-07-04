@@ -229,3 +229,51 @@ def test_signature_tolerates_missing_tables():
     finally:
         empty_cache.close()
         empty_stats.close()
+
+
+# ===========================================================================
+# Task 0.2 — new-entry timestamp watermark
+# ===========================================================================
+def test_watermark_reaches_back_for_late_ingest(tmp_cache):
+    """A late-ingested row (new id, OLD timestamp) makes the watermark reach
+    back to the OLD event time, not "now" — because session_entries.id is
+    ingest order, not event time (spec §3 / Codex F1)."""
+    from _lib_snapshot_cache import new_min_timestamp
+
+    last = _max_id(tmp_cache)
+    _insert_session_entry(tmp_cache, "2026-06-27T18:00:00Z")  # id > last, past ts
+    wm = new_min_timestamp(tmp_cache, last)
+    assert wm == dt.datetime(2026, 6, 27, 18, 0, tzinfo=dt.timezone.utc)
+    # No genuinely-new rows past the current max → None.
+    assert new_min_timestamp(tmp_cache, _max_id(tmp_cache)) is None
+
+
+def test_watermark_is_min_over_new_rows_only(tmp_cache):
+    """Watermark is the EARLIEST event time among rows with id > last_seen,
+    ignoring older ids and unaffected by insertion order."""
+    from _lib_snapshot_cache import new_min_timestamp
+
+    _insert_session_entry(tmp_cache, "2026-07-04T12:00:00Z")  # "already seen"
+    last = _max_id(tmp_cache)
+    # Two new rows; the SECOND-inserted carries the EARLIER event time.
+    _insert_session_entry(tmp_cache, "2026-07-04T20:00:00Z")
+    _insert_session_entry(tmp_cache, "2026-07-01T06:00:00Z")
+    wm = new_min_timestamp(tmp_cache, last)
+    assert wm == dt.datetime(2026, 7, 1, 6, 0, tzinfo=dt.timezone.utc)
+
+
+def test_watermark_returns_aware_utc(tmp_cache):
+    """Returned datetime is aware and normalized to UTC (spec §3)."""
+    from _lib_snapshot_cache import new_min_timestamp
+
+    _insert_session_entry(tmp_cache, "2026-06-27T18:00:00Z")
+    wm = new_min_timestamp(tmp_cache, 0)
+    assert wm is not None
+    assert wm.tzinfo is not None
+    assert wm.utcoffset() == dt.timedelta(0)
+
+
+def test_watermark_none_on_empty(tmp_cache):
+    from _lib_snapshot_cache import new_min_timestamp
+
+    assert new_min_timestamp(tmp_cache, 0) is None

@@ -130,3 +130,43 @@ def compute_signature(
         max_codex_id=_max_id(cache_conn, "codex_session_entries"),
         generation=int(generation),
     )
+
+
+# === Task 0.2 — new-entry timestamp watermark ==============================
+
+
+def new_min_timestamp(
+    cache_conn: sqlite3.Connection,
+    last_seen_max_id: int,
+) -> "dt.datetime | None":
+    """Earliest EVENT time among genuinely-new session_entries rows.
+
+    Returns ``MIN(timestamp_utc)`` over rows with ``id > last_seen_max_id``
+    as an aware UTC datetime, or ``None`` when there are no such rows.
+
+    This is the per-builder dirty-bucket watermark (spec §3, Codex F1).
+    ``session_entries.id`` is INGEST order, not event time — a resumed or
+    late-ingested file produces a NEW ``id`` carrying an OLD
+    ``timestamp_utc``. So when the signature advances, the affected time
+    window starts at the earliest event time among the new rows, which may
+    reach back into a PAST calendar bucket; each builder recomputes every
+    one of its buckets whose window ends after this watermark and serves
+    strictly-older buckets from cache.
+
+    Returns ``None`` on a missing table (fresh DB) so callers can treat it
+    as "no new rows".
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT MIN(timestamp_utc) FROM session_entries WHERE id > ?",
+            (last_seen_max_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    # Parse via the repo's canonical ISO helper (handles both `...Z` and
+    # `...+00:00` stored forms), then normalize to a UTC-tzinfo instant so
+    # downstream comparisons against UTC bucket boundaries are exact.
+    parsed = parse_iso_datetime(row[0], "session_entries.timestamp_utc")
+    return parsed.astimezone(dt.timezone.utc)
