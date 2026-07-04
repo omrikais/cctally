@@ -3201,6 +3201,16 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     # JSONL was removed from disk (e.g. a deleted git worktree), without a
     # full rebuild. Claude-only surface; runs the three-gate safe helper.
     if getattr(args, "prune_orphans", False):
+        if source == "codex":
+            # The prune surface is Claude-only; Codex orphans are pruned
+            # automatically during codex sync (see sync_codex_cache). Respect
+            # the explicit --source codex rather than silently pruning Claude.
+            eprint(
+                "[cache-sync] --prune-orphans applies to the Claude cache only "
+                "(Codex orphans are pruned automatically during codex sync); "
+                "nothing to do for --source codex."
+            )
+            return 0
         res = _prune_orphaned_cache_entries(
             conn, lock_timeout=_REBUILD_LOCK_TIMEOUT_SECONDS
         )

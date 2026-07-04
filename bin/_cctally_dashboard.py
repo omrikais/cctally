@@ -8769,6 +8769,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # _DashboardSyncThread (started below, before the bind) owns the first full
     # sync_cache — including any pending conversation-enrichment reingest — and
     # SSE-pushes the populated snapshot on completion.
+    # Self-heal removed-worktree orphans BEFORE building the first snapshot so
+    # the initial render already excludes stale sessions from a deleted
+    # worktree (rather than showing them until the first periodic tick).
+    # Gated off under --no-sync (a frozen dashboard mutates nothing).
+    _heal = _dashboard_self_heal_orphans(skip_sync=bool(args.no_sync))
+    if _heal is not None and _heal.pruned_files:
+        print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
+              f"from removed sessions on startup", flush=True)
+
     initial = _dashboard_initial_snapshot(
         args, pinned_now=pinned_now,
         display_tz_pref_override=display_tz_pref_override,
@@ -8779,14 +8788,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         # stamp so the envelope emits sync_age_s=None and the JS client
         # renders the documented `sync paused` state.
         initial = dataclasses.replace(initial, last_sync_at=None)
-
-    # Self-heal removed-worktree orphans on startup so a stale cache from a
-    # deleted session directory doesn't linger until the first --rebuild.
-    # Gated off under --no-sync (a frozen dashboard mutates nothing).
-    _heal = _dashboard_self_heal_orphans(skip_sync=bool(args.no_sync))
-    if _heal is not None and _heal.pruned_files:
-        print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
-              f"from removed sessions on startup", flush=True)
 
     ref = _SnapshotRef(initial)
     hub = SSEHub()
