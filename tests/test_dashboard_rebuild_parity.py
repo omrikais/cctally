@@ -1462,6 +1462,107 @@ def test_config_change_forces_full_rebuild_not_idle(monkeypatch, tmp_path):
     )
 
 
+def test_idle_rebuild_refreshes_update_state(monkeypatch, tmp_path):
+    """The update-state / update-suppress reads live on the snapshot's
+    `envelope_precompute` (M4). `update-state.json` is written OUT OF BAND by
+    `_DashboardUpdateCheckThread`, advancing neither MAX(id) nor the reset legs
+    nor the config render key — so the idle path must refresh
+    `envelope_precompute` each tick, else a newly-detected release never surfaces
+    on a long-idle / --no-sync dashboard until new usage or a config edit lands
+    (#268 M5 Finding 1). Models the REAL idle interleave: no module-state reset
+    between the two builds."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    _seed_multiday_jsonl(tmp_path)
+
+    # Full build with NO update-state.json → update-state is null.
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert snap1.envelope_precompute is not None
+    assert snap1.envelope_precompute["update_state"] is None
+    env1 = ns["snapshot_to_envelope"](snap1, now_utc=NOW_UTC)
+    assert env1["update"]["state"] is None
+
+    # A new release is detected out of band: update-state.json now names 9.9.9.
+    # NO DB change, NO config change, NO module-state reset.
+    ns["UPDATE_STATE_PATH"].write_text(json.dumps({"latest_version": "9.9.9"}))
+
+    # No DB / config change → the second rebuild is IDLE (assert zero
+    # re-aggregation), yet it must pick up the freshly-written update-state.
+    calls = _spy_heavy_builders(monkeypatch)
+    later = NOW_UTC + dt.timedelta(seconds=5)
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] == 0, (
+        f"second rebuild must be IDLE, ran {calls['n']} heavy builds"
+    )
+    # Heavy rows still reused verbatim — proves this is the idle path, not a
+    # silent full rebuild that would refresh update-state as a side effect.
+    assert snap2.daily_panel is snap1.daily_panel
+    assert snap2.weekly_periods is snap1.weekly_periods
+    # The fix: envelope_precompute is refreshed on the idle tick, NOT frozen to
+    # `prior`'s. update-state now reflects the out-of-band write.
+    assert snap2.envelope_precompute["update_state"] == {"latest_version": "9.9.9"}
+    env2 = ns["snapshot_to_envelope"](snap2, now_utc=later)
+    assert env2["update"]["state"]["latest_version"] == "9.9.9"
+
+
+def test_snapshot_period_rollover_detects_5h_reset(monkeypatch, tmp_path):
+    """A zero-usage 5h reset on a truly-idle dashboard advances no DB signature
+    and crosses no day/week/month boundary, so the idle-rollover guard must
+    independently force a full rebuild once `now` crosses the prior snapshot's
+    5h reset instant (#268 M5 Finding 4). Otherwise the 'current block' surface
+    goes stale until real usage lands. Pure-function test on
+    `_snapshot_period_rolled_over` — no DB, no flakiness."""
+    ns = load_script()
+    import _cctally_tui as tui
+
+    # NOW = 2026-07-04 12:00Z. 5h block resets in 2h (14:00Z), still the SAME
+    # calendar day and inside the subscription week — so ONLY the 5h leg can
+    # trip the guard (day/week legs stay False), keeping the test non-vacuous.
+    reset_at = NOW_UTC + dt.timedelta(hours=2)
+    cw = ns["TuiCurrentWeek"](
+        week_start_at=NOW_UTC - dt.timedelta(days=1),
+        week_end_at=NOW_UTC + dt.timedelta(days=6),
+        used_pct=12.0, five_hour_pct=30.0, five_hour_resets_at=reset_at,
+        spent_usd=1.0, dollars_per_percent=None, latest_snapshot_at=NOW_UTC,
+    )
+    prior = ns["DataSnapshot"](cw, None, [], [], None, None, NOW_UTC)
+
+    # Just BEFORE the reset instant, same day/week → NOT rolled over.
+    assert tui._snapshot_period_rolled_over(
+        prior, reset_at - dt.timedelta(minutes=1), UTC_TZ,
+    ) is False
+    # AT the 5h reset instant (no day/week change) → rolled over.
+    assert tui._snapshot_period_rolled_over(prior, reset_at, UTC_TZ) is True
+    # And past it.
+    assert tui._snapshot_period_rolled_over(
+        prior, reset_at + dt.timedelta(minutes=1), UTC_TZ,
+    ) is True
+
+    # A prior snapshot with NO 5h reset (field None) must not trip the guard.
+    cw_none = ns["TuiCurrentWeek"](
+        week_start_at=NOW_UTC - dt.timedelta(days=1),
+        week_end_at=NOW_UTC + dt.timedelta(days=6),
+        used_pct=12.0, five_hour_pct=None, five_hour_resets_at=None,
+        spent_usd=1.0, dollars_per_percent=None, latest_snapshot_at=NOW_UTC,
+    )
+    prior_none = ns["DataSnapshot"](cw_none, None, [], [], None, None, NOW_UTC)
+    assert tui._snapshot_period_rolled_over(
+        prior_none, reset_at + dt.timedelta(hours=1), UTC_TZ,
+    ) is False
+
+
 # ===========================================================================
 # M5 Task 5.3 — concurrency invariant: no shared-row mutation (Codex F7)
 # ===========================================================================

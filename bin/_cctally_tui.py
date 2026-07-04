@@ -2167,7 +2167,8 @@ def _tui_build_snapshot(
                     idle_snap = _tui_build_idle_snapshot(
                         prior_snap, now_utc=now_utc,
                         precompute_envelope=precompute_envelope,
-                        runtime_bind=runtime_bind, errors=errors,
+                        runtime_bind=runtime_bind, raw_config=raw_config,
+                        errors=errors,
                     )
                     _sc.store_dispatch_state(dispatch_key, idle_snap)
                     return idle_snap
@@ -2664,10 +2665,12 @@ def _snapshot_period_rolled_over(prior, now_utc, display_tz):
     ``prior.current_week`` (reset-anchored UTC datetimes) — a week can roll at a
     mid-day reset hour without the calendar day changing.
 
-    (The 5-hour block is a within-current-week surface whose countdown renders
-    live from the envelope's now; a 5h reset with zero new usage across a full
-    window on a truly-idle dashboard is out of scope for this guard — the next
-    real usage advances the signature and forces a full rebuild.)
+    The 5-hour block is also boundary-checked here (#268 M5 Finding 4): a 5h
+    reset with zero new usage across a full window on a truly-idle dashboard
+    advances no DB signature and crosses no calendar day, so without this leg the
+    idle path would keep serving the prior "current block" past its reset. The
+    reset-anchored UTC instant carried on ``prior.current_week.five_hour_resets_at``
+    forces a full rebuild once ``now`` reaches it, re-anchoring the block.
     """
     prev = getattr(prior, "generated_at", None)
     if prev is None:
@@ -2691,13 +2694,22 @@ def _snapshot_period_rolled_over(prior, now_utc, display_tz):
             return True
         if week_start is not None and now_utc < week_start:
             return True
+        # 5h block rollover (#268 M5 Finding 4): the reset instant is the
+        # reset-anchored UTC end of the active block (already suppressed to None
+        # by `_tui_build_current_week` once it has elapsed, so a non-None value is
+        # a future boundary at build time). Once now crosses it, force a full
+        # rebuild so the blocks panel re-anchors even with zero new usage.
+        five_hour_reset = getattr(cw, "five_hour_resets_at", None)
+        if five_hour_reset is not None and now_utc >= five_hour_reset:
+            return True
     return False
 
 
 def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
-                             runtime_bind, errors):
+                             runtime_bind, raw_config, errors):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
-    time-derived fields + the doctor payload on TTL (spec §3 idle path).
+    time-derived fields + the doctor payload / envelope precompute on each idle
+    tick (spec §3 idle path).
 
     ``dataclasses.replace`` builds a NEW ``DataSnapshot`` sharing ``prior``'s
     immutable row objects (never mutated in place — Codex F7), so an SSE client
@@ -2709,20 +2721,38 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
     the wall-clock countdowns / freshness ages are computed from a LIVE now at
     envelope-render time (the SSE loop passes its own ``now_utc`` /
     ``time.monotonic()``), so nothing else needs patching here.
+
+    ``envelope_precompute`` is ALSO refreshed each idle tick (#268 M5 Finding 1):
+    since M4 the envelope reads update-state / update-suppress off the snapshot's
+    ``envelope_precompute`` rather than re-reading the JSON files per client.
+    ``_DashboardUpdateCheckThread`` writes ``update-state.json`` OUT OF BAND
+    (advancing no DB signature and no config render key), so carrying
+    ``prior.envelope_precompute`` forward would freeze the version banner on a
+    long-idle / --no-sync dashboard until new usage or a config edit lands. This
+    mirrors the doctor-on-idle treatment (spec §6): config is render-key-stable on
+    the idle path (the short-circuit only runs when the render key — which bundles
+    the full raw config — is unchanged), so recomputing is cheap small-JSON I/O,
+    not CPU, and byte-matches a full rebuild's envelope for the same state.
     """
     import time
     doctor_payload = prior.doctor_payload
+    envelope_precompute = prior.envelope_precompute
     if precompute_envelope:
         try:
             doctor_payload = _tui_precompute_doctor_payload(now_utc, runtime_bind)
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
             errors.append(f"doctor-precompute: {exc}")
+        try:
+            envelope_precompute = _tui_precompute_envelope_config(raw_config)
+        except Exception as exc:  # noqa: BLE001 — never crash the rebuild
+            errors.append(f"envelope-precompute: {exc}")
     return dataclasses.replace(
         prior,
         generated_at=now_utc,
         last_sync_at=time.monotonic(),
         last_sync_error=("; ".join(errors) if errors else None),
         doctor_payload=doctor_payload,
+        envelope_precompute=envelope_precompute,
     )
 
 
