@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+import sys
 
 from conftest import load_script, redirect_paths  # type: ignore
 
@@ -334,3 +335,138 @@ def test_build_cached_group_a_full_invalidate_on_signature_change(tmp_path):
         )
     finally:
         conn.close()
+
+
+# ===========================================================================
+# M2 Task 2.2 — wire `_dashboard_build_daily_panel` through the cache.
+#
+# Parity gate: the cached rebuild's `DailyPanelRow` list (incl.
+# `intensity_bucket`, `models` first-seen order, `is_today`, tokens) must
+# equal the from-scratch (`_GROUP_A_CACHE_ENABLED=False`) build on the same
+# DB — cold, warm (new current-day entry), and late-ingest (new row with an
+# OLD event time in a past day).
+# ===========================================================================
+
+
+def _seed_multiday_jsonl(tmp_path, extra=()):
+    """Claude JSONL spanning several days + two models (first-seen order
+    matters). `extra` appends more (uuid, msg, req, text, ts, model) lines."""
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    rows = [
+        ("d1", "m1", "r1", "a", "2026-06-20T08:00:00Z", "claude-sonnet-4-5"),
+        ("d2", "m2", "r2", "b", "2026-06-28T09:00:00Z", "claude-opus-4-8"),
+        ("d3", "m3", "r3", "c", "2026-06-28T09:30:00Z", "claude-sonnet-4-5"),
+        ("d4", "m4", "r4", "d", "2026-07-01T10:00:00Z", "claude-opus-4-8"),
+        ("d5", "m5", "r5", "e", "2026-07-03T11:00:00Z", "claude-sonnet-4-5"),
+        ("d6", "m6", "r6", "f", "2026-07-03T11:30:00Z", "claude-opus-4-8"),
+        ("d7", "m7", "r7", "g", "2026-07-04T09:00:00Z", "claude-opus-4-8"),
+        *extra,
+    ]
+    text = "".join(
+        _asst_line(u, m, r, t, ts=ts, model=model) for (u, m, r, t, ts, model) in rows
+    )
+    (proj / "s1.jsonl").write_text(text)
+
+
+def _prime_cache(ns):
+    conn = ns["open_cache_db"]()
+    ns["sync_cache"](conn)
+    conn.close()
+
+
+def _build_daily(ns, stats_conn, *, enabled, display_tz=None):
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    sc.reset_group_a_state()
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    dash._GROUP_A_CACHE_ENABLED = enabled
+    try:
+        return ns["_dashboard_build_daily_panel"](
+            stats_conn, NOW_UTC, n=30, skip_sync=True, display_tz=display_tz
+        )
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def test_daily_panel_cached_parity(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        cached = _build_daily(ns, stats, enabled=True)
+        # Non-vacuity: the cached path actually populated the bucket cache.
+        assert sc.group_a_cache().get("daily", "2026-07-03") is not None, (
+            "cached daily build should have populated the Group A cache"
+        )
+        wide = _build_daily(ns, stats, enabled=False)
+        assert cached == wide, "cached daily rows must equal from-scratch"
+        # Sanity: real data present (not the vacuous all-gap case).
+        assert any(r.cost_usd > 0 for r in cached)
+        assert any(r.intensity_bucket > 0 for r in cached)
+    finally:
+        stats.close()
+
+
+def test_daily_panel_warm_new_current_entry(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        # Cold build (populates cache).
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        # New entry in the CURRENT day (07-04); re-ingest.
+        _seed_multiday_jsonl(tmp_path, extra=[
+            ("w1", "wm", "wr", "z", "2026-07-04T10:30:00Z", "claude-sonnet-4-5"),
+        ])
+        _prime_cache(ns)
+        # Warm build reuses the module cache (no reset).
+        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        # From-scratch on the same post-insert DB.
+        wide = _build_daily(ns, stats, enabled=False)
+        assert warm == wide, "warm rebuild must equal from-scratch after a current-day entry"
+    finally:
+        stats.close()
+
+
+def test_daily_panel_late_ingest_recomputes_past_day(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        cold = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        cold_0701 = next(r for r in cold if r.date == "2026-07-01")
+        # Late ingest: a NEW row (new id) with an OLD event time in a PAST day
+        # that is within the current week (07-01). The past bucket must update.
+        _seed_multiday_jsonl(tmp_path, extra=[
+            ("l1", "lm", "lr", "late", "2026-07-01T15:00:00Z", "claude-sonnet-4-5"),
+        ])
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        warm_0701 = next(r for r in warm if r.date == "2026-07-01")
+        assert warm_0701.cost_usd > cold_0701.cost_usd, (
+            "the late-ingested past day must be recomputed (cost grew)"
+        )
+        wide = _build_daily(ns, stats, enabled=False)
+        assert warm == wide, "late-ingest warm rebuild must equal from-scratch"
+    finally:
+        stats.close()

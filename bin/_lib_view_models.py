@@ -335,7 +335,8 @@ class DailyView:
     display_tz_label: str = ""
 
 
-def build_daily_view(entries, *, now_utc, display_tz=None, mode="auto"):
+def build_daily_view(entries, *, now_utc, display_tz=None, mode="auto",
+                     aggregated_override=None):
     """Build a ``DailyView`` from raw ``UsageEntry`` list (spec §5.1).
 
     Gap-free: only days with entries appear in ``view.rows`` /
@@ -351,9 +352,22 @@ def build_daily_view(entries, *, now_utc, display_tz=None, mode="auto"):
     Leaves ``DailyPanelRow.label`` and ``intensity_bucket`` at dataclass
     defaults — the dashboard envelope adapter populates them. CLI /
     share consumers ignore them and read ``view.aggregated`` instead.
+
+    ``aggregated_override`` (#268): when provided (a list/tuple of
+    ``BucketUsage`` in ascending bucket-key order), skip the
+    ``_aggregate_daily(entries, ...)`` re-costing and build the view over
+    those pre-aggregated buckets instead. This is the reuse seam the
+    dashboard's cached daily builder uses to serve immutable past days
+    from memory while keeping every downstream derivation (rows,
+    ``cache_hit_pct``, totals, ``period_start``) single-sourced here. When
+    ``None`` (CLI / share / cold path) behavior is unchanged and
+    byte-identical.
     """
     _agg = _load_lib("_lib_aggregators")
-    buckets = _agg._aggregate_daily(entries, mode=mode, tz=display_tz)
+    if aggregated_override is not None:
+        buckets = list(aggregated_override)
+    else:
+        buckets = _agg._aggregate_daily(entries, mode=mode, tz=display_tz)
     if not buckets:
         return DailyView(
             rows=(),

@@ -317,8 +317,20 @@ from _lib_blocks import _group_entries_into_blocks
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
-    get_entries, open_cache_db, sync_cache, _prune_orphaned_cache_entries,
+    get_entries, iter_entries, open_cache_db, sync_cache,
+    _prune_orphaned_cache_entries,
 )
+from _lib_snapshot_cache import build_cached_group_a
+
+
+# #268 Group A cached-bucket path master switch. Normally True: the
+# calendar builders (daily / monthly / weekly) assemble their per-bucket
+# aggregates through the module-level BucketCache and recompute only the
+# current/dirty slice. Flip to False to force the from-scratch wide-fetch
+# path (the pre-#268 behavior) — the parity tests toggle it to prove the
+# cached and from-scratch rebuilds are byte-identical, and the builders
+# fall back to it automatically if the cache DB can't be opened.
+_GROUP_A_CACHE_ENABLED = True
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -2983,6 +2995,89 @@ def _dashboard_build_blocks_panel(conn: "sqlite3.Connection",
     return list(view.rows)
 
 
+def _group_a_daily_buckets(now_utc, *, n, display_tz):
+    """Assemble the daily panel's per-day ``BucketUsage`` list via the #268
+    Group A cache, or ``None`` to signal the caller should take the
+    from-scratch wide-fetch path (spec §5.1).
+
+    Returns a tuple of ``BucketUsage`` in ascending date order (matching
+    ``_aggregate_daily``'s sorted output), so ``build_daily_view`` consumes
+    it as ``aggregated_override`` with no reorder. Each recompute fetches a
+    ±1-day-padded window and filters ``_aggregate_daily`` to the target date,
+    so the day boundary follows ``display_tz`` exactly (DST-safe) and the
+    per-bucket first-seen model order reproduces the wide pass byte-for-byte.
+    ``None`` is returned when the cache path is disabled or the cache DB is
+    unavailable — the builder then does the original wide aggregation.
+    """
+    if not _GROUP_A_CACHE_ENABLED:
+        return None
+    try:
+        cache_conn = open_cache_db()
+    except Exception:
+        return None
+    try:
+        # The from-scratch path fetches exactly [range_start, now_utc]; the
+        # per-day fetches below clamp to the SAME window so the current day's
+        # bucket never picks up an entry after now_utc (and nothing outside
+        # the wide window leaks in) — byte-identical to the wide fetch.
+        range_start = now_utc - dt.timedelta(days=n + 1)
+        today_local = (
+            now_utc.astimezone(display_tz) if display_tz is not None
+            # internal fallback: host-local intentional
+            else now_utc.astimezone()
+        ).date()
+        # Contiguous n-day window, oldest → newest (ascending, so the
+        # assembled list matches _aggregate_daily's sorted-key order).
+        labels = [
+            (today_local - dt.timedelta(days=i)).isoformat()
+            for i in range(n - 1, -1, -1)
+        ]
+        current_label = today_local.isoformat()
+        tz_sig = display_tz.key if display_tz is not None else "local"
+
+        def _fetch(label):
+            d = dt.date.fromisoformat(label)
+            base = dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
+            # ±1 day of slack fully covers the display-tz day for any tz
+            # offset; the aggregate filter below selects exactly the label's
+            # entries, so over-fetch is harmless and DST-robust. Clamp to the
+            # wide [range_start, now_utc] window for exact parity.
+            lo = max(base - dt.timedelta(days=1), range_start)
+            hi = min(base + dt.timedelta(days=2), now_utc)
+            if hi <= lo:
+                return []
+            return iter_entries(cache_conn, lo, hi)
+
+        def _agg_one(label, entries):
+            for b in _aggregate_daily(entries, tz=display_tz):
+                if b.bucket == label:
+                    return b
+            return None
+
+        def _end_of(label):
+            d = dt.date.fromisoformat(label)
+            # Over-estimate the day's UTC end (true end ≤ (d+1) 12:00 UTC for
+            # any tz); over-marking dirty is safe, under-marking is not.
+            return (
+                dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
+                + dt.timedelta(days=2)
+            )
+
+        buckets = build_cached_group_a(
+            "daily",
+            cache_conn=cache_conn,
+            all_bucket_labels=labels,
+            current_label=current_label,
+            bucket_end_of=_end_of,
+            fetch_bucket_entries=_fetch,
+            aggregate_one=_agg_one,
+            extra_signature=("daily", tz_sig),
+        )
+        return tuple(buckets)
+    finally:
+        cache_conn.close()
+
+
 def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
                                   now_utc: "dt.datetime",
                                   *,
@@ -3022,11 +3117,26 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     # forgiving of tz boundary issues.
     range_start = now_utc - dt.timedelta(days=n + 1)
     range_end = now_utc
-    entries = get_entries(range_start, range_end, skip_sync=skip_sync)
+
+    # #268 Group A cache: assemble the per-day BucketUsage list through the
+    # module-level cache (recompute only the current + watermark-dirty days;
+    # serve immutable past days from memory) and hand it to build_daily_view
+    # as ``aggregated_override`` so every downstream derivation stays
+    # single-sourced. Falls back to the from-scratch wide fetch when the
+    # cache is disabled (parity tests) or the cache DB can't be opened.
+    aggregated_override = _group_a_daily_buckets(
+        now_utc, n=n, display_tz=display_tz,
+    )
 
     c = _cctally()
-    view = c.build_daily_view(entries, now_utc=now_utc,
-                              display_tz=display_tz)
+    if aggregated_override is None:
+        entries = get_entries(range_start, range_end, skip_sync=skip_sync)
+        view = c.build_daily_view(entries, now_utc=now_utc,
+                                  display_tz=display_tz)
+    else:
+        view = c.build_daily_view((), now_utc=now_utc,
+                                  display_tz=display_tz,
+                                  aggregated_override=aggregated_override)
     if not view.rows:
         return []
 
