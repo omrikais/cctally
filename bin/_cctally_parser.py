@@ -1960,6 +1960,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Which ingest half to sync/rebuild (default: all).",
     )
+    p_cache_sync.add_argument(
+        "--prune-orphans",
+        action="store_true",
+        help="Prune cache rows for source files removed from disk "
+             "(e.g. a deleted git worktree) without a full rebuild.",
+    )
     p_cache_sync.set_defaults(func=c.cmd_cache_sync)
 
     # -- daily --

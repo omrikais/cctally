@@ -834,6 +834,7 @@ get_codex_entries = _cctally_cache.get_codex_entries
 _sum_codex_cost_for_range = _cctally_cache._sum_codex_cost_for_range
 get_entries = _cctally_cache.get_entries
 open_cache_db = _cctally_cache.open_cache_db
+_REBUILD_LOCK_TIMEOUT_SECONDS = _cctally_cache._REBUILD_LOCK_TIMEOUT_SECONDS
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
 
 

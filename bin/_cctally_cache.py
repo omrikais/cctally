@@ -591,6 +591,14 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
     conn.commit()
 
 
+# How long `cache-sync --rebuild` (and the --prune-orphans path) waits on the
+# cache.db flock before giving up. Routine auto-syncs stay non-blocking
+# (lock_timeout=None); an explicit rebuild is worth a bounded wait so a running
+# dashboard's background tick doesn't turn the rebuild into a silent no-op.
+# Read at call time in cmd_cache_sync so tests can monkeypatch it low.
+_REBUILD_LOCK_TIMEOUT_SECONDS = 30.0
+
+
 # Flags whose presence means the cache is mid-migration / mid-reingest. A
 # targeted (only_paths) ingest DECLINES when any is set and defers to the next
 # full background sync — inserting through a half-migrated FTS shape or skipping
@@ -3143,20 +3151,53 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     source = getattr(args, "source", "all")
     conn = open_cache_db()
 
+    # --prune-orphans: fast, targeted cleanup of cache rows whose source
+    # JSONL was removed from disk (e.g. a deleted git worktree), without a
+    # full rebuild. Claude-only surface; runs the three-gate safe helper.
+    if getattr(args, "prune_orphans", False):
+        res = _prune_orphaned_cache_entries(
+            conn, lock_timeout=_REBUILD_LOCK_TIMEOUT_SECONDS
+        )
+        if res.contended:
+            eprint(
+                "[cache-sync] prune-orphans skipped: "
+                "another process holds the lock"
+            )
+            return 1
+        eprint(
+            f"[cache-sync] pruned {res.pruned_files} orphaned file(s), "
+            f"{res.pruned_entries} cost row(s), {res.pruned_messages} message(s)"
+        )
+        if res.residual_paths:
+            eprint(
+                f"[cache-sync] {len(res.residual_paths)} orphan(s) left in place "
+                f"(shared session or missing conversation evidence); "
+                f"run `cache-sync --rebuild` to clear them"
+            )
+        return 0
+
     # Note: when --rebuild is set we delegate the DELETE to sync_cache /
     # sync_codex_cache, which execute it AFTER acquiring the flock. A
     # pre-sync DELETE here would wipe the cache even when the subsequent
     # sync loses the lock race and bails — leaving the user with empty
-    # state. See sync_cache() / sync_codex_cache() docstrings.
+    # state. See sync_cache() / sync_codex_cache() docstrings. A rebuild
+    # is worth a bounded wait on the flock (vs the non-blocking auto-sync)
+    # so a running dashboard's background tick doesn't silently no-op it;
+    # if it still can't acquire, we report + exit non-zero rather than lie.
+    lt = _REBUILD_LOCK_TIMEOUT_SECONDS if args.rebuild else None
+    contended = False
 
     if source in ("claude", "all"):
-        stats = sync_cache(conn, progress=_progress_stderr, rebuild=args.rebuild)
+        stats = sync_cache(
+            conn, progress=_progress_stderr, rebuild=args.rebuild, lock_timeout=lt
+        )
         _progress_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
                 "[cache-sync] rebuild skipped (claude): "
                 "another process holds the lock"
             )
+            contended = True
         elif not stats.lock_contended:
             eprint(
                 f"[cache-sync] claude done: {stats.files_processed} processed, "
@@ -3167,7 +3208,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
 
     if source in ("codex", "all"):
         stats = sync_codex_cache(
-            conn, progress=_progress_codex_stderr, rebuild=args.rebuild
+            conn, progress=_progress_codex_stderr, rebuild=args.rebuild, lock_timeout=lt
         )
         _progress_codex_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
@@ -3175,6 +3216,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "[cache-sync] rebuild skipped (codex): "
                 "another process holds the lock"
             )
+            contended = True
         elif not stats.lock_contended:
             eprint(
                 f"[cache-sync] codex done: {stats.files_processed} processed, "
@@ -3183,4 +3225,4 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.rows_changed} rows changed"
             )
 
-    return 0
+    return 1 if contended else 0
