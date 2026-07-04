@@ -322,6 +322,9 @@ from _cctally_cache import (
 )
 from _lib_snapshot_cache import (
     build_cached_group_a,
+    bump_generation,
+    reset_group_a_state,
+    reset_session_cache_state,
     _max_id as _snapshot_max_id,
     _reset_sig as _snapshot_reset_sig,
 )
@@ -372,17 +375,35 @@ def _make_run_sync_now_locked(*args, **kwargs):
 def _dashboard_self_heal_orphans(*, skip_sync):
     """Prune removed-worktree orphans from the cache using a throwaway
     connection. No-op under frozen (--no-sync) mode. Non-blocking on the
-    cache lock (retries on the next cadence if contended). Never raises."""
+    cache lock (retries on the next cadence if contended). Never raises.
+
+    #268 M5.2 (spec §7 / Codex F4): a prune that actually deleted rows rewrites
+    history in place — which `MAX(id)` alone can't detect (deleting a NON-max
+    row leaves the max unchanged). So on any real deletion, bump the
+    cache-generation counter (a composite-signature leg, so the next rebuild
+    can't idle-short-circuit) AND clear the Group A / session caches, forcing a
+    correct cold recompute on the next tick. The prune runs AFTER the tick's
+    publish on the same sync thread, so the very next tick recomputes."""
     if skip_sync:
         return None
     try:
         conn = open_cache_db()
         try:
-            return _prune_orphaned_cache_entries(conn, lock_timeout=None)
+            result = _prune_orphaned_cache_entries(conn, lock_timeout=None)
         finally:
             conn.close()
     except Exception:
         return None
+    if result is not None and (result.pruned_entries or result.pruned_files):
+        try:
+            bump_generation()
+            reset_group_a_state()
+            reset_session_cache_state()
+        except Exception:
+            # Invalidation must never turn a successful prune into a failure;
+            # a stale-cache tick is self-corrected once the signature next moves.
+            pass
+    return result
 
 
 def _build_forecast_json_payload(*args, **kwargs):
