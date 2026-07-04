@@ -45,6 +45,7 @@ reason.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sqlite3
 import threading
 from typing import TYPE_CHECKING, Callable, NamedTuple
@@ -464,3 +465,130 @@ def build_cached_group_a(
     )
     _GROUP_A_LAST_SEEN[builder_key] = {"max_id": cur_max_id, "extra": extra_signature}
     return buckets
+
+
+# === Task 3.1 — changed-session resolution (join + filename-stem fallback) ==
+
+
+def affected_session_keys(
+    cache_conn: sqlite3.Connection,
+    last_seen_max_id: int,
+) -> "set[str]":
+    """Resolved session identities for entries with ``id > last_seen`` (spec §5.2).
+
+    Mirrors ``_aggregate_claude_sessions`` grouping EXACTLY: identity is
+    ``session_files.session_id`` when the ``LEFT JOIN`` on ``source_path``
+    yields a non-null id, else the filename-stem of ``source_path``
+    (``os.path.splitext(os.path.basename(path))[0]``) — the same fallback
+    the aggregator applies when ``entry.session_id is None``
+    (``bin/_lib_aggregators.py``). ``<synthetic>``-model rows are skipped
+    (the aggregator skips them before the fallback), so a purely-synthetic
+    new row contributes no key.
+
+    ``session_entries`` has NO ``session_id`` column — identity comes from
+    the join to ``session_files`` — so the returned keys key IDENTICALLY to
+    the aggregator's session grouping (Codex F5). Returns an empty set on a
+    missing table (fresh / partially-migrated DB) so callers never raise.
+    """
+    try:
+        rows = cache_conn.execute(
+            "SELECT se.source_path, sf.session_id "
+            "FROM session_entries se "
+            "LEFT JOIN session_files sf ON sf.path = se.source_path "
+            "WHERE se.id > ? AND se.model != '<synthetic>'",
+            (last_seen_max_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    keys: "set[str]" = set()
+    for source_path, session_id in rows:
+        if session_id is not None:
+            keys.add(session_id)
+        else:
+            keys.add(os.path.splitext(os.path.basename(source_path))[0])
+    return keys
+
+
+# === Task 3.2 — Group B session aggregate cache over the FULL window =======
+#
+# Module-level state following the Group A precedent (spec §7): a single
+# shared ``SessionCache`` holding ALL sessions in the 365-day window (NOT
+# just the visible top 100 — Codex F5), plus this builder's own last-seen
+# ``MAX(session_entries.id)`` watermark. Every cached value is an immutable
+# ``ClaudeSessionUsage``; the builder builds FRESH ``TuiSessionRow`` objects
+# from the assembled list each tick and never mutates a cached aggregate
+# (Codex F7). Mutated ONLY on the sync thread (single-writer, like Group A).
+
+_SESSION_CACHE = SessionCache()
+_SESSION_LAST_SEEN: "dict" = {}
+
+
+def session_cache() -> SessionCache:
+    """Return the shared Group B ``SessionCache`` (all sessions in-window)."""
+    return _SESSION_CACHE
+
+
+def reset_session_cache_state() -> None:
+    """Clear the session cache AND its last-seen watermark (full invalidation).
+
+    Test hook + the M5 orphan-prune / ``cache-sync --rebuild`` invalidation
+    entry point: after history is deleted or rewritten in place, drop every
+    cached session and reset the watermark so the next rebuild re-aggregates
+    the whole window from scratch (spec §7 / Codex F4).
+    """
+    _SESSION_CACHE.clear()
+    _SESSION_LAST_SEEN.clear()
+
+
+def build_cached_sessions(
+    *,
+    cache_conn: sqlite3.Connection,
+    aggregate_all: "Callable[[], list]",
+    reaggregate: "Callable[[int, set], list]",
+    extra_signature: object = None,
+) -> "list":
+    """Stateful Group B assembly: cold full-aggregate / warm affected-only (spec §5.2).
+
+    ``cache_conn`` is a ``cache.db`` connection (reads
+    ``MAX(session_entries.id)`` + the affected-session set). ``aggregate_all``
+    returns the full ``list[ClaudeSessionUsage]`` for the window (cold path).
+    ``reaggregate(last_seen, affected_keys)`` returns the re-aggregated
+    ``ClaudeSessionUsage`` for exactly the sessions touched since ``last_seen``
+    (warm path) — a straddling/resumed session re-aggregates WHOLE from its
+    own full in-window entry set, so no split-row bug. ``extra_signature`` is
+    any hashable whose change forces a full cold rebuild.
+
+    Cold when: no prior state, ``extra_signature`` changed, or a
+    ``MAX(id)`` regression (cache.db rebuilt). Warm otherwise, re-aggregating
+    only the affected sessions and updating their cache rows in place of the
+    stale ones. Returns the FULL cached session list (UNSORTED — the caller
+    window-filters, sorts by ``last_activity`` desc, and truncates to the
+    view limit, which is what preserves correct eviction/**promotion** at the
+    100-row boundary, Codex F5).
+
+    Each returned/stored value is an immutable ``ClaudeSessionUsage`` keyed by
+    its resolved ``session_id`` (which the aggregator sets to the stem for
+    fallback sessions), so the cache keys match ``affected_session_keys``.
+    """
+    cur_max_id = _max_id(cache_conn, "session_entries")
+    state = _SESSION_LAST_SEEN
+    cold = (
+        not state
+        or state.get("extra") != extra_signature
+        or cur_max_id < int(state.get("max_id", 0))
+    )
+    if cold:
+        _SESSION_CACHE.clear()
+        for sess in aggregate_all():
+            _SESSION_CACHE.put(sess.session_id, sess)
+    else:
+        last_seen = int(state.get("max_id", 0))
+        if cur_max_id > last_seen:
+            affected = affected_session_keys(cache_conn, last_seen)
+            if affected:
+                for sess in reaggregate(last_seen, affected):
+                    _SESSION_CACHE.put(sess.session_id, sess)
+    _SESSION_LAST_SEEN.clear()
+    _SESSION_LAST_SEEN["max_id"] = cur_max_id
+    _SESSION_LAST_SEEN["extra"] = extra_signature
+    return list(_SESSION_CACHE.get_all().values())

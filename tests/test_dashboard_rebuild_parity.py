@@ -997,3 +997,250 @@ def test_weekly_share_override_does_not_pollute_sync_cache(monkeypatch, tmp_path
     finally:
         dash._GROUP_A_CACHE_ENABLED = True
         stats.close()
+
+
+# ===========================================================================
+# M3 (Group B) — sessions cache.
+#
+# `_tui_build_sessions` serves the sessions pane from a module-level
+# `SessionCache` holding ALL sessions in the 365-day window. On a warm tick
+# it re-aggregates ONLY the sessions changed since the last tick, then
+# sort+truncates the FULL cached set — so a session below the top-N can
+# promote once it gets new activity (Codex F5). Gated on `use_session_cache`
+# (sync-thread only), NEVER on `skip_sync`, so no non-sync caller can pollute
+# the shared cache (the Bundle 2 Group A lesson).
+# ===========================================================================
+
+
+def _sess_line(session_id, uuid, msg_id, req_id, text, *, ts,
+               cwd="/Users/u/proj", model="claude-opus-4-8"):
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": session_id,
+        "requestId": req_id, "timestamp": ts, "cwd": cwd,
+        "message": {
+            "role": "assistant", "id": msg_id, "model": model,
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 100, "output_tokens": 40,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+def _write_session_file(tmp_path, session_id, text):
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    p = proj / f"{session_id}.jsonl"
+    p.write_text(text)
+    return p
+
+
+def _seed_sessions(tmp_path, specs):
+    """specs: {session_id: [(ts, text), ...]}. One JSONL file per session,
+    named `<session_id>.jsonl`. Each line's (msg_id, req_id) is derived from
+    `(session_id, index)` so it is STABLE across rewrites and UNIQUE across
+    sessions — a global counter would collide on rewrite and hit the
+    `(msg_id, req_id)` dedup index, silently dropping the appended line."""
+    for sid, entries in specs.items():
+        lines = []
+        for i, (ts, text) in enumerate(entries):
+            key = f"{sid}-{i}"
+            lines.append(_sess_line(
+                sid, f"u-{key}", f"m-{key}", f"r-{key}", text, ts=ts,
+            ))
+        _write_session_file(tmp_path, sid, "".join(lines))
+
+
+def _build_sessions(ns, *, enabled, now=NOW_UTC, limit=100):
+    """Cold cached (enabled=True) vs from-scratch (enabled=False) — resets the
+    module SessionCache first so the cached build starts cold."""
+    import _lib_snapshot_cache as sc
+    tui = sys.modules["_cctally_tui"]
+    sc.reset_session_cache_state()
+    prev = getattr(tui, "_SESSION_CACHE_ENABLED", True)
+    tui._SESSION_CACHE_ENABLED = enabled
+    try:
+        return ns["_tui_build_sessions"](
+            now, skip_sync=True, use_session_cache=True, limit=limit,
+        )
+    finally:
+        tui._SESSION_CACHE_ENABLED = prev
+
+
+def _ids(rows):
+    return [r.session_id for r in rows]
+
+
+def test_sessions_cached_parity(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_sessions(tmp_path, {
+        "sess-a": [("2026-07-04T09:00:00Z", "a")],
+        "sess-b": [("2026-07-03T10:00:00Z", "b1"), ("2026-07-03T10:30:00Z", "b2")],
+        "sess-c": [("2026-07-01T08:00:00Z", "c")],
+    })
+    _prime_cache(ns)
+
+    cached = _build_sessions(ns, enabled=True)
+    # Non-vacuity: the cached path actually populated the module cache.
+    assert sc.session_cache().get_all(), (
+        "cached sessions build must populate the SessionCache"
+    )
+    wide = _build_sessions(ns, enabled=False)
+    assert cached == wide, "cached sessions rows must equal from-scratch"
+    # Real data present (not the vacuous empty case).
+    assert cached and any(r.cost_usd > 0 for r in cached)
+    # Descending by last_activity (started_at desc for these single/paired sessions).
+    assert _ids(cached) == ["sess-a", "sess-b", "sess-c"]
+
+
+def test_sessions_warm_matches_from_scratch(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_sessions(tmp_path, {
+        "sess-a": [("2026-07-04T09:00:00Z", "a")],
+        "sess-b": [("2026-07-03T10:00:00Z", "b1")],
+        "sess-c": [("2026-07-01T08:00:00Z", "c")],
+    })
+    _prime_cache(ns)
+    tui = sys.modules["_cctally_tui"]
+    sc.reset_session_cache_state()
+    tui._SESSION_CACHE_ENABLED = True
+    # Cold populate.
+    cold = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True, use_session_cache=True)
+    cold_b = next(r for r in cold if r.session_id == "sess-b")
+
+    # New activity in an EXISTING session (sess-b) — append a later line.
+    _seed_sessions(tmp_path, {
+        "sess-a": [("2026-07-04T09:00:00Z", "a")],
+        "sess-b": [("2026-07-03T10:00:00Z", "b1"), ("2026-07-04T11:45:00Z", "b2")],
+        "sess-c": [("2026-07-01T08:00:00Z", "c")],
+    })
+    _prime_cache(ns)
+    warm = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True, use_session_cache=True)
+    warm_b = next(r for r in warm if r.session_id == "sess-b")
+    assert warm_b.cost_usd > cold_b.cost_usd, "changed session must re-aggregate (cost grew)"
+
+    wide = _build_sessions(ns, enabled=False)
+    assert warm == wide, "warm sessions rebuild must equal from-scratch"
+
+
+def test_sessions_promotion_below_topN(monkeypatch, tmp_path):
+    """A session below the top-N gets new activity → it promotes into the
+    visible slice and the evicted one drops (Codex F5). Uses limit=3."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    # 4 sessions; sess-d is the OLDEST (rank 4, outside a top-3 view).
+    _seed_sessions(tmp_path, {
+        "sess-a": [("2026-07-04T09:00:00Z", "a")],
+        "sess-b": [("2026-07-03T09:00:00Z", "b")],
+        "sess-c": [("2026-07-02T09:00:00Z", "c")],
+        "sess-d": [("2026-06-01T09:00:00Z", "d")],
+    })
+    _prime_cache(ns)
+    tui = sys.modules["_cctally_tui"]
+    sc.reset_session_cache_state()
+    tui._SESSION_CACHE_ENABLED = True
+    cold = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True,
+                                     use_session_cache=True, limit=3)
+    assert _ids(cold) == ["sess-a", "sess-b", "sess-c"]
+    assert "sess-d" not in _ids(cold)
+
+    # sess-d (previously outside the top-3) gets the LATEST activity.
+    _seed_sessions(tmp_path, {
+        "sess-a": [("2026-07-04T09:00:00Z", "a")],
+        "sess-b": [("2026-07-03T09:00:00Z", "b")],
+        "sess-c": [("2026-07-02T09:00:00Z", "c")],
+        "sess-d": [("2026-06-01T09:00:00Z", "d"), ("2026-07-04T11:59:00Z", "d2")],
+    })
+    _prime_cache(ns)
+    warm = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True,
+                                     use_session_cache=True, limit=3)
+    assert "sess-d" in _ids(warm), "session with new activity must promote into top-N"
+    assert "sess-c" not in _ids(warm), "the evicted (now rank-4) session must drop"
+    assert _ids(warm) == ["sess-d", "sess-a", "sess-b"]
+
+    # Parity with from-scratch on the post-append DB.
+    sc.reset_session_cache_state()
+    tui._SESSION_CACHE_ENABLED = False
+    wide = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True,
+                                     use_session_cache=True, limit=3)
+    tui._SESSION_CACHE_ENABLED = True
+    assert warm == wide
+
+
+def test_sessions_straddling_reaggregates_whole(monkeypatch, tmp_path):
+    """A resumed session straddling multiple calendar days aggregates WHOLE
+    (no split-row) — cached cost/tokens equal the sum of ALL its entries, and
+    a warm append on yet another day still re-aggregates the whole session."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_sessions(tmp_path, {
+        # Same session_id across three different days.
+        "sess-straddle": [
+            ("2026-07-01T08:00:00Z", "s1"),
+            ("2026-07-03T10:00:00Z", "s2"),
+        ],
+        "sess-other": [("2026-07-04T09:00:00Z", "o")],
+    })
+    _prime_cache(ns)
+
+    cached = _build_sessions(ns, enabled=True)
+    wide = _build_sessions(ns, enabled=False)
+    assert cached == wide
+    straddle = next(r for r in cached if r.session_id == "sess-straddle")
+    one = next(r for r in wide if r.session_id == "sess-other")
+    # The straddling session folded BOTH its entries (2 lines) into one row →
+    # ~2x the single-entry session's cost (same per-line usage).
+    assert straddle.cost_usd > one.cost_usd * 1.5
+
+    # Warm: a THIRD entry on a new day. The whole session re-aggregates.
+    tui = sys.modules["_cctally_tui"]
+    sc.reset_session_cache_state()
+    tui._SESSION_CACHE_ENABLED = True
+    ns["_tui_build_sessions"](NOW_UTC, skip_sync=True, use_session_cache=True)
+    _seed_sessions(tmp_path, {
+        "sess-straddle": [
+            ("2026-07-01T08:00:00Z", "s1"),
+            ("2026-07-03T10:00:00Z", "s2"),
+            ("2026-07-04T11:00:00Z", "s3"),
+        ],
+        "sess-other": [("2026-07-04T09:00:00Z", "o")],
+    })
+    _prime_cache(ns)
+    warm = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True, use_session_cache=True)
+    wide2 = _build_sessions(ns, enabled=False)
+    assert warm == wide2
+    straddle2 = next(r for r in warm if r.session_id == "sess-straddle")
+    assert straddle2.cost_usd > straddle.cost_usd, "3rd entry must fold into the whole session"
+
+
+def test_sessions_from_scratch_call_does_not_populate_cache(monkeypatch, tmp_path):
+    """Caller-audit guard: a default (use_session_cache=False) call must NOT
+    touch the shared SessionCache. `_tui_build_sessions`' ONLY caller today is
+    `_tui_build_snapshot` (real-now sync thread), but this locks in that no
+    future non-sync caller with a shifted `now` can pollute the cache — the
+    Bundle 2 Group A pollution lesson applied to Group B."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_sessions(tmp_path, {"sess-a": [("2026-07-04T09:00:00Z", "a")]})
+    _prime_cache(ns)
+    sc.reset_session_cache_state()
+    # Default flag (False): the from-scratch path. A shifted PAST now, too.
+    past = dt.datetime(2026, 7, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
+    rows = ns["_tui_build_sessions"](past, skip_sync=True)
+    assert sc.session_cache().get_all() == {}, (
+        "a use_session_cache=False call must never write the shared SessionCache"
+    )
+    # And it still renders from-scratch.
+    assert isinstance(rows, list)

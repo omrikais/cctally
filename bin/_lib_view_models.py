@@ -1078,9 +1078,20 @@ class SessionsView:
     display_tz_label: str = ""
 
 
-def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None, mode="auto"):
+def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None,
+                        mode="auto", aggregated_override=None):
     """Build a ``SessionsView`` from joined Claude session entries
     (spec §5.5).
+
+    ``aggregated_override`` (#268 Group B): when provided, SKIP the
+    ``_aggregate_claude_sessions(entries)`` re-aggregation and use this
+    pre-aggregated ``list[ClaudeSessionUsage]`` verbatim (the caller has
+    already assembled + sorted-by-last_activity-desc the full session set
+    from the module-level ``SessionCache``). ``entries`` is then unused for
+    aggregation. The ``limit`` truncation + the per-row ``TuiSessionRow``
+    derivation below run identically over the override, so a cached rebuild
+    is byte-identical to the from-scratch pass. ``None`` (CLI ``session`` /
+    share / cold paths) is unchanged — the aggregator runs on ``entries``.
 
     ``entries`` is the ``list[_JoinedClaudeEntry]`` from
     ``get_claude_session_entries(range_start, range_end)``. The caller
@@ -1108,8 +1119,11 @@ def build_sessions_view(entries, *, now_utc, limit=None, display_tz=None, mode="
     is informational only.
     """
     import os as _os                # late: keep top-level imports lean.
-    _agg = _load_lib("_lib_aggregators")
-    aggregated = _agg._aggregate_claude_sessions(entries, mode=mode)
+    if aggregated_override is not None:
+        aggregated = list(aggregated_override)
+    else:
+        _agg = _load_lib("_lib_aggregators")
+        aggregated = _agg._aggregate_claude_sessions(entries, mode=mode)
     # Apply limit truncation up front so `rows` and `aggregated` stay
     # in lockstep (spec §4.3 invariant: `total_sessions == len(rows)
     # == len(aggregated)`). limit=None → keep everything.

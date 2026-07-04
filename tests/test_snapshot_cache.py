@@ -42,6 +42,15 @@ CREATE TABLE session_entries (
     cache_create_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens   INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE session_files (
+    path             TEXT PRIMARY KEY,
+    size_bytes       INTEGER NOT NULL DEFAULT 0,
+    mtime_ns         INTEGER NOT NULL DEFAULT 0,
+    last_byte_offset INTEGER NOT NULL DEFAULT 0,
+    last_ingested_at TEXT    NOT NULL DEFAULT '2026-07-04T00:00:00Z',
+    session_id       TEXT,
+    project_path     TEXT
+);
 CREATE TABLE codex_session_entries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     source_path   TEXT    NOT NULL,
@@ -399,3 +408,93 @@ def test_session_cache_clear():
     sc.put("a", object())
     sc.clear()
     assert sc.get_all() == {}
+
+
+# ===========================================================================
+# Task 3.1 — changed-session resolution (join + filename-stem fallback)
+# ===========================================================================
+def _insert_session_file(conn, path, *, session_id=None, project_path=None):
+    conn.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) VALUES (?, 0, 0, 0, ?, ?, ?)",
+        (path, "2026-07-04T00:00:00Z", session_id, project_path),
+    )
+    conn.commit()
+
+
+def _insert_entry_at_path(conn, ts, source, *, model="claude-opus-4-8"):
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model) VALUES (?, 0, ?, ?)",
+        (source, ts, model),
+    )
+    conn.commit()
+
+
+def test_affected_session_keys_join_and_stem_fallback(tmp_cache):
+    """Resolves a session_files.session_id via the join AND the filename-stem
+    fallback when the join yields null — keying IDENTICALLY to how
+    `_aggregate_claude_sessions` groups (sf.session_id else basename-stem)."""
+    from _lib_snapshot_cache import affected_session_keys
+
+    # One session carries an explicit session_files.session_id (join path).
+    _insert_session_file(tmp_cache, "/p/known.jsonl", session_id="SID-known")
+    # One session_files row has a NULL session_id → filename-stem fallback.
+    _insert_session_file(tmp_cache, "/p/orphan.jsonl", session_id=None)
+    last = _max_id(tmp_cache)
+    _insert_entry_at_path(tmp_cache, "2026-07-04T10:00:00Z", "/p/known.jsonl")
+    _insert_entry_at_path(tmp_cache, "2026-07-04T11:00:00Z", "/p/orphan.jsonl")
+
+    keys = affected_session_keys(tmp_cache, last)
+    assert keys == {"SID-known", "orphan"}
+
+
+def test_affected_session_keys_missing_session_files_row(tmp_cache):
+    """A source_path with NO session_files row at all (LEFT JOIN → null)
+    still resolves via the basename-stem fallback."""
+    from _lib_snapshot_cache import affected_session_keys
+
+    last = _max_id(tmp_cache)
+    _insert_entry_at_path(tmp_cache, "2026-07-04T10:00:00Z", "/p/no-sf-row.jsonl")
+    assert affected_session_keys(tmp_cache, last) == {"no-sf-row"}
+
+
+def test_affected_session_keys_only_new_ids(tmp_cache):
+    """Only entries with id > last_seen contribute; older ids are ignored."""
+    from _lib_snapshot_cache import affected_session_keys
+
+    _insert_entry_at_path(tmp_cache, "2026-07-01T10:00:00Z", "/p/old.jsonl")
+    last = _max_id(tmp_cache)
+    _insert_entry_at_path(tmp_cache, "2026-07-04T10:00:00Z", "/p/new.jsonl")
+    assert affected_session_keys(tmp_cache, last) == {"new"}
+
+
+def test_affected_session_keys_skips_synthetic(tmp_cache):
+    """A `<synthetic>`-model entry never forms a session (mirrors the
+    aggregator's skip), so it contributes no affected key."""
+    from _lib_snapshot_cache import affected_session_keys
+
+    last = _max_id(tmp_cache)
+    _insert_entry_at_path(
+        tmp_cache, "2026-07-04T10:00:00Z", "/p/syn.jsonl", model="<synthetic>"
+    )
+    assert affected_session_keys(tmp_cache, last) == set()
+
+
+def test_affected_session_keys_empty_when_nothing_new(tmp_cache):
+    from _lib_snapshot_cache import affected_session_keys
+
+    _insert_entry_at_path(tmp_cache, "2026-07-04T10:00:00Z", "/p/a.jsonl")
+    assert affected_session_keys(tmp_cache, _max_id(tmp_cache)) == set()
+
+
+def test_affected_session_keys_tolerates_missing_tables():
+    """Fresh DB with no session_entries table → empty set, no raise."""
+    from _lib_snapshot_cache import affected_session_keys
+
+    empty = sqlite3.connect(":memory:")
+    try:
+        assert affected_session_keys(empty, 0) == set()
+    finally:
+        empty.close()

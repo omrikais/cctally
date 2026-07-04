@@ -1574,11 +1574,22 @@ def _tui_build_weekly_history_view(
     )
 
 
+# #268 Group B session-cache master switch. Normally True: the sync-thread
+# rebuild serves the sessions pane from the module-level ``SessionCache``,
+# re-aggregating only the sessions touched since the last tick. Flip to False
+# to force the from-scratch 365-day fetch (the pre-#268 behavior) — the parity
+# tests toggle it to prove the cached and from-scratch rebuilds are
+# byte-identical, and the builder falls back to it automatically if the cache
+# DB can't be opened.
+_SESSION_CACHE_ENABLED = True
+
+
 def _tui_build_sessions(
     now_utc: dt.datetime,
     *,
     limit: int = 100,
     skip_sync: bool = False,
+    use_session_cache: bool = False,
 ) -> list[TuiSessionRow]:
     """Load the last `limit` Claude sessions (merged across resumes).
 
@@ -1597,6 +1608,17 @@ def _tui_build_sessions(
     consumes ``view.rows`` (the typed ``TuiSessionRow`` tuple). The
     view's parallel ``view.aggregated`` is reserved for the CLI / share
     surfaces; the TUI doesn't need ``ClaudeSessionUsage`` fields.
+
+    ``use_session_cache`` (#268 Group B): when True AND
+    ``_SESSION_CACHE_ENABLED``, serve the sessions from the module-level
+    ``SessionCache`` — re-aggregate ONLY the sessions changed since the last
+    tick, then sort+truncate the FULL cached set (so a session below the top
+    100 can still promote once it gets new activity, Codex F5). Set True ONLY
+    by the sync-thread rebuild (``_tui_build_snapshot``), which runs on a
+    process-consistent ``now``. Every OTHER caller keeps the default
+    ``False`` → the from-scratch 365-day fetch, so a non-sync-thread caller
+    with a shifted ``now`` can NEVER pollute the shared cache (the Bundle 2
+    Group A lesson). The visible rows are byte-identical either way.
     """
     # Bounded scan window — the sessions pane promises "last `limit`". A
     # 365-day scan covers virtually all users (even one-session-every-few-days
@@ -1604,11 +1626,27 @@ def _tui_build_sessions(
     # sync-tick cost stays predictable on heavy DBs: the aggregator runs
     # on every entry in the window before slicing.
     range_start = now_utc - dt.timedelta(days=365)
-    entries = get_claude_session_entries(range_start, now_utc, skip_sync=skip_sync)
     c = _cctally()
-    view = c.build_sessions_view(
-        entries, now_utc=now_utc, limit=limit, display_tz=None,
-    )
+    aggregated_override = None
+    if use_session_cache and _SESSION_CACHE_ENABLED:
+        try:
+            aggregated_override = _tui_sessions_cached(
+                now_utc, range_start, limit, skip_sync,
+            )
+        except (sqlite3.DatabaseError, OSError):
+            # Cache DB unavailable / read failure — fall back to the
+            # from-scratch fetch so the pane still renders.
+            aggregated_override = None
+    if aggregated_override is None:
+        entries = get_claude_session_entries(range_start, now_utc, skip_sync=skip_sync)
+        view = c.build_sessions_view(
+            entries, now_utc=now_utc, limit=limit, display_tz=None,
+        )
+    else:
+        view = c.build_sessions_view(
+            (), now_utc=now_utc, limit=limit, display_tz=None,
+            aggregated_override=aggregated_override,
+        )
     rows = list(view.rows)
     # Attach human-readable titles for the dashboard/TUI Sessions surface.
     # Reuses the conversation viewer's title derivation (AI title wins, else
@@ -1643,6 +1681,128 @@ def _tui_build_sessions(
                 except sqlite3.Error:
                     pass
     return rows
+
+
+def _tui_sessions_cached(
+    now_utc: dt.datetime,
+    range_start: dt.datetime,
+    limit: int,
+    skip_sync: bool,
+) -> "list":
+    """Assemble the full session set from the module-level ``SessionCache`` (#268).
+
+    Cold tick: aggregate every session in ``[range_start, now]`` and populate
+    the cache. Warm tick: re-aggregate ONLY the sessions touched since the
+    last tick — each from its OWN full in-window entry set (a straddling /
+    resumed session re-aggregates whole, no split-row). Returns the FULL
+    cached set, window-filtered to ``[range_start, now]`` and sorted by
+    ``last_activity`` desc; ``build_sessions_view`` then truncates to the view
+    limit, which is what preserves correct eviction/**promotion** at the
+    100-row boundary (Codex F5).
+
+    Raises ``sqlite3.DatabaseError`` / ``OSError`` on a cache-open failure so
+    ``_tui_build_sessions`` can fall back to the from-scratch path.
+    """
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+    cache_conn = c.open_cache_db()
+    try:
+        def _aggregate_all():
+            entries = get_claude_session_entries(
+                range_start, now_utc, skip_sync=skip_sync,
+            )
+            return _aggregate_claude_sessions(entries)
+
+        def _reaggregate(last_seen, _affected):
+            entries = _fetch_affected_session_entries(
+                cache_conn, last_seen, range_start, now_utc,
+            )
+            return _aggregate_claude_sessions(entries)
+
+        full = sc.build_cached_sessions(
+            cache_conn=cache_conn,
+            aggregate_all=_aggregate_all,
+            reaggregate=_reaggregate,
+        )
+    finally:
+        try:
+            cache_conn.close()
+        except sqlite3.Error:
+            pass
+    # Match the from-scratch window under a sliding `now`: a session whose
+    # last_activity has aged out of [range_start, now] is not in the
+    # from-scratch fetch, so exclude it. No-op on a pinned `now` (every
+    # cold-populated session's last_activity is >= range_start by
+    # construction), and cheap (a scalar filter + sort over a few thousand
+    # aggregates, not a 365-day entry re-scan).
+    in_window = [s for s in full if s.last_activity >= range_start]
+    in_window.sort(key=lambda s: s.last_activity, reverse=True)
+    return in_window
+
+
+def _fetch_affected_session_entries(
+    cache_conn: "sqlite3.Connection",
+    last_seen_max_id: int,
+    range_start: dt.datetime,
+    range_end: dt.datetime,
+) -> "list":
+    """Fetch (timestamp-ASC) every entry of every session touched by a row with
+    ``id > last_seen`` — expanded across ``session_id`` siblings so a resumed
+    session re-aggregates WHOLE — within ``[range_start, range_end]``.
+
+    The column list + ``LEFT JOIN`` mirror ``get_claude_session_entries``
+    EXACTLY (including the materialized ``speed`` column → ``usage_extra``), so
+    the per-session aggregate is byte-identical to the from-scratch pass. The
+    affected-source-paths set is inlined as a SQL subquery (parameterized only
+    by ``last_seen``) so the fetch stays a single timestamp-ordered result —
+    no Python ``IN`` list to chunk, and stable first-seen model order.
+    """
+    c = _cctally()
+    _JoinedClaudeEntry = c._JoinedClaudeEntry
+    start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
+    end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
+    sql = (
+        "SELECT se.timestamp_utc, se.model, se.input_tokens, se.output_tokens, "
+        "  se.cache_create_tokens, se.cache_read_tokens, se.source_path, "
+        "  sf.session_id, sf.project_path, se.cost_usd_raw, se.speed "
+        "FROM session_entries se "
+        "LEFT JOIN session_files sf ON sf.path = se.source_path "
+        "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ? "
+        "  AND se.source_path IN ("
+        # Sibling paths of every session_id touched by a new row ...
+        "    SELECT sf2.path FROM session_files sf2 WHERE sf2.session_id IN ("
+        "      SELECT sf1.session_id FROM session_files sf1 "
+        "      JOIN (SELECT DISTINCT source_path FROM session_entries "
+        "            WHERE id > ?) af "
+        "        ON af.source_path = sf1.path "
+        "      WHERE sf1.session_id IS NOT NULL"
+        "    )"
+        # ... UNION the touched files themselves (covers fallback / not-yet-
+        # backfilled session_files rows keyed by filename stem).
+        "    UNION "
+        "    SELECT DISTINCT source_path FROM session_entries WHERE id > ?"
+        "  ) "
+        "ORDER BY se.timestamp_utc ASC"
+    )
+    rows = cache_conn.execute(
+        sql, (start_iso, end_iso, last_seen_max_id, last_seen_max_id),
+    ).fetchall()
+    return [
+        _JoinedClaudeEntry(
+            timestamp=dt.datetime.fromisoformat(row[0]),
+            model=row[1],
+            input_tokens=row[2],
+            output_tokens=row[3],
+            cache_creation_tokens=row[4],
+            cache_read_tokens=row[5],
+            source_path=row[6],
+            session_id=row[7],
+            project_path=row[8],
+            cost_usd=row[9],
+            usage_extra=({"speed": row[10]} if row[10] is not None else None),
+        )
+        for row in rows
+    ]
 
 
 @dataclass
@@ -1942,7 +2102,9 @@ def _tui_build_snapshot(
             # `skip_sync=True` is threaded through. Honor the caller's
             # intent so `--no-sync` and the initial cache-only paint
             # both avoid ingest latency/lock contention.
-            sessions = _tui_build_sessions(now_utc, skip_sync=skip_sync)
+            sessions = _tui_build_sessions(
+                now_utc, skip_sync=skip_sync, use_session_cache=True,
+            )
         except Exception as exc:
             errors.append(f"sessions: {exc}")
         # ---- v2 additions ----
