@@ -78,14 +78,20 @@ def test_residual_gate_a_shared_session(env):
 
 def test_residual_gate_c_surviving_key(env):
     ns, conn, projects = env
+    # Different session ids (Gate A passes) but the surviving file physically
+    # shares (m1,r1) — Gate C must catch it. Force ingest order so the shared
+    # deduped session_entries row pins to `gone` (first inserter), making Gate
+    # C's own-key scan deterministically find it under a surviving path.
     live = projects / "-proj-live" / "a.jsonl"
     gone = projects / "-proj-gone" / "b.jsonl"
-    _write(live, "LIVE", [_assistant("m1", "r1", uuid="u1")])
     _write(gone, "GONE", [_assistant("m1", "r1", uuid="u1b")])
+    ns["sync_cache"](conn)                      # pins (m1,r1) -> gone
+    _write(live, "LIVE", [_assistant("m1", "r1", uuid="u1")])
     ns["sync_cache"](conn)
     import os; os.remove(gone)
     res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
     assert res.pruned_files == 0 and str(gone) in res.residual_paths
+    # Safety invariant: the shared cost row survives (never dropped).
     assert conn.execute("SELECT count(*) FROM session_entries WHERE msg_id='m1' AND req_id='r1'").fetchone()[0] == 1
 
 
@@ -114,3 +120,36 @@ def test_marker_reestablished_after_prune(env):
     ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
     ns["sync_cache"](conn)
     assert conn.execute("SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'").fetchone() is not None
+
+
+def test_null_session_id_residual(env):
+    ns, conn, projects = env
+    gone = projects / "-proj-gone" / "n.jsonl"
+    _write(gone, "SID", [_assistant("m1", "r1", uuid="u1")])
+    ns["sync_cache"](conn)
+    conn.execute("UPDATE session_files SET session_id=NULL WHERE path=?", (str(gone),))
+    conn.commit()
+    import os; os.remove(gone)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 0 and str(gone) in res.residual_paths
+
+
+def test_contended_returns_without_mutating(env):
+    ns, conn, projects = env
+    import fcntl
+    gone = projects / "-proj-gone" / "c.jsonl"
+    _write(gone, "CID", [_assistant("m1", "r1", uuid="u1")])
+    ns["sync_cache"](conn)
+    import os; os.remove(gone)
+    lock_path = ns["_cctally_core"].CACHE_LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = open(lock_path, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=0.1)
+        assert res.contended is True
+        assert res.pruned_files == 0
+        # Untouched: the orphan row is still tracked.
+        assert conn.execute("SELECT count(*) FROM session_files WHERE path=?", (str(gone),)).fetchone()[0] == 1
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN); holder.close()

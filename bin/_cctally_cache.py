@@ -731,25 +731,32 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
         if not safe_paths:
             return result
 
-        ph = ",".join("?" * len(safe_paths))              # safe_paths is tiny
+        # No IN(...) chunking: safe_paths is bounded by the orphan count (a
+        # handful of removed files), well under SQLite's variable limit;
+        # _recompute_conversation_sessions chunks its own session-id list.
+        ph = ",".join("?" * len(safe_paths))
         result.pruned_messages = conn.execute(
             f"SELECT count(*) FROM conversation_messages WHERE source_path IN ({ph})",
             safe_paths).fetchone()[0]
         conn.execute("BEGIN")
-        conn.execute(
-            f"DELETE FROM conversation_file_touches WHERE message_id IN "
-            f"(SELECT id FROM conversation_messages WHERE source_path IN ({ph}))",
-            safe_paths)
-        conn.execute(
-            f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
-        conn.execute(
-            f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
-        result.pruned_entries = conn.execute(
-            f"DELETE FROM session_entries WHERE source_path IN ({ph})", safe_paths).rowcount
-        result.pruned_files = conn.execute(
-            f"DELETE FROM session_files WHERE path IN ({ph})", safe_paths).rowcount
-        _recompute_conversation_sessions(conn, list(pruned_sids))  # inside the txn
-        conn.commit()
+        try:
+            conn.execute(
+                f"DELETE FROM conversation_file_touches WHERE message_id IN "
+                f"(SELECT id FROM conversation_messages WHERE source_path IN ({ph}))",
+                safe_paths)
+            conn.execute(
+                f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
+            conn.execute(
+                f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
+            result.pruned_entries = conn.execute(
+                f"DELETE FROM session_entries WHERE source_path IN ({ph})", safe_paths).rowcount
+            result.pruned_files = conn.execute(
+                f"DELETE FROM session_files WHERE path IN ({ph})", safe_paths).rowcount
+            _recompute_conversation_sessions(conn, list(pruned_sids))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return result
     finally:
         try:
