@@ -372,6 +372,22 @@ def _make_run_sync_now_locked(*args, **kwargs):
     return sys.modules["cctally"]._make_run_sync_now_locked(*args, **kwargs)
 
 
+def _register_faulthandler_sigusr1():
+    """Register a SIGUSR1 handler that dumps all-thread tracebacks (#268 M6.1).
+
+    So any future dashboard spin (a sync thread stuck in a rebuild) is
+    self-diagnosing — ``kill -USR1 <pid>`` prints every thread's stack to stderr
+    — without needing a root py-spy. Guarded for platforms lacking SIGUSR1
+    (Windows), where it is a silent no-op. Idempotent; returns True when the
+    handler was registered, False when SIGUSR1 is unavailable."""
+    import faulthandler
+    import signal
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    return True
+
+
 def _dashboard_self_heal_orphans(*, skip_sync):
     """Prune removed-worktree orphans from the cache using a throwaway
     connection. No-op under frozen (--no-sync) mode. Non-blocking on the
@@ -9118,6 +9134,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     import threading
     import time as _time
     import webbrowser as _wb
+
+    # #268 M6.1: arm the SIGUSR1 all-thread traceback dump so any future spin is
+    # self-diagnosing (`kill -USR1 <pid>`) without root py-spy. No-op where
+    # SIGUSR1 is unavailable (Windows).
+    _register_faulthandler_sigusr1()
 
     # Spec §5.7: capture the un-mutated argv + PATH-resolved entrypoint
     # at boot so the in-place ``execvp`` after a successful update
