@@ -82,3 +82,32 @@ def test_sync_cache_called_once_per_rebuild(monkeypatch, tmp_path):
         f"expected exactly 1 sync_cache per rebuild, got {calls['n']} "
         "(pre-change: each wide builder re-globs → ~8-10 redundant syncs)"
     )
+
+
+def test_no_sync_never_ingests_but_still_reads(monkeypatch, tmp_path):
+    """--no-sync (caller skip_sync=True): the top-of-rebuild ingest is
+    gated OFF (zero sync_cache), yet builders still read the already-cached
+    rows (spec §4)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_jsonl(tmp_path)
+
+    # Pre-populate the cache with a real ingest BEFORE the spy, so a pure
+    # --no-sync read has existing rows to serve.
+    conn = ns["open_cache_db"]()
+    ns["sync_cache"](conn)
+    conn.close()
+
+    calls = _install_sync_spy(ns, monkeypatch)
+
+    snap = ns["_tui_build_snapshot"](now_utc=NOW_UTC, skip_sync=True)
+
+    assert snap is not None
+    assert calls["n"] == 0, (
+        f"--no-sync must not ingest, but sync_cache ran {calls['n']} times"
+    )
+    # The snapshot still populated from the pre-existing cache rows — the
+    # seeded entries' tokens surface without any fresh ingest.
+    assert snap.daily_total_tokens > 0, (
+        "expected --no-sync rebuild to read existing cached entries"
+    )
