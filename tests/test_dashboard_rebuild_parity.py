@@ -16,14 +16,35 @@ real ingest — which is exactly the "8-10 → 1" story the change lands.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import sqlite3
 import sys
+from zoneinfo import ZoneInfo
 
 from conftest import load_script, redirect_paths  # type: ignore
 
 
 NOW_UTC = dt.datetime(2026, 7, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+UTC_TZ = ZoneInfo("Etc/UTC")
+
+
+def _sync_kwargs(fn):
+    """Kwargs that activate the Group A cache the way the sync thread does.
+
+    The sync-thread rebuild (`_tui_build_snapshot`) opts a builder into the
+    shared Group A cache via an explicit `use_group_a_cache=True` — NOT via
+    `skip_sync` (which the off-sync-thread share-period-override path also
+    sets). Resolving the flag by signature introspection keeps this file's
+    cache-active call sites correct across the API change: it returns the
+    explicit opt-in once the builders grow the parameter, and an empty dict
+    (falling back to the historical `skip_sync`-only gate) before then, so
+    the interleave regression test below reproduces RED on the pre-fix code
+    and passes GREEN once the dedicated signal lands.
+    """
+    if "use_group_a_cache" in inspect.signature(fn).parameters:
+        return {"use_group_a_cache": True}
+    return {}
 
 
 def _asst_line(uuid, msg_id, req_id, text, *, ts, model="claude-opus-4-8"):
@@ -384,7 +405,8 @@ def _build_daily(ns, stats_conn, *, enabled, display_tz=None):
     dash._GROUP_A_CACHE_ENABLED = enabled
     try:
         return ns["_dashboard_build_daily_panel"](
-            stats_conn, NOW_UTC, n=30, skip_sync=True, display_tz=display_tz
+            stats_conn, NOW_UTC, n=30, skip_sync=True,
+            use_group_a_cache=True, display_tz=display_tz
         )
     finally:
         dash._GROUP_A_CACHE_ENABLED = prev
@@ -426,14 +448,16 @@ def test_daily_panel_warm_new_current_entry(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True,
+                                           use_group_a_cache=True)
         # New entry in the CURRENT day (07-04); re-ingest.
         _seed_multiday_jsonl(tmp_path, extra=[
             ("w1", "wm", "wr", "z", "2026-07-04T10:30:00Z", "claude-sonnet-4-5"),
         ])
         _prime_cache(ns)
         # Warm build reuses the module cache (no reset).
-        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True,
+                                                  use_group_a_cache=True)
         # From-scratch on the same post-insert DB.
         wide = _build_daily(ns, stats, enabled=False)
         assert warm == wide, "warm rebuild must equal from-scratch after a current-day entry"
@@ -453,7 +477,8 @@ def test_daily_panel_late_ingest_recomputes_past_day(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        cold = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        cold = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True,
+                                                  use_group_a_cache=True)
         cold_0701 = next(r for r in cold if r.date == "2026-07-01")
         # Late ingest: a NEW row (new id) with an OLD event time in a PAST day
         # that is within the current week (07-01). The past bucket must update.
@@ -461,7 +486,8 @@ def test_daily_panel_late_ingest_recomputes_past_day(monkeypatch, tmp_path):
             ("l1", "lm", "lr", "late", "2026-07-01T15:00:00Z", "claude-sonnet-4-5"),
         ])
         _prime_cache(ns)
-        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True)
+        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True,
+                                                  use_group_a_cache=True)
         warm_0701 = next(r for r in warm if r.date == "2026-07-01")
         assert warm_0701.cost_usd > cold_0701.cost_usd, (
             "the late-ingested past day must be recomputed (cost grew)"
@@ -510,7 +536,8 @@ def _build_monthly(ns, stats_conn, *, enabled, display_tz=None):
     dash._GROUP_A_CACHE_ENABLED = enabled
     try:
         return ns["_dashboard_build_monthly_periods"](
-            stats_conn, NOW_UTC, n=12, skip_sync=True, display_tz=display_tz
+            stats_conn, NOW_UTC, n=12, skip_sync=True,
+            use_group_a_cache=True, display_tz=display_tz
         )
     finally:
         dash._GROUP_A_CACHE_ENABLED = prev
@@ -552,13 +579,15 @@ def test_monthly_current_delta_sees_prior_cached_month(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                               use_group_a_cache=True)
         # New entry in the CURRENT month (2026-07); re-ingest.
         _seed_multimonth_jsonl(tmp_path, extra=[
             ("wm", "wmm", "wmr", "z", "2026-07-04T09:00:00Z", "claude-opus-4-8"),
         ])
         _prime_cache(ns)
-        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                      use_group_a_cache=True)
         wide = _build_monthly(ns, stats, enabled=False)
         assert warm == wide, "warm monthly rebuild must equal from-scratch"
         cur = next(r for r in warm if r.is_current)
@@ -581,14 +610,16 @@ def test_monthly_late_ingest_recomputes_past_month(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        cold = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        cold = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                      use_group_a_cache=True)
         cold_apr = next(r for r in cold if r.label == "2026-04")
         # Late ingest in a PAST month (2026-04); re-ingest.
         _seed_multimonth_jsonl(tmp_path, extra=[
             ("lm", "lmm", "lmr", "late", "2026-04-20T12:00:00Z", "claude-opus-4-8"),
         ])
         _prime_cache(ns)
-        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm = ns["_dashboard_build_monthly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                      use_group_a_cache=True)
         warm_apr = next(r for r in warm if r.label == "2026-04")
         assert warm_apr.cost_usd > cold_apr.cost_usd, (
             "the late-ingested past month must be recomputed (cost grew)"
@@ -642,7 +673,7 @@ def _build_weekly(ns, stats_conn, *, enabled):
     dash._GROUP_A_CACHE_ENABLED = enabled
     try:
         return ns["_dashboard_build_weekly_periods"](
-            stats_conn, NOW_UTC, n=12, skip_sync=True
+            stats_conn, NOW_UTC, n=12, skip_sync=True, use_group_a_cache=True
         )
     finally:
         dash._GROUP_A_CACHE_ENABLED = prev
@@ -685,12 +716,14 @@ def test_weekly_warm_current_entry(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                              use_group_a_cache=True)
         _seed_multiweek_jsonl(tmp_path, extra=[
             ("ww", "wkw", "wrw", "z", "2026-07-03T09:00:00Z", "claude-opus-4-8"),
         ])
         _prime_cache(ns)
-        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                     use_group_a_cache=True)
         wide = _build_weekly(ns, stats, enabled=False)
         assert warm == wide, "warm weekly rebuild must equal from-scratch"
     finally:
@@ -709,13 +742,15 @@ def test_weekly_late_ingest_past_week(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        cold = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        cold = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                     use_group_a_cache=True)
         # Late ingest into a PAST week (mid-June).
         _seed_multiweek_jsonl(tmp_path, extra=[
             ("wl", "wkl", "wrl", "late", "2026-06-16T14:00:00Z", "claude-opus-4-8"),
         ])
         _prime_cache(ns)
-        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                     use_group_a_cache=True)
         wide = _build_weekly(ns, stats, enabled=False)
         assert warm == wide, "late-ingest weekly rebuild must equal from-scratch"
         assert _weekly_total(warm) > _weekly_total(cold), (
@@ -740,7 +775,8 @@ def test_weekly_stats_change_full_invalidate(monkeypatch, tmp_path):
         sc.reset_group_a_state()
         dash = sys.modules["_cctally_dashboard"]
         dash._GROUP_A_CACHE_ENABLED = True
-        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                              use_group_a_cache=True)
         # Insert a weekly_usage_snapshot overlay for a covered week — NO new
         # session_entries row. The extra-signature leg must move → full
         # invalidate → recompute.
@@ -752,11 +788,212 @@ def test_weekly_stats_change_full_invalidate(monkeypatch, tmp_path):
             "'2026-06-29T00:00:00+00:00', '2026-07-06T00:00:00+00:00', 42.0, '{}')"
         )
         stats.commit()
-        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True,
+                                                     use_group_a_cache=True)
         wide = _build_weekly(ns, stats, enabled=False)
         assert warm == wide, (
             "a weekly_usage_snapshots change (no new entry) must recompute "
             "the affected weeks — cached == from-scratch"
         )
     finally:
+        stats.close()
+
+
+# ===========================================================================
+# Bundle-2 review — share-period-override must NOT pollute the shared Group A
+# cache with a partial past bucket.
+#
+# `_share_apply_period_override` rebuilds daily/monthly/weekly on an HTTP
+# handler thread with a shifted (PAST) `now_override` and `skip_sync=True`.
+# When the Group A cache activated on `skip_sync=True` (the pre-fix gate),
+# that off-sync-thread caller shared the SAME module-level `_GROUP_A_CACHE`
+# as the sync thread: the bucket that is *current relative to now_override*
+# was recomputed clamped to that past instant → a PARTIAL aggregate → cached
+# under a real PAST-period label. The next sync tick then served that
+# truncated bucket as a "clean past bucket" → the live dashboard showed a
+# truncated past day/week/month.
+#
+# These tests INTERLEAVE a share-override build at a PAST `now` with a
+# sync-thread rebuild at the real `now` WITHOUT resetting the cache between
+# them (modelling the real shared-process interleave) and assert the sync
+# rebuild's past bucket is byte-identical to a from-scratch build. The fix
+# gates the cache on a dedicated `use_group_a_cache` signal that ONLY the
+# sync-thread rebuild sets — so the share path never touches the cache.
+# ===========================================================================
+
+
+def _share_build_daily(ns, stats_conn, now_override, *, display_tz):
+    """Mirror `_share_apply_period_override`'s daily invocation exactly:
+    `skip_sync=True`, a shifted `now`, and NO `use_group_a_cache` opt-in."""
+    return ns["_dashboard_build_daily_panel"](
+        stats_conn, now_override, n=30, skip_sync=True, display_tz=display_tz
+    )
+
+
+def _sync_build_daily(ns, stats_conn, *, display_tz):
+    """Mirror the sync thread's daily invocation (cache-active)."""
+    fn = ns["_dashboard_build_daily_panel"]
+    return fn(stats_conn, NOW_UTC, n=30, skip_sync=True,
+              display_tz=display_tz, **_sync_kwargs(fn))
+
+
+def test_daily_share_override_does_not_pollute_sync_cache(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    dash = sys.modules["_cctally_dashboard"]
+    try:
+        sc.reset_group_a_state()
+        dash._GROUP_A_CACHE_ENABLED = True
+        # SHARE PATH: a PAST instant that splits the 07-03 day BETWEEN its two
+        # entries (11:00 and 11:30). Pinning display_tz to UTC keeps the day
+        # bucket + the split deterministic regardless of host tz.
+        past = dt.datetime(2026, 7, 3, 11, 15, 0, tzinfo=dt.timezone.utc)
+        _share_build_daily(ns, stats, past, display_tz=UTC_TZ)
+        # SYNC PATH at the real NOW — same shared namespace, NO reset between.
+        # Pre-fix: reads the truncated 07-03 bucket the share build cached.
+        sync_rows = _sync_build_daily(ns, stats, display_tz=UTC_TZ)
+        sync_0703 = next(r for r in sync_rows if r.date == "2026-07-03")
+        # From-scratch reference (fresh cache, cache path disabled).
+        wide = _build_daily(ns, stats, enabled=False, display_tz=UTC_TZ)
+        wide_0703 = next(r for r in wide if r.date == "2026-07-03")
+        # Non-vacuity: 07-03 genuinely has data on both sides of the split, so
+        # a truncated bucket is strictly cheaper than the full one.
+        assert wide_0703.cost_usd > 0
+        assert sync_0703.cost_usd == wide_0703.cost_usd, (
+            "share-override build at a PAST now must not pollute the sync "
+            "cache with a truncated past-day bucket (07-03 lost its 11:30 "
+            f"entry): sync={sync_0703.cost_usd} wide={wide_0703.cost_usd}"
+        )
+        assert sync_rows == wide, "sync rebuild must equal from-scratch"
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = True
+        stats.close()
+
+
+def _share_build_monthly(ns, stats_conn, now_override, *, display_tz):
+    return ns["_dashboard_build_monthly_periods"](
+        stats_conn, now_override, n=12, skip_sync=True, display_tz=display_tz
+    )
+
+
+def _sync_build_monthly(ns, stats_conn, *, display_tz):
+    fn = ns["_dashboard_build_monthly_periods"]
+    return fn(stats_conn, NOW_UTC, n=12, skip_sync=True,
+              display_tz=display_tz, **_sync_kwargs(fn))
+
+
+def test_monthly_share_override_does_not_pollute_sync_cache(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    dash = sys.modules["_cctally_dashboard"]
+    try:
+        sc.reset_group_a_state()
+        dash._GROUP_A_CACHE_ENABLED = True
+        # SHARE PATH: a PAST instant that splits 2026-04 BETWEEN its two
+        # entries (04-05 10:00 and 04-06 10:30).
+        past = dt.datetime(2026, 4, 5, 12, 0, 0, tzinfo=dt.timezone.utc)
+        _share_build_monthly(ns, stats, past, display_tz=UTC_TZ)
+        # SYNC PATH at the real NOW — same shared namespace, NO reset between.
+        sync_rows = _sync_build_monthly(ns, stats, display_tz=UTC_TZ)
+        sync_apr = next(r for r in sync_rows if r.label == "2026-04")
+        wide = _build_monthly(ns, stats, enabled=False, display_tz=UTC_TZ)
+        wide_apr = next(r for r in wide if r.label == "2026-04")
+        assert wide_apr.cost_usd > 0
+        assert sync_apr.cost_usd == wide_apr.cost_usd, (
+            "share-override build must not pollute the sync cache with a "
+            f"truncated past-month bucket: sync={sync_apr.cost_usd} "
+            f"wide={wide_apr.cost_usd}"
+        )
+        assert sync_rows == wide, "sync rebuild must equal from-scratch"
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = True
+        stats.close()
+
+
+def _share_build_weekly(ns, stats_conn, now_override):
+    return ns["_dashboard_build_weekly_periods"](
+        stats_conn, now_override, n=12, skip_sync=True
+    )
+
+
+def _sync_build_weekly(ns, stats_conn):
+    fn = ns["_dashboard_build_weekly_periods"]
+    return fn(stats_conn, NOW_UTC, n=12, skip_sync=True, **_sync_kwargs(fn))
+
+
+def test_weekly_share_override_does_not_pollute_sync_cache(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    dash = sys.modules["_cctally_dashboard"]
+    try:
+        # Discover the real subscription-week boundaries so the reproduction
+        # is robust to the env's default week-start. Find a PAST week (ends
+        # before NOW) that carries ≥2 session entries, then pick a now_override
+        # strictly between its earliest and latest entry so the share build
+        # clamps that week to a partial aggregate.
+        conn = ns["open_db"]()
+        try:
+            weeks = ns["_compute_subscription_weeks"](
+                conn, NOW_UTC - dt.timedelta(days=7 * 13), NOW_UTC
+            )
+        finally:
+            conn.close()
+        parse = ns["parse_iso_datetime"]
+        entry_times = [
+            dt.datetime(2026, 6, 6, 8, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6, 15, 9, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6, 16, 9, 30, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6, 24, 10, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 7, 1, 11, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 7, 2, 11, 30, tzinfo=dt.timezone.utc),
+        ]
+        target_label = None
+        past = None
+        for w in weeks:
+            s = parse(w.start_ts, "week.start_ts")
+            e = parse(w.end_ts, "week.end_ts")
+            if e >= NOW_UTC:
+                continue  # not a fully-past week
+            in_week = sorted(t for t in entry_times if s <= t < e)
+            if len(in_week) >= 2 and in_week[0] < in_week[-1]:
+                target_label = w.start_date.isoformat()
+                # midpoint strictly between first and last entry of the week
+                past = in_week[0] + (in_week[-1] - in_week[0]) / 2
+                break
+        assert target_label is not None and past is not None, (
+            "fixture must contain a fully-past subscription week with ≥2 "
+            "entries spanning a mid-point"
+        )
+
+        sc.reset_group_a_state()
+        dash._GROUP_A_CACHE_ENABLED = True
+        # SHARE PATH at the PAST midpoint → clamps `target_label` week partial.
+        _share_build_weekly(ns, stats, past)
+        # SYNC PATH at the real NOW — same shared namespace, NO reset between.
+        sync_rows = _sync_build_weekly(ns, stats)
+        wide = _build_weekly(ns, stats, enabled=False)
+        # Compare the whole list (the polluted week would show a lower cost).
+        assert sync_rows == wide, (
+            "share-override build at a PAST now must not pollute the sync "
+            "cache with a truncated past-week bucket — sync rebuild must "
+            "equal from-scratch"
+        )
+        assert _weekly_total(wide) > 0
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = True
         stats.close()

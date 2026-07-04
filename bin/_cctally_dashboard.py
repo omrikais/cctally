@@ -2589,6 +2589,7 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
                                      now_utc: "dt.datetime",
                                      *, n: int = 12,
                                      skip_sync: bool = False,
+                                     use_group_a_cache: bool = False,
                                      display_tz: "ZoneInfo | None" = None) -> "list[MonthlyPeriodRow]":
     """Latest n calendar months as MonthlyPeriodRow, newest-first.
 
@@ -2620,14 +2621,18 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
     # #268 Group A cache: assemble the per-month BucketUsage list through the
     # module cache (recompute only the current + watermark-dirty months;
     # serve immutable past months from memory) and hand it to
-    # build_monthly_view as aggregated_override. Only on the pure-read
-    # (skip_sync=True) path; a skip_sync=False caller falls through to the
-    # syncing wide fetch. Also falls back when disabled / cache DB unavailable.
+    # build_monthly_view as aggregated_override. Gated on ``use_group_a_cache``
+    # — set ONLY by the sync-thread rebuild, never by ``skip_sync`` (the
+    # share-period-override path also runs ``skip_sync=True`` but on an HTTP
+    # thread with a shifted PAST now, which would pollute the shared cache with
+    # a partial past-month bucket — see ``_dashboard_build_daily_panel``). Every
+    # non-sync-thread caller falls through to the from-scratch wide fetch. Also
+    # falls back when disabled / cache DB unavailable.
     aggregated_override = (
         _group_a_monthly_buckets(
             now_utc, n=n, range_start=range_start, display_tz=display_tz,
         )
-        if skip_sync else None
+        if use_group_a_cache else None
     )
     c = _cctally()
     if aggregated_override is None:
@@ -2741,7 +2746,8 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
 def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                                     now_utc: "dt.datetime",
                                     *, n: int = 12,
-                                    skip_sync: bool = False) -> "list[WeeklyPeriodRow]":
+                                    skip_sync: bool = False,
+                                    use_group_a_cache: bool = False) -> "list[WeeklyPeriodRow]":
     """Latest n subscription weeks as WeeklyPeriodRow, newest-first.
 
     Thin builder-using prelude + Bug-K pre-credit synthesis on top of
@@ -2779,13 +2785,20 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     # #268 Group A cache: assemble the per-week BucketUsage list through the
     # module cache (recompute only the current + watermark-dirty weeks; serve
     # immutable past weeks from memory) and hand it to build_weekly_view as
-    # aggregated_override. Pure-read (skip_sync=True) path only; a
-    # skip_sync=False caller falls through to the syncing wide fetch, as does
-    # the cache-disabled / cache-unavailable case. The overlay + Bug-K + delta
-    # + is_current presentation always reruns fresh over the assembled list.
+    # aggregated_override. Gated on ``use_group_a_cache`` — set ONLY by the
+    # sync-thread rebuild, never by ``skip_sync``. The share-period-override
+    # path also runs ``skip_sync=True`` but on an HTTP thread with a shifted
+    # PAST now; routing it through the shared cache would clamp the
+    # now_override-current week to a partial aggregate and cache it under a real
+    # PAST-week label (weekly is the worst case — its extra_signature is
+    # stats-only, so nothing invalidates the polluted week until a data change
+    # lands). Every non-sync-thread caller falls through to the from-scratch
+    # wide fetch, as does the cache-disabled / cache-unavailable case. The
+    # overlay + Bug-K + delta + is_current presentation always reruns fresh over
+    # the assembled list.
     aggregated_override = (
         _group_a_weekly_buckets(conn, now_utc, weeks=weeks)
-        if skip_sync else None
+        if use_group_a_cache else None
     )
     c = _cctally()
     if aggregated_override is None:
@@ -3310,6 +3323,7 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
                                   *,
                                   n: int = 30,
                                   skip_sync: bool = False,
+                                  use_group_a_cache: bool = False,
                                   display_tz: "ZoneInfo | None" = None) -> "list[DailyPanelRow]":
     """Latest n display-tz dates as DailyPanelRow, newest-first.
 
@@ -3349,13 +3363,21 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     # module-level cache (recompute only the current + watermark-dirty days;
     # serve immutable past days from memory) and hand it to build_daily_view
     # as ``aggregated_override`` so every downstream derivation stays
-    # single-sourced. Only taken on the pure-read (skip_sync=True) path — a
-    # skip_sync=False caller wants a fresh ingest, so fall through to the
-    # syncing wide fetch. Also falls back when the cache is disabled (parity
-    # tests) or the cache DB can't be opened.
+    # single-sourced. Gated on ``use_group_a_cache`` — set ONLY by the
+    # sync-thread rebuild (``_tui_build_snapshot``), which runs on a
+    # process-consistent ``now``. NOT gated on ``skip_sync``: the
+    # share-period-override path (``_share_apply_period_override``) also runs
+    # ``skip_sync=True`` but on an HTTP handler thread with a shifted (PAST)
+    # ``now_override`` — routing it through the shared module cache would clamp
+    # the now_override-current bucket to a partial aggregate and cache it under
+    # a real PAST-period label, truncating the live dashboard's past day (and
+    # would mutate the module cache unlocked, off the sync thread). So every
+    # non-sync-thread caller (default ``use_group_a_cache=False``) takes the
+    # original from-scratch wide fetch. Also falls back when the cache is
+    # disabled (parity tests) or the cache DB can't be opened.
     aggregated_override = (
         _group_a_daily_buckets(now_utc, n=n, display_tz=display_tz)
-        if skip_sync else None
+        if use_group_a_cache else None
     )
 
     c = _cctally()

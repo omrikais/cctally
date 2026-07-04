@@ -1983,7 +1983,8 @@ def _tui_build_snapshot(
         weekly_total_tokens = 0
         try:
             weekly_periods = _dashboard_build_weekly_periods(
-                conn, now_utc, n=12, skip_sync=skip_sync
+                conn, now_utc, n=12, skip_sync=skip_sync,
+                use_group_a_cache=True,
             )
             # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
             # so the envelope stays byte-stable with the pre-fix ``0.0`` shape
@@ -2006,6 +2007,7 @@ def _tui_build_snapshot(
         try:
             monthly_periods = _dashboard_build_monthly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync,
+                use_group_a_cache=True,
                 display_tz=_build_display_tz,
             )
             monthly_total_cost_usd = stable_sum(
@@ -2049,6 +2051,7 @@ def _tui_build_snapshot(
         try:
             daily_panel = _dashboard_build_daily_panel(
                 conn, now_utc, n=30, skip_sync=skip_sync,
+                use_group_a_cache=True,
                 display_tz=_build_display_tz,
             )
             daily_total_cost_usd = stable_sum(
