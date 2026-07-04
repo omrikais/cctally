@@ -458,11 +458,20 @@ def _week_ref_has_reset_event(
     return row is not None
 
 
-def _compute_cost_for_weekref(ref: WeekRef) -> float | None:
+def _compute_cost_for_weekref(
+    ref: WeekRef, *, skip_sync: bool = False
+) -> float | None:
     """Live-compute USD cost over `ref`'s (possibly reset-adjusted) range
     straight from session_entries. Mirrors what cmd_sync_week writes into
     weekly_cost_snapshots, minus the cache write — used for reset-affected
     weeks where the cached range disagrees with the effective range.
+
+    ``skip_sync`` (default ``False``) is threaded to ``_sum_cost_for_range``
+    so the caller can read the cache without triggering a JSONL ingest.
+    The #268 dashboard/TUI sync-thread rebuild passes ``True`` (it ingests
+    once at the top of the rebuild); ``build_trend_view`` calls this once per
+    reset-event week, so without the flag each reset week re-globbed the whole
+    ``~/.claude/projects`` tree — the CPU peg the sync-once refactor removes.
     """
     c = _cctally()
     if not ref.week_start_at or not ref.week_end_at:
@@ -474,7 +483,7 @@ def _compute_cost_for_weekref(ref: WeekRef) -> float | None:
         return None
     if end <= start:
         return 0.0
-    return c._sum_cost_for_range(start, end, mode="auto")
+    return c._sum_cost_for_range(start, end, mode="auto", skip_sync=skip_sync)
 
 
 def _apply_overlap_clamp_to_weekrefs(refs: list[WeekRef]) -> list[WeekRef]:

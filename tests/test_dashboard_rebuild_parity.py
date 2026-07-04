@@ -136,6 +136,116 @@ def test_no_sync_never_ingests_but_still_reads(monkeypatch, tmp_path):
     )
 
 
+def _seed_reset_event_week(ns, stats_conn):
+    """Seed weekly_usage_snapshots for a handful of weeks, then attach a
+    reset event to one of them so ``_week_ref_has_reset_event`` returns True.
+
+    The reset-event branch of ``build_trend_view`` is the one that calls
+    ``_compute_cost_for_weekref`` → ``_sum_cost_for_range`` → ``sync_cache``.
+    The golden fixtures (and ``test_sync_cache_called_once_per_rebuild``)
+    have NO reset-event weeks, so that redundant-sync path never fired in a
+    test — this helper closes that fixture gap.
+
+    Keying the event off the *canonical* ``week_end_at`` (discovered via a
+    ``get_recent_weeks`` probe) rather than the raw inserted string dodges the
+    ``_canonicalize_optional_iso`` normalization that would otherwise make the
+    hand-written ``new_week_end_at`` fail to match the ref boundary.
+    """
+    # A few clean, monotonically-increasing weeks so the historical backfill
+    # (invoked by open_db) never synthesizes an *extra* reset of its own.
+    weeks = [
+        ("2026-06-08", "2026-06-15", 20.0),
+        ("2026-06-15", "2026-06-22", 40.0),
+        ("2026-06-22", "2026-06-29", 60.0),
+        ("2026-06-29", "2026-07-06", 80.0),
+    ]
+    for ws_d, we_d, pct in weeks:
+        stats_conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, payload_json) "
+            "VALUES (?,?,?,?,?,?,'{}')",
+            (ws_d + "T12:00:00Z", ws_d, we_d,
+             ws_d + "T00:00:00+00:00", we_d + "T00:00:00+00:00", pct),
+        )
+    stats_conn.commit()
+
+    # Probe the canonical boundaries BEFORE the event exists, then pin the
+    # reset onto the most-recent week so it lands in BOTH the n=8 trend panel
+    # window and the n=12 weekly-history window.
+    refs = ns["get_recent_weeks"](stats_conn, 12)
+    target = next(
+        r for r in refs if r.week_start_at and r.week_end_at
+    )
+    # A standard post-reset event: new_week_end_at == the week's canonical end
+    # rewrites that ref's week_start_at to `effective`, so
+    # `effective IN (week_start_at, week_end_at)` holds → has_reset_event True.
+    # old_week_end_at is a distinct sentinel (NOT equal to effective, so this
+    # is not classified as an in-place credit and no ref is split/dropped).
+    effective = target.week_start_at[:11] + "06:00:00+00:00"
+    stats_conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc) "
+        "VALUES (?,?,?,?)",
+        (effective, "2020-01-01T00:00:00+00:00", target.week_end_at, effective),
+    )
+    stats_conn.commit()
+    return target, effective
+
+
+def test_sync_cache_called_once_per_rebuild_with_reset_event_week(
+    monkeypatch, tmp_path
+):
+    """A rebuild whose trend window contains a RESET-EVENT week must STILL
+    ingest exactly ONCE (#268 scale-verification finding).
+
+    ``build_trend_view`` live-recomputes cost for reset-affected weeks via
+    ``_compute_cost_for_weekref`` → ``_sum_cost_for_range``. Before the
+    ``skip_sync`` thread-through, that helper ran a full ``sync_cache``
+    (10K-file glob at scale) once per reset-event week — and it fires from
+    BOTH the n=8 trend-panel call and the n=12 weekly-history call, so a
+    single reset week costs 2 redundant syncs on top of the intended
+    top-of-rebuild ingest. The plain golden fixtures have no reset weeks, so
+    ``test_sync_cache_called_once_per_rebuild`` passed (==1) despite the bug;
+    this fixture exercises the path and pins the count at 1.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_jsonl(tmp_path)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    try:
+        target, effective = _seed_reset_event_week(ns, stats)
+        # Guard: the reset-event branch is actually reachable for this week —
+        # otherwise the test would be vacuous (it would pass at ==1 without
+        # ever touching _compute_cost_for_weekref).
+        adjusted = ns["get_recent_weeks"](stats, 12)
+        assert any(
+            ns["_week_ref_has_reset_event"](stats, r) for r in adjusted
+        ), "fixture must produce at least one reset-event week"
+    finally:
+        stats.close()
+
+    calls = _install_sync_spy(ns, monkeypatch)
+
+    snap = ns["_tui_build_snapshot"](now_utc=NOW_UTC, skip_sync=False)
+
+    assert snap is not None
+    # The trend sub-build must not have errored out (else the reset path never
+    # ran and the count would be a false 1). ``last_sync_error`` is the
+    # "; "-joined error string (or None).
+    assert "trend" not in (snap.last_sync_error or ""), (
+        f"trend/weekly-history sub-build errored: {snap.last_sync_error}"
+    )
+    assert calls["n"] == 1, (
+        f"expected exactly 1 sync_cache per rebuild even with a reset-event "
+        f"week, got {calls['n']} (pre-fix: build_trend_view's "
+        "_compute_cost_for_weekref re-globs per reset week × 2 call sites)"
+    )
+
+
 # ===========================================================================
 # M2 Task 2.1 — the cached-bucket recompute helper (spec §5.1)
 #

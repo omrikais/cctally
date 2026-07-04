@@ -758,7 +758,7 @@ class TrendView:
     display_tz_label: str = ""
 
 
-def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
+def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False):
     """Build a ``TrendView`` of the last ``n`` subscription weeks
     (spec §5.4).
 
@@ -769,6 +769,17 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
     ``_compute_cost_for_weekref(week_ref)``. This matches the existing
     cmd_report path (``bin/cctally:~7969-7979``) and ``_tui_build_trend``
     (``bin/_cctally_tui.py:~1515-1524``).
+
+    ``skip_sync`` (default ``False``) threads through to
+    ``_compute_cost_for_weekref`` → ``_sum_cost_for_range`` so the
+    reset-event live-cost path can read the cache WITHOUT running a
+    JSONL ingest. The #268 dashboard/TUI sync-thread rebuild sets it
+    ``True`` (it ingests exactly once at the top of the rebuild); every
+    other caller — ``cmd_report``, ``_tui_build_trend`` panel, etc. —
+    keeps the default so their sync-on-read behavior is byte-identical.
+    At scale (~19 reset-event weeks over a 10K-file instance) the default
+    ran a full 10K-file glob PER reset week PER call site — the CPU peg
+    the #268 M1 sync-once refactor was meant to remove.
 
     Rows are emitted oldest-first (chronological); each row populates
     all 17 ``TuiTrendRow`` fields (7 historical + 10 extended).
@@ -849,7 +860,7 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None):
         )
         usage_captured_at = usage["captured_at_utc"] if usage else None
         if c._week_ref_has_reset_event(conn, week_ref):
-            cost_usd = c._compute_cost_for_weekref(week_ref)
+            cost_usd = c._compute_cost_for_weekref(week_ref, skip_sync=skip_sync)
             cost_captured_at = (
                 usage_captured_at if cost_usd is not None else None
             )

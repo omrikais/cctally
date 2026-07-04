@@ -1519,7 +1519,7 @@ def _tui_build_trend(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
     *,
-    skip_sync: bool = False,  # noqa: ARG001 — unused today, kept for API symmetry
+    skip_sync: bool = False,
     count: int = 8,
     display_tz: "ZoneInfo | None" = None,
 ) -> list[TuiTrendRow]:
@@ -1530,10 +1530,15 @@ def _tui_build_trend(
     ``bin/_lib_view_models.build_trend_view``. The TUI snapshot module
     consumes the first 7 ``TuiTrendRow`` fields and ignores the 10
     extended fields (which exist for cmd_report's JSON contract).
+
+    ``skip_sync`` threads into ``build_trend_view`` so the reset-event
+    live-cost path reads the cache without a JSONL ingest. The share
+    period-override handler (``_share_apply_period_override``) passes
+    ``skip_sync=True`` on an HTTP thread that must not glob (#268).
     """
     c = _cctally()
     view = c.build_trend_view(conn, now_utc=now_utc, n=max(1, count),
-                               display_tz=display_tz)
+                               display_tz=display_tz, skip_sync=skip_sync)
     return list(view.rows)
 
 
@@ -1572,7 +1577,7 @@ def _tui_build_weekly_history_view(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
     *,
-    skip_sync: bool = False,                # noqa: ARG001 — unused today, kept for API symmetry
+    skip_sync: bool = False,
     count: int = 12,
     display_tz: "ZoneInfo | None" = None,
 ):
@@ -1592,6 +1597,7 @@ def _tui_build_weekly_history_view(
     c = _cctally()
     return c.build_trend_view(
         conn, now_utc=now_utc, n=max(1, count), display_tz=display_tz,
+        skip_sync=skip_sync,
     )
 
 
@@ -2196,6 +2202,7 @@ def _tui_build_snapshot(
             c = _cctally()
             _trend_view = c.build_trend_view(
                 conn, now_utc=now_utc, n=8, display_tz=_build_display_tz,
+                skip_sync=skip_sync,
             )
             trend = list(_trend_view.rows)
             trend_avg_dpp = _trend_view.avg_dollars_per_pct
