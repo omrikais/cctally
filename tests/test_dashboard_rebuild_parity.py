@@ -1244,3 +1244,188 @@ def test_sessions_from_scratch_call_does_not_populate_cache(monkeypatch, tmp_pat
     )
     # And it still renders from-scratch.
     assert isinstance(rows, list)
+
+
+# ===========================================================================
+# M5 Task 5.1 — idle-path short-circuit + republish (spec §3, §7)
+#
+# When the composite data-version signature is unchanged and no wall-clock
+# day/week/month boundary rolled over, the dashboard rebuild reuses the prior
+# published snapshot's heavy period/session rows and re-patches ONLY the
+# time-derived fields (generated_at / last_sync_at) + the doctor payload on
+# TTL — running NO re-aggregation, so an idle dashboard sits near 0% CPU.
+# Dashboard-only (precompute_envelope=True) and sync-thread-only.
+# ===========================================================================
+
+
+def _spy_heavy_builders(monkeypatch):
+    """Count every heavy re-aggregation a full rebuild runs: the three Group A
+    period builders (each wraps `_aggregate_daily/_monthly/_weekly`) + the
+    sessions aggregator. The idle path must invoke NONE of them. All four are
+    resolved by `_tui_build_snapshot` through the `cctally` namespace shims, so
+    patching that dict intercepts the real calls."""
+    cd = sys.modules["cctally"].__dict__
+    calls = {"n": 0}
+    for _name in ("_dashboard_build_daily_panel",
+                  "_dashboard_build_monthly_periods",
+                  "_dashboard_build_weekly_periods",
+                  "_aggregate_claude_sessions"):
+        _real = cd[_name]
+
+        def _spy(*a, _real=_real, **k):
+            calls["n"] += 1
+            return _real(*a, **k)
+
+        monkeypatch.setitem(cd, _name, _spy)
+    return calls
+
+
+def _spy_doctor_gather_local(monkeypatch):
+    calls = {"n": 0}
+    real = sys.modules["cctally"].doctor_gather_state
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setitem(sys.modules["cctally"].__dict__, "doctor_gather_state", spy)
+    return calls
+
+
+def test_idle_rebuild_reuses_rows_and_skips_reaggregation(monkeypatch, tmp_path):
+    """Two rebuilds with no DB change: the second takes the IDLE path — no
+    heavy builder / aggregator runs, the prior snapshot's rows are reused
+    verbatim, and only the time-derived fields are re-patched (spec §3)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    _seed_multiday_jsonl(tmp_path)
+
+    # First rebuild (cold/full): ingest + aggregate, store the dispatch state.
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert snap1.daily_panel and snap1.weekly_periods, "cold build has data"
+
+    # No DB change → the second rebuild must be IDLE.
+    calls = _spy_heavy_builders(monkeypatch)
+    later = NOW_UTC + dt.timedelta(seconds=5)
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] == 0, (
+        f"idle rebuild must skip all re-aggregation, ran {calls['n']} heavy builds"
+    )
+    # Heavy rows reused verbatim (shared reference — copied, not rebuilt).
+    assert snap2.daily_panel is snap1.daily_panel
+    assert snap2.weekly_periods is snap1.weekly_periods
+    assert snap2.monthly_periods is snap1.monthly_periods
+    assert snap2.sessions is snap1.sessions
+    # Fresh DataSnapshot object; time-derived fields re-patched.
+    assert snap2 is not snap1
+    assert snap2.generated_at == later
+    assert snap2.last_sync_at is not None
+    # Doctor carried (present); within TTL it is not re-gathered.
+    assert snap2.doctor_payload is not None
+
+
+def test_idle_rebuild_recomputes_after_new_usage(monkeypatch, tmp_path):
+    """A new entry advances the composite signature → the next rebuild is NOT
+    idle: the heavy builders run and the new usage lands (non-vacuity guard for
+    the idle short-circuit)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    _seed_multiday_jsonl(tmp_path)
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    base_cost = snap1.daily_total_cost_usd
+
+    # New current-day usage → signature advances → full rebuild.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("n1", "nm", "nr", "new", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
+    ])
+    calls = _spy_heavy_builders(monkeypatch)
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC + dt.timedelta(seconds=5), skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] >= 4, "a signature change must trigger a full rebuild"
+    assert snap2.daily_total_cost_usd > base_cost, "new usage must land"
+    assert snap2.daily_panel is not snap1.daily_panel, "fresh rows built"
+
+
+def test_idle_rebuild_refreshes_doctor_on_ttl(monkeypatch, tmp_path):
+    """The doctor TTL is an INDEPENDENT invalidation (Codex F6): on a long-idle
+    dashboard, once the doctor memo TTL elapses an idle tick still re-gathers
+    doctor and republishes, so the doctor chip never freezes."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    _seed_multiday_jsonl(tmp_path)
+    calls = _spy_doctor_gather_local(monkeypatch)
+
+    # Full build gathers doctor once.
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] == 1
+    # Idle within TTL → memo hit, no re-gather.
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC + dt.timedelta(seconds=5), skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] == 1, "within the TTL the idle tick must not re-fork doctor"
+    # Idle PAST the TTL → doctor refreshes on the idle tick.
+    past_ttl = NOW_UTC + dt.timedelta(seconds=sc.DOCTOR_MEMO_TTL_S + 5)
+    snap3 = ns["_tui_build_snapshot"](
+        now_utc=past_ttl, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] == 2, "an idle tick past the doctor TTL must re-gather doctor"
+    assert snap3.doctor_payload is not None
+
+
+def test_idle_path_off_for_tui_rebuild(monkeypatch, tmp_path):
+    """The idle short-circuit is dashboard-only: a TUI-path rebuild
+    (precompute_envelope=False) never consults or stores the dispatch memo, so
+    it always does a full build (no regression to the terminal TUI)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    _seed_multiday_jsonl(tmp_path)
+
+    ns["_tui_build_snapshot"](now_utc=NOW_UTC, skip_sync=False)
+    # A TUI rebuild must not have stored dispatch state.
+    prior_sig, prior_snap = sc.dispatch_state()
+    assert prior_sig is None and prior_snap is None
+    # And the second TUI rebuild still runs the heavy builders (the three
+    # period builders always run on a non-idle rebuild; the sessions aggregator
+    # is skipped only because the session cache is warm with no new entries).
+    calls = _spy_heavy_builders(monkeypatch)
+    ns["_tui_build_snapshot"](now_utc=NOW_UTC + dt.timedelta(seconds=5), skip_sync=False)
+    assert calls["n"] >= 3, "TUI rebuild must not idle-short-circuit"

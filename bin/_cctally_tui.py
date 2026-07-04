@@ -2105,6 +2105,40 @@ def _tui_build_snapshot(
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
+        # ── Three-path dispatch — idle short-circuit (spec §3, #268 M5.1) ──
+        # Compute the composite data-version signature (cheap MAX(id) descents
+        # over cache.db + stats.db + the reset-event change-signal + the
+        # generation counter). When it is UNCHANGED versus the last published
+        # rebuild AND no wall-clock day/week/month boundary has rolled over,
+        # take the IDLE path: reuse the prior snapshot's heavy period/session
+        # rows and re-patch ONLY the time-derived fields + doctor-on-TTL, then
+        # return — NO re-aggregation, so an idle dashboard sits near 0% CPU.
+        # Dashboard-only (``precompute_envelope``) + sync-thread-only, mirroring
+        # the Group A / session cache gating; the shared ``(signature,
+        # snapshot)`` memo lives in ``_lib_snapshot_cache`` (single-writer here).
+        # The signature is computed AFTER the top-of-rebuild ingest so a fresh
+        # tail-ingested row is reflected before the idle decision is made.
+        dispatch_sig = None
+        if precompute_envelope:
+            try:
+                dispatch_sig = _tui_compute_dispatch_signature(conn)
+            except Exception as exc:
+                errors.append(f"dispatch-signature: {exc}")
+                dispatch_sig = None
+            if dispatch_sig is not None:
+                _sc = _cctally()._load_sibling("_lib_snapshot_cache")
+                prior_sig, prior_snap = _sc.dispatch_state()
+                if (prior_snap is not None and prior_sig is not None
+                        and dispatch_sig == prior_sig
+                        and not _snapshot_period_rolled_over(
+                            prior_snap, now_utc, _build_display_tz)):
+                    idle_snap = _tui_build_idle_snapshot(
+                        prior_snap, now_utc=now_utc,
+                        precompute_envelope=precompute_envelope,
+                        runtime_bind=runtime_bind, errors=errors,
+                    )
+                    _sc.store_dispatch_state(dispatch_sig, idle_snap)
+                    return idle_snap
         try:
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
@@ -2444,7 +2478,7 @@ def _tui_build_snapshot(
             except Exception as exc:
                 errors.append(f"envelope-precompute: {exc}")
 
-        return DataSnapshot(
+        snap = DataSnapshot(
             current_week=cw,
             forecast=fc,
             trend=trend,
@@ -2476,6 +2510,15 @@ def _tui_build_snapshot(
             doctor_payload=doctor_payload_block,
             envelope_precompute=envelope_precompute_block,
         )
+        # #268 M5.1: record (signature, snapshot) so the next dashboard tick can
+        # idle-short-circuit when nothing changed. Full-build path only sets it
+        # when the signature was computed (precompute_envelope); the TUI path
+        # never touches the dispatch memo.
+        if precompute_envelope and dispatch_sig is not None:
+            _cctally()._load_sibling("_lib_snapshot_cache").store_dispatch_state(
+                dispatch_sig, snap,
+            )
+        return snap
     finally:
         conn.close()
 
@@ -2554,6 +2597,101 @@ def _tui_precompute_envelope_config(raw_config: dict) -> dict:
         "update_state": update_state,
         "update_suppress": update_suppress,
     }
+
+
+def _tui_compute_dispatch_signature(stats_conn):
+    """Composite data-version signature for the three-path dispatch (#268 M5.1).
+
+    Cheap ``MAX(id)`` b-tree descents over cache.db + stats.db, the reset-event
+    change-signal, and the module generation counter (spec §3). ``stats_conn``
+    is the already-open stats.db connection the rebuild holds; a throwaway
+    cache.db connection is opened for the ``session_entries`` / ``codex`` legs.
+    ``compute_signature`` never raises (each leg degrades to 0 on a missing
+    table); a cache-open failure propagates so the caller skips the idle path
+    and does a full rebuild.
+    """
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+    cache_conn = c.open_cache_db()
+    try:
+        return sc.compute_signature(
+            cache_conn, stats_conn, generation=sc.current_generation(),
+        )
+    finally:
+        cache_conn.close()
+
+
+def _snapshot_period_rolled_over(prior, now_utc, display_tz):
+    """True if a day/week/month boundary was crossed since ``prior`` was built.
+
+    The idle short-circuit reuses ``prior``'s period rows, which is only valid
+    while the current day/week/month is unchanged (spec §3). A day change in the
+    display tz subsumes a month change (a new month starts on a new day), so
+    daily+monthly reduce to one day-label compare. Weekly rollover is checked
+    against the subscription week's absolute boundaries carried on
+    ``prior.current_week`` (reset-anchored UTC datetimes) — a week can roll at a
+    mid-day reset hour without the calendar day changing.
+
+    (The 5-hour block is a within-current-week surface whose countdown renders
+    live from the envelope's now; a 5h reset with zero new usage across a full
+    window on a truly-idle dashboard is out of scope for this guard — the next
+    real usage advances the signature and forces a full rebuild.)
+    """
+    prev = getattr(prior, "generated_at", None)
+    if prev is None:
+        return True
+
+    def _day(dtm):
+        # Day label in the resolved display tz — matches how the daily builder
+        # buckets (display tz, host-local when None). Not a user-facing render,
+        # only a same-day equality check.
+        localized = dtm.astimezone(display_tz) if display_tz is not None \
+            else dtm.astimezone()  # internal fallback: host-local intentional
+        return localized.strftime("%Y-%m-%d")
+
+    if _day(prev) != _day(now_utc):
+        return True
+    cw = getattr(prior, "current_week", None)
+    if cw is not None:
+        week_end = getattr(cw, "week_end_at", None)
+        week_start = getattr(cw, "week_start_at", None)
+        if week_end is not None and now_utc >= week_end:
+            return True
+        if week_start is not None and now_utc < week_start:
+            return True
+    return False
+
+
+def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
+                             runtime_bind, errors):
+    """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
+    time-derived fields + the doctor payload on TTL (spec §3 idle path).
+
+    ``dataclasses.replace`` builds a NEW ``DataSnapshot`` sharing ``prior``'s
+    immutable row objects (never mutated in place — Codex F7), so an SSE client
+    thread serializing the previously-published snapshot can't observe a torn
+    value. ``generated_at`` moves to ``now_utc`` (drives the envelope's display
+    block + the emitted timestamp); ``last_sync_at`` refreshes (the ingest ran,
+    so "synced Xs ago" resets); the doctor payload is refreshed through the TTL
+    memo so the doctor chip stays live on a long-idle dashboard (Codex F6). All
+    the wall-clock countdowns / freshness ages are computed from a LIVE now at
+    envelope-render time (the SSE loop passes its own ``now_utc`` /
+    ``time.monotonic()``), so nothing else needs patching here.
+    """
+    import time
+    doctor_payload = prior.doctor_payload
+    if precompute_envelope:
+        try:
+            doctor_payload = _tui_precompute_doctor_payload(now_utc, runtime_bind)
+        except Exception as exc:  # noqa: BLE001 — never crash the rebuild
+            errors.append(f"doctor-precompute: {exc}")
+    return dataclasses.replace(
+        prior,
+        generated_at=now_utc,
+        last_sync_at=time.monotonic(),
+        last_sync_error=("; ".join(errors) if errors else None),
+        doctor_payload=doctor_payload,
+    )
 
 
 def _tui_empty_snapshot(now_utc: dt.datetime) -> DataSnapshot:

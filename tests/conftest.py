@@ -145,6 +145,28 @@ def _restore_process_timezone():
             time.tzset()
 
 
+@pytest.fixture(autouse=True)
+def _reset_snapshot_dispatch_state():
+    """Clear the #268 idle-path (signature, snapshot) memo before each test.
+
+    ``_lib_snapshot_cache`` holds the last published dashboard snapshot + its
+    composite signature as process-global module state (the idle short-circuit).
+    The signature does not encode the DB path, so two tests with structurally
+    identical (e.g. empty) DBs produce the SAME signature — without this reset a
+    prior test's leftover snapshot could be idle-served into a later test's
+    first ``_tui_build_snapshot`` call, returning stale rows from a different
+    tmp DB. Resetting before every test isolates it; a no-op for the vast
+    majority of tests that never build a snapshot. Defensive import so a test
+    run that hasn't loaded the module yet is unaffected.
+    """
+    try:
+        import _lib_snapshot_cache as _sc  # bin/ is on sys.path (see top)
+        _sc.reset_dispatch_state()
+    except Exception:
+        pass
+    yield
+
+
 def load_script():
     """Execute the main script and return its globals dict.
 
