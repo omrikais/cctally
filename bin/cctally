@@ -814,6 +814,7 @@ _discover_codex_session_files = _cctally_cache._discover_codex_session_files
 IngestStats = _cctally_cache.IngestStats
 _progress_stderr = _cctally_cache._progress_stderr
 _ensure_session_files_row = _cctally_cache._ensure_session_files_row
+_acquire_cache_flock = _cctally_cache._acquire_cache_flock
 sync_cache = _cctally_cache.sync_cache
 backfill_conversation_messages = _cctally_cache.backfill_conversation_messages
 backfill_ai_titles = _cctally_cache.backfill_ai_titles

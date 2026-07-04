@@ -106,6 +106,7 @@ import os
 import pathlib
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
@@ -612,12 +613,36 @@ def _targeted_has_pending_global_work(conn) -> bool:
     return row is not None
 
 
+def _acquire_cache_flock(lock_fh, *, timeout):
+    """Acquire the exclusive cache flock on ``lock_fh``.
+
+    ``timeout is None`` -> a single non-blocking attempt (today's behavior
+    for routine auto-syncs): returns False immediately on contention.
+    ``timeout > 0`` -> retry ``LOCK_NB`` every ~0.2s until acquired or the
+    deadline elapses. Returns True iff the lock is held on return.
+
+    A retry-with-sleep loop, NOT a SIGALRM-based blocking LOCK_EX: the
+    dashboard runs its sync on a background thread, where Python signals
+    never fire, so an alarm timeout would silently never trip.
+    """
+    deadline = None if timeout is None else (time.monotonic() + timeout)
+    while True:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if deadline is None or time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+
 def sync_cache(
     conn: sqlite3.Connection,
     *,
     progress: Callable[[IngestStats], None] | None = None,
     rebuild: bool = False,
     only_paths: "set[str] | None" = None,
+    lock_timeout: "float | None" = None,
 ) -> IngestStats:
     """Read-through delta ingest. Acquires an exclusive fcntl.flock; if
     another process holds it, returns immediately with lock_contended=True
@@ -635,9 +660,7 @@ def sync_cache(
 
     lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
     try:
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             eprint("[cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
@@ -2429,6 +2452,7 @@ def sync_codex_cache(
     *,
     progress: Callable[[CodexIngestStats], None] | None = None,
     rebuild: bool = False,
+    lock_timeout: "float | None" = None,
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
@@ -2448,9 +2472,7 @@ def sync_codex_cache(
 
     lock_fh = open(_cctally_core.CACHE_LOCK_CODEX_PATH, "w")
     try:
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
