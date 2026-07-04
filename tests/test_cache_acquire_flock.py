@@ -1,7 +1,7 @@
 """_acquire_cache_flock: timeout=None is a single non-blocking attempt;
 timeout>0 retries until the deadline; returns True iff the lock is held."""
 from __future__ import annotations
-import fcntl, time, pathlib
+import fcntl, time
 import pytest
 from conftest import load_script, redirect_paths
 
@@ -13,7 +13,7 @@ def ns_paths(tmp_path, monkeypatch):
     return ns
 
 
-def test_non_blocking_returns_false_when_held(ns_paths, tmp_path):
+def test_non_blocking_returns_false_when_held(ns_paths):
     ns = ns_paths
     acquire = ns["_acquire_cache_flock"]
     lock_path = ns["_cctally_core"].CACHE_LOCK_PATH

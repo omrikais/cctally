@@ -482,6 +482,19 @@ class IngestStats:
                 and self.files_failed == 0)
 
 
+@dataclass
+class PruneResult:
+    """Outcome of _prune_orphaned_cache_entries: how much of the derived Claude
+    surface was removed for safely-orphaned source paths, plus the orphan paths
+    left in place (residual — a gate failed, so `--rebuild` is the escape hatch)
+    and whether the flock was contended (nothing mutated)."""
+    pruned_files: int = 0
+    pruned_entries: int = 0
+    pruned_messages: int = 0
+    residual_paths: "list[str]" = field(default_factory=list)
+    contended: bool = False
+
+
 def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
     """Default stderr progress callback. Every 200 files or when forced."""
     if not force and stats.files_processed % 200 != 0:
@@ -634,6 +647,116 @@ def _acquire_cache_flock(lock_fh, *, timeout):
             if deadline is None or time.monotonic() >= deadline:
                 return False
             time.sleep(0.2)
+
+
+def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
+    """Safely prune the FULL derived Claude cache surface for orphaned
+    (removed-from-disk) source paths. See the design spec
+    docs/superpowers/specs/2026-07-04-cache-orphan-prune-design.md §2.
+
+    Kept OUT of the shared sync_cache (which stays detect-only, fixture-safe):
+    only real runtimes call this — the CLI cache-sync --prune-orphans and the
+    dashboard self-heal — so synthetic /fake/… fixture paths never reach it.
+
+    Three gates decide safety per orphan path P (session_id sid):
+      A) sid is non-null and not shared by any surviving on-disk file
+         (cheap prefilter; "same session_id" is empirical, not proof).
+      B) coverage: every one of P's session_entries (msg_id, req_id) keys
+         has a conversation_messages row under P's OWN source_path (else
+         it is a uuid-less blind spot -> unprovable -> residual).
+      C) disjointness: none of P's keys appears in conversation_messages
+         under a surviving on-disk source_path (a survivor physically holds
+         the same turn -> deleting P's deduped cost row would lose it).
+    Anything failing A/B/C is left as residual (reported; for `--rebuild`).
+
+    Deletes the full derived surface for the safe set in ONE transaction
+    (conversation_file_touches -> conversation_messages [+FTS trigger] ->
+    conversation_ai_titles [+FTS trigger] -> session_entries -> session_files),
+    then recomputes the conversation_sessions rollup for exactly the pruned
+    session_ids (all their messages gone -> the stale rail rows drop). Does NOT
+    write the walk-complete marker: the next full sync_cache re-establishes it
+    on a clean walk. Acquires the cache.db.lock flock itself; a contended
+    lock_timeout returns a `contended` result without mutating.
+    """
+    result = PruneResult()
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CACHE_LOCK_PATH.touch()
+    lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
+    try:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+            result.contended = True
+            return result
+
+        tracked = conn.execute(
+            "SELECT path, size_bytes, session_id FROM session_files").fetchall()
+        on_disk = {p for (p, _sz, _sid) in tracked if os.path.isfile(p)}
+        surviving_sids = {sid for (p, _sz, sid) in tracked
+                          if p in on_disk and sid is not None}
+        orphan_cands = [(p, sid) for (p, sz, sid) in tracked
+                        if sz and p not in on_disk]
+        if not orphan_cands:
+            return result
+
+        safe_paths = []
+        pruned_sids = set()
+        for path, sid in orphan_cands:
+            if sid is None or sid in surviving_sids:          # Gate A
+                result.residual_paths.append(path)
+                continue
+            keys = conn.execute(
+                "SELECT DISTINCT msg_id, req_id FROM session_entries "
+                "WHERE source_path=? AND msg_id IS NOT NULL AND req_id IS NOT NULL",
+                (path,)).fetchall()
+            ok = True
+            for mid, rid in keys:
+                covered = conn.execute(                        # Gate B
+                    "SELECT 1 FROM conversation_messages "
+                    "WHERE msg_id=? AND req_id=? AND source_path=? LIMIT 1",
+                    (mid, rid, path)).fetchone() is not None
+                if not covered:
+                    ok = False
+                    break
+                shared = conn.execute(                         # Gate C
+                    "SELECT source_path FROM conversation_messages "
+                    "WHERE msg_id=? AND req_id=?", (mid, rid)).fetchall()
+                if any(sp in on_disk for (sp,) in shared):
+                    ok = False
+                    break
+            if not ok:
+                result.residual_paths.append(path)
+                continue
+            safe_paths.append(path)
+            pruned_sids.add(sid)
+
+        if not safe_paths:
+            return result
+
+        ph = ",".join("?" * len(safe_paths))              # safe_paths is tiny
+        result.pruned_messages = conn.execute(
+            f"SELECT count(*) FROM conversation_messages WHERE source_path IN ({ph})",
+            safe_paths).fetchone()[0]
+        conn.execute("BEGIN")
+        conn.execute(
+            f"DELETE FROM conversation_file_touches WHERE message_id IN "
+            f"(SELECT id FROM conversation_messages WHERE source_path IN ({ph}))",
+            safe_paths)
+        conn.execute(
+            f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
+        conn.execute(
+            f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
+        result.pruned_entries = conn.execute(
+            f"DELETE FROM session_entries WHERE source_path IN ({ph})", safe_paths).rowcount
+        result.pruned_files = conn.execute(
+            f"DELETE FROM session_files WHERE path IN ({ph})", safe_paths).rowcount
+        _recompute_conversation_sessions(conn, list(pruned_sids))  # inside the txn
+        conn.commit()
+        return result
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
 
 
 def sync_cache(
