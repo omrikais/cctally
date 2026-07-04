@@ -252,3 +252,48 @@ class BucketCache:
     def clear(self) -> None:
         """Drop every cached bucket across all builders (full invalidation)."""
         self._store.clear()
+
+
+# === Task 0.5 — Group B session cache holder ===============================
+
+
+class SessionCache:
+    """Immutable per-session aggregate cache over the FULL sessions window.
+
+    Holds ALL sessions in the builder's window (spec §5.2 / Codex F5),
+    keyed by the resolved session identity — NOT just the visible top 100.
+    Sorting/truncating for the 100-row view is done over ``get_all()`` each
+    tick, so a session that was previously below the cut can promote into
+    view once it gets new activity; caching only the visible slice would
+    make that impossible.
+
+    Values are aggregated ``ClaudeSessionUsage`` rows, treated immutable: a
+    changed session is fully re-aggregated and ``put`` whole (a resumed /
+    straddling session re-aggregates from its entire entry set, so there is
+    no split-row bug), never mutated in place (spec §7 / Codex F7).
+    """
+
+    def __init__(self) -> None:
+        self._store: "dict[str, ClaudeSessionUsage]" = {}
+
+    def get_all(self) -> "dict[str, ClaudeSessionUsage]":
+        """Return a shallow COPY of every cached session, keyed by identity.
+
+        A copy so a caller's sort/truncate over the candidate set can never
+        mutate the module-level store (the immutable-cache discipline). The
+        aggregate values are shared (they are themselves immutable).
+        """
+        return dict(self._store)
+
+    def put(self, session_key: str, session: "ClaudeSessionUsage") -> None:
+        """Store (or replace) the aggregate for one session identity."""
+        self._store[session_key] = session
+
+    def drop(self, session_keys: "set[str]") -> None:
+        """Remove the given session identities; absent keys are ignored."""
+        for key in session_keys:
+            self._store.pop(key, None)
+
+    def clear(self) -> None:
+        """Drop every cached session (full invalidation)."""
+        self._store.clear()

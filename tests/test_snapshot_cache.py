@@ -348,3 +348,54 @@ def test_bucket_cache_drop_from_predicate_only_matching():
     assert bc.get("daily", "2026-06-29") is None
     assert bc.get("daily", "2026-06-30") is None
     assert bc.get("monthly", "2026-06") is not None  # other builder untouched
+
+
+# ===========================================================================
+# Task 0.5 — Group B session cache holder
+# ===========================================================================
+def test_session_cache_put_get_all_roundtrip():
+    from _lib_snapshot_cache import SessionCache
+
+    sc = SessionCache()
+    assert sc.get_all() == {}
+    a, b = object(), object()
+    sc.put("sess-a", a)
+    sc.put("sess-b", b)
+    allrows = sc.get_all()
+    assert allrows == {"sess-a": a, "sess-b": b}
+
+
+def test_session_cache_get_all_returns_copy():
+    """get_all() hands back a copy so a caller's sort/truncate can't mutate
+    the module-level store (spec §7 immutability discipline)."""
+    from _lib_snapshot_cache import SessionCache
+
+    sc = SessionCache()
+    sc.put("sess-a", object())
+    snapshot = sc.get_all()
+    snapshot["injected"] = object()
+    del snapshot["sess-a"]
+    # Internal store is unaffected.
+    assert set(sc.get_all().keys()) == {"sess-a"}
+
+
+def test_session_cache_drop_subset():
+    from _lib_snapshot_cache import SessionCache
+
+    sc = SessionCache()
+    for k in ("a", "b", "c"):
+        sc.put(k, object())
+    sc.drop({"a", "c"})
+    assert set(sc.get_all().keys()) == {"b"}
+    # Dropping an absent key is a no-op, not an error.
+    sc.drop({"zzz"})
+    assert set(sc.get_all().keys()) == {"b"}
+
+
+def test_session_cache_clear():
+    from _lib_snapshot_cache import SessionCache
+
+    sc = SessionCache()
+    sc.put("a", object())
+    sc.clear()
+    assert sc.get_all() == {}
