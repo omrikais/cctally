@@ -39,3 +39,21 @@ def test_warning_throttled_and_repeats_on_change(env, capsys):
     os.remove(b)
     ns["sync_cache"](conn)
     assert "no longer on disk" in capsys.readouterr().err     # changed set -> warns again
+
+
+def test_throttle_resets_when_orphans_clear(env, capsys):
+    # After a clean walk (no orphans), the throttle memory is cleared so a
+    # LATER distinct orphan episode at the same path warns again instead of
+    # being silently suppressed.
+    ns = env
+    conn = ns["open_cache_db"]()
+    a = _mk(ns, "SA", "a")
+    ns["sync_cache"](conn); capsys.readouterr()
+    os.remove(a)
+    ns["sync_cache"](conn)
+    assert "no longer on disk" in capsys.readouterr().err     # first orphan warns
+    _mk(ns, "SA", "a")                                        # recreate at same path
+    ns["sync_cache"](conn); capsys.readouterr()              # clean walk -> throttle reset
+    os.remove(a)
+    ns["sync_cache"](conn)
+    assert "no longer on disk" in capsys.readouterr().err     # same path, but warns again

@@ -73,3 +73,22 @@ def test_prune_orphans_source_codex_is_noop(env, capsys):
     # The Claude orphan was NOT pruned (source codex was respected).
     conn = ns["open_cache_db"]()
     assert conn.execute("SELECT count(*) FROM session_files WHERE size_bytes>0").fetchone()[0] == 1
+
+
+def test_prune_orphans_source_all(env, capsys):
+    # --source all (the default) prunes the Claude surface, same as --source claude.
+    ns, tmp_path, monkeypatch = env
+    pdir = pathlib.Path(os.environ["HOME"]) / ".claude" / "projects" / "-p-gone"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "s.jsonl").write_text(json.dumps({"type": "assistant",
+        "timestamp": "2026-07-01T00:00:00Z", "requestId": "r1", "sessionId": "S1",
+        "uuid": "u1", "parentUuid": None,
+        "message": {"id": "m1", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 0, "output_tokens": 5,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}) + "\n")
+    conn = ns["open_cache_db"](); ns["sync_cache"](conn); conn.close()
+    shutil.rmtree(pdir)
+    args = argparse.Namespace(source="all", rebuild=False, prune_orphans=True)
+    rc = ns["cmd_cache_sync"](args)
+    assert rc == 0
+    assert "pruned 1 orphaned file" in capsys.readouterr().err.lower()

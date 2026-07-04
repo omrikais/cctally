@@ -1218,6 +1218,7 @@ def sync_cache(
         # for targeted: the live-tail fast path never prunes orphans (the full
         # background sync owns that).
         if not targeted:
+            global _LAST_WARNED_ORPHAN_SET
             on_disk_paths = {str(jp) for jp in paths}
             orphaned_tracked_paths = [
                 p for p, (size_bytes, _, _) in existing.items()
@@ -1229,7 +1230,6 @@ def sync_cache(
                 # so an unthrottled warn re-spams indefinitely). The marker
                 # invalidation below stays UNCONDITIONAL — throttling the print
                 # must not weaken the D5a invariant.
-                global _LAST_WARNED_ORPHAN_SET
                 cur = frozenset(orphaned_tracked_paths)
                 if cur != _LAST_WARNED_ORPHAN_SET:
                     eprint(
@@ -1250,6 +1250,11 @@ def sync_cache(
                     )
                     conn.commit()
                 walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
+            else:
+                # No orphans this walk: clear the throttle memory so a LATER,
+                # distinct orphan episode (even one recreated at the same paths)
+                # warns again rather than being silently suppressed.
+                _LAST_WARNED_ORPHAN_SET = frozenset()
 
         # Pre-scan for any truncation among tracked files. Under the
         # ccusage-parity ON CONFLICT DO UPDATE, source_path is PINNED to
