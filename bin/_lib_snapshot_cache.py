@@ -297,3 +297,170 @@ class SessionCache:
     def clear(self) -> None:
         """Drop every cached session (full invalidation)."""
         self._store.clear()
+
+
+# === Task 2.1 — Group A cached-bucket recompute helper =====================
+#
+# The shared per-past-bucket aggregate cache for the three calendar
+# builders (daily / monthly / weekly), plus the two entry points the
+# dashboard builders call:
+#
+# - ``cached_buckets`` — the PURE per-bucket assembly loop: recompute the
+#   current + caller-marked-dirty buckets whole (from a timestamp-ordered
+#   fetch, spec §5.1 / Codex F3), serve clean past buckets from the
+#   ``BucketCache``, and recompute (cold-miss) any label the cache lacks.
+# - ``build_cached_group_a`` — the STATEFUL wrapper: each Group A builder
+#   is self-caching and independently byte-correct (M2 key decision — no
+#   dependency on the not-yet-built M5 dispatch). It tracks THIS builder's
+#   own last-seen ``(MAX(session_entries.id), extra_signature)`` alongside
+#   the builder's ``BucketCache`` namespace, derives the dirty predicate
+#   from the new-entry timestamp watermark (``new_min_timestamp``), and
+#   full-invalidates the namespace on an ``extra_signature`` change (weekly
+#   snapshot/reset legs, or the daily/monthly display-tz flip) or a
+#   ``MAX(id)`` regression (cache.db rebuilt). Cold, warm, and invalidated
+#   ticks are all byte-identical to a from-scratch aggregation.
+#
+# Module-level state follows the ``_PROJECTS_ENV_MEMO`` precedent (spec §7):
+# a single shared ``BucketCache`` namespaced by ``builder_key`` and a
+# per-builder last-seen dict. Every cached value is an IMMUTABLE
+# ``BucketUsage``; the builders build FRESH presentation rows over the
+# assembled list each tick and never mutate a cached aggregate (Codex F7).
+
+_GROUP_A_CACHE = BucketCache()
+_GROUP_A_LAST_SEEN: "dict[str, dict]" = {}
+
+
+def group_a_cache() -> BucketCache:
+    """Return the shared Group A ``BucketCache`` (daily/monthly/weekly)."""
+    return _GROUP_A_CACHE
+
+
+def reset_group_a_state() -> None:
+    """Clear the Group A bucket cache AND every builder's last-seen state.
+
+    Test hook + the M5 orphan-prune / ``cache-sync --rebuild`` invalidation
+    entry point: after history is deleted or rewritten in place, drop every
+    cached bucket and reset the watermarks so the next rebuild recomputes
+    from scratch (spec §7 / Codex F4).
+    """
+    _GROUP_A_CACHE.clear()
+    _GROUP_A_LAST_SEEN.clear()
+
+
+def cached_buckets(
+    builder_key: str,
+    *,
+    cache: BucketCache,
+    all_bucket_labels: "list[str]",
+    current_label: "str | None",
+    dirty_predicate: "Callable[[str], bool]",
+    fetch_bucket_entries: "Callable[[str], list]",
+    aggregate_one: "Callable[[str, list], object | None]",
+) -> "list[object]":
+    """Assemble one Group A builder's per-bucket aggregates (spec §5.1).
+
+    For each label in ``all_bucket_labels`` (caller order — pass oldest→newest
+    so the assembled list matches ``_aggregate_*``'s ascending-key output):
+
+    - If the label is ``current_label`` (the open bucket) or ``dirty_predicate``
+      returns True (the watermark reached it, or a forced recompute), recompute
+      it WHOLE via ``aggregate_one(label, fetch_bucket_entries(label))`` — a
+      timestamp-ordered fetch, so ``_aggregate_buckets`` first-seen model order
+      reproduces the full-history pass byte-for-byte (Codex F3).
+    - Otherwise serve the cached ``BucketUsage``; on a cache MISS (cold start /
+      post-invalidation) recompute it the same way.
+
+    ``aggregate_one`` returns ``None`` for a label with no data (a gap
+    day/month/week): the bucket is omitted from the result and any stale cache
+    entry for that label is evicted. The returned list therefore contains only
+    buckets-with-data — exactly what ``_aggregate_daily/_monthly/_weekly`` over
+    the full entry set returns — in ``all_bucket_labels`` order.
+
+    Values are stored/served as-is (immutable ``BucketUsage``); this loop never
+    mutates a bucket in place (spec §7).
+    """
+    result: "list[object]" = []
+    for label in all_bucket_labels:
+        recompute = (label == current_label) or dirty_predicate(label)
+        bucket = None
+        if not recompute:
+            bucket = cache.get(builder_key, label)
+        if bucket is None:  # forced recompute OR cold miss
+            bucket = aggregate_one(label, fetch_bucket_entries(label))
+        if bucket is None:
+            # Gap bucket (no data): drop any stale cache entry, omit from output.
+            cache.drop_from(builder_key, lambda lbl, _t=label: lbl == _t)
+        else:
+            cache.put(builder_key, label, bucket)
+            result.append(bucket)
+    return result
+
+
+def build_cached_group_a(
+    builder_key: str,
+    *,
+    cache_conn: sqlite3.Connection,
+    all_bucket_labels: "list[str]",
+    current_label: "str | None",
+    bucket_end_of: "Callable[[str], dt.datetime | None]",
+    fetch_bucket_entries: "Callable[[str], list]",
+    aggregate_one: "Callable[[str, list], object | None]",
+    extra_signature: object = None,
+    always_recompute: "tuple[str, ...] | set[str]" = (),
+) -> "list[object]":
+    """Stateful Group A assembly: invalidation + watermark + ``cached_buckets``.
+
+    ``cache_conn`` is a ``cache.db`` connection (reads
+    ``MAX(session_entries.id)`` + the new-entry watermark). ``bucket_end_of``
+    maps a label to an aware-UTC datetime that is at-or-after that bucket's
+    window end — a bucket is watermark-dirty when its end is after
+    ``new_min_timestamp`` (over-estimating the end only over-marks buckets
+    dirty, which is safe: it never serves stale past data). ``extra_signature``
+    is any hashable value whose change forces a full namespace invalidation
+    (the weekly snapshot/reset legs, or the daily/monthly display-tz label).
+    ``always_recompute`` is an optional set of labels to recompute every tick
+    regardless of the watermark (e.g. a weekly bucket still transitioning
+    through a credit).
+
+    Returns the assembled ``BucketUsage`` list (cache hits for clean past
+    labels, fresh recompute for current + dirty), in ``all_bucket_labels``
+    order, and updates this builder's last-seen state.
+    """
+    cur_max_id = _max_id(cache_conn, "session_entries")
+    state = _GROUP_A_LAST_SEEN.get(builder_key)
+    full_invalidate = state is not None and (
+        state.get("extra") != extra_signature
+        or cur_max_id < int(state.get("max_id", 0))
+    )
+    if full_invalidate:
+        _GROUP_A_CACHE.drop_from(builder_key, lambda _lbl: True)
+
+    if state is None or full_invalidate:
+        # Cold start OR post-invalidation: recompute every label. (Cold already
+        # cache-misses; being explicit also covers the boundary/signature-shift
+        # case where a stale label could otherwise collide with a fresh window.)
+        def dirty(_label: str) -> bool:
+            return True
+    else:
+        new_min_ts = new_min_timestamp(cache_conn, int(state.get("max_id", 0)))
+        _always = set(always_recompute)
+
+        def dirty(label: str) -> bool:
+            if label in _always:
+                return True
+            if new_min_ts is None:
+                return False
+            end = bucket_end_of(label)
+            return end is not None and end > new_min_ts
+
+    buckets = cached_buckets(
+        builder_key,
+        cache=_GROUP_A_CACHE,
+        all_bucket_labels=all_bucket_labels,
+        current_label=current_label,
+        dirty_predicate=dirty,
+        fetch_bucket_entries=fetch_bucket_entries,
+        aggregate_one=aggregate_one,
+    )
+    _GROUP_A_LAST_SEEN[builder_key] = {"max_id": cur_max_id, "extra": extra_signature}
+    return buckets

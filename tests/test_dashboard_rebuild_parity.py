@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sqlite3
 
 from conftest import load_script, redirect_paths  # type: ignore
 
@@ -111,3 +112,225 @@ def test_no_sync_never_ingests_but_still_reads(monkeypatch, tmp_path):
     assert snap.daily_total_tokens > 0, (
         "expected --no-sync rebuild to read existing cached entries"
     )
+
+
+# ===========================================================================
+# M2 Task 2.1 — the cached-bucket recompute helper (spec §5.1)
+#
+# `cached_buckets` is the pure per-bucket assembly loop: recompute the
+# current + dirty buckets whole; serve clean past buckets from the
+# BucketCache; recompute (cold-miss) any label absent from the cache.
+# `build_cached_group_a` is the stateful wrapper that tracks each
+# builder's own last-seen (MAX(session_entries.id), extra_signature),
+# derives the dirty predicate from the new-entry watermark, invalidates
+# on an extra-signature change / id regression, and calls `cached_buckets`.
+# ===========================================================================
+
+
+_MIN_CACHE_SCHEMA = """
+CREATE TABLE session_entries (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path         TEXT    NOT NULL,
+    line_offset         INTEGER NOT NULL,
+    timestamp_utc       TEXT    NOT NULL,
+    model               TEXT    NOT NULL
+);
+"""
+
+
+def _min_cache_conn(tmp_path):
+    conn = sqlite3.connect(tmp_path / "mincache.db")
+    conn.executescript(_MIN_CACHE_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def _ins_entry(conn, ts):
+    conn.execute(
+        "INSERT INTO session_entries (source_path, line_offset, timestamp_utc, model) "
+        "VALUES ('/p/a.jsonl', 0, ?, 'claude-opus-4-8')",
+        (ts,),
+    )
+    conn.commit()
+
+
+def _spy_agg(calls):
+    def agg(label, entries):
+        calls.append(label)
+        return {"bucket": label, "n": len(entries)}
+    return agg
+
+
+def test_cached_buckets_cold_recomputes_all():
+    import _lib_snapshot_cache as sc
+
+    cache = sc.BucketCache()
+    calls: list = []
+    got = sc.cached_buckets(
+        "daily",
+        cache=cache,
+        all_bucket_labels=["a", "b", "c"],
+        current_label="c",
+        dirty_predicate=lambda _l: False,
+        fetch_bucket_entries=lambda label: [label],
+        aggregate_one=_spy_agg(calls),
+    )
+    # Every label is a cold miss → recompute+cache; assembled in order.
+    assert [b["bucket"] for b in got] == ["a", "b", "c"]
+    assert sorted(calls) == ["a", "b", "c"]
+    # All three cached now.
+    assert cache.get("daily", "a") is not None
+    assert cache.get("daily", "c") is not None
+
+
+def test_cached_buckets_warm_only_current_and_dirty():
+    import _lib_snapshot_cache as sc
+
+    cache = sc.BucketCache()
+    # Cold populate.
+    sc.cached_buckets(
+        "daily", cache=cache, all_bucket_labels=["a", "b", "c"],
+        current_label="c", dirty_predicate=lambda _l: False,
+        fetch_bucket_entries=lambda label: [], aggregate_one=lambda l, e: {"bucket": l, "gen": 0},
+    )
+    # Warm: only current ("c") + dirty ("b") recomputed; "a" served from cache.
+    calls: list = []
+
+    def agg(label, entries):
+        calls.append(label)
+        return {"bucket": label, "gen": 1}
+
+    got = sc.cached_buckets(
+        "daily", cache=cache, all_bucket_labels=["a", "b", "c"],
+        current_label="c", dirty_predicate=lambda l: l == "b",
+        fetch_bucket_entries=lambda label: [], aggregate_one=agg,
+    )
+    assert sorted(calls) == ["b", "c"], "only current + dirty recomputed"
+    by = {b["bucket"]: b for b in got}
+    assert by["a"]["gen"] == 0, "clean past bucket served from cache"
+    assert by["b"]["gen"] == 1 and by["c"]["gen"] == 1
+
+
+def test_cached_buckets_empty_bucket_omitted_and_uncached():
+    import _lib_snapshot_cache as sc
+
+    cache = sc.BucketCache()
+    got = sc.cached_buckets(
+        "daily", cache=cache, all_bucket_labels=["a", "gap", "c"],
+        current_label="c", dirty_predicate=lambda _l: False,
+        fetch_bucket_entries=lambda label: [],
+        aggregate_one=lambda l, e: None if l == "gap" else {"bucket": l},
+    )
+    assert [b["bucket"] for b in got] == ["a", "c"], "gap (None) omitted"
+    assert cache.get("daily", "gap") is None, "empty bucket not cached"
+
+
+def test_build_cached_group_a_cold_then_warm(tmp_path):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_group_a_state()
+    conn = _min_cache_conn(tmp_path)
+    try:
+        _ins_entry(conn, "2026-07-02T10:00:00Z")
+        _ins_entry(conn, "2026-07-04T09:00:00Z")
+
+        def end_of(label):
+            d = dt.date.fromisoformat(label)
+            return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc) + dt.timedelta(days=2)
+
+        labels = ["2026-07-02", "2026-07-03", "2026-07-04"]
+
+        cold_calls: list = []
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=_spy_agg(cold_calls),
+            extra_signature=("local",),
+        )
+        assert sorted(cold_calls) == labels, "cold recomputes every label"
+
+        # Warm with NO new entries: only the current label recomputes.
+        warm_calls: list = []
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=_spy_agg(warm_calls),
+            extra_signature=("local",),
+        )
+        assert warm_calls == ["2026-07-04"], (
+            f"warm should recompute only the current bucket, got {warm_calls}"
+        )
+    finally:
+        conn.close()
+
+
+def test_build_cached_group_a_late_ingest_marks_past_dirty(tmp_path):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_group_a_state()
+    conn = _min_cache_conn(tmp_path)
+    try:
+        _ins_entry(conn, "2026-07-04T09:00:00Z")
+
+        def end_of(label):
+            d = dt.date.fromisoformat(label)
+            return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc) + dt.timedelta(days=2)
+
+        labels = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04"]
+        # Cold.
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=lambda l, e: {"bucket": l},
+            extra_signature=("local",),
+        )
+        # Late ingest: a NEW row (new id) carrying an OLD event time (07-01).
+        _ins_entry(conn, "2026-07-01T18:00:00Z")
+        calls: list = []
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=_spy_agg(calls),
+            extra_signature=("local",),
+        )
+        # The past 07-01 bucket must recompute (watermark reached back).
+        assert "2026-07-01" in calls, (
+            f"late ingest must recompute the affected PAST bucket, got {calls}"
+        )
+        assert "2026-07-04" in calls  # current always recomputed
+    finally:
+        conn.close()
+
+
+def test_build_cached_group_a_full_invalidate_on_signature_change(tmp_path):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_group_a_state()
+    conn = _min_cache_conn(tmp_path)
+    try:
+        _ins_entry(conn, "2026-07-04T09:00:00Z")
+
+        def end_of(label):
+            d = dt.date.fromisoformat(label)
+            return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc) + dt.timedelta(days=2)
+
+        labels = ["2026-07-02", "2026-07-03", "2026-07-04"]
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=lambda l, e: {"bucket": l},
+            extra_signature=("utc",),
+        )
+        # extra_signature changed (e.g. display tz flip) → full invalidate.
+        calls: list = []
+        sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=end_of,
+            fetch_bucket_entries=lambda l: [], aggregate_one=_spy_agg(calls),
+            extra_signature=("local",),
+        )
+        assert sorted(calls) == labels, (
+            f"extra_signature change must recompute all, got {calls}"
+        )
+    finally:
+        conn.close()
