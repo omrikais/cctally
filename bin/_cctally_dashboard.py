@@ -320,7 +320,11 @@ from _cctally_cache import (
     get_entries, iter_entries, open_cache_db, sync_cache,
     _prune_orphaned_cache_entries,
 )
-from _lib_snapshot_cache import build_cached_group_a
+from _lib_snapshot_cache import (
+    build_cached_group_a,
+    _max_id as _snapshot_max_id,
+    _reset_sig as _snapshot_reset_sig,
+)
 
 
 # #268 Group A cached-bucket path master switch. Normally True: the
@@ -2616,10 +2620,14 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
     # #268 Group A cache: assemble the per-month BucketUsage list through the
     # module cache (recompute only the current + watermark-dirty months;
     # serve immutable past months from memory) and hand it to
-    # build_monthly_view as aggregated_override. Falls back to the
-    # from-scratch wide fetch when disabled / cache DB unavailable.
-    aggregated_override = _group_a_monthly_buckets(
-        now_utc, n=n, range_start=range_start, display_tz=display_tz,
+    # build_monthly_view as aggregated_override. Only on the pure-read
+    # (skip_sync=True) path; a skip_sync=False caller falls through to the
+    # syncing wide fetch. Also falls back when disabled / cache DB unavailable.
+    aggregated_override = (
+        _group_a_monthly_buckets(
+            now_utc, n=n, range_start=range_start, display_tz=display_tz,
+        )
+        if skip_sync else None
     )
     c = _cctally()
     if aggregated_override is None:
@@ -2631,6 +2639,103 @@ def _dashboard_build_monthly_periods(conn: "sqlite3.Connection",
                                     display_tz=display_tz,
                                     aggregated_override=aggregated_override)
     return list(view.rows)
+
+
+def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
+    """Assemble the weekly panel's per-week ``BucketUsage`` list via the #268
+    Group A cache, or ``None`` to fall back to the wide fetch (spec §5.1).
+
+    ``all_bucket_labels`` = each SubWeek's ``start_date.isoformat()`` in
+    ascending order (matching ``_aggregate_weekly``'s sorted-key output);
+    ``current_label`` = the SubWeek containing ``now_utc`` (always recomputed
+    as the open week). Each recompute fetches ``[week.start_ts, min(week.end_ts,
+    now_utc)]`` (clamped to now, matching the wide fetch's ``range_end`` bound)
+    and runs ``_aggregate_weekly`` over the FULL ``weeks`` list — extracting
+    the target week's bucket — so overlapping SubWeeks (reset-day drift) keep
+    their first-match-wins assignment byte-for-byte with the wide pass.
+
+    Weekly is the multi-table case (spec §5.1): the SubWeek boundaries derive
+    from ``weekly_usage_snapshots`` + the reset-event tables, so the cached raw
+    aggregate could shift when any of those move. ``extra_signature`` folds in
+    ``MAX(weekly_usage_snapshots.id)`` / ``MAX(weekly_cost_snapshots.id)`` /
+    the reset-event change-signal — a change to any full-invalidates the weekly
+    namespace (the scoped M2.4 fallback: recompute-all on a weekly-relevant
+    change, cache-hit only when nothing weekly-relevant moved — still the idle
+    win, and trivially byte-identical). Pure session-entry adds stay per-week
+    via the watermark. The overlay / Bug-K presentation reruns fresh each tick,
+    so a snapshot change is reflected even on a cache-served bucket.
+    """
+    if not _GROUP_A_CACHE_ENABLED:
+        return None
+    try:
+        cache_conn = open_cache_db()
+    except Exception:
+        return None
+    try:
+        sw_by_label = {w.start_date.isoformat(): w for w in weeks}
+        labels = [w.start_date.isoformat() for w in weeks]  # ascending
+        # current_label = the SubWeek that contains now_utc (the open week);
+        # fall back to the newest week if none contains it.
+        current_label = None
+        for w in weeks:
+            try:
+                s = parse_iso_datetime(w.start_ts, "week.start_ts")
+                e = parse_iso_datetime(w.end_ts, "week.end_ts")
+            except ValueError:
+                continue
+            if s <= now_utc < e:
+                current_label = w.start_date.isoformat()
+                break
+        if current_label is None:
+            current_label = max(
+                weeks, key=lambda w: w.start_date
+            ).start_date.isoformat()
+
+        # Weekly-relevant signature legs: any change full-invalidates.
+        extra_signature = (
+            _snapshot_max_id(stats_conn, "weekly_usage_snapshots"),
+            _snapshot_max_id(stats_conn, "weekly_cost_snapshots"),
+            _snapshot_reset_sig(stats_conn),
+        )
+
+        def _fetch(label):
+            w = sw_by_label[label]
+            s = parse_iso_datetime(w.start_ts, "week.start_ts")
+            e = parse_iso_datetime(w.end_ts, "week.end_ts")
+            hi = min(e, now_utc)  # cap the open week at now, like the wide fetch
+            if hi <= s:
+                return []
+            return iter_entries(cache_conn, s, hi)
+
+        def _agg_one(label, entries):
+            # Aggregate against the FULL weeks list so overlapping SubWeeks
+            # resolve first-match-wins exactly as the wide pass does; extract
+            # the target week's bucket.
+            for b in _aggregate_weekly(entries, weeks):
+                if b.bucket == label:
+                    return b
+            return None
+
+        def _end_of(label):
+            w = sw_by_label[label]
+            try:
+                return parse_iso_datetime(w.end_ts, "week.end_ts")
+            except ValueError:
+                return None
+
+        buckets = build_cached_group_a(
+            "weekly",
+            cache_conn=cache_conn,
+            all_bucket_labels=labels,
+            current_label=current_label,
+            bucket_end_of=_end_of,
+            fetch_bucket_entries=_fetch,
+            aggregate_one=_agg_one,
+            extra_signature=extra_signature,
+        )
+        return tuple(buckets)
+    finally:
+        cache_conn.close()
 
 
 def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
@@ -2664,7 +2769,6 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
         range_start,
         parse_iso_datetime(weeks[0].start_ts, "week_start_at"),
     )
-    entries = get_entries(fetch_start, range_end, skip_sync=skip_sync)
     as_of_utc = (
         range_end.astimezone(dt.timezone.utc)
         .replace(microsecond=0)
@@ -2672,12 +2776,30 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
         .replace("+00:00", "Z")
     )
 
-    # Builder prelude: produce the natural newest-first rows + overlay.
-    c = _cctally()
-    view = c.build_weekly_view(
-        conn, entries, weeks=weeks, now_utc=now_utc,
-        display_tz=None, as_of_utc=as_of_utc,
+    # #268 Group A cache: assemble the per-week BucketUsage list through the
+    # module cache (recompute only the current + watermark-dirty weeks; serve
+    # immutable past weeks from memory) and hand it to build_weekly_view as
+    # aggregated_override. Pure-read (skip_sync=True) path only; a
+    # skip_sync=False caller falls through to the syncing wide fetch, as does
+    # the cache-disabled / cache-unavailable case. The overlay + Bug-K + delta
+    # + is_current presentation always reruns fresh over the assembled list.
+    aggregated_override = (
+        _group_a_weekly_buckets(conn, now_utc, weeks=weeks)
+        if skip_sync else None
     )
+    c = _cctally()
+    if aggregated_override is None:
+        entries = get_entries(fetch_start, range_end, skip_sync=skip_sync)
+        view = c.build_weekly_view(
+            conn, entries, weeks=weeks, now_utc=now_utc,
+            display_tz=None, as_of_utc=as_of_utc,
+        )
+    else:
+        view = c.build_weekly_view(
+            conn, (), weeks=weeks, now_utc=now_utc,
+            display_tz=None, as_of_utc=as_of_utc,
+            aggregated_override=aggregated_override,
+        )
     if not view.rows:
         return []
 
@@ -2745,9 +2867,10 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     # _apply_reset_events_to_subweeks shifts the credited SubWeek's
     # start_ts to ``effective_reset_at_utc``, so _aggregate_weekly's
     # bucket for that SubWeek already covers ONLY the post-credit
-    # interval. We rebuild the pre-credit bucket here by filtering the
-    # same ``entries`` list to ``[original_start, effective)`` and
-    # re-aggregating cost / tokens / per-model.
+    # interval. We rebuild the pre-credit bucket here by fetching the
+    # ``[original_start, effective)`` window directly (#268: no longer a
+    # wide ``entries`` list on the cached path) and re-aggregating cost /
+    # tokens / per-model.
     #
     # The pre-credit row's ``used_pct`` comes from the
     # weekly_usage_snapshots row captured at-or-before the credit
@@ -2819,12 +2942,16 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                 # No pre-credit interval to aggregate.
                 continue
 
-            # Aggregate entries in [original_start, effective).
+            # Aggregate entries in [original_start, effective). Fetch this
+            # window directly (skip_sync=True — the rebuild already ingested,
+            # or the fallback's wide fetch above did) rather than filtering a
+            # wide `entries` list, so Bug-K works identically on the cached
+            # path (where no wide entry list exists) and the fallback path.
             pre_input = pre_output = pre_cc = pre_cr = 0
             pre_cost = 0.0
             pre_models: dict[str, float] = {}
             pre_entry_count = 0
-            for e in entries:
+            for e in get_entries(original_start_dt, eff_dt, skip_sync=True):
                 if original_start_dt <= e.timestamp < eff_dt:
                     usage = e.usage
                     pre_input  += usage.get("input_tokens", 0)
@@ -3222,10 +3349,13 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     # module-level cache (recompute only the current + watermark-dirty days;
     # serve immutable past days from memory) and hand it to build_daily_view
     # as ``aggregated_override`` so every downstream derivation stays
-    # single-sourced. Falls back to the from-scratch wide fetch when the
-    # cache is disabled (parity tests) or the cache DB can't be opened.
-    aggregated_override = _group_a_daily_buckets(
-        now_utc, n=n, display_tz=display_tz,
+    # single-sourced. Only taken on the pure-read (skip_sync=True) path — a
+    # skip_sync=False caller wants a fresh ingest, so fall through to the
+    # syncing wide fetch. Also falls back when the cache is disabled (parity
+    # tests) or the cache DB can't be opened.
+    aggregated_override = (
+        _group_a_daily_buckets(now_utc, n=n, display_tz=display_tz)
+        if skip_sync else None
     )
 
     c = _cctally()

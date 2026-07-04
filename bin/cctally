@@ -487,6 +487,26 @@ build_codex_weekly_view = _lib_view_models.build_codex_weekly_view
 CodexSessionView = _lib_view_models.CodexSessionView
 build_codex_session_view = _lib_view_models.build_codex_session_view
 
+# Snapshot-rebuild cache infrastructure (#268) — the composite data-version
+# signature, the new-entry watermark, the generation counter, the Group A/B
+# cache holders, and the Group A cached-bucket recompute helper. Registered
+# here (before _cctally_dashboard / _cctally_tui load) so those siblings can
+# `from _lib_snapshot_cache import ...` at module top under the _load_sibling
+# loader, which does not place bin/ on sys.path. _load_sibling dedups via
+# sys.modules, so this is the same instance pytest imports directly.
+_lib_snapshot_cache = _load_sibling("_lib_snapshot_cache")
+SnapshotSignature = _lib_snapshot_cache.SnapshotSignature
+compute_signature = _lib_snapshot_cache.compute_signature
+new_min_timestamp = _lib_snapshot_cache.new_min_timestamp
+bump_generation = _lib_snapshot_cache.bump_generation
+current_generation = _lib_snapshot_cache.current_generation
+BucketCache = _lib_snapshot_cache.BucketCache
+SessionCache = _lib_snapshot_cache.SessionCache
+cached_buckets = _lib_snapshot_cache.cached_buckets
+build_cached_group_a = _lib_snapshot_cache.build_cached_group_a
+group_a_cache = _lib_snapshot_cache.group_a_cache
+reset_group_a_state = _lib_snapshot_cache.reset_group_a_state
+
 _lib_render = _load_sibling("_lib_render")
 _CODEX_MONTHS = _lib_render._CODEX_MONTHS
 _render_blocks_table = _lib_render._render_blocks_table

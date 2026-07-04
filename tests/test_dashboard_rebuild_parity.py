@@ -597,3 +597,166 @@ def test_monthly_late_ingest_recomputes_past_month(monkeypatch, tmp_path):
         assert warm == wide, "late-ingest monthly rebuild must equal from-scratch"
     finally:
         stats.close()
+
+
+# ===========================================================================
+# M2 Task 2.4 — wire `_dashboard_build_weekly_periods` through the cache.
+#
+# The widest special-case surface: build_weekly_view overlay + Bug-K
+# synthesized pre-credit rows + delta + is_current, and a multi-table
+# dependency (weekly_usage_snapshots / weekly_cost_snapshots / reset
+# events feed the SubWeek boundaries). Cached raw per-week BucketUsage is
+# full-invalidated whenever a weekly-relevant leg moves (scoped M2.4
+# fallback); the presentation reruns fresh every tick. Parity gate:
+# cached == from-scratch for plain / warm / late-ingest / stats-change.
+# The Bug-K credit-week byte-identity is covered by the reset-week golden
+# (bin/cctally-dashboard-test).
+# ===========================================================================
+
+
+def _seed_multiweek_jsonl(tmp_path, extra=()):
+    """Claude JSONL spanning several subscription weeks + two models."""
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    rows = [
+        ("w01", "wk1", "wr1", "a", "2026-06-06T08:00:00Z", "claude-sonnet-4-5"),
+        ("w02", "wk2", "wr2", "b", "2026-06-15T09:00:00Z", "claude-opus-4-8"),
+        ("w03", "wk3", "wr3", "c", "2026-06-16T09:30:00Z", "claude-sonnet-4-5"),
+        ("w04", "wk4", "wr4", "d", "2026-06-24T10:00:00Z", "claude-opus-4-8"),
+        ("w05", "wk5", "wr5", "e", "2026-07-01T11:00:00Z", "claude-sonnet-4-5"),
+        ("w06", "wk6", "wr6", "f", "2026-07-02T11:30:00Z", "claude-opus-4-8"),
+        *extra,
+    ]
+    text = "".join(
+        _asst_line(u, m, r, t, ts=ts, model=model) for (u, m, r, t, ts, model) in rows
+    )
+    (proj / "s1.jsonl").write_text(text)
+
+
+def _build_weekly(ns, stats_conn, *, enabled):
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    sc.reset_group_a_state()
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    dash._GROUP_A_CACHE_ENABLED = enabled
+    try:
+        return ns["_dashboard_build_weekly_periods"](
+            stats_conn, NOW_UTC, n=12, skip_sync=True
+        )
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def _weekly_total(rows):
+    return sum(r.cost_usd for r in rows)
+
+
+def test_weekly_periods_cached_parity(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        cached = _build_weekly(ns, stats, enabled=True)
+        # Non-vacuity: the cached path populated the weekly namespace.
+        assert any(
+            k[0] == "weekly" for k in sc.group_a_cache()._store
+        ), "cached weekly build should have populated the Group A cache"
+        wide = _build_weekly(ns, stats, enabled=False)
+        assert cached == wide, "cached weekly rows must equal from-scratch"
+        assert any(r.cost_usd > 0 for r in cached)
+    finally:
+        stats.close()
+
+
+def test_weekly_warm_current_entry(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        _seed_multiweek_jsonl(tmp_path, extra=[
+            ("ww", "wkw", "wrw", "z", "2026-07-03T09:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        wide = _build_weekly(ns, stats, enabled=False)
+        assert warm == wide, "warm weekly rebuild must equal from-scratch"
+    finally:
+        stats.close()
+
+
+def test_weekly_late_ingest_past_week(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        cold = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        # Late ingest into a PAST week (mid-June).
+        _seed_multiweek_jsonl(tmp_path, extra=[
+            ("wl", "wkl", "wrl", "late", "2026-06-16T14:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        wide = _build_weekly(ns, stats, enabled=False)
+        assert warm == wide, "late-ingest weekly rebuild must equal from-scratch"
+        assert _weekly_total(warm) > _weekly_total(cold), (
+            "the late-ingested past week must be recomputed (total grew)"
+        )
+    finally:
+        stats.close()
+
+
+def test_weekly_stats_change_full_invalidate(monkeypatch, tmp_path):
+    """A weekly_usage_snapshots insert with NO new session entry must still
+    make the affected weeks recompute (the snapshot legs feed the SubWeek
+    boundaries / overlay) — cached == from-scratch (spec §5.1 F2)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        # Insert a weekly_usage_snapshot overlay for a covered week — NO new
+        # session_entries row. The extra-signature leg must move → full
+        # invalidate → recompute.
+        stats.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, payload_json) "
+            "VALUES ('2026-07-02T00:00:00Z', '2026-06-29', '2026-07-06', "
+            "'2026-06-29T00:00:00+00:00', '2026-07-06T00:00:00+00:00', 42.0, '{}')"
+        )
+        stats.commit()
+        warm = ns["_dashboard_build_weekly_periods"](stats, NOW_UTC, n=12, skip_sync=True)
+        wide = _build_weekly(ns, stats, enabled=False)
+        assert warm == wide, (
+            "a weekly_usage_snapshots change (no new entry) must recompute "
+            "the affected weeks — cached == from-scratch"
+        )
+    finally:
+        stats.close()

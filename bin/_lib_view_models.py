@@ -572,7 +572,7 @@ class WeeklyView:
 
 
 def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
-                      as_of_utc=None, mode="auto"):
+                      as_of_utc=None, mode="auto", aggregated_override=None):
     """Build a ``WeeklyView`` from subscription-week boundaries
     (spec §5.3).
 
@@ -589,10 +589,22 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
 
     Output is newest-first across ``rows`` / ``aggregated`` /
     ``overlay`` — the CLI re-reverses for asc rendering.
+
+    ``aggregated_override`` (#268): when provided (a list/tuple of
+    ``BucketUsage`` in ascending bucket-key order — one per SubWeek WITH
+    data), skip the ``_aggregate_weekly(entries, weeks)`` re-costing and
+    run the overlay / delta / is_current presentation over those
+    pre-aggregated buckets. The overlay (``weekly_usage_snapshots``) is
+    always re-read fresh here, so a snapshot change is reflected even for a
+    cached bucket. ``None`` preserves the CLI/share/cold behavior
+    byte-identically.
     """
     _agg = _load_lib("_lib_aggregators")
     _cct_core = _load_lib("_cctally_core")
-    buckets_asc = _agg._aggregate_weekly(entries, weeks, mode=mode)
+    if aggregated_override is not None:
+        buckets_asc = list(aggregated_override)
+    else:
+        buckets_asc = _agg._aggregate_weekly(entries, weeks, mode=mode)
     if not buckets_asc:
         return WeeklyView(
             rows=(), aggregated=(), overlay=(),
