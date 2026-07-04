@@ -47,9 +47,12 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import threading
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from _cctally_core import parse_iso_datetime
+
+if TYPE_CHECKING:  # type hints only — no runtime coupling to the aggregators
+    from _lib_aggregators import BucketUsage, ClaudeSessionUsage
 
 
 # === Task 0.1 — composite data-version signature ===========================
@@ -197,3 +200,55 @@ def current_generation() -> int:
     """Return the current cache-generation counter."""
     with _GENERATION_LOCK:
         return _GENERATION
+
+
+# === Task 0.4 — Group A bucket cache holder ================================
+
+
+class BucketCache:
+    """Immutable per-past-bucket `BucketUsage` cache for the calendar builders.
+
+    Stores the raw immutable aggregate (a `BucketUsage`) per past bucket,
+    keyed by ``(builder_key, bucket_label)`` where ``builder_key`` is one
+    of ``"daily"`` / ``"monthly"`` / ``"weekly"`` and ``bucket_label`` is
+    that builder's bucket identifier (``"2026-06-30"`` daily, ``"2026-06"``
+    monthly, the SubWeek key for weekly).
+
+    Spec §5.1: the cache holds the RAW aggregate, never the final
+    presentation row, and values are treated IMMUTABLE — a recomputed
+    bucket is put whole (never mutated in place), so an SSE client thread
+    reading a previously-published snapshot's rows can never observe a
+    torn value (spec §7 / Codex F7).
+    """
+
+    def __init__(self) -> None:
+        self._store: "dict[tuple[str, str], BucketUsage]" = {}
+
+    def get(self, builder_key: str, bucket_label: str) -> "BucketUsage | None":
+        """Return the cached aggregate for this bucket, or None on a miss."""
+        return self._store.get((builder_key, bucket_label))
+
+    def put(self, builder_key: str, bucket_label: str, bucket: "BucketUsage") -> None:
+        """Store the (immutable) aggregate for this bucket."""
+        self._store[(builder_key, bucket_label)] = bucket
+
+    def drop_from(
+        self, builder_key: str, predicate: "Callable[[str], bool]"
+    ) -> None:
+        """Evict cached buckets for ``builder_key`` whose label matches ``predicate``.
+
+        Used to invalidate the dirty tail: pass a predicate that is True for
+        every bucket label at/after the watermark (or otherwise known dirty).
+        Only the given ``builder_key``'s namespace is touched.
+        """
+        doomed = [
+            key
+            for key in self._store
+            if key[0] == builder_key and predicate(key[1])
+        ]
+        for key in doomed:
+            del self._store[key]
+
+    def clear(self) -> None:
+        """Drop every cached bucket across all builders (full invalidation)."""
+        self._store.clear()

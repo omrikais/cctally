@@ -303,3 +303,48 @@ def test_generation_feeds_signature(tmp_cache, tmp_stats):
     g1 = sc.bump_generation()
     s1 = sc.compute_signature(tmp_cache, tmp_stats, generation=g1)
     assert s1 != s0 and s1.generation == g1
+
+
+# ===========================================================================
+# Task 0.4 — Group A bucket cache holder
+# ===========================================================================
+def test_bucket_cache_put_get_roundtrip():
+    from _lib_snapshot_cache import BucketCache
+
+    bc = BucketCache()
+    assert bc.get("daily", "2026-06-30") is None
+    sentinel = object()
+    bc.put("daily", "2026-06-30", sentinel)
+    assert bc.get("daily", "2026-06-30") is sentinel
+    # Distinct builder_key namespaces don't collide on same label.
+    assert bc.get("monthly", "2026-06-30") is None
+    other = object()
+    bc.put("monthly", "2026-06", other)
+    assert bc.get("monthly", "2026-06") is other
+    assert bc.get("daily", "2026-06-30") is sentinel
+
+
+def test_bucket_cache_clear_empties_all():
+    from _lib_snapshot_cache import BucketCache
+
+    bc = BucketCache()
+    bc.put("daily", "2026-06-30", object())
+    bc.put("weekly", "2026-06-29", object())
+    bc.clear()
+    assert bc.get("daily", "2026-06-30") is None
+    assert bc.get("weekly", "2026-06-29") is None
+
+
+def test_bucket_cache_drop_from_predicate_only_matching():
+    from _lib_snapshot_cache import BucketCache
+
+    bc = BucketCache()
+    for label in ("2026-06-28", "2026-06-29", "2026-06-30"):
+        bc.put("daily", label, object())
+    bc.put("monthly", "2026-06", object())  # different builder, untouched
+    # Drop daily buckets on/after 2026-06-29.
+    bc.drop_from("daily", lambda label: label >= "2026-06-29")
+    assert bc.get("daily", "2026-06-28") is not None
+    assert bc.get("daily", "2026-06-29") is None
+    assert bc.get("daily", "2026-06-30") is None
+    assert bc.get("monthly", "2026-06") is not None  # other builder untouched
