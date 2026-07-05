@@ -323,10 +323,14 @@ from _cctally_cache import (
 from _lib_snapshot_cache import (
     build_cached_group_a,
     bump_generation,
+    cached_bugk_segment,
+    reset_bugk_segment_state,
     reset_group_a_state,
     reset_projects_env_state,
     reset_session_cache_state,
     reset_weekref_cost_state,
+    BugKSegment,
+    _bugk_key,
     _max_id as _snapshot_max_id,
     _reset_sig as _snapshot_reset_sig,
 )
@@ -426,6 +430,11 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # #269 M4.5 (spec §14 Win 2): the projects-envelope per-(project,
             # week) cache rides the same prune-site clear for the same reason.
             reset_projects_env_state()
+            # #271 M3 (spec §18): the Bug-K pre-credit segment cache rides the
+            # same prune-site clear — a non-max deletion inside a closed
+            # pre-credit window the reconcile's max-id regression check can't
+            # catch.
+            reset_bugk_segment_state()
             # #269 (final reviewer): the per-(project, week) cache clear above is
             # NOT sufficient on its own. `_build_projects_envelope` consults the
             # whole-envelope memo `_PROJECTS_ENV_MEMO` FIRST — and its memo_key is
@@ -2889,7 +2898,8 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                                     now_utc: "dt.datetime",
                                     *, n: int = 12,
                                     skip_sync: bool = False,
-                                    use_group_a_cache: bool = False) -> "list[WeeklyPeriodRow]":
+                                    use_group_a_cache: bool = False,
+                                    use_bugk_segment_cache: bool = False) -> "list[WeeklyPeriodRow]":
     """Latest n subscription weeks as WeeklyPeriodRow, newest-first.
 
     Thin builder-using prelude + Bug-K pre-credit synthesis on top of
@@ -3102,23 +3112,59 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
             # or the fallback's wide fetch above did) rather than filtering a
             # wide `entries` list, so Bug-K works identically on the cached
             # path (where no wide entry list exists) and the fallback path.
-            pre_input = pre_output = pre_cc = pre_cr = 0
-            pre_cost = 0.0
-            pre_models: dict[str, float] = {}
-            pre_entry_count = 0
-            for e in get_entries(original_start_dt, eff_dt, skip_sync=True):
-                if original_start_dt <= e.timestamp < eff_dt:
-                    usage = e.usage
-                    pre_input  += usage.get("input_tokens", 0)
-                    pre_output += usage.get("output_tokens", 0)
-                    pre_cc     += usage.get("cache_creation_input_tokens", 0)
-                    pre_cr     += usage.get("cache_read_input_tokens", 0)
-                    c = _calc(
-                        e.model, usage, mode="auto", cost_usd=e.cost_usd,
-                    )
-                    pre_cost += c
-                    pre_models[e.model] = pre_models.get(e.model, 0.0) + c
-                    pre_entry_count += 1
+            #
+            # #271 §18: the [original_start, effective) window is a CLOSED past
+            # interval (effective is a historical credit moment), so this folded
+            # aggregate is IMMUTABLE — cache it byte-identically (the same
+            # "re-aggregate immutable history every tick" pattern the #269
+            # weekref cost cache fixed). `_compute_pre_segment` is the exact
+            # from-scratch fetch+fold closure; on the sync thread
+            # (`use_bugk_segment_cache=True`) it routes through
+            # `cached_bugk_segment` (get-or-compute over the canonical window
+            # key), on EVERY other caller (CLI / share / tests / reconcile-
+            # failed) it computes directly — byte-unchanged. The `used_pct`
+            # snapshot query + WeeklyPeriodRow build BELOW always rerun fresh
+            # from the segment (do NOT cache the row — Codex-BK-5).
+            def _compute_pre_segment(_orig=original_start_dt, _eff=eff_dt):
+                pi = po = pcc = pcr = 0
+                pcost = 0.0
+                pmodels: dict[str, float] = {}
+                pcount = 0
+                for e in get_entries(_orig, _eff, skip_sync=True):
+                    if _orig <= e.timestamp < _eff:
+                        usage = e.usage
+                        pi  += usage.get("input_tokens", 0)
+                        po  += usage.get("output_tokens", 0)
+                        pcc += usage.get("cache_creation_input_tokens", 0)
+                        pcr += usage.get("cache_read_input_tokens", 0)
+                        c = _calc(
+                            e.model, usage, mode="auto", cost_usd=e.cost_usd,
+                        )
+                        pcost += c
+                        pmodels[e.model] = pmodels.get(e.model, 0.0) + c
+                        pcount += 1
+                # Codex-BK-4: freeze `models` as a tuple of (model, cost) in
+                # first-seen (dict-insertion) order so the row's stable cost-desc
+                # sort tie-order can't be mutated after caching.
+                return BugKSegment(
+                    input=pi, output=po, cache_create=pcc, cache_read=pcr,
+                    cost=pcost, models=tuple(pmodels.items()), entry_count=pcount,
+                )
+
+            if use_bugk_segment_cache:
+                seg = cached_bugk_segment(
+                    key=_bugk_key(original_start_dt, eff_dt),
+                    compute=_compute_pre_segment,
+                )
+            else:
+                seg = _compute_pre_segment()
+            pre_input = seg.input
+            pre_output = seg.output
+            pre_cc = seg.cache_create
+            pre_cr = seg.cache_read
+            pre_cost = seg.cost
+            pre_models = seg.models  # ((model, cost), ...) in first-seen order
+            pre_entry_count = seg.entry_count
             if pre_entry_count == 0 and pre_cost <= 0:
                 # No measurable pre-credit activity — skip insertion.
                 continue
@@ -3141,9 +3187,12 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
             )
 
             pre_total = pre_input + pre_output + pre_cc + pre_cr
+            # `pre_models` is a first-seen-order tuple of (model, cost); the
+            # stable cost-desc sort preserves that tie-order byte-for-byte,
+            # identical to the pre-#271 `sorted(dict.items(), ...)`.
             pre_model_breakdowns = [
                 {"modelName": m, "cost": c}
-                for m, c in sorted(pre_models.items(), key=lambda kv: -kv[1])
+                for m, c in sorted(pre_models, key=lambda kv: -kv[1])
             ]
             pre_label = original_start_dt.strftime("%m-%d")
             pre_row = WeeklyPeriodRow(

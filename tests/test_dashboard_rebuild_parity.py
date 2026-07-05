@@ -3054,3 +3054,234 @@ def test_current_accumulator_rollover_weekly(monkeypatch, tmp_path):
         assert rolled == wide, "weekly rollover warm build == from-scratch"
     finally:
         stats.close()
+
+
+# ===========================================================================
+# #271 M3 — Bug-K pre-credit segment cache (spec §18). Real-builder parity:
+# the CLOSED `[original_start, effective)` pre-credit aggregate the Weekly
+# panel re-folds per in-place credit event every warm tick is cacheable
+# byte-identically. Fixtures here MUST contain an in-place credit event
+# (`week_reset_events WHERE old_week_end_at = effective_reset_at_utc`) or the
+# Bug-K synthesis never fires and the test is vacuous — so this seeds one,
+# mirroring `test_dashboard_weekly_synthesizes_pre_credit_row`.
+# ===========================================================================
+NOW_BUGK = dt.datetime(2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def _seed_bugk_credit_db(ns, tmp_path):
+    """Seed stats.db (2 snapshots + an in-place credit event) and cache.db
+    (two pre-credit entries in different models + one post-credit entry) so the
+    Weekly Bug-K synthesis produces a multi-model pre-credit segment row.
+
+    Returns ``(original_start_iso, effective_iso, week_end_iso)``.
+    """
+    import pathlib
+    import sqlite3
+    import sys as _sys
+
+    _sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import (
+        create_cache_db, seed_session_file, seed_session_entry,
+        seed_weekly_usage_snapshot,
+    )
+
+    share = tmp_path / ".local" / "share" / "cctally"
+    open_db = ns["open_db"]
+    week_start = "2026-05-09T15:00:00+00:00"
+    week_end = "2026-05-16T15:00:00+00:00"
+    effective = "2026-05-15T17:00:00+00:00"
+
+    with open_db() as conn:
+        seed_weekly_usage_snapshot(
+            conn, captured_at_utc="2026-05-15T16:00:00Z",
+            week_start_date="2026-05-09", week_end_date="2026-05-16",
+            week_start_at=week_start, week_end_at=week_end, weekly_percent=67.0,
+        )
+        seed_weekly_usage_snapshot(
+            conn, captured_at_utc="2026-05-15T19:00:00Z",
+            week_start_date="2026-05-09", week_end_date="2026-05-16",
+            week_start_at=week_start, week_end_at=week_end, weekly_percent=4.0,
+        )
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+            ("2026-05-15T17:01:00Z", effective, week_end, effective),
+        )
+        conn.commit()
+
+    cache_path = share / "cache.db"
+    create_cache_db(cache_path)
+    with sqlite3.connect(cache_path) as cconn:
+        seed_session_file(
+            cconn, path="/fake/sess.jsonl", session_id="s1", project_path="/p",
+        )
+        # Two pre-credit models so the segment's `models` tuple has a
+        # non-trivial (multi-entry) first-seen order; distinct costs so the
+        # cost-desc sort is decisive.
+        seed_session_entry(
+            cconn, source_path="/fake/sess.jsonl", line_offset=0,
+            timestamp_utc="2026-05-13T12:00:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=10_000, output_tokens=5_000,
+            cache_create=100_000, cache_read=500_000,
+        )
+        seed_session_entry(
+            cconn, source_path="/fake/sess.jsonl", line_offset=1,
+            timestamp_utc="2026-05-13T13:00:00Z",
+            model="claude-sonnet-4-5-20250929",
+            input_tokens=2_000, output_tokens=1_000,
+            cache_create=10_000, cache_read=50_000,
+        )
+        seed_session_entry(  # post-credit
+            cconn, source_path="/fake/sess.jsonl", line_offset=2,
+            timestamp_utc="2026-05-15T18:30:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=100, output_tokens=50,
+            cache_create=1_000, cache_read=5_000,
+        )
+    return week_start, effective, week_end
+
+
+def _bugk_expected_key(sc):
+    return sc._bugk_key(
+        dt.datetime(2026, 5, 9, 15, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 5, 15, 17, tzinfo=dt.timezone.utc),
+    )
+
+
+def test_bugk_segment_cache_parity(monkeypatch, tmp_path):
+    """cache-off == cache-on (cold AND warm), byte-identical WeeklyPeriodRow
+    lists — exact cost/tokens/models order for the synthesized pre-credit row."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _orig, eff, _wend = _seed_bugk_credit_db(ns, tmp_path)
+    builder = ns["_dashboard_build_weekly_periods"]
+
+    sc.reset_bugk_segment_state()
+    with ns["open_db"]() as conn:
+        off = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                      use_bugk_segment_cache=False)
+    sc.reset_bugk_segment_state()
+    with ns["open_db"]() as conn:
+        on_cold = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                          use_bugk_segment_cache=True)
+    with ns["open_db"]() as conn:  # warm — served from cache
+        on_warm = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                          use_bugk_segment_cache=True)
+
+    pre_off = [r for r in off if r.week_end_at == eff]
+    assert len(pre_off) == 1, [r.label for r in off]  # non-vacuous: Bug-K fired
+    assert len(pre_off[0].models) >= 2, "multi-model pre-credit segment expected"
+    assert off == on_cold, "cache-on(cold) must be byte-identical to cache-off"
+    assert off == on_warm, "cache-on(warm) must be byte-identical to cache-off"
+    assert _bugk_expected_key(sc) in sc._BUGK_SEGMENT_CACHE
+
+
+def test_bugk_segment_cache_warm_no_refetch(monkeypatch, tmp_path):
+    """Warm tick serves the segment from cache: `get_entries` is NOT re-called
+    for the closed pre-credit window (spy). The cold tick DID fetch it."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _orig, eff, _wend = _seed_bugk_credit_db(ns, tmp_path)
+    builder = ns["_dashboard_build_weekly_periods"]
+    eff_instant = dt.datetime(2026, 5, 15, 17, tzinfo=dt.timezone.utc)
+
+    calls: list = []
+    real = dash.get_entries
+
+    def spy(a, b, **kw):
+        calls.append((a, b))
+        return real(a, b, **kw)
+
+    monkeypatch.setattr(dash, "get_entries", spy)
+
+    sc.reset_bugk_segment_state()
+    with ns["open_db"]() as conn:
+        cold = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                       use_bugk_segment_cache=True)
+    # The pre-credit window fetch is identified by its `effective` upper bound
+    # (only Bug-K fetches with `hi == effective`).
+    cold_bugk = [c for c in calls if c[1] == eff_instant]
+    assert len(cold_bugk) >= 1, "cold build must fetch the pre-credit window once"
+
+    calls.clear()
+    with ns["open_db"]() as conn:
+        warm = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                       use_bugk_segment_cache=True)
+    warm_bugk = [c for c in calls if c[1] == eff_instant]
+    assert warm_bugk == [], (
+        "warm build must NOT re-fetch the cached pre-credit window"
+    )
+    assert cold == warm
+
+
+def test_bugk_segment_cache_late_ingest_recomputes(monkeypatch, tmp_path):
+    """F1 late-ingest: an OLD-timestamp row lands inside a cached pre-credit
+    window → reconcile evicts its segment → the next warm build recomputes,
+    byte-identically to a from-scratch pass over the post-ingest DB."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib
+    import sqlite3
+    import sys as _sys
+
+    _sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import seed_session_entry
+    import _lib_snapshot_cache as sc
+
+    _orig, eff, _wend = _seed_bugk_credit_db(ns, tmp_path)
+    builder = ns["_dashboard_build_weekly_periods"]
+    RS = (1, 1)  # constant reset-sig across both ticks (no credit change)
+
+    # Tick 1: reconcile (cold, records last-seen) then a cold build populates
+    # the segment cache.
+    sc.reset_bugk_segment_state()
+    cconn = ns["open_cache_db"]()
+    try:
+        max0 = sc._max_id(cconn, "session_entries")
+        sc.reconcile_bugk_cache(cconn, max_entry_id=max0, reset_sig=RS)
+    finally:
+        cconn.close()
+    with ns["open_db"]() as conn:
+        cold = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                       use_bugk_segment_cache=True)
+    cold_pre = next(r for r in cold if r.week_end_at == eff)
+    assert _bugk_expected_key(sc) in sc._BUGK_SEGMENT_CACHE
+
+    # Late-ingest an OLD-timestamp row (new id) INSIDE the pre-credit window.
+    cache_path = tmp_path / ".local" / "share" / "cctally" / "cache.db"
+    with sqlite3.connect(cache_path) as cc:
+        seed_session_entry(
+            cc, source_path="/fake/sess.jsonl", line_offset=99,
+            timestamp_utc="2026-05-11T09:00:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=50_000, output_tokens=20_000,
+            cache_create=200_000, cache_read=900_000,
+        )
+
+    # Tick 2: reconcile sees the new id → watermark 05-11 < effective 05-15 →
+    # the segment evicts.
+    cconn = ns["open_cache_db"]()
+    try:
+        max1 = sc._max_id(cconn, "session_entries")
+        assert max1 > max0
+        sc.reconcile_bugk_cache(cconn, max_entry_id=max1, reset_sig=RS)
+    finally:
+        cconn.close()
+    assert _bugk_expected_key(sc) not in sc._BUGK_SEGMENT_CACHE  # evicted
+
+    with ns["open_db"]() as conn:
+        warm = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                       use_bugk_segment_cache=True)
+    with ns["open_db"]() as conn:
+        scratch = builder(conn, NOW_BUGK, n=6, skip_sync=True,
+                          use_bugk_segment_cache=False)
+    warm_pre = next(r for r in warm if r.week_end_at == eff)
+    assert warm_pre.cost_usd > cold_pre.cost_usd, "late row must raise the cost"
+    assert warm == scratch, "post-eviction warm build == from-scratch"

@@ -173,6 +173,7 @@ def _reset_snapshot_dispatch_state():
             "reset_group_a_state",
             "reset_session_cache_state",
             "reset_doctor_memo",
+            "reset_bugk_segment_state",
         ):
             _fn = getattr(_sc, _name, None)
             if _fn is not None:

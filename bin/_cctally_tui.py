@@ -2155,6 +2155,15 @@ def _tui_build_snapshot(
         # `reconcile_projects_env_cache` succeeds. Off ⇒ `_build_projects_envelope`
         # does the full-window walk (CLI / drill / test byte-identical).
         use_projects_env_cache = False
+        # ── #271 M3: Bug-K pre-credit segment cache (spec §18) ──────────────
+        # A DEDICATED flag (Codex-BK-2 — NOT piggybacked on `use_group_a_cache`):
+        # OFF by default, flipped ON only on the dashboard sync-thread NON-IDLE
+        # path after the once-per-rebuild `reconcile_bugk_cache` succeeds. Off ⇒
+        # the Weekly builder's Bug-K synthesis re-folds the closed pre-credit
+        # window directly each tick (CLI / share / test byte-identical). A
+        # failed/absent reconcile must fall back to direct compute, never reuse
+        # stale segment state.
+        use_bugk_segment_cache = False
         # ── Three-path dispatch — idle short-circuit (spec §3, #268 M5.1) ──
         # Compute the composite data-version signature (cheap MAX(id) descents
         # over cache.db + stats.db + the reset-event change-signal + the
@@ -2237,6 +2246,18 @@ def _tui_build_snapshot(
                             sf_sig=_sc.session_files_sig(_rc_cache_conn),
                         )
                         use_projects_env_cache = True
+                        # #271 M3: reconcile the Bug-K pre-credit segment cache
+                        # with the SAME short-lived cache conn (its watermark
+                        # query lives in cache.db), using the dispatch-signature
+                        # legs already computed. Only after this succeeds does
+                        # `_dashboard_build_weekly_periods` opt into the cache
+                        # below (`use_bugk_segment_cache=True`).
+                        _sc.reconcile_bugk_cache(
+                            _rc_cache_conn,
+                            max_entry_id=dispatch_sig.max_entry_id,
+                            reset_sig=dispatch_sig.reset_sig,
+                        )
+                        use_bugk_segment_cache = True
                     finally:
                         _rc_cache_conn.close()
                 except Exception as exc:
@@ -2327,6 +2348,7 @@ def _tui_build_snapshot(
             weekly_periods = _dashboard_build_weekly_periods(
                 conn, now_utc, n=12, skip_sync=skip_sync,
                 use_group_a_cache=True,
+                use_bugk_segment_cache=use_bugk_segment_cache,
             )
             # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
             # so the envelope stays byte-stable with the pre-fix ``0.0`` shape

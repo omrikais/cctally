@@ -1356,3 +1356,218 @@ def test_iter_entries_order_is_timestamp_then_id(tmp_path):
         assert [e.usage["input_tokens"] for e in rows] == [3, 1, 2]
     finally:
         conn.close()
+
+
+# ===========================================================================
+# #271 M3 — Bug-K pre-credit segment cache (spec §18). Mirrors the #269
+# weekref cost-cache shape: a bare module dict of immutable `BugKSegment`
+# values (no lock — only the sync thread mutates), a per-cache last-seen, a
+# `reset_sig` / max-id-regression full-clear, and a HALF-OPEN `>` watermark
+# eviction (`[original_start, effective)` — Codex-BK-5, the ONE semantic
+# difference from the weekref cache's inclusive `>=`).
+# ===========================================================================
+def test_bugk_key_normalizes_to_utc_iso():
+    import _lib_snapshot_cache as sc
+
+    a = sc._bugk_key(
+        dt.datetime(2026, 5, 9, 15, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 5, 15, 17, tzinfo=dt.timezone.utc),
+    )
+    # A different tz denoting the same instants keys identically.
+    est = dt.timezone(dt.timedelta(hours=-4))
+    b = sc._bugk_key(
+        dt.datetime(2026, 5, 9, 11, tzinfo=est),
+        dt.datetime(2026, 5, 15, 13, tzinfo=est),
+    )
+    assert a == b == (
+        "2026-05-09T15:00:00+00:00",
+        "2026-05-15T17:00:00+00:00",
+    )
+
+
+def test_reset_bugk_segment_state_clears():
+    import _lib_snapshot_cache as sc
+
+    sc._BUGK_SEGMENT_CACHE[("s", "e")] = sc.BugKSegment(
+        input=1, output=2, cache_create=3, cache_read=4, cost=5.0,
+        models=(("m", 5.0),), entry_count=1,
+    )
+    sc._BUGK_SEGMENT_LAST_SEEN["max_id"] = 5
+    sc.reset_bugk_segment_state()
+    assert sc._BUGK_SEGMENT_CACHE == {} and sc._BUGK_SEGMENT_LAST_SEEN == {}
+
+
+def test_bugk_segment_models_is_immutable_tuple():
+    """Codex-BK-4: the stored `models` payload is a frozen tuple of
+    (model, cost) in first-seen order, so a later mutation of the source dict
+    can't tear the cached segment's tie-order."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    src = {}
+    src["opus"] = 3.0
+    src["sonnet"] = 1.0
+
+    def compute():
+        return sc.BugKSegment(
+            input=1, output=1, cache_create=0, cache_read=0, cost=4.0,
+            models=tuple(src.items()), entry_count=2,
+        )
+
+    seg = sc.cached_bugk_segment(key=("s", "e"), compute=compute)
+    assert isinstance(seg.models, tuple)
+    assert seg.models == (("opus", 3.0), ("sonnet", 1.0))
+    # Mutating the source dict after caching leaves the cached tuple intact.
+    src["haiku"] = 9.0
+    assert sc._BUGK_SEGMENT_CACHE[("s", "e")].models == (
+        ("opus", 3.0), ("sonnet", 1.0),
+    )
+
+
+def test_cached_bugk_segment_hit_and_miss():
+    """Closed pre-credit window ⇒ always cacheable: compute runs once, the
+    second call is a hit."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return sc.BugKSegment(
+            input=10, output=5, cache_create=0, cache_read=0, cost=2.5,
+            models=(("m", 2.5),), entry_count=1,
+        )
+
+    k = sc._bugk_key(
+        dt.datetime(2026, 5, 9, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc),
+    )
+    a = sc.cached_bugk_segment(key=k, compute=compute)
+    b = sc.cached_bugk_segment(key=k, compute=compute)
+    assert a is b
+    assert a.cost == 2.5
+    assert calls["n"] == 1  # second call was a cache hit
+
+
+def test_reconcile_bugk_evicts_late_ingest_segment(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    seg = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=1.0,
+        models=(), entry_count=0,
+    )
+    # Two cached segments (different `effective` boundaries).
+    old = (
+        dt.datetime(2026, 6, 8, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
+    )
+    new = (
+        dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc),
+    )
+    sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*old)] = seg
+    sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*new)] = seg
+    last = _max_id(tmp_cache)
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    # Late-ingest a row (new id) with an OLD timestamp inside the `new` window.
+    _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
+    sc.reconcile_bugk_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+    )
+    assert sc._bugk_key(*new) not in sc._BUGK_SEGMENT_CACHE  # eff 06-29 > wm 06-25
+    assert sc._bugk_key(*old) in sc._BUGK_SEGMENT_CACHE       # eff 06-15 < wm 06-25
+
+
+def test_reconcile_bugk_boundary_at_effective_not_evicted(tmp_cache):
+    """Codex-BK-5: the segment window is HALF-OPEN `[original_start,
+    effective)`, so a new row EXACTLY at `effective` is OUTSIDE the segment
+    and must NOT evict — eviction is `effective > wm` (strict), NOT `>=`."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    eff = dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc)
+    wk = (dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc), eff)
+    sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=2.0,
+        models=(), entry_count=0,
+    )
+    last = _max_id(tmp_cache)
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly effective
+    sc.reconcile_bugk_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+    )
+    assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE  # eff == wm ⇒ kept (half-open)
+
+
+def test_reconcile_bugk_full_clear_on_reset_sig(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    sc._BUGK_SEGMENT_CACHE[("s", "e")] = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=3.0,
+        models=(), entry_count=0,
+    )
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=_max_id(tmp_cache), reset_sig=(1, 1))
+    sc.reconcile_bugk_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(2, 2)
+    )
+    assert sc._BUGK_SEGMENT_CACHE == {}  # a credit event moved → full clear
+
+
+def test_reconcile_bugk_full_clear_on_maxid_regression(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    sc._BUGK_SEGMENT_CACHE[("s", "e")] = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=3.0,
+        models=(), entry_count=0,
+    )
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=100, reset_sig=(0, 0))
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=5, reset_sig=(0, 0))  # rebuilt
+    assert sc._BUGK_SEGMENT_CACHE == {}
+
+
+def test_reconcile_bugk_cold_records_last_seen(tmp_cache):
+    """First (cold) call just records last-seen and touches no cache entry."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    keep = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=5.0,
+        models=(), entry_count=0,
+    )
+    sc._BUGK_SEGMENT_CACHE[("s", "e")] = keep  # must survive the cold call
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=7, reset_sig=(3, 4))
+    assert sc._BUGK_SEGMENT_LAST_SEEN == {"max_id": 7, "reset_sig": (3, 4)}
+    assert sc._BUGK_SEGMENT_CACHE == {("s", "e"): keep}
+
+
+def test_reconcile_bugk_idempotent_within_tick(tmp_cache):
+    """After the first reconcile updates last-seen, a second call with the same
+    signature sees no delta and evicts nothing (never re-queries the watermark)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_bugk_segment_state()
+    wk = (
+        dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc),
+    )
+    seg = sc.BugKSegment(
+        input=0, output=0, cache_create=0, cache_read=0, cost=2.0,
+        models=(), entry_count=0,
+    )
+    sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = seg
+    last = _max_id(tmp_cache)
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # future → keeps wk
+    new_max = _max_id(tmp_cache)
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE  # 06-29 < 07-04
+    # Re-populate, reconcile again with the SAME sig: no watermark re-query, so
+    # the entry survives (idempotent no-op).
+    sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = seg
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE

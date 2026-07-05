@@ -1167,3 +1167,163 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
         ls["max_id"] = max_entry_id
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig
+
+
+# === #271 M3 — Bug-K pre-credit segment cache (spec §18) =====================
+#
+# The dashboard Weekly panel's Bug-K synthesis (`_dashboard_build_weekly_periods`)
+# rebuilds, per in-place credit event, the pre-credit aggregate over the CLOSED
+# past interval `[original_start, effective)` on EVERY warm tick — a wide
+# `get_entries` re-fetch + re-cost (~100ms wall / 5 windows / ~42.6K entries on
+# the 314K-entry prod copy). Because `effective` is a historical credit moment
+# (always <= now), that aggregate is IMMUTABLE — the SAME "re-aggregate immutable
+# history every tick" pattern the #269 weekref cost cache (above, §4) fixed. Cache
+# it and recompute only when a genuine data change reaches the window.
+#
+# Module-level state mirrors the weekref cost cache exactly: a plain dict of
+# immutable `BugKSegment` values + a per-cache last-seen dict, mutated only on the
+# dashboard sync thread (single-writer). Every cached value is immutable and each
+# rebuild builds a FRESH `WeeklyPeriodRow` from the cached segment, never mutating
+# it (F7). The `models` payload is a FROZEN TUPLE of (model, cost) in first-seen
+# order (NOT a live dict — Codex-BK-4), so the row's stable cost-desc sort
+# tie-order (which depends on first-seen order) can never be mutated after caching.
+#
+# Two accepted trade-offs, IDENTICAL to the shipped #269 weekref cost cache — and
+# deliberately NOT closed here (closing them would be inconsistent with the
+# already-shipped caches):
+# - Id-stable in-place mutation (Codex-BK-1, shared #270 exposure). `sync_cache`'s
+#   `ON CONFLICT(msg_id, req_id) DO UPDATE` can finalize a streaming-intermediate
+#   entry in place (same `id`, changed tokens/cost/timestamp) inside a closed
+#   pre-credit window, advancing NEITHER `max_entry_id` NOR the
+#   `new_min_timestamp` watermark → a stale segment. This is the SAME exposure the
+#   weekref cost cache (`cached_weekref_cost` / `reconcile_weekref_cache`, above)
+#   and the Group A past-bucket caches already carry (spec §6 / first-review
+#   Codex-2); it is very narrow (append-only JSONL — a finalization lands in the
+#   window it started in, so only a cross-boundary message finalizing after the
+#   window closed leaves a stale CLOSED segment) and is tracked by #270 (a durable
+#   `session_entries` mutation signal in `compute_signature` that would harden
+#   every #268/#269/#271 cache at once).
+# - Pricing-at-cache-time (Codex-BK-3). Caching the folded `pre_cost` means an
+#   in-process embedded-pricing edit is not reflected in the Bug-K pre-credit cost
+#   until the segment invalidates — the SAME dashboard-only trade-off the weekref
+#   cost cache already makes (see its module note above). Acceptable because
+#   embedded-pricing edits require a code change + process restart regardless.
+
+
+class BugKSegment(NamedTuple):
+    """Immutable folded pre-credit aggregate over a closed `[original_start,
+    effective)` window (spec §18).
+
+    ``models`` is a frozen tuple of ``(display_model, cost)`` in FIRST-SEEN order
+    (Codex-BK-4); the caller re-derives the cost-desc-sorted ``model_breakdowns``
+    fresh each tick from it, and the stable sort preserves that first-seen tie
+    order byte-for-byte.
+    """
+
+    input: int
+    output: int
+    cache_create: int
+    cache_read: int
+    cost: float
+    models: tuple  # ((display_model, cost), ...) in first-seen order
+    entry_count: int
+
+
+_BUGK_SEGMENT_CACHE: dict = {}       # {(orig_start_utc_iso, eff_utc_iso): BugKSegment}
+_BUGK_SEGMENT_LAST_SEEN: dict = {}   # {"max_id": int, "reset_sig": tuple}
+
+
+def _bugk_key(original_start_at, effective_at):
+    """Canonical UTC-ISO key for a pre-credit segment window (spec §18).
+
+    Normalizes both boundaries to UTC before serializing (exactly like
+    ``_weekref_key``), so two spellings of one window can't create duplicate
+    entries. The RAW ISO strings are still used for the row output — this key is
+    cache identity only.
+    """
+    return (
+        original_start_at.astimezone(dt.timezone.utc).isoformat(),
+        effective_at.astimezone(dt.timezone.utc).isoformat(),
+    )
+
+
+def reset_bugk_segment_state():
+    """Clear the Bug-K segment cache + its watermark (full invalidation).
+
+    Called from the orphan-prune site (a prune deletes ``session_entries``
+    possibly WITHOUT lowering ``MAX(id)``, so the reconcile's max-id-regression
+    check cannot catch it — the explicit clear must) and as a test hook.
+    """
+    _BUGK_SEGMENT_CACHE.clear()
+    _BUGK_SEGMENT_LAST_SEEN.clear()
+
+
+def cached_bugk_segment(*, key, compute):
+    """Get-or-compute one pre-credit segment aggregate (spec §18).
+
+    The ``[original_start, effective)`` window is ALWAYS a closed past interval
+    (``effective`` is a historical credit moment), so it is always cacheable: a
+    cache hit returns the stored ``BugKSegment``; a miss calls ``compute()`` — the
+    caller's exact from-scratch fetch+fold closure, a ``(timestamp_utc, id)``-
+    ordered fetch so the left-fold ``cost`` / first-seen ``models`` order is
+    bit-identical to today's — and stores it. ``key`` is the canonical
+    ``_bugk_key``.
+    """
+    hit = _BUGK_SEGMENT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = compute()
+    _BUGK_SEGMENT_CACHE[key] = val
+    return val
+
+
+def reconcile_bugk_cache(cache_conn, *, max_entry_id, reset_sig):
+    """Once-per-non-idle-rebuild invalidation for the Bug-K segment cache (§18).
+
+    Driven by ``_tui_build_snapshot`` after the idle-path check, before the
+    builders run, ALONGSIDE ``reconcile_weekref_cache``, using the dispatch-
+    signature legs already computed for the idle decision (``max_entry_id`` +
+    ``reset_sig`` passed in — no extra query for those):
+
+    - Cold (no last-seen): record last-seen, return — no eviction.
+    - ``reset_sig`` changed (credit events / their ``effective`` moments moved)
+      OR ``max_entry_id < last_seen`` (cache.db rebuilt out-of-process): full
+      ``clear()``. Credit events are rare, so a conservative full clear is correct
+      and cheap; a max-id regression means the ids no longer map to the same rows.
+    - ``max_entry_id > last_seen``: evict segments whose ``effective`` is
+      ``> new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row could
+      fall inside them (F1 late-ingest). The bound is ``>`` (STRICT), NOT ``>=``,
+      because the segment window is HALF-OPEN ``[original_start, effective)``
+      (Codex-BK-5): a new row EXACTLY at ``effective`` is OUTSIDE the segment
+      (never contributes), while a row at ``original_start`` .. just-below
+      ``effective`` evicts. This is the ONE semantic difference from the weekref
+      cache's inclusive ``>=`` (that window is ``[start, end]``). Over-eviction is
+      byte-safe (forces a recompute); normally ``wm`` is recent and nothing drops.
+
+    Idempotent within a tick: after the first call updates last-seen, a later call
+    with the same signature sees no delta and no-ops (never re-running the
+    watermark query). The short-lived ``cache_conn`` is used only for the
+    ``new_min_timestamp`` query on the ``max_entry_id > last_seen`` branch
+    (Codex-4 lifecycle from §4).
+    """
+    ls = _BUGK_SEGMENT_LAST_SEEN
+    if not ls:  # cold
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig
+        return
+    if reset_sig != ls["reset_sig"] or max_entry_id < ls["max_id"]:
+        _BUGK_SEGMENT_CACHE.clear()  # a credit event moved, or cache.db rebuilt
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig
+        return
+    if max_entry_id > ls["max_id"]:
+        wm = new_min_timestamp(cache_conn, ls["max_id"])
+        if wm is not None:
+            for key in list(_BUGK_SEGMENT_CACHE):
+                # key = (orig_start_iso, eff_iso); half-open [start, eff) window,
+                # so evict when eff > the earliest new event time (a row AT eff is
+                # outside the segment; a row < eff could be inside it).
+                if dt.datetime.fromisoformat(key[1]) > wm:
+                    del _BUGK_SEGMENT_CACHE[key]
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig
