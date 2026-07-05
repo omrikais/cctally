@@ -2140,6 +2140,15 @@ def _tui_build_snapshot(
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
+        # ── #269 M3.1: shared per-weekref immutable-cost cache (spec §4/§6) ──
+        # Gated OFF by default; flipped ON only on the dashboard sync-thread
+        # NON-IDLE path below, AFTER the once-per-rebuild `reconcile_weekref_cache`
+        # has run. Off ⇒ the trend / weekly-history / forecast builders compute
+        # per-closed-week cost directly (CLI / TUI byte-identical). B2 (the
+        # cache-report per-day cache) was DROPPED at the M2.0 byte-identity gate
+        # (by_project net_usd is not associative across the day partition — see
+        # the spec §5 finding note), so only the weekref cache is wired here.
+        use_weekref_cost_cache = False
         # ── Three-path dispatch — idle short-circuit (spec §3, #268 M5.1) ──
         # Compute the composite data-version signature (cheap MAX(id) descents
         # over cache.db + stats.db + the reset-event change-signal + the
@@ -2191,6 +2200,29 @@ def _tui_build_snapshot(
                     )
                     _sc.store_dispatch_state(dispatch_key, idle_snap)
                     return idle_snap
+                # ── #269 M3.1: non-idle rebuild — reconcile the shared
+                # per-weekref immutable-cost cache ONCE here (spec §4/§6),
+                # before the builders run, using the dispatch-signature legs
+                # already computed for the idle decision (no extra MAX(id) /
+                # reset query). A SHORT-LIVED cache.db conn is opened only for
+                # reconcile's new-entry watermark query (Codex-4), mirroring
+                # `_tui_compute_dispatch_signature`. On success the trend /
+                # weekly-history / forecast builders opt into the cache via
+                # `use_weekref_cost_cache=True`; any failure leaves the flag OFF
+                # (safe direct-compute fallback, byte-identical output).
+                try:
+                    _rc_cache_conn = _cctally().open_cache_db()
+                    try:
+                        _sc.reconcile_weekref_cache(
+                            _rc_cache_conn,
+                            max_entry_id=dispatch_sig.max_entry_id,
+                            reset_sig=dispatch_sig.reset_sig,
+                        )
+                    finally:
+                        _rc_cache_conn.close()
+                    use_weekref_cost_cache = True
+                except Exception as exc:
+                    errors.append(f"weekref-reconcile: {exc}")
         try:
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
@@ -2201,7 +2233,10 @@ def _tui_build_snapshot(
             # the legacy ``ForecastOutput`` (for ``snap.forecast``, which
             # the many TUI panel consumers still read) and the surface
             # fields the envelope adapter used to re-derive inline.
-            fc_view = _tui_build_forecast_view(conn, now_utc, skip_sync=skip_sync)
+            fc_view = _tui_build_forecast_view(
+                conn, now_utc, skip_sync=skip_sync,
+                use_weekref_cost_cache=use_weekref_cost_cache,
+            )
             fc = fc_view.output if fc_view is not None else None
         except Exception as exc:
             errors.append(f"forecast: {exc}")
@@ -2216,6 +2251,7 @@ def _tui_build_snapshot(
             _trend_view = c.build_trend_view(
                 conn, now_utc=now_utc, n=8, display_tz=_build_display_tz,
                 skip_sync=skip_sync,
+                use_weekref_cost_cache=use_weekref_cost_cache,
             )
             trend = list(_trend_view.rows)
             trend_avg_dpp = _trend_view.avg_dollars_per_pct
@@ -2248,6 +2284,7 @@ def _tui_build_snapshot(
             # TrendModal.tsx stops re-deriving it client-side.
             history_view = _tui_build_weekly_history_view(
                 conn, now_utc, skip_sync=skip_sync, display_tz=_build_display_tz,
+                use_weekref_cost_cache=use_weekref_cost_cache,
             )
             history = list(history_view.rows)
             history_median_dpp = history_view.median_dpp_non_current_4w

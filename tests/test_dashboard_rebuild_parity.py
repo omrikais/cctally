@@ -2036,3 +2036,164 @@ def test_forecast_trailing_weeks_cache_hit_second_tick(monkeypatch, tmp_path):
     # Warm pass (unchanged signature): the 4 closed weeks are cache hits; only
     # the open current-week spend (never cached) still calls the primitive.
     assert calls["n"] - first <= 1
+
+
+# ===========================================================================
+# #269 M3.1 — dispatch wiring in `_tui_build_snapshot` (spec §6). The live
+# dashboard rebuild must (a) DRIVE `reconcile_weekref_cache` once per non-idle
+# rebuild using the already-computed dispatch signature, and (b) pass
+# `use_weekref_cost_cache=True` at the trend / weekly-history / forecast call
+# sites. These end-to-end tests exercise the whole `_tui_build_snapshot` and
+# prove the wiring via a spy on `_compute_cost_for_weekref` — the closed
+# reset-week cost primitive the weekref cache serves — plus a warm-vs-fresh
+# trend parity (the byte-identity acceptance gate). B2 (cache-report cache) was
+# dropped at the M2.0 gate, so only the weekref cache is wired here.
+# ===========================================================================
+
+
+def _reset_rebuild_caches(sc):
+    sc.reset_dispatch_state()
+    sc.reset_group_a_state()
+    sc.reset_session_cache_state()
+    sc.reset_doctor_memo()
+    sc.reset_weekref_cost_state()
+
+
+def test_snapshot_warm_rebuild_serves_closed_reset_week_from_cache(monkeypatch, tmp_path):
+    """A warm (non-idle) dashboard rebuild whose only change is a CURRENT-week
+    entry serves the CLOSED reset week from the weekref cache — proving
+    `use_weekref_cost_cache=True` reached the trend + weekly-history builders
+    (else the closed week would recompute on every non-idle tick). Spy on
+    `_compute_cost_for_weekref`: zero calls on the warm rebuild; and the warm
+    trend/weekly-history equal a from-scratch (reset-cache) rebuild."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _reset_rebuild_caches(sc)
+    _seed_multiday_jsonl(tmp_path)      # includes a 2026-06-20 entry (closed week)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    try:
+        _seed_closed_reset_event_week(ns, stats)
+        refs = ns["get_recent_weeks"](stats, 12)
+        assert any(ns["_week_ref_has_reset_event"](stats, r) for r in refs), (
+            "fixture must produce at least one reset-event week"
+        )
+    finally:
+        stats.close()
+
+    calls = {"n": 0}
+    real = ns["_compute_cost_for_weekref"]
+
+    def spy(ref, **kw):
+        calls["n"] += 1
+        return real(ref, **kw)
+
+    monkeypatch.setitem(ns, "_compute_cost_for_weekref", spy)
+
+    # Cold dashboard rebuild: populates the weekref cache with the closed week.
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] >= 1, "cold rebuild must compute the closed reset week"
+
+    # Warm: a NEW current-week entry → signature advances → NON-IDLE rebuild,
+    # but the closed reset week is unchanged → served from the weekref cache.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("z1", "zm", "zr", "z", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
+    ])
+    before = calls["n"]
+    later = NOW_UTC + dt.timedelta(seconds=5)
+    warm = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] - before == 0, (
+        f"warm rebuild must serve the closed reset week from the weekref cache "
+        f"(use_weekref_cost_cache=True must reach the trend/weekly-history "
+        f"builders), but _compute_cost_for_weekref ran {calls['n'] - before} times"
+    )
+
+    # Acceptance gate: the warm trend equals a from-scratch (reset-cache) rebuild
+    # on the same post-insert DB at the same `now`.
+    sc.reset_weekref_cost_state()
+    sc.reset_dispatch_state()
+    fresh = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=True,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert warm.trend == fresh.trend, "warm trend must equal from-scratch"
+    assert warm.weekly_history == fresh.weekly_history, (
+        "warm weekly-history must equal from-scratch"
+    )
+
+
+def test_snapshot_reconcile_evicts_late_ingest_closed_week(monkeypatch, tmp_path):
+    """`_tui_build_snapshot` DRIVES `reconcile_weekref_cache` on the non-idle
+    path: a late-ingest whose event time lands INSIDE the CLOSED reset week
+    advances the new-entry watermark, so reconcile evicts that week and the warm
+    rebuild recomputes it (spy delta >= 1) — and the warm trend equals a
+    from-scratch rebuild. Were reconcile NOT driven (flag set but no reconcile),
+    the stale cached cost would persist and the warm trend would diverge."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _reset_rebuild_caches(sc)
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    try:
+        _seed_closed_reset_event_week(ns, stats)
+    finally:
+        stats.close()
+
+    calls = {"n": 0}
+    real = ns["_compute_cost_for_weekref"]
+
+    def spy(ref, **kw):
+        calls["n"] += 1
+        return real(ref, **kw)
+
+    monkeypatch.setitem(ns, "_compute_cost_for_weekref", spy)
+
+    ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] >= 1, "cold rebuild computed the closed reset week"
+
+    # Late-ingest: a NEW row with an OLD event time INSIDE the closed reset week
+    # (2026-06-15 -> 2026-06-22). Its ingest id is new (advances the signature);
+    # its timestamp reaches back → reconcile's watermark must evict the week.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("l1", "lm", "lr", "late", "2026-06-18T12:00:00Z", "claude-opus-4-8"),
+    ])
+    before = calls["n"]
+    later = NOW_UTC + dt.timedelta(seconds=5)
+    warm = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert calls["n"] - before >= 1, (
+        "a late-ingest into the closed reset week must make reconcile evict it "
+        "so the warm rebuild recomputes it (proves reconcile_weekref_cache runs "
+        "on the non-idle path)"
+    )
+
+    # Acceptance gate: the warm trend equals a from-scratch (reset-cache) rebuild
+    # — the reconcile-wiring guard (a stale hit would diverge here).
+    sc.reset_weekref_cost_state()
+    sc.reset_dispatch_state()
+    fresh = ns["_tui_build_snapshot"](
+        now_utc=later, skip_sync=True,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert warm.trend == fresh.trend, (
+        "warm trend must equal from-scratch after a late-ingest into a closed "
+        "reset week (reconcile must have evicted the stale cached cost)"
+    )
