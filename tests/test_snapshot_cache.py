@@ -950,3 +950,76 @@ def test_reconcile_projects_env_idempotent_within_tick(tmp_cache, monkeypatch):
     # Second call, SAME signature: no watermark re-query, entry survives.
     sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_wus_id=0, sf_sig=(0, 0))
     assert calls["n"] == 1
+
+
+# ===========================================================================
+# #271 M1 — incremental current-bucket floor
+#
+# Shared helpers: a FULL-production-schema cache.db (so ``iter_entries`` and
+# its delta sibling run against the real column/index shape, incl.
+# ``idx_entries_timestamp`` and the ``speed``/``cost_usd_raw`` columns), plus
+# a plain ISO→aware-UTC parser and a ``(id, UsageEntry)`` row builder for the
+# pure accumulator tests (no DB).
+# ===========================================================================
+def _make_cache_db(tmp_path, name="cache271.db"):
+    """A cache.db carrying the real production ``session_entries`` schema.
+
+    Uses ``_cctally_db._apply_cache_schema`` (the single schema source) so the
+    table has ``id INTEGER PRIMARY KEY AUTOINCREMENT``, ``speed`` /
+    ``cost_usd_raw``, and ``idx_entries_timestamp`` — everything
+    ``iter_entries`` / ``iter_entries_with_id`` read and the query-plan test
+    depends on.
+    """
+    import _cctally_db as _db
+
+    conn = sqlite3.connect(tmp_path / name)
+    _db._apply_cache_schema(conn)
+    conn.commit()
+    return conn
+
+
+def _insert_entry(conn, *, ts, model="claude-opus-4-8", input=0, output=0,
+                  cache_create=0, cache_read=0, speed=None, cost_usd=None,
+                  source="/p/a.jsonl"):
+    """Insert one ``session_entries`` row (auto-incrementing ``line_offset``)."""
+    off = conn.execute(
+        "SELECT COALESCE(MAX(line_offset), -1) + 1 FROM session_entries"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, cache_create_tokens, cache_read_tokens, speed, cost_usd_raw) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (source, off, ts, model, input, output, cache_create, cache_read,
+         speed, cost_usd),
+    )
+    conn.commit()
+
+
+def _dt(iso):
+    """Parse an ISO-8601 string (``…Z`` or offset) to an aware-UTC datetime."""
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(
+        dt.timezone.utc
+    )
+
+
+# --- Task 1: iter_entries fold-order tie-break -----------------------------
+def test_iter_entries_order_is_timestamp_then_id(tmp_path):
+    """``iter_entries`` returns rows in ``(timestamp_utc, id)`` ascending order,
+    equal-timestamp ties broken by ``id`` (#271 §5 / Codex-3)."""
+    import _cctally_cache as cache
+
+    conn = _make_cache_db(tmp_path)
+    try:
+        # Two rows with the SAME timestamp, inserted in id order 1 then 2, plus
+        # an earlier-timestamp row inserted LAST (id=3).
+        _insert_entry(conn, ts="2026-07-01T00:00:00Z", input=1)   # id=1
+        _insert_entry(conn, ts="2026-07-01T00:00:00Z", input=2)   # id=2
+        _insert_entry(conn, ts="2026-06-30T23:59:59Z", input=3)   # id=3 (earlier ts)
+        rows = cache.iter_entries(
+            conn, _dt("2026-06-01T00:00:00Z"), _dt("2026-07-31T00:00:00Z")
+        )
+        # Ascending by timestamp; the equal-ts pair ordered by id (1 then 2).
+        assert [e.usage["input_tokens"] for e in rows] == [3, 1, 2]
+    finally:
+        conn.close()

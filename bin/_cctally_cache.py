@@ -2302,7 +2302,14 @@ def iter_entries(
         )
         sql += r" AND source_path LIKE ? ESCAPE '\'"
         params.append(f"%/projects/{escaped}/%")
-    sql += " ORDER BY timestamp_utc ASC"
+    # Explicit (timestamp_utc, id) tie-break (#271 §5 / Codex-3): the
+    # `idx_entries_timestamp` index already stores keys as (timestamp_utc,
+    # rowid), so an index-driven walk yields exactly this order and pinning it
+    # is free at runtime (goldens unchanged). The pin converts that OBSERVED
+    # planner behavior into a CONTRACT — a guaranteed total fold order — which
+    # is what makes #271's incremental current-bucket append provably
+    # byte-identical to the full-pass fold.
+    sql += " ORDER BY timestamp_utc ASC, id ASC"
 
     entries: list[UsageEntry] = []
     for row in conn.execute(sql, params):
