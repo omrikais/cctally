@@ -1196,6 +1196,75 @@ def test_iter_entries_with_id_query_plan_is_indexed(tmp_path):
         conn.close()
 
 
+# --- Task 5: current_override hook + accumulator wiring --------------------
+def _bucket(label, *, input=0):
+    """A minimal ``BucketUsage`` for override/wiring tests."""
+    from _lib_aggregators import BucketUsage
+
+    return BucketUsage(
+        bucket=label, input_tokens=input, output_tokens=0,
+        cache_creation_tokens=0, cache_read_tokens=0, total_tokens=input,
+        cost_usd=0.0, models=[], model_breakdowns=[])
+
+
+def _daily_end_of(label):
+    d = dt.date.fromisoformat(label)
+    return (dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
+            + dt.timedelta(days=2))
+
+
+def test_cached_buckets_current_override():
+    """When ``current_override`` is supplied, the current label is served from
+    it and ``aggregate_one`` is NOT called for it (#271 §8a)."""
+    import _lib_snapshot_cache as sc
+
+    calls = []
+
+    def agg_one(label, entries):
+        calls.append(label)
+        return _bucket(label, input=1)
+
+    out = sc.cached_buckets(
+        "daily", cache=sc.BucketCache(),
+        all_bucket_labels=["2026-06-30", "2026-07-01"], current_label="2026-07-01",
+        dirty_predicate=lambda l: False,
+        fetch_bucket_entries=lambda l: [], aggregate_one=agg_one,
+        current_override=lambda: _bucket("2026-07-01", input=42))
+    assert "2026-07-01" not in calls           # override used, not aggregate_one
+    assert "2026-06-30" in calls               # past bucket still via aggregate_one
+    assert out[-1].input_tokens == 42          # current comes from the override
+
+
+def test_build_cached_group_a_accumulator_off_by_default(tmp_path):
+    """The default path (``use_current_accumulator=False``) never engages the
+    accumulator — the current label is computed via ``aggregate_one`` and the
+    ``_GROUP_A_CURRENT`` holder stays empty (byte-identical to today)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_group_a_state()
+    conn = _make_cache_db(tmp_path)
+    try:
+        _insert_entry(conn, ts="2026-07-04T09:00:00Z", input=3)
+        labels = ["2026-07-03", "2026-07-04"]
+        calls = []
+
+        def agg_one(label, entries):
+            calls.append(label)
+            return _bucket(label, input=len(entries))
+
+        out = sc.build_cached_group_a(
+            "daily", cache_conn=conn, all_bucket_labels=labels,
+            current_label="2026-07-04", bucket_end_of=_daily_end_of,
+            fetch_bucket_entries=lambda l: [1] if l == "2026-07-04" else [],
+            aggregate_one=agg_one, extra_signature=("daily", "local"),
+            use_current_accumulator=False)
+        assert "2026-07-04" in calls          # current computed via aggregate_one
+        assert sc._GROUP_A_CURRENT == {}       # accumulator holder untouched
+        assert out[-1].input_tokens == 1
+    finally:
+        conn.close()
+
+
 # --- Task 1: iter_entries fold-order tie-break -----------------------------
 def test_iter_entries_order_is_timestamp_then_id(tmp_path):
     """``iter_entries`` returns rows in ``(timestamp_utc, id)`` ascending order,

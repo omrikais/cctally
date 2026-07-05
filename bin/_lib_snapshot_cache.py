@@ -464,37 +464,48 @@ def cached_buckets(
     dirty_predicate: "Callable[[str], bool]",
     fetch_bucket_entries: "Callable[[str], list]",
     aggregate_one: "Callable[[str, list], object | None]",
+    current_override: "Callable[[], object | None] | None" = None,
 ) -> "list[object]":
     """Assemble one Group A builder's per-bucket aggregates (spec §5.1).
 
     For each label in ``all_bucket_labels`` (caller order — pass oldest→newest
     so the assembled list matches ``_aggregate_*``'s ascending-key output):
 
-    - If the label is ``current_label`` (the open bucket) or ``dirty_predicate``
-      returns True (the watermark reached it, or a forced recompute), recompute
-      it WHOLE via ``aggregate_one(label, fetch_bucket_entries(label))`` — a
+    - If the label is ``current_label`` and ``current_override`` is supplied
+      (#271 §8a), the current bucket is produced by ``current_override()`` — the
+      incremental accumulator — INSTEAD of the full ``aggregate_one`` recompute.
+      The override returns the finalized ``BucketUsage`` (or ``None`` for a
+      no-data current bucket, handled by the same gap-drop below).
+    - Else if the label is ``current_label`` or ``dirty_predicate`` returns True
+      (the watermark reached it, or a forced recompute), recompute it WHOLE via
+      ``aggregate_one(label, fetch_bucket_entries(label))`` — a
       timestamp-ordered fetch, so ``_aggregate_buckets`` first-seen model order
       reproduces the full-history pass byte-for-byte (Codex F3).
     - Otherwise serve the cached ``BucketUsage``; on a cache MISS (cold start /
       post-invalidation) recompute it the same way.
 
-    ``aggregate_one`` returns ``None`` for a label with no data (a gap
-    day/month/week): the bucket is omitted from the result and any stale cache
-    entry for that label is evicted. The returned list therefore contains only
-    buckets-with-data — exactly what ``_aggregate_daily/_monthly/_weekly`` over
-    the full entry set returns — in ``all_bucket_labels`` order.
+    ``aggregate_one`` / ``current_override`` return ``None`` for a label with no
+    data (a gap day/month/week): the bucket is omitted from the result and any
+    stale cache entry for that label is evicted. The returned list therefore
+    contains only buckets-with-data — exactly what
+    ``_aggregate_daily/_monthly/_weekly`` over the full entry set returns — in
+    ``all_bucket_labels`` order.
 
     Values are stored/served as-is (immutable ``BucketUsage``); this loop never
-    mutates a bucket in place (spec §7).
+    mutates a bucket in place (spec §7). ``current_override`` stays a pure hook:
+    the assembly order, past-bucket serve/cold-miss, and gap-drop are untouched.
     """
     result: "list[object]" = []
     for label in all_bucket_labels:
-        recompute = (label == current_label) or dirty_predicate(label)
-        bucket = None
-        if not recompute:
-            bucket = cache.get(builder_key, label)
-        if bucket is None:  # forced recompute OR cold miss
-            bucket = aggregate_one(label, fetch_bucket_entries(label))
+        if label == current_label and current_override is not None:
+            bucket = current_override()
+        else:
+            recompute = (label == current_label) or dirty_predicate(label)
+            bucket = None
+            if not recompute:
+                bucket = cache.get(builder_key, label)
+            if bucket is None:  # forced recompute OR cold miss
+                bucket = aggregate_one(label, fetch_bucket_entries(label))
         if bucket is None:
             # Gap bucket (no data): drop any stale cache entry, omit from output.
             cache.drop_from(builder_key, lambda lbl, _t=label: lbl == _t)
@@ -514,6 +525,11 @@ def build_cached_group_a(
     fetch_bucket_entries: "Callable[[str], list]",
     aggregate_one: "Callable[[str, list], object | None]",
     extra_signature: object = None,
+    use_current_accumulator: bool = False,
+    now_utc: "dt.datetime | None" = None,
+    current_all_fetch: "Callable[[str], list] | None" = None,
+    current_delta_fetch: "Callable[[str, int, dt.datetime], list] | None" = None,
+    membership_of: "Callable[[object], bool] | None" = None,
 ) -> "list[object]":
     """Stateful Group A assembly: invalidation + watermark + ``cached_buckets``.
 
@@ -541,6 +557,10 @@ def build_cached_group_a(
     )
     if full_invalidate:
         _GROUP_A_CACHE.drop_from(builder_key, lambda _lbl: True)
+        # The current bucket's boundaries may have shifted (a weekly signature
+        # move / cache.db rebuild) → discard the accumulator so the override
+        # cold-refolds this tick (#271 §8c).
+        _GROUP_A_CURRENT.pop(builder_key, None)
 
     if state is None or full_invalidate:
         # Cold start OR post-invalidation: recompute every label. (Cold already
@@ -557,6 +577,30 @@ def build_cached_group_a(
             end = bucket_end_of(label)
             return end is not None and end > new_min_ts
 
+    # #271 §8a/§8b: when the incremental accumulator is enabled, the current
+    # bucket is produced by folding only the delta each tick instead of a full
+    # re-aggregate. The delta's id lower bound reuses the SAME previous-tick
+    # `state["max_id"]` the watermark path reads (via prior.last_seen_id inside
+    # the accumulator). Gated ON only by the sync-thread `_group_a_*_buckets`
+    # closures; every other caller leaves it off (byte-identical to today).
+    current_override = None
+    if use_current_accumulator and current_label is not None:
+        def current_override():
+            prior = _GROUP_A_CURRENT.get(builder_key)
+            bucket, new_state = accumulate_current_bucket(
+                prior,
+                current_label=current_label,
+                cur_now=now_utc,
+                cur_max_id=cur_max_id,
+                fetch_all=lambda: current_all_fetch(current_label),
+                fetch_delta=lambda aid, ats: current_delta_fetch(
+                    current_label, aid, ats),
+                membership=membership_of,
+                mode="auto",
+            )
+            _GROUP_A_CURRENT[builder_key] = new_state
+            return bucket
+
     buckets = cached_buckets(
         builder_key,
         cache=_GROUP_A_CACHE,
@@ -565,6 +609,7 @@ def build_cached_group_a(
         dirty_predicate=dirty,
         fetch_bucket_entries=fetch_bucket_entries,
         aggregate_one=aggregate_one,
+        current_override=current_override,
     )
     _GROUP_A_LAST_SEEN[builder_key] = {"max_id": cur_max_id, "extra": extra_signature}
     return buckets
