@@ -247,7 +247,7 @@ import urllib.request
 import webbrowser as _wb
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -3559,12 +3559,189 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
         yield row
 
 
+class _ProjWeekBucket(NamedTuple):
+    """One (bucket_path, week) immutable aggregate for the projects-envelope
+    per-week cache (#269 §14 Win 2).
+
+    All fields are entry-local — each entry belongs to exactly one bucket and
+    one week — so a CLOSED week's values are stable and reproduce the
+    full-window walk's contribution for that week byte-for-byte.
+
+    ``first_seen`` / ``last_seen`` are the min / max PARSED event datetimes
+    (emitted via ``_iso_z``). ``first_order`` / ``first_id`` / ``first_key`` are
+    the SQL-FIRST entry for this bucket in this week (first-encountered under
+    ``ORDER BY timestamp_utc ASC, id ASC``): ``first_order`` is the RAW
+    ``timestamp_utc`` string, so the ``key_by_bucket`` reconstruction argmin
+    reproduces the from-scratch global first-seen exactly (Codex-M4 P1 — the
+    no-git ``display_key`` makes ``key_by_bucket[bp]`` non-deterministic per
+    bucket_path; the envelope picks by global first-seen order).
+    """
+    cost_usd: float
+    sessions_count: int
+    first_seen: "dt.datetime"
+    last_seen: "dt.datetime"
+    first_order: str
+    first_id: int
+    first_key: "Any"
+
+
+def _aggregate_projects_week(
+    conn: "sqlite3.Connection",
+    *,
+    week_start: "dt.datetime",
+    week_end: "dt.datetime",
+    resolver_cache: dict,
+) -> "tuple[dict[str, _ProjWeekBucket], float]":
+    """Aggregate one Monday-anchored subscription week's entry slice.
+
+    Returns ``({bucket_path: _ProjWeekBucket}, week_total_cost)``. Byte-identical
+    to the contribution the full-window walk in ``_build_projects_envelope``
+    makes for this week: the per-week query returns entries in the same
+    ``timestamp_utc ASC, id ASC`` order, filtered to those whose
+    Monday-anchored week equals ``week_start``, so the per-bucket cost sum, the
+    entry-order ``week_total`` sum, the session set, and the first/last-seen +
+    SQL-first-entry captures all reproduce the full pass. ``week_end`` is the
+    inclusive query bound (``<= ?``); the exact next-Monday boundary entry is
+    fetched but filtered out (it belongs to the next week) — the next week's
+    slice keeps it, so no entry is lost or double-counted.
+    """
+    c = _cctally()
+    _resolve_project_key = c._resolve_project_key
+    week_total = 0.0
+    mut: "dict[str, dict]" = {}
+    for row in _projects_iter_session_entries(
+        conn, since=week_start, until=week_end,
+    ):
+        (entry_id, ts_iso, model, input_tok, output_tok,
+         cache_create, cache_read, cost_raw, source_path,
+         session_id, project_path) = row
+        if model == "<synthetic>":
+            continue
+        ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+        if _projects_week_start_monday_utc(ts) != week_start:
+            continue
+        entry_cost = _calculate_entry_cost(
+            model,
+            {
+                "input_tokens": input_tok or 0,
+                "output_tokens": output_tok or 0,
+                "cache_creation_input_tokens": cache_create or 0,
+                "cache_read_input_tokens": cache_read or 0,
+            },
+            mode="auto",
+            cost_usd=cost_raw,
+        )
+        pkey = _resolve_project_key(project_path, "git-root", resolver_cache)
+        bp = pkey.bucket_path
+        a = mut.get(bp)
+        if a is None:
+            a = {
+                "cost_usd": 0.0,
+                "sessions": set(),
+                "first_seen": ts,
+                "last_seen": ts,
+                "first_order": ts_iso,
+                "first_id": entry_id,
+                "first_key": pkey,
+            }
+            mut[bp] = a
+        a["cost_usd"] += entry_cost
+        if session_id:
+            a["sessions"].add(session_id)
+        elif source_path:
+            a["sessions"].add(source_path)
+        if ts < a["first_seen"]:
+            a["first_seen"] = ts
+        if ts > a["last_seen"]:
+            a["last_seen"] = ts
+        week_total += entry_cost
+    out = {
+        bp: _ProjWeekBucket(
+            cost_usd=a["cost_usd"],
+            sessions_count=len(a["sessions"]),
+            first_seen=a["first_seen"],
+            last_seen=a["last_seen"],
+            first_order=a["first_order"],
+            first_id=a["first_id"],
+            first_key=a["first_key"],
+        )
+        for bp, a in mut.items()
+    }
+    return out, week_total
+
+
+def _assemble_projects_via_cache(
+    conn: "sqlite3.Connection",
+    *,
+    weeks_full: "list[dt.datetime]",
+    cw_start: "dt.datetime",
+    cw_end: "dt.datetime",
+) -> "tuple[dict, dict, dict]":
+    """Flag-ON assembly (#269 §14 Win 2): recompute only the CURRENT week each
+    warm tick; serve CLOSED weeks from the per-(project, week) cache on a hit and
+    RECOMPUTE-AND-POPULATE on a miss (cold / Monday rollover / window slide,
+    Codex-M4 P2). Returns ``(buckets, total_cost_by_week, key_by_bucket)`` in the
+    exact shape the from-scratch walk produces, so the downstream disambiguation
+    / attribution / trend assembly runs unchanged and byte-identically.
+    """
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+    resolver_cache: dict = {}
+    buckets: dict = {}
+    total_cost_by_week: dict = {}
+    key_by_bucket: dict = {}
+    # Reconstruct key_by_bucket by the GLOBAL first-seen SQL order
+    # (timestamp_utc ASC, id ASC): per bucket_path, the argmin of
+    # (first_order, first_id) across its assembled weeks (Codex-M4 P1).
+    best_order: dict = {}
+
+    def _merge_week(w, week_buckets, week_total):
+        # `total_cost_by_week` mirrors the from-scratch dict, which is only
+        # populated for weeks that had entries (an empty week stays absent and
+        # falls back to `.get(w, 0.0)` downstream).
+        if week_buckets:
+            total_cost_by_week[w] = week_total
+        for bp, wb in week_buckets.items():
+            buckets[(bp, w)] = {
+                "cost_usd": wb.cost_usd,
+                # `sessions` is only ever `len()`-d downstream; a `range` of the
+                # cached count reproduces that without storing the id set.
+                "sessions": range(wb.sessions_count),
+                "first_seen": wb.first_seen,
+                "last_seen": wb.last_seen,
+            }
+            cand = (wb.first_order, wb.first_id)
+            if bp not in best_order or cand < best_order[bp]:
+                best_order[bp] = cand
+                key_by_bucket[bp] = wb.first_key
+
+    for w in weeks_full:
+        if w == cw_start:
+            week_buckets, week_total = _aggregate_projects_week(
+                conn, week_start=w, week_end=cw_end, resolver_cache=resolver_cache,
+            )
+        else:
+            week_iso = sc.projects_env_week_key(w)
+            hit = sc.projects_env_week_get(week_iso)
+            if hit is not None:
+                week_buckets, week_total = hit
+            else:
+                week_buckets, week_total = _aggregate_projects_week(
+                    conn, week_start=w, week_end=w + dt.timedelta(days=7),
+                    resolver_cache=resolver_cache,
+                )
+                sc.projects_env_week_put(week_iso, week_buckets, week_total)
+        _merge_week(w, week_buckets, week_total)
+    return buckets, total_cost_by_week, key_by_bucket
+
+
 def _build_projects_envelope(
     conn: "sqlite3.Connection",
     *,
     now_utc: "dt.datetime",
     current_week: "Any | None" = None,
     weeks_back: int = 12,
+    use_projects_env_cache: bool = False,
 ) -> dict:
     """Build the ``projects.{current_week, trend}`` envelope block.
 
@@ -3644,95 +3821,105 @@ def _build_projects_envelope(
     until_dt = cw_end  # exclusive end; SQL is `>= since AND <= until`
 
     # ---- Bucket entries per (ProjectKey, week_start) --------------------
-    # `_resolve_project_key` is the production resolver; we use git-root
-    # mode (default for `cmd_project --group` absent) — matches the
-    # CLI's default.
-    _resolve_project_key = c._resolve_project_key
-    resolver_cache: dict = {}
-
-    # buckets[(bucket_path, week_start)] -> {key, cost, sessions, ...}
-    buckets: dict[tuple[str, dt.datetime], dict] = {}
-    # Track total cost per week across ALL entries (attribution denominator).
-    total_cost_by_week: dict[dt.datetime, float] = {}
-    # Track first-seen ProjectKey instance per bucket_path so we can pass
-    # the dict to `_project_disambiguate_labels` (which keys on `key.bucket_path`
-    # equality via ProjectKey.__eq__).
-    key_by_bucket: dict[str, Any] = {}
-
-    def _week_for(ts: dt.datetime) -> "dt.datetime | None":
-        wstart = _projects_week_start_monday_utc(ts)
-        if wstart < weeks_full[0] or wstart > weeks_full[-1]:
-            return None
-        return wstart
-
-    # Orphan handling: `_projects_iter_session_entries` LEFT JOINs
-    # `session_files` so entries whose source_path has no
-    # `session_files` row return `project_path = NULL`. Below,
-    # `_resolve_project_key(None, ...)` maps that to the
-    # `(unknown)` bucket — same identity the drill-down's explicit
-    # orphan scan in `_project_detail_for_window` (see the
-    # ``if unknown_bucket:`` branch around the
-    # `orphan_cur` SELECT) collects via a NULL-side LEFT JOIN. The
-    # two paths converge on the same `(unknown)` source_path set.
-    for row in _projects_iter_session_entries(
-        conn, since=since_dt, until=until_dt,
-    ):
-        (entry_id, ts_iso, model, input_tok, output_tok,
-         cache_create, cache_read, cost_raw, source_path,
-         session_id, project_path) = row
-        if model == "<synthetic>":
-            continue
-        # Parse timestamp; assume Z / +00:00 — production iterators do
-        # the same via `parse_iso_datetime`.
-        ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
-        wstart = _week_for(ts)
-        if wstart is None:
-            continue
-
-        # Entry cost via the shared pricing chokepoint.
-        entry_cost = _calculate_entry_cost(
-            model,
-            {
-                "input_tokens": input_tok or 0,
-                "output_tokens": output_tok or 0,
-                "cache_creation_input_tokens": cache_create or 0,
-                "cache_read_input_tokens": cache_read or 0,
-            },
-            mode="auto",
-            cost_usd=cost_raw,
+    # The three structures the downstream disambiguation / attribution /
+    # trend assembly consume:
+    #   buckets[(bucket_path, week_start)] -> {cost_usd, sessions, first/last_seen}
+    #   total_cost_by_week[week_start]     -> attribution denominator
+    #   key_by_bucket[bucket_path]         -> global first-seen ProjectKey
+    # Flag ON (#269 §14 Win 2, sync-thread only): the CURRENT week is recomputed
+    # fresh each warm tick; CLOSED weeks are served from the per-(project, week)
+    # cache (hit) or recomputed-and-populated (miss). Flag OFF (CLI / tests /
+    # HTTP-drill): the original single full-window walk, byte-unchanged.
+    if use_projects_env_cache:
+        buckets, total_cost_by_week, key_by_bucket = _assemble_projects_via_cache(
+            conn, weeks_full=weeks_full, cw_start=cw_start, cw_end=cw_end,
         )
+    else:
+        # `_resolve_project_key` is the production resolver; we use git-root
+        # mode (default for `cmd_project --group` absent) — matches the
+        # CLI's default.
+        _resolve_project_key = c._resolve_project_key
+        resolver_cache: dict = {}
 
-        # Project-key identity (`git_root` mode = production default).
-        pkey = _resolve_project_key(project_path, "git-root", resolver_cache)
-        bkey = (pkey.bucket_path, wstart)
-        b = buckets.get(bkey)
-        if b is None:
-            b = {
-                "key": pkey,
-                "cost_usd": 0.0,
-                "sessions": set(),
-                "first_seen": ts,
-                "last_seen": ts,
-            }
-            buckets[bkey] = b
-        b["cost_usd"] += entry_cost
-        if session_id:
-            b["sessions"].add(session_id)
-        elif source_path:
-            # Fallback: treat one source_path as one session when
-            # session_files.session_id is NULL (lazy population).
-            b["sessions"].add(source_path)
-        if ts < b["first_seen"]:
-            b["first_seen"] = ts
-        if ts > b["last_seen"]:
-            b["last_seen"] = ts
-        total_cost_by_week[wstart] = (
-            total_cost_by_week.get(wstart, 0.0) + entry_cost
-        )
-        # Remember first-seen ProjectKey for each bucket_path so the
-        # disambiguator pass below sees consistent ProjectKey instances.
-        if pkey.bucket_path not in key_by_bucket:
-            key_by_bucket[pkey.bucket_path] = pkey
+        buckets = {}
+        total_cost_by_week = {}
+        # First-seen ProjectKey per bucket_path (feeds `_project_disambiguate_labels`).
+        key_by_bucket = {}
+
+        def _week_for(ts: dt.datetime) -> "dt.datetime | None":
+            wstart = _projects_week_start_monday_utc(ts)
+            if wstart < weeks_full[0] or wstart > weeks_full[-1]:
+                return None
+            return wstart
+
+        # Orphan handling: `_projects_iter_session_entries` LEFT JOINs
+        # `session_files` so entries whose source_path has no
+        # `session_files` row return `project_path = NULL`. Below,
+        # `_resolve_project_key(None, ...)` maps that to the
+        # `(unknown)` bucket — same identity the drill-down's explicit
+        # orphan scan in `_project_detail_for_window` (see the
+        # ``if unknown_bucket:`` branch around the
+        # `orphan_cur` SELECT) collects via a NULL-side LEFT JOIN. The
+        # two paths converge on the same `(unknown)` source_path set.
+        for row in _projects_iter_session_entries(
+            conn, since=since_dt, until=until_dt,
+        ):
+            (entry_id, ts_iso, model, input_tok, output_tok,
+             cache_create, cache_read, cost_raw, source_path,
+             session_id, project_path) = row
+            if model == "<synthetic>":
+                continue
+            # Parse timestamp; assume Z / +00:00 — production iterators do
+            # the same via `parse_iso_datetime`.
+            ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+            wstart = _week_for(ts)
+            if wstart is None:
+                continue
+
+            # Entry cost via the shared pricing chokepoint.
+            entry_cost = _calculate_entry_cost(
+                model,
+                {
+                    "input_tokens": input_tok or 0,
+                    "output_tokens": output_tok or 0,
+                    "cache_creation_input_tokens": cache_create or 0,
+                    "cache_read_input_tokens": cache_read or 0,
+                },
+                mode="auto",
+                cost_usd=cost_raw,
+            )
+
+            # Project-key identity (`git_root` mode = production default).
+            pkey = _resolve_project_key(project_path, "git-root", resolver_cache)
+            bkey = (pkey.bucket_path, wstart)
+            b = buckets.get(bkey)
+            if b is None:
+                b = {
+                    "key": pkey,
+                    "cost_usd": 0.0,
+                    "sessions": set(),
+                    "first_seen": ts,
+                    "last_seen": ts,
+                }
+                buckets[bkey] = b
+            b["cost_usd"] += entry_cost
+            if session_id:
+                b["sessions"].add(session_id)
+            elif source_path:
+                # Fallback: treat one source_path as one session when
+                # session_files.session_id is NULL (lazy population).
+                b["sessions"].add(source_path)
+            if ts < b["first_seen"]:
+                b["first_seen"] = ts
+            if ts > b["last_seen"]:
+                b["last_seen"] = ts
+            total_cost_by_week[wstart] = (
+                total_cost_by_week.get(wstart, 0.0) + entry_cost
+            )
+            # Remember first-seen ProjectKey for each bucket_path so the
+            # disambiguator pass below sees consistent ProjectKey instances.
+            if pkey.bucket_path not in key_by_bucket:
+                key_by_bucket[pkey.bucket_path] = pkey
 
     # ---- Load weekly_usage_snapshots for attribution --------------------
     # weekly_percent keyed by week_start (UTC datetime, Monday). We

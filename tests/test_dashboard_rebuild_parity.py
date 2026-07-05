@@ -22,6 +22,8 @@ import sqlite3
 import sys
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from conftest import load_script, redirect_paths  # type: ignore
 
 
@@ -2348,3 +2350,224 @@ def test_resolve_project_key_fullpath_alias_collapse_preserved(tmp_path):
         "the second alias must collapse to the FIRST spelling's display_key"
     )
     assert k_phys is k_alias  # returned via the normalized cache, not a new key
+
+
+# ===========================================================================
+# #269 M4.3 — wire `_build_projects_envelope` through the per-(project,week)
+# cache (spec §14 Win 2). Governing invariant: the envelope JSON is
+# byte-identical with the flag OFF *and* ON (reconcile-tested R-PROJ1/2/5).
+# ===========================================================================
+_PROJ_FIXTURE_DIR = None  # resolved lazily below
+_PROJ_NOW = dt.datetime(2026, 5, 19, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def _proj_fixture_path(name):
+    import pathlib
+    return pathlib.Path(__file__).resolve().parent / "fixtures" / "projects" / name
+
+
+def _open_proj_copy(name, tmp_path):
+    import shutil
+    dst = tmp_path / name
+    shutil.copy(_proj_fixture_path(name), dst)
+    return sqlite3.connect(dst)
+
+
+def _proj_sig_legs(conn):
+    mid = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM session_entries"
+    ).fetchone()[0]
+    try:
+        mw = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM weekly_usage_snapshots"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        mw = 0
+    return int(mid), int(mw)
+
+
+def _proj_reconcile(sc, conn, mid, mw):
+    sc.reconcile_projects_env_cache(
+        conn, max_entry_id=mid, max_wus_id=mw, sf_sig=sc.session_files_sig(conn),
+    )
+
+
+def _build_env(d, conn, *, now, flag, current_week=None):
+    d._projects_reset_memo()
+    return d._build_projects_envelope(
+        conn, now_utc=now, current_week=current_week, weeks_back=12,
+        use_projects_env_cache=flag,
+    )
+
+
+@pytest.mark.parametrize("fixture", ["multi-week.db", "edge-cases.db"])
+def test_projects_env_cached_matches_from_scratch(fixture):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = sqlite3.connect(_proj_fixture_path(fixture))
+    sc.reset_projects_env_state()
+    base = _build_env(d, conn, now=_PROJ_NOW, flag=False)
+
+    mid, mw = _proj_sig_legs(conn)
+    # Cold cached pass: every week is a miss → recompute-and-populate.
+    _proj_reconcile(sc, conn, mid, mw)
+    cached_cold = _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    assert cached_cold == base, "cold cached envelope must equal from-scratch"
+
+    # Warm cached pass (same signature): closed weeks are cache hits, only the
+    # current week recomputes.
+    _proj_reconcile(sc, conn, mid, mw)
+    cached_warm = _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    assert cached_warm == base, "warm cached envelope must equal from-scratch"
+
+
+def test_projects_env_warm_recomputes_only_current_week(monkeypatch):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = sqlite3.connect(_proj_fixture_path("multi-week.db"))
+    sc.reset_projects_env_state()
+    mid, mw = _proj_sig_legs(conn)
+
+    real = d._aggregate_projects_week
+    seen = {"weeks": []}
+
+    def spy(conn_, *, week_start, week_end, resolver_cache):
+        seen["weeks"].append(week_start)
+        return real(conn_, week_start=week_start, week_end=week_end,
+                    resolver_cache=resolver_cache)
+
+    monkeypatch.setattr(d, "_aggregate_projects_week", spy)
+
+    # Cold pass: all 12 weeks recomputed.
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    assert len(seen["weeks"]) >= 2, "cold pass must aggregate multiple weeks"
+
+    cw_start = d._projects_week_start_monday_utc(_PROJ_NOW)
+    seen["weeks"].clear()
+    # Warm pass (same sig): only the current week is recomputed.
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    assert seen["weeks"] == [cw_start], (
+        f"warm pass must recompute ONLY the current week, got {seen['weeks']}"
+    )
+
+
+def test_projects_env_late_ingest_recomputes_past_week(tmp_path):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = _open_proj_copy("multi-week.db", tmp_path)
+    sc.reset_projects_env_state()
+    mid, mw = _proj_sig_legs(conn)
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)  # cold populate
+
+    # Late-ingest an OLD-timestamp entry into a PAST closed week (id > last_seen,
+    # ts back in week 2026-04-13). New session_files row too.
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, cache_create_tokens, cache_read_tokens, cost_usd_raw) "
+        "VALUES (?, 0, ?, ?, 0, 0, 0, 0, ?)",
+        ("/jsonl/late/x.jsonl", "2026-04-15T10:00:00Z", "claude-opus-4-8", 1.25),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) VALUES (?, 0, 0, 0, ?, ?, ?)",
+        ("/jsonl/late/x.jsonl", "2026-05-19T11:50:00Z", "late-s", "/repos/late"),
+    )
+    conn.commit()
+
+    mid2, mw2 = _proj_sig_legs(conn)
+    _proj_reconcile(sc, conn, mid2, mw2)  # watermark evicts the past week
+    cached = _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    fresh = _build_env(d, conn, now=_PROJ_NOW, flag=False)
+    assert cached == fresh, "late-ingest cached rebuild must equal from-scratch"
+
+
+def test_projects_env_max_wus_change_full_recompute(tmp_path):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = _open_proj_copy("multi-week.db", tmp_path)
+    sc.reset_projects_env_state()
+    mid, mw = _proj_sig_legs(conn)
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)
+
+    # A new weekly_usage_snapshots row (attribution denominator) → full clear.
+    cw_start = d._projects_week_start_monday_utc(_PROJ_NOW)
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, weekly_percent, "
+        " source, payload_json) VALUES (?, ?, ?, ?, 'test', '{}')",
+        ("2026-05-19T06:00:00Z", cw_start.date().isoformat(),
+         (cw_start + dt.timedelta(days=7)).date().isoformat(), 42.0),
+    )
+    conn.commit()
+
+    mid2, mw2 = _proj_sig_legs(conn)
+    assert mw2 != mw
+    _proj_reconcile(sc, conn, mid2, mw2)
+    cached = _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    fresh = _build_env(d, conn, now=_PROJ_NOW, flag=False)
+    assert cached == fresh
+
+
+def test_projects_env_session_files_backfill_invalidates(tmp_path):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = _open_proj_copy("multi-week.db", tmp_path)
+    sc.reset_projects_env_state()
+    mid, mw = _proj_sig_legs(conn)
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)
+
+    # Simulate a lazy attribution backfill: a NEW session_files row (Codex-M4
+    # P2) that moves sf_sig WITHOUT any new session_entries / WUS row.
+    conn.execute(
+        "INSERT OR REPLACE INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) VALUES (?, 0, 0, 0, ?, ?, ?)",
+        ("/jsonl/cctally-dev/w00.jsonl", "2026-05-19T11:50:00Z",
+         "cctally-dev-w00-s0", "/repos/moved-elsewhere"),
+    )
+    conn.commit()
+
+    mid2, mw2 = _proj_sig_legs(conn)
+    assert mid2 == mid and mw2 == mw  # neither entry nor WUS id moved
+    _proj_reconcile(sc, conn, mid2, mw2)  # sf_sig moved → full clear
+    cached = _build_env(d, conn, now=_PROJ_NOW, flag=True)
+    fresh = _build_env(d, conn, now=_PROJ_NOW, flag=False)
+    assert cached == fresh
+
+
+def test_projects_env_rollover_populates_previously_current_week(tmp_path):
+    load_script()
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    conn = _open_proj_copy("multi-week.db", tmp_path)
+    sc.reset_projects_env_state()
+    mid, mw = _proj_sig_legs(conn)
+    _proj_reconcile(sc, conn, mid, mw)
+    _build_env(d, conn, now=_PROJ_NOW, flag=True)  # cold at the original now
+
+    # Advance now past the Monday so the previously-current week closes. Same
+    # signature (no DB change) → reconcile is a no-op; the newly-closed week is
+    # a cache MISS (never cached as the current week) → recompute-and-populate.
+    later = _PROJ_NOW + dt.timedelta(days=7)
+    _proj_reconcile(sc, conn, mid, mw)
+    cached = _build_env(d, conn, now=later, flag=True)
+    fresh = _build_env(d, conn, now=later, flag=False)
+    assert cached == fresh
