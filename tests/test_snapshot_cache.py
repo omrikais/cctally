@@ -797,10 +797,21 @@ def test_reset_projects_env_state_clears():
     sc._PROJECTS_ENV_WEEK_CACHE[("/p", "wk")] = ("agg",)
     sc._PROJECTS_ENV_WEEK_TOTALS["wk"] = 1.0
     sc._PROJECTS_ENV_LAST_SEEN["max_id"] = 5
+    sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk"}  # #271 M4 current slot
     sc.reset_projects_env_state()
     assert sc._PROJECTS_ENV_WEEK_CACHE == {}
     assert sc._PROJECTS_ENV_WEEK_TOTALS == {}
     assert sc._PROJECTS_ENV_LAST_SEEN == {}
+    assert sc._PROJECTS_ENV_CURRENT["state"] is None  # #271 M4: current slot rides the clear
+
+
+def test_reset_projects_env_current_state_clears():
+    """#271 M4: the standalone current-slot reset (rides prune + reconcile)."""
+    import _lib_snapshot_cache as sc
+
+    sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk", "mut": {}}
+    sc.reset_projects_env_current_state()
+    assert sc._PROJECTS_ENV_CURRENT["state"] is None
 
 
 def test_session_files_sig_moves_on_row_add(tmp_cache):
@@ -894,6 +905,33 @@ def test_reconcile_projects_env_full_clear_on_sf_sig(tmp_cache):
         tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(2, 5),
     )
     assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
+
+
+def test_reconcile_projects_env_current_slot_rides_full_clear(tmp_cache):
+    """#271 M4 (spec §20 invalidation): the current-week accumulator slot is
+    dropped by the SAME reconcile full-clear signals as the closed-week cache
+    (sf_sig attribution remap / max_id regression), but a WUS-only bump keeps it
+    (byte-safe cost reuse — attribution refreshes via the whole-envelope memo)."""
+    import _lib_snapshot_cache as sc
+
+    mid = _max_id(tmp_cache)
+    # sf_sig moves → full clear → current slot dropped.
+    sc.reset_projects_env_state()
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(1, 1))
+    sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk", "reconciled_max_id": mid}
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=mid, max_wus_id=3, sf_sig=(2, 5),
+    )
+    assert sc._PROJECTS_ENV_CURRENT["state"] is None
+
+    # A WUS-only bump (record-usage write) must NOT drop the slot.
+    sc.reset_projects_env_state()
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(2, 5))
+    sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk", "reconciled_max_id": mid}
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=mid, max_wus_id=99, sf_sig=(2, 5),
+    )
+    assert sc._PROJECTS_ENV_CURRENT["state"] is not None
 
 
 def test_reconcile_projects_env_full_clear_on_maxid_regression(tmp_cache):

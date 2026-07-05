@@ -1019,6 +1019,18 @@ _PROJECTS_ENV_WEEK_CACHE: dict = {}   # {(bucket_path, week_iso): agg}
 _PROJECTS_ENV_WEEK_TOTALS: dict = {}  # {week_iso: total_cost}  (also the registry)
 _PROJECTS_ENV_LAST_SEEN: dict = {}    # {"max_id", "max_wus_id", "sf_sig"}
 
+# #271 M4 (spec §20): the CURRENT-week per-project aggregate is re-folded from
+# scratch every warm tick (the closed weeks are already cache-served). This
+# single-slot accumulator folds only the new-by-id delta each warm tick,
+# byte-identically — the exact Item-1 incremental single-left-fold, but per
+# project and simpler (the current-week window `[cw_start, cw_end]` is FIXED, not
+# `now`-clamped, so the delta predicate is purely `id > reconciled_max_id`; no
+# `last_now` machinery). Single-writer (sync thread only), module state, never
+# reachable from a published DataSnapshot (F7 — the snapshot holds the finalized
+# buckets, not the running `mut`). The `mut` is opaque here (the dashboard
+# packs/unpacks it — same "no dashboard import" discipline as `BucketCache`).
+_PROJECTS_ENV_CURRENT: dict = {"state": None}  # single-slot current-week fold
+
 
 def projects_env_week_key(week_start):
     """Canonical UTC-ISO key for a Monday-anchored subscription week start.
@@ -1031,15 +1043,31 @@ def projects_env_week_key(week_start):
 
 
 def reset_projects_env_state():
-    """Clear the projects-envelope week cache + totals + watermark.
+    """Clear the projects-envelope week cache + totals + watermark + the
+    CURRENT-week accumulator slot (#271 M4).
 
     Called from the orphan-prune site (a prune deletes ``session_entries``
     possibly WITHOUT lowering ``MAX(id)``, so the reconcile's regression check
-    cannot catch it — the explicit clear must) and as a test hook.
+    cannot catch it — the explicit clear must) and as a test hook. The
+    current-week slot rides this same clear (spec §20): a prune can re-key a
+    current-week bucket_path, so it must cold-refold next tick.
     """
     _PROJECTS_ENV_WEEK_CACHE.clear()
     _PROJECTS_ENV_WEEK_TOTALS.clear()
     _PROJECTS_ENV_LAST_SEEN.clear()
+    reset_projects_env_current_state()
+
+
+def reset_projects_env_current_state():
+    """Drop the projects-envelope CURRENT-week accumulator slot (#271 §20).
+
+    A standalone hook (mirrors ``reset_group_a_current_state``); also invoked by
+    ``reset_projects_env_state`` (prune site + test reset) and by
+    ``reconcile_projects_env_cache``'s full-clear branch, so a project-key remap
+    / prune / cache.db rebuild cold-refolds the current week the same tick the
+    closed-week cache clears.
+    """
+    _PROJECTS_ENV_CURRENT["state"] = None
 
 
 def session_files_sig(cache_conn) -> "tuple[int, int]":
@@ -1105,6 +1133,106 @@ def projects_env_week_put(week_iso, buckets_by_bp, total) -> None:
         _PROJECTS_ENV_WEEK_CACHE[(bp, week_iso)] = agg
 
 
+def accumulate_projects_current_week(*, week_key, cur_max_id,
+                                     fetch_all_raw, fetch_delta_rows,
+                                     finalize, fold):
+    """Single-slot incremental fold of the projects-envelope CURRENT week (#271 §20).
+
+    Returns ``(finalized_buckets, week_total)`` — the exact
+    ``_aggregate_projects_week`` public shape — folding only the new-by-id delta
+    each warm tick instead of re-folding the whole ~12K-entry current week
+    (the closed weeks are already cache-served). The dashboard injects the
+    fold/finalize/fetch callables so this module keeps no dashboard import
+    (the ``BucketCache`` / ``build_cached_group_a`` discipline).
+
+    Injected closures (all capture the current-week window ``[cw_start, cw_end]``
+    and the live conn on the dashboard side):
+      ``fetch_all_raw() -> (mut_with_sessions_sets, week_total, tail)`` — the
+        full-window raw fold (cold seed / fold-order fallback).
+      ``fetch_delta_rows(after_id) -> list[row]`` — rows with ``id > after_id``
+        in the current-week window, already membership/``<synthetic>``-filtered
+        AND sorted ``(timestamp_utc, id)`` (the rowid-seek delta, so ``rows[0]``
+        is the minimum genuine current-week entry).
+      ``fold(mut, row) -> entry_cost | None`` — the shared ``_fold_projects_entry``
+        (byte-identical arithmetic to the cold path).
+      ``finalize(mut) -> {bucket_path: agg}`` — the public finalize.
+
+    Simpler than the Group A accumulator (spec §20): the current-week aggregate
+    is a pure function of ``(conn, cw_start)`` over the FIXED ``[cw_start, cw_end]``
+    window (no moving-``now`` clamp), so there is no ``last_now`` field / empty-
+    delta-by-time machinery — the delta predicate is purely
+    ``id > reconciled_max_id``.
+
+    - **Cold** (``prior is None``, ``label`` changed = Monday rollover / window
+      slide, or ``cur_max_id < reconciled_max_id`` = cache.db rebuilt): seed the
+      slot from ``fetch_all_raw()``; finalize and return.
+    - **Warm**: fetch the ``id > reconciled_max_id`` delta (empty when
+      ``cur_max_id`` did not advance — the fast path, no fetch). **Fold-order
+      gate:** the delta is ``(ts_iso, id)``-sorted, so ``rows[0]`` is the minimum;
+      if it sorts ``(ts_iso, id) <= tail`` a late older-timestamp backfill landed
+      mid-week → discard the delta and cold-refold (byte-safe; first-row-only is
+      sufficient under the total order). ``tail is None`` ⇒ prior folded nothing
+      ⇒ the delta is a pure suffix, so no gate. Otherwise ``fold`` each delta row
+      onto ``prior.mut`` in order.
+    - ``reconciled_max_id`` advances to ``cur_max_id`` on EVERY path (cold, empty
+      delta, append, fallback). It is the tick's GLOBAL ``MAX(session_entries.id)``,
+      DECOUPLED from ``tail`` (Codex-P2a): a quiet current week has a folded-max
+      far below the global max because high ids land in OTHER weeks (recent
+      backfills), so keying the delta on the folded-max would re-scan every tick
+      and let the ~63ms floor creep back.
+
+    F7: the running ``mut`` is module state, never reachable from a published
+    snapshot — ``finalize`` builds a FRESH bucket map each tick, so mutating
+    ``mut`` next tick cannot tear a prior snapshot.
+    """
+    prior = _PROJECTS_ENV_CURRENT["state"]
+    cold = (
+        prior is None
+        or prior["label"] != week_key
+        or cur_max_id < prior["reconciled_max_id"]
+    )
+    rows: list = []
+    if not cold:
+        if cur_max_id > prior["reconciled_max_id"]:
+            rows = fetch_delta_rows(prior["reconciled_max_id"])
+        # Fold-order gate: rows are (ts_iso, id)-sorted so rows[0] is the
+        # minimum; if it sorts <= tail, some genuinely-new row is out of the
+        # from-scratch fold order → cold refold. (tail None ⇒ prior folded
+        # nothing ⇒ the delta is a pure suffix; never gate against None.)
+        if (
+            rows
+            and prior["tail"] is not None
+            and (rows[0][1], rows[0][0]) <= prior["tail"]
+        ):
+            cold = True
+    if cold:
+        mut, week_total, tail = fetch_all_raw()
+        _PROJECTS_ENV_CURRENT["state"] = {
+            "label": week_key,
+            "mut": mut,
+            "week_total": week_total,
+            "tail": tail,
+            "reconciled_max_id": cur_max_id,
+        }
+        return finalize(mut), week_total
+    # Warm: append the delta onto the running mut in (ts_iso, id) order. The
+    # week_total is its OWN entry-order accumulator (never re-summed from the
+    # per-bucket costs — spec §14(a) non-association rule).
+    mut = prior["mut"]
+    week_total = prior["week_total"]
+    tail = prior["tail"]
+    for row in rows:
+        entry_cost = fold(mut, row)
+        if entry_cost is None:  # defensive: fetch_delta_rows pre-filters
+            continue
+        week_total += entry_cost
+        tail = (row[1], row[0])
+    prior["week_total"] = week_total
+    prior["tail"] = tail
+    prior["reconciled_max_id"] = cur_max_id
+    return finalize(mut), week_total
+
+
 def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig):
     """Once-per-non-idle-rebuild invalidation for the projects-envelope cache.
 
@@ -1148,6 +1276,10 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
         # `max_wus_id != ls["max_wus_id"]` here.
         _PROJECTS_ENV_WEEK_CACHE.clear()
         _PROJECTS_ENV_WEEK_TOTALS.clear()
+        # #271 M4 (spec §20): the current-week accumulator rides the SAME
+        # full-clear signals (sf_sig attribution remap / max_entry_id regression)
+        # — an sf_sig move can re-key a current-week bucket_path, so cold-refold.
+        reset_projects_env_current_state()
         ls["max_id"] = max_entry_id
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig

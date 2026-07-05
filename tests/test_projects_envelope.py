@@ -29,6 +29,8 @@ _NS = load_script()
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import _cctally_dashboard  # noqa: E402
 
+import _lib_snapshot_cache as sc  # noqa: E402  (bin/ on sys.path above)
+
 _build_projects_envelope = _cctally_dashboard._build_projects_envelope
 
 
@@ -38,6 +40,77 @@ NOW_UTC = dt.datetime(2026, 5, 19, 12, 0, 0, tzinfo=dt.timezone.utc)
 
 def _open(path: pathlib.Path) -> sqlite3.Connection:
     return sqlite3.connect(path)
+
+
+def test_aggregate_projects_week_raw_finalize_matches_public():
+    """#271 §20 Codex-P1a: the raw fold + finalize split reproduces the public
+    ``_aggregate_projects_week`` output byte-for-byte, and the raw ``mut`` keeps
+    real session SETS (not a ``range`` of the count) so the accumulator can dedup
+    a resumed session across a later warm delta.
+    """
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    ws = _cctally_dashboard._projects_week_start_monday_utc(NOW_UTC)
+    we = ws + dt.timedelta(days=7)
+    public, public_total = _cctally_dashboard._aggregate_projects_week(
+        conn, week_start=ws, week_end=we, resolver_cache={})
+    mut, raw_total, tail = _cctally_dashboard._aggregate_projects_week_raw(
+        conn, week_start=ws, week_end=we, resolver_cache={})
+    finalized = _cctally_dashboard._finalize_projects_mut(mut)
+    assert finalized == public, "raw+finalize must equal the public shape"
+    assert raw_total == public_total, "entry-order week_total must match"
+    # mut keeps real sets (not range) so the accumulator can dedup later.
+    assert mut, "multi-week fixture has current-week activity"
+    assert all(isinstance(v["sessions"], set) for v in mut.values())
+    # tail is the (ts_iso, id) of the last folded current-week entry.
+    assert tail is not None
+    assert isinstance(tail[0], str) and isinstance(tail[1], int)
+
+
+def test_projects_iter_after_id_filters_by_rowid():
+    """``after_id`` returns exactly the rows with ``id > after_id`` from the
+    ``[since, until]`` window (order-independent set equality) — the warm delta
+    seek is a correct subset of the full window fetch.
+    """
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    ws = _cctally_dashboard._projects_week_start_monday_utc(NOW_UTC)
+    we = ws + dt.timedelta(days=7)
+    full = list(_cctally_dashboard._projects_iter_session_entries(
+        conn, since=ws, until=we))
+    assert full, "current week has rows"
+    ids = sorted(r[0] for r in full)
+    cut = ids[len(ids) // 2]  # a mid rowid
+    delta = list(_cctally_dashboard._projects_iter_session_entries(
+        conn, since=ws, until=we, after_id=cut))
+    expected = {r for r in full if r[0] > cut}
+    assert set(delta) == expected, "after_id must return exactly id>cut rows"
+    assert all(r[0] > cut for r in delta)
+
+
+def test_projects_after_id_uses_rowid_seek():
+    """#271 §20 Codex-P2b: the warm-delta ``after_id`` fetch seeks by the
+    INTEGER PRIMARY KEY (rowid), NOT a full ``idx_entries_timestamp`` scan over
+    the whole current week — otherwise the ~63ms floor creeps back. The
+    ``+e.timestamp_utc`` unary-plus no-op deprioritizes the timestamp index so
+    the planner drives off the rowid range. Mirrors the SQL emitted by
+    ``_projects_iter_session_entries``' ``after_id`` branch.
+    """
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+        "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+        "       e.cost_usd_raw, e.source_path, sf.session_id, sf.project_path "
+        "FROM session_entries e "
+        "LEFT JOIN session_files sf ON sf.path = e.source_path "
+        "WHERE e.id > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
+        "ORDER BY e.id ASC",
+        (0, "2020-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ).fetchall()
+    text = " ".join(str(r) for r in plan).lower()
+    assert "integer primary key" in text, \
+        f"driving table e must be seeked by rowid; plan was: {text}"
+    assert "idx_entries_timestamp" not in text, \
+        f"must NOT scan the current-week timestamp index; plan was: {text}"
 
 
 def test_current_week_rows_sorted_desc_by_cost():
@@ -322,3 +395,263 @@ def test_memo_invalidates_on_new_weekly_usage_snapshot():
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+# ===========================================================================
+# #271 M4 — projects-envelope CURRENT-week incremental accumulator (spec §20).
+#
+# Drive `accumulate_projects_current_week` directly through the SAME closures
+# `_assemble_projects_via_cache` builds, asserting the finalized
+# `(buckets, week_total)` byte-matches a fresh `_aggregate_projects_week` on the
+# same conn across cold / warm / delta / rollover / fold-order-gate ticks.
+# ===========================================================================
+
+WK_MON = dt.datetime(2026, 5, 18, tzinfo=dt.timezone.utc)  # Monday of NOW_UTC's week
+WK_END = WK_MON + dt.timedelta(days=7)
+PREV_MON = WK_MON - dt.timedelta(days=7)                    # a prior (closed) week
+
+
+def _seed_conn(rows):
+    """Build an in-memory conn (session_entries + session_files) from
+    ``rows`` = list of ``(id, source_path, ts_iso, model, cost, session_id,
+    project_path)``. Cost is threaded verbatim (mode=auto + cost_usd)."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT, "
+        "timestamp_utc TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+        "cache_create_tokens INTEGER, cache_read_tokens INTEGER, cost_usd_raw REAL)")
+    conn.execute("CREATE INDEX idx_entries_timestamp ON session_entries(timestamp_utc)")
+    conn.execute(
+        "CREATE TABLE session_files (path TEXT, session_id TEXT, project_path TEXT)")
+    files = {}
+    for (eid, sp, ts, model, cost, sid, pp) in rows:
+        conn.execute(
+            "INSERT INTO session_entries (id, source_path, timestamp_utc, model, "
+            "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+            "cost_usd_raw) VALUES (?,?,?,?,0,0,0,0,?)", (eid, sp, ts, model, cost))
+        files[sp] = (sp, sid, pp)
+    for f in files.values():
+        conn.execute(
+            "INSERT INTO session_files (path, session_id, project_path) VALUES (?,?,?)", f)
+    conn.commit()
+    return conn
+
+
+def _insert(conn, eid, sp, ts, model, cost, sid, pp):
+    conn.execute(
+        "INSERT INTO session_entries (id, source_path, timestamp_utc, model, "
+        "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+        "cost_usd_raw) VALUES (?,?,?,?,0,0,0,0,?)", (eid, sp, ts, model, cost))
+    conn.execute(
+        "INSERT OR REPLACE INTO session_files (path, session_id, project_path) "
+        "VALUES (?,?,?)", (sp, sid, pp))
+    conn.commit()
+
+
+def _max_id(conn):
+    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM session_entries").fetchone()[0]
+
+
+def _fresh(conn, cw_start=WK_MON, cw_end=WK_END):
+    """From-scratch reference: the finalized public aggregate for the week."""
+    return _cctally_dashboard._aggregate_projects_week(
+        conn, week_start=cw_start, week_end=cw_end, resolver_cache={})
+
+
+def _acc_tick(conn, cur_max_id, cw_start=WK_MON, cw_end=WK_END, calls=None):
+    """Drive ONE `accumulate_projects_current_week` tick with the SAME closures
+    `_assemble_projects_via_cache` builds. ``calls`` (optional dict) records
+    ``all_raw`` (cold-fold count) + ``delta_after_ids`` (the after_id watermark
+    each warm fetch used) for the spy-based tests."""
+    d = _cctally_dashboard
+    resolver_cache = {}
+
+    def _fetch_all_raw():
+        if calls is not None:
+            calls["all_raw"] = calls.get("all_raw", 0) + 1
+        return d._aggregate_projects_week_raw(
+            conn, week_start=cw_start, week_end=cw_end, resolver_cache=resolver_cache)
+
+    def _fetch_delta_rows(after_id):
+        if calls is not None:
+            calls.setdefault("delta_after_ids", []).append(after_id)
+        out = []
+        for r in d._projects_iter_session_entries(
+                conn, since=cw_start, until=cw_end, after_id=after_id):
+            if r[2] == "<synthetic>":
+                continue
+            ts = d.parse_iso_datetime(r[1], "session_entries.timestamp_utc")
+            if d._projects_week_start_monday_utc(ts) != cw_start:
+                continue
+            out.append(r)
+        out.sort(key=lambda r: (r[1], r[0]))
+        return out
+
+    return sc.accumulate_projects_current_week(
+        week_key=sc.projects_env_week_key(cw_start),
+        cur_max_id=cur_max_id,
+        fetch_all_raw=_fetch_all_raw,
+        fetch_delta_rows=_fetch_delta_rows,
+        finalize=d._finalize_projects_mut,
+        fold=lambda mut, row: d._fold_projects_entry(
+            mut, row, resolver_cache=resolver_cache, week_start=cw_start))
+
+
+def test_accumulator_cold_then_warm_matches_from_scratch():
+    """Cold seed + an empty-delta warm tick both byte-match the from-scratch
+    `_aggregate_projects_week` on the real multi-week fixture."""
+    sc.reset_projects_env_current_state()
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    mid = _max_id(conn)
+    fresh, fresh_total = _fresh(conn)
+    cold, cold_total = _acc_tick(conn, mid)
+    assert cold == fresh and cold_total == fresh_total, "cold must == from-scratch"
+    warm, warm_total = _acc_tick(conn, mid)
+    assert warm == fresh and warm_total == fresh_total, "empty-delta warm must == from-scratch"
+
+
+def test_accumulator_empty_delta_skips_fetch():
+    """An empty-delta warm tick (cur_max_id unchanged) does NOT call the delta
+    fetch NOR a full re-fold — the M4 win."""
+    sc.reset_projects_env_current_state()
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    mid = _max_id(conn)
+    calls = {}
+    _acc_tick(conn, mid, calls=calls)          # cold
+    assert calls["all_raw"] == 1
+    _acc_tick(conn, mid, calls=calls)          # warm, same max_id
+    assert calls["all_raw"] == 1, "no full re-fold on empty-delta warm"
+    assert "delta_after_ids" not in calls, "no delta fetch when cur_max_id unchanged"
+
+
+def test_accumulator_warm_delta_dedups_resumed_session():
+    """#271 §20 Codex-P1a: a warm delta adds a SECOND row for the SAME session
+    (across two files) → sessions_count stays 1, proving the cold seed kept the
+    real SET (a finalized `range(count)` seed would AttributeError on `.add`)."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+    ])
+    cold, _ = _acc_tick(conn, _max_id(conn))
+    bp = next(iter(cold))
+    assert cold[bp].sessions_count == 1
+    # Resume the SAME session s1 in a different file, later ts + higher id.
+    _insert(conn, 2, "/j/b.jsonl", "2026-05-19T11:00:00Z", "claude-opus-4-8", 0.2, "s1", "/repos/foo")
+    warm, warm_total = _acc_tick(conn, _max_id(conn))
+    assert warm[bp].sessions_count == 1, "resumed session must dedup to 1"
+    fresh, fresh_total = _fresh(conn)
+    assert warm == fresh and warm_total == fresh_total
+
+
+def test_accumulator_new_bucket_in_delta_first_seen():
+    """A project's FIRST current-week activity arriving in a warm delta captures
+    its first_order/first_id/first_key correctly (== from-scratch)."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+    ])
+    _acc_tick(conn, _max_id(conn))  # cold: only foo
+    # A brand-new project bar's first entry arrives in the delta.
+    _insert(conn, 2, "/j/c.jsonl", "2026-05-19T12:00:00Z", "claude-opus-4-8", 0.3, "s2", "/repos/bar")
+    warm, warm_total = _acc_tick(conn, _max_id(conn))
+    fresh, fresh_total = _fresh(conn)
+    assert warm == fresh and warm_total == fresh_total
+    assert len(warm) == 2, "both foo and bar present"
+
+
+def test_accumulator_fold_order_gate_forces_cold_refold():
+    """#271 §20 fold-order gate: a late OLD-timestamp backfill that sorts <= tail
+    forces a cold refold so the per-bucket cost + week_total left-folds stay in
+    (ts, id) order == from-scratch. NON-VACUOUS: the costs (0.1, 0.2, 0.57) are
+    non-associative — a naive append (no gate) folds in the wrong order and the
+    float sum diverges (0.8700000000000001 vs 0.8699999999999999)."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+        (2, "/j/a.jsonl", "2026-05-19T12:00:00Z", "claude-opus-4-8", 0.2, "s1", "/repos/foo"),
+    ])
+    calls = {}
+    _acc_tick(conn, _max_id(conn), calls=calls)  # cold: tail = (12:00, 2)
+    assert calls["all_raw"] == 1
+    # Late-ingest a row timestamped BETWEEN the two cold rows (sorts <= tail).
+    _insert(conn, 3, "/j/a.jsonl", "2026-05-19T11:00:00Z", "claude-opus-4-8", 0.57, "s1", "/repos/foo")
+    warm, warm_total = _acc_tick(conn, _max_id(conn), calls=calls)
+    assert calls["all_raw"] == 2, "fold-order gate must trigger a cold refold"
+    fresh, fresh_total = _fresh(conn)
+    assert warm == fresh and warm_total == fresh_total, \
+        "cold refold must reproduce the (ts, id)-ordered from-scratch fold"
+
+
+def test_accumulator_quiet_current_week_uses_global_max_watermark():
+    """#271 §20 Codex-P2a: reconciled_max_id is the tick's GLOBAL max id, NOT the
+    max id FOLDED into the current week. A quiet current week (high ids landing in
+    a PAST week) must seek the delta by `id > global_max` (returning nothing),
+    never re-scan from the lower folded-max."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+        (2, "/j/a.jsonl", "2026-05-19T12:00:00Z", "claude-opus-4-8", 0.2, "s1", "/repos/foo"),
+        # A PAST-week entry with the GLOBAL max id — folded-max (2) << global (3).
+        (3, "/j/p.jsonl", "2026-05-11T10:00:00Z", "claude-opus-4-8", 0.9, "s9", "/repos/past"),
+    ])
+    calls = {}
+    _acc_tick(conn, _max_id(conn), calls=calls)  # cold; cur_max_id = 3
+    # A NEW past-week entry → global max advances to 4, current week unchanged.
+    _insert(conn, 4, "/j/p.jsonl", "2026-05-11T11:00:00Z", "claude-opus-4-8", 0.5, "s9", "/repos/past")
+    warm, warm_total = _acc_tick(conn, _max_id(conn), calls=calls)
+    # The delta seek used the GLOBAL max (3) — the prior tick's cur_max_id — NOT
+    # the folded-max (2). (Both yield an empty in-window delta, but the watermark
+    # VALUE is the non-vacuous assertion.)
+    assert calls["delta_after_ids"] == [3]
+    assert calls["all_raw"] == 1, "quiet week must NOT cold-refold"
+    fresh, fresh_total = _fresh(conn)
+    assert warm == fresh and warm_total == fresh_total
+
+
+def test_accumulator_monday_rollover_cold_refolds():
+    """A tick at a NEW cw_start (Monday rollover) changes the label → cold refold
+    of the new (here empty) current week."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+    ])
+    calls = {}
+    _acc_tick(conn, _max_id(conn), calls=calls)  # cold at WK_MON
+    assert calls["all_raw"] == 1
+    nxt = WK_MON + dt.timedelta(days=7)
+    rolled, rolled_total = _acc_tick(
+        conn, _max_id(conn), cw_start=nxt, cw_end=nxt + dt.timedelta(days=7), calls=calls)
+    assert calls["all_raw"] == 2, "rollover (label change) must cold-refold"
+    fresh_next, fresh_next_total = _fresh(conn, cw_start=nxt, cw_end=nxt + dt.timedelta(days=7))
+    assert rolled == fresh_next and rolled_total == fresh_next_total  # empty next week
+
+
+def test_accumulator_maxid_regression_cold_refolds():
+    """cache.db rebuilt (cur_max_id < reconciled_max_id) → cold refold."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+        (2, "/j/a.jsonl", "2026-05-19T11:00:00Z", "claude-opus-4-8", 0.2, "s1", "/repos/foo"),
+    ])
+    calls = {}
+    _acc_tick(conn, _max_id(conn), calls=calls)  # cold; reconciled = 2
+    _acc_tick(conn, 1, calls=calls)              # cur_max_id regressed to 1
+    assert calls["all_raw"] == 2, "max-id regression must cold-refold"
+
+
+def test_accumulator_f7_no_torn_value():
+    """F7: a finalized bucket captured from one tick is NOT mutated by a later
+    appending tick (finalize builds fresh immutable buckets each tick)."""
+    sc.reset_projects_env_current_state()
+    conn = _seed_conn([
+        (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
+    ])
+    cold, _ = _acc_tick(conn, _max_id(conn))
+    bp = next(iter(cold))
+    captured = cold[bp]
+    captured_cost = captured.cost_usd
+    # Append another row into the same bucket.
+    _insert(conn, 2, "/j/a.jsonl", "2026-05-19T11:00:00Z", "claude-opus-4-8", 0.2, "s1", "/repos/foo")
+    warm, _ = _acc_tick(conn, _max_id(conn))
+    assert warm[bp].cost_usd != captured_cost, "the live tick advanced the running cost"
+    assert captured.cost_usd == captured_cost, "the previously-captured bucket is untouched (F7)"

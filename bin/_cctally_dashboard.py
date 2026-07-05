@@ -3712,13 +3712,29 @@ def _projects_week_label(week_start: "dt.datetime") -> str:
 def _projects_iter_session_entries(conn: "sqlite3.Connection",
                                    *,
                                    since: "dt.datetime",
-                                   until: "dt.datetime"):
+                                   until: "dt.datetime",
+                                   after_id: "int | None" = None):
     """Read ``session_entries`` joined with ``session_files`` over
     [since, until]. Yields rows directly off the passed conn — no
     cache.db monkeypatch, no production ``get_claude_session_entries``
     pipeline. The fixture DBs co-locate both schemas in one file; the
     production wiring opens both DBs and ATTACHes cache.db as a schema
     on the stats conn (see ``_run_dashboard_sync_tick``).
+
+    ``after_id`` (Codex-P2b — #271 §20): when set, the current-week
+    accumulator's warm delta seeks by the **rowid range** (``WHERE e.id > ?``)
+    with the ``[since, until]`` timestamp bounds applied as a NON-indexed
+    filter — the unary-plus no-op ``+e.timestamp_utc`` deprioritizes
+    ``idx_entries_timestamp`` so the planner drives off the INTEGER PRIMARY
+    KEY (``SEARCH e USING INTEGER PRIMARY KEY (rowid>?)``), touching only the
+    small ingest delta instead of re-scanning the whole current-week timestamp
+    range. Unary ``+`` is a TRUE no-op (it preserves the TEXT value AND the
+    string comparison, unlike ``+ 0`` which would coerce to numeric), so the
+    filtered row SET is byte-identical to the un-hinted form; the caller
+    (``_fetch_delta_rows``) re-sorts the small result by
+    ``(timestamp_utc, id)`` to reproduce the full pass's fold order. An
+    ``EXPLAIN QUERY PLAN`` regression asserts the rowid seek
+    (``tests/test_projects_envelope.py``).
     """
     since_iso = since.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -3726,17 +3742,30 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
     until_iso = until.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    cur = conn.execute(
-        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
-        "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
-        "       e.cost_usd_raw, e.source_path, "
-        "       sf.session_id, sf.project_path "
-        "FROM session_entries e "
-        "LEFT JOIN session_files sf ON sf.path = e.source_path "
-        "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
-        "ORDER BY e.timestamp_utc ASC, e.id ASC",
-        (since_iso, until_iso),
-    )
+    if after_id is not None:
+        cur = conn.execute(
+            "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+            "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+            "       e.cost_usd_raw, e.source_path, "
+            "       sf.session_id, sf.project_path "
+            "FROM session_entries e "
+            "LEFT JOIN session_files sf ON sf.path = e.source_path "
+            "WHERE e.id > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
+            "ORDER BY e.id ASC",
+            (after_id, since_iso, until_iso),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+            "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+            "       e.cost_usd_raw, e.source_path, "
+            "       sf.session_id, sf.project_path "
+            "FROM session_entries e "
+            "LEFT JOIN session_files sf ON sf.path = e.source_path "
+            "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
+            "ORDER BY e.timestamp_utc ASC, e.id ASC",
+            (since_iso, until_iso),
+        )
     for row in cur:
         yield row
 
@@ -3767,6 +3796,134 @@ class _ProjWeekBucket(NamedTuple):
     first_key: "Any"
 
 
+def _fold_projects_entry(
+    mut: dict,
+    row: tuple,
+    *,
+    resolver_cache: dict,
+    week_start: "dt.datetime",
+) -> "float | None":
+    """Fold ONE ``_projects_iter_session_entries`` row onto ``mut`` (the shared
+    per-row body, #271 §20 Codex-P1a).
+
+    Used by BOTH the full-window cold fold (``_aggregate_projects_week_raw``)
+    and the current-week accumulator's warm incremental append, so their
+    per-bucket cost sums, session sets, and first/last-seen captures are
+    byte-identical BY CONSTRUCTION. Returns the entry cost, or ``None`` when the
+    row is filtered out (``<synthetic>`` model, or its Monday-anchored week ≠
+    ``week_start``) — the caller then skips ``week_total`` / ``tail`` advance.
+
+    ``mut[bp]`` is the running mutable dict ``{"cost_usd": float,
+    "sessions": set, "first_seen": dt, "last_seen": dt, "first_order": ts_iso,
+    "first_id": int, "first_key": ProjectKey}``. The first row seen for a
+    ``bucket_path`` captures ``first_order`` / ``first_id`` / ``first_key`` —
+    order-safe for the warm append because every delta row sorts strictly after
+    ``tail`` (#271 §20), so a delta row is never the first-seen of a bucket that
+    already exists in ``mut``.
+    """
+    c = _cctally()
+    (entry_id, ts_iso, model, input_tok, output_tok,
+     cache_create, cache_read, cost_raw, source_path,
+     session_id, project_path) = row
+    if model == "<synthetic>":
+        return None
+    ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+    if _projects_week_start_monday_utc(ts) != week_start:
+        return None
+    entry_cost = _calculate_entry_cost(
+        model,
+        {
+            "input_tokens": input_tok or 0,
+            "output_tokens": output_tok or 0,
+            "cache_creation_input_tokens": cache_create or 0,
+            "cache_read_input_tokens": cache_read or 0,
+        },
+        mode="auto",
+        cost_usd=cost_raw,
+    )
+    pkey = c._resolve_project_key(project_path, "git-root", resolver_cache)
+    bp = pkey.bucket_path
+    a = mut.get(bp)
+    if a is None:
+        a = {
+            "cost_usd": 0.0,
+            "sessions": set(),
+            "first_seen": ts,
+            "last_seen": ts,
+            "first_order": ts_iso,
+            "first_id": entry_id,
+            "first_key": pkey,
+        }
+        mut[bp] = a
+    a["cost_usd"] += entry_cost
+    if session_id:
+        a["sessions"].add(session_id)
+    elif source_path:
+        a["sessions"].add(source_path)
+    if ts < a["first_seen"]:
+        a["first_seen"] = ts
+    if ts > a["last_seen"]:
+        a["last_seen"] = ts
+    return entry_cost
+
+
+def _aggregate_projects_week_raw(
+    conn: "sqlite3.Connection",
+    *,
+    week_start: "dt.datetime",
+    week_end: "dt.datetime",
+    resolver_cache: dict,
+) -> "tuple[dict, float, tuple | None]":
+    """Full-window fold for one Monday-anchored subscription week, returning the
+    RAW mutable ``mut`` (sessions kept as SETS, so the current-week accumulator
+    can dedup across ticks), the entry-order ``week_total`` float, and the
+    ``tail`` ``(ts_iso, id)`` of the last folded CURRENT-WEEK entry (``None``
+    when no row folded).
+
+    Shared by the finalizing ``_aggregate_projects_week`` wrapper (closed-week
+    cache path) and the current-week accumulator's cold seed (#271 §20
+    Codex-P1a — the finalized public shape discards the sessions SET into a
+    count, so cold seeding needs the raw ``mut``). Byte-identical to the
+    original single-loop aggregate: same ``timestamp_utc ASC, id ASC`` order,
+    same per-row ``_fold_projects_entry`` arithmetic, same entry-order
+    ``week_total`` left-fold.
+    """
+    mut: "dict[str, dict]" = {}
+    week_total = 0.0
+    tail: "tuple | None" = None
+    for row in _projects_iter_session_entries(
+        conn, since=week_start, until=week_end,
+    ):
+        entry_cost = _fold_projects_entry(
+            mut, row, resolver_cache=resolver_cache, week_start=week_start,
+        )
+        if entry_cost is None:
+            continue
+        week_total += entry_cost
+        tail = (row[1], row[0])  # (ts_iso, id)
+    return mut, week_total, tail
+
+
+def _finalize_projects_mut(mut: dict) -> "dict[str, _ProjWeekBucket]":
+    """Finalize a raw ``mut`` (sessions SETS) into ``{bucket_path:
+    _ProjWeekBucket}`` — ``sessions_count = len(sessions)``, the rest copied
+    through. The public shape both the closed-week cache and the current-week
+    accumulator return (#271 §20).
+    """
+    return {
+        bp: _ProjWeekBucket(
+            cost_usd=a["cost_usd"],
+            sessions_count=len(a["sessions"]),
+            first_seen=a["first_seen"],
+            last_seen=a["last_seen"],
+            first_order=a["first_order"],
+            first_id=a["first_id"],
+            first_key=a["first_key"],
+        )
+        for bp, a in mut.items()
+    }
+
+
 def _aggregate_projects_week(
     conn: "sqlite3.Connection",
     *,
@@ -3786,70 +3943,16 @@ def _aggregate_projects_week(
     inclusive query bound (``<= ?``); the exact next-Monday boundary entry is
     fetched but filtered out (it belongs to the next week) — the next week's
     slice keeps it, so no entry is lost or double-counted.
+
+    Thin wrapper over ``_aggregate_projects_week_raw`` + ``_finalize_projects_mut``
+    (#271 §20 Codex-P1a); the public shape is unchanged for the closed-week
+    cache path.
     """
-    c = _cctally()
-    _resolve_project_key = c._resolve_project_key
-    week_total = 0.0
-    mut: "dict[str, dict]" = {}
-    for row in _projects_iter_session_entries(
-        conn, since=week_start, until=week_end,
-    ):
-        (entry_id, ts_iso, model, input_tok, output_tok,
-         cache_create, cache_read, cost_raw, source_path,
-         session_id, project_path) = row
-        if model == "<synthetic>":
-            continue
-        ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
-        if _projects_week_start_monday_utc(ts) != week_start:
-            continue
-        entry_cost = _calculate_entry_cost(
-            model,
-            {
-                "input_tokens": input_tok or 0,
-                "output_tokens": output_tok or 0,
-                "cache_creation_input_tokens": cache_create or 0,
-                "cache_read_input_tokens": cache_read or 0,
-            },
-            mode="auto",
-            cost_usd=cost_raw,
-        )
-        pkey = _resolve_project_key(project_path, "git-root", resolver_cache)
-        bp = pkey.bucket_path
-        a = mut.get(bp)
-        if a is None:
-            a = {
-                "cost_usd": 0.0,
-                "sessions": set(),
-                "first_seen": ts,
-                "last_seen": ts,
-                "first_order": ts_iso,
-                "first_id": entry_id,
-                "first_key": pkey,
-            }
-            mut[bp] = a
-        a["cost_usd"] += entry_cost
-        if session_id:
-            a["sessions"].add(session_id)
-        elif source_path:
-            a["sessions"].add(source_path)
-        if ts < a["first_seen"]:
-            a["first_seen"] = ts
-        if ts > a["last_seen"]:
-            a["last_seen"] = ts
-        week_total += entry_cost
-    out = {
-        bp: _ProjWeekBucket(
-            cost_usd=a["cost_usd"],
-            sessions_count=len(a["sessions"]),
-            first_seen=a["first_seen"],
-            last_seen=a["last_seen"],
-            first_order=a["first_order"],
-            first_id=a["first_id"],
-            first_key=a["first_key"],
-        )
-        for bp, a in mut.items()
-    }
-    return out, week_total
+    mut, week_total, _tail = _aggregate_projects_week_raw(
+        conn, week_start=week_start, week_end=week_end,
+        resolver_cache=resolver_cache,
+    )
+    return _finalize_projects_mut(mut), week_total
 
 
 def _assemble_projects_via_cache(
@@ -3858,6 +3961,7 @@ def _assemble_projects_via_cache(
     weeks_full: "list[dt.datetime]",
     cw_start: "dt.datetime",
     cw_end: "dt.datetime",
+    cur_max_id: int,
 ) -> "tuple[dict, dict, dict]":
     """Flag-ON assembly (#269 §14 Win 2): recompute only the CURRENT week each
     warm tick; serve CLOSED weeks from the per-(project, week) cache on a hit and
@@ -3865,6 +3969,14 @@ def _assemble_projects_via_cache(
     Codex-M4 P2). Returns ``(buckets, total_cost_by_week, key_by_bucket)`` in the
     exact shape the from-scratch walk produces, so the downstream disambiguation
     / attribution / trend assembly runs unchanged and byte-identically.
+
+    #271 M4 (spec §20): the CURRENT week is no longer re-folded from scratch each
+    warm tick — it goes through the single-slot ``accumulate_projects_current_week``
+    accumulator, which folds only the ``id > reconciled_max_id`` delta (or
+    finalizes the cached running ``mut`` unchanged on an empty-delta tick),
+    byte-identically. ``cur_max_id`` is the tick's ``MAX(session_entries.id)``
+    (the delta watermark). The accumulator is single-writer here (this runs only
+    on the sync-thread ``use_projects_env_cache=True`` path).
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
@@ -3897,10 +4009,43 @@ def _assemble_projects_via_cache(
                 best_order[bp] = cand
                 key_by_bucket[bp] = wb.first_key
 
+    def _fetch_all_raw():
+        return _aggregate_projects_week_raw(
+            conn, week_start=cw_start, week_end=cw_end,
+            resolver_cache=resolver_cache,
+        )
+
+    def _fetch_delta_rows(after_id):
+        # Rowid-seek the ingest delta (id > after_id) over the current-week
+        # window, then PRE-FILTER to genuine current-week non-synthetic rows
+        # (mirrors _fold_projects_entry's membership filter) so the accumulator's
+        # fold-order gate compares a REAL current-week entry as rows[0]. Sort by
+        # (ts_iso, id) to reproduce the full pass's fold order exactly (SQLite
+        # BINARY collation on the Z-normalized ISO string == Python str compare).
+        out = []
+        for r in _projects_iter_session_entries(
+            conn, since=cw_start, until=cw_end, after_id=after_id,
+        ):
+            if r[2] == "<synthetic>":  # r[2] = model
+                continue
+            ts = parse_iso_datetime(r[1], "session_entries.timestamp_utc")
+            if _projects_week_start_monday_utc(ts) != cw_start:
+                continue
+            out.append(r)
+        out.sort(key=lambda r: (r[1], r[0]))  # (ts_iso, id)
+        return out
+
     for w in weeks_full:
         if w == cw_start:
-            week_buckets, week_total = _aggregate_projects_week(
-                conn, week_start=w, week_end=cw_end, resolver_cache=resolver_cache,
+            week_buckets, week_total = sc.accumulate_projects_current_week(
+                week_key=sc.projects_env_week_key(cw_start),
+                cur_max_id=cur_max_id,
+                fetch_all_raw=_fetch_all_raw,
+                fetch_delta_rows=_fetch_delta_rows,
+                finalize=_finalize_projects_mut,
+                fold=lambda mut, row: _fold_projects_entry(
+                    mut, row, resolver_cache=resolver_cache, week_start=cw_start,
+                ),
             )
         else:
             week_iso = sc.projects_env_week_key(w)
@@ -4015,6 +4160,7 @@ def _build_projects_envelope(
     if use_projects_env_cache:
         buckets, total_cost_by_week, key_by_bucket = _assemble_projects_via_cache(
             conn, weeks_full=weeks_full, cw_start=cw_start, cw_end=cw_end,
+            cur_max_id=max_id,
         )
     else:
         # `_resolve_project_key` is the production resolver; we use git-root

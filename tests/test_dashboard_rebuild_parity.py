@@ -2438,6 +2438,15 @@ def test_projects_env_cached_matches_from_scratch(fixture):
 
 
 def test_projects_env_warm_recomputes_only_current_week(monkeypatch):
+    """#271 M4: a warm same-signature tick does NO full-window fold at all — the
+    closed weeks are cache hits AND the current week takes the accumulator's
+    empty-delta fast path (finalize the cached running ``mut`` unchanged, no
+    re-fold). Both the closed-week wrapper and the current-week cold seed go
+    through ``_aggregate_projects_week_raw``, so spying it captures every full
+    fold: cold folds all weeks; warm folds none. (Non-vacuous: a buggy
+    cold-refold-every-tick accumulator would re-fetch the current week via
+    ``_fetch_all_raw`` → ``_aggregate_projects_week_raw`` → RED.)
+    """
     load_script()
     import _cctally_dashboard as d
     import _lib_snapshot_cache as sc
@@ -2446,7 +2455,7 @@ def test_projects_env_warm_recomputes_only_current_week(monkeypatch):
     sc.reset_projects_env_state()
     mid, mw = _proj_sig_legs(conn)
 
-    real = d._aggregate_projects_week
+    real = d._aggregate_projects_week_raw
     seen = {"weeks": []}
 
     def spy(conn_, *, week_start, week_end, resolver_cache):
@@ -2454,20 +2463,21 @@ def test_projects_env_warm_recomputes_only_current_week(monkeypatch):
         return real(conn_, week_start=week_start, week_end=week_end,
                     resolver_cache=resolver_cache)
 
-    monkeypatch.setattr(d, "_aggregate_projects_week", spy)
+    monkeypatch.setattr(d, "_aggregate_projects_week_raw", spy)
 
-    # Cold pass: all 12 weeks recomputed.
+    # Cold pass: every week (closed misses + the current-week cold seed) folds.
     _proj_reconcile(sc, conn, mid, mw)
     _build_env(d, conn, now=_PROJ_NOW, flag=True)
-    assert len(seen["weeks"]) >= 2, "cold pass must aggregate multiple weeks"
+    assert len(seen["weeks"]) >= 2, "cold pass must fold multiple weeks"
 
-    cw_start = d._projects_week_start_monday_utc(_PROJ_NOW)
     seen["weeks"].clear()
-    # Warm pass (same sig): only the current week is recomputed.
+    # Warm pass (same sig, empty delta): closed weeks are cache hits and the
+    # current week finalizes the cached mut incrementally → ZERO full folds.
     _proj_reconcile(sc, conn, mid, mw)
     _build_env(d, conn, now=_PROJ_NOW, flag=True)
-    assert seen["weeks"] == [cw_start], (
-        f"warm pass must recompute ONLY the current week, got {seen['weeks']}"
+    assert seen["weeks"] == [], (
+        f"warm pass must do NO full-window fold (closed cached + current "
+        f"incremental), got {seen['weeks']}"
     )
 
 
@@ -2657,9 +2667,16 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
     sc.projects_env_week_put(sc.projects_env_week_key(week1), {bp: wb_early}, 1.0)
     sc.projects_env_week_put(sc.projects_env_week_key(week2), {bp: wb_late}, 2.0)
 
+    # The current week is EMPTY (no session_entries), so cur_max_id = 0 and the
+    # accumulator cold-folds nothing — key_by_bucket comes only from the two
+    # seeded closed weeks.
+    cur_max_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM session_entries"
+    ).fetchone()[0]
     _, _, key_by_bucket = d._assemble_projects_via_cache(
         conn, weeks_full=[week1, week2, cw_start],
         cw_start=cw_start, cw_end=cw_start + dt.timedelta(days=7),
+        cur_max_id=cur_max_id,
     )
 
     assert key_by_bucket[bp].display_key == "EARLY", (
@@ -2674,10 +2691,13 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
 # ===========================================================================
 def test_live_rebuild_warm_reuses_closed_week_envelope(monkeypatch, tmp_path):
     """Two full `_tui_build_snapshot` rebuilds (dashboard mode). A new
-    current-week entry between them forces a non-idle WARM rebuild that
-    recomputes ONLY the current week's envelope buckets (spy) and reuses the
-    cached closed weeks — and `snap.projects_envelope` stays byte-identical to a
-    cold from-scratch rebuild on the same DB."""
+    current-week entry between them forces a non-idle WARM rebuild that reuses
+    the cached closed weeks AND folds the current week incrementally through the
+    #271 M4 accumulator (only the one new row appended, no full-window fold) —
+    and `snap.projects_envelope` stays byte-identical to a cold from-scratch
+    rebuild on the same DB. The spy on `_aggregate_projects_week_raw` (the shared
+    full-window fold behind both the closed-week wrapper and the current-week
+    cold seed) proves the warm tick does NO full fold."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_dashboard as d
@@ -2701,30 +2721,31 @@ def test_live_rebuild_warm_reuses_closed_week_envelope(monkeypatch, tmp_path):
         ("z1", "zm", "zr", "z", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
     ])
     seen = {"weeks": []}
-    real = d._aggregate_projects_week
+    real = d._aggregate_projects_week_raw
 
     def spy(conn_, *, week_start, week_end, resolver_cache):
         seen["weeks"].append(week_start)
         return real(conn_, week_start=week_start, week_end=week_end,
                     resolver_cache=resolver_cache)
 
-    monkeypatch.setattr(d, "_aggregate_projects_week", spy)
+    monkeypatch.setattr(d, "_aggregate_projects_week_raw", spy)
     now2 = NOW_UTC + dt.timedelta(minutes=1)
     snap2 = ns["_tui_build_snapshot"](
         now_utc=now2, skip_sync=False,
         precompute_envelope=True, runtime_bind="127.0.0.1",
     )
     assert snap2.projects_envelope is not None
-    # WARM: only ONE week (the current week) was recomputed; closed weeks came
-    # from the cache.
-    assert len(set(seen["weeks"])) == 1, (
-        f"warm live rebuild must recompute ONLY the current week, got "
+    # WARM: NO full-window fold — closed weeks came from the cache, and the
+    # current week's one new row was appended incrementally by the accumulator
+    # (not re-folded via _fetch_all_raw → _aggregate_projects_week_raw).
+    assert seen["weeks"] == [], (
+        f"warm live rebuild must do NO full-window fold, got "
         f"{sorted(set(seen['weeks']))}"
     )
 
     # Byte-identity: a cold from-scratch rebuild on the same DB at the same now
     # (dispatch + envelope cache reset → full recompute) matches the warm one.
-    monkeypatch.setattr(d, "_aggregate_projects_week", real)
+    monkeypatch.setattr(d, "_aggregate_projects_week_raw", real)
     sc.reset_dispatch_state()
     sc.reset_projects_env_state()
     snap3 = ns["_tui_build_snapshot"](

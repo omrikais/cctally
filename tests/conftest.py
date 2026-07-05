@@ -174,6 +174,9 @@ def _reset_snapshot_dispatch_state():
             "reset_session_cache_state",
             "reset_doctor_memo",
             "reset_bugk_segment_state",
+            # #271 M4: the projects-envelope current-week accumulator slot —
+            # driven directly by the accumulator unit tests, so isolate it.
+            "reset_projects_env_current_state",
         ):
             _fn = getattr(_sc, _name, None)
             if _fn is not None:
