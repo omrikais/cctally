@@ -2197,3 +2197,64 @@ def test_snapshot_reconcile_evicts_late_ingest_closed_week(monkeypatch, tmp_path
         "warm trend must equal from-scratch after a late-ingest into a closed "
         "reset week (reconcile must have evicted the stale cached cost)"
     )
+
+
+# ===========================================================================
+# #269 M3.3 — no-shared-mutation (spec §6 / Codex F7) for the weekref cache.
+# The weekref-cost cache holds IMMUTABLE floats; each rebuild builds FRESH
+# trend / weekly-history presentation rows from them. A rebuild must never
+# mutate a row object reachable from an already-published DataSnapshot (SSE
+# client threads read it concurrently).
+# ===========================================================================
+
+
+def test_snapshot_weekref_cache_never_mutates_published_trend_rows(monkeypatch, tmp_path):
+    """Capture a published snapshot's trend + weekly-history rows (deep copy),
+    run a warm (non-idle) recompute that re-reads the weekref cache, and assert
+    the captured objects are byte-unchanged and the rebuild produced FRESH
+    containers. If a builder mutated a cached value in place, the deep-copy
+    compare would diverge."""
+    import copy
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _reset_rebuild_caches(sc)
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        _seed_closed_reset_event_week(ns, stats)
+    finally:
+        stats.close()
+
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    captured_trend = snap1.trend
+    captured_history = snap1.weekly_history
+    deep_trend = copy.deepcopy(captured_trend)
+    deep_history = copy.deepcopy(captured_history)
+    # Non-vacuity: the cold rebuild produced trend rows (the weekref cache served
+    # the reset week into them).
+    assert captured_trend, "cold rebuild must produce trend rows"
+
+    # A new current-week entry → non-idle warm recompute that re-reads the
+    # weekref cache (closed weeks served from cache, current recomputed).
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("z1", "zm", "zr", "z", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
+    ])
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC + dt.timedelta(minutes=1), skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+
+    assert captured_trend == deep_trend, (
+        "the previously-published trend rows must be byte-unchanged (no in-place "
+        "mutation of an object reachable from an already-published snapshot)"
+    )
+    assert captured_history == deep_history, (
+        "the previously-published weekly-history rows must be byte-unchanged"
+    )
+    assert snap2.trend is not captured_trend, "the rebuild built a FRESH trend container"
