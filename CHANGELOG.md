@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.61.0] - 2026-07-05
+
 ### Added
 - `cache-sync --prune-orphans` cleans up cache rows left behind when a session's transcript directory is removed — for example after you delete a git worktree — so stale sessions and projects don't linger in your reports. It's a fast, targeted alternative to a full `cache-sync --rebuild`, and only removes rows it can prove are safe to drop, leaving anything ambiguous in place.
 
