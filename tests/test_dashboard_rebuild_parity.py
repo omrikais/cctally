@@ -2258,3 +2258,93 @@ def test_snapshot_weekref_cache_never_mutates_published_trend_rows(monkeypatch, 
         "the previously-published weekly-history rows must be byte-unchanged"
     )
     assert snap2.trend is not captured_trend, "the rebuild built a FRESH trend container"
+
+
+# ===========================================================================
+# #269 M4.1 — Win 1: raw-`project_path` fast path in `_resolve_project_key`
+# (spec §14 Win 1, Codex-M4 P1). The expensive realpath/lstat walk runs once
+# per DISTINCT raw spelling, not once per entry — WITHOUT dropping the
+# normalized cache that collapses `full-path` symlink aliases.
+# ===========================================================================
+def test_resolve_project_key_raw_fast_path_dedups_realpath(monkeypatch, tmp_path):
+    import os
+    import _cctally_cache
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    raw = str(repo / "sub" / "dir")
+    (repo / "sub" / "dir").mkdir(parents=True)
+
+    real = os.path.realpath
+    calls = {"n": 0}
+
+    def spy(p):
+        calls["n"] += 1
+        return real(p)
+
+    monkeypatch.setattr(os.path, "realpath", spy)
+
+    cache: dict = {}
+    keys = [
+        _cctally_cache._resolve_project_key(raw, "git-root", cache)
+        for _ in range(5)
+    ]
+    # All five resolutions agree, and realpath ran exactly ONCE (the raw
+    # fast path short-circuits the other four). Pre-change: realpath ran 5x.
+    assert all(k == keys[0] for k in keys)
+    assert calls["n"] == 1, (
+        f"raw fast path must dedup realpath to 1 call, got {calls['n']}"
+    )
+
+
+def test_resolve_project_key_parity_across_modes(tmp_path):
+    import _cctally_cache
+
+    repo = tmp_path / "gitrepo"
+    (repo / ".git").mkdir(parents=True)
+    nogit = tmp_path / "plain"
+    nogit.mkdir()
+
+    # A shared cache (memoized) and a fresh-cache-per-call reference must
+    # agree for git-root, no-git, and NULL inputs (byte-identical resolution).
+    shared: dict = {}
+    for raw in (str(repo), str(nogit), None):
+        memoized = _cctally_cache._resolve_project_key(raw, "git-root", shared)
+        fresh = _cctally_cache._resolve_project_key(raw, "git-root", {})
+        assert memoized == fresh
+        assert memoized.display_key == fresh.display_key
+        assert memoized.git_root == fresh.git_root
+        assert memoized.is_no_git == fresh.is_no_git
+        assert memoized.is_unknown == fresh.is_unknown
+
+    git_key = _cctally_cache._resolve_project_key(str(repo), "git-root", shared)
+    assert git_key.git_root == str(repo)
+    nogit_key = _cctally_cache._resolve_project_key(str(nogit), "git-root", shared)
+    assert nogit_key.is_no_git is True
+    unknown_key = _cctally_cache._resolve_project_key(None, "git-root", shared)
+    assert unknown_key.is_unknown is True and unknown_key.bucket_path == "(unknown)"
+
+
+def test_resolve_project_key_fullpath_alias_collapse_preserved(tmp_path):
+    """Codex-M4 P1: two symlink-alias spellings of one physical path still
+    collapse to the FIRST-spelling `display_key` in mode='full-path'. The raw
+    fast path must NOT replace the normalized cache."""
+    import os
+    import _cctally_cache
+
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "alias"
+    os.symlink(physical, alias)
+
+    cache: dict = {}
+    # Resolve the ALIAS spelling first — it becomes the first-seen display_key.
+    k_alias = _cctally_cache._resolve_project_key(str(alias), "full-path", cache)
+    # Then the PHYSICAL spelling (a different raw string, same realpath).
+    k_phys = _cctally_cache._resolve_project_key(str(physical), "full-path", cache)
+
+    assert k_alias.bucket_path == k_phys.bucket_path  # same normalized path
+    assert k_phys.display_key == str(alias), (
+        "the second alias must collapse to the FIRST spelling's display_key"
+    )
+    assert k_phys is k_alias  # returned via the normalized cache, not a new key

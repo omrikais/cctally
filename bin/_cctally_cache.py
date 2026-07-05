@@ -342,22 +342,40 @@ def _resolve_project_key(
             is_unknown=True,
         )
 
+    # Win 1 (#269 §14, Codex-M4 P1): raw-`project_path` fast path. The
+    # normalized cache is keyed on ``os.path.realpath(...)``, so on the base
+    # code the expensive realpath/lstat walk runs once per ENTRY (~190K on a
+    # large instance) rather than once per DISTINCT raw spelling (~10K). A
+    # namespaced raw key (``("raw", project_path)``) — a tuple that can never
+    # collide with the normalized string keys — short-circuits the common case
+    # (the same raw spelling repeated across a project's entries). This does
+    # NOT replace the normalized cache: a raw MISS still consults/populates the
+    # normalized entry, so ``mode="full-path"`` symlink-alias collapse to the
+    # first spelling seen is preserved (a second alias misses the raw fast
+    # path, hits the normalized entry, and returns the first spelling's key).
+    # Byte-identical for ALL modes.
+    raw_key = ("raw", project_path)
+    raw_hit = cache.get(raw_key)
+    if raw_hit is not None:
+        return raw_hit
+
     if mode == "full-path":
         normalized = os.path.realpath(os.path.expanduser(project_path))
         key = cache.get(normalized)
-        if key is not None:
-            return key
-        key = ProjectKey(
-            bucket_path=normalized,
-            display_key=project_path,   # raw, so user sees what they typed
-            git_root=None,
-        )
-        cache[normalized] = key
+        if key is None:
+            key = ProjectKey(
+                bucket_path=normalized,
+                display_key=project_path,   # raw, so user sees what they typed
+                git_root=None,
+            )
+            cache[normalized] = key
+        cache[raw_key] = key
         return key
 
     normalized = os.path.realpath(os.path.expanduser(project_path))
     cached = cache.get(normalized)
     if cached is not None:
+        cache[raw_key] = cached
         return cached
 
     home = os.path.expanduser("~")
@@ -372,6 +390,7 @@ def _resolve_project_key(
                 git_root=cur,
             )
             cache[normalized] = key
+            cache[raw_key] = key
             return key
         cur = os.path.dirname(cur)
 
@@ -382,6 +401,7 @@ def _resolve_project_key(
         is_no_git=True,
     )
     cache[normalized] = key
+    cache[raw_key] = key
     return key
 
 
