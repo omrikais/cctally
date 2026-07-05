@@ -773,3 +773,54 @@ def cached_weekref_cost(*, week_start_at, week_end_at, now_utc, compute):
     val = compute()
     _WEEKREF_COST_CACHE[key] = val
     return val
+
+
+def reconcile_weekref_cache(cache_conn, *, max_entry_id, reset_sig):
+    """Once-per-non-idle-rebuild invalidation for the weekref-cost cache (spec §4).
+
+    Driven by ``_tui_build_snapshot`` after the idle-path check, before the
+    builders run, using the already-computed dispatch-signature legs
+    (``max_entry_id`` + ``reset_sig`` are passed in — no extra query for those):
+
+    - Cold (no last-seen): record last-seen, return — no eviction.
+    - ``reset_sig`` changed OR ``max_entry_id < last_seen`` (cache.db rebuilt
+      out-of-process): full ``clear()``. A credit/reset re-shapes a past week's
+      cost; reset events are rare, so a conservative full clear is correct and
+      cheap. A max-id regression means the ids no longer map to the same rows.
+    - ``max_entry_id > last_seen``: evict cached weeks whose ``week_end_at`` is
+      ``>= new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row
+      could fall inside them (F1 late-ingest). The bound is ``>=``, NOT ``>``,
+      because ``_sum_cost_for_range`` / ``iter_entries`` sum an inclusive
+      ``[start, end]`` window, so a row whose timestamp lands exactly on
+      ``week_end_at`` belongs to that week (Codex-1). Over-eviction is byte-safe
+      (forces a recompute). Normally ``wm`` is recent and no closed week drops.
+
+    Idempotent within a tick: after the first call updates last-seen, a later
+    call in the same tick sees no delta (``max_entry_id == last_seen``,
+    ``reset_sig`` unchanged) and no-ops — never re-running the watermark query.
+
+    Connection lifecycle (Codex-4): the ``new_min_timestamp`` watermark query is
+    the only use of ``cache_conn`` and runs only on the
+    ``max_entry_id > last_seen`` branch; the caller passes a short-lived cache
+    connection, opened for that query.
+    """
+    ls = _WEEKREF_COST_LAST_SEEN
+    if not ls:  # cold
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig
+        return
+    if reset_sig != ls["reset_sig"] or max_entry_id < ls["max_id"]:
+        _WEEKREF_COST_CACHE.clear()  # reset/credit, or cache.db rebuilt
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig
+        return
+    if max_entry_id > ls["max_id"]:
+        wm = new_min_timestamp(cache_conn, ls["max_id"])
+        if wm is not None:
+            for key in list(_WEEKREF_COST_CACHE):
+                # key = (start_iso, end_iso); inclusive [start,end] window, so
+                # evict when the week's end >= the earliest new event time.
+                if dt.datetime.fromisoformat(key[1]) >= wm:
+                    del _WEEKREF_COST_CACHE[key]
+        ls["max_id"] = max_entry_id
+        ls["reset_sig"] = reset_sig

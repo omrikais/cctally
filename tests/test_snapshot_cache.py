@@ -669,3 +669,107 @@ def test_cached_weekref_cost_zero_is_a_hit():
         week_start_at=ws, week_end_at=we, now_utc=now, compute=compute
     )
     assert calls["n"] == 1  # 0.0 is a hit, not a miss
+
+
+# ===========================================================================
+# #269 M0.3 — `reconcile_weekref_cache` (signature-driven invalidation)
+# ===========================================================================
+def test_reconcile_weekref_evicts_late_ingest_week(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    # Two cached closed weeks.
+    wk_old = (
+        dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc),
+    )
+    wk_new = (
+        dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc),
+    )
+    sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk_old)] = 1.0
+    sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk_new)] = 2.0
+    last = _max_id(tmp_cache)
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    # Late-ingest a row (new id) with an OLD timestamp inside wk_new.
+    _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
+    sc.reconcile_weekref_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+    )
+    assert sc._weekref_key(*wk_new) not in sc._WEEKREF_COST_CACHE  # evicted
+    assert sc._weekref_key(*wk_old) in sc._WEEKREF_COST_CACHE  # untouched
+
+
+def test_reconcile_weekref_full_clear_on_reset_sig(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 3.0
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=_max_id(tmp_cache), reset_sig=(1, 1))
+    sc.reconcile_weekref_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(2, 2)
+    )
+    assert sc._WEEKREF_COST_CACHE == {}  # reset/credit reshaped a past week
+
+
+def test_reconcile_weekref_full_clear_on_maxid_regression(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 3.0
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=100, reset_sig=(0, 0))
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=5, reset_sig=(0, 0))  # rebuilt
+    assert sc._WEEKREF_COST_CACHE == {}
+
+
+def test_reconcile_weekref_boundary_equal_is_evicted(tmp_cache):
+    """Codex-1: inclusive [start,end] means an entry AT week_end belongs to
+    the week, so eviction is >= not >."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    we = dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc)
+    wk = (dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc), we)
+    sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
+    last = _max_id(tmp_cache)
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly week_end
+    sc.reconcile_weekref_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+    )
+    assert sc._weekref_key(*wk) not in sc._WEEKREF_COST_CACHE  # >= evicts it
+
+
+def test_reconcile_weekref_cold_records_last_seen(tmp_cache):
+    """First (cold) call just records last-seen and touches no cache entry."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 5.0  # pre-seeded, must survive the cold call
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=7, reset_sig=(3, 4))
+    assert sc._WEEKREF_COST_LAST_SEEN == {"max_id": 7, "reset_sig": (3, 4)}
+    assert sc._WEEKREF_COST_CACHE == {("s", "e"): 5.0}
+
+
+def test_reconcile_weekref_idempotent_within_tick(tmp_cache):
+    """After the first reconcile updates last-seen, a second call with the same
+    signature sees no delta and evicts nothing (and never re-queries)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    wk = (
+        dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc),
+    )
+    sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
+    last = _max_id(tmp_cache)
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # in the future, keeps wk
+    new_max = _max_id(tmp_cache)
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    assert sc._weekref_key(*wk) in sc._WEEKREF_COST_CACHE  # 2026-06-29 < 2026-07-04
+    # Re-populate a would-be-dirty entry, then reconcile again with SAME sig:
+    # no watermark re-query fires, so the entry survives (idempotent no-op).
+    sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    assert sc._weekref_key(*wk) in sc._WEEKREF_COST_CACHE
