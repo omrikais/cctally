@@ -2335,6 +2335,67 @@ def iter_entries(
     return entries
 
 
+def iter_entries_with_id(
+    conn: sqlite3.Connection,
+    range_start: dt.datetime,
+    range_end: dt.datetime,
+    *,
+    after_id: int | None = None,
+    after_ts: dt.datetime | None = None,
+) -> list[tuple[int, UsageEntry]]:
+    """Like ``iter_entries`` but yields ``(id, UsageEntry)`` rows, ordered
+    ``(timestamp_utc, id)``, for #271's current-bucket accumulator (§7d).
+
+    When ``after_id`` / ``after_ts`` are given, restricts to the incremental
+    delta ``(id > after_id OR timestamp_utc > after_ts)`` — the ``id`` leg
+    catches genuinely-new ingests, the ``timestamp_utc`` leg catches
+    already-ingested rows that newly entered the window because ``now`` advanced
+    (Codex-1). Both disjuncts stay index-usable (rowid range +
+    ``idx_entries_timestamp`` range), so the delta is O(delta), not a full
+    current-bucket scan (an ``EXPLAIN QUERY PLAN`` regression test guards this,
+    Codex-2). ``iter_entries``' public ``list[UsageEntry]`` shape and
+    ``UsageEntry`` (which has no ``id`` field) are left untouched — this is a
+    thin internal sibling, not an overload (Codex-5).
+    """
+    start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
+    end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
+    sql = (
+        "SELECT id, timestamp_utc, model, input_tokens, output_tokens, "
+        "cache_create_tokens, cache_read_tokens, speed, cost_usd_raw, source_path "
+        "FROM session_entries "
+        "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
+    )
+    params: list[Any] = [start_iso, end_iso]
+    if after_id is not None or after_ts is not None:
+        after_id_val = -1 if after_id is None else int(after_id)
+        after_ts_val = (
+            "" if after_ts is None
+            else after_ts.astimezone(dt.timezone.utc).isoformat()
+        )
+        sql += " AND (id > ? OR timestamp_utc > ?)"
+        params += [after_id_val, after_ts_val]
+    sql += " ORDER BY timestamp_utc ASC, id ASC"
+
+    out: list[tuple[int, UsageEntry]] = []
+    for row in conn.execute(sql, params):
+        usage: dict[str, Any] = {
+            "input_tokens":                row[3],
+            "output_tokens":               row[4],
+            "cache_creation_input_tokens": row[5],
+            "cache_read_input_tokens":     row[6],
+        }
+        if row[7] is not None:  # speed (materialized column, #181)
+            usage["speed"] = row[7]
+        out.append((row[0], UsageEntry(
+            timestamp=dt.datetime.fromisoformat(row[1]),
+            model=row[2],
+            usage=usage,
+            cost_usd=row[8],
+            source_path=row[9],
+        )))
+    return out
+
+
 def _collect_entries_direct(
     range_start: dt.datetime,
     range_end: dt.datetime,

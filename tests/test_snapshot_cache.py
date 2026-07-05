@@ -981,7 +981,13 @@ def _make_cache_db(tmp_path, name="cache271.db"):
 def _insert_entry(conn, *, ts, model="claude-opus-4-8", input=0, output=0,
                   cache_create=0, cache_read=0, speed=None, cost_usd=None,
                   source="/p/a.jsonl"):
-    """Insert one ``session_entries`` row (auto-incrementing ``line_offset``)."""
+    """Insert one ``session_entries`` row (auto-incrementing ``line_offset``).
+
+    ``timestamp_utc`` is stored in the SAME normalized form ``sync_cache`` uses
+    (``.astimezone(utc).isoformat()`` → the ``+00:00`` suffix, not ``Z``), so
+    the lexical ``timestamp_utc > ?`` / ``BETWEEN`` string comparisons behave
+    identically to production.
+    """
     off = conn.execute(
         "SELECT COALESCE(MAX(line_offset), -1) + 1 FROM session_entries"
     ).fetchone()[0]
@@ -990,8 +996,8 @@ def _insert_entry(conn, *, ts, model="claude-opus-4-8", input=0, output=0,
         "(source_path, line_offset, timestamp_utc, model, input_tokens, "
         " output_tokens, cache_create_tokens, cache_read_tokens, speed, cost_usd_raw) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (source, off, ts, model, input, output, cache_create, cache_read,
-         speed, cost_usd),
+        (source, off, _dt(ts).isoformat(), model, input, output, cache_create,
+         cache_read, speed, cost_usd),
     )
     conn.commit()
 
@@ -1134,6 +1140,60 @@ def test_accumulate_synthetic_skipped_does_not_advance_tail():
                             max_id=2, all_rows=r1 + syn, delta_rows=syn)
     assert bucket.input_tokens == 10
     assert acc.tail == (r1[0][1].timestamp, 1)  # unchanged; synthetic never folded
+
+
+# --- Task 4: the (id, UsageEntry) delta fetch sibling ----------------------
+def test_iter_entries_with_id_delta(tmp_path):
+    """``iter_entries_with_id`` yields ``(id, UsageEntry)`` and restricts to the
+    ``(id > after_id OR timestamp_utc > after_ts)`` delta (#271 §7d)."""
+    import _cctally_cache as cache
+
+    conn = _make_cache_db(tmp_path)
+    try:
+        _insert_entry(conn, ts="2026-07-01T00:00:00Z", input=1)  # id 1
+        _insert_entry(conn, ts="2026-07-01T01:00:00Z", input=2)  # id 2
+        _insert_entry(conn, ts="2026-07-01T02:00:00Z", input=3)  # id 3
+        lo, hi = _dt("2026-07-01T00:00:00Z"), _dt("2026-07-01T23:00:00Z")
+        # after_id=1, after_ts far-future → only id>1 (the id leg).
+        got = cache.iter_entries_with_id(
+            conn, lo, hi, after_id=1, after_ts=_dt("2100-01-01T00:00:00Z")
+        )
+        assert [i for i, _ in got] == [2, 3]
+        # after_id huge, after_ts=01:00 → only ts>01:00 (the ts leg, id 3).
+        got2 = cache.iter_entries_with_id(
+            conn, lo, hi, after_id=10**9, after_ts=_dt("2026-07-01T01:00:00Z")
+        )
+        assert [i for i, _ in got2] == [3]
+        # No after-predicate → the whole window in (timestamp_utc, id) order.
+        allrows = cache.iter_entries_with_id(conn, lo, hi)
+        assert [i for i, _ in allrows] == [1, 2, 3]
+        # The UsageEntry side is fully built (tokens + timestamp).
+        assert allrows[0][1].usage["input_tokens"] == 1
+        assert allrows[2][1].timestamp == _dt("2026-07-01T02:00:00Z")
+    finally:
+        conn.close()
+
+
+def test_iter_entries_with_id_query_plan_is_indexed(tmp_path):
+    """The delta predicate stays index-driven — not a bare full-table scan
+    (#271 §7d / Codex-2)."""
+    import _cctally_cache as cache  # noqa: F401 (schema/module parity)
+
+    conn = _make_cache_db(tmp_path)
+    try:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id, timestamp_utc FROM session_entries "
+            "WHERE timestamp_utc >= ? AND timestamp_utc <= ? "
+            "AND (id > ? OR timestamp_utc > ?) "
+            "ORDER BY timestamp_utc ASC, id ASC",
+            ("2026-07-01T00:00:00+00:00", "2026-07-01T23:00:00+00:00", 1,
+             "2026-07-01T01:00:00+00:00"),
+        ).fetchall()
+        text = " ".join(str(r) for r in plan).upper()
+        assert "SCAN SESSION_ENTRIES" not in text or "USING INDEX" in text
+    finally:
+        conn.close()
 
 
 # --- Task 1: iter_entries fold-order tie-break -----------------------------
