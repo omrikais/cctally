@@ -1053,6 +1053,89 @@ def test_fold_primitive_matches_aggregate_buckets():
     assert got == full[0]  # exact dataclass equality
 
 
+# --- Task 3: CurrentBucketAccumulator + the pure tick algorithm ------------
+def _rows(*specs):
+    """Build ``(id, UsageEntry)`` rows from ``(id, ts_iso, model, input)``."""
+    return [(i, _entry(ts, model, input=inp)) for (i, ts, model, inp) in specs]
+
+
+def _acc_call(prior, *, label, now, max_id, all_rows, delta_rows,
+              member=lambda e: True):
+    import _lib_snapshot_cache as sc
+
+    return sc.accumulate_current_bucket(
+        prior, current_label=label, cur_now=_dt(now), cur_max_id=max_id,
+        fetch_all=lambda: all_rows,
+        fetch_delta=lambda aid, ats: [
+            (i, e) for (i, e) in delta_rows if i > aid or e.timestamp > ats
+        ],
+        membership=member, mode="auto")
+
+
+def test_accumulate_cold_folds_all():
+    rows = _rows((1, "2026-07-01T00:00:00Z", "claude-opus-4-8", 10),
+                 (2, "2026-07-01T01:00:00Z", "claude-opus-4-8", 5))
+    bucket, acc = _acc_call(None, label="2026-07-01", now="2026-07-01T02:00:00Z",
+                            max_id=2, all_rows=rows, delta_rows=[])
+    assert bucket.input_tokens == 15
+    assert acc.tail == (rows[1][1].timestamp, 2)
+    assert acc.last_seen_id == 2
+
+
+def test_accumulate_empty_delta_reuses():
+    rows = _rows((1, "2026-07-01T00:00:00Z", "claude-opus-4-8", 10))
+    _, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T01:00:00Z",
+                         max_id=1, all_rows=rows, delta_rows=[])
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T02:00:00Z",
+                            max_id=1, all_rows=rows, delta_rows=[])
+    assert bucket.input_tokens == 10  # unchanged, from cached acc
+
+
+def test_accumulate_append_after_tail():
+    r1 = _rows((1, "2026-07-01T00:00:00Z", "claude-opus-4-8", 10))
+    _, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T00:30:00Z",
+                         max_id=1, all_rows=r1, delta_rows=[])
+    new = _rows((2, "2026-07-01T01:00:00Z", "claude-opus-4-8", 5))
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T01:30:00Z",
+                            max_id=2, all_rows=r1 + new, delta_rows=new)
+    assert bucket.input_tokens == 15
+    assert acc.tail == (new[0][1].timestamp, 2)
+
+
+def test_accumulate_mid_bucket_late_ingest_falls_back():
+    r1 = _rows((1, "2026-07-01T02:00:00Z", "claude-opus-4-8", 10))
+    _, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T02:30:00Z",
+                         max_id=1, all_rows=r1, delta_rows=[])
+    late = _rows((2, "2026-07-01T01:00:00Z", "claude-opus-4-8", 5))  # ts BEFORE tail
+    allrows = _rows((2, "2026-07-01T01:00:00Z", "claude-opus-4-8", 5),
+                    (1, "2026-07-01T02:00:00Z", "claude-opus-4-8", 10))  # (ts,id) order
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T02:40:00Z",
+                            max_id=2, all_rows=allrows, delta_rows=late)
+    assert bucket.input_tokens == 15  # full recompute, correct total
+    assert acc.tail == (r1[0][1].timestamp, 1)  # tail = max (ts,id) = the 02:00 row
+
+
+def test_accumulate_now_advances_past_ingested_row():
+    # A row already ingested (id=1) but with ts AFTER prior now; MAX(id) unchanged.
+    r1 = _rows((1, "2026-07-01T05:00:00Z", "claude-opus-4-8", 10))
+    _, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T04:00:00Z",
+                         max_id=1, all_rows=[], delta_rows=[])  # not yet reached: empty
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T06:00:00Z",
+                            max_id=1, all_rows=r1, delta_rows=r1)  # ts>last_now leg catches it
+    assert bucket is not None and bucket.input_tokens == 10
+
+
+def test_accumulate_synthetic_skipped_does_not_advance_tail():
+    r1 = _rows((1, "2026-07-01T00:00:00Z", "claude-opus-4-8", 10))
+    _, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T00:30:00Z",
+                         max_id=1, all_rows=r1, delta_rows=[])
+    syn = _rows((2, "2026-07-01T01:00:00Z", "<synthetic>", 99))
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T01:30:00Z",
+                            max_id=2, all_rows=r1 + syn, delta_rows=syn)
+    assert bucket.input_tokens == 10
+    assert acc.tail == (r1[0][1].timestamp, 1)  # unchanged; synthetic never folded
+
+
 # --- Task 1: iter_entries fold-order tie-break -----------------------------
 def test_iter_entries_order_is_timestamp_then_id(tmp_path):
     """``iter_entries`` returns rows in ``(timestamp_utc, id)`` ascending order,

@@ -48,9 +48,18 @@ import datetime as dt
 import os
 import sqlite3
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from _cctally_core import parse_iso_datetime
+
+# #271: the current-bucket accumulator (below) reuses the aggregators' single
+# per-entry fold primitive so the incremental append is byte-identical to the
+# full pass (spec §6/§7). This is the ONE deliberate runtime coupling to
+# _lib_aggregators — the cache primitives above stay decoupled (BucketUsage is
+# still a TYPE_CHECKING-only hint). _lib_aggregators imports only _cctally_core,
+# so there is no import cycle.
+from _lib_aggregators import _fold_entry, _finalize_bucket, _new_bucket_acc
 
 if TYPE_CHECKING:  # type hints only — no runtime coupling to the aggregators
     from _lib_aggregators import BucketUsage, ClaudeSessionUsage
@@ -346,6 +355,104 @@ def reset_group_a_state() -> None:
     """
     _GROUP_A_CACHE.clear()
     _GROUP_A_LAST_SEEN.clear()
+    reset_group_a_current_state()
+
+
+# === #271 — incremental current-bucket accumulator =========================
+#
+# The Group A builders (daily / monthly / weekly) re-fold the whole OPEN
+# bucket every warm tick (`cached_buckets` recomputes `current_label` from a
+# full window fetch). On a recency-dense instance that open week/month/day
+# holds tens of thousands of entries, so the recompute dominates the residual
+# warm rebuild (#271 §1). This holds a persisted single-left-fold accumulator
+# per builder key: each warm tick folds only the DELTA (new-by-id OR
+# newly-in-window-because-`now`-advanced) into the running aggregate, with a
+# full-recompute fallback when a late older-timestamp row lands mid-bucket.
+#
+# Byte-identity rests on the pinned `(timestamp_utc, id)` fold order (#271 §5)
+# + the shared `_fold_entry` primitive (§6): the incremental append reproduces
+# the full left-fold exactly. Single-writer (sync thread only), module state,
+# never reachable from a published DataSnapshot (F7 — the snapshot holds the
+# finalized BucketUsage, not `acc`).
+
+
+@dataclass
+class CurrentBucketAccumulator:
+    """Persisted running fold of one Group A builder's CURRENT bucket (§7a)."""
+    label: str
+    acc: dict                    # running _new_bucket_acc() shape
+    tail: "tuple | None"         # (timestamp_utc, id) of the last folded entry
+    last_seen_id: int            # max session_entries.id reconciled (= cur_max_id)
+    last_now: dt.datetime        # now_utc upper bound used to clamp the last fold
+
+
+_GROUP_A_CURRENT: "dict[str, CurrentBucketAccumulator]" = {}
+
+
+def reset_group_a_current_state() -> None:
+    """Drop every builder's current-bucket accumulator (prune-site + full-invalidate)."""
+    _GROUP_A_CURRENT.clear()
+
+
+def _finalize_or_none(label, acc, tail):
+    """Finalize ``acc`` into a ``BucketUsage``, or ``None`` when nothing was
+    folded (``tail is None`` ⇒ an empty/gap bucket, matching a from-scratch
+    ``aggregate_one`` returning ``None``)."""
+    return None if tail is None else _finalize_bucket(label, acc)
+
+
+def accumulate_current_bucket(prior, *, current_label, cur_now, cur_max_id,
+                              fetch_all, fetch_delta, membership, mode="auto"):
+    """Pure §7b tick algorithm. Returns ``(BucketUsage | None, CurrentBucketAccumulator)``.
+
+    ``fetch_all() -> list[(id, UsageEntry)]`` over the whole current-bucket
+    window (cold / fallback); ``fetch_delta(after_id, after_ts) ->
+    list[(id, UsageEntry)]`` the ``(id > after_id OR ts > after_ts)`` delta;
+    both ordered ``(timestamp_utc, id)``. ``membership(entry) -> bool`` keeps
+    exactly the entries the full pass assigns to ``current_label``.
+    """
+    def _cold():
+        acc = _new_bucket_acc()
+        tail = None
+        for eid, e in fetch_all():
+            if e.model == "<synthetic>" or not membership(e):
+                continue
+            _fold_entry(acc, e, mode)
+            tail = (e.timestamp, eid)
+        return acc, tail
+
+    if prior is None or prior.label != current_label:
+        acc, tail = _cold()
+        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+        return _finalize_or_none(current_label, acc, tail), new
+
+    delta = [
+        (eid, e) for eid, e in fetch_delta(prior.last_seen_id, prior.last_now)
+        if e.model != "<synthetic>" and membership(e)
+    ]
+    if not delta:
+        # From-scratch fold set unchanged since last tick → byte-identical.
+        new = CurrentBucketAccumulator(current_label, prior.acc, prior.tail,
+                                       cur_max_id, cur_now)
+        return _finalize_or_none(current_label, prior.acc, prior.tail), new
+
+    # Guard: every folded delta row must sort AFTER the tail (a strict suffix).
+    # tail None ⇒ prior folded nothing ⇒ the delta IS the full member set (each
+    # current member has id>last_seen OR ts>last_now), so appending == full fold.
+    if prior.tail is not None and any(
+        (e.timestamp, eid) <= prior.tail for eid, e in delta
+    ):
+        acc, tail = _cold()  # late-ingest mid-bucket fallback
+        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+        return _finalize_or_none(current_label, acc, tail), new
+
+    acc = prior.acc  # mutate in place (module state, never published)
+    tail = prior.tail
+    for eid, e in delta:  # fetch_delta returns (timestamp_utc, id) ascending
+        _fold_entry(acc, e, mode)
+        tail = (e.timestamp, eid)
+    new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+    return _finalize_or_none(current_label, acc, tail), new
 
 
 def cached_buckets(
