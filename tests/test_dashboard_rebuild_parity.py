@@ -1757,3 +1757,161 @@ def test_session_cache_drops_aged_out_sessions(monkeypatch, tmp_path):
     assert "sess-old" not in sc.session_cache().get_all(), (
         "an aged-out session must be dropped from the store, not just the view"
     )
+
+
+# ===========================================================================
+# #269 M1 — B1 (trend / weekly-history) + B3 (forecast) share the per-weekref
+# immutable-cost cache (spec §4). With `use_weekref_cost_cache=True` a closed
+# subscription week's cost is served from `_WEEKREF_COST_CACHE` after the first
+# compute; the OPEN week always recomputes. The flag defaults OFF so CLI callers
+# stay byte-identical. Each wiring test ends with a cached-vs-from-scratch parity
+# assert (the acceptance gate) or a spied reuse assert (the cache genuinely
+# short-circuits the compute primitive on a same-signature second pass).
+#
+# The tests drive `reconcile_weekref_cache` BEFORE the cached builder pass,
+# exactly as #269 M3 will wire it into the live rebuild (sync → dispatch
+# signature → idle-check → reconcile → builders).
+# ===========================================================================
+
+
+def _seed_closed_reset_event_week(ns, stats_conn):
+    """Seed four monotone weeks + attach a reset event to a CLOSED past week.
+
+    Clone of ``_seed_reset_event_week`` above, but the reset is pinned onto a
+    week whose ``week_end_at`` is strictly before ``NOW_UTC`` (2026-06-15 →
+    2026-06-22 < 2026-07-04), so ``build_trend_view``'s reset branch treats it
+    as CLOSED and ``cached_weekref_cost`` actually caches it (the open-week
+    fixture the sibling helper builds never populates the cache). The current
+    open week (2026-06-29 → 2026-07-06) carries NO reset event, so it flows the
+    cheap ``get_latest_cost_for_week`` snapshot path — leaving exactly ONE
+    reset-event week, and it is closed.
+    """
+    weeks = [
+        ("2026-06-08", "2026-06-15", 20.0),
+        ("2026-06-15", "2026-06-22", 40.0),
+        ("2026-06-22", "2026-06-29", 60.0),
+        ("2026-06-29", "2026-07-06", 80.0),
+    ]
+    for ws_d, we_d, pct in weeks:
+        stats_conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, payload_json) "
+            "VALUES (?,?,?,?,?,?,'{}')",
+            (ws_d + "T12:00:00Z", ws_d, we_d,
+             ws_d + "T00:00:00+00:00", we_d + "T00:00:00+00:00", pct),
+        )
+    stats_conn.commit()
+
+    # Probe the canonical boundaries of the CLOSED 2026-06-15 week, then pin the
+    # reset onto it. ``new_week_end_at == that week's canonical end`` rewrites
+    # its ``week_start_at`` to ``effective`` (06:00), so ``effective IN
+    # (week_start_at, week_end_at)`` holds → has_reset_event True. The distinct
+    # ``old_week_end_at`` sentinel keeps this out of the in-place-credit path
+    # (no ref split/drop).
+    refs = ns["get_recent_weeks"](stats_conn, 12)
+    target = next(
+        r for r in refs
+        if r.week_start_at and r.week_end_at
+        and r.week_start.isoformat() == "2026-06-15"
+    )
+    effective = target.week_start_at[:11] + "06:00:00+00:00"
+    stats_conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc) "
+        "VALUES (?,?,?,?)",
+        (effective, "2020-01-01T00:00:00+00:00", target.week_end_at, effective),
+    )
+    stats_conn.commit()
+    return target, effective
+
+
+def test_trend_view_cached_matches_from_scratch(monkeypatch, tmp_path):
+    """`use_weekref_cost_cache=True` yields a byte-identical TrendView."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_jsonl(tmp_path)
+    _prime_cache(ns)
+    sc.reset_weekref_cost_state()
+
+    stats = ns["open_db"]()
+    cache_conn = ns["open_cache_db"]()
+    try:
+        _seed_closed_reset_event_week(ns, stats)
+        # Guard: a reset-event week is actually reachable (else the reset branch
+        # never runs and the parity assert is vacuous).
+        refs = ns["get_recent_weeks"](stats, 12)
+        assert any(ns["_week_ref_has_reset_event"](stats, r) for r in refs), (
+            "fixture must produce at least one reset-event week"
+        )
+
+        base = ns["build_trend_view"](
+            stats, now_utc=NOW_UTC, n=8, display_tz=None, skip_sync=True,
+        )
+        sig = sc.compute_signature(
+            cache_conn, stats, generation=sc.current_generation(),
+        )
+        sc.reconcile_weekref_cache(
+            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+        )
+        cached = ns["build_trend_view"](
+            stats, now_utc=NOW_UTC, n=8, display_tz=None, skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+    finally:
+        cache_conn.close()
+        stats.close()
+
+    assert cached == base
+
+
+def test_trend_view_cached_reuses_closed_reset_week(monkeypatch, tmp_path):
+    """A same-signature second pass serves the CLOSED reset week from cache —
+    `_compute_cost_for_weekref` is NOT re-called for it (spy proves the hit)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_jsonl(tmp_path)
+    _prime_cache(ns)
+    sc.reset_weekref_cost_state()
+
+    calls = {"n": 0}
+    real = ns["_compute_cost_for_weekref"]
+
+    def spy(ref, **kw):
+        calls["n"] += 1
+        return real(ref, **kw)
+
+    monkeypatch.setitem(ns, "_compute_cost_for_weekref", spy)
+
+    stats = ns["open_db"]()
+    cache_conn = ns["open_cache_db"]()
+    try:
+        _seed_closed_reset_event_week(ns, stats)
+        sig = sc.compute_signature(
+            cache_conn, stats, generation=sc.current_generation(),
+        )
+        sc.reconcile_weekref_cache(
+            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+        )
+        ns["build_trend_view"](
+            stats, now_utc=NOW_UTC, n=8, skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+        first = calls["n"]
+        ns["build_trend_view"](
+            stats, now_utc=NOW_UTC, n=8, skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+    finally:
+        cache_conn.close()
+        stats.close()
+
+    # Cold pass computed the (single, closed) reset week; the second pass with an
+    # unchanged signature is a pure cache hit — zero further computes.
+    assert first >= 1
+    assert calls["n"] - first == 0

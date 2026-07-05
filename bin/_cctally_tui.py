@@ -1549,6 +1549,7 @@ def _tui_build_weekly_history(
     skip_sync: bool = False,
     count: int = 12,
     display_tz: "ZoneInfo | None" = None,
+    use_weekref_cost_cache: bool = False,
 ) -> list[TuiTrendRow]:
     """Return the last `count` weeks for the Trend modal (spec §4.6.3).
 
@@ -1569,6 +1570,7 @@ def _tui_build_weekly_history(
         _tui_build_weekly_history_view(
             conn, now_utc, skip_sync=skip_sync, count=count,
             display_tz=display_tz,
+            use_weekref_cost_cache=use_weekref_cost_cache,
         ).rows
     )
 
@@ -1580,6 +1582,7 @@ def _tui_build_weekly_history_view(
     skip_sync: bool = False,
     count: int = 12,
     display_tz: "ZoneInfo | None" = None,
+    use_weekref_cost_cache: bool = False,
 ):
     """Build the full ``TrendView`` for the dashboard Trend modal
     (issue #59).
@@ -1597,7 +1600,7 @@ def _tui_build_weekly_history_view(
     c = _cctally()
     return c.build_trend_view(
         conn, now_utc=now_utc, n=max(1, count), display_tz=display_tz,
-        skip_sync=skip_sync,
+        skip_sync=skip_sync, use_weekref_cost_cache=use_weekref_cost_cache,
     )
 
 

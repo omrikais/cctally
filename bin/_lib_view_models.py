@@ -758,7 +758,8 @@ class TrendView:
     display_tz_label: str = ""
 
 
-def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False):
+def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
+                     use_weekref_cost_cache=False):
     """Build a ``TrendView`` of the last ``n`` subscription weeks
     (spec §5.4).
 
@@ -860,7 +861,33 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False):
         )
         usage_captured_at = usage["captured_at_utc"] if usage else None
         if c._week_ref_has_reset_event(conn, week_ref):
-            cost_usd = c._compute_cost_for_weekref(week_ref, skip_sync=skip_sync)
+            if (
+                use_weekref_cost_cache
+                and week_ref.week_start_at
+                and week_ref.week_end_at
+            ):
+                # #269 §4: a closed subscription week's cost is immutable, so
+                # route the reset-event live-cost through the shared per-weekref
+                # cache (the OPEN week is decided per call and never cached).
+                # `compute` is the from-scratch closure — invoked synchronously
+                # inside this iteration, so `week_ref` capture is safe — and
+                # `skip_sync=True` unconditionally (the dashboard already synced
+                # once at the top of the rebuild; the flag is only True there).
+                _sc = _load_lib("_lib_snapshot_cache")
+                cost_usd = _sc.cached_weekref_cost(
+                    week_start_at=parse_iso(
+                        week_ref.week_start_at, "week_start_at"
+                    ),
+                    week_end_at=parse_iso(week_ref.week_end_at, "week_end_at"),
+                    now_utc=now_utc,
+                    compute=lambda: c._compute_cost_for_weekref(
+                        week_ref, skip_sync=True
+                    ),
+                )
+            else:
+                cost_usd = c._compute_cost_for_weekref(
+                    week_ref, skip_sync=skip_sync
+                )
             cost_captured_at = (
                 usage_captured_at if cost_usd is not None else None
             )
