@@ -23,10 +23,17 @@ NOW_UTC = dt.datetime(2026, 7, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
 
 
 def _line(session_id, uuid, msg_id, req_id, *, ts):
+    return _line_cwd(session_id, uuid, msg_id, req_id, ts=ts, cwd="/Users/u/proj")
+
+
+def _line_cwd(session_id, uuid, msg_id, req_id, *, ts, cwd):
+    """Like ``_line`` but with a caller-chosen ``cwd`` so two sessions map to
+    two DISTINCT envelope projects (``session_files.project_path`` is populated
+    from ``cwd``; a non-git path resolves to its own ``bucket_path``)."""
     return json.dumps({
         "type": "assistant", "uuid": uuid, "parentUuid": None,
         "sessionId": session_id, "requestId": req_id, "timestamp": ts,
-        "cwd": "/Users/u/proj",
+        "cwd": cwd,
         "message": {
             "role": "assistant", "id": msg_id, "model": "claude-opus-4-8",
             "usage": {"input_tokens": 100, "output_tokens": 40,
@@ -297,3 +304,94 @@ def test_prune_noop_does_not_clear_projects_env_cache(env):
     assert sc._PROJECTS_ENV_WEEK_TOTALS == {"wk": 4.56}, (
         "a no-op prune must not clear the envelope cache"
     )
+
+
+def _envelope_bucket_paths(envelope) -> set:
+    """Union of ``bucket_path`` over the envelope's current-week rows and trend
+    projects — the identity set a viewer actually sees."""
+    paths = {r["bucket_path"] for r in envelope["current_week"]["rows"]}
+    paths |= {p["bucket_path"] for p in envelope["trend"]["projects"]}
+    return paths
+
+
+def test_prune_then_rebuild_drops_pruned_project_from_live_envelope(env):
+    """#269 (final whole-branch reviewer): a real prune must clear the
+    WHOLE-envelope memo ``_PROJECTS_ENV_MEMO`` too — not merely the per-week
+    cache that ``reset_projects_env_state()`` clears.
+
+    ``_build_projects_envelope`` consults ``_PROJECTS_ENV_MEMO`` at the TOP,
+    BEFORE the #269 per-week cache path. Its memo_key is
+    ``(max_id, max_wus_id, cw_key, weeks_back)`` — it carries NO generation
+    counter. A prune that deletes only NON-max ``session_entries`` rows leaves
+    ``MAX(id)`` unchanged (exactly the case the reconcile's max-id-regression
+    check cannot catch), so the memo_key still matches after the prune. Without
+    the prune-site ``_projects_reset_memo()`` clear the rebuild stale-serves the
+    pre-prune envelope — still showing the deleted project and its cost — and the
+    fresh ``_assemble_projects_via_cache`` recompute is never reached.
+
+    This drives a LIVE ``_build_projects_envelope`` (not just module-dict
+    assertions): build once → prune one project's non-max rows → rebuild → the
+    pruned project must be GONE from the output.
+    """
+    ns, tmp_path = env
+    import sys
+
+    dash = sys.modules["_cctally_dashboard"]
+
+    home = pathlib.Path(os.environ["HOME"])
+    # Project A (orphan): ingested FIRST → LOW session_entries ids, so pruning it
+    # deletes NON-max rows and leaves MAX(id) unchanged. Distinct cwd → its own
+    # envelope project. On disk at `-gone`; removed before the prune.
+    orphan_dir = home / ".claude" / "projects" / "-gone"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "s_orphan.jsonl").write_text(
+        _line_cwd("S_ORPH", "uo", "mo", "ro",
+                  ts="2026-07-01T00:00:00Z", cwd="/Users/u/proj-a")
+    )
+    _sync(ns)
+    # Project B (survivor): ingested SECOND → HIGHER ids (holds MAX). Stays on disk.
+    keep_dir = home / ".claude" / "projects" / "-Users-u-proj-b"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    (keep_dir / "s_keep.jsonl").write_text(
+        _line_cwd("S_KEEP", "uk", "mk", "rk",
+                  ts="2026-07-03T00:00:00Z", cwd="/Users/u/proj-b")
+    )
+    _sync(ns)
+
+    # 1) Build the envelope once → populates _PROJECTS_ENV_MEMO with BOTH projects.
+    dash._projects_reset_memo()
+    conn = ns["open_cache_db"]()
+    env_before = dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None,
+    )
+    max_before = conn.execute("SELECT MAX(id) FROM session_entries").fetchone()[0]
+    conn.close()
+    before_paths = _envelope_bucket_paths(env_before)
+    assert "/Users/u/proj-a" in before_paths, before_paths
+    assert "/Users/u/proj-b" in before_paths, before_paths
+
+    # 2) Orphan-prune project A (its transcript is gone → its NON-max rows drop).
+    shutil.rmtree(orphan_dir)
+    res = ns["_dashboard_self_heal_orphans"](skip_sync=False)
+    assert res is not None and res.pruned_files >= 1
+
+    conn = ns["open_cache_db"]()
+    max_after = conn.execute("SELECT MAX(id) FROM session_entries").fetchone()[0]
+    assert max_after == max_before, (
+        "the survivor holds MAX(id) both before and after — the prune left "
+        "MAX(id) unchanged, so the memo_key is identical and the memo would "
+        "stale-serve unless the prune clears it"
+    )
+
+    # 3) Rebuild → the pruned project must be GONE (the memo was invalidated).
+    env_after = dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None,
+    )
+    conn.close()
+    after_paths = _envelope_bucket_paths(env_after)
+    assert "/Users/u/proj-a" not in after_paths, (
+        "the pruned project is STILL in the rebuilt envelope — the whole-envelope "
+        "memo (_PROJECTS_ENV_MEMO) stale-served it because the prune-site reset "
+        "block did not call _projects_reset_memo()"
+    )
+    assert "/Users/u/proj-b" in after_paths, after_paths

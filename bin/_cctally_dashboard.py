@@ -426,6 +426,17 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # #269 M4.5 (spec §14 Win 2): the projects-envelope per-(project,
             # week) cache rides the same prune-site clear for the same reason.
             reset_projects_env_state()
+            # #269 (final reviewer): the per-(project, week) cache clear above is
+            # NOT sufficient on its own. `_build_projects_envelope` consults the
+            # whole-envelope memo `_PROJECTS_ENV_MEMO` FIRST — and its memo_key is
+            # `(max_id, max_wus_id, cw_key, weeks_back)`, which carries NO
+            # generation counter. A prune that deletes only NON-max
+            # `session_entries` rows leaves `max_id` unchanged, so the memo_key
+            # still matches and the memo would stale-serve the pre-prune envelope
+            # (still showing the deleted project + its cost) before the fresh
+            # per-week cache path is ever reached. Clear the memo too so a real
+            # prune actually changes the envelope output.
+            _projects_reset_memo()
         except Exception:
             # Invalidation must never turn a successful prune into a failure;
             # a stale-cache tick is self-corrected once the signature next moves.
