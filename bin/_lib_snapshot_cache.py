@@ -706,3 +706,48 @@ def reset_dispatch_state() -> None:
     global _LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT
     _LAST_DISPATCH_KEY = None
     _LAST_PUBLISHED_SNAPSHOT = None
+
+
+# === #269 M0 — shared per-weekref immutable-cost cache (B1 trend + B3 forecast)
+#
+# A closed subscription week's cost is IMMUTABLE, so it is computed once and
+# reused until a signal invalidates it (spec §4). Both `build_trend_view`'s
+# reset-event weeks (`_compute_cost_for_weekref`) and forecast's trailing-4-week
+# fallback (`_select_dollars_per_percent` → `_sum_cost_for_range`) call the same
+# per-closed-week cost primitive from two sites; one shared cache keyed by the
+# week's `(week_start_at, week_end_at)` boundaries serves both. The OPEN (current)
+# week is never cached — it is decided per call from `week_end_at > now_utc`, so a
+# just-closed week caches on the next tick and the newly-opened week always
+# recomputes (no `_snapshot_period_rolled_over` dependence).
+#
+# Module-level state follows the Group A / session-cache precedent (spec §7): a
+# plain dict of immutable floats + a per-cache last-seen dict, mutated only on the
+# dashboard sync thread (single-writer). Every cached value is an immutable float;
+# each rebuild builds FRESH trend / forecast presentation objects and never
+# mutates a cached value (Codex F7).
+
+_WEEKREF_COST_CACHE: dict = {}          # {(week_start_iso, week_end_iso): cost_usd}
+_WEEKREF_COST_LAST_SEEN: dict = {}      # {"max_id": int, "reset_sig": tuple}
+
+
+def _weekref_key(week_start_at, week_end_at):
+    """Canonical UTC-ISO key for a subscription week's cost.
+
+    Normalizes both boundaries to UTC before serializing, so two callers that
+    resolve the same physical week in different tzinfos key identically.
+    """
+    return (
+        week_start_at.astimezone(dt.timezone.utc).isoformat(),
+        week_end_at.astimezone(dt.timezone.utc).isoformat(),
+    )
+
+
+def reset_weekref_cost_state():
+    """Clear the weekref-cost cache + its watermark (full invalidation).
+
+    Called from the orphan-prune site (a prune deletes ``session_entries``
+    possibly WITHOUT lowering ``MAX(id)``, so the reconcile's max-id-regression
+    check cannot catch it — the explicit clear must) and as a test hook.
+    """
+    _WEEKREF_COST_CACHE.clear()
+    _WEEKREF_COST_LAST_SEEN.clear()

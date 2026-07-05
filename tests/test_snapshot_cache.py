@@ -574,3 +574,34 @@ def test_reset_doctor_memo_forces_recompute():
     sc.reset_doctor_memo()
     sc.doctor_payload_memo(_T0, "127.0.0.1", ttl_s=30, compute=compute)
     assert calls["n"] == 2
+
+
+# ===========================================================================
+# #269 M0.1 — weekref-cost cache state + `_weekref_key` + reset
+# ===========================================================================
+def test_weekref_key_normalizes_to_utc_iso():
+    import _lib_snapshot_cache as sc
+
+    a = sc._weekref_key(
+        dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 7, 6, tzinfo=dt.timezone.utc),
+    )
+    # A different tz that denotes the same instants keys identically.
+    est = dt.timezone(dt.timedelta(hours=-4))
+    b = sc._weekref_key(
+        dt.datetime(2026, 6, 28, 20, tzinfo=est),
+        dt.datetime(2026, 7, 5, 20, tzinfo=est),
+    )
+    assert a == b == (
+        "2026-06-29T00:00:00+00:00",
+        "2026-07-06T00:00:00+00:00",
+    )
+
+
+def test_reset_weekref_cost_state_clears():
+    import _lib_snapshot_cache as sc
+
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 1.23
+    sc._WEEKREF_COST_LAST_SEEN["max_id"] = 5
+    sc.reset_weekref_cost_state()
+    assert sc._WEEKREF_COST_CACHE == {} and sc._WEEKREF_COST_LAST_SEEN == {}
