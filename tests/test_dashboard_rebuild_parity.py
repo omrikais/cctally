@@ -2720,3 +2720,323 @@ def test_live_rebuild_warm_reuses_closed_week_envelope(monkeypatch, tmp_path):
     assert snap2.projects_envelope == snap3.projects_envelope, (
         "warm cached envelope must byte-match the cold from-scratch rebuild"
     )
+
+
+# ===========================================================================
+# #271 M1 — current-bucket accumulator threaded through the three builders.
+#
+# The cached-parity / warm / late-ingest tests above now ALSO exercise the
+# accumulator (each _group_a_*_buckets closure sets use_current_accumulator
+# =True). These add the accumulator-specific behaviors, each proven
+# cached==from-scratch, byte-identical:
+#   - the append path is actually taken (acc mutated IN PLACE, not a cold /
+#     fallback fresh acc);
+#   - the now-advances delta leg folds an already-ingested future-dated row
+#     once now reaches it (Codex-1);
+#   - rollover across a bucket boundary cold-refolds the new current bucket;
+#   - the prune-site reset clears the accumulator too.
+# ===========================================================================
+
+
+def _daily_cached(ns, stats, now, *, display_tz=UTC_TZ):
+    """Cached (accumulator-on) daily build at ``now``; does NOT reset state."""
+    dash = sys.modules["_cctally_dashboard"]
+    dash._GROUP_A_CACHE_ENABLED = True
+    return ns["_dashboard_build_daily_panel"](
+        stats, now, n=30, skip_sync=True, use_group_a_cache=True,
+        display_tz=display_tz)
+
+
+def _daily_from_scratch(ns, stats, now, *, display_tz=UTC_TZ):
+    """From-scratch (accumulator-off) daily build at ``now``."""
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    sc.reset_group_a_state()
+    dash._GROUP_A_CACHE_ENABLED = False
+    try:
+        return ns["_dashboard_build_daily_panel"](
+            stats, now, n=30, skip_sync=True, use_group_a_cache=True,
+            display_tz=display_tz)
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def _seed_two_intraday(tmp_path):
+    """Two 07-04 rows: 07:00 (in window at now=08:00) + 10:00 (future then)."""
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "s1.jsonl").write_text(
+        _asst_line("a1", "am1", "ar1", "early", ts="2026-07-04T07:00:00Z")
+        + _asst_line("a2", "am2", "ar2", "later", ts="2026-07-04T10:00:00Z")
+    )
+
+
+def test_current_accumulator_engaged_and_append_daily(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        _daily_cached(ns, stats, NOW_UTC)  # cold — populates the accumulator
+        assert "daily" in sc._GROUP_A_CURRENT, "accumulator engaged for daily"
+        acc_obj = sc._GROUP_A_CURRENT["daily"].acc
+        # A new CURRENT-day (07-04) entry → non-empty delta → append path.
+        _seed_multiday_jsonl(tmp_path, extra=[
+            ("w1", "wm", "wr", "z", "2026-07-04T10:30:00Z", "claude-sonnet-4-5"),
+        ])
+        _prime_cache(ns)
+        warm = _daily_cached(ns, stats, NOW_UTC)
+        assert sc._GROUP_A_CURRENT["daily"].acc is acc_obj, (
+            "append must mutate the accumulator in place (not cold / fallback)"
+        )
+        wide = _daily_from_scratch(ns, stats, NOW_UTC)
+        assert warm == wide, "accumulator append == from-scratch (byte-identical)"
+    finally:
+        stats.close()
+
+
+def test_current_accumulator_now_advances_daily(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_two_intraday(tmp_path)
+    _prime_cache(ns)  # BOTH rows ingested (ids fixed) before any build
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        now1 = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.timezone.utc)  # before 10:00 row
+        cold = _daily_cached(ns, stats, now1)  # current 07-04 folds only the 07:00 row
+        assert "daily" in sc._GROUP_A_CURRENT, "accumulator engaged (delta path under test)"
+        cold_0704 = next(r for r in cold if r.date == "2026-07-04")
+        now2 = dt.datetime(2026, 7, 4, 12, 0, tzinfo=dt.timezone.utc)  # past 10:00 row
+        warm = _daily_cached(ns, stats, now2)  # the ts>last_now leg folds the 10:00 row
+        warm_0704 = next(r for r in warm if r.date == "2026-07-04")
+        assert warm_0704.cost_usd > cold_0704.cost_usd, (
+            "advancing now must fold the already-ingested future-dated row (Codex-1)"
+        )
+        wide = _daily_from_scratch(ns, stats, now2)
+        assert warm == wide, "now-advances warm build == from-scratch"
+    finally:
+        stats.close()
+
+
+def test_current_accumulator_rollover_daily(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiday_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        now1 = dt.datetime(2026, 7, 4, 12, 0, tzinfo=dt.timezone.utc)  # current 07-04
+        _daily_cached(ns, stats, now1)
+        assert sc._GROUP_A_CURRENT["daily"].label == "2026-07-04"
+        # New entry on 07-05 (the NEW current day after rollover).
+        _seed_multiday_jsonl(tmp_path, extra=[
+            ("r1", "rm", "rr", "roll", "2026-07-05T09:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        now2 = dt.datetime(2026, 7, 5, 12, 0, tzinfo=dt.timezone.utc)  # current 07-05
+        rolled = _daily_cached(ns, stats, now2)
+        assert sc._GROUP_A_CURRENT["daily"].label == "2026-07-05", (
+            "rollover: accumulator cold-refolds the new current day"
+        )
+        wide = _daily_from_scratch(ns, stats, now2)
+        assert rolled == wide, "rollover warm build == from-scratch"
+    finally:
+        stats.close()
+
+
+def test_current_accumulator_prune_resets_daily(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    # Two CURRENT-day (07-04) entries so one can be deleted as a NON-max row.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("p1", "pm1", "pr1", "x1", "2026-07-04T10:00:00Z", "claude-opus-4-8"),
+        ("p2", "pm2", "pr2", "x2", "2026-07-04T11:00:00Z", "claude-opus-4-8"),
+    ])
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        _daily_cached(ns, stats, NOW_UTC)  # accumulator folds both extras
+        assert "daily" in sc._GROUP_A_CURRENT
+        # Delete a NON-max current-bucket row directly (an orphan prune that does
+        # NOT lower MAX(id)): the signature can't catch it — the explicit
+        # prune-site reset must clear the accumulator (else it serves stale).
+        cconn = ns["open_cache_db"]()
+        try:
+            cconn.execute(
+                "DELETE FROM session_entries "
+                "WHERE timestamp_utc LIKE '2026-07-04T10:00:00%'"
+            )
+            cconn.commit()
+        finally:
+            cconn.close()
+        sc.reset_group_a_state()  # the prune-site clear (_dashboard_self_heal_orphans)
+        pruned = _daily_cached(ns, stats, NOW_UTC)
+        wide = _daily_from_scratch(ns, stats, NOW_UTC)
+        assert pruned == wide, "post-prune build (accumulator reset) == from-scratch"
+    finally:
+        stats.close()
+
+
+def _monthly_cached(ns, stats, now, *, display_tz=UTC_TZ):
+    dash = sys.modules["_cctally_dashboard"]
+    dash._GROUP_A_CACHE_ENABLED = True
+    return ns["_dashboard_build_monthly_periods"](
+        stats, now, n=12, skip_sync=True, use_group_a_cache=True,
+        display_tz=display_tz)
+
+
+def _monthly_from_scratch(ns, stats, now, *, display_tz=UTC_TZ):
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    sc.reset_group_a_state()
+    dash._GROUP_A_CACHE_ENABLED = False
+    try:
+        return ns["_dashboard_build_monthly_periods"](
+            stats, now, n=12, skip_sync=True, use_group_a_cache=True,
+            display_tz=display_tz)
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def test_current_accumulator_engaged_and_append_monthly(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        _monthly_cached(ns, stats, NOW_UTC)  # cold; current month 2026-07
+        assert "monthly" in sc._GROUP_A_CURRENT
+        acc_obj = sc._GROUP_A_CURRENT["monthly"].acc
+        _seed_multimonth_jsonl(tmp_path, extra=[
+            ("mx", "mmx", "mrx", "z", "2026-07-03T09:00:00Z", "claude-sonnet-4-5"),
+        ])
+        _prime_cache(ns)
+        warm = _monthly_cached(ns, stats, NOW_UTC)
+        assert sc._GROUP_A_CURRENT["monthly"].acc is acc_obj, "append path taken"
+        wide = _monthly_from_scratch(ns, stats, NOW_UTC)
+        assert warm == wide
+    finally:
+        stats.close()
+
+
+def test_current_accumulator_rollover_monthly(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multimonth_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        now1 = dt.datetime(2026, 7, 15, 12, 0, tzinfo=dt.timezone.utc)  # month 2026-07
+        _monthly_cached(ns, stats, now1)
+        assert sc._GROUP_A_CURRENT["monthly"].label == "2026-07"
+        _seed_multimonth_jsonl(tmp_path, extra=[
+            ("ax", "amx", "arx", "aug", "2026-08-05T09:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        now2 = dt.datetime(2026, 8, 10, 12, 0, tzinfo=dt.timezone.utc)  # month 2026-08
+        rolled = _monthly_cached(ns, stats, now2)
+        assert sc._GROUP_A_CURRENT["monthly"].label == "2026-08", (
+            "rollover: accumulator cold-refolds the new current month"
+        )
+        wide = _monthly_from_scratch(ns, stats, now2)
+        assert rolled == wide, "monthly rollover warm build == from-scratch"
+    finally:
+        stats.close()
+
+
+def _weekly_cached(ns, stats, now):
+    dash = sys.modules["_cctally_dashboard"]
+    dash._GROUP_A_CACHE_ENABLED = True
+    return ns["_dashboard_build_weekly_periods"](
+        stats, now, n=12, skip_sync=True, use_group_a_cache=True)
+
+
+def _weekly_from_scratch(ns, stats, now):
+    import _lib_snapshot_cache as sc
+
+    dash = sys.modules["_cctally_dashboard"]
+    prev = getattr(dash, "_GROUP_A_CACHE_ENABLED", True)
+    sc.reset_group_a_state()
+    dash._GROUP_A_CACHE_ENABLED = False
+    try:
+        return ns["_dashboard_build_weekly_periods"](
+            stats, now, n=12, skip_sync=True, use_group_a_cache=True)
+    finally:
+        dash._GROUP_A_CACHE_ENABLED = prev
+
+
+def test_current_accumulator_engaged_and_append_weekly(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        _weekly_cached(ns, stats, NOW_UTC)  # cold
+        assert "weekly" in sc._GROUP_A_CURRENT
+        acc_obj = sc._GROUP_A_CURRENT["weekly"].acc
+        # An entry in the CURRENT week (same day as now, before now).
+        _seed_multiweek_jsonl(tmp_path, extra=[
+            ("wx", "wkx", "wrx", "z", "2026-07-04T06:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        warm = _weekly_cached(ns, stats, NOW_UTC)
+        assert sc._GROUP_A_CURRENT["weekly"].acc is acc_obj, "append path taken"
+        wide = _weekly_from_scratch(ns, stats, NOW_UTC)
+        assert warm == wide
+    finally:
+        stats.close()
+
+
+def test_current_accumulator_rollover_weekly(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_multiweek_jsonl(tmp_path)
+    _prime_cache(ns)
+    stats = ns["open_db"]()
+    try:
+        sc.reset_group_a_state()
+        now1 = NOW_UTC  # 2026-07-04
+        _weekly_cached(ns, stats, now1)
+        label1 = sc._GROUP_A_CURRENT["weekly"].label
+        _seed_multiweek_jsonl(tmp_path, extra=[
+            ("wr", "wkr", "wrr", "roll", "2026-07-10T09:00:00Z", "claude-opus-4-8"),
+        ])
+        _prime_cache(ns)
+        now2 = now1 + dt.timedelta(days=7)  # 2026-07-11 — a later subscription week
+        rolled = _weekly_cached(ns, stats, now2)
+        label2 = sc._GROUP_A_CURRENT["weekly"].label
+        assert label2 != label1, "rollover: accumulator tracks the new current week"
+        wide = _weekly_from_scratch(ns, stats, now2)
+        assert rolled == wide, "weekly rollover warm build == from-scratch"
+    finally:
+        stats.close()

@@ -317,7 +317,7 @@ from _lib_blocks import _group_entries_into_blocks
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
-    get_entries, iter_entries, open_cache_db, sync_cache,
+    get_entries, iter_entries, iter_entries_with_id, open_cache_db, sync_cache,
     _prune_orphaned_cache_entries,
 )
 from _lib_snapshot_cache import (
@@ -2629,6 +2629,33 @@ def _group_a_monthly_buckets(now_utc, *, n, range_start, display_tz):
             _start, nxt = _month_bounds(label)
             return nxt + dt.timedelta(days=2)
 
+        # #271: current-bucket accumulator inputs. `_membership` IS
+        # `_aggregate_monthly`'s own key (display-tz `%Y-%m`);
+        # `_all_fetch`/`_delta_fetch` reuse `_fetch`'s ±2-day-padded month
+        # window (clamped to now_utc) via the `(id, UsageEntry)` delta sibling.
+        def _membership(e):
+            local = (
+                e.timestamp.astimezone(display_tz) if display_tz is not None
+                # internal fallback: host-local intentional
+                else e.timestamp.astimezone()
+            )
+            return local.strftime("%Y-%m") == current_label
+
+        def _current_window(label):
+            start, nxt = _month_bounds(label)
+            lo = max(start - dt.timedelta(days=2), range_start)
+            hi = min(nxt + dt.timedelta(days=2), now_utc)
+            return lo, hi
+
+        def _all_fetch(label):
+            lo, hi = _current_window(label)
+            return [] if hi <= lo else iter_entries_with_id(cache_conn, lo, hi)
+
+        def _delta_fetch(label, after_id, after_ts):
+            lo, hi = _current_window(label)
+            return [] if hi <= lo else iter_entries_with_id(
+                cache_conn, lo, hi, after_id=after_id, after_ts=after_ts)
+
         buckets = build_cached_group_a(
             "monthly",
             cache_conn=cache_conn,
@@ -2638,6 +2665,11 @@ def _group_a_monthly_buckets(now_utc, *, n, range_start, display_tz):
             fetch_bucket_entries=_fetch,
             aggregate_one=_agg_one,
             extra_signature=("monthly", tz_sig),
+            use_current_accumulator=True,
+            now_utc=now_utc,
+            current_all_fetch=_all_fetch,
+            current_delta_fetch=_delta_fetch,
+            membership_of=_membership,
         )
         return tuple(buckets)
     finally:
@@ -2787,6 +2819,52 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
             except ValueError:
                 return None
 
+        # #271: current-bucket accumulator inputs. Membership REUSES
+        # _aggregate_weekly's exact bisect + first-match-wins assignment
+        # (bin/_lib_aggregators.py::_week_key_or_none) — the parsed-bounds list
+        # is built identically (same order, same parse) so an entry in an
+        # overlap region (reset-day drift) keys to the SAME week the full pass
+        # assigns it. _all_fetch/_delta_fetch reuse _fetch's
+        # [week.start, min(week.end, now_utc)] window via the (id, UsageEntry)
+        # delta sibling.
+        _parsed_bounds = [
+            (parse_iso_datetime(w.start_ts, "week.start_ts"),
+             parse_iso_datetime(w.end_ts, "week.end_ts"),
+             w.start_date.isoformat())
+            for w in weeks
+        ]
+        _bound_starts = [b[0] for b in _parsed_bounds]
+
+        def _week_key(e):
+            ts = e.timestamp
+            idx = bisect.bisect_right(_bound_starts, ts) - 1
+            if idx < 0:
+                return None
+            while idx > 0 and (
+                _parsed_bounds[idx - 1][0] <= ts < _parsed_bounds[idx - 1][1]
+            ):
+                idx -= 1
+            s_dt, e_dt, key = _parsed_bounds[idx]
+            return key if s_dt <= ts < e_dt else None
+
+        def _membership(e):
+            return _week_key(e) == current_label
+
+        def _current_window(label):
+            w = sw_by_label[label]
+            s = parse_iso_datetime(w.start_ts, "week.start_ts")
+            e = parse_iso_datetime(w.end_ts, "week.end_ts")
+            return s, min(e, now_utc)
+
+        def _all_fetch(label):
+            s, hi = _current_window(label)
+            return [] if hi <= s else iter_entries_with_id(cache_conn, s, hi)
+
+        def _delta_fetch(label, after_id, after_ts):
+            s, hi = _current_window(label)
+            return [] if hi <= s else iter_entries_with_id(
+                cache_conn, s, hi, after_id=after_id, after_ts=after_ts)
+
         buckets = build_cached_group_a(
             "weekly",
             cache_conn=cache_conn,
@@ -2796,6 +2874,11 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
             fetch_bucket_entries=_fetch,
             aggregate_one=_agg_one,
             extra_signature=extra_signature,
+            use_current_accumulator=True,
+            now_utc=now_utc,
+            current_all_fetch=_all_fetch,
+            current_delta_fetch=_delta_fetch,
+            membership_of=_membership,
         )
         return tuple(buckets)
     finally:
@@ -3362,6 +3445,36 @@ def _group_a_daily_buckets(now_utc, *, n, display_tz):
                 + dt.timedelta(days=2)
             )
 
+        # #271: current-bucket accumulator inputs. `_membership` IS
+        # `_aggregate_daily`'s own key (display-tz `%Y-%m-%d`), so the id-bounded
+        # fetch keeps exactly the entries the full pass assigns to the current
+        # day, byte-identically. `_all_fetch`/`_delta_fetch` reuse `_fetch`'s
+        # ±1-day-padded window (clamped to now_utc) via the `(id, UsageEntry)`
+        # delta sibling.
+        def _membership(e):
+            local = (
+                e.timestamp.astimezone(display_tz) if display_tz is not None
+                # internal fallback: host-local intentional
+                else e.timestamp.astimezone()
+            )
+            return local.strftime("%Y-%m-%d") == current_label
+
+        def _current_window(label):
+            d = dt.date.fromisoformat(label)
+            base = dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
+            lo = max(base - dt.timedelta(days=1), range_start)
+            hi = min(base + dt.timedelta(days=2), now_utc)
+            return lo, hi
+
+        def _all_fetch(label):
+            lo, hi = _current_window(label)
+            return [] if hi <= lo else iter_entries_with_id(cache_conn, lo, hi)
+
+        def _delta_fetch(label, after_id, after_ts):
+            lo, hi = _current_window(label)
+            return [] if hi <= lo else iter_entries_with_id(
+                cache_conn, lo, hi, after_id=after_id, after_ts=after_ts)
+
         buckets = build_cached_group_a(
             "daily",
             cache_conn=cache_conn,
@@ -3371,6 +3484,11 @@ def _group_a_daily_buckets(now_utc, *, n, display_tz):
             fetch_bucket_entries=_fetch,
             aggregate_one=_agg_one,
             extra_signature=("daily", tz_sig),
+            use_current_accumulator=True,
+            now_utc=now_utc,
+            current_all_fetch=_all_fetch,
+            current_delta_fetch=_delta_fetch,
+            membership_of=_membership,
         )
         return tuple(buckets)
     finally:
