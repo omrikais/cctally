@@ -325,6 +325,7 @@ from _lib_snapshot_cache import (
     bump_generation,
     reset_group_a_state,
     reset_session_cache_state,
+    reset_weekref_cost_state,
     _max_id as _snapshot_max_id,
     _reset_sig as _snapshot_reset_sig,
 )
@@ -415,6 +416,12 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             bump_generation()
             reset_group_a_state()
             reset_session_cache_state()
+            # #269 M3.2 (spec §6): the shared per-weekref immutable-cost cache
+            # (B1 trend/weekly-history + B3 forecast) rides the SAME prune-site
+            # clear — a non-max deletion the reconcile's max-id regression check
+            # can't catch. (B2 cache-report cache was dropped at the M2.0 gate,
+            # so there is no reset_cache_report_state() to call here.)
+            reset_weekref_cost_state()
         except Exception:
             # Invalidation must never turn a successful prune into a failure;
             # a stale-cache tick is self-corrected once the signature next moves.

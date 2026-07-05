@@ -133,6 +133,71 @@ def test_prune_noop_does_not_bump_generation(env):
     )
 
 
+def test_prune_clears_weekref_cost_cache(env):
+    """#269 M3.2 (spec §6): a real prune (non-max deletion) must ALSO clear the
+    shared per-weekref immutable-cost cache. A prune deletes session_entries
+    possibly WITHOUT lowering MAX(id), so the reconcile's max-id-regression check
+    can't catch it — the explicit prune-site clear must."""
+    ns, tmp_path = env
+    import _lib_snapshot_cache as sc
+
+    home = pathlib.Path(os.environ["HOME"])
+    orphan_dir = home / ".claude" / "projects" / "-gone"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "s_orphan.jsonl").write_text(
+        _line("S_ORPH", "uo", "mo", "ro", ts="2026-07-01T00:00:00Z")
+    )
+    _sync(ns)
+    keep_dir = home / ".claude" / "projects" / "-Users-u-proj"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    (keep_dir / "s_keep.jsonl").write_text(
+        _line("S_KEEP", "uk", "mk", "rk", ts="2026-07-03T00:00:00Z")
+    )
+    _sync(ns)
+    shutil.rmtree(orphan_dir)
+
+    # Prime the weekref cache + its watermark with sentinels so we can prove the
+    # prune clears them.
+    sc.reset_weekref_cost_state()
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 1.23
+    sc._WEEKREF_COST_LAST_SEEN["max_id"] = 999
+
+    res = ns["_dashboard_self_heal_orphans"](skip_sync=False)
+    assert res is not None and res.pruned_files >= 1
+
+    assert sc._WEEKREF_COST_CACHE == {}, (
+        "a real prune must clear the weekref-cost cache (a non-max deletion the "
+        "reconcile's max-id regression check cannot catch)"
+    )
+    assert sc._WEEKREF_COST_LAST_SEEN == {}, (
+        "the prune-site clear must also reset the weekref watermark"
+    )
+
+
+def test_prune_noop_does_not_clear_weekref_cache(env):
+    """Non-vacuity: a no-op prune (nothing deleted) must NOT clear the weekref
+    cache — the clear fires ONLY on a real deletion."""
+    ns, tmp_path = env
+    import _lib_snapshot_cache as sc
+
+    home = pathlib.Path(os.environ["HOME"])
+    keep_dir = home / ".claude" / "projects" / "-Users-u-proj"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    (keep_dir / "s_keep.jsonl").write_text(
+        _line("S_KEEP", "uk", "mk", "rk", ts="2026-07-03T00:00:00Z")
+    )
+    _sync(ns)
+
+    sc.reset_weekref_cost_state()
+    sc._WEEKREF_COST_CACHE[("s", "e")] = 4.56
+
+    res = ns["_dashboard_self_heal_orphans"](skip_sync=False)
+    assert res is not None and res.pruned_files == 0
+    assert sc._WEEKREF_COST_CACHE == {("s", "e"): 4.56}, (
+        "a no-op prune must not clear the weekref cache"
+    )
+
+
 def test_prune_then_rebuild_recomputes_correctly(env):
     """After a prune clears the caches, the next sessions rebuild recomputes cold
     from the POST-prune DB — the survivor is present, the pruned orphan is gone,
