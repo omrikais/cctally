@@ -421,7 +421,19 @@ def accumulate_current_bucket(prior, *, current_label, cur_now, cur_max_id,
             tail = (e.timestamp, eid)
         return acc, tail
 
-    if prior is None or prior.label != current_label:
+    # Cold refold on: no prior, a bucket rollover (label change), OR a backward
+    # wall-clock step (`cur_now < prior.last_now`, e.g. an NTP adjustment). The
+    # current-bucket fetch window is clamped to `now_utc`; if `now` moves
+    # backward with no data change, the empty-delta fast path would reuse the
+    # larger prior fold set and OVER-count vs a from-scratch pass over the
+    # shrunken `[start, cur_now]` window. A graceful cold refold matches
+    # from-scratch byte-for-byte — never `assert`, a clock step must not crash
+    # the dashboard (#271 M1 review).
+    if (
+        prior is None
+        or prior.label != current_label
+        or cur_now < prior.last_now
+    ):
         acc, tail = _cold()
         new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
         return _finalize_or_none(current_label, acc, tail), new

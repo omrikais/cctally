@@ -610,6 +610,20 @@ def test_daily_panel_late_ingest_recomputes_past_day(monkeypatch, tmp_path):
         stats.close()
 
 
+# NOTE (#271 M1 review, Minor 3): an end-to-end real-builder test of the
+# mid-CURRENT-bucket late-ingest fallback (a new row with `id > last_seen`
+# timestamped BEFORE the current tail) was evaluated and deliberately NOT added
+# here. The shared `_asst_line` fixture emits identical token counts for every
+# entry, so all per-entry costs are equal and their sum commutes exactly, and
+# `DailyPanelRow.models` is sorted by cost (not first-seen order) — so the
+# fold-order divergence the ordering guard prevents is not observable through
+# `DailyPanelRow`, and disabling the guard leaves such a test GREEN (verified).
+# Making it non-vacuous would require extending the shared fixture to vary token
+# counts. The guard itself is covered non-vacuously at the unit level by
+# `test_accumulate_mid_bucket_late_ingest_falls_back` in tests/test_snapshot_cache.py
+# (its `acc.tail` assertion goes RED under the misordered append path).
+
+
 # ===========================================================================
 # M2 Task 2.3 — wire `_dashboard_build_monthly_periods` through the cache.
 #

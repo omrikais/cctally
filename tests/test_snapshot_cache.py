@@ -1163,6 +1163,56 @@ def test_accumulate_synthetic_skipped_does_not_advance_tail():
     assert acc.tail == (r1[0][1].timestamp, 1)  # unchanged; synthetic never folded
 
 
+def test_accumulate_backward_now_cold_refolds():
+    """#271 M1 review (Minor 1): a backward wall-clock step (`cur_now <
+    prior.last_now`, e.g. an NTP adjustment) must force a cold refold. The
+    current-bucket window is clamped to `now`, so reusing the larger prior fold
+    set over an empty delta would OVER-count rows now beyond the shrunken
+    `[start, cur_now]` window. A cold refold matches from-scratch byte-for-byte.
+
+    Non-vacuous: without the `cur_now < prior.last_now` trigger the empty-delta
+    fast path reuses `prior.acc` → input 15 (over-count) → RED."""
+    a = _rows((1, "2026-07-01T00:30:00Z", "claude-opus-4-8", 10))  # ts <= T1
+    b = _rows((2, "2026-07-01T01:30:00Z", "claude-opus-4-8", 5))   # ts in (T1, T2]
+    # Warm at now=T2 (02:00): both rows folded → input 15, tail = the 01:30 row.
+    warm, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T02:00:00Z",
+                            max_id=2, all_rows=a + b, delta_rows=[])
+    assert warm.input_tokens == 15
+    # Backward tick: now=T1 (01:00 < 02:00). fetch_all over [start, T1] returns
+    # only row A (row B's 01:30 ts is now beyond the window); no new delta.
+    bucket, acc = _acc_call(prior, label="2026-07-01", now="2026-07-01T01:00:00Z",
+                            max_id=2, all_rows=a, delta_rows=[])
+    assert bucket.input_tokens == 10  # excludes row B — matches from-scratch [start, T1]
+    assert acc.tail == (a[0][1].timestamp, 1)
+    assert acc.last_now == _dt("2026-07-01T01:00:00Z")
+
+
+def test_accumulate_published_bucket_not_mutated_by_later_append():
+    """#271 F7 (spec §10): a published current-bucket `BucketUsage` must not be
+    mutated by a later appending tick. `_finalize_bucket` copies `models` /
+    `model_breakdowns`, so the earlier row stays byte-frozen even though the
+    accumulator keeps folding into the same `acc` dict in place.
+
+    Non-vacuous: if `_finalize_bucket` shared `acc["models_order"]` instead of
+    copying it, the append (a new distinct model) would grow the published row's
+    `models` list → the captured snapshot would differ → RED."""
+    import copy
+
+    r1 = _rows((1, "2026-07-01T00:00:00Z", "claude-opus-4-8", 10))
+    published, prior = _acc_call(None, label="2026-07-01", now="2026-07-01T00:30:00Z",
+                                 max_id=1, all_rows=r1, delta_rows=[])
+    snapshot = copy.deepcopy(published)
+    # Append a second row (a DIFFERENT model) in a later tick — mutates prior.acc
+    # in place, growing acc["models_order"] to two entries.
+    new = _rows((2, "2026-07-01T01:00:00Z", "claude-sonnet-4-5", 5))
+    bucket2, _ = _acc_call(prior, label="2026-07-01", now="2026-07-01T01:30:00Z",
+                           max_id=2, all_rows=r1 + new, delta_rows=new)
+    assert bucket2.input_tokens == 15                 # the new tick grew
+    assert bucket2.models == ["claude-opus-4-8", "claude-sonnet-4-5"]
+    assert published == snapshot                      # earlier published row is byte-unchanged
+    assert published.models == ["claude-opus-4-8"]    # not torn by the append
+
+
 # --- Task 4: the (id, UsageEntry) delta fetch sibling ----------------------
 def test_iter_entries_with_id_delta(tmp_path):
     """``iter_entries_with_id`` yields ``(id, UsageEntry)`` and restricts to the
