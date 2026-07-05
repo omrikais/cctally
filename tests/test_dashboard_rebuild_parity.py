@@ -1915,3 +1915,124 @@ def test_trend_view_cached_reuses_closed_reset_week(monkeypatch, tmp_path):
     # unchanged signature is a pure cache hit — zero further computes.
     assert first >= 1
     assert calls["n"] - first == 0
+
+
+def _seed_forecast_4wk(ns, stats_conn):
+    """Seed a low-percent current week + four CLOSED prior weeks so forecast's
+    `_select_dollars_per_percent` takes the trailing-4-week median fallback.
+
+    p_now < 10 on the current week (2026-06-29 → 2026-07-06, containing NOW)
+    skips the this-week path; the four prior weeks all satisfy the eligibility
+    filter (``ws < current_week_start AND we < now AND final_pct >= 1``), so the
+    fallback loop calls ``_sum_cost_for_range`` once per closed week — the leg
+    the weekref cache serves.
+    """
+    weeks = [
+        ("2026-06-01", "2026-06-08", 55.0),
+        ("2026-06-08", "2026-06-15", 60.0),
+        ("2026-06-15", "2026-06-22", 65.0),
+        ("2026-06-22", "2026-06-29", 70.0),
+        ("2026-06-29", "2026-07-06", 5.0),   # current (open) week, low percent
+    ]
+    for ws_d, we_d, pct in weeks:
+        stats_conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, weekly_percent, payload_json) "
+            "VALUES (?,?,?,?,?,?,'{}')",
+            (ws_d + "T12:00:00Z", ws_d, we_d,
+             ws_d + "T00:00:00+00:00", we_d + "T00:00:00+00:00", pct),
+        )
+    stats_conn.commit()
+
+
+def test_forecast_dpp_cached_matches_from_scratch(monkeypatch, tmp_path):
+    """`use_weekref_cost_cache=True` yields a byte-identical ForecastView."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_jsonl(tmp_path)
+    _prime_cache(ns)
+    sc.reset_weekref_cost_state()
+
+    stats = ns["open_db"]()
+    cache_conn = ns["open_cache_db"]()
+    try:
+        _seed_forecast_4wk(ns, stats)
+        base = ns["build_forecast_view"](
+            stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
+        )
+        # Guard: the trailing-4-week fallback actually fired (else the cache
+        # serves nothing and the parity assert is vacuous).
+        assert base.output is not None, "forecast produced no output"
+        assert (
+            base.output.inputs.dollars_per_percent_source
+            == "trailing_4wk_median"
+        ), "fixture must drive the trailing-4-week fallback path"
+
+        sig = sc.compute_signature(
+            cache_conn, stats, generation=sc.current_generation(),
+        )
+        sc.reconcile_weekref_cache(
+            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+        )
+        cached = ns["build_forecast_view"](
+            stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+    finally:
+        cache_conn.close()
+        stats.close()
+
+    assert cached == base
+
+
+def test_forecast_trailing_weeks_cache_hit_second_tick(monkeypatch, tmp_path):
+    """The four trailing closed weeks cache-hit on a same-signature second pass;
+    only the (uncached) current-week spend recomputes (spy `_sum_cost_for_range`)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    _seed_jsonl(tmp_path)
+    _prime_cache(ns)
+    sc.reset_weekref_cost_state()
+
+    calls = {"n": 0}
+    real = ns["_sum_cost_for_range"]
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setitem(ns, "_sum_cost_for_range", spy)
+
+    stats = ns["open_db"]()
+    cache_conn = ns["open_cache_db"]()
+    try:
+        _seed_forecast_4wk(ns, stats)
+        sig = sc.compute_signature(
+            cache_conn, stats, generation=sc.current_generation(),
+        )
+        sc.reconcile_weekref_cache(
+            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+        )
+        ns["build_forecast_view"](
+            stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+        first = calls["n"]
+        ns["build_forecast_view"](
+            stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
+            use_weekref_cost_cache=True,
+        )
+    finally:
+        cache_conn.close()
+        stats.close()
+
+    # Cold pass: 4 trailing weeks + the current-week spend all recompute.
+    assert first >= 4
+    # Warm pass (unchanged signature): the 4 closed weeks are cache hits; only
+    # the open current-week spend (never cached) still calls the primitive.
+    assert calls["n"] - first <= 1

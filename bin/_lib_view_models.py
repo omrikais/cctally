@@ -1598,6 +1598,7 @@ def build_forecast_view(
     targets=(100, 90),
     skip_sync: bool = False,
     display_tz=None,
+    use_weekref_cost_cache: bool = False,
 ):
     """Build a ``ForecastView`` (issue #57).
 
@@ -1616,7 +1617,10 @@ def build_forecast_view(
     refresh skip).
     """
     c = _cctally()
-    inputs = c._load_forecast_inputs(conn, now_utc, skip_sync=skip_sync)
+    inputs = c._load_forecast_inputs(
+        conn, now_utc, skip_sync=skip_sync,
+        use_weekref_cost_cache=use_weekref_cost_cache,
+    )
     if inputs is None:
         return ForecastView(
             output=None,

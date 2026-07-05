@@ -327,6 +327,7 @@ def _select_dollars_per_percent(
     spent_usd: float,
     *,
     skip_sync: bool = False,
+    use_weekref_cost_cache: bool = False,
 ) -> tuple[float, str]:
     """Return (dollars_per_percent, source_label). See spec §1 selection rule.
 
@@ -375,7 +376,26 @@ def _select_dollars_per_percent(
         import statistics
         values: list[float] = []
         for ws, we, final_pct in prior:
-            week_cost = c._sum_cost_for_range(ws, we, mode="auto", skip_sync=skip_sync)
+            if use_weekref_cost_cache:
+                # #269 §4: every `prior` week satisfies `we < now_utc` (an
+                # eligibility filter above), so all four are CLOSED and
+                # cacheable — this is the SAME immutable per-weekref cost the
+                # trend builder caches (B1↔B3 shared key). The `ws=ws, we=we`
+                # default-arg capture pins the loop variables (the closure is
+                # invoked lazily inside cached_weekref_cost). `skip_sync=True`
+                # unconditionally (the dashboard synced once at the top of the
+                # rebuild; the flag is only True there).
+                _sc = c._load_sibling("_lib_snapshot_cache")
+                week_cost = _sc.cached_weekref_cost(
+                    week_start_at=ws, week_end_at=we, now_utc=now_utc,
+                    compute=lambda ws=ws, we=we: c._sum_cost_for_range(
+                        ws, we, mode="auto", skip_sync=True
+                    ),
+                )
+            else:
+                week_cost = c._sum_cost_for_range(
+                    ws, we, mode="auto", skip_sync=skip_sync
+                )
             values.append(week_cost / final_pct)
         return statistics.median(values), "trailing_4wk_median"
 
@@ -422,6 +442,7 @@ def _load_forecast_inputs(
     now_utc: dt.datetime,
     *,
     skip_sync: bool = False,
+    use_weekref_cost_cache: bool = False,
 ) -> ForecastInputs | None:
     """Gather everything from the DB. Returns None if no current-week snapshot.
 
@@ -466,7 +487,8 @@ def _load_forecast_inputs(
     # re-syncs in downstream cost lookups (trailing-4wk-median loop hits
     # _sum_cost_for_range once per historical week).
     dpp, dpp_source = _select_dollars_per_percent(
-        conn, now_utc, week_start_at, p_now, spent_usd, skip_sync=True
+        conn, now_utc, week_start_at, p_now, spent_usd, skip_sync=True,
+        use_weekref_cost_cache=use_weekref_cost_cache,
     )
     confidence, reasons = _assess_forecast_confidence(elapsed_hours, p_now, len(samples))
     target_24h = now_utc - dt.timedelta(hours=24)

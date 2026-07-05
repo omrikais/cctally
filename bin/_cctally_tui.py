@@ -1486,6 +1486,7 @@ def _tui_build_forecast(
     now_utc: dt.datetime,
     *,
     skip_sync: bool = False,
+    use_weekref_cost_cache: bool = False,
 ):
     """Build the TUI/dashboard sync-thread forecast.
 
@@ -1495,7 +1496,10 @@ def _tui_build_forecast(
     adapter, share builder). Use ``_tui_build_forecast_view`` when the
     full view is needed (e.g. ``snap.forecast_view`` population).
     """
-    view = _tui_build_forecast_view(conn, now_utc, skip_sync=skip_sync)
+    view = _tui_build_forecast_view(
+        conn, now_utc, skip_sync=skip_sync,
+        use_weekref_cost_cache=use_weekref_cost_cache,
+    )
     return view.output if view is not None else None
 
 
@@ -1504,14 +1508,20 @@ def _tui_build_forecast_view(
     now_utc: dt.datetime,
     *,
     skip_sync: bool = False,
+    use_weekref_cost_cache: bool = False,
 ):
     """Build the ``ForecastView`` (issue #57). Returns ``None`` only on
     error in callers — the empty-state View is constructed by the
     builder itself with ``output=None`` + ``verdict="LOW CONF"``.
+
+    ``use_weekref_cost_cache`` (#269 §4) threads into the trailing-4-week
+    fallback so the dashboard sync thread serves closed prior weeks from the
+    shared per-weekref cost cache; default off keeps CLI byte-identical.
     """
     c = _cctally()
     return c.build_forecast_view(
         conn, now_utc=now_utc, targets=(100, 90), skip_sync=skip_sync,
+        use_weekref_cost_cache=use_weekref_cost_cache,
     )
 
 
