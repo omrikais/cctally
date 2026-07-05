@@ -605,3 +605,67 @@ def test_reset_weekref_cost_state_clears():
     sc._WEEKREF_COST_LAST_SEEN["max_id"] = 5
     sc.reset_weekref_cost_state()
     assert sc._WEEKREF_COST_CACHE == {} and sc._WEEKREF_COST_LAST_SEEN == {}
+
+
+# ===========================================================================
+# #269 M0.2 — `cached_weekref_cost` (open-vs-closed get-or-compute)
+# ===========================================================================
+def test_cached_weekref_cost_closed_caches_open_never():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    now = dt.datetime(2026, 7, 5, 12, tzinfo=dt.timezone.utc)
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return 4.0
+
+    ws = dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc)
+    we = dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc)  # closed (we < now)
+    assert sc.cached_weekref_cost(
+        week_start_at=ws, week_end_at=we, now_utc=now, compute=compute
+    ) == 4.0
+    assert sc.cached_weekref_cost(
+        week_start_at=ws, week_end_at=we, now_utc=now, compute=compute
+    ) == 4.0
+    assert calls["n"] == 1  # second call was a cache hit
+    # open week (end > now) always recomputes, never stored
+    ows = dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc)
+    owe = dt.datetime(2026, 7, 6, tzinfo=dt.timezone.utc)
+    c2 = {"n": 0}
+
+    def compute2():
+        c2["n"] += 1
+        return 9.0
+
+    sc.cached_weekref_cost(
+        week_start_at=ows, week_end_at=owe, now_utc=now, compute=compute2
+    )
+    sc.cached_weekref_cost(
+        week_start_at=ows, week_end_at=owe, now_utc=now, compute=compute2
+    )
+    assert c2["n"] == 2  # never cached
+    assert sc._weekref_key(ows, owe) not in sc._WEEKREF_COST_CACHE
+
+
+def test_cached_weekref_cost_zero_is_a_hit():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_weekref_cost_state()
+    now = dt.datetime(2026, 7, 5, tzinfo=dt.timezone.utc)
+    ws = dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc)
+    we = dt.datetime(2026, 6, 29, tzinfo=dt.timezone.utc)
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return 0.0  # a $0 week
+
+    sc.cached_weekref_cost(
+        week_start_at=ws, week_end_at=we, now_utc=now, compute=compute
+    )
+    sc.cached_weekref_cost(
+        week_start_at=ws, week_end_at=we, now_utc=now, compute=compute
+    )
+    assert calls["n"] == 1  # 0.0 is a hit, not a miss

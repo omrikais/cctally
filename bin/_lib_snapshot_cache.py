@@ -751,3 +751,25 @@ def reset_weekref_cost_state():
     """
     _WEEKREF_COST_CACHE.clear()
     _WEEKREF_COST_LAST_SEEN.clear()
+
+
+def cached_weekref_cost(*, week_start_at, week_end_at, now_utc, compute):
+    """Get-or-compute a subscription week's cost (spec §4).
+
+    The OPEN week (``week_end_at > now_utc``) is always recomputed and never
+    cached — open-vs-closed is decided per call so a just-closed week caches on
+    the next tick and the newly-opened week always recomputes. A CLOSED week is
+    served from ``_WEEKREF_COST_CACHE`` on a hit, else computed via ``compute``
+    and stored. ``compute`` is the caller's from-scratch closure
+    (``_compute_cost_for_weekref`` for B1, ``_sum_cost_for_range`` for B3), so
+    the returned float is bit-identical to today's.
+    """
+    if week_end_at > now_utc:
+        return compute()
+    key = _weekref_key(week_start_at, week_end_at)
+    hit = _WEEKREF_COST_CACHE.get(key)
+    if hit is not None:  # 0.0 is a legitimate cached value, not a miss
+        return hit
+    val = compute()
+    _WEEKREF_COST_CACHE[key] = val
+    return val
