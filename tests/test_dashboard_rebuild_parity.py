@@ -2573,6 +2573,88 @@ def test_projects_env_rollover_populates_previously_current_week(tmp_path):
     assert cached == fresh
 
 
+def test_projects_env_reconstruction_picks_global_earliest_week_key():
+    """Codex-M4 P1 non-vacuity: when ONE ``bucket_path`` is reached by two
+    DIFFERENT raw ``project_path`` spellings across two closed weeks, the no-git
+    fallback (`_resolve_project_key`, `bin/_cctally_cache.py`) gives each week a
+    DIFFERENT ``display_key`` for the SAME bucket — ``os.path.basename(raw) or
+    raw`` differs by spelling while the normalized realpath ``bucket_path`` is
+    identical. ``_assemble_projects_via_cache`` must reconstruct
+    ``key_by_bucket[bp]`` as the ProjectKey of the GLOBAL-earliest
+    ``(first_order, first_id)`` entry — reproducing the from-scratch walk's
+    global first-seen (``timestamp_utc ASC, id ASC``) — NOT the later week's key.
+
+    Every existing envelope fixture reaches each bucket by a SINGLE spelling, so
+    every week's ``first_key`` for a bucket is identical and inverting the argmin
+    (pick the LATEST week instead of the EARLIEST) is byte-invisible — the parity
+    tests stay green. This test makes the two weeks' keys DIFFER, so the argmin
+    DIRECTION is observable: inverting `cand < best` to `cand > best` in
+    `_merge_week` flips the emitted key from ``EARLY`` to ``LATE``.
+    """
+    load_script()
+    import _cctally_cache
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+
+    # Minimal conn whose CURRENT-week slice is EMPTY (no session_entries rows), so
+    # the ONLY contributors to key_by_bucket are the two cached CLOSED weeks
+    # seeded below — the current-week recompute adds nothing.
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT, "
+        "timestamp_utc TEXT, model TEXT, input_tokens INTEGER, "
+        "output_tokens INTEGER, cache_create_tokens INTEGER, "
+        "cache_read_tokens INTEGER, cost_usd_raw REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE session_files (path TEXT, session_id TEXT, project_path TEXT)"
+    )
+    conn.commit()
+
+    bp = "/repos/proj"  # ONE normalized bucket_path, reached by two raw spellings.
+    week1 = dt.datetime(2026, 1, 5, tzinfo=dt.timezone.utc)      # global-earliest
+    week2 = dt.datetime(2026, 1, 12, tzinfo=dt.timezone.utc)     # later closed week
+    cw_start = dt.datetime(2026, 1, 19, tzinfo=dt.timezone.utc)  # current (empty)
+
+    # Same bucket_path, but the earlier week's entry carries display_key EARLY and
+    # the later week's carries LATE — the no-git fallback's per-spelling display.
+    early = _cctally_cache.ProjectKey(
+        bucket_path=bp, display_key="EARLY", git_root=None,
+    )
+    late = _cctally_cache.ProjectKey(
+        bucket_path=bp, display_key="LATE", git_root=None,
+    )
+    # ProjectKey equality is bucket_path-only, so these ARE the same bucket — the
+    # exact condition that makes key_by_bucket[bp] non-deterministic per bucket.
+    assert early == late
+
+    wb_early = d._ProjWeekBucket(
+        cost_usd=1.0, sessions_count=1,
+        first_seen=week1, last_seen=week1,
+        first_order="2026-01-05T09:00:00Z", first_id=5, first_key=early,
+    )
+    wb_late = d._ProjWeekBucket(
+        cost_usd=2.0, sessions_count=1,
+        first_seen=week2, last_seen=week2,
+        first_order="2026-01-12T09:00:00Z", first_id=500, first_key=late,
+    )
+    sc.projects_env_week_put(sc.projects_env_week_key(week1), {bp: wb_early}, 1.0)
+    sc.projects_env_week_put(sc.projects_env_week_key(week2), {bp: wb_late}, 2.0)
+
+    _, _, key_by_bucket = d._assemble_projects_via_cache(
+        conn, weeks_full=[week1, week2, cw_start],
+        cw_start=cw_start, cw_end=cw_start + dt.timedelta(days=7),
+    )
+
+    assert key_by_bucket[bp].display_key == "EARLY", (
+        "reconstruction must pick the GLOBAL-earliest week's ProjectKey "
+        "(argmin over (first_order, first_id)), not the later week's; got "
+        f"{key_by_bucket[bp].display_key!r}"
+    )
+
+
 # ===========================================================================
 # #269 M4.5 — dispatch wiring: activate the envelope cache in the live rebuild.
 # ===========================================================================
