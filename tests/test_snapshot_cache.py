@@ -848,17 +848,38 @@ def test_reconcile_projects_env_cold_records_last_seen(tmp_cache):
     assert sc.projects_env_week_get(wk) is not None  # untouched by cold call
 
 
-def test_reconcile_projects_env_full_clear_on_max_wus(tmp_cache):
+def test_reconcile_projects_env_keeps_cache_on_wus_change(tmp_cache):
+    """#271 §9a: a `max_wus_id` bump (a `record-usage` write) must NOT full-clear
+    the per-(project,week) cost cache (layer 2). Attribution stays fresh via the
+    whole-envelope memo (layer 1, `_PROJECTS_ENV_MEMO`), which still keys on
+    `max_wus_id` and misses on the bump; layer 2's `session_entries`-only cost
+    aggregates are byte-safe to reuse across a WUS bump. (Before the clause drop
+    this full-cleared — RED.)"""
     import _lib_snapshot_cache as sc
 
     sc.reset_projects_env_state()
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    mid = _max_id(tmp_cache)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(0, 0))
     sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(0, 0))
+    # WUS bumps, entries/sf unchanged → the cost cache MUST survive.
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=4, sf_sig=(0, 0),
+        tmp_cache, max_entry_id=mid, max_wus_id=4, sf_sig=(0, 0),
     )
-    assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
+    assert sc.projects_env_week_get(wk) is not None
+
+
+def test_projects_env_memo_key_includes_max_wus_id():
+    """#271 §9 Codex-4 invariant: the whole-envelope memo (`_PROJECTS_ENV_MEMO`)
+    MUST keep `max_wus_id` in its key, so a `record-usage` write busts the memo
+    and attribution is recomputed fresh — even after Item 3 dropped `max_wus_id`
+    from layer 2's (`reconcile_projects_env_cache`) full-clear. A regression that
+    drops `max_wus_id` from the memo key goes RED here."""
+    src = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "bin" / "_cctally_dashboard.py"
+    ).read_text()
+    assert "memo_key = (max_id, max_wus_id, cw_key, weeks_back)" in src
 
 
 def test_reconcile_projects_env_full_clear_on_sf_sig(tmp_cache):

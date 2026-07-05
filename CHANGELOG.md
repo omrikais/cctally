@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Dashboard warm rebuilds are materially faster on very large histories: the weekly/monthly/daily panels now fold only new activity into the current period each refresh instead of re-summing the whole open period, and a `record-usage` write no longer forces a full projects rebuild. Output is unchanged (#271).
+
 ## [1.61.0] - 2026-07-05
 
 ### Added

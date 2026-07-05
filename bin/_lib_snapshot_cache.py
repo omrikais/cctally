@@ -1040,6 +1040,15 @@ def session_files_sig(cache_conn) -> "tuple[int, int]":
     So the envelope cache keys this cheap change-signal and full-clears when it
     moves. Returns ``(0, 0)`` on a missing table (fresh DB) so callers never
     raise.
+
+    #271 §9d rider (from the #269 final review): this ``(COUNT(*), MAX(rowid))``
+    leg does NOT by itself catch the in-place ``ON CONFLICT(path) DO UPDATE SET
+    project_path = COALESCE(...)`` attribution backfill — that UPDATE preserves
+    the rowid and the row count, so both legs are unmoved. It is covered
+    belt-and-suspenders, though: the backfill lands in the SAME ``sync_cache``
+    ingest-loop iteration as the file's new ``session_entries`` rows, which bump
+    ``max_entry_id`` — caught by the watermark eviction path. So a pure
+    attribution move never both slips this signal and leaves the cache stale.
     """
     try:
         row = cache_conn.execute(
@@ -1092,9 +1101,11 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
     ``max_wus_id``) + a ``session_files`` signal (``sf_sig``) passed in:
 
     - Cold (no last-seen): record last-seen, return — no eviction.
-    - ``max_wus_id`` changed (attribution denominator), ``sf_sig`` changed
-      (attribution backfill, Codex-M4 P2), OR ``max_entry_id < last_seen``
-      (cache.db rebuilt): full clear. Conservative but byte-safe (recompute).
+    - ``sf_sig`` changed (attribution backfill, Codex-M4 P2) OR
+      ``max_entry_id < last_seen`` (cache.db rebuilt): full clear. Conservative
+      but byte-safe (recompute). ``max_wus_id`` stays tracked in last-seen
+      but is deliberately NOT a full-clear trigger (#271 §9) — a `record-usage`
+      write reuses this cost cache; the whole-envelope memo refreshes attribution.
     - ``max_entry_id > last_seen``: evict cached weeks (and their bucket rows +
       week total) whose ``week_end (= parse(week_iso) + 7d)`` is
       ``>= new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row
@@ -1113,10 +1124,16 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
         ls["sf_sig"] = sf_sig
         return
     if (
-        max_wus_id != ls["max_wus_id"]
-        or sf_sig != ls["sf_sig"]
+        sf_sig != ls["sf_sig"]
         or max_entry_id < ls["max_id"]
     ):
+        # NOTE (#271 §9): max_wus_id is deliberately NOT a full-clear trigger. The
+        # cached per-(project, week) aggregates are session_entries-only; a WUS
+        # bump (a `record-usage` write) changes only the attribution denominator,
+        # which the whole-envelope memo (_PROJECTS_ENV_MEMO, still keyed on
+        # max_wus_id) recomputes fresh on its own miss. Reusing this cost cache
+        # across a WUS bump is byte-identical. Do NOT re-add
+        # `max_wus_id != ls["max_wus_id"]` here.
         _PROJECTS_ENV_WEEK_CACHE.clear()
         _PROJECTS_ENV_WEEK_TOTALS.clear()
         ls["max_id"] = max_entry_id

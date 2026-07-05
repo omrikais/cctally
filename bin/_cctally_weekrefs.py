@@ -309,6 +309,15 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     c = _cctally()
     # #269 M4.4: skip the full rescan when neither the snapshots nor the
     # reset events moved since the last successful backfill on this DB file.
+    #
+    # #271 §9d rider (from the #269 final review): the skip signature
+    # (`_backfill_reset_events_signature`, a MAX(id)/COUNT descent) is blind to a
+    # NON-max `weekly_usage_snapshots` DELETE — dropping a middle row leaves
+    # MAX(id) and could leave COUNT unchanged vs a prior state, so a rescan may
+    # be skipped. That is byte-safe because this backfill is ADD-ONLY
+    # (`INSERT OR IGNORE INTO week_reset_events`): a skipped rescan can only fail
+    # to *add* an event, never *remove* a needed one, matching the pre-#269
+    # idempotent behavior exactly.
     db_id = _backfill_db_identity(conn)
     sig = _backfill_reset_events_signature(conn)
     if db_id is not None:
