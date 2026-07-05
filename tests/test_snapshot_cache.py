@@ -773,3 +773,180 @@ def test_reconcile_weekref_idempotent_within_tick(tmp_cache):
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
     sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
     assert sc._weekref_key(*wk) in sc._WEEKREF_COST_CACHE
+
+
+# ===========================================================================
+# #269 M4.2 — projects-envelope per-(project, week) cache infra
+# (spec §14 Win 2). Mirrors the M0 weekref shape: bare module dicts (no lock —
+# only the sync thread mutates), a per-builder last-seen, a `>=` watermark
+# eviction, plus a `session_files_sig` attribution-backfill signal and a
+# `max_wus_id` attribution-denominator full-clear (Codex-M4 P2).
+# ===========================================================================
+def _insert_session_file(conn, path, *, session_id="s", project_path="/p"):
+    conn.execute(
+        "INSERT OR REPLACE INTO session_files "
+        "(path, session_id, project_path) VALUES (?, ?, ?)",
+        (path, session_id, project_path),
+    )
+    conn.commit()
+
+
+def test_reset_projects_env_state_clears():
+    import _lib_snapshot_cache as sc
+
+    sc._PROJECTS_ENV_WEEK_CACHE[("/p", "wk")] = ("agg",)
+    sc._PROJECTS_ENV_WEEK_TOTALS["wk"] = 1.0
+    sc._PROJECTS_ENV_LAST_SEEN["max_id"] = 5
+    sc.reset_projects_env_state()
+    assert sc._PROJECTS_ENV_WEEK_CACHE == {}
+    assert sc._PROJECTS_ENV_WEEK_TOTALS == {}
+    assert sc._PROJECTS_ENV_LAST_SEEN == {}
+
+
+def test_session_files_sig_moves_on_row_add(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    s0 = sc.session_files_sig(tmp_cache)
+    _insert_session_file(tmp_cache, "/f/a.jsonl")
+    s1 = sc.session_files_sig(tmp_cache)
+    assert s1 != s0 and s1[0] == s0[0] + 1
+    # An in-place attribution backfill (UPDATE project_path, same row) moves the
+    # count-signal not at all but keeps MAX(rowid) stable — the belt is the
+    # count; add a second row to prove monotonic growth of both legs.
+    _insert_session_file(tmp_cache, "/f/b.jsonl")
+    s2 = sc.session_files_sig(tmp_cache)
+    assert s2 != s1 and s2[1] >= s1[1]
+
+
+def test_projects_env_week_put_get_roundtrip():
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    assert sc.projects_env_week_get(wk) is None  # miss before put
+    sc.projects_env_week_put(wk, {"/p/a": ("agg-a",), "/p/b": ("agg-b",)}, 7.5)
+    by_bp, total = sc.projects_env_week_get(wk)
+    assert total == 7.5
+    assert by_bp == {"/p/a": ("agg-a",), "/p/b": ("agg-b",)}
+    # An empty computed week is a HIT (registry presence), not a miss.
+    wk2 = sc.projects_env_week_key(dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk2, {}, 0.0)
+    by_bp2, total2 = sc.projects_env_week_get(wk2)
+    assert by_bp2 == {} and total2 == 0.0
+
+
+def test_reconcile_projects_env_cold_records_last_seen(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)  # survives the cold call
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=7, max_wus_id=3, sf_sig=(2, 9),
+    )
+    assert sc._PROJECTS_ENV_LAST_SEEN == {"max_id": 7, "max_wus_id": 3, "sf_sig": (2, 9)}
+    assert sc.projects_env_week_get(wk) is not None  # untouched by cold call
+
+
+def test_reconcile_projects_env_full_clear_on_max_wus(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(0, 0))
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=4, sf_sig=(0, 0),
+    )
+    assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
+
+
+def test_reconcile_projects_env_full_clear_on_sf_sig(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(1, 1))
+    # session_files attribution backfill moved rows WITHOUT a new entry/WUS row.
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(2, 5),
+    )
+    assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
+
+
+def test_reconcile_projects_env_full_clear_on_maxid_regression(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=100, max_wus_id=3, sf_sig=(0, 0))
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=5, max_wus_id=3, sf_sig=(0, 0),  # cache.db rebuilt
+    )
+    assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
+
+
+def test_reconcile_projects_env_evicts_late_ingest_week(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk_old = sc.projects_env_week_key(dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc))
+    wk_new = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk_old, {"/p": ("old",)}, 1.0)
+    sc.projects_env_week_put(wk_new, {"/p": ("new",)}, 2.0)
+    last = _max_id(tmp_cache)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    # Late-ingest a row with an OLD timestamp inside wk_new (2026-06-22..06-29).
+    _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
+    )
+    assert sc.projects_env_week_get(wk_new) is None      # week_end 06-29 >= wm
+    assert sc.projects_env_week_get(wk_old) is not None   # week_end 06-22 < wm
+    # The bucket rows for the evicted week are gone too.
+    assert ("/p", wk_new) not in sc._PROJECTS_ENV_WEEK_CACHE
+    assert ("/p", wk_old) in sc._PROJECTS_ENV_WEEK_CACHE
+
+
+def test_reconcile_projects_env_boundary_equal_evicted(tmp_cache):
+    """Codex-1 `>=` rule: a week whose end equals the watermark is over-evicted
+    (byte-safe — forces a harmless recompute)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("x",)}, 2.0)  # week_end = 2026-06-29
+    last = _max_id(tmp_cache)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly week_end
+    sc.reconcile_projects_env_cache(
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
+    )
+    assert sc.projects_env_week_get(wk) is None  # >= evicts it
+
+
+def test_reconcile_projects_env_idempotent_within_tick(tmp_cache, monkeypatch):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_projects_env_state()
+    wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
+    sc.projects_env_week_put(wk, {"/p": ("x",)}, 2.0)
+    last = _max_id(tmp_cache)
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # future — keeps wk
+    new_max = _max_id(tmp_cache)
+    real_nmt = sc.new_min_timestamp
+    calls = {"n": 0}
+
+    def spy(conn, last_id):
+        calls["n"] += 1
+        return real_nmt(conn, last_id)
+
+    monkeypatch.setattr(sc, "new_min_timestamp", spy)
+    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_wus_id=0, sf_sig=(0, 0))
+    assert calls["n"] == 1 and sc.projects_env_week_get(wk) is not None  # 06-29 < 07-04
+    # Second call, SAME signature: no watermark re-query, entry survives.
+    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_wus_id=0, sf_sig=(0, 0))
+    assert calls["n"] == 1

@@ -824,3 +824,165 @@ def reconcile_weekref_cache(cache_conn, *, max_entry_id, reset_sig):
                     del _WEEKREF_COST_CACHE[key]
         ls["max_id"] = max_entry_id
         ls["reset_sig"] = reset_sig
+
+
+# === #269 M4 — projects-envelope per-(project, week) incremental cache =======
+#
+# `_build_projects_envelope` re-iterates all ~190K window entries every warm
+# tick, doing a per-entry `_resolve_project_key` + cost + per-(project, week)
+# aggregation. At scale that builder DOMINATES the warm rebuild (spec §13). A
+# CLOSED week's per-project aggregate is IMMUTABLE, so cache it and recompute
+# only the CURRENT week each warm tick (spec §14 Win 2).
+#
+# Storage (opaque — this module never introspects the aggregate object, keeping
+# the "no dashboard/TUI import" design, exactly like `BucketCache`):
+# - `_PROJECTS_ENV_WEEK_CACHE`: `{(bucket_path, week_iso) -> agg}` per closed
+#   week. The dashboard packs a `(cost_usd, sessions_count, first_seen,
+#   last_seen, first_order, first_id, first_key)` record; here it is opaque.
+# - `_PROJECTS_ENV_WEEK_TOTALS`: `{week_iso -> total_cost}` cached as its OWN
+#   entry-order aggregate (spec §14(a) — never re-summed from project buckets,
+#   which would re-associate the float sum). ALSO the "week computed" registry:
+#   a week is a cache HIT iff its `week_iso` is present here (an empty computed
+#   week is stored with total 0.0 and no bucket rows, so cold empty weeks are
+#   not re-queried every tick).
+# - `_PROJECTS_ENV_LAST_SEEN`: `{max_id, max_wus_id, sf_sig}` this cache last
+#   reconciled against.
+#
+# Single-writer (sync thread only), immutable values, fresh presentation each
+# tick — the Group A / weekref discipline (spec §6, Codex F7).
+
+_PROJECTS_ENV_WEEK_CACHE: dict = {}   # {(bucket_path, week_iso): agg}
+_PROJECTS_ENV_WEEK_TOTALS: dict = {}  # {week_iso: total_cost}  (also the registry)
+_PROJECTS_ENV_LAST_SEEN: dict = {}    # {"max_id", "max_wus_id", "sf_sig"}
+
+
+def projects_env_week_key(week_start):
+    """Canonical UTC-ISO key for a Monday-anchored subscription week start.
+
+    The dashboard resolves week starts as aware-UTC datetimes; normalizing to
+    UTC before serializing keeps the key stable and parseable back by
+    ``reconcile_projects_env_cache`` (for the ``week_end`` watermark compare).
+    """
+    return week_start.astimezone(dt.timezone.utc).isoformat()
+
+
+def reset_projects_env_state():
+    """Clear the projects-envelope week cache + totals + watermark.
+
+    Called from the orphan-prune site (a prune deletes ``session_entries``
+    possibly WITHOUT lowering ``MAX(id)``, so the reconcile's regression check
+    cannot catch it — the explicit clear must) and as a test hook.
+    """
+    _PROJECTS_ENV_WEEK_CACHE.clear()
+    _PROJECTS_ENV_WEEK_TOTALS.clear()
+    _PROJECTS_ENV_LAST_SEEN.clear()
+
+
+def session_files_sig(cache_conn) -> "tuple[int, int]":
+    """`(COUNT(*), COALESCE(MAX(rowid), 0))` over ``session_files`` (Codex-M4 P2).
+
+    ``sync_cache`` lazily backfills ``session_files.session_id`` /
+    ``project_path`` for OLD entries — moving a closed week's row from
+    ``(unknown)`` to a project, or changing a per-week session count — WITHOUT
+    advancing ``MAX(session_entries.id)`` / ``MAX(weekly_usage_snapshots.id)``.
+    So the envelope cache keys this cheap change-signal and full-clears when it
+    moves. Returns ``(0, 0)`` on a missing table (fresh DB) so callers never
+    raise.
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM session_files"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+    except sqlite3.Error:
+        return (0, 0)
+
+
+def projects_env_week_get(week_iso):
+    """Return ``(buckets_by_bucket_path, total_cost)`` for a cached week, or
+    ``None`` on a miss.
+
+    ``_PROJECTS_ENV_WEEK_TOTALS`` is the presence registry: a week is a HIT iff
+    its key is present (an empty computed week is stored with total 0.0 and no
+    bucket rows, so it is a HIT with an empty bucket map). The bucket rows are
+    reassembled by scanning ``_PROJECTS_ENV_WEEK_CACHE`` for this week's keys —
+    the distinct-bucket_path count is small (project count), so the scan is
+    cheap.
+    """
+    if week_iso not in _PROJECTS_ENV_WEEK_TOTALS:
+        return None
+    total = _PROJECTS_ENV_WEEK_TOTALS[week_iso]
+    by_bp = {
+        bp: agg
+        for (bp, wk), agg in _PROJECTS_ENV_WEEK_CACHE.items()
+        if wk == week_iso
+    }
+    return by_bp, total
+
+
+def projects_env_week_put(week_iso, buckets_by_bp, total) -> None:
+    """Store one CLOSED week's per-bucket aggregates + entry-order total.
+
+    ``total`` is registered even when ``buckets_by_bp`` is empty, so a
+    computed-empty week is a HIT (not a perpetual miss). Values are stored
+    as-is (immutable); this never mutates a stored aggregate in place.
+    """
+    _PROJECTS_ENV_WEEK_TOTALS[week_iso] = total
+    for bp, agg in buckets_by_bp.items():
+        _PROJECTS_ENV_WEEK_CACHE[(bp, week_iso)] = agg
+
+
+def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig):
+    """Once-per-non-idle-rebuild invalidation for the projects-envelope cache.
+
+    Driven by ``_tui_build_snapshot`` after the idle-path check, before the
+    envelope builder runs, using the dispatch-signature legs (``max_entry_id``,
+    ``max_wus_id``) + a ``session_files`` signal (``sf_sig``) passed in:
+
+    - Cold (no last-seen): record last-seen, return — no eviction.
+    - ``max_wus_id`` changed (attribution denominator), ``sf_sig`` changed
+      (attribution backfill, Codex-M4 P2), OR ``max_entry_id < last_seen``
+      (cache.db rebuilt): full clear. Conservative but byte-safe (recompute).
+    - ``max_entry_id > last_seen``: evict cached weeks (and their bucket rows +
+      week total) whose ``week_end (= parse(week_iso) + 7d)`` is
+      ``>= new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row
+      could fall inside them (F1 late-ingest). The bound is ``>=`` (Codex-1);
+      over-eviction is byte-safe.
+
+    Idempotent within a tick: after the first call updates last-seen, a later
+    call with the same signature sees no delta and no-ops (never re-running the
+    watermark query). The short-lived ``cache_conn`` is used only for the
+    watermark query on the ``max_entry_id > last_seen`` branch (Codex-4).
+    """
+    ls = _PROJECTS_ENV_LAST_SEEN
+    if not ls:  # cold
+        ls["max_id"] = max_entry_id
+        ls["max_wus_id"] = max_wus_id
+        ls["sf_sig"] = sf_sig
+        return
+    if (
+        max_wus_id != ls["max_wus_id"]
+        or sf_sig != ls["sf_sig"]
+        or max_entry_id < ls["max_id"]
+    ):
+        _PROJECTS_ENV_WEEK_CACHE.clear()
+        _PROJECTS_ENV_WEEK_TOTALS.clear()
+        ls["max_id"] = max_entry_id
+        ls["max_wus_id"] = max_wus_id
+        ls["sf_sig"] = sf_sig
+        return
+    if max_entry_id > ls["max_id"]:
+        wm = new_min_timestamp(cache_conn, ls["max_id"])
+        if wm is not None:
+            dirty = [
+                wk
+                for wk in list(_PROJECTS_ENV_WEEK_TOTALS)
+                if dt.datetime.fromisoformat(wk) + dt.timedelta(days=7) >= wm
+            ]
+            for wk in dirty:
+                _PROJECTS_ENV_WEEK_TOTALS.pop(wk, None)
+                for key in [k for k in _PROJECTS_ENV_WEEK_CACHE if k[1] == wk]:
+                    del _PROJECTS_ENV_WEEK_CACHE[key]
+        ls["max_id"] = max_entry_id
+        ls["max_wus_id"] = max_wus_id
+        ls["sf_sig"] = sf_sig
