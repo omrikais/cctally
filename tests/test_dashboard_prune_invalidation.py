@@ -237,3 +237,63 @@ def test_prune_then_rebuild_recomputes_correctly(env):
     finally:
         tui._SESSION_CACHE_ENABLED = prev
     assert cached == wide
+
+
+def test_prune_clears_projects_env_cache(env):
+    """#269 M4.5 (spec §14 Win 2): a real prune (non-max deletion) must ALSO
+    clear the projects-envelope per-(project, week) cache — the same non-max
+    deletion the reconcile's max-id-regression check cannot catch."""
+    ns, tmp_path = env
+    import _lib_snapshot_cache as sc
+
+    home = pathlib.Path(os.environ["HOME"])
+    orphan_dir = home / ".claude" / "projects" / "-gone"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "s_orphan.jsonl").write_text(
+        _line("S_ORPH", "uo", "mo", "ro", ts="2026-07-01T00:00:00Z")
+    )
+    _sync(ns)
+    keep_dir = home / ".claude" / "projects" / "-Users-u-proj"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    (keep_dir / "s_keep.jsonl").write_text(
+        _line("S_KEEP", "uk", "mk", "rk", ts="2026-07-03T00:00:00Z")
+    )
+    _sync(ns)
+    shutil.rmtree(orphan_dir)
+
+    # Prime the envelope week cache + registry + watermark with sentinels.
+    sc.reset_projects_env_state()
+    sc._PROJECTS_ENV_WEEK_CACHE[("/p", "wk")] = ("agg",)
+    sc._PROJECTS_ENV_WEEK_TOTALS["wk"] = 1.0
+    sc._PROJECTS_ENV_LAST_SEEN["max_id"] = 999
+
+    res = ns["_dashboard_self_heal_orphans"](skip_sync=False)
+    assert res is not None and res.pruned_files >= 1
+
+    assert sc._PROJECTS_ENV_WEEK_CACHE == {}, "prune must clear the envelope cache"
+    assert sc._PROJECTS_ENV_WEEK_TOTALS == {}, "prune must clear the week totals"
+    assert sc._PROJECTS_ENV_LAST_SEEN == {}, "prune must reset the envelope watermark"
+
+
+def test_prune_noop_does_not_clear_projects_env_cache(env):
+    """Non-vacuity: a no-op prune (nothing deleted) must NOT clear the envelope
+    cache — the clear fires ONLY on a real deletion."""
+    ns, tmp_path = env
+    import _lib_snapshot_cache as sc
+
+    home = pathlib.Path(os.environ["HOME"])
+    keep_dir = home / ".claude" / "projects" / "-Users-u-proj"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    (keep_dir / "s_keep.jsonl").write_text(
+        _line("S_KEEP", "uk", "mk", "rk", ts="2026-07-03T00:00:00Z")
+    )
+    _sync(ns)
+
+    sc.reset_projects_env_state()
+    sc._PROJECTS_ENV_WEEK_TOTALS["wk"] = 4.56
+
+    res = ns["_dashboard_self_heal_orphans"](skip_sync=False)
+    assert res is not None and res.pruned_files == 0
+    assert sc._PROJECTS_ENV_WEEK_TOTALS == {"wk": 4.56}, (
+        "a no-op prune must not clear the envelope cache"
+    )

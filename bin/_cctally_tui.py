@@ -2149,6 +2149,12 @@ def _tui_build_snapshot(
         # (by_project net_usd is not associative across the day partition — see
         # the spec §5 finding note), so only the weekref cache is wired here.
         use_weekref_cost_cache = False
+        # ── #269 M4.5: projects-envelope per-(project, week) cache (spec §14) ──
+        # Same gating as the weekref cache: OFF by default, flipped ON only on
+        # the dashboard sync-thread NON-IDLE path after the once-per-rebuild
+        # `reconcile_projects_env_cache` succeeds. Off ⇒ `_build_projects_envelope`
+        # does the full-window walk (CLI / drill / test byte-identical).
+        use_projects_env_cache = False
         # ── Three-path dispatch — idle short-circuit (spec §3, #268 M5.1) ──
         # Compute the composite data-version signature (cheap MAX(id) descents
         # over cache.db + stats.db + the reset-event change-signal + the
@@ -2218,11 +2224,23 @@ def _tui_build_snapshot(
                             max_entry_id=dispatch_sig.max_entry_id,
                             reset_sig=dispatch_sig.reset_sig,
                         )
+                        use_weekref_cost_cache = True
+                        # #269 M4.5: reconcile the projects-envelope cache with
+                        # the SAME short-lived cache conn (session_files_sig +
+                        # the new-entry watermark both live in cache.db). Only
+                        # after this succeeds does `_build_projects_envelope`
+                        # opt into the cache below.
+                        _sc.reconcile_projects_env_cache(
+                            _rc_cache_conn,
+                            max_entry_id=dispatch_sig.max_entry_id,
+                            max_wus_id=dispatch_sig.max_wus_id,
+                            sf_sig=_sc.session_files_sig(_rc_cache_conn),
+                        )
+                        use_projects_env_cache = True
                     finally:
                         _rc_cache_conn.close()
-                    use_weekref_cost_cache = True
                 except Exception as exc:
-                    errors.append(f"weekref-reconcile: {exc}")
+                    errors.append(f"snapshot-cache-reconcile: {exc}")
         try:
             cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
         except Exception as exc:
@@ -2449,6 +2467,7 @@ def _tui_build_snapshot(
                 now_utc=now_utc,
                 current_week=cw,
                 weeks_back=12,
+                use_projects_env_cache=use_projects_env_cache,
             )
         except Exception as exc:
             errors.append(f"projects-envelope: {exc}")

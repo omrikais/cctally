@@ -2571,3 +2571,70 @@ def test_projects_env_rollover_populates_previously_current_week(tmp_path):
     cached = _build_env(d, conn, now=later, flag=True)
     fresh = _build_env(d, conn, now=later, flag=False)
     assert cached == fresh
+
+
+# ===========================================================================
+# #269 M4.5 — dispatch wiring: activate the envelope cache in the live rebuild.
+# ===========================================================================
+def test_live_rebuild_warm_reuses_closed_week_envelope(monkeypatch, tmp_path):
+    """Two full `_tui_build_snapshot` rebuilds (dashboard mode). A new
+    current-week entry between them forces a non-idle WARM rebuild that
+    recomputes ONLY the current week's envelope buckets (spy) and reuses the
+    cached closed weeks — and `snap.projects_envelope` stays byte-identical to a
+    cold from-scratch rebuild on the same DB."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as d
+    import _lib_snapshot_cache as sc
+
+    for reset in (sc.reset_dispatch_state, sc.reset_group_a_state,
+                  sc.reset_session_cache_state, sc.reset_doctor_memo,
+                  sc.reset_weekref_cost_state, sc.reset_projects_env_state):
+        reset()
+    _seed_multiday_jsonl(tmp_path)
+
+    # Cold rebuild → populates the per-(project, week) cache for the closed weeks.
+    snap1 = ns["_tui_build_snapshot"](
+        now_utc=NOW_UTC, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert snap1.projects_envelope is not None
+
+    # New CURRENT-week entry → signature advances → non-idle WARM rebuild.
+    _seed_multiday_jsonl(tmp_path, extra=[
+        ("z1", "zm", "zr", "z", "2026-07-04T10:45:00Z", "claude-opus-4-8"),
+    ])
+    seen = {"weeks": []}
+    real = d._aggregate_projects_week
+
+    def spy(conn_, *, week_start, week_end, resolver_cache):
+        seen["weeks"].append(week_start)
+        return real(conn_, week_start=week_start, week_end=week_end,
+                    resolver_cache=resolver_cache)
+
+    monkeypatch.setattr(d, "_aggregate_projects_week", spy)
+    now2 = NOW_UTC + dt.timedelta(minutes=1)
+    snap2 = ns["_tui_build_snapshot"](
+        now_utc=now2, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert snap2.projects_envelope is not None
+    # WARM: only ONE week (the current week) was recomputed; closed weeks came
+    # from the cache.
+    assert len(set(seen["weeks"])) == 1, (
+        f"warm live rebuild must recompute ONLY the current week, got "
+        f"{sorted(set(seen['weeks']))}"
+    )
+
+    # Byte-identity: a cold from-scratch rebuild on the same DB at the same now
+    # (dispatch + envelope cache reset → full recompute) matches the warm one.
+    monkeypatch.setattr(d, "_aggregate_projects_week", real)
+    sc.reset_dispatch_state()
+    sc.reset_projects_env_state()
+    snap3 = ns["_tui_build_snapshot"](
+        now_utc=now2, skip_sync=False,
+        precompute_envelope=True, runtime_bind="127.0.0.1",
+    )
+    assert snap2.projects_envelope == snap3.projects_envelope, (
+        "warm cached envelope must byte-match the cold from-scratch rebuild"
+    )

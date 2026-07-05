@@ -324,6 +324,7 @@ from _lib_snapshot_cache import (
     build_cached_group_a,
     bump_generation,
     reset_group_a_state,
+    reset_projects_env_state,
     reset_session_cache_state,
     reset_weekref_cost_state,
     _max_id as _snapshot_max_id,
@@ -422,6 +423,9 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # can't catch. (B2 cache-report cache was dropped at the M2.0 gate,
             # so there is no reset_cache_report_state() to call here.)
             reset_weekref_cost_state()
+            # #269 M4.5 (spec §14 Win 2): the projects-envelope per-(project,
+            # week) cache rides the same prune-site clear for the same reason.
+            reset_projects_env_state()
         except Exception:
             # Invalidation must never turn a successful prune into a failure;
             # a stale-cache tick is self-corrected once the signature next moves.
