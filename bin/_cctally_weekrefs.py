@@ -31,6 +31,7 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import sys
+import threading
 from dataclasses import replace
 
 from _cctally_core import (
@@ -220,6 +221,68 @@ def _apply_reset_events_to_weekrefs(
     return out
 
 
+# === #269 M4.4 — backfill-rescan process guard ==============================
+#
+# `_backfill_week_reset_events` rescans ALL `weekly_usage_snapshots` on every
+# `open_db()`. Its output is NOT a pure function of the snapshots alone: the
+# in-place-credit branch also reads existing `week_reset_events`, and the
+# reset-events-regenerate contract deletes `week_reset_events` and re-runs the
+# backfill WITHOUT a snapshot insert. So a `MAX(weekly_usage_snapshots.id)`-only
+# guard would skip a needed regeneration. Guard instead on a process-level memo
+# of BOTH `MAX(weekly_usage_snapshots.id)` AND a `week_reset_events` signature
+# `(COUNT(*), MAX(rowid))`, scoped per DB FILE identity: skip the rescan only
+# when both are unchanged since the last successful backfill. Byte-identical (a
+# snapshot insert advances the WUS id; a reset-event delete/clear moves the
+# reset-event sig; a backfill's own inserts move the sig so the next open is a
+# clean skip). Production snapshots are append-only, so the WUS id moves on
+# every new capture. In-memory / temp DBs (no file identity) are never memoized
+# (always rescanned) — a `:memory:` identity could otherwise collide across
+# distinct databases.
+
+_BACKFILL_MEMO_LOCK = threading.Lock()
+_BACKFILL_RESET_EVENTS_MEMO: dict = {}  # db_path -> (max_wus_id, (count, max_rowid))
+
+
+def _reset_backfill_reset_events_memo() -> None:
+    """Drop the backfill-guard memo (test hook + isolation)."""
+    with _BACKFILL_MEMO_LOCK:
+        _BACKFILL_RESET_EVENTS_MEMO.clear()
+
+
+def _backfill_db_identity(conn: sqlite3.Connection) -> "str | None":
+    """The `main` schema's on-disk file path, or None for in-memory/temp DBs
+    (empty file string) — the memo key. None ⇒ never memoize (always rescan)."""
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                return file or None
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def _backfill_reset_events_signature(
+    conn: sqlite3.Connection,
+) -> "tuple[int, tuple[int, int]]":
+    """`(MAX(weekly_usage_snapshots.id), (COUNT, MAX(rowid)) over
+    week_reset_events)` — two O(1) MAX/COUNT descents vs the full-table rescan.
+    Degrades to zero legs on a missing table so it never raises."""
+    try:
+        max_wus = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM weekly_usage_snapshots"
+        ).fetchone()[0]
+    except sqlite3.DatabaseError:
+        max_wus = 0
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM week_reset_events"
+        ).fetchone()
+        wre = (int(row[0]), int(row[1]))
+    except sqlite3.DatabaseError:
+        wre = (0, 0)
+    return (int(max_wus), wre)
+
+
 def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     """One-shot scan over historical snapshots to synthesize reset events
     for past mid-week resets the tool lived through before this feature
@@ -244,6 +307,17 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     window. See ``_is_reset_drop`` for the full rationale.
     """
     c = _cctally()
+    # #269 M4.4: skip the full rescan when neither the snapshots nor the
+    # reset events moved since the last successful backfill on this DB file.
+    db_id = _backfill_db_identity(conn)
+    sig = _backfill_reset_events_signature(conn)
+    if db_id is not None:
+        with _BACKFILL_MEMO_LOCK:
+            if _BACKFILL_RESET_EVENTS_MEMO.get(db_id) == sig:
+                # Preserve the original's transaction-flush behavior on the
+                # skip path (harmless when there is nothing pending).
+                conn.commit()
+                return
     try:
         rows = conn.execute(
             "SELECT captured_at_utc, week_end_at, weekly_percent "
@@ -372,6 +446,13 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     # (e.g. _backfill_five_hour_blocks) don't trip "cannot start a
     # transaction within a transaction".
     conn.commit()
+    # #269 M4.4: store the POST-backfill signature (the scan's own inserts move
+    # the reset-event sig, so the next open with no snapshot change is a clean
+    # skip). Only after a completed scan — the early `except` return above
+    # deliberately does not memoize a partial state.
+    if db_id is not None:
+        with _BACKFILL_MEMO_LOCK:
+            _BACKFILL_RESET_EVENTS_MEMO[db_id] = _backfill_reset_events_signature(conn)
 
 
 # Minimum weekly_percent drop that counts as a goodwill reset (percentage

@@ -3790,3 +3790,86 @@ def test_reset_zero_marker_roundtrip_and_failsoft(ns):
     ):
         marker_path.write_text(bad + "\n")
         assert rec._read_reset_zero_marker() is None, bad
+
+
+# ── #269 M4.4: backfill-rescan process guard ───────────────────────────────
+def test_backfill_guard_skips_rescan_when_signature_unchanged(ns, monkeypatch):
+    """The backfill rescans ALL weekly_usage_snapshots on every open_db(). Guard
+    it on a process-level memo of (MAX(weekly_usage_snapshots.id),
+    (COUNT, MAX(rowid)) over week_reset_events), scoped per DB file identity: a
+    second call with NO change SKIPS the rescan. A RUN computes the signature
+    twice (check + post-backfill store); a SKIP computes it once (check only).
+    """
+    import _cctally_weekrefs as wr
+
+    wr._reset_backfill_reset_events_memo()
+    conn = ns["open_db"]()  # first open runs the backfill (cold)
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T10:00:00Z",
+            week_start_date="2026-05-12",
+            week_end_at="2026-05-19T00:00:00+00:00",
+            weekly_percent=46.0,
+        )
+        conn.commit()
+
+        calls = {"n": 0}
+        real = wr._backfill_reset_events_signature
+
+        def spy(c):
+            calls["n"] += 1
+            return real(c)
+
+        monkeypatch.setattr(wr, "_backfill_reset_events_signature", spy)
+
+        # A snapshot was just inserted → signature moved → RUN (check + store).
+        ns["_backfill_week_reset_events"](conn)
+        assert calls["n"] == 2, "post-insert backfill must RUN (2 signature reads)"
+
+        calls["n"] = 0
+        # No change since → SKIP the rescan (check only).
+        ns["_backfill_week_reset_events"](conn)
+        assert calls["n"] == 1, "unchanged backfill must SKIP the rescan"
+    finally:
+        conn.close()
+
+
+def test_backfill_guard_regenerates_after_reset_events_deleted(ns):
+    """Regenerate contract (Codex-M4 P1): the backfill output is NOT a pure
+    function of the snapshots alone. Deleting week_reset_events and re-running
+    WITHOUT a snapshot insert must REGENERATE the events — a max_wus_id-only
+    guard would wrongly skip, so the guard keys the week_reset_events signature
+    too.
+    """
+    import _cctally_weekrefs as wr
+
+    wr._reset_backfill_reset_events_memo()
+    end_iso, _ = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-13T10:00:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date, week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+        n1 = conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+        assert n1 >= 1, "backfill must detect the historical in-place credit"
+
+        # Delete the events, then re-run with NO snapshot change.
+        conn.execute("DELETE FROM week_reset_events")
+        conn.commit()
+        ns["_backfill_week_reset_events"](conn)
+        n2 = conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
+        assert n2 == n1, "deleting the events must force a regenerate, not a skip"
+    finally:
+        conn.close()
