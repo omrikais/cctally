@@ -1003,6 +1003,56 @@ def _dt(iso):
     )
 
 
+def _entry(ts, model="claude-opus-4-8", *, input=0, output=0, cache_create=0,
+           cache_read=0, speed=None, cost_usd=None, source="/p/a.jsonl"):
+    """Build one in-memory ``UsageEntry`` (no DB) for the pure fold/accumulator
+    tests. ``ts`` is any ISO string; the ``speed`` key is added only when set,
+    mirroring ``iter_entries``' materialization."""
+    from _lib_jsonl import UsageEntry
+
+    usage = {
+        "input_tokens": input,
+        "output_tokens": output,
+        "cache_creation_input_tokens": cache_create,
+        "cache_read_input_tokens": cache_read,
+    }
+    if speed is not None:
+        usage["speed"] = speed
+    return UsageEntry(timestamp=_dt(ts), model=model, usage=usage,
+                      cost_usd=cost_usd, source_path=source)
+
+
+def _entries(specs):
+    """Build a list of ``UsageEntry`` from ``(ts, model, input, output, cc, cr,
+    speed, cost_usd)`` tuples."""
+    return [
+        _entry(ts, model, input=i, output=o, cache_create=cc, cache_read=cr,
+               speed=sp, cost_usd=cu)
+        for (ts, model, i, o, cc, cr, sp, cu) in specs
+    ]
+
+
+# --- Task 2: shared per-entry fold primitive -------------------------------
+def test_fold_primitive_matches_aggregate_buckets():
+    """A hand-built entry list folded via ``_new_bucket_acc``/``_fold_entry``/
+    ``_finalize_bucket`` equals ``_aggregate_buckets`` output byte-for-byte
+    (exact cost float, models first-seen order, model_breakdowns) (#271 §6)."""
+    import _lib_aggregators as agg
+
+    entries = _entries([  # (ts, model, input, output, cc, cr, speed, cost_usd)
+        ("2026-07-01T00:00:00Z", "claude-opus-4-8", 10, 5, 0, 0, None, None),
+        ("2026-07-01T01:00:00Z", "claude-sonnet-4-5", 3, 1, 0, 0, "fast", None),
+        ("2026-07-01T02:00:00Z", "claude-opus-4-8", 7, 2, 0, 0, None, None),
+        ("2026-07-01T03:00:00Z", "<synthetic>", 99, 99, 0, 0, None, None),  # skipped
+    ])
+    full = agg._aggregate_buckets(entries, key_fn=lambda e: "2026-07-01", mode="auto")
+    acc = agg._new_bucket_acc()
+    for e in entries:
+        agg._fold_entry(acc, e, "auto")
+    got = agg._finalize_bucket("2026-07-01", acc)
+    assert got == full[0]  # exact dataclass equality
+
+
 # --- Task 1: iter_entries fold-order tie-break -----------------------------
 def test_iter_entries_order_is_timestamp_then_id(tmp_path):
     """``iter_entries`` returns rows in ``(timestamp_utc, id)`` ascending order,

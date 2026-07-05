@@ -106,6 +106,94 @@ class BucketUsage:
     model_breakdowns: list[dict[str, Any]]  # Sorted by cost desc
 
 
+def _new_bucket_acc() -> dict[str, Any]:
+    """A fresh running accumulator for one bucket (the pre-``BucketUsage`` shape).
+
+    The single per-bucket accumulation state shared by the full-pass
+    ``_aggregate_buckets`` and #271's incremental current-bucket accumulator, so
+    the byte-identity proof reduces to "same primitive, entries appended in the
+    same order" (spec §6).
+    """
+    return {
+        "input": 0, "output": 0, "cache_create": 0, "cache_read": 0,
+        "cost": 0.0, "models": {}, "models_order": [],
+    }
+
+
+def _fold_entry(acc: dict[str, Any], entry: UsageEntry, mode: str = "auto") -> None:
+    """Fold one entry into ``acc`` (the exact per-entry logic of ``_aggregate_buckets``).
+
+    Carries over verbatim: the ``<synthetic>`` skip (never touches ``acc`` for
+    them, so it is safe over an unfiltered delta stream), the ``-fast``
+    ``display_model`` suffix, the ``_calculate_entry_cost`` call, the four
+    integer token ``+=``, the running float ``cost +=``, the per-model
+    sub-bucket sums, and the first-seen ``models_order.append``. Order-sensitive:
+    the running ``cost`` is a left-fold, so callers MUST fold in the same order
+    the full pass would (the pinned ``(timestamp_utc, id)`` order, #271 §5).
+    """
+    if entry.model == "<synthetic>":
+        return
+    usage = entry.usage
+    display_model = f"{entry.model}-fast" if usage.get("speed") == "fast" else entry.model
+    inp = int(usage.get("input_tokens", 0) or 0)
+    out = int(usage.get("output_tokens", 0) or 0)
+    cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cost = _calculate_entry_cost(
+        entry.model, usage, mode=mode, cost_usd=entry.cost_usd,
+    )
+    acc["input"] += inp
+    acc["output"] += out
+    acc["cache_create"] += cc
+    acc["cache_read"] += cr
+    acc["cost"] += cost
+    model_bucket = acc["models"].setdefault(display_model, {
+        "input": 0, "output": 0, "cache_create": 0, "cache_read": 0, "cost": 0.0,
+    })
+    model_bucket["input"] += inp
+    model_bucket["output"] += out
+    model_bucket["cache_create"] += cc
+    model_bucket["cache_read"] += cr
+    model_bucket["cost"] += cost
+    if display_model not in acc["models_order"]:
+        acc["models_order"].append(display_model)
+
+
+def _finalize_bucket(bucket_key: str, acc: dict[str, Any]) -> BucketUsage:
+    """Build the immutable ``BucketUsage`` from a running accumulator.
+
+    Copies ``models`` / ``model_breakdowns`` so the returned row shares no
+    mutable state with ``acc`` (F7 — a live accumulator may keep being folded,
+    e.g. #271's persisted current-bucket state).
+    """
+    model_breakdowns = [
+        {
+            "modelName": model,
+            "inputTokens": mb["input"],
+            "outputTokens": mb["output"],
+            "cacheCreationTokens": mb["cache_create"],
+            "cacheReadTokens": mb["cache_read"],
+            "cost": mb["cost"],
+        }
+        for model, mb in acc["models"].items()
+    ]
+    model_breakdowns.sort(key=lambda m: m["cost"], reverse=True)
+    total_tokens = (
+        acc["input"] + acc["output"] + acc["cache_create"] + acc["cache_read"]
+    )
+    return BucketUsage(
+        bucket=bucket_key,
+        input_tokens=acc["input"],
+        output_tokens=acc["output"],
+        cache_creation_tokens=acc["cache_create"],
+        cache_read_tokens=acc["cache_read"],
+        total_tokens=total_tokens,
+        cost_usd=acc["cost"],
+        models=list(acc["models_order"]),
+        model_breakdowns=model_breakdowns,
+    )
+
+
 def _aggregate_buckets(
     entries: list[UsageEntry],
     key_fn: Callable[[UsageEntry], str],
@@ -117,84 +205,23 @@ def _aggregate_buckets(
     The returned list is sorted by bucket key ascending — callers reverse
     for --order desc.  Model breakdowns within each bucket are sorted by
     descending cost, matching upstream ccusage.
+
+    The per-entry accumulation is the shared ``_fold_entry`` primitive (spec
+    §6): a ``<synthetic>`` entry is skipped BEFORE keying (so a synthetic-only
+    key never materializes an empty bucket), and each surviving entry is folded
+    into its bucket's running accumulator, finalized per key in ascending order.
     """
     by_bucket: dict[str, dict[str, Any]] = {}
-    models_order: dict[str, list[str]] = {}
-
     for entry in entries:
         if entry.model == "<synthetic>":
             continue
-        usage = entry.usage
-        display_model = f"{entry.model}-fast" if usage.get("speed") == "fast" else entry.model
         key = key_fn(entry)
-        bucket = by_bucket.setdefault(key, {
-            "input": 0,
-            "output": 0,
-            "cache_create": 0,
-            "cache_read": 0,
-            "cost": 0.0,
-            "models": {},
-        })
-        order = models_order.setdefault(key, [])
+        acc = by_bucket.get(key)
+        if acc is None:
+            by_bucket[key] = acc = _new_bucket_acc()
+        _fold_entry(acc, entry, mode)
 
-        inp = int(usage.get("input_tokens", 0) or 0)
-        out = int(usage.get("output_tokens", 0) or 0)
-        cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
-        cr = int(usage.get("cache_read_input_tokens", 0) or 0)
-        cost = _calculate_entry_cost(
-            entry.model, usage, mode=mode, cost_usd=entry.cost_usd,
-        )
-
-        bucket["input"] += inp
-        bucket["output"] += out
-        bucket["cache_create"] += cc
-        bucket["cache_read"] += cr
-        bucket["cost"] += cost
-
-        model_bucket = bucket["models"].setdefault(display_model, {
-            "input": 0,
-            "output": 0,
-            "cache_create": 0,
-            "cache_read": 0,
-            "cost": 0.0,
-        })
-        model_bucket["input"] += inp
-        model_bucket["output"] += out
-        model_bucket["cache_create"] += cc
-        model_bucket["cache_read"] += cr
-        model_bucket["cost"] += cost
-
-        if display_model not in order:
-            order.append(display_model)
-
-    result: list[BucketUsage] = []
-    for key in sorted(by_bucket.keys()):
-        b = by_bucket[key]
-        model_breakdowns = [
-            {
-                "modelName": model,
-                "inputTokens": mb["input"],
-                "outputTokens": mb["output"],
-                "cacheCreationTokens": mb["cache_create"],
-                "cacheReadTokens": mb["cache_read"],
-                "cost": mb["cost"],
-            }
-            for model, mb in b["models"].items()
-        ]
-        model_breakdowns.sort(key=lambda m: m["cost"], reverse=True)
-        total_tokens = b["input"] + b["output"] + b["cache_create"] + b["cache_read"]
-        result.append(BucketUsage(
-            bucket=key,
-            input_tokens=b["input"],
-            output_tokens=b["output"],
-            cache_creation_tokens=b["cache_create"],
-            cache_read_tokens=b["cache_read"],
-            total_tokens=total_tokens,
-            cost_usd=b["cost"],
-            models=models_order[key],
-            model_breakdowns=model_breakdowns,
-        ))
-    return result
+    return [_finalize_bucket(key, by_bucket[key]) for key in sorted(by_bucket.keys())]
 
 
 def _aggregate_daily(
