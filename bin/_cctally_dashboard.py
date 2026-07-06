@@ -4136,6 +4136,11 @@ def _build_projects_envelope(
     # read off the SAME `session_entries` surface as `max_id` (an id-stable
     # UPSERT advances it), index-backed by `idx_entries_mutation_seq`, and
     # degrades to 0 where the column is absent (old fixtures) — byte-identical.
+    # Deliberately `MAX(mutation_seq)`, NOT the `cache_meta` counter the reconciles
+    # read via `_entry_mutation_seq` (this conn is a project-detail view without a
+    # `cache_meta` surface). The two are consistent — the counter is always
+    # >= MAX(mutation_seq), and no row exists strictly between them at read time —
+    # so do not "unify" them here (the divergence is intentional; see #270 §M3-1).
     try:
         cur = conn.execute(
             "SELECT COALESCE(MAX(mutation_seq), 0) FROM session_entries"
