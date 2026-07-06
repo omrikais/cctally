@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.62.0] - 2026-07-06
+
 ### Changed
 - Dashboard warm rebuilds are materially faster on very large histories: the Daily, Weekly, Monthly, and Projects panels now fold only new activity into the current period each refresh instead of re-summing the whole open period, a `record-usage` write no longer forces a full projects rebuild, and on weeks with an in-place credit the pre-credit segment of the Weekly panel is now computed once and reused instead of being re-summed on every refresh. Output is unchanged (#271).
 - The dashboard's cache-report card is now the last panel to join the warm-refresh fast path: each closed day's cache-savings breakdown is computed once and reused, so a live refresh recomputes only today instead of re-reading and re-folding the whole 14-day window every time — a large chunk of the remaining per-refresh work on big histories. This holds even when the trailing two weeks contain a day with no activity (a weekend or a day off): a quiet day is remembered as quiet, so it no longer forces the card back onto the slow full-window path on every refresh. The card's per-project net-savings values shift by a negligible floating-point amount as a side effect of the order-independent fold this relies on; everything else is unchanged (#272).
