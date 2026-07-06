@@ -817,3 +817,126 @@ def test_aggregate_cache_breakdown_none_project_collapses_to_unknown():
     )
     assert len(rows) == 1
     assert rows[0].key == "(unknown)"
+
+
+# ---------------------------------------------------------------------------
+# #272 §4 — the two-level `by_project` fold (grouping-invariant `stable_sum`).
+#
+# `aggregate_by_day_project` buckets RAW entries by (display-tz day, project);
+# the per-(day,project) net is a `stable_sum` over that group's per-entry nets.
+# `combine_day_project_partials` `stable_sum`s each project's day-partials into
+# the window by_project rows. The canonical by_project net is therefore a fully
+# order- and grouping-invariant two-level `stable_sum`.
+# ---------------------------------------------------------------------------
+
+_UTC = ZoneInfo("Etc/UTC")
+
+
+def _bp_entry(
+    *, day: str, project: str, model: str = "claude-sonnet-4-6",
+    cache_creation: int = 0, cache_read: int = 0, input_tokens: int = 0,
+    hour: int = 12,
+) -> SimpleNamespace:
+    """A raw ``_JoinedClaudeEntry``-shaped object for the two-level fold.
+
+    ``aggregate_by_day_project`` reads ``timestamp`` (aware UTC), ``model``,
+    ``project_path``, ``input_tokens``, ``cache_creation_tokens``,
+    ``cache_read_tokens`` as flat attributes. ``day`` is a ``YYYY-MM-DD``
+    string; the timestamp is placed at ``hour``:00 UTC so the display-tz-UTC
+    bucket date is deterministic regardless of host tz.
+    """
+    y, m, d = (int(x) for x in day.split("-"))
+    return SimpleNamespace(
+        timestamp=dt.datetime(y, m, d, hour, 0, tzinfo=dt.timezone.utc),
+        model=model,
+        project_path=project,
+        input_tokens=input_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+    )
+
+
+def _bp_dataset() -> list[SimpleNamespace]:
+    """Two projects across two days, each with several entries so the
+    per-(day,project) net is a multi-term ``stable_sum`` (non-vacuous:
+    the flat left-fold and the two-level fold differ at the ULP)."""
+    rows = [
+        # (day, project, cache_creation, cache_read, input)
+        ("2026-01-01", "/a", 300_000, 100_000, 40_000),
+        ("2026-01-01", "/a", 111_111, 222_222, 3_333),
+        ("2026-01-01", "/b", 250_000, 90_000, 12_000),
+        ("2026-01-02", "/a", 210_000, 80_000, 7_000),
+        ("2026-01-02", "/a", 33_333, 77_777, 999),
+        ("2026-01-02", "/b", 260_000, 70_000, 5_000),
+        ("2026-01-02", "/b", 41_000, 59_000, 4_000),
+    ]
+    return [
+        _bp_entry(
+            day=day, project=proj, cache_creation=cc, cache_read=cr,
+            input_tokens=it,
+        )
+        for (day, proj, cc, cr, it) in rows
+    ]
+
+
+def test_aggregate_by_day_project_two_level_matches_direct_stable_sum():
+    """The two-level fold equals a direct two-level ``stable_sum`` over each
+    project's per-entry nets (per-day ``stable_sum``, then across days)."""
+    from collections import defaultdict
+
+    entries = _bp_dataset()
+    pricing = _PRICING_SONNET
+    partials = crk.aggregate_by_day_project(entries, display_tz=_UTC, pricing=pricing)
+    combined = crk.combine_day_project_partials(partials)
+
+    tz = crk._resolve_bucket_tz(_UTC)
+    by_day_proj: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for e in entries:
+        _s, _w, net = crk._compute_entry_cache_dollars(
+            e.model, e.cache_creation_tokens, e.cache_read_tokens, pricing=pricing,
+        )
+        day = e.timestamp.astimezone(tz).strftime("%Y-%m-%d")
+        by_day_proj[(day, e.project_path)].append(net)
+    proj_totals: dict[str, list[float]] = defaultdict(list)
+    for (_day, proj), nets in by_day_proj.items():
+        proj_totals[proj].append(crk.stable_sum(nets))
+    expected = {p: crk.stable_sum(v) for p, v in proj_totals.items()}
+
+    got = {r.key: r.net_usd for r in combined}
+    # Exact float equality — the two-level fold is deterministic.
+    assert got == expected
+    # Non-vacuity guard: the nets are actually non-zero on both projects.
+    assert all(v != 0.0 for v in got.values())
+    assert set(got) == {"/a", "/b"}
+
+
+def test_aggregate_by_day_project_grouping_invariant_to_input_order():
+    """Reversing the input entry order leaves the two-level fold's per-project
+    ``net_usd`` byte-identical (order-independent by construction)."""
+    entries = _bp_dataset()
+    shuffled = list(entries)
+    shuffled.reverse()
+    a = crk.combine_day_project_partials(
+        crk.aggregate_by_day_project(entries, display_tz=_UTC, pricing=_PRICING_SONNET)
+    )
+    b = crk.combine_day_project_partials(
+        crk.aggregate_by_day_project(shuffled, display_tz=_UTC, pricing=_PRICING_SONNET)
+    )
+    assert {r.key: r.net_usd for r in a} == {r.key: r.net_usd for r in b}
+
+
+def test_aggregate_by_day_project_skips_synthetic():
+    """``skip_synthetic=True`` drops ``<synthetic>``-model entries from the
+    per-(day,project) partials (matches the by_project contract)."""
+    entries = [
+        _bp_entry(day="2026-01-01", project="/a",
+                  cache_creation=300_000, cache_read=100_000, input_tokens=5_000),
+        _bp_entry(day="2026-01-01", project="/a", model="<synthetic>",
+                  cache_creation=999_999, cache_read=999_999, input_tokens=999_999),
+    ]
+    partials = crk.aggregate_by_day_project(entries, display_tz=_UTC, pricing=_PRICING_SONNET)
+    p = partials["2026-01-01"]["/a"]
+    # Only the non-synthetic entry contributes to /a's tokens.
+    assert p.cache_creation_tokens == 300_000
+    assert p.cache_read_tokens == 100_000
+    assert p.input_tokens == 5_000

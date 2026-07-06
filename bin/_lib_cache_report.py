@@ -175,6 +175,23 @@ class _Bucket:
     net_usd: float = 0.0
 
 
+@dataclass(frozen=True)
+class _ProjectPartial:
+    """One (day, project) net-$/token partial — a frozen cache primitive (#272 §4).
+
+    Produced by ``aggregate_by_day_project`` and combined across days by
+    ``combine_day_project_partials``. ``net_usd`` is a ``stable_sum`` over
+    that (day, project) group's per-entry nets (order-independent); the
+    token components are associative int sums. Frozen so a cached day
+    (§5) can hold a tuple of these without any risk of tick-to-tick
+    mutation (F7).
+    """
+    net_usd: float
+    input_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+
+
 def _compute_cache_hit_percent(
     input_tokens: int,
     cache_creation_tokens: int,
@@ -696,6 +713,41 @@ def _classify_anomalies(
 # Window-wide breakdown aggregator (by-project / by-model dedup)
 # ---------------------------------------------------------------------------
 
+def _finalize_breakdown_rows(
+    rows: list["CacheBreakdownRow"],
+    *,
+    top_n: int = 5,
+    other_label: str = "(other)",
+) -> tuple["CacheBreakdownRow", ...]:
+    """Sort by ``abs(net_usd)`` desc, keep ``top_n``, fold the tail into ``(other)``.
+
+    Shared by ``_aggregate_cache_breakdown``,
+    ``_aggregate_cache_breakdown_from_rows``, and
+    ``combine_day_project_partials`` (#272 §4) so the sort / top-N /
+    ``(other)`` contract lives in one place. Byte-identical to the prior
+    inline tail: the ``(other)`` net is a ``stable_sum`` over the tail's
+    per-row nets and its ``cache_hit_percent`` is the true aggregate over
+    the tail's summed token components (EFF-4).
+    """
+    rows.sort(key=lambda r: abs(r.net_usd), reverse=True)
+    if len(rows) <= top_n:
+        return tuple(rows)
+    head = rows[:top_n]
+    tail = rows[top_n:]
+    other_net = stable_sum(r.net_usd for r in tail)
+    tail_input = sum(r.input_tokens for r in tail)
+    tail_creation = sum(r.cache_creation_tokens for r in tail)
+    tail_read = sum(r.cache_read_tokens for r in tail)
+    other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
+    head.append(CacheBreakdownRow(
+        key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
+        input_tokens=tail_input,
+        cache_creation_tokens=tail_creation,
+        cache_read_tokens=tail_read,
+    ))
+    return tuple(head)
+
+
 def _aggregate_cache_breakdown(
     entries: Iterable,
     *,
@@ -762,26 +814,7 @@ def _aggregate_cache_breakdown(
             cache_creation_tokens=b.cache_creation_tokens,
             cache_read_tokens=b.cache_read_tokens,
         ))
-    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
-    if len(out) <= top_n:
-        return tuple(out)
-    head = out[:top_n]
-    tail = out[top_n:]
-    other_net = stable_sum(r.net_usd for r in tail)
-    # True aggregate hit % over the tail buckets — sum directly from the
-    # CacheBreakdownRow token fields (EFF-4 — avoids the previous triple
-    # walk over ``buckets.items()``).
-    tail_input = sum(r.input_tokens for r in tail)
-    tail_creation = sum(r.cache_creation_tokens for r in tail)
-    tail_read = sum(r.cache_read_tokens for r in tail)
-    other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
-    head.append(CacheBreakdownRow(
-        key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
-        input_tokens=tail_input,
-        cache_creation_tokens=tail_creation,
-        cache_read_tokens=tail_read,
-    ))
-    return tuple(head)
+    return _finalize_breakdown_rows(out, top_n=top_n, other_label=other_label)
 
 
 def _aggregate_cache_breakdown_from_rows(
@@ -830,23 +863,104 @@ def _aggregate_cache_breakdown_from_rows(
             cache_creation_tokens=b.cache_creation_tokens,
             cache_read_tokens=b.cache_read_tokens,
         ))
-    out.sort(key=lambda r: abs(r.net_usd), reverse=True)
-    if len(out) <= top_n:
-        return tuple(out)
-    head = out[:top_n]
-    tail = out[top_n:]
-    other_net = stable_sum(r.net_usd for r in tail)
-    tail_input = sum(r.input_tokens for r in tail)
-    tail_creation = sum(r.cache_creation_tokens for r in tail)
-    tail_read = sum(r.cache_read_tokens for r in tail)
-    other_pct = _compute_cache_hit_percent(tail_input, tail_creation, tail_read)
-    head.append(CacheBreakdownRow(
-        key=other_label, cache_hit_percent=other_pct, net_usd=other_net,
-        input_tokens=tail_input,
-        cache_creation_tokens=tail_creation,
-        cache_read_tokens=tail_read,
-    ))
-    return tuple(head)
+    return _finalize_breakdown_rows(out, top_n=top_n, other_label=other_label)
+
+
+# ---------------------------------------------------------------------------
+# Two-level by_project fold (grouping-invariant; dashboard-only) — #272 §4
+# ---------------------------------------------------------------------------
+
+def aggregate_by_day_project(
+    entries: "Iterable",
+    *,
+    display_tz: "ZoneInfo | None",
+    pricing: dict,
+    skip_synthetic: bool = True,
+) -> "dict[str, dict[str, _ProjectPartial]]":
+    """Per-(display-tz day, project) net-$/token partials (#272 §4).
+
+    Groups RAW entries (each carrying ``.project_path`` / ``.model`` /
+    ``.cache_*`` / ``.input_tokens`` / ``.timestamp``) by (day, project).
+    The per-(day, project) ``net_usd`` is a ``stable_sum`` over that
+    group's per-entry nets so it is order-independent
+    (``get_claude_session_entries`` orders by ``timestamp_utc`` only, with
+    no ``id`` tiebreak). Token components are associative int sums. Drops
+    ``<synthetic>``-model entries when ``skip_synthetic`` (matches the
+    by_project contract; the day-row ``model_breakdowns`` deliberately keep
+    ``<synthetic>``). Day key uses ``_resolve_bucket_tz(display_tz)`` —
+    identical to ``_aggregate_cache_by_day``, so keys align with
+    ``CacheRow.date`` / the builder's ``kept_dates``.
+    """
+    tz = _resolve_bucket_tz(display_tz)
+    nets: dict[tuple[str, str], list[float]] = {}
+    toks: dict[tuple[str, str], list[int]] = {}  # [input, creation, read]
+    for e in entries:
+        model = getattr(e, "model", "")
+        if skip_synthetic and model == "<synthetic>":
+            continue
+        day_key = e.timestamp.astimezone(tz).strftime("%Y-%m-%d")
+        proj = getattr(e, "project_path", None) or "(unknown)"
+        k = (day_key, proj)
+        create_tok = getattr(e, "cache_creation_tokens", 0)
+        read_tok = getattr(e, "cache_read_tokens", 0)
+        _s, _w, net = _compute_entry_cache_dollars(
+            model, create_tok, read_tok, pricing=pricing,
+        )
+        nets.setdefault(k, []).append(net)
+        t = toks.setdefault(k, [0, 0, 0])
+        t[0] += getattr(e, "input_tokens", 0)
+        t[1] += create_tok
+        t[2] += read_tok
+    out: dict[str, dict[str, _ProjectPartial]] = {}
+    for (day_key, proj), net_list in nets.items():
+        t = toks[(day_key, proj)]
+        out.setdefault(day_key, {})[proj] = _ProjectPartial(
+            net_usd=stable_sum(net_list),
+            input_tokens=t[0],
+            cache_creation_tokens=t[1],
+            cache_read_tokens=t[2],
+        )
+    return out
+
+
+def combine_day_project_partials(
+    partials_by_date: "dict[str, dict[str, _ProjectPartial]]",
+    *,
+    top_n: int = 5,
+    other_label: str = "(other)",
+) -> tuple["CacheBreakdownRow", ...]:
+    """Combine per-(day, project) partials into the window by_project rows (#272 §4).
+
+    Per project: ``stable_sum`` its day-partials' ``net_usd`` across the
+    given dates (byte-identical whether the dates come from a fresh
+    full-window fold or a per-day cache), int-sum its token components,
+    compute ``cache_hit_percent`` once, then the shared top-N / ``(other)``
+    fold. Dates are iterated in sorted order so the by_project map's
+    insertion order is deterministic (warm == cold); with order-independent
+    partials this only affects exact-``abs(net)`` tie ordering, which the
+    stable sort then resolves identically on both paths.
+    """
+    net_lists: dict[str, list[float]] = {}
+    tok: dict[str, list[int]] = {}  # [input, creation, read]
+    for day_key in sorted(partials_by_date):
+        for proj, p in partials_by_date[day_key].items():
+            net_lists.setdefault(proj, []).append(p.net_usd)
+            t = tok.setdefault(proj, [0, 0, 0])
+            t[0] += p.input_tokens
+            t[1] += p.cache_creation_tokens
+            t[2] += p.cache_read_tokens
+    rows: list[CacheBreakdownRow] = []
+    for proj, nets in net_lists.items():
+        t = tok[proj]
+        rows.append(CacheBreakdownRow(
+            key=proj,
+            cache_hit_percent=_compute_cache_hit_percent(t[0], t[1], t[2]),
+            net_usd=stable_sum(nets),
+            input_tokens=t[0],
+            cache_creation_tokens=t[1],
+            cache_read_tokens=t[2],
+        ))
+    return _finalize_breakdown_rows(rows, top_n=top_n, other_label=other_label)
 
 
 # ---------------------------------------------------------------------------

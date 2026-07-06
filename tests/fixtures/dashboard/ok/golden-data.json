@@ -158,24 +158,24 @@
       },
       {
         "anchor": "heuristic",
-        "cost_usd": 2.88,
+        "cost_usd": 8.642283149999999,
         "end_at": "2026-04-15T13:00:00+00:00",
         "is_active": false,
         "label": "08:00 Apr 15 UTC",
         "models": [
           {
+            "chip": "sonnet",
+            "cost_pct": 79.17217049293276,
+            "cost_usd": 6.84228315,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
             "chip": "opus",
-            "cost_pct": 62.5,
+            "cost_pct": 20.827829507067243,
             "cost_usd": 1.8,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
-          },
-          {
-            "chip": "sonnet",
-            "cost_pct": 37.50000000000001,
-            "cost_usd": 1.08,
-            "display": "sonnet-4-6",
-            "model": "claude-sonnet-4-6"
           }
         ],
         "start_at": "2026-04-15T08:00:00+00:00"
@@ -254,22 +254,22 @@
       },
       {
         "anchor": "heuristic",
-        "cost_usd": 2.88,
+        "cost_usd": 3.3384261000000004,
         "end_at": "2026-04-14T17:00:00+00:00",
         "is_active": false,
         "label": "12:00 Apr 14 UTC",
         "models": [
           {
             "chip": "opus",
-            "cost_pct": 62.5,
+            "cost_pct": 53.917623037993856,
             "cost_usd": 1.8,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
           },
           {
             "chip": "sonnet",
-            "cost_pct": 37.50000000000001,
-            "cost_usd": 1.08,
+            "cost_pct": 46.08237696200614,
+            "cost_usd": 1.5384261000000001,
             "display": "sonnet-4-6",
             "model": "claude-sonnet-4-6"
           }
@@ -278,24 +278,24 @@
       },
       {
         "anchor": "heuristic",
-        "cost_usd": 2.88,
+        "cost_usd": 7.9135355999999994,
         "end_at": "2026-04-14T12:00:00+00:00",
         "is_active": false,
         "label": "07:00 Apr 14 UTC",
         "models": [
           {
+            "chip": "sonnet",
+            "cost_pct": 77.25416184391715,
+            "cost_usd": 6.1135356,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
             "chip": "opus",
-            "cost_pct": 62.5,
+            "cost_pct": 22.745838156082854,
             "cost_usd": 1.8,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
-          },
-          {
-            "chip": "sonnet",
-            "cost_pct": 37.50000000000001,
-            "cost_usd": 1.08,
-            "display": "sonnet-4-6",
-            "model": "claude-sonnet-4-6"
           }
         ],
         "start_at": "2026-04-14T07:00:00+00:00"
@@ -373,17 +373,17 @@
         "start_at": "2026-04-13T16:00:00+00:00"
       }
     ],
-    "total_cost_usd": 37.949999999999996,
-    "total_tokens": 6214000
+    "total_cost_usd": 49.20424485,
+    "total_tokens": 10583771
   },
   "cache_report": {
     "anomaly_threshold_pp": 15,
     "anomaly_window_days": 14,
     "by_model": [
       {
-        "cache_hit_percent": 0.0,
+        "cache_hit_percent": 14.057872078994823,
         "key": "claude-sonnet-4-6",
-        "net_usd": 0.0
+        "net_usd": 2.25106815
       },
       {
         "cache_hit_percent": 0.0,
@@ -392,6 +392,16 @@
       }
     ],
     "by_project": [
+      {
+        "cache_hit_percent": 45.325312536906786,
+        "key": "/fake/repos/cache-heavy",
+        "net_usd": 2.7829681500000003
+      },
+      {
+        "cache_hit_percent": 5.081495685522531,
+        "key": "/fake/repos/cache-waste",
+        "net_usd": -0.5319
+      },
       {
         "cache_hit_percent": 0.0,
         "key": "/fake/repos/project-2",
@@ -409,12 +419,7 @@
       },
       {
         "cache_hit_percent": 0.0,
-        "key": "/fake/repos/project-4",
-        "net_usd": 0.0
-      },
-      {
-        "cache_hit_percent": 0.0,
-        "key": "/fake/repos/fixture-demo",
+        "key": "(other)",
         "net_usd": 0.0
       }
     ],
@@ -435,28 +440,28 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
-        "cache_creation_tokens": 0,
-        "cache_hit_percent": 0.0,
-        "cache_read_tokens": 0,
+        "cache_creation_tokens": 1342871,
+        "cache_hit_percent": 16.718000847835725,
+        "cache_read_tokens": 691723,
         "date": "2026-04-15",
-        "input_tokens": 2000000,
-        "net_usd": 0.0,
-        "output_tokens": 320000,
-        "saved_usd": 0.0,
-        "wasted_usd": 0.0
+        "input_tokens": 2103000,
+        "net_usd": 0.8604988499999999,
+        "output_tokens": 334000,
+        "saved_usd": 1.8676521000000001,
+        "wasted_usd": 1.00715325
       },
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
-        "cache_creation_tokens": 0,
-        "cache_hit_percent": 0.0,
-        "cache_read_tokens": 0,
+        "cache_creation_tokens": 1220988,
+        "cache_hit_percent": 20.940228874598972,
+        "cache_read_tokens": 854189,
         "date": "2026-04-14",
-        "input_tokens": 1880000,
-        "net_usd": 0.0,
-        "output_tokens": 300000,
-        "saved_usd": 0.0,
-        "wasted_usd": 0.0
+        "input_tokens": 2004000,
+        "net_usd": 1.3905693000000001,
+        "output_tokens": 319000,
+        "saved_usd": 2.3063103000000003,
+        "wasted_usd": 0.915741
       },
       {
         "anomaly_reasons": [],
@@ -485,11 +490,11 @@
         "wasted_usd": 0.0
       }
     ],
-    "fourteen_day_counterfactual_usd": 0.0,
-    "fourteen_day_efficiency_ratio": 0.0,
+    "fourteen_day_counterfactual_usd": 4.173962400000001,
+    "fourteen_day_efficiency_ratio": 0.6846089123647019,
     "is_empty": false,
     "seven_day_anomaly_count": 0,
-    "seven_day_net_usd": 0.0,
+    "seven_day_net_usd": 2.25106815,
     "today": {
       "anomaly_reasons": [],
       "anomaly_triggered": false,
@@ -505,7 +510,7 @@
     "window_days": 14
   },
   "current_week": {
-    "dollar_per_pct": 0.9487500000000002,
+    "dollar_per_pct": 1.2301061212500004,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -800,7 +805,7 @@
     ],
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
-    "spent_usd": 37.95000000000001,
+    "spent_usd": 49.204244850000016,
     "used_pct": 40.0
   },
   "daily": {
@@ -811,8 +816,8 @@
     "quantile_thresholds": [
       5.0600000000000005,
       5.19,
-      14.399999999999997,
       19.32,
+      20.16228315,
       21.6
     ],
     "rows": [
@@ -846,62 +851,62 @@
         "total_tokens": 878000
       },
       {
-        "cache_creation_tokens": 0,
-        "cache_hit_pct": 0.0,
-        "cache_read_tokens": 0,
-        "cost_usd": 14.399999999999997,
+        "cache_creation_tokens": 1342871,
+        "cache_hit_pct": 16.718000847835725,
+        "cache_read_tokens": 691723,
+        "cost_usd": 20.16228315,
         "date": "2026-04-15",
-        "input_tokens": 2000000,
-        "intensity_bucket": 3,
+        "input_tokens": 2103000,
+        "intensity_bucket": 4,
         "is_today": false,
         "label": "04-15",
         "models": [
           {
+            "chip": "sonnet",
+            "cost_pct": 55.36219815462715,
+            "cost_usd": 11.16228315,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
             "chip": "opus",
-            "cost_pct": 62.50000000000002,
+            "cost_pct": 44.63780184537286,
             "cost_usd": 9.000000000000002,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
-          },
-          {
-            "chip": "sonnet",
-            "cost_pct": 37.500000000000014,
-            "cost_usd": 5.4,
-            "display": "sonnet-4-6",
-            "model": "claude-sonnet-4-6"
           }
         ],
-        "output_tokens": 320000,
-        "total_tokens": 2320000
+        "output_tokens": 334000,
+        "total_tokens": 4471594
       },
       {
-        "cache_creation_tokens": 0,
-        "cache_hit_pct": 0.0,
-        "cache_read_tokens": 0,
-        "cost_usd": 13.299999999999999,
+        "cache_creation_tokens": 1220988,
+        "cache_hit_pct": 20.940228874598972,
+        "cache_read_tokens": 854189,
+        "cost_usd": 18.7919617,
         "date": "2026-04-14",
-        "input_tokens": 1880000,
+        "input_tokens": 2004000,
         "intensity_bucket": 2,
         "is_today": false,
         "label": "04-14",
         "models": [
           {
+            "chip": "sonnet",
+            "cost_pct": 57.96074871736248,
+            "cost_usd": 10.8919617,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
             "chip": "opus",
-            "cost_pct": 59.39849624060152,
+            "cost_pct": 42.039251282637515,
             "cost_usd": 7.900000000000001,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
-          },
-          {
-            "chip": "sonnet",
-            "cost_pct": 40.6015037593985,
-            "cost_usd": 5.4,
-            "display": "sonnet-4-6",
-            "model": "claude-sonnet-4-6"
           }
         ],
-        "output_tokens": 300000,
-        "total_tokens": 2180000
+        "output_tokens": 319000,
+        "total_tokens": 4398177
       },
       {
         "cache_creation_tokens": 0,
@@ -1313,7 +1318,7 @@
         "cost_usd": 19.32,
         "date": "2026-03-18",
         "input_tokens": 3220000,
-        "intensity_bucket": 4,
+        "intensity_bucket": 3,
         "is_today": false,
         "label": "03-18",
         "models": [
@@ -1329,8 +1334,8 @@
         "total_tokens": 3864000
       }
     ],
-    "total_cost_usd": 122.91,
-    "total_tokens": 23206000
+    "total_cost_usd": 134.16424485000002,
+    "total_tokens": 27575771
   },
   "dashboard_prefs": {
     "cache_failure_markers": true,
@@ -1345,20 +1350,20 @@
   "doctor": "__DOCTOR_BLOCK__",
   "envelope_version": 2,
   "forecast": {
-    "budget_100_per_day_usd": 14.231250000000003,
-    "budget_90_per_day_usd": 11.859375000000002,
+    "budget_100_per_day_usd": 18.451591818750007,
+    "budget_90_per_day_usd": 15.376326515625005,
     "confidence": "high",
     "confidence_score": 7,
     "explain": {
       "budget": [
         {
-          "dollars_per_day": 14.23125,
+          "dollars_per_day": 18.451592,
           "pct_headroom": 60.0,
           "percent_per_day": 15.0,
           "target_percent": 100
         },
         {
-          "dollars_per_day": 11.859375,
+          "dollars_per_day": 15.376327,
           "pct_headroom": 50.0,
           "percent_per_day": 12.5,
           "target_percent": 90
@@ -1368,7 +1373,7 @@
         "five_hour_percent": null,
         "latest_snapshot_at": "2026-04-16T14:00:00Z",
         "snapshot_count": 7,
-        "spent_usd": 37.95,
+        "spent_usd": 49.204245,
         "weekly_percent": 40.0
       },
       "forecast": {
@@ -1386,7 +1391,7 @@
         "tool_version": "forecast-v1"
       },
       "rates": {
-        "dollars_per_percent": 0.94875,
+        "dollars_per_percent": 1.230106,
         "dollars_per_percent_source": "this_week",
         "recent_24h_pct_per_hour": 0.533333,
         "week_average_pct_per_hour": 0.555556
@@ -1406,7 +1411,7 @@
   },
   "generated_at": "__NOW__",
   "header": {
-    "dollar_per_pct": 0.9487500000000002,
+    "dollar_per_pct": 1.2301061212500004,
     "five_hour_pct": null,
     "forecast_pct": 93.33333333333334,
     "forecast_verdict": "ok",
@@ -1419,31 +1424,31 @@
   "monthly": {
     "rows": [
       {
-        "cache_creation_tokens": 0,
-        "cache_read_tokens": 0,
-        "cost_usd": 81.99,
-        "delta_cost_pct": -0.030851029462802545,
-        "input_tokens": 12700000,
+        "cache_creation_tokens": 2563859,
+        "cache_read_tokens": 1545912,
+        "cost_usd": 93.24424484999999,
+        "delta_cost_pct": 0.10217787419070458,
+        "input_tokens": 12927000,
         "is_current": true,
         "label": "2026-04",
         "models": [
           {
             "chip": "sonnet",
-            "cost_pct": 72.37467983900474,
-            "cost_usd": 59.33999999999998,
+            "cost_pct": 75.70895658339388,
+            "cost_usd": 70.59424484999998,
             "display": "sonnet-4-6",
             "model": "claude-sonnet-4-6"
           },
           {
             "chip": "opus",
-            "cost_pct": 27.625320160995248,
+            "cost_pct": 24.291043416606108,
             "cost_usd": 22.650000000000002,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
           }
         ],
-        "output_tokens": 2322000,
-        "total_tokens": 15022000
+        "output_tokens": 2355000,
+        "total_tokens": 19391771
       },
       {
         "cache_creation_tokens": 0,
@@ -1486,49 +1491,63 @@
         "total_tokens": 8328000
       }
     ],
-    "total_cost_usd": 208.229997,
-    "total_tokens": 40269999
+    "total_cost_usd": 219.48424185,
+    "total_tokens": 44639770
   },
   "projects": {
     "current_week": {
       "rows": [
         {
-          "attributed_pct": 11.383399209486164,
+          "attributed_pct": 8.779730312231383,
           "bucket_path": "/fake/repos/project-2",
           "cost_usd": 10.8,
           "key": "project-2",
           "sessions_count": 6
         },
         {
-          "attributed_pct": 11.383399209486164,
+          "attributed_pct": 8.779730312231383,
           "bucket_path": "/fake/repos/project-4",
           "cost_usd": 10.8,
           "key": "project-4",
           "sessions_count": 6
         },
         {
-          "attributed_pct": 7.968379446640315,
+          "attributed_pct": 6.145811218561967,
           "bucket_path": "/fake/repos/project-1",
           "cost_usd": 7.5600000000000005,
           "key": "project-1",
           "sessions_count": 7
         },
         {
-          "attributed_pct": 6.8300395256916975,
+          "attributed_pct": 6.002201535666894,
+          "bucket_path": "/fake/repos/cache-heavy",
+          "cost_usd": 7.383344849999999,
+          "key": "cache-heavy",
+          "sessions_count": 1
+        },
+        {
+          "attributed_pct": 5.267838187338829,
           "bucket_path": "/fake/repos/project-3",
           "cost_usd": 6.48,
           "key": "project-3",
           "sessions_count": 6
         },
         {
-          "attributed_pct": 2.434782608695652,
+          "attributed_pct": 3.1468016727422645,
+          "bucket_path": "/fake/repos/cache-waste",
+          "cost_usd": 3.8709,
+          "key": "cache-waste",
+          "sessions_count": 1
+        },
+        {
+          "attributed_pct": 1.8778867612272678,
           "bucket_path": "/fake/repos/fixture-demo",
           "cost_usd": 2.31,
           "key": "fixture-demo",
           "sessions_count": 1
         }
       ],
-      "total_cost_usd": 37.95000000000001,
+      "total_cost_usd": 49.204244850000016,
       "week_label": "wk Apr 13",
       "week_start_at": "2026-04-13T00:00:00Z",
       "week_start_date": "2026-04-13"
@@ -1591,7 +1610,7 @@
             null,
             null,
             45.0,
-            11.383399209486164
+            8.779730312231383
           ]
         },
         {
@@ -1650,7 +1669,7 @@
             null,
             42.0,
             null,
-            6.8300395256916975
+            5.267838187338829
           ]
         },
         {
@@ -1709,7 +1728,7 @@
             43.0,
             null,
             null,
-            7.968379446640315
+            6.145811218561967
           ]
         },
         {
@@ -1768,7 +1787,125 @@
             null,
             null,
             null,
-            11.383399209486164
+            8.779730312231383
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/cache-heavy",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-14T10:00:00Z"
+          ],
+          "key": "cache-heavy",
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-15T12:00:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "weekly_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            7.383344849999999
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            6.002201535666894
+          ]
+        },
+        {
+          "bucket_path": "/fake/repos/cache-waste",
+          "first_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-14T10:00:00Z"
+          ],
+          "key": "cache-waste",
+          "last_seen_per_week": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2026-04-15T11:00:00Z"
+          ],
+          "sessions_per_week": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "weekly_cost": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            3.8709
+          ],
+          "weekly_pct": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            3.1468016727422645
           ]
         },
         {
@@ -1827,7 +1964,7 @@
             null,
             null,
             null,
-            2.434782608695652
+            1.8778867612272678
           ]
         }
       ],
@@ -1881,7 +2018,7 @@
           "week_start_date": "2026-04-06"
         },
         {
-          "total_cost_usd": 37.95000000000001,
+          "total_cost_usd": 49.204244850000016,
           "total_pct": 40.0,
           "week_label": "wk Apr 13",
           "week_start_date": "2026-04-13"
@@ -1971,6 +2108,26 @@
         "project_key": "project-3",
         "session_id": "ok-cur-s018-0000-0000-0000-0000-000000000000",
         "started_utc": "2026-04-15T13:00:00Z"
+      },
+      {
+        "cache_hit_pct": 45.3,
+        "cost_usd": 7.3833,
+        "duration_min": 1560,
+        "model": "claude-sonnet-4-6",
+        "project": "cache-heavy",
+        "project_key": "cache-heavy",
+        "session_id": "ok-cache-heavy-0000-0000-0000-000000000000",
+        "started_utc": "2026-04-14T10:00:00Z"
+      },
+      {
+        "cache_hit_pct": 5.1,
+        "cost_usd": 3.8709,
+        "duration_min": 1500,
+        "model": "claude-sonnet-4-6",
+        "project": "cache-waste",
+        "project_key": "cache-waste",
+        "session_id": "ok-cache-waste-0000-0000-0000-000000000000",
+        "started_utc": "2026-04-14T10:00:00Z"
       },
       {
         "cache_hit_pct": 0.0,
@@ -2234,7 +2391,7 @@
       }
     ],
     "sort_key": "started_desc",
-    "total": 34
+    "total": 36
   },
   "sync_age_s": null,
   "transcriptsEnabled": true,
@@ -2396,32 +2553,32 @@
   "weekly": {
     "rows": [
       {
-        "cache_creation_tokens": 0,
-        "cache_read_tokens": 0,
-        "cost_usd": 37.95000000000001,
-        "delta_cost_pct": 0.6557591623036653,
-        "dollar_per_pct": 0.9487500000000002,
-        "input_tokens": 5360000,
+        "cache_creation_tokens": 2563859,
+        "cache_read_tokens": 1545912,
+        "cost_usd": 49.204244850000016,
+        "delta_cost_pct": 1.146782061518325,
+        "dollar_per_pct": 1.2301061212500004,
+        "input_tokens": 5587000,
         "is_current": true,
         "label": "04-13",
         "models": [
           {
+            "chip": "sonnet",
+            "cost_pct": 53.967386210175725,
+            "cost_usd": 26.55424485000001,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
             "chip": "opus",
-            "cost_pct": 59.68379446640315,
+            "cost_pct": 46.03261378982426,
             "cost_usd": 22.650000000000002,
             "display": "opus-4-7",
             "model": "claude-opus-4-7"
-          },
-          {
-            "chip": "sonnet",
-            "cost_pct": 40.31620553359683,
-            "cost_usd": 15.3,
-            "display": "sonnet-4-6",
-            "model": "claude-sonnet-4-6"
           }
         ],
-        "output_tokens": 854000,
-        "total_tokens": 6214000,
+        "output_tokens": 887000,
+        "total_tokens": 10583771,
         "used_pct": 40.0,
         "week_end_at": "2026-04-20T14:00:00Z",
         "week_start_at": "2026-04-13T14:00:00Z"
@@ -2619,7 +2776,7 @@
         "week_start_at": "2026-02-16T14:00:00Z"
       }
     ],
-    "total_cost_usd": 208.22999700000003,
-    "total_tokens": 40269999
+    "total_cost_usd": 219.48424185000002,
+    "total_tokens": 44639770
   }
 }

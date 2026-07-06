@@ -577,6 +577,56 @@ def build_ok(as_of: dt.datetime) -> None:
                 line_offset_start=next_off,
             )
 
+        # Cache activity (#272 §4 non-vacuity): two distinct project_paths
+        # each with non-zero cache_creation / cache_read across two UTC days,
+        # so the dashboard cache-report by_project two-level ``stable_sum``
+        # fold is exercised non-vacuously. Every other session in this
+        # scenario seeds zero cache tokens, which would make by_project
+        # ``net_usd`` 0.0 everywhere and vacuously test the fold. The two
+        # projects have opposite cache profiles so their window ``net_usd``
+        # values are distinct and non-zero: one read-heavy (positive net,
+        # caching helped) and one creation-heavy (negative net). Each spans
+        # 2026-04-14 and 2026-04-15 (both inside the 14-day cache window and
+        # the current subscription week) with multiple same-day entries so
+        # the within-day per-project net partial is itself a multi-term
+        # ``stable_sum``. The cache-heavy token counts are deliberately
+        # "awkward" (non-round) so the flat running left-fold and the
+        # two-level ``stable_sum`` fold differ by one ULP
+        # (flat 2.78296815 vs two-level 2.7829681500000003): this makes the
+        # #272 §4 fold redefinition load-bearing — reverting the builder to
+        # the old ``_aggregate_cache_breakdown`` flat fold turns this golden
+        # RED, proving the two-level fold is non-vacuously tested.
+        d14 = dt.datetime(2026, 4, 14, tzinfo=dt.timezone.utc)
+        d15 = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)
+        next_off = _seed_session(
+            cache_conn,
+            session_id="ok-cache-heavy-0000-0000-0000-000000000000",
+            project_path="/fake/repos/cache-heavy",
+            model="claude-sonnet-4-6",
+            entries=[
+                (d14 + dt.timedelta(hours=10), 40_000, 6_000, 222_571, 30_991),
+                (d14 + dt.timedelta(hours=11), 22_000, 3_000, 433_509, 296_461),
+                (d14 + dt.timedelta(hours=12), 12_000, 2_000, 64_908, 496_737),
+                (d15 + dt.timedelta(hours=10), 35_000, 5_000, 117_042, 330_630),
+                (d15 + dt.timedelta(hours=11), 18_000, 2_000, 328_956, 305_659),
+                (d15 + dt.timedelta(hours=12), 10_000, 1_000, 496_873, 32_434),
+            ],
+            line_offset_start=next_off,
+        )
+        next_off = _seed_session(
+            cache_conn,
+            session_id="ok-cache-waste-0000-0000-0000-000000000000",
+            project_path="/fake/repos/cache-waste",
+            model="claude-sonnet-4-6",
+            entries=[
+                (d14 + dt.timedelta(hours=10), 30_000, 5_000, 300_000, 20_000),
+                (d14 + dt.timedelta(hours=11), 20_000, 3_000, 200_000, 10_000),
+                (d15 + dt.timedelta(hours=10), 25_000, 4_000, 250_000, 15_000),
+                (d15 + dt.timedelta(hours=11), 15_000, 2_000, 150_000, 8_000),
+            ],
+            line_offset_start=next_off,
+        )
+
         # Deterministic "known id" session for GET /api/session/:id
         # goldens (Task 3.2). Multi-model to exercise primary/secondary
         # role attribution. Distinct project so the golden row is

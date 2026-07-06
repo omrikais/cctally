@@ -2308,17 +2308,19 @@ def build_cache_report_snapshot(
     # cache entry and its corresponding day row always agree on which
     # bucket they belong to.
     kept_dates = frozenset(r.date for r in days if r.date)
-    bucket_tz = display_tz if display_tz is not None else dt.timezone.utc
-    entries_in_window = [
-        e for e in entries
-        if e.timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d") in kept_dates
-    ]
     rows_in_window = [r for r in result.rows if r.date in kept_dates]
-    by_project_rows = crk._aggregate_cache_breakdown(
-        entries_in_window,
-        key_fn=lambda e: (getattr(e, "project_path", None) or "(unknown)"),
-        pricing=pricing,
-        skip_synthetic=True,
+    # by_project via the #272 §4 two-level ``stable_sum`` fold
+    # (grouping-invariant, so a per-day cache can memoize the partials
+    # byte-identically). Feed the FULL window entries and restrict to
+    # ``kept_dates`` at combine time — the per-(day, project) day keys use
+    # ``_resolve_bucket_tz(display_tz)`` (matching ``CacheRow.date`` /
+    # ``kept_dates``), so combining over ``kept_dates`` is exactly the old
+    # ``entries_in_window`` slice, modulo the one-time ULP fold move.
+    _day_proj_partials = crk.aggregate_by_day_project(
+        entries, display_tz=display_tz, pricing=pricing, skip_synthetic=True,
+    )
+    by_project_rows = crk.combine_day_project_partials(
+        {d: _day_proj_partials.get(d, {}) for d in kept_dates}
     )
     by_model_rows = crk._aggregate_cache_breakdown_from_rows(
         rows_in_window,

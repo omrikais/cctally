@@ -7,6 +7,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Dashboard warm rebuilds are materially faster on very large histories: the Daily, Weekly, Monthly, and Projects panels now fold only new activity into the current period each refresh instead of re-summing the whole open period, a `record-usage` write no longer forces a full projects rebuild, and on weeks with an in-place credit the pre-credit segment of the Weekly panel is now computed once and reused instead of being re-summed on every refresh. Output is unchanged (#271).
+- Groundwork toward faster dashboard warm refreshes on very large histories: the cache-report card's per-project net-savings breakdown is now computed so each day's contribution is summed on its own and combined order-independently, letting a later per-day cache reuse closed days unchanged; the only visible effect today is a negligible floating-point shift in per-project net values (#272).
 
 ### Fixed
 - The live dashboard no longer serves a stale value for a past day, week, or month after a streaming message that began in that period finalizes after the period has rolled over — an in-place finalization that reused the same cache row previously slipped the idle-path snapshot check, so the closed period could keep showing its pre-finalization total until the next real change; the dashboard now recomputes the affected period (and no longer double-counts the current period's open bucket in the same situation) (#270).
