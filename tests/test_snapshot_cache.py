@@ -1836,3 +1836,35 @@ def test_reset_cache_report_state_clears(tmp_cache):
         max_id=5, max_seq=5, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
     sc.reset_cache_report_state()
     assert sc._CACHE_REPORT_DAY_CACHE == {} and sc._CACHE_REPORT_LAST_SEEN == {}
+
+
+def test_cache_report_day_evict_before_drops_older_keeps_ge():
+    """`cache_report_day_evict_before(oldest)` drops every cached day strictly
+    `< oldest` (rolled off the trailing window edge) and keeps every `>= oldest`.
+    This is the tail the reconcile's `>= watermark` seq-gated pass never reaches,
+    so on a long-uptime dashboard it would otherwise accrete one frozen unit/day
+    (#275). Non-vacuous: the two `>=` keys survive, so the predicate is a strict
+    `<`, not a blanket clear."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    for d in ("2026-06-28", "2026-06-29", "2026-06-30", "2026-07-01"):
+        sc.cache_report_day_store(d, object())
+    sc.cache_report_day_evict_before("2026-06-30")
+    assert sc.cache_report_day_get("2026-06-28") is None       # < oldest: evicted
+    assert sc.cache_report_day_get("2026-06-29") is None       # < oldest: evicted
+    assert sc.cache_report_day_get("2026-06-30") is not None   # == oldest: kept
+    assert sc.cache_report_day_get("2026-07-01") is not None   # > oldest: kept
+
+
+def test_cache_report_day_evict_before_noop_when_all_ge():
+    """When no cached key is `< oldest` the evict is a no-op — nothing is dropped
+    (the steady state once the window has stopped advancing) (#275)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    for d in ("2026-07-02", "2026-07-03"):
+        sc.cache_report_day_store(d, object())
+    sc.cache_report_day_evict_before("2026-07-01")
+    assert sc.cache_report_day_get("2026-07-02") is not None
+    assert sc.cache_report_day_get("2026-07-03") is not None

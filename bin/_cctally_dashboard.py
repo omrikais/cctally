@@ -2288,6 +2288,16 @@ def build_cache_report_snapshot(
             for d in needed_closed:
                 if d not in built:
                     _sc.cache_report_day_store(d, crk.empty_cached_day(d))
+            # Window-rolloff eviction (#275): the reconcile's seq-gated pass only
+            # evicts CHANGED days (>= the change watermark); days that roll off the
+            # trailing edge of the [since, now] window are never pruned there and
+            # would accrete one frozen unit/day on a long-uptime dashboard. Drop
+            # them here on this rare cold/rollover store tick (the warm path never
+            # reaches this branch). ``needed_closed`` is sorted ascending, so its
+            # first element is the window's oldest still-needed closed day; every
+            # needed day (real or ``is_empty`` sentinel) is >= it and survives.
+            if needed_closed:
+                _sc.cache_report_day_evict_before(needed_closed[0])
 
     if not cached_days:
         return _cache_report_empty(

@@ -1696,6 +1696,25 @@ def cache_report_day_store(date_key, value) -> None:
     _CACHE_REPORT_DAY_CACHE[date_key] = value
 
 
+def cache_report_day_evict_before(oldest_key) -> None:
+    """Drop cached days strictly older than ``oldest_key`` — the window-rolloff
+    tail (#275).
+
+    ``reconcile_cache_report_cache`` only evicts CLOSED days that CHANGED (``>=``
+    the seq-gated change watermark); a day that simply rolls off the trailing edge
+    of the ``[since, now]`` window is never touched by it and would linger in the
+    module dict until a reset / tz-change / ``sf_sig`` / regression full-clear or
+    ``reset_cache_report_state()``. On a long-uptime dashboard that accretes ~1
+    frozen ``CachedCacheReportDay`` per day. ``build_cache_report_snapshot`` calls
+    this on its rare cold/rollover store tick with the window's oldest still-needed
+    closed date, keeping the dict bounded to the live window. Over-eviction is
+    byte-safe (a re-needed day just re-populates on the next cold tick), so the
+    predicate is a plain lexical ``<`` on the ``YYYY-MM-DD`` keys.
+    """
+    for date_key in [d for d in _CACHE_REPORT_DAY_CACHE if d < oldest_key]:
+        del _CACHE_REPORT_DAY_CACHE[date_key]
+
+
 def reconcile_cache_report_cache(
     cache_conn, *, max_entry_id, max_mutation_seq, reset_sig, sf_sig, bucket_tz,
     tz_key,

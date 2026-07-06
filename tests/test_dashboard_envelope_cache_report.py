@@ -542,3 +542,59 @@ def test_build_cache_report_snapshot_breakdowns_match_days_window(monkeypatch):
         f"by_model net {by_model_net} != days net {days_net}; "
         "breakdown is aggregating outside the displayed window"
     )
+
+
+def test_build_cache_report_snapshot_evicts_rolled_out_day(monkeypatch):
+    """#275 fix 2: the cold/rollover store path evicts per-day cache entries that
+    have rolled off the trailing edge of the ``[now-14d, now]`` window.
+
+    A stale far-past day is seeded into ``_CACHE_REPORT_DAY_CACHE`` (as if the
+    dashboard had been up for months), then a cold build runs with
+    ``use_cache_report_cache=True`` — ``have_all`` is False (the live window's
+    closed days aren't cached yet), so the cold store branch fires and prunes the
+    tail. After the build the stale key is gone and a fresh in-window closed day
+    is present.
+
+    Non-vacuous: the reconcile's seq-gated pass only evicts CHANGED days
+    (``>=`` the watermark) and never reaches this far-past key — without the
+    ``cache_report_day_evict_before`` call the stale day would survive the build.
+    """
+    dash, cctally_ns = _bootstrap_dashboard()
+    sc = sys.modules["_lib_snapshot_cache"]
+
+    sc.reset_cache_report_state()
+    stale_key = "2020-01-01"  # far below any live [now-14d, now] window
+    sc.cache_report_day_store(stale_key, object())
+
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    days = [
+        dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc)
+        for d in range(14, 21)  # 2026-05-14 .. 2026-05-20
+    ]
+    entries = [
+        _make_joined_entry(
+            ts_utc=ts, cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100, project_path="/proj/a",
+        )
+        for ts in days
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries", lambda *a, **kw: entries,
+    )
+
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc,
+        anomaly_threshold_pp=15,
+        anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+        use_cache_report_cache=True,
+    )
+
+    assert snap.is_empty is False
+    # The stale rolled-out day is evicted; an in-window closed day is retained.
+    assert sc.cache_report_day_get(stale_key) is None
+    assert sc.cache_report_day_get("2026-05-14") is not None
+    # Sanity: today is never stored as a closed unit.
+    assert sc.cache_report_day_get("2026-05-20") is None
+
+    sc.reset_cache_report_state()  # don't leak module state into sibling tests

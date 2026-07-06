@@ -2603,7 +2603,16 @@ def get_claude_session_entries(
         )
         sql += r" AND se.source_path LIKE ? ESCAPE '\'"
         params.append(f"%/projects/{escaped}/%")
-    sql += " ORDER BY se.timestamp_utc ASC"
+    # Explicit (timestamp_utc, id) tie-break (#275) — the same contract #271 §5
+    # pinned on `get_entries` (see the twin ORDER BY above). `id` is the rowid, so
+    # against `idx_entries_timestamp` (which stores keys as (timestamp_utc, rowid))
+    # this is free at runtime and byte-identical to today's observed order. Pinning
+    # it makes the fold order a total, plan-INDEPENDENT contract: the #272 warm path
+    # folds today over a narrow `[today_start, now]` query while the cold path folds
+    # over the full `[since, now]` query, and both — plus the `+=` day-row fold and
+    # the by_project partials — must agree on equal-timestamp rows regardless of
+    # which plan SQLite picks for either window.
+    sql += " ORDER BY se.timestamp_utc ASC, se.id ASC"
 
     rows = conn.execute(sql, params).fetchall()
 
