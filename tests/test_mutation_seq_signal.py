@@ -279,6 +279,43 @@ def test_rows_changed_not_inflated_by_counter_bump(ingest):
     assert stats.rows_changed == 2
 
 
+def test_two_files_one_sync_get_distinct_consecutive_seq(ingest):
+    """Two files that BOTH write rows in a single `sync_cache` call get DISTINCT,
+    strictly-increasing consecutive mutation_seq stamps ({G, G+1}) — the per-file
+    counter bump lands inside each file's own `if rows:` write transaction, so the
+    counter write is atomic with that file's row stamps and rolls back with it
+    (spec §6). Only per-file monotonicity is load-bearing for the watermark; this
+    nails the consecutive-stamp rationale DIRECTLY (#273), which the two-file
+    truncation dedup tests otherwise exercise only indirectly.
+
+    `glob(**/*.jsonl)` order is not guaranteed, so assert on the value SET keyed by
+    source_path — NOT on which physical file wins the lower seq: each file's rows
+    share exactly ONE seq (one per-file bump), the two seqs are DISTINCT, and they
+    are consecutive."""
+    _, conn, jsonl, sync = ingest
+    other = jsonl.parent / "sess2.jsonl"
+    jsonl.write_text(
+        _assistant_line("a1", "ra1", out_tokens=10)
+        + _assistant_line("a2", "ra2", out_tokens=11)
+    )
+    other.write_text(
+        _assistant_line("b1", "rb1", out_tokens=20)
+        + _assistant_line("b2", "rb2", out_tokens=21)
+    )
+    sync()  # both files grow in ONE sync call
+    by_file: dict[str, set[int]] = {}
+    for source_path, seq in conn.execute(
+        "SELECT source_path, mutation_seq FROM session_entries"
+    ):
+        by_file.setdefault(source_path, set()).add(seq)
+    assert len(by_file) == 2, "both files ingested rows in this one sync"
+    for sp, seqs in by_file.items():
+        assert len(seqs) == 1, f"{sp}: all of a file's rows share ONE per-file seq"
+    stamps = sorted(next(iter(s)) for s in by_file.values())
+    assert stamps[0] != stamps[1], "the two files got DISTINCT stamps"
+    assert stamps[1] == stamps[0] + 1, "distinct AND consecutive (G, G+1)"
+
+
 # ── Carry-forward (M1 review): legacy-row min_ts hardening ────────────────
 #
 # A row written BEFORE the #270 columns existed is `mutation_seq = 0,
