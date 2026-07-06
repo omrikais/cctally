@@ -857,13 +857,20 @@ def _bp_entry(
 
 
 def _bp_dataset() -> list[SimpleNamespace]:
-    """Two projects across two days, each with several entries so the
-    per-(day,project) net is a multi-term ``stable_sum`` (non-vacuous:
-    the flat left-fold and the two-level fold differ at the ULP)."""
+    """Two projects across two days. At least one ``(day, project)`` group has
+    **three** entries whose per-entry nets are genuinely non-associative — the
+    flat left-fold of the ``("2026-01-01", "/a")`` group differs from its
+    ``stable_sum`` at one ULP (``0.8678397`` vs ``0.8678396999999999``). That
+    is what makes ``test_..._within_day_partial_uses_stable_sum`` able to
+    distinguish the Codex-3 within-day ``stable_sum`` from a running ``+=``;
+    two-entry groups alone would be associativity-equivalent and vacuous."""
     rows = [
         # (day, project, cache_creation, cache_read, input)
         ("2026-01-01", "/a", 300_000, 100_000, 40_000),
         ("2026-01-01", "/a", 111_111, 222_222, 3_333),
+        # Third /a entry on day 1 — chosen so the 3-term within-day net fold is
+        # non-associative (flat left-fold != stable_sum); see the docstring.
+        ("2026-01-01", "/a", 11_111, 116_484, 1_777),
         ("2026-01-01", "/b", 250_000, 90_000, 12_000),
         ("2026-01-02", "/a", 210_000, 80_000, 7_000),
         ("2026-01-02", "/a", 33_333, 77_777, 999),
@@ -908,6 +915,51 @@ def test_aggregate_by_day_project_two_level_matches_direct_stable_sum():
     # Non-vacuity guard: the nets are actually non-zero on both projects.
     assert all(v != 0.0 for v in got.values())
     assert set(got) == {"/a", "/b"}
+
+
+def test_aggregate_by_day_project_within_day_partial_uses_stable_sum():
+    """Codex-3: the per-(day,project) net is a ``stable_sum`` of that group's
+    per-entry nets, NOT a running ``+=`` left-fold.
+
+    Guards directly against a within-day fold regression: the
+    ``("2026-01-01", "/a")`` group has three entries whose nets are
+    non-associative, so a ``+=`` implementation would produce the flat
+    left-fold value while ``stable_sum`` produces the correctly-rounded one —
+    the two differ at a ULP. Asserting on the intermediate partial (not the
+    final combined net) makes the check robust to downstream across-day
+    cancellation that can mask the difference in the final total."""
+    entries = _bp_dataset()
+    day1_a_nets = [
+        crk._compute_entry_cache_dollars(
+            e.model, e.cache_creation_tokens, e.cache_read_tokens,
+            pricing=_PRICING_SONNET,
+        )[2]
+        for e in entries
+        if e.project_path == "/a"
+        and e.timestamp.astimezone(crk._resolve_bucket_tz(_UTC)).strftime("%Y-%m-%d")
+        == "2026-01-01"
+    ]
+    assert len(day1_a_nets) == 3
+
+    def _flat_left_fold(xs):
+        acc = 0.0
+        for x in xs:
+            acc += x
+        return acc
+
+    # Guard: the group is genuinely non-associative, so this test can actually
+    # distinguish stable_sum from +=. If a future dataset edit makes these
+    # equal, this assertion fails loudly rather than the test silently going
+    # vacuous.
+    assert _flat_left_fold(day1_a_nets) != crk.stable_sum(day1_a_nets)
+
+    partials = crk.aggregate_by_day_project(
+        entries, display_tz=_UTC, pricing=_PRICING_SONNET,
+    )
+    # The implementation must use stable_sum (order-independent, correctly
+    # rounded), NOT the running += that would equal the flat left-fold.
+    assert partials["2026-01-01"]["/a"].net_usd == crk.stable_sum(day1_a_nets)
+    assert partials["2026-01-01"]["/a"].net_usd != _flat_left_fold(day1_a_nets)
 
 
 def test_aggregate_by_day_project_grouping_invariant_to_input_order():
