@@ -3633,3 +3633,344 @@ def test_projects_env_outer_memo_busts_on_idstable_update(monkeypatch, tmp_path)
     assert key_after[2] > key_before[2], (
         "the entry_mutation_seq memo-key leg must advance"
     )
+
+
+# ===========================================================================
+# #272 — cache-report per-day cache parity (mirrors test_bugk_segment_cache_*).
+#
+# The builder serves CLOSED days from an immutable per-day cache and recomputes
+# only the current (open) day; the warm (cache-served) envelope must be
+# byte-identical to a from-scratch (cache-off) rebuild. Non-vacuous: the fixture
+# seeds real cache activity across 2 projects × 14 closed days so by_project
+# net_usd != 0 AND `have_all` becomes True (the warm today-only-fetch path is
+# genuinely exercised — a stale cache would fail `cached_matches_from_scratch`).
+# NOW_CR is deliberately at noon so `since = now - 14d` straddles midnight →
+# 15 overlapping display dates (Codex-2), exercising the classify-pre-cap set.
+# ===========================================================================
+NOW_CR = dt.datetime(2026, 6, 20, 12, 0, 0, tzinfo=dt.timezone.utc)
+CR_TZ = ZoneInfo("Etc/UTC")
+CR_A_PATH = "/fake/a.jsonl"
+CR_B_PATH = "/fake/b.jsonl"
+
+
+def _seed_cache_report_db(ns, tmp_path, *, second_project_unattributed=False):
+    """Seed cache.db with cache activity across two projects over 14 CLOSED days
+    (2026-06-06 .. 06-19) plus the current open day (06-20), all inside the
+    build's ``[now-14d, now]`` window for NOW_CR.
+
+    Closed-day entries land at 18:00 (after ``since``'s 12:00 time-of-day, so the
+    oldest straddling day 06-06 is IN the window and caches); the current-day
+    entries land at 09:00 (before NOW_CR's 12:00). Distinct per-project seconds
+    keep the two entries' ``timestamp_utc`` non-equal. Returns the closed date
+    keys. With ``second_project_unattributed`` the second project's session_files
+    row is NOT seeded, so its entries LEFT-JOIN to ``project_path=NULL`` →
+    by_project shows ``(unknown)`` until a session_files row is later inserted
+    (Codex-1 re-attribution).
+    """
+    import pathlib
+    import sqlite3
+    import sys as _sys
+
+    _sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import (
+        create_cache_db, seed_session_file, seed_session_entry,
+    )
+
+    share = tmp_path / ".local" / "share" / "cctally"
+    cache_path = share / "cache.db"
+    create_cache_db(cache_path)
+    model = "claude-sonnet-4-5"
+    with sqlite3.connect(cache_path) as cc:
+        seed_session_file(cc, path=CR_A_PATH, session_id="sa", project_path="/pa")
+        if not second_project_unattributed:
+            seed_session_file(cc, path=CR_B_PATH, session_id="sb", project_path="/pb")
+        off = 0
+        for day in range(6, 20):  # 06-06 .. 06-19 (14 closed days)
+            seed_session_entry(
+                cc, source_path=CR_A_PATH, line_offset=off,
+                timestamp_utc=f"2026-06-{day:02d}T18:00:00Z", model=model,
+                input_tokens=1000, output_tokens=200,
+                cache_create=120_000, cache_read=500_000,
+            )
+            off += 1
+            seed_session_entry(
+                cc, source_path=CR_B_PATH, line_offset=off,
+                timestamp_utc=f"2026-06-{day:02d}T18:00:01Z", model=model,
+                input_tokens=1500, output_tokens=300,
+                cache_create=80_000, cache_read=700_000,
+            )
+            off += 1
+        # Current OPEN day (06-20) at 09:00 — before NOW_CR (12:00).
+        seed_session_entry(
+            cc, source_path=CR_A_PATH, line_offset=off,
+            timestamp_utc="2026-06-20T09:00:00Z", model=model,
+            input_tokens=500, output_tokens=80,
+            cache_create=40_000, cache_read=250_000,
+        )
+        off += 1
+        seed_session_entry(
+            cc, source_path=CR_B_PATH, line_offset=off,
+            timestamp_utc="2026-06-20T09:00:01Z", model=model,
+            input_tokens=600, output_tokens=90,
+            cache_create=30_000, cache_read=300_000,
+        )
+    return [f"2026-06-{d:02d}" for d in range(6, 20)]
+
+
+def _build_cache_report(dash, *, use):
+    return dash.build_cache_report_snapshot(
+        now_utc=NOW_CR, anomaly_threshold_pp=15, anomaly_window_days=14,
+        display_tz=CR_TZ, skip_sync=True, use_cache_report_cache=use,
+    )
+
+
+def _cr_reconcile(ns, sc, *, reset_sig=(1, 1)):
+    """Run one `reconcile_cache_report_cache` on a fresh short-lived cache conn,
+    threading the current signature legs (mirrors the TUI reconcile block)."""
+    cconn = ns["open_cache_db"]()
+    try:
+        sc.reconcile_cache_report_cache(
+            cconn,
+            max_entry_id=sc._max_id(cconn, "session_entries"),
+            max_mutation_seq=sc._entry_mutation_seq(cconn),
+            reset_sig=reset_sig,
+            sf_sig=sc.session_files_sig(cconn),
+            bucket_tz=dt.timezone.utc,
+            tz_key="Etc/UTC",
+        )
+    finally:
+        cconn.close()
+
+
+def test_cache_report_cached_matches_from_scratch(monkeypatch, tmp_path):
+    """Warm (cache-served) == from-scratch, byte-identical serialized envelope —
+    non-vacuous (by_project net_usd != 0; 14 closed days actually cached)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path)
+
+    sc.reset_cache_report_state()
+    scratch = _build_cache_report(dash, use=False)
+    sc.reset_cache_report_state()
+    cold = _build_cache_report(dash, use=True)   # primes the cache (full fetch)
+    warm = _build_cache_report(dash, use=True)   # served from cache (today-only)
+
+    to_dict = dash._cache_report_snapshot_to_dict
+    # Non-vacuity: real activity + the cache genuinely populated with closed days.
+    assert scratch.is_empty is False
+    assert any(r.net_usd != 0.0 for r in scratch.by_project), "by_project must be non-zero"
+    assert len(sc._CACHE_REPORT_DAY_CACHE) == 14, "the 14 closed days are cached"
+    assert to_dict(cold) == to_dict(scratch), "cache-on(cold) == from-scratch"
+    assert to_dict(warm) == to_dict(scratch), "cache-on(warm) == from-scratch"
+
+
+def test_cache_report_cache_warm_no_refetch(monkeypatch, tmp_path):
+    """Warm tick fetches ONLY the current day: exactly one narrow
+    [today_start, now] query, NO full-window [since, now] fetch (spy)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path)
+    since = NOW_CR - dt.timedelta(days=14)
+    today_start = dt.datetime(2026, 6, 20, 0, 0, tzinfo=dt.timezone.utc)
+
+    real = ns["get_claude_session_entries"]
+    calls: list = []
+
+    def spy(a, b, **kw):
+        calls.append((a, b))
+        return real(a, b, **kw)
+
+    monkeypatch.setattr(dash, "get_claude_session_entries", spy)
+
+    sc.reset_cache_report_state()
+    cold = _build_cache_report(dash, use=True)
+    # Cold: one full-window fetch (lower bound == since).
+    assert len(calls) == 1, calls
+    assert calls[0][0] == since, "cold build must fetch the full window once"
+
+    calls.clear()
+    warm = _build_cache_report(dash, use=True)
+    # Warm: exactly ONE narrow current-day fetch; no full-window refetch.
+    assert len(calls) == 1, calls
+    assert calls[0][0] == today_start, "warm build must fetch only the current day"
+    assert calls[0][0] != since, "warm build must NOT refetch the full window"
+    assert dash._cache_report_snapshot_to_dict(warm) == \
+        dash._cache_report_snapshot_to_dict(cold)
+
+
+def test_cache_report_cache_late_ingest_recomputes(monkeypatch, tmp_path):
+    """F1 late-ingest: an OLD-timestamp row lands inside a CLOSED cached day →
+    the seq-gated reconcile evicts that day (and later ones) → the next warm
+    build recomputes, byte-identical to a from-scratch pass over the new DB."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib
+    import sqlite3
+    import sys as _sys
+
+    _sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import seed_session_entry
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path)
+
+    sc.reset_cache_report_state()
+    _cr_reconcile(ns, sc)               # cold — records last-seen (seq0)
+    cold = _build_cache_report(dash, use=True)   # primes the cache
+    assert "2026-06-10" in sc._CACHE_REPORT_DAY_CACHE
+    assert "2026-06-09" in sc._CACHE_REPORT_DAY_CACHE
+
+    # Late-ingest an OLD-timestamp row INSIDE the closed 06-10 day; bump + stamp
+    # ONLY the new row so the #270 seq watermark lands on 06-10 (not earlier).
+    cache_path = tmp_path / ".local" / "share" / "cctally" / "cache.db"
+    with sqlite3.connect(cache_path) as cc:
+        seed_session_entry(
+            cc, source_path=CR_A_PATH, line_offset=900,
+            timestamp_utc="2026-06-10T09:00:00Z", model="claude-sonnet-4-5",
+            input_tokens=90_000, output_tokens=20_000,
+            cache_create=300_000, cache_read=1_000_000,
+        )
+        cc.execute(
+            "INSERT INTO cache_meta(key, value) "
+            "VALUES ('session_entries_mutation_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value = CAST(cache_meta.value AS INTEGER) + 1"
+        )
+        seqv = cc.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='session_entries_mutation_seq'"
+        ).fetchone()[0]
+        cc.execute(
+            "UPDATE session_entries SET mutation_seq = ?, "
+            "mutation_min_ts = timestamp_utc "
+            "WHERE source_path = ? AND line_offset = 900",
+            (seqv, CR_A_PATH),
+        )
+
+    _cr_reconcile(ns, sc)               # seq advanced → wm 06-10 → evict >= 06-10
+    assert "2026-06-10" not in sc._CACHE_REPORT_DAY_CACHE, "06-10 evicted"
+    assert "2026-06-09" in sc._CACHE_REPORT_DAY_CACHE, "earlier days survive"
+
+    warm = _build_cache_report(dash, use=True)
+    scratch = _build_cache_report(dash, use=False)
+    to_dict = dash._cache_report_snapshot_to_dict
+    assert to_dict(cold) != to_dict(scratch), "the late row must change the output"
+    assert to_dict(warm) == to_dict(scratch), "post-eviction warm == from-scratch"
+
+
+def test_cache_report_cache_session_files_reattribution(monkeypatch, tmp_path):
+    """Codex-1: a CLOSED day whose session_files attribution moves
+    ``(unknown)``→``/pb`` (via a new session_files row → sf_sig moves) with no
+    session_entries change → the sf_sig full-clear → by_project == from-scratch."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import pathlib
+    import sqlite3
+    import sys as _sys
+
+    _sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import seed_session_file
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    # Second project starts WITHOUT a session_files row → (unknown).
+    _seed_cache_report_db(ns, tmp_path, second_project_unattributed=True)
+
+    cconn = ns["open_cache_db"]()
+    try:
+        sf0 = sc.session_files_sig(cconn)
+    finally:
+        cconn.close()
+
+    sc.reset_cache_report_state()
+    _cr_reconcile(ns, sc)               # cold — records last-seen (sf_sig=sf0)
+    cold = _build_cache_report(dash, use=True)   # primes the cache
+    assert any(r.key == "(unknown)" for r in cold.by_project), \
+        "second project must start unattributed"
+
+    # Attribute /fake/b.jsonl → /pb by INSERTing a session_files row (COUNT+1 →
+    # session_files_sig moves); NO new session_entries, flat max_id/seq.
+    cache_path = tmp_path / ".local" / "share" / "cctally" / "cache.db"
+    with sqlite3.connect(cache_path) as cc:
+        seed_session_file(cc, path=CR_B_PATH, session_id="sb", project_path="/pb")
+
+    cconn = ns["open_cache_db"]()
+    try:
+        assert sc.session_files_sig(cconn) != sf0, "sf_sig must move on the new row"
+    finally:
+        cconn.close()
+    _cr_reconcile(ns, sc)               # sf_sig changed → full-clear
+    assert not sc._CACHE_REPORT_DAY_CACHE, "sf_sig change must full-clear the cache"
+
+    warm = _build_cache_report(dash, use=True)
+    scratch = _build_cache_report(dash, use=False)
+    assert any(r.key == "/pb" for r in scratch.by_project), \
+        "re-attribution must surface /pb from-scratch"
+    assert not any(r.key == "(unknown)" for r in warm.by_project), \
+        "warm must reflect the re-attribution (not stale-serve (unknown))"
+    assert dash._cache_report_snapshot_to_dict(warm) == \
+        dash._cache_report_snapshot_to_dict(scratch)
+
+
+def test_cache_report_cache_window_straddle(monkeypatch, tmp_path):
+    """Codex-2: a since-straddling window yields window_days+1 (=15) display
+    dates; the cached restitch classifies over the FULL set before the `days`
+    cap drops the oldest, and matches from-scratch byte-for-byte."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path)  # NOW_CR (noon) straddles → 15 dates
+
+    sc.reset_cache_report_state()
+    scratch = _build_cache_report(dash, use=False)
+    sc.reset_cache_report_state()
+    cold = _build_cache_report(dash, use=True)   # primes
+    warm = _build_cache_report(dash, use=True)
+
+    to_dict = dash._cache_report_snapshot_to_dict
+    # 15 overlapping display dates (06-06..06-20); the cap keeps the newest 14.
+    assert len(warm.days) == 14
+    assert "2026-06-06" in sc._CACHE_REPORT_DAY_CACHE, \
+        "the oldest straddling day IS cached (Codex-2 non-vacuity)"
+    assert "2026-06-06" not in {d.date for d in warm.days}, \
+        "the oldest straddling day is dropped from the days cap"
+    assert to_dict(cold) == to_dict(scratch)
+    assert to_dict(warm) == to_dict(scratch), \
+        "warm restitch over the full straddling set == from-scratch"
+
+
+def test_cache_report_cache_f7_no_shared_mutation(monkeypatch, tmp_path):
+    """F7: a cached day unit is never mutated tick-to-tick — its object identity
+    and every field are stable across two later rebuilds (the reconstructed rows
+    are fresh objects, so classify never touches the frozen cached primitives)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path)
+
+    sc.reset_cache_report_state()
+    _build_cache_report(dash, use=True)          # cold prime
+    unit = sc.cache_report_day_get("2026-06-10")
+    assert unit is not None
+    captured_net = unit.net_usd
+    captured_pp = unit.project_partials
+
+    _build_cache_report(dash, use=True)          # warm tick (reconstruct+classify)
+    _build_cache_report(dash, use=True)          # another tick
+
+    same = sc.cache_report_day_get("2026-06-10")
+    assert same is unit, "cached day object identity is stable across ticks"
+    assert same.net_usd == captured_net, "cached net_usd is never mutated (F7)"
+    assert same.project_partials is captured_pp, "project_partials tuple identity stable"
+    assert same.project_partials == captured_pp

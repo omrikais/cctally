@@ -2170,6 +2170,13 @@ def _tui_build_snapshot(
         # failed/absent reconcile must fall back to direct compute, never reuse
         # stale segment state.
         use_bugk_segment_cache = False
+        # ── #272: cache-report per-day cache (spec §5/§6) ───────────────────
+        # Same gating: OFF by default, flipped ON only on the dashboard
+        # sync-thread NON-IDLE path after the once-per-rebuild
+        # `reconcile_cache_report_cache` succeeds. Off ⇒ `build_cache_report_snapshot`
+        # fetches + folds the full 14d window every tick (byte-identical to the
+        # cached path). A failed/absent reconcile falls back to full recompute.
+        use_cache_report_cache = False
         # ── Three-path dispatch — idle short-circuit (spec §3, #268 M5.1) ──
         # Compute the composite data-version signature (cheap MAX(id) descents
         # over cache.db + stats.db + the reset-event change-signal + the
@@ -2267,6 +2274,26 @@ def _tui_build_snapshot(
                             reset_sig=dispatch_sig.reset_sig,
                         )
                         use_bugk_segment_cache = True
+                        # #272: reconcile the cache-report per-day cache with the
+                        # SAME short-lived cache conn (its watermark query +
+                        # session_files_sig both live in cache.db), using the
+                        # dispatch-signature legs already computed. `sf_sig`
+                        # closes the lazy-`project_path`-backfill hole (Codex-1);
+                        # `tz_key` full-clears on a display-tz change (every
+                        # calendar-day key shifts). Only after this succeeds does
+                        # `build_cache_report_snapshot` opt into the cache below.
+                        _sc.reconcile_cache_report_cache(
+                            _rc_cache_conn,
+                            max_entry_id=dispatch_sig.max_entry_id,
+                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
+                            reset_sig=dispatch_sig.reset_sig,
+                            sf_sig=_sc.session_files_sig(_rc_cache_conn),
+                            bucket_tz=_cctally()._load_sibling(
+                                "_lib_cache_report"
+                            )._resolve_bucket_tz(_build_display_tz),
+                            tz_key=str(_build_display_tz),
+                        )
+                        use_cache_report_cache = True
                     finally:
                         _rc_cache_conn.close()
                 except Exception as exc:
@@ -2591,6 +2618,7 @@ def _tui_build_snapshot(
                 anomaly_window_days=_dash_mod.CACHE_REPORT_ANOMALY_WINDOW_DAYS,
                 display_tz=_build_display_tz,
                 skip_sync=skip_sync,
+                use_cache_report_cache=use_cache_report_cache,
             )
         except Exception as exc:
             errors.append(f"cache-report: {exc}")

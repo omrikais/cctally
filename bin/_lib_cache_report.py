@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Optional
+from typing import Any, Callable, Iterable, Literal, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
 
@@ -964,6 +964,179 @@ def combine_day_project_partials(
 
 
 # ---------------------------------------------------------------------------
+# Frozen per-day cached unit + build / reconstruct helpers (#272 §5)
+# ---------------------------------------------------------------------------
+
+class _FrozenModelBreakdown(NamedTuple):
+    """Immutable mirror of ``CacheModelBreakdown`` (#272 §5, Codex-4).
+
+    ``CacheModelBreakdown`` is a *mutable* dataclass; a cached day must hold
+    its per-model children as frozen primitives so nothing reachable from a
+    published ``DataSnapshot`` is ever mutated tick-to-tick (F7). Field names
+    and order mirror ``CacheModelBreakdown`` EXACTLY (``:79``) so
+    ``reconstruct_cache_row`` can rebuild an equal mutable child by keyword.
+    """
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    cache_hit_percent: float
+    cost: float
+    saved_usd: float
+    wasted_usd: float
+    net_usd: float
+
+
+@dataclass(frozen=True)
+class CachedCacheReportDay:
+    """One CLOSED day's raw aggregate + per-project partials, frozen (#272 §5).
+
+    Pre-classification: it carries NO ``anomaly_*`` state — those are
+    populated on a freshly reconstructed mutable ``CacheRow`` each tick
+    (``reconstruct_cache_row``), so nothing cached is ever mutated (F7).
+
+    Fields are the non-anomaly day-mode ``CacheRow`` scalars (``:113``) —
+    ``cache_hit_percent`` is a snapshot of the row's derived property (the
+    reconstructed row recomputes it from tokens, so it is informational
+    here) — plus:
+      - ``model_breakdowns``: a tuple of ``_FrozenModelBreakdown`` KEEPING
+        ``<synthetic>`` (the day-row contract; by_model applies its own
+        ``skip_synthetic`` at fold time).
+      - ``project_partials``: a tuple of ``(project_key, _ProjectPartial)``
+        pairs (``skip_synthetic=True`` — the by_project restitch input, §4).
+
+    Day-mode only: the session-mode ``CacheRow`` fields (``session_id`` /
+    ``project_path`` / ``last_activity`` / ``source_paths``) are never
+    populated by ``_aggregate_cache_by_day`` (they stay at their defaults),
+    so they are not stored; ``reconstruct_cache_row`` leaves them at the
+    ``CacheRow`` defaults, which the round-trip equality test confirms.
+    """
+    date: str
+    cache_hit_percent: float
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    cost: float
+    saved_usd: float
+    wasted_usd: float
+    net_usd: float
+    model_breakdowns: tuple  # tuple[_FrozenModelBreakdown, ...]
+    project_partials: tuple   # tuple[tuple[str, _ProjectPartial], ...]
+
+
+def build_cached_days(
+    day_entries: Iterable,
+    raw_entries: Iterable,
+    *,
+    display_tz: ZoneInfo | None,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
+) -> "dict[str, CachedCacheReportDay]":
+    """Per-day frozen aggregates + project partials for the whole input (#272 §5).
+
+    Runs ``_aggregate_cache_by_day(day_entries, ...)`` for the day rows and
+    ``aggregate_by_day_project(raw_entries, ...)`` for the per-project
+    partials, then zips them per display-tz date into a
+    ``CachedCacheReportDay``. Both aggregators bucket via
+    ``_resolve_bucket_tz(display_tz)``, so their date keys align.
+
+    ``day_entries`` are the ``SimpleNamespace`` wrappers (``.usage`` dict,
+    no ``.project_path``); ``raw_entries`` are the raw joined entries
+    (flat ``.project_path`` / ``.cache_*`` / ``.input_tokens``). The day
+    rows are stored pre-classification (no ``anomaly_*``); the caller
+    reconstructs mutable rows and classifies fresh each tick.
+    """
+    rows = _aggregate_cache_by_day(
+        day_entries,
+        display_tz=display_tz, pricing=pricing,
+        cost_calculator=cost_calculator,
+    )
+    partials = aggregate_by_day_project(
+        raw_entries, display_tz=display_tz, pricing=pricing, skip_synthetic=True,
+    )
+    out: dict[str, CachedCacheReportDay] = {}
+    for r in rows:
+        mbs = tuple(
+            _FrozenModelBreakdown(
+                model_name=mb.model_name,
+                input_tokens=mb.input_tokens,
+                output_tokens=mb.output_tokens,
+                cache_creation_tokens=mb.cache_creation_tokens,
+                cache_read_tokens=mb.cache_read_tokens,
+                cache_hit_percent=mb.cache_hit_percent,
+                cost=mb.cost,
+                saved_usd=mb.saved_usd,
+                wasted_usd=mb.wasted_usd,
+                net_usd=mb.net_usd,
+            )
+            for mb in r.model_breakdowns
+        )
+        pp = tuple(sorted((partials.get(r.date, {}) or {}).items()))
+        out[r.date] = CachedCacheReportDay(
+            date=r.date,
+            cache_hit_percent=r.cache_hit_percent,
+            input_tokens=r.input_tokens,
+            output_tokens=r.output_tokens,
+            cache_creation_tokens=r.cache_creation_tokens,
+            cache_read_tokens=r.cache_read_tokens,
+            cost=r.cost,
+            saved_usd=r.saved_usd,
+            wasted_usd=r.wasted_usd,
+            net_usd=r.net_usd,
+            model_breakdowns=mbs,
+            project_partials=pp,
+        )
+    return out
+
+
+def reconstruct_cache_row(cached: "CachedCacheReportDay") -> CacheRow:
+    """A fresh MUTABLE ``CacheRow`` from a frozen cached day (#272 §5, F7).
+
+    Rebuilds a brand-new mutable ``CacheRow`` (+ mutable
+    ``CacheModelBreakdown`` children) equal to the original
+    ``_aggregate_cache_by_day`` row modulo the anomaly fields, which are
+    cleared so ``_classify_anomalies`` can repopulate them each tick over a
+    row it fully owns. NOTHING reachable from ``cached`` is aliased — the
+    frozen unit is never mutated.
+
+    ``cache_hit_percent`` is a read-only *property* on ``CacheRow`` (derived
+    from the token counters), so it is NOT assigned here; setting the tokens
+    makes the property recompute the stored value. The session-mode fields
+    (``session_id`` / ``project_path`` / ``last_activity`` / ``source_paths``)
+    stay at the ``CacheRow`` defaults — day-mode rows never carry them.
+    """
+    row = CacheRow(date=cached.date)
+    row.input_tokens = cached.input_tokens
+    row.output_tokens = cached.output_tokens
+    row.cache_creation_tokens = cached.cache_creation_tokens
+    row.cache_read_tokens = cached.cache_read_tokens
+    row.cost = cached.cost
+    row.saved_usd = cached.saved_usd
+    row.wasted_usd = cached.wasted_usd
+    row.net_usd = cached.net_usd
+    row.model_breakdowns = [
+        CacheModelBreakdown(
+            model_name=m.model_name,
+            input_tokens=m.input_tokens,
+            output_tokens=m.output_tokens,
+            cache_creation_tokens=m.cache_creation_tokens,
+            cache_read_tokens=m.cache_read_tokens,
+            cache_hit_percent=m.cache_hit_percent,
+            cost=m.cost,
+            saved_usd=m.saved_usd,
+            wasted_usd=m.wasted_usd,
+            net_usd=m.net_usd,
+        )
+        for m in cached.model_breakdowns
+    ]
+    row.anomaly_reasons = []
+    row.anomaly_triggered = False
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Top-level orchestrator
 # ---------------------------------------------------------------------------
 
@@ -993,56 +1166,64 @@ class _CacheReportResult:
     today_baseline_median: float | None = None
 
 
-def _build_cache_report(
+def _aggregate_cache_report_rows(
     entries: Iterable,
+    *,
+    display_tz: ZoneInfo | None,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
+    mode: Literal["day", "session"] = "day",
+    project_decoder: Callable[[str], str] | None = None,
+) -> list[CacheRow]:
+    """The aggregate half of ``_build_cache_report`` (#272 §6).
+
+    Buckets ``entries`` into ``CacheRow``s — by display-tz calendar date
+    (``mode="day"``) or by Claude ``sessionId`` (``mode="session"``,
+    resume-merged; requires ``project_decoder``). Split out so the
+    dashboard cache path (§6) can run the aggregate over a mix of
+    cached + freshly-fetched entries and then classify separately, while
+    the classify phase (``classify_and_summarize``) re-runs fresh each
+    tick. Byte-identical to the inline aggregate it replaced.
+    """
+    if mode == "day":
+        return _aggregate_cache_by_day(
+            entries,
+            display_tz=display_tz, pricing=pricing,
+            cost_calculator=cost_calculator,
+        )
+    if mode == "session":
+        if project_decoder is None:
+            raise ValueError("session mode requires project_decoder")
+        return _aggregate_cache_by_session(
+            entries,
+            pricing=pricing,
+            cost_calculator=cost_calculator,
+            project_decoder=project_decoder,
+        ).rows
+    raise ValueError(f"unknown mode: {mode!r}")
+
+
+def classify_and_summarize(
+    rows: list[CacheRow],
     *,
     now_utc: dt.datetime,
     window_days: int,
     anomaly_threshold_pp: int,
     anomaly_window_days: int,
     display_tz: ZoneInfo | None,
-    pricing: dict,
-    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
     mode: Literal["day", "session"] = "day",
-    project_decoder: Callable[[str], str] | None = None,
     anomaly_enabled: bool = True,
 ) -> _CacheReportResult:
-    """Top-level orchestrator: aggregate + classify anomalies.
+    """The classify + summarize half of ``_build_cache_report`` (#272 §6).
 
-    Returns a ``_CacheReportResult`` that both the CLI renderer and the
-    dashboard snapshot builder consume. Pure-function — no I/O, no
-    logging, no environment reads. Callers (CLI / dashboard) own all
-    I/O via the ``entries`` iterable + the ``cost_calculator`` /
-    ``project_decoder`` injections.
-
-    ``mode="day"`` buckets entries by display-tz calendar date;
-    ``mode="session"`` buckets by Claude ``sessionId`` (resume-merged
-    across JSONL files). Session mode requires ``project_decoder`` (the
-    CLI passes its ``_decode_escaped_cwd``-backed shim); day mode
-    ignores it.
-
-    The ``since`` window for both modes is ``now_utc − window_days``;
-    the kernel trusts callers to pre-filter via their own query
-    (``get_entries`` / ``get_claude_session_entries``).
+    Mutates ``rows`` in place (``_classify_anomalies``), computes the
+    day-mode ``today_baseline_median`` (EFF-3), and packages the
+    ``_CacheReportResult``. Split out so the dashboard cache path (§6)
+    can re-run this cross-row pass every tick over freshly reconstructed
+    rows (the cached day aggregates carry no anomaly state), while the
+    per-day aggregates are served from cache. Byte-identical to the
+    inline classify half it replaced.
     """
-    if mode == "day":
-        rows = _aggregate_cache_by_day(
-            entries,
-            display_tz=display_tz, pricing=pricing,
-            cost_calculator=cost_calculator,
-        )
-    elif mode == "session":
-        if project_decoder is None:
-            raise ValueError("session mode requires project_decoder")
-        rows = _aggregate_cache_by_session(
-            entries,
-            pricing=pricing,
-            cost_calculator=cost_calculator,
-            project_decoder=project_decoder,
-        ).rows
-    else:
-        raise ValueError(f"unknown mode: {mode!r}")
-
     _classify_anomalies(
         rows,
         threshold_pp=anomaly_threshold_pp,
@@ -1084,4 +1265,57 @@ def _build_cache_report(
         anomaly_window_days=anomaly_window_days,
         display_tz_key=display_tz.key if display_tz is not None else None,
         today_baseline_median=today_baseline_median,
+    )
+
+
+def _build_cache_report(
+    entries: Iterable,
+    *,
+    now_utc: dt.datetime,
+    window_days: int,
+    anomaly_threshold_pp: int,
+    anomaly_window_days: int,
+    display_tz: ZoneInfo | None,
+    pricing: dict,
+    cost_calculator: Callable[[str, dict, str, Optional[float]], float],
+    mode: Literal["day", "session"] = "day",
+    project_decoder: Callable[[str], str] | None = None,
+    anomaly_enabled: bool = True,
+) -> _CacheReportResult:
+    """Top-level orchestrator: aggregate + classify anomalies.
+
+    Returns a ``_CacheReportResult`` that both the CLI renderer and the
+    dashboard snapshot builder consume. Pure-function — no I/O, no
+    logging, no environment reads. Callers (CLI / dashboard) own all
+    I/O via the ``entries`` iterable + the ``cost_calculator`` /
+    ``project_decoder`` injections.
+
+    ``mode="day"`` buckets entries by display-tz calendar date;
+    ``mode="session"`` buckets by Claude ``sessionId`` (resume-merged
+    across JSONL files). Session mode requires ``project_decoder`` (the
+    CLI passes its ``_decode_escaped_cwd``-backed shim); day mode
+    ignores it.
+
+    The ``since`` window for both modes is ``now_utc − window_days``;
+    the kernel trusts callers to pre-filter via their own query
+    (``get_entries`` / ``get_claude_session_entries``). Composed (#272
+    §6) from ``_aggregate_cache_report_rows`` + ``classify_and_summarize``
+    — the CLI keeps this one-shot orchestrator; the dashboard cache path
+    calls the two halves directly so it can memoize the aggregate.
+    """
+    rows = _aggregate_cache_report_rows(
+        entries,
+        display_tz=display_tz, pricing=pricing,
+        cost_calculator=cost_calculator,
+        mode=mode, project_decoder=project_decoder,
+    )
+    return classify_and_summarize(
+        rows,
+        now_utc=now_utc,
+        window_days=window_days,
+        anomaly_threshold_pp=anomaly_threshold_pp,
+        anomaly_window_days=anomaly_window_days,
+        display_tz=display_tz,
+        mode=mode,
+        anomaly_enabled=anomaly_enabled,
     )

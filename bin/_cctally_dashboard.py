@@ -325,6 +325,7 @@ from _lib_snapshot_cache import (
     bump_generation,
     cached_bugk_segment,
     reset_bugk_segment_state,
+    reset_cache_report_state,
     reset_group_a_state,
     reset_projects_env_state,
     reset_session_cache_state,
@@ -424,9 +425,12 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # #269 M3.2 (spec §6): the shared per-weekref immutable-cost cache
             # (B1 trend/weekly-history + B3 forecast) rides the SAME prune-site
             # clear — a non-max deletion the reconcile's max-id regression check
-            # can't catch. (B2 cache-report cache was dropped at the M2.0 gate,
-            # so there is no reset_cache_report_state() to call here.)
+            # can't catch.
             reset_weekref_cost_state()
+            # #272: the per-day cache-report cache rides the same prune-site
+            # clear — a non-max deletion inside a closed day the reconcile's
+            # max-id / mutation-seq regression check can't catch.
+            reset_cache_report_state()
             # #269 M4.5 (spec §14 Win 2): the projects-envelope per-(project,
             # week) cache rides the same prune-site clear for the same reason.
             reset_projects_env_state()
@@ -2080,6 +2084,73 @@ def _cache_report_load_kernel():
     return sys.modules["cctally"]._load_sibling("_lib_cache_report")
 
 
+def _cache_report_needed_closed_dates(since, now_utc, bucket_tz):
+    """The CLOSED display-tz dates a full-window cache-report build needs (#272 §6).
+
+    Every display-tz calendar date overlapping ``[since, now_utc]`` EXCEPT the
+    current open day (Codex-2: a ``since``-straddling window yields up to
+    ``window_days + 1`` display dates, and classification runs over the full
+    set BEFORE the ``days`` cap). Returned sorted ascending. The ``have_all``
+    gate requires every one of these to be cached before serving the warm
+    (today-only-fetch) path; a genuinely activity-free calendar day never
+    caches, so a window containing a gap day degrades to the full-fetch path
+    (byte-identical, just without the warm win) — the accepted YAGNI tradeoff
+    (§3).
+    """
+    today_key = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
+    d = since.astimezone(bucket_tz).date()
+    end_date = now_utc.astimezone(bucket_tz).date()
+    out: list = []
+    while d <= end_date:
+        key = d.strftime("%Y-%m-%d")
+        if key != today_key:
+            out.append(key)
+        d += dt.timedelta(days=1)
+    return out
+
+
+def _day_start(date_iso, bucket_tz):
+    """The aware-UTC instant of ``date_iso``'s local midnight in ``bucket_tz`` (#272 §6).
+
+    Lower-bounds the warm-path current-day fetch so it returns exactly the
+    entries ``_aggregate_cache_by_day`` buckets to ``date_iso`` (which buckets
+    via ``entry.timestamp.astimezone(bucket_tz)``). DST-correct: attaching the
+    zone to the naive local-midnight then converting to UTC lets ``ZoneInfo``
+    pick the right offset for that wall time.
+    """
+    naive = dt.datetime.strptime(date_iso, "%Y-%m-%d")
+    return naive.replace(tzinfo=bucket_tz).astimezone(dt.timezone.utc)
+
+
+def _cache_report_empty(
+    *, today_iso, window_days, anomaly_threshold_pp, anomaly_window_days,
+):
+    """The empty (no in-window entries) ``CacheReportSnapshot`` — factored so the
+    warm and cold builder paths share one ``is_empty`` return (#272 §6)."""
+    empty_today = CacheReportTodaySpotlight(
+        date=today_iso,
+        cache_hit_percent=0.0,
+        baseline_median_percent=None,
+        delta_pp=None,
+        net_usd=0.0, saved_usd=0.0, wasted_usd=0.0,
+        anomaly_triggered=False,
+        anomaly_reasons=(),
+        baseline_daily_row_count=0,
+    )
+    return CacheReportSnapshot(
+        window_days=window_days,
+        anomaly_threshold_pp=anomaly_threshold_pp,
+        anomaly_window_days=anomaly_window_days,
+        today=empty_today,
+        days=(), by_project=(), by_model=(),
+        seven_day_net_usd=0.0,
+        seven_day_anomaly_count=0,
+        fourteen_day_counterfactual_usd=0.0,
+        fourteen_day_efficiency_ratio=0.0,
+        is_empty=True,
+    )
+
+
 def build_cache_report_snapshot(
     *,
     now_utc: dt.datetime,
@@ -2087,6 +2158,7 @@ def build_cache_report_snapshot(
     anomaly_window_days: int,
     display_tz: "ZoneInfo | None",
     skip_sync: bool = False,
+    use_cache_report_cache: bool = False,
 ) -> CacheReportSnapshot:
     """Build the ``cache_report`` envelope field from the session-entry cache.
 
@@ -2100,78 +2172,125 @@ def build_cache_report_snapshot(
     ``anomaly_window_days`` too; ``anomaly_threshold_pp`` is the only
     user-configurable knob). F10 from spec §10 tracks making the window
     configurable, plus the UI-copy work it'd require.
+
+    **Per-day cache (#272 §6).** With ``use_cache_report_cache=True`` (set by
+    the dashboard sync thread AFTER ``reconcile_cache_report_cache`` succeeds),
+    the CLOSED days are served from the immutable per-day cache and only the
+    current (open) day is fetched + folded fresh — the warm-tick win. The
+    reconcile (in ``_tui_build_snapshot``) owns invalidation; this builder only
+    reads/populates the cache. With the flag OFF (default / safe fallback), the
+    full window is fetched every tick and the output is byte-identical to the
+    cached path (same restructured assembly, cache bypassed).
     """
     crk = _cache_report_load_kernel()
     cctally_ns = sys.modules["cctally"]
+    _sc = sys.modules["_lib_snapshot_cache"]
 
     window_days = CACHE_REPORT_WINDOW_DAYS  # v1: hardcoded per spec §6.1.
     since = now_utc - dt.timedelta(days=window_days)
+    pricing = cctally_ns.CLAUDE_MODEL_PRICING
 
-    entries = list(
-        get_claude_session_entries(since, now_utc, project=None, skip_sync=skip_sync)
-    )
-
+    # Cache mechanics key on the BUCKETING tz (``_resolve_bucket_tz`` — the same
+    # tz ``_aggregate_cache_by_day`` buckets by), so ``today_key`` / the closed-
+    # day keys line up with ``CacheRow.date``. The spotlight's ``today_iso``
+    # keeps its own UTC-fallback derivation unchanged (byte-identity); the two
+    # agree whenever ``display_tz`` is set — always, on the dashboard.
+    bucket_tz = crk._resolve_bucket_tz(display_tz)
+    today_key = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
     today_iso = now_utc.astimezone(
         display_tz if display_tz is not None else dt.timezone.utc
     ).strftime("%Y-%m-%d")
 
-    if not entries:
-        empty_today = CacheReportTodaySpotlight(
-            date=today_iso,
-            cache_hit_percent=0.0,
-            baseline_median_percent=None,
-            delta_pp=None,
-            net_usd=0.0, saved_usd=0.0, wasted_usd=0.0,
-            anomaly_triggered=False,
-            anomaly_reasons=(),
-            baseline_daily_row_count=0,
+    def _wrap_day_entries(raw):
+        # Day-mode kernel expects entries with a ``usage`` dict (matches
+        # ``UsageEntry``); ``get_claude_session_entries`` returns flat
+        # ``_JoinedClaudeEntry`` objects. SimpleNamespace keeps the wrapper
+        # pure-Python and avoids a new dataclass type just for the bridge.
+        from types import SimpleNamespace as _NS
+        return [
+            _NS(
+                timestamp=e.timestamp,
+                model=e.model,
+                cost_usd=e.cost_usd,
+                usage={
+                    "input_tokens": e.input_tokens,
+                    "output_tokens": e.output_tokens,
+                    "cache_creation_input_tokens": e.cache_creation_tokens,
+                    "cache_read_input_tokens": e.cache_read_tokens,
+                },
+            )
+            for e in raw
+        ]
+
+    # Which CLOSED display-tz dates the window needs (every date overlapping
+    # [since, now] except the current open day). If the cache holds them ALL,
+    # fetch only the current day (the warm win); else one full-window fetch
+    # (re)populates the closed days + recomputes today.
+    needed_closed = _cache_report_needed_closed_dates(since, now_utc, bucket_tz)
+    have_all = use_cache_report_cache and all(
+        _sc.cache_report_day_get(d) is not None for d in needed_closed
+    )
+
+    cached_days: dict = {}  # date_key -> CachedCacheReportDay
+    if have_all:
+        # Steady-state warm: recompute ONLY the open bucket; reuse cached closed.
+        raw_today = list(get_claude_session_entries(
+            _day_start(today_key, bucket_tz), now_utc,
+            project=None, skip_sync=skip_sync,
+        ))
+        built = crk.build_cached_days(
+            _wrap_day_entries(raw_today), raw_today,
+            display_tz=display_tz, pricing=pricing,
+            cost_calculator=_calculate_entry_cost,
         )
-        return CacheReportSnapshot(
-            window_days=window_days,
+        for d in needed_closed:
+            cached_days[d] = _sc.cache_report_day_get(d)
+        cached_days.update(built)  # the fresh current day (today only)
+    else:
+        # Cold / partial-miss / post-eviction: pay one full-window fetch, then
+        # (re)compute + store every closed day. Runs on the rare stale tick.
+        raw = list(get_claude_session_entries(
+            since, now_utc, project=None, skip_sync=skip_sync,
+        ))
+        if not raw:
+            return _cache_report_empty(
+                today_iso=today_iso, window_days=window_days,
+                anomaly_threshold_pp=anomaly_threshold_pp,
+                anomaly_window_days=anomaly_window_days,
+            )
+        built = crk.build_cached_days(
+            _wrap_day_entries(raw), raw,
+            display_tz=display_tz, pricing=pricing,
+            cost_calculator=_calculate_entry_cost,
+        )
+        cached_days = dict(built)
+        if use_cache_report_cache:
+            for d, unit in built.items():
+                if d != today_key:  # never store the OPEN day as a closed unit
+                    _sc.cache_report_day_store(d, unit)
+
+    if not cached_days:
+        return _cache_report_empty(
+            today_iso=today_iso, window_days=window_days,
             anomaly_threshold_pp=anomaly_threshold_pp,
             anomaly_window_days=anomaly_window_days,
-            today=empty_today,
-            days=(), by_project=(), by_model=(),
-            seven_day_net_usd=0.0,
-            seven_day_anomaly_count=0,
-            fourteen_day_counterfactual_usd=0.0,
-            fourteen_day_efficiency_ratio=0.0,
-            is_empty=True,
         )
 
-    pricing = cctally_ns.CLAUDE_MODEL_PRICING
-
-    # Day-mode kernel expects entries with a ``usage`` dict (matches
-    # ``UsageEntry``). ``get_claude_session_entries`` returns flat
-    # ``_JoinedClaudeEntry`` objects, so wrap each into the right shape
-    # before passing to the kernel. SimpleNamespace keeps the wrapper
-    # pure-Python and avoids a new dataclass type just for the bridge.
-    from types import SimpleNamespace as _NS
-    day_entries = [
-        _NS(
-            timestamp=e.timestamp,
-            model=e.model,
-            cost_usd=e.cost_usd,
-            usage={
-                "input_tokens": e.input_tokens,
-                "output_tokens": e.output_tokens,
-                "cache_creation_input_tokens": e.cache_creation_tokens,
-                "cache_read_input_tokens": e.cache_read_tokens,
-            },
-        )
-        for e in entries
+    # Reconstruct fresh MUTABLE rows from the frozen cached days (F7 — cached
+    # units are never touched), then run the cross-row classify + summarize
+    # pass over the FULL assembled set every tick (the cached day aggregates
+    # carry no anomaly state).
+    rows = [
+        crk.reconstruct_cache_row(cached_days[d]) for d in sorted(cached_days)
     ]
-
-    result = crk._build_cache_report(
-        day_entries,
+    result = crk.classify_and_summarize(
+        rows,
         now_utc=now_utc,
         window_days=window_days,
         anomaly_threshold_pp=anomaly_threshold_pp,
         anomaly_window_days=anomaly_window_days,
         display_tz=display_tz,
-        pricing=pricing,
         mode="day",
-        cost_calculator=_calculate_entry_cost,
     )
 
     # Pick out today's row (if any) and the baseline-daily-row count for
@@ -2310,17 +2429,19 @@ def build_cache_report_snapshot(
     kept_dates = frozenset(r.date for r in days if r.date)
     rows_in_window = [r for r in result.rows if r.date in kept_dates]
     # by_project via the #272 §4 two-level ``stable_sum`` fold
-    # (grouping-invariant, so a per-day cache can memoize the partials
-    # byte-identically). Feed the FULL window entries and restrict to
-    # ``kept_dates`` at combine time — the per-(day, project) day keys use
-    # ``_resolve_bucket_tz(display_tz)`` (matching ``CacheRow.date`` /
-    # ``kept_dates``), so combining over ``kept_dates`` is exactly the old
-    # ``entries_in_window`` slice, modulo the one-time ULP fold move.
-    _day_proj_partials = crk.aggregate_by_day_project(
-        entries, display_tz=display_tz, pricing=pricing, skip_synthetic=True,
-    )
+    # (grouping-invariant). The per-(day, project) partials are carried on each
+    # ``CachedCacheReportDay`` (§5) — served from cache for closed days and
+    # freshly folded for today — so restitching them here memoizes the fold
+    # byte-identically. Their day keys use ``_resolve_bucket_tz(display_tz)``
+    # (matching ``CacheRow.date`` / ``kept_dates``), so combining over
+    # ``kept_dates`` is exactly the old full-window slice, modulo the one-time
+    # ULP fold move. Every ``kept_date`` is in ``cached_days`` (it came from a
+    # day row); the ``if d in cached_days`` guard is defensive.
     by_project_rows = crk.combine_day_project_partials(
-        {d: _day_proj_partials.get(d, {}) for d in kept_dates}
+        {
+            d: dict(cached_days[d].project_partials)
+            for d in kept_dates if d in cached_days
+        }
     )
     by_model_rows = crk._aggregate_cache_breakdown_from_rows(
         rows_in_window,

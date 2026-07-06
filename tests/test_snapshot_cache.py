@@ -1652,3 +1652,187 @@ def test_reconcile_bugk_idempotent_within_tick(tmp_cache):
     sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = seg
     sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, reset_sig=(0, 0))
     assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE
+
+
+# ===========================================================================
+# #272 — cache-report per-day cache reconcile
+#
+# Mirrors the `test_reconcile_bugk_*` cluster (same in-memory cache.db +
+# mutation_seq helpers). The reconcile stores no domain object — the tests
+# use `object()` sentinels keyed by display-tz `YYYY-MM-DD`. The ONE
+# semantic difference from Bug-K: eviction is INCLUSIVE (`date_key >= wm_day`)
+# because a day bucket is the closed interval `[start, end]` (Bug-K's segment
+# window is half-open, so it evicts strict `>`).
+# ===========================================================================
+def test_reconcile_cache_report_cold_records_last_seen(tmp_cache):
+    """First (cold) call just records last-seen and touches no cache entry;
+    a same-signature re-call is an idempotent no-op."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    keep = object()
+    sc.cache_report_day_store("2026-01-01", keep)  # must survive the cold call
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=5, max_mutation_seq=3,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc._CACHE_REPORT_LAST_SEEN == {
+        "max_id": 5, "max_seq": 3, "reset_sig": (0, 0),
+        "sf_sig": (0, 0), "tz_key": "None"}
+    assert sc.cache_report_day_get("2026-01-01") is keep
+    # Same sig again → no delta → the stored day still survives.
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=5, max_mutation_seq=3,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc.cache_report_day_get("2026-01-01") is keep
+
+
+def test_reconcile_cache_report_full_clear_on_reset_sig(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    sc.cache_report_day_store("2026-01-01", object())
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=0, max_seq=0, reset_sig=(1, 1), sf_sig=(0, 0), tz_key="None")
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=0, max_mutation_seq=0,
+        reset_sig=(2, 2), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc._CACHE_REPORT_DAY_CACHE == {}  # a credit event moved → full clear
+
+
+def test_reconcile_cache_report_full_clear_on_sf_sig(tmp_cache):
+    """Codex-1: a lazy `session_files.project_path` re-attribution moves ONLY
+    `sf_sig` (no `session_entries` / seq change), yet a CLOSED day's by_project
+    rows can change — so the `sf_sig` leg must full-clear.
+
+    Non-vacuity: nothing else moves (reset_sig / tz_key equal, max_id / max_seq
+    equal-not-regressed, max_seq not `>` last-seen), so ONLY the `sf_sig != `
+    leg can fire this clear. Drop that leg and the stored day survives."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    sc.cache_report_day_store("2026-01-01", object())
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=0, max_seq=0, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=0, max_mutation_seq=0,
+        reset_sig=(0, 0), sf_sig=(1, 7), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc._CACHE_REPORT_DAY_CACHE == {}
+
+
+def test_reconcile_cache_report_full_clear_on_tz_key(tmp_cache):
+    """A display-tz change shifts every calendar-day boundary → all cached day
+    keys invalid → full clear. Only `tz_key` moves here."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    sc.cache_report_day_store("2026-01-01", object())
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=0, max_seq=0, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=0, max_mutation_seq=0,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc,
+        tz_key="Asia/Tokyo")
+    assert sc._CACHE_REPORT_DAY_CACHE == {}
+
+
+def test_reconcile_cache_report_full_clear_on_maxid_regression(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    sc.cache_report_day_store("2026-01-01", object())
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=100, max_seq=100, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=5, max_mutation_seq=5,  # cache.db rebuilt
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc._CACHE_REPORT_DAY_CACHE == {}
+
+
+def test_reconcile_cache_report_seq_gated_eviction_ge_watermark(tmp_cache):
+    """`max_mutation_seq > last_seen` → evict every cached day whose key is
+    `>= wm_day`. Proves the boundary AND the INCLUSIVE `>=` (the day EXACTLY on
+    the watermark evicts — with `>` it would wrongly survive)."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    for d in ("2026-01-01", "2026-01-02", "2026-01-03"):
+        sc.cache_report_day_store(d, object())
+    last = _max_id(tmp_cache)  # 0 on the empty fixture
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=last, max_seq=last, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    # A genuinely-new row whose changed_min_timestamp lands on 2026-01-02.
+    _insert_session_entry(tmp_cache, ts="2026-01-02T12:00:00Z")
+    new = _max_id(tmp_cache)
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=new, max_mutation_seq=new,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc.cache_report_day_get("2026-01-01") is not None  # older: survives
+    assert sc.cache_report_day_get("2026-01-02") is None       # == wm: evicted (>=)
+    assert sc.cache_report_day_get("2026-01-03") is None       # newer: evicted
+
+
+def test_reconcile_cache_report_cross_day_finalization_evicts_old_day(tmp_cache):
+    """An id-stable in-place finalization that moved a row across a day boundary
+    stamps `mutation_min_ts = min(old, new)` (#270), pulling the watermark back
+    to the OLD day. Evicting `>= wm_day` (INCLUSIVE) drops the OLD day (exactly
+    at the watermark) AND every newer cached day — with a strict `>` the OLD
+    day would wrongly survive."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    for d in ("2026-01-01", "2026-01-03", "2026-01-05"):
+        sc.cache_report_day_store(d, object())
+    _insert_session_entry(tmp_cache, ts="2026-01-05T09:00:00Z")  # id 1, seq 1
+    last = _max_id(tmp_cache)  # 1
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=last, max_seq=last, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    # id-stable finalization: bump mutation_seq above last-seen, pull
+    # mutation_min_ts back to the OLD day (the #270 min(old,new) change-time).
+    tmp_cache.execute(
+        "UPDATE session_entries SET mutation_seq = 99, "
+        "mutation_min_ts = '2026-01-01T00:00:00Z' WHERE id = 1")
+    tmp_cache.commit()
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=last, max_mutation_seq=99,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc.cache_report_day_get("2026-01-01") is None  # OLD day AT wm: evicted
+    assert sc.cache_report_day_get("2026-01-03") is None
+    assert sc.cache_report_day_get("2026-01-05") is None
+
+
+def test_reconcile_cache_report_idempotent_within_tick(tmp_cache):
+    """After the first reconcile updates last-seen, a second call with the SAME
+    signature sees `max_mutation_seq == last_seen` → no watermark re-query, no
+    eviction. Proven non-vacuously: a day stored between the two calls that WOULD
+    fall in the eviction range survives the second call."""
+    import _lib_snapshot_cache as sc
+
+    sc.reset_cache_report_state()
+    sc.cache_report_day_store("2026-01-01", object())  # far below any watermark
+    last = _max_id(tmp_cache)  # 0
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=last, max_seq=last, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # wm_day 2026-07-04
+    new = _max_id(tmp_cache)  # 1
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=new, max_mutation_seq=new,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc.cache_report_day_get("2026-01-01") is not None  # 01-01 < 07-04
+    # Store a day AFTER the watermark day, then reconcile again with the SAME
+    # sig: no re-query, so it survives (a re-run would evict it as >= 07-04).
+    sc.cache_report_day_store("2026-07-05", object())
+    sc.reconcile_cache_report_cache(
+        tmp_cache, max_entry_id=new, max_mutation_seq=new,
+        reset_sig=(0, 0), sf_sig=(0, 0), bucket_tz=dt.timezone.utc, tz_key="None")
+    assert sc.cache_report_day_get("2026-07-05") is not None  # idempotent no-op
+    assert sc.cache_report_day_get("2026-01-01") is not None
+
+
+def test_reset_cache_report_state_clears(tmp_cache):
+    import _lib_snapshot_cache as sc
+
+    sc.cache_report_day_store("2026-01-01", object())
+    sc._CACHE_REPORT_LAST_SEEN.update(
+        max_id=5, max_seq=5, reset_sig=(0, 0), sf_sig=(0, 0), tz_key="None")
+    sc.reset_cache_report_state()
+    assert sc._CACHE_REPORT_DAY_CACHE == {} and sc._CACHE_REPORT_LAST_SEEN == {}

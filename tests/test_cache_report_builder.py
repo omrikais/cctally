@@ -992,3 +992,138 @@ def test_aggregate_by_day_project_skips_synthetic():
     assert p.cache_creation_tokens == 300_000
     assert p.cache_read_tokens == 100_000
     assert p.input_tokens == 5_000
+
+
+# ---------------------------------------------------------------------------
+# #272 §5 — the frozen per-day cached unit + build / reconstruct round-trip.
+#
+# `build_cached_days` runs `_aggregate_cache_by_day` (day rows, keeping
+# `<synthetic>`) + `aggregate_by_day_project` (per-project partials,
+# `skip_synthetic=True`) and zips them per date into a frozen
+# `CachedCacheReportDay`. `reconstruct_cache_row` rebuilds a FRESH MUTABLE
+# `CacheRow` equal to the from-scratch day aggregate (anomaly fields cleared).
+# ---------------------------------------------------------------------------
+
+def _cached_day_specs():
+    """(ts_utc, model, project, input, output, cache_creation, cache_read, cost).
+
+    Two projects on 2026-01-01, plus a real + a ``<synthetic>`` /a entry on
+    2026-01-02 so the round-trip exercises: multi-project days, per-model
+    children that KEEP ``<synthetic>`` (day-row contract), and the
+    ``skip_synthetic=True`` per-project partials (by_project contract).
+    """
+    _u = lambda *a: dt.datetime(*a, tzinfo=dt.timezone.utc)  # noqa: E731
+    return [
+        (_u(2026, 1, 1, 12), "claude-sonnet-4-6", "/a", 40_000, 5_000, 300_000, 100_000, 1.50),
+        (_u(2026, 1, 1, 13), "claude-sonnet-4-6", "/b", 12_000, 2_000, 250_000, 90_000, 0.90),
+        (_u(2026, 1, 2, 9), "claude-sonnet-4-6", "/a", 7_000, 1_000, 210_000, 80_000, 0.40),
+        (_u(2026, 1, 2, 10), "<synthetic>", "/a", 999, 0, 111, 222, 0.0),
+    ]
+
+
+def _day_entries_from_specs(specs):
+    """The ``SimpleNamespace`` wrappers `_aggregate_cache_by_day` reads
+    (``.usage`` dict, ``.timestamp``, ``.model``, ``.cost_usd`` — NO project)."""
+    return [
+        SimpleNamespace(
+            timestamp=ts, model=model, cost_usd=cost,
+            usage={
+                "input_tokens": inp, "output_tokens": out,
+                "cache_creation_input_tokens": cc, "cache_read_input_tokens": cr,
+            },
+        )
+        for (ts, model, _proj, inp, out, cc, cr, cost) in specs
+    ]
+
+
+def _raw_entries_from_specs(specs):
+    """The raw joined entries `aggregate_by_day_project` reads (flat
+    ``.project_path`` / ``.cache_*`` / ``.input_tokens`` attributes)."""
+    return [
+        SimpleNamespace(
+            timestamp=ts, model=model, project_path=proj,
+            input_tokens=inp, cache_creation_tokens=cc, cache_read_tokens=cr,
+        )
+        for (ts, model, proj, inp, _out, cc, cr, _cost) in specs
+    ]
+
+
+def test_build_cached_days_reconstruct_roundtrip_matches_from_scratch():
+    """`reconstruct_cache_row(build_cached_days(...)[d])` equals a from-scratch
+    `_aggregate_cache_by_day` row for day `d` (anomaly fields cleared on both).
+
+    The field-completeness guard: if `build_cached_days` / `reconstruct_cache_row`
+    dropped ANY non-anomaly `CacheRow` field (or any `CacheModelBreakdown`
+    child field) the dataclass `==` fails loudly.
+    """
+    specs = _cached_day_specs()
+    day_entries = _day_entries_from_specs(specs)
+    raw_entries = _raw_entries_from_specs(specs)
+    pricing = _PRICING_SONNET
+
+    cached = crk.build_cached_days(
+        day_entries, raw_entries, display_tz=_UTC, pricing=pricing,
+        cost_calculator=_trivial_cost,
+    )
+    scratch = crk._aggregate_cache_by_day(
+        day_entries, display_tz=_UTC, pricing=pricing,
+        cost_calculator=_trivial_cost,
+    )
+    for r in scratch:
+        r.anomaly_reasons = []
+        r.anomaly_triggered = False
+    scratch_by_date = {r.date: r for r in scratch}
+
+    assert set(cached) == set(scratch_by_date) == {"2026-01-01", "2026-01-02"}
+    for d, unit in cached.items():
+        recon = crk.reconstruct_cache_row(unit)
+        assert recon == scratch_by_date[d], f"reconstructed row for {d} diverged"
+        # Fresh MUTABLE row each call (F7): never aliased to a cached object.
+        assert recon is not crk.reconstruct_cache_row(unit)
+        assert isinstance(recon.model_breakdowns, list)
+
+    # Non-vacuity: the round-trip actually exercises non-zero net / cost /
+    # per-model children (not a vacuous all-zeros pass).
+    assert any(u.net_usd != 0.0 for u in cached.values())
+    assert any(u.cost != 0.0 for u in cached.values())
+    assert all(len(u.model_breakdowns) >= 1 for u in cached.values())
+
+    # Day rows KEEP <synthetic> in model_breakdowns (day-row contract): the
+    # 2026-01-02 row has a real + a synthetic child.
+    day2_models = {m.model_name for m in cached["2026-01-02"].model_breakdowns}
+    assert "<synthetic>" in day2_models and "claude-sonnet-4-6" in day2_models
+
+    # project_partials use skip_synthetic=True (the by_project contract): the
+    # 2026-01-02 <synthetic> /a entry is DROPPED, so /a's partial reflects only
+    # the real entry's tokens.
+    pp_0102 = dict(cached["2026-01-02"].project_partials)
+    assert set(pp_0102) == {"/a"}
+    assert pp_0102["/a"].cache_creation_tokens == 210_000
+    assert pp_0102["/a"].cache_read_tokens == 80_000
+    # 2026-01-01 carries both projects.
+    assert set(dict(cached["2026-01-01"].project_partials)) == {"/a", "/b"}
+
+
+def test_cached_cache_report_day_is_frozen():
+    """`CachedCacheReportDay` is a frozen dataclass of frozen primitives
+    (Codex-4): the unit, its `_FrozenModelBreakdown` children, and its
+    `_ProjectPartial` partials all reject mutation (F7)."""
+    import pytest
+
+    specs = _cached_day_specs()
+    cached = crk.build_cached_days(
+        _day_entries_from_specs(specs), _raw_entries_from_specs(specs),
+        display_tz=_UTC, pricing=_PRICING_SONNET, cost_calculator=_trivial_cost,
+    )
+    unit = cached["2026-01-01"]
+    # frozen dataclass — FrozenInstanceError is an AttributeError subclass.
+    with pytest.raises(AttributeError):
+        unit.net_usd = 9.9
+    assert isinstance(unit.model_breakdowns, tuple)
+    assert isinstance(unit.project_partials, tuple)
+    # frozen NamedTuple child.
+    with pytest.raises(AttributeError):
+        unit.model_breakdowns[0].net_usd = 1.0
+    # frozen _ProjectPartial value.
+    with pytest.raises(AttributeError):
+        unit.project_partials[0][1].net_usd = 1.0

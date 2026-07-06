@@ -1658,3 +1658,111 @@ def reconcile_bugk_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset_si
         ls["max_id"] = max_entry_id
         ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
+
+
+# === #272 — cache-report per-day cache =====================================
+#
+# A per-day cache in front of the dashboard's `build_cache_report_snapshot`
+# warm-tick leg. Each closed day's raw aggregate + per-project partials is
+# an immutable `CachedCacheReportDay` (bin/_lib_cache_report.py §5); the
+# reconcile below invalidates it on the #270/#271 `mutation_seq` / `max_id`
+# / `reset_sig` / `sf_sig` / display-tz signals, mirroring
+# `reconcile_bugk_cache` + the projects-env `session_files_sig` leg.
+
+_CACHE_REPORT_DAY_CACHE: dict = {}    # {date_key: CachedCacheReportDay}
+_CACHE_REPORT_LAST_SEEN: dict = {}    # {max_id, max_seq, reset_sig, sf_sig, tz_key}
+
+
+def reset_cache_report_state():
+    """Clear the cache-report per-day cache + its watermark (full invalidation).
+
+    Called from the orphan-prune site (a prune can delete ``session_entries``
+    WITHOUT lowering ``MAX(id)`` / advancing ``mutation_seq``, which the
+    reconcile's regression check cannot catch — the explicit clear must) and
+    as a test hook. Mirrors ``reset_bugk_segment_state`` /
+    ``reset_projects_env_state``.
+    """
+    _CACHE_REPORT_DAY_CACHE.clear()
+    _CACHE_REPORT_LAST_SEEN.clear()
+
+
+def cache_report_day_get(date_key):
+    """Return the cached ``CachedCacheReportDay`` for ``date_key``, or ``None``."""
+    return _CACHE_REPORT_DAY_CACHE.get(date_key)
+
+
+def cache_report_day_store(date_key, value) -> None:
+    """Store one CLOSED day's immutable ``CachedCacheReportDay`` (never mutated)."""
+    _CACHE_REPORT_DAY_CACHE[date_key] = value
+
+
+def reconcile_cache_report_cache(
+    cache_conn, *, max_entry_id, max_mutation_seq, reset_sig, sf_sig, bucket_tz,
+    tz_key,
+):
+    """Once-per-non-idle-rebuild invalidation for the cache-report cache (#272 §5).
+
+    The canonical four-step shape (mirrors ``reconcile_bugk_cache`` +
+    ``reconcile_weekref_cache``, plus the projects-env cache's
+    ``session_files_sig`` leg and a display-tz leg):
+
+    1. **Cold** (empty last-seen) → record
+       ``{max_id, max_seq, reset_sig, sf_sig, tz_key}``, return, no eviction.
+    2. **Full-clear** on any of: ``reset_sig`` changed, ``sf_sig`` changed
+       (Codex-1 — lazy ``session_files.project_path`` backfill can re-attribute
+       a CLOSED day's by_project rows with no ``session_entries`` / seq change),
+       ``tz_key`` changed (a display-tz change shifts every calendar-day
+       boundary → all cached day keys invalid), ``max_entry_id`` regressed, or
+       ``max_mutation_seq`` regressed (cache.db rebuilt out-of-process) →
+       ``clear()``, update last-seen, return.
+    3. **Seq-gated eviction** (``max_mutation_seq > last_seen_seq`` — the #270
+       §7c seq gate, so an id-stable in-place finalization with a flat
+       ``max_entry_id`` still evicts): ``wm = changed_min_timestamp(cache_conn,
+       last_seen_seq)`` (the one query on this branch; #270
+       ``min(old_ts, new_ts)`` change-time). Evict every cached day whose
+       ``date_key >= wm.astimezone(bucket_tz).strftime("%Y-%m-%d")``. The bound
+       is ``>=`` (INCLUSIVE), NOT ``>`` — a day bucket is the CLOSED interval
+       ``[start, end]``, so a changed row landing anywhere on ``wm_day`` (or a
+       later day) is inside that day and must evict it; and a cross-day
+       finalization pulls ``mutation_min_ts`` back to ``min(old, new)``, i.e.
+       the OLD day, so the OLD day (exactly at the watermark) evicts too. This
+       is the ONE semantic difference from ``reconcile_bugk_cache``'s strict
+       ``>`` (its segment window is HALF-OPEN ``[start, effective)``).
+       Over-eviction is byte-safe. Update last-seen.
+    4. **Idempotent within a tick**: after the first call updates last-seen, a
+       same-signature second call sees ``max_mutation_seq == last_seen_seq`` and
+       no sig delta → no watermark re-query, no eviction.
+    """
+    ls = _CACHE_REPORT_LAST_SEEN
+    if not ls:  # cold
+        ls.update(
+            max_id=max_entry_id, max_seq=max_mutation_seq,
+            reset_sig=reset_sig, sf_sig=sf_sig, tz_key=tz_key,
+        )
+        return
+    if (
+        reset_sig != ls["reset_sig"]
+        or sf_sig != ls["sf_sig"]
+        or tz_key != ls["tz_key"]
+        or max_entry_id < ls["max_id"]
+        or max_mutation_seq < ls["max_seq"]
+    ):
+        _CACHE_REPORT_DAY_CACHE.clear()
+        ls.update(
+            max_id=max_entry_id, max_seq=max_mutation_seq,
+            reset_sig=reset_sig, sf_sig=sf_sig, tz_key=tz_key,
+        )
+        return
+    if max_mutation_seq > ls["max_seq"]:
+        wm = changed_min_timestamp(cache_conn, ls["max_seq"])
+        if wm is not None:
+            wm_day = wm.astimezone(bucket_tz).strftime("%Y-%m-%d")
+            for date_key in list(_CACHE_REPORT_DAY_CACHE):
+                # Inclusive [start, end] day bucket: a changed row on wm_day (or
+                # any later day) falls inside that day, so evict date_key >= wm_day.
+                if date_key >= wm_day:
+                    del _CACHE_REPORT_DAY_CACHE[date_key]
+        ls.update(
+            max_id=max_entry_id, max_seq=max_mutation_seq,
+            reset_sig=reset_sig, sf_sig=sf_sig, tz_key=tz_key,
+        )
