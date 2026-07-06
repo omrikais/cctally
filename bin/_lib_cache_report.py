@@ -1011,6 +1011,16 @@ class CachedCacheReportDay:
     populated by ``_aggregate_cache_by_day`` (they stay at their defaults),
     so they are not stored; ``reconstruct_cache_row`` leaves them at the
     ``CacheRow`` defaults, which the round-trip equality test confirms.
+
+    ``is_empty`` is a trailing sentinel flag (default ``False``): a genuinely
+    activity-free CLOSED day never appears in ``build_cached_days`` output
+    (that only emits days with entries), so the builder stores an
+    ``empty_cached_day`` sentinel for it — registering the quiet day as a
+    cache HIT (mirroring ``projects_env_week_put`` storing a computed-empty
+    week) so a weekend/vacation gap day can't permanently defeat ``have_all``.
+    The warm restitch SKIPS ``is_empty`` days entirely: they contribute no
+    ``CacheRow`` and no by_project partials, so a sentinel is byte-identical
+    to from-scratch (which never emits a row for a day with no entries).
     """
     date: str
     cache_hit_percent: float
@@ -1024,6 +1034,36 @@ class CachedCacheReportDay:
     net_usd: float
     model_breakdowns: tuple  # tuple[_FrozenModelBreakdown, ...]
     project_partials: tuple   # tuple[tuple[str, _ProjectPartial], ...]
+    is_empty: bool = False    # sentinel for an activity-free CLOSED day (§P1 fix)
+
+
+def empty_cached_day(date: str) -> "CachedCacheReportDay":
+    """A sentinel ``CachedCacheReportDay`` for an activity-free CLOSED date (#272 P1).
+
+    An all-zero unit with empty ``model_breakdowns`` / ``project_partials``
+    tuples and ``is_empty=True``. The builder stores one of these for every
+    needed closed date the per-day fold produced no row for, so
+    ``have_all`` (which gates the warm today-only-fetch path) sees a quiet day
+    as present instead of a perpetual miss — the exact hit-registration
+    ``projects_env_week_put`` does for a computed-empty week. The warm
+    reconstruct / by_project restitch skip ``is_empty`` days, so the sentinel
+    is byte-identical to from-scratch.
+    """
+    return CachedCacheReportDay(
+        date=date,
+        cache_hit_percent=0.0,
+        input_tokens=0,
+        output_tokens=0,
+        cache_creation_tokens=0,
+        cache_read_tokens=0,
+        cost=0.0,
+        saved_usd=0.0,
+        wasted_usd=0.0,
+        net_usd=0.0,
+        model_breakdowns=(),
+        project_partials=(),
+        is_empty=True,
+    )
 
 
 def build_cached_days(

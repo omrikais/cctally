@@ -2092,10 +2092,14 @@ def _cache_report_needed_closed_dates(since, now_utc, bucket_tz):
     ``window_days + 1`` display dates, and classification runs over the full
     set BEFORE the ``days`` cap). Returned sorted ascending. The ``have_all``
     gate requires every one of these to be cached before serving the warm
-    (today-only-fetch) path; a genuinely activity-free calendar day never
-    caches, so a window containing a gap day degrades to the full-fetch path
-    (byte-identical, just without the warm win) — the accepted YAGNI tradeoff
-    (§3).
+    (today-only-fetch) path. A genuinely activity-free calendar day produces
+    no per-day fold row, so the cold/miss populate branch stores an
+    ``is_empty`` sentinel (``empty_cached_day``) for every needed closed date
+    the fold didn't emit — registering the quiet day as a cache HIT (the same
+    computed-empty registration ``projects_env_week_put`` does for an empty
+    week). That keeps ``have_all`` reachable, so a weekend/vacation gap day
+    does NOT permanently defeat the warm path; the sentinel is skipped in the
+    restitch, so the output stays byte-identical to from-scratch.
     """
     today_key = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
     d = since.astimezone(bucket_tz).date()
@@ -2268,6 +2272,19 @@ def build_cache_report_snapshot(
             for d, unit in built.items():
                 if d != today_key:  # never store the OPEN day as a closed unit
                     _sc.cache_report_day_store(d, unit)
+            # Empty/gap-day sentinel: a genuinely activity-free CLOSED day never
+            # appears in ``built`` (``build_cached_days`` only emits days with
+            # entries), so register an ``is_empty`` sentinel for every needed
+            # closed date the fold produced nothing for. Without this,
+            # ``have_all`` would see that quiet day as a perpetual miss and the
+            # builder would full-window-refetch on EVERY warm tick — permanently
+            # defeating the cache for any user with an off day. Mirrors
+            # ``projects_env_week_put`` registering a computed-empty week as a
+            # hit. ``needed_closed`` already excludes ``today_key``; the sentinel
+            # is skipped in the restitch below, so this is byte-identical.
+            for d in needed_closed:
+                if d not in built:
+                    _sc.cache_report_day_store(d, crk.empty_cached_day(d))
 
     if not cached_days:
         return _cache_report_empty(
@@ -2281,7 +2298,9 @@ def build_cache_report_snapshot(
     # pass over the FULL assembled set every tick (the cached day aggregates
     # carry no anomaly state).
     rows = [
-        crk.reconstruct_cache_row(cached_days[d]) for d in sorted(cached_days)
+        crk.reconstruct_cache_row(cached_days[d])
+        for d in sorted(cached_days)
+        if not cached_days[d].is_empty  # sentinel gap days emit no CacheRow
     ]
     result = crk.classify_and_summarize(
         rows,
@@ -2440,7 +2459,8 @@ def build_cache_report_snapshot(
     by_project_rows = crk.combine_day_project_partials(
         {
             d: dict(cached_days[d].project_partials)
-            for d in kept_dates if d in cached_days
+            for d in kept_dates
+            if d in cached_days and not cached_days[d].is_empty
         }
     )
     by_model_rows = crk._aggregate_cache_breakdown_from_rows(

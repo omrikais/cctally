@@ -3653,7 +3653,10 @@ CR_A_PATH = "/fake/a.jsonl"
 CR_B_PATH = "/fake/b.jsonl"
 
 
-def _seed_cache_report_db(ns, tmp_path, *, second_project_unattributed=False):
+def _seed_cache_report_db(
+    ns, tmp_path, *, second_project_unattributed=False, gap_day=None,
+    no_today=False,
+):
     """Seed cache.db with cache activity across two projects over 14 CLOSED days
     (2026-06-06 .. 06-19) plus the current open day (06-20), all inside the
     build's ``[now-14d, now]`` window for NOW_CR.
@@ -3666,6 +3669,11 @@ def _seed_cache_report_db(ns, tmp_path, *, second_project_unattributed=False):
     row is NOT seeded, so its entries LEFT-JOIN to ``project_path=NULL`` →
     by_project shows ``(unknown)`` until a session_files row is later inserted
     (Codex-1 re-attribution).
+
+    ``gap_day`` (``"YYYY-MM-DD"``) seeds NO entries for that one CLOSED day,
+    leaving a genuinely activity-free hole in the window (the empty-day sentinel
+    P1 fix). ``no_today`` seeds no current-day (06-20) entries, so the spotlight
+    is synthesized (empty-today path through the cache).
     """
     import pathlib
     import sqlite3
@@ -3686,6 +3694,8 @@ def _seed_cache_report_db(ns, tmp_path, *, second_project_unattributed=False):
             seed_session_file(cc, path=CR_B_PATH, session_id="sb", project_path="/pb")
         off = 0
         for day in range(6, 20):  # 06-06 .. 06-19 (14 closed days)
+            if gap_day == f"2026-06-{day:02d}":
+                continue  # activity-free hole → empty-day sentinel path
             seed_session_entry(
                 cc, source_path=CR_A_PATH, line_offset=off,
                 timestamp_utc=f"2026-06-{day:02d}T18:00:00Z", model=model,
@@ -3700,21 +3710,25 @@ def _seed_cache_report_db(ns, tmp_path, *, second_project_unattributed=False):
                 cache_create=80_000, cache_read=700_000,
             )
             off += 1
-        # Current OPEN day (06-20) at 09:00 — before NOW_CR (12:00).
-        seed_session_entry(
-            cc, source_path=CR_A_PATH, line_offset=off,
-            timestamp_utc="2026-06-20T09:00:00Z", model=model,
-            input_tokens=500, output_tokens=80,
-            cache_create=40_000, cache_read=250_000,
-        )
-        off += 1
-        seed_session_entry(
-            cc, source_path=CR_B_PATH, line_offset=off,
-            timestamp_utc="2026-06-20T09:00:01Z", model=model,
-            input_tokens=600, output_tokens=90,
-            cache_create=30_000, cache_read=300_000,
-        )
-    return [f"2026-06-{d:02d}" for d in range(6, 20)]
+        if not no_today:
+            # Current OPEN day (06-20) at 09:00 — before NOW_CR (12:00).
+            seed_session_entry(
+                cc, source_path=CR_A_PATH, line_offset=off,
+                timestamp_utc="2026-06-20T09:00:00Z", model=model,
+                input_tokens=500, output_tokens=80,
+                cache_create=40_000, cache_read=250_000,
+            )
+            off += 1
+            seed_session_entry(
+                cc, source_path=CR_B_PATH, line_offset=off,
+                timestamp_utc="2026-06-20T09:00:01Z", model=model,
+                input_tokens=600, output_tokens=90,
+                cache_create=30_000, cache_read=300_000,
+            )
+    return [
+        f"2026-06-{d:02d}" for d in range(6, 20)
+        if gap_day != f"2026-06-{d:02d}"
+    ]
 
 
 def _build_cache_report(dash, *, use):
@@ -3867,8 +3881,18 @@ def test_cache_report_cache_late_ingest_recomputes(monkeypatch, tmp_path):
 
 def test_cache_report_cache_session_files_reattribution(monkeypatch, tmp_path):
     """Codex-1: a CLOSED day whose session_files attribution moves
-    ``(unknown)``→``/pb`` (via a new session_files row → sf_sig moves) with no
-    session_entries change → the sf_sig full-clear → by_project == from-scratch."""
+    ``(unknown)``→``/pb`` via a NEW ``session_files`` row (COUNT(*) moves →
+    ``sf_sig`` moves) with no ``session_entries`` change → the ``sf_sig``
+    full-clear → by_project == from-scratch.
+
+    Honesty note (P2): this exercises the COUNT-moving INSERT path ONLY.
+    ``sf_sig`` is ``(COUNT(*), MAX(rowid))``, so the actual lazy-backfill shape
+    — an in-place ``ON CONFLICT(path) DO UPDATE SET project_path = COALESCE(...)``
+    (rowid + count both stable) — does NOT move ``sf_sig`` and is deliberately
+    NOT covered here. That in-place UPDATE on a closed day is only
+    watermark-covered (reaches only ``>= the co-ingested new rows' day``), an
+    accepted inherited limitation matching the projects-env cache — see
+    ``reconcile_cache_report_cache``'s docstring."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     import pathlib
@@ -3974,3 +3998,88 @@ def test_cache_report_cache_f7_no_shared_mutation(monkeypatch, tmp_path):
     assert same.net_usd == captured_net, "cached net_usd is never mutated (F7)"
     assert same.project_partials is captured_pp, "project_partials tuple identity stable"
     assert same.project_partials == captured_pp
+
+
+def test_cache_report_cache_gap_day_still_warm(monkeypatch, tmp_path):
+    """[P1] An activity-free CLOSED day must NOT permanently defeat the cache.
+
+    The gap day (06-12) never appears in the per-day fold, so the cold populate
+    stores an ``is_empty`` sentinel for it — keeping ``have_all`` True so the
+    next warm tick still takes the NARROW today-only fetch (not a full-window
+    refetch), while the warm envelope stays byte-identical to from-scratch.
+
+    Non-vacuity: pre-fix (no sentinel store) the gap day is a perpetual miss, so
+    ``have_all`` is False forever and the warm tick full-window-refetches
+    (``calls[0][0] == since``) — the ``== today_start`` assertion goes RED. It
+    was verified RED by temporarily removing the sentinel-store loop."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path, gap_day="2026-06-12")
+    since = NOW_CR - dt.timedelta(days=14)
+    today_start = dt.datetime(2026, 6, 20, 0, 0, tzinfo=dt.timezone.utc)
+
+    real = ns["get_claude_session_entries"]
+    calls: list = []
+
+    def spy(a, b, **kw):
+        calls.append((a, b))
+        return real(a, b, **kw)
+
+    monkeypatch.setattr(dash, "get_claude_session_entries", spy)
+
+    sc.reset_cache_report_state()
+    scratch = _build_cache_report(dash, use=False)
+
+    calls.clear()
+    cold = _build_cache_report(dash, use=True)   # primes the cache (full fetch)
+    assert len(calls) == 1 and calls[0][0] == since, "cold full-window fetch"
+    # The activity-free day is registered as an is_empty sentinel (a HIT).
+    gap_unit = sc.cache_report_day_get("2026-06-12")
+    assert gap_unit is not None and gap_unit.is_empty, \
+        "the gap day must be cached as an empty sentinel"
+    assert len(sc._CACHE_REPORT_DAY_CACHE) == 14, \
+        "13 real closed days + 1 sentinel = all 14 needed closed dates cached"
+
+    calls.clear()
+    warm = _build_cache_report(dash, use=True)   # served from cache (today-only)
+    # The sentinel keeps have_all True → the warm tick takes the narrow path.
+    assert len(calls) == 1, calls
+    assert calls[0][0] == today_start, \
+        "warm build must fetch ONLY the current day despite the gap day"
+    assert calls[0][0] != since, "warm build must NOT refetch the full window"
+
+    to_dict = dash._cache_report_snapshot_to_dict
+    assert to_dict(cold) == to_dict(scratch), "cold == from-scratch"
+    assert to_dict(warm) == to_dict(scratch), "gap-day warm == from-scratch"
+    # The gap day contributes NO day row (byte-identity — never a zero-row).
+    assert "2026-06-12" not in {d.date for d in warm.days}, \
+        "the sentinel gap day emits no CacheRow"
+
+
+def test_cache_report_cache_empty_today_matches_from_scratch(monkeypatch, tmp_path):
+    """[P3] Today has NO entries but closed days do: the synthetic-today path
+    through the cache stays byte-identical to from-scratch (guards the warm
+    build when the current-day fold is empty)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_dashboard as dash
+    import _lib_snapshot_cache as sc
+
+    _seed_cache_report_db(ns, tmp_path, no_today=True)
+
+    sc.reset_cache_report_state()
+    scratch = _build_cache_report(dash, use=False)
+    sc.reset_cache_report_state()
+    cold = _build_cache_report(dash, use=True)   # primes the cache
+    warm = _build_cache_report(dash, use=True)   # today-only fetch returns []
+
+    to_dict = dash._cache_report_snapshot_to_dict
+    # Non-vacuity: today is genuinely empty (synthetic zero spotlight).
+    assert scratch.today.date == "2026-06-20"
+    assert scratch.today.cache_hit_percent == 0.0, "no today entries → zero spotlight"
+    assert any(r.net_usd != 0.0 for r in scratch.by_project), "closed days non-zero"
+    assert to_dict(cold) == to_dict(scratch), "cold == from-scratch"
+    assert to_dict(warm) == to_dict(scratch), "empty-today warm == from-scratch"

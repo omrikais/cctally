@@ -1710,7 +1710,17 @@ def reconcile_cache_report_cache(
        ``{max_id, max_seq, reset_sig, sf_sig, tz_key}``, return, no eviction.
     2. **Full-clear** on any of: ``reset_sig`` changed, ``sf_sig`` changed
        (Codex-1 — lazy ``session_files.project_path`` backfill can re-attribute
-       a CLOSED day's by_project rows with no ``session_entries`` / seq change),
+       a CLOSED day's by_project rows with no ``session_entries`` / seq change).
+       INHERITED LIMITATION (accepted; matches the projects-env cache, same
+       ``sf_sig`` leg): ``sf_sig`` is ``(COUNT(*), MAX(rowid))``, so an in-place
+       ``ON CONFLICT(path) DO UPDATE SET project_path = COALESCE(...)`` backfill
+       (rowid + count both stable — the actual lazy-backfill shape) does NOT
+       move it. Such an UPDATE is only watermark-covered via the co-ingested new
+       ``session_entries`` rows, which carry the NEW day — so the seq-gated
+       eviction reaches only ``>= that day`` and a re-attributed CLOSED day can
+       stale-serve ``(unknown)`` until it rolls out of the window (or a reset
+       full-clears). A framework-wide fix belongs with the shared ``sf_sig``
+       leg, not #272.
        ``tz_key`` changed (a display-tz change shifts every calendar-day
        boundary → all cached day keys invalid), ``max_entry_id`` regressed, or
        ``max_mutation_seq`` regressed (cache.db rebuilt out-of-process) →

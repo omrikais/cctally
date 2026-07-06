@@ -2288,6 +2288,12 @@ def _tui_build_snapshot(
                             max_mutation_seq=dispatch_sig.entry_mutation_seq,
                             reset_sig=dispatch_sig.reset_sig,
                             sf_sig=_sc.session_files_sig(_rc_cache_conn),
+                            # `_load_sibling` is the canonical idempotent
+                            # sibling-access idiom (it returns the already-loaded
+                            # cctally-bound kernel instance). `_lib_cache_report`
+                            # is loaded eagerly at import (bin/cctally), so this
+                            # is a plain re-fetch of a populated `sys.modules`
+                            # entry — NOT a first-tick KeyError guard.
                             bucket_tz=_cctally()._load_sibling(
                                 "_lib_cache_report"
                             )._resolve_bucket_tz(_build_display_tz),
