@@ -106,12 +106,19 @@ def _open_with_full_schema(path: pathlib.Path) -> sqlite3.Connection:
             cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
             usage_extra_json    TEXT,
             cost_usd_raw        REAL,
-            speed               TEXT
+            speed               TEXT,
+            -- #270: durable per-row mutation signal (mirrors production schema);
+            -- the projects-envelope current-week accumulator seeks its warm delta
+            -- by `mutation_seq > ?`, so the fixture rows must carry it.
+            mutation_seq        INTEGER NOT NULL DEFAULT 0,
+            mutation_min_ts     TEXT
         );
         CREATE INDEX idx_entries_timestamp
             ON session_entries(timestamp_utc);
         CREATE INDEX idx_entries_source
             ON session_entries(source_path);
+        CREATE INDEX idx_entries_mutation_seq
+            ON session_entries(mutation_seq, mutation_min_ts);
 
         CREATE TABLE weekly_usage_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,9 +170,13 @@ def _insert_entry(
     conn.execute(
         "INSERT INTO session_entries "
         "(source_path, line_offset, timestamp_utc, model, "
-        " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
-        (source_path, line_offset, _iso(ts), model, input_tokens, output_tokens),
+        " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+        " mutation_seq, mutation_min_ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 0, "
+        "        (SELECT COALESCE(MAX(mutation_seq), 0) + 1 FROM session_entries), "
+        "        ?)",
+        (source_path, line_offset, _iso(ts), model, input_tokens, output_tokens,
+         _iso(ts)),
     )
 
 

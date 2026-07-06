@@ -805,6 +805,34 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
         lock_fh.close()
 
 
+def _bump_mutation_seq(conn: sqlite3.Connection) -> int:
+    """Atomically increment the ``session_entries`` mutation counter in
+    ``cache_meta`` and return the new value (#270, spec §6).
+
+    The counter (key ``session_entries_mutation_seq``) is a monotonic integer
+    stamped onto every insert and every WHERE-passing in-place UPSERT so an
+    id-stable finalization advances the composite dispatch signature (via the
+    ``entry_mutation_seq`` leg) and the change-aware watermark, closing the
+    dashboard idle-path stale-snapshot hole.
+
+    ``value`` has TEXT affinity; ``CAST(... AS INTEGER) + 1`` yields an integer
+    stored back as text, and ``RETURNING value`` returns that text form so
+    ``int(...)`` is correct. Called PER FILE inside ``sync_cache``'s per-file
+    write transaction (rollback-safe: a file that rolls back reverts the counter
+    and its row stamps together), under the single-writer ``cache.db.lock``
+    flock, so no concurrency guard beyond the flock is needed. ``cache_meta`` is
+    guaranteed present by ``_apply_cache_schema`` before any ``sync_cache`` runs.
+    """
+    row = conn.execute(
+        "INSERT INTO cache_meta(key, value) "
+        "VALUES ('session_entries_mutation_seq', '1') "
+        "ON CONFLICT(key) DO UPDATE SET "
+        "    value = CAST(cache_meta.value AS INTEGER) + 1 "
+        "RETURNING value"
+    ).fetchone()
+    return int(row[0])
+
+
 def sync_cache(
     conn: sqlite3.Connection,
     *,
@@ -1493,6 +1521,18 @@ def sync_cache(
                     )
                     stats.files_reset_truncated += 1
                 if rows:
+                    # #270: bump the per-file mutation counter BEFORE capturing
+                    # `before`, so this cache_meta write stays OUTSIDE the
+                    # [before, after] total_changes window and never inflates
+                    # `stats.rows_changed` (byte-identity). Per file (not once
+                    # per sync) for rollback-safety: the counter write is atomic
+                    # with the row stamps in this file's write transaction, so a
+                    # file that rolls back reverts both together (spec §6). Each
+                    # row built for this file is stamped mutation_seq = this
+                    # file's `sync_seq` and mutation_min_ts = its own
+                    # timestamp_utc (== the event time on insert).
+                    sync_seq = _bump_mutation_seq(conn)
+                    stamped_rows = [r + (sync_seq, r[2]) for r in rows]
                     before = conn.total_changes
                     # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
                     # wins on conflict; speed-set breaks ties. The partial
@@ -1522,8 +1562,9 @@ def sync_cache(
                            (source_path, line_offset, timestamp_utc, model,
                             msg_id, req_id, input_tokens, output_tokens,
                             cache_create_tokens, cache_read_tokens,
-                            usage_extra_json, speed, cost_usd_raw)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            usage_extra_json, speed, cost_usd_raw,
+                            mutation_seq, mutation_min_ts)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(msg_id, req_id)
                            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
                            DO UPDATE SET
@@ -1535,7 +1576,32 @@ def sync_cache(
                                cache_read_tokens = excluded.cache_read_tokens,
                                usage_extra_json = excluded.usage_extra_json,
                                speed = excluded.speed,
-                               cost_usd_raw = excluded.cost_usd_raw
+                               cost_usd_raw = excluded.cost_usd_raw,
+                               -- #270: stamp the change. mutation_seq advances
+                               -- exactly when this guarded UPSERT's WHERE passes
+                               -- (incl. the equal-tokens speed-tiebreak branch,
+                               -- Codex-2d). mutation_min_ts accumulates the
+                               -- EARLIEST event time the row has held —
+                               -- session_entries.mutation_min_ts is the OLD
+                               -- (pre-update) value, excluded.timestamp_utc the
+                               -- finalization's new time — so a finalization
+                               -- that moves the row across a bucket boundary
+                               -- still lets the closed-bucket watermark reach
+                               -- the OLD bucket (spec §6/§7b). The SET reads
+                               -- pre-update column values, unaffected by the
+                               -- sibling timestamp_utc = excluded.timestamp_utc.
+                               -- COALESCE(mutation_min_ts, timestamp_utc) guards
+                               -- a LEGACY row (written before these columns
+                               -- existed: mutation_min_ts NULL): SQLite scalar
+                               -- MIN(NULL, x) is NULL, which would strand the
+                               -- watermark; the pre-update timestamp_utc is that
+                               -- legacy row's old event time, so both its old
+                               -- and new buckets stay reachable. No-op for
+                               -- non-legacy rows (mutation_min_ts already set).
+                               mutation_seq = excluded.mutation_seq,
+                               mutation_min_ts = MIN(COALESCE(session_entries.mutation_min_ts,
+                                                              session_entries.timestamp_utc),
+                                                     excluded.timestamp_utc)
                            WHERE
                                (excluded.input_tokens + excluded.output_tokens
                                 + excluded.cache_create_tokens + excluded.cache_read_tokens)
@@ -1551,7 +1617,7 @@ def sync_cache(
                                AND excluded.speed IS NOT NULL
                                AND session_entries.speed IS NULL
                             )""",
-                        rows,
+                        stamped_rows,
                     )
                     stats.rows_changed += conn.total_changes - before
                 # Conversation message ingest (Plan 1). Lands in the SAME
@@ -2340,20 +2406,27 @@ def iter_entries_with_id(
     range_start: dt.datetime,
     range_end: dt.datetime,
     *,
-    after_id: int | None = None,
+    after_seq: int | None = None,
     after_ts: dt.datetime | None = None,
 ) -> list[tuple[int, UsageEntry]]:
     """Like ``iter_entries`` but yields ``(id, UsageEntry)`` rows, ordered
     ``(timestamp_utc, id)``, for #271's current-bucket accumulator (§7d).
 
-    When ``after_id`` / ``after_ts`` are given, restricts to the incremental
-    delta ``(id > after_id OR timestamp_utc > after_ts)`` — the ``id`` leg
-    catches genuinely-new ingests, the ``timestamp_utc`` leg catches
-    already-ingested rows that newly entered the window because ``now`` advanced
-    (Codex-1). Both disjuncts stay index-usable (rowid range +
-    ``idx_entries_timestamp`` range), so the delta is O(delta), not a full
-    current-bucket scan (an ``EXPLAIN QUERY PLAN`` regression test guards this,
-    Codex-2). ``iter_entries``' public ``list[UsageEntry]`` shape and
+    When ``after_seq`` / ``after_ts`` are given, restricts to the incremental
+    delta ``(mutation_seq > after_seq OR timestamp_utc > after_ts)`` — the
+    ``mutation_seq`` leg (#270 §8) catches genuinely-new ingests AND id-stable
+    in-place finalizations (which advance ``mutation_seq`` while leaving ``id``
+    flat, so the pre-#270 ``id > after_id`` leg missed them and double-counted);
+    the ``timestamp_utc`` leg catches already-ingested rows that newly entered
+    the window because ``now`` advanced (Codex-1). Both disjuncts stay
+    index-usable (``idx_entries_mutation_seq`` range + ``idx_entries_timestamp``
+    range), so the delta is O(delta), not a full current-bucket scan (an
+    ``EXPLAIN QUERY PLAN`` regression test guards this, Codex-2). On a
+    pure-insert interval ``{mutation_seq > after_seq}`` == ``{id > after_id}``
+    (each insert carries a fresh seq monotone with id), so the delta row set is
+    byte-identical to the old ``id`` leg (§7b). The ``id`` is still SELECTed (the
+    accumulator's ``id <= reconciled_max_id`` pre-existing-row cold-refold trigger
+    reads it). ``iter_entries``' public ``list[UsageEntry]`` shape and
     ``UsageEntry`` (which has no ``id`` field) are left untouched — this is a
     thin internal sibling, not an overload (Codex-5).
     """
@@ -2366,14 +2439,14 @@ def iter_entries_with_id(
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
     )
     params: list[Any] = [start_iso, end_iso]
-    if after_id is not None or after_ts is not None:
-        after_id_val = -1 if after_id is None else int(after_id)
+    if after_seq is not None or after_ts is not None:
+        after_seq_val = -1 if after_seq is None else int(after_seq)
         after_ts_val = (
             "" if after_ts is None
             else after_ts.astimezone(dt.timezone.utc).isoformat()
         )
-        sql += " AND (id > ? OR timestamp_utc > ?)"
-        params += [after_id_val, after_ts_val]
+        sql += " AND (mutation_seq > ? OR timestamp_utc > ?)"
+        params += [after_seq_val, after_ts_val]
     sql += " ORDER BY timestamp_utc ASC, id ASC"
 
     out: list[tuple[int, UsageEntry]] = []

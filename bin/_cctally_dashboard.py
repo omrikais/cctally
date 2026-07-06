@@ -438,8 +438,8 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # #269 (final reviewer): the per-(project, week) cache clear above is
             # NOT sufficient on its own. `_build_projects_envelope` consults the
             # whole-envelope memo `_PROJECTS_ENV_MEMO` FIRST — and its memo_key is
-            # `(max_id, max_wus_id, cw_key, weeks_back)`, which carries NO
-            # generation counter. A prune that deletes only NON-max
+            # `(max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)`, which
+            # carries NO generation counter. A prune that deletes only NON-max
             # `session_entries` rows leaves `max_id` unchanged, so the memo_key
             # still matches and the memo would stale-serve the pre-prune envelope
             # (still showing the deleted project + its cost) before the fresh
@@ -2660,10 +2660,10 @@ def _group_a_monthly_buckets(now_utc, *, n, range_start, display_tz):
             lo, hi = _current_window(label)
             return [] if hi <= lo else iter_entries_with_id(cache_conn, lo, hi)
 
-        def _delta_fetch(label, after_id, after_ts):
+        def _delta_fetch(label, after_seq, after_ts):
             lo, hi = _current_window(label)
             return [] if hi <= lo else iter_entries_with_id(
-                cache_conn, lo, hi, after_id=after_id, after_ts=after_ts)
+                cache_conn, lo, hi, after_seq=after_seq, after_ts=after_ts)
 
         buckets = build_cached_group_a(
             "monthly",
@@ -2869,10 +2869,10 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
             s, hi = _current_window(label)
             return [] if hi <= s else iter_entries_with_id(cache_conn, s, hi)
 
-        def _delta_fetch(label, after_id, after_ts):
+        def _delta_fetch(label, after_seq, after_ts):
             s, hi = _current_window(label)
             return [] if hi <= s else iter_entries_with_id(
-                cache_conn, s, hi, after_id=after_id, after_ts=after_ts)
+                cache_conn, s, hi, after_seq=after_seq, after_ts=after_ts)
 
         buckets = build_cached_group_a(
             "weekly",
@@ -3519,10 +3519,10 @@ def _group_a_daily_buckets(now_utc, *, n, display_tz):
             lo, hi = _current_window(label)
             return [] if hi <= lo else iter_entries_with_id(cache_conn, lo, hi)
 
-        def _delta_fetch(label, after_id, after_ts):
+        def _delta_fetch(label, after_seq, after_ts):
             lo, hi = _current_window(label)
             return [] if hi <= lo else iter_entries_with_id(
-                cache_conn, lo, hi, after_id=after_id, after_ts=after_ts)
+                cache_conn, lo, hi, after_seq=after_seq, after_ts=after_ts)
 
         buckets = build_cached_group_a(
             "daily",
@@ -3713,7 +3713,7 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
                                    *,
                                    since: "dt.datetime",
                                    until: "dt.datetime",
-                                   after_id: "int | None" = None):
+                                   after_seq: "int | None" = None):
     """Read ``session_entries`` joined with ``session_files`` over
     [since, until]. Yields rows directly off the passed conn — no
     cache.db monkeypatch, no production ``get_claude_session_entries``
@@ -3721,20 +3721,32 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
     production wiring opens both DBs and ATTACHes cache.db as a schema
     on the stats conn (see ``_run_dashboard_sync_tick``).
 
-    ``after_id`` (Codex-P2b — #271 §20): when set, the current-week
-    accumulator's warm delta seeks by the **rowid range** (``WHERE e.id > ?``)
-    with the ``[since, until]`` timestamp bounds applied as a NON-indexed
-    filter — the unary-plus no-op ``+e.timestamp_utc`` deprioritizes
-    ``idx_entries_timestamp`` so the planner drives off the INTEGER PRIMARY
-    KEY (``SEARCH e USING INTEGER PRIMARY KEY (rowid>?)``), touching only the
-    small ingest delta instead of re-scanning the whole current-week timestamp
-    range. Unary ``+`` is a TRUE no-op (it preserves the TEXT value AND the
-    string comparison, unlike ``+ 0`` which would coerce to numeric), so the
-    filtered row SET is byte-identical to the un-hinted form; the caller
-    (``_fetch_delta_rows``) re-sorts the small result by
-    ``(timestamp_utc, id)`` to reproduce the full pass's fold order. An
-    ``EXPLAIN QUERY PLAN`` regression asserts the rowid seek
-    (``tests/test_projects_envelope.py``).
+    ``after_seq`` (#270 §8, re-key of Codex-P2b — #271 §20): when set, the
+    current-week accumulator's warm delta seeks by the **mutation_seq range**
+    (``WHERE e.mutation_seq > ?``) with the ``[since, until]`` timestamp bounds
+    applied as a residual filter. Two hints keep the planner on the
+    ``idx_entries_mutation_seq`` seek (``SEARCH e USING INDEX
+    idx_entries_mutation_seq (mutation_seq>?)``) instead of a full ``SCAN`` /
+    ``idx_entries_timestamp`` window scan (which would re-read the whole ~12K-entry
+    current week and let the ~63ms floor creep back): (1) the unary-plus no-op
+    ``+e.timestamp_utc`` deprioritizes ``idx_entries_timestamp`` (a TRUE no-op —
+    it preserves the TEXT value AND the string comparison, unlike ``+ 0``); and
+    (2) ``ORDER BY e.mutation_seq`` matches the index's leading column so the
+    planner satisfies the order from the seek itself. ``INDEXED BY`` is NOT usable
+    here — production runs this against a TEMP VIEW (``session_entries`` over the
+    ATTACHed ``cache_db.session_entries``), and a view has no indexes; the hint
+    pair drives the same seek on both the view and a base-table fixture. Unlike
+    the old ``e.id > ?`` leg (a free INTEGER PRIMARY KEY rowid range), a bare
+    ``e.mutation_seq > ?`` lets the planner fall back to a scan on a small table,
+    so the hints are load-bearing. Re-keying from ``e.id`` to ``e.mutation_seq``
+    catches an id-stable in-place finalization (it advances the seq while
+    ``MAX(id)`` stays flat, so the pre-#270 ``e.id > ?`` leg missed it); on a
+    pure-insert tick ``{mutation_seq > ?}`` == ``{id > ?}`` (seq monotone with
+    id), so the delta row SET is byte-identical. The caller (``_fetch_delta_rows``)
+    re-sorts the small result by ``(timestamp_utc, id)`` to reproduce the full
+    pass's fold order, so the ``mutation_seq``-ASC SQL order is irrelevant
+    downstream. An ``EXPLAIN QUERY PLAN`` regression asserts the mutation_seq
+    index seek (``tests/test_projects_envelope.py``).
     """
     since_iso = since.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -3742,7 +3754,7 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
     until_iso = until.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    if after_id is not None:
+    if after_seq is not None:
         cur = conn.execute(
             "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
             "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
@@ -3750,9 +3762,9 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
             "       sf.session_id, sf.project_path "
             "FROM session_entries e "
             "LEFT JOIN session_files sf ON sf.path = e.source_path "
-            "WHERE e.id > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
-            "ORDER BY e.id ASC",
-            (after_id, since_iso, until_iso),
+            "WHERE e.mutation_seq > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
+            "ORDER BY e.mutation_seq ASC",
+            (after_seq, since_iso, until_iso),
         )
     else:
         cur = conn.execute(
@@ -3962,6 +3974,7 @@ def _assemble_projects_via_cache(
     cw_start: "dt.datetime",
     cw_end: "dt.datetime",
     cur_max_id: int,
+    cur_max_seq: int,
 ) -> "tuple[dict, dict, dict]":
     """Flag-ON assembly (#269 §14 Win 2): recompute only the CURRENT week each
     warm tick; serve CLOSED weeks from the per-(project, week) cache on a hit and
@@ -3972,11 +3985,13 @@ def _assemble_projects_via_cache(
 
     #271 M4 (spec §20): the CURRENT week is no longer re-folded from scratch each
     warm tick — it goes through the single-slot ``accumulate_projects_current_week``
-    accumulator, which folds only the ``id > reconciled_max_id`` delta (or
-    finalizes the cached running ``mut`` unchanged on an empty-delta tick),
-    byte-identically. ``cur_max_id`` is the tick's ``MAX(session_entries.id)``
-    (the delta watermark). The accumulator is single-writer here (this runs only
-    on the sync-thread ``use_projects_env_cache=True`` path).
+    accumulator, which folds only the changed-row delta (or finalizes the cached
+    running ``mut`` unchanged on an empty-delta tick), byte-identically.
+    ``cur_max_id`` is the tick's ``MAX(session_entries.id)`` (the regression
+    backstop + pre-existing-row cold-refold trigger); ``cur_max_seq`` is the
+    tick's ``MAX(mutation_seq)`` (the #270 §8 delta watermark, so an id-stable
+    in-place finalization is caught). The accumulator is single-writer here (this
+    runs only on the sync-thread ``use_projects_env_cache=True`` path).
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
@@ -4015,16 +4030,17 @@ def _assemble_projects_via_cache(
             resolver_cache=resolver_cache,
         )
 
-    def _fetch_delta_rows(after_id):
-        # Rowid-seek the ingest delta (id > after_id) over the current-week
-        # window, then PRE-FILTER to genuine current-week non-synthetic rows
-        # (mirrors _fold_projects_entry's membership filter) so the accumulator's
-        # fold-order gate compares a REAL current-week entry as rows[0]. Sort by
-        # (ts_iso, id) to reproduce the full pass's fold order exactly (SQLite
-        # BINARY collation on the Z-normalized ISO string == Python str compare).
+    def _fetch_delta_rows(after_seq):
+        # Index-seek the changed-row delta (mutation_seq > after_seq, #270 §8)
+        # over the current-week window, then PRE-FILTER to genuine current-week
+        # non-synthetic rows (mirrors _fold_projects_entry's membership filter) so
+        # the accumulator's fold-order gate compares a REAL current-week entry as
+        # rows[0]. Sort by (ts_iso, id) to reproduce the full pass's fold order
+        # exactly (SQLite BINARY collation on the Z-normalized ISO string ==
+        # Python str compare).
         out = []
         for r in _projects_iter_session_entries(
-            conn, since=cw_start, until=cw_end, after_id=after_id,
+            conn, since=cw_start, until=cw_end, after_seq=after_seq,
         ):
             if r[2] == "<synthetic>":  # r[2] = model
                 continue
@@ -4040,6 +4056,7 @@ def _assemble_projects_via_cache(
             week_buckets, week_total = sc.accumulate_projects_current_week(
                 week_key=sc.projects_env_week_key(cw_start),
                 cur_max_id=cur_max_id,
+                cur_max_seq=cur_max_seq,
                 fetch_all_raw=_fetch_all_raw,
                 fetch_delta_rows=_fetch_delta_rows,
                 finalize=_finalize_projects_mut,
@@ -4089,7 +4106,9 @@ def _build_projects_envelope(
 
     Determinism: same conn + same ``now_utc`` ⇒ byte-identical JSON
     (R-PROJ5 invariant). Per-tick memoized on
-    ``(max(session_entries.id), cw_week_start, weeks_back)``.
+    ``(max(session_entries.id), max_wus_id, max(mutation_seq), cw_week_start,
+    weeks_back)`` — the ``mutation_seq`` leg (#270 §7d) busts the memo on an
+    id-stable in-place finalization.
     """
     c = _cctally()
 
@@ -4109,10 +4128,25 @@ def _build_projects_envelope(
         max_wus_id = cur.fetchone()[0]
     except sqlite3.OperationalError:
         max_wus_id = 0
+    # #270 (§7d, Codex-2b): this OUTER whole-envelope memo returns BEFORE the
+    # inner per-(project, week) reconcile cache, so an id-stable in-place
+    # finalization — which leaves MAX(id)/MAX(wus id) flat — would serve the
+    # stale envelope regardless of the inner seq fix. Fold the mutation signal
+    # into the memo key so it busts on any changed row. `MAX(mutation_seq)` is
+    # read off the SAME `session_entries` surface as `max_id` (an id-stable
+    # UPSERT advances it), index-backed by `idx_entries_mutation_seq`, and
+    # degrades to 0 where the column is absent (old fixtures) — byte-identical.
+    try:
+        cur = conn.execute(
+            "SELECT COALESCE(MAX(mutation_seq), 0) FROM session_entries"
+        )
+        entry_mutation_seq = cur.fetchone()[0]
+    except sqlite3.OperationalError:
+        entry_mutation_seq = 0
     cw_key: "dt.datetime | None" = None
     if current_week is not None:
         cw_key = getattr(current_week, "week_start_at", None)
-    memo_key = (max_id, max_wus_id, cw_key, weeks_back)
+    memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)
     cached = _PROJECTS_ENV_MEMO.get("value")
     if cached is not None and _PROJECTS_ENV_MEMO.get("key") == memo_key:
         return cached
@@ -4160,7 +4194,7 @@ def _build_projects_envelope(
     if use_projects_env_cache:
         buckets, total_cost_by_week, key_by_bucket = _assemble_projects_via_cache(
             conn, weeks_full=weeks_full, cw_start=cw_start, cw_end=cw_end,
-            cur_max_id=max_id,
+            cur_max_id=max_id, cur_max_seq=entry_mutation_seq,
         )
     else:
         # `_resolve_project_key` is the production resolver; we use git-root

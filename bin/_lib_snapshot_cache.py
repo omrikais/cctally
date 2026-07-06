@@ -81,6 +81,10 @@ class SnapshotSignature(NamedTuple):
     reset_sig: tuple[int, int]
     max_codex_id: int
     generation: int
+    # #270 §7a: the O(1) `cache_meta` mutation counter. An id-stable in-place
+    # finalization UPSERT advances this leg while `max_entry_id` stays flat, so
+    # the dashboard leaves the idle path and recomputes the affected bucket.
+    entry_mutation_seq: int = 0
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -95,6 +99,32 @@ def _max_id(conn: sqlite3.Connection, table: str) -> int:
         return int(row[0])
     except sqlite3.Error:
         return 0
+
+
+def _entry_mutation_seq(conn: sqlite3.Connection) -> int:
+    """Current ``session_entries`` mutation counter from ``cache_meta`` (§7a).
+
+    Reads the O(1) KV counter (key ``session_entries_mutation_seq``) that
+    ``sync_cache`` bumps on every insert AND every WHERE-passing in-place UPSERT
+    (#270). This is the new ``entry_mutation_seq`` signature leg: an id-stable
+    finalization advances it even though ``MAX(session_entries.id)`` is flat, so
+    the dashboard leaves the idle path and recomputes the affected bucket.
+
+    An O(1) KV read — NOT a ``MAX(mutation_seq)`` full scan (that is exactly the
+    per-tick cost #268 removed). Degrades to 0 on a fresh / partially-migrated DB
+    where the ``cache_meta`` table or the key is absent (like ``_max_id`` /
+    ``_reset_sig``), so the signature never raises.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='session_entries_mutation_seq'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
 
 
 def _reset_sig(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -142,6 +172,7 @@ def compute_signature(
         reset_sig=_reset_sig(stats_conn),
         max_codex_id=_max_id(cache_conn, "codex_session_entries"),
         generation=int(generation),
+        entry_mutation_seq=_entry_mutation_seq(cache_conn),
     )
 
 
@@ -182,6 +213,53 @@ def new_min_timestamp(
     # `...+00:00` stored forms), then normalize to a UTC-tzinfo instant so
     # downstream comparisons against UTC bucket boundaries are exact.
     parsed = parse_iso_datetime(row[0], "session_entries.timestamp_utc")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def changed_min_timestamp(
+    cache_conn: sqlite3.Connection,
+    last_seen_seq: int,
+) -> "dt.datetime | None":
+    """Earliest event time among rows CHANGED since ``last_seen_seq`` (§7b).
+
+    Returns ``MIN(mutation_min_ts) WHERE mutation_seq > last_seen_seq`` as an
+    aware UTC datetime, or ``None`` when there are no such rows. Generalizes
+    ``new_min_timestamp`` from the ``id`` watermark to the #270 ``mutation_seq``
+    watermark; the same parse / normalize-to-UTC path and the same
+    ``None``-on-missing-table degrade.
+
+    Load-bearing byte-identity invariant: on a PURE-INSERT interval every changed
+    row is a fresh insert carrying a new ``id`` (> last_seen_id), a new
+    ``mutation_seq`` (> last_seen_seq), and ``mutation_min_ts == timestamp_utc``,
+    and no existing row was re-stamped — so ``{mutation_seq > last_seen_seq}`` ==
+    ``{id > last_seen_id}`` and ``MIN(mutation_min_ts)`` == ``MIN(timestamp_utc)``,
+    i.e. this equals ``new_min_timestamp(last_seen_id)`` (late-ingest reach-back
+    included). When an in-place update landed, the seq set additionally contains
+    the updated row, whose ``mutation_min_ts = min(all event times it has held)``
+    pulls the watermark back to the EARLIEST bucket it has touched, so both the
+    old bucket (stripped from) and the new bucket (added to) are recomputed;
+    over-marking the between-buckets is byte-safe. ``MIN()`` ignores the NULL
+    ``mutation_min_ts`` of any legacy seq-0 row (which this ``> last_seen_seq``
+    predicate never selects anyway).
+
+    Backed by ``idx_entries_mutation_seq(mutation_seq, mutation_min_ts)`` — an
+    index-only range-min over the handful of rows changed since the last tick, so
+    #268's per-tick full-scan is not reintroduced.
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT MIN(mutation_min_ts) FROM session_entries "
+            "WHERE mutation_seq > ?",
+            (last_seen_seq,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    # Parse via the repo's canonical ISO helper (both ``...Z`` and ``...+00:00``
+    # stored forms), then normalize to a UTC-tzinfo instant so downstream
+    # comparisons against UTC bucket boundaries are exact.
+    parsed = parse_iso_datetime(row[0], "session_entries.mutation_min_ts")
     return parsed.astimezone(dt.timezone.utc)
 
 
@@ -383,6 +461,7 @@ class CurrentBucketAccumulator:
     acc: dict                    # running _new_bucket_acc() shape
     tail: "tuple | None"         # (timestamp_utc, id) of the last folded entry
     last_seen_id: int            # max session_entries.id reconciled (= cur_max_id)
+    last_seen_seq: int           # #270 §8: the mutation_seq watermark (= cur_max_seq)
     last_now: dt.datetime        # now_utc upper bound used to clamp the last fold
 
 
@@ -402,14 +481,27 @@ def _finalize_or_none(label, acc, tail):
 
 
 def accumulate_current_bucket(prior, *, current_label, cur_now, cur_max_id,
-                              fetch_all, fetch_delta, membership, mode="auto"):
+                              cur_max_seq, fetch_all, fetch_delta, membership,
+                              mode="auto"):
     """Pure §7b tick algorithm. Returns ``(BucketUsage | None, CurrentBucketAccumulator)``.
 
     ``fetch_all() -> list[(id, UsageEntry)]`` over the whole current-bucket
-    window (cold / fallback); ``fetch_delta(after_id, after_ts) ->
-    list[(id, UsageEntry)]`` the ``(id > after_id OR ts > after_ts)`` delta;
-    both ordered ``(timestamp_utc, id)``. ``membership(entry) -> bool`` keeps
-    exactly the entries the full pass assigns to ``current_label``.
+    window (cold / fallback); ``fetch_delta(after_seq, after_ts) ->
+    list[(id, UsageEntry)]`` the ``(mutation_seq > after_seq OR ts > after_ts)``
+    delta (#270 §8 re-key); both ordered ``(timestamp_utc, id)``.
+    ``membership(entry) -> bool`` keeps exactly the entries the full pass assigns
+    to ``current_label``.
+
+    #270 §8: the delta is keyed on ``mutation_seq`` (a strict superset of the old
+    ``id`` leg — every insert carries a fresh seq, so the insert path stays
+    byte-identical), so an id-stable in-place finalization of a current-bucket
+    row now appears in the delta. But the incremental fold cannot un-fold a stale
+    contribution: a finalization that keeps or increases its timestamp sorts
+    AT-OR-AFTER ``tail`` and the ``(ts,id) <= tail`` gate would append it,
+    double-counting the already-folded partial. So any delta row that is a
+    PRE-EXISTING row (``id <= reconciled_max_id``) forces a cold refold of the
+    whole current bucket instead. Genuine new inserts (``id > reconciled_max_id``)
+    proceed through the unchanged ``(ts,id)``-vs-``tail`` gate + append.
     """
     def _cold():
         acc = _new_bucket_acc()
@@ -435,27 +527,44 @@ def accumulate_current_bucket(prior, *, current_label, cur_now, cur_max_id,
         or cur_now < prior.last_now
     ):
         acc, tail = _cold()
-        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id,
+                                       cur_max_seq, cur_now)
         return _finalize_or_none(current_label, acc, tail), new
 
     delta = [
-        (eid, e) for eid, e in fetch_delta(prior.last_seen_id, prior.last_now)
+        (eid, e) for eid, e in fetch_delta(prior.last_seen_seq, prior.last_now)
         if e.model != "<synthetic>" and membership(e)
     ]
     if not delta:
         # From-scratch fold set unchanged since last tick → byte-identical.
         new = CurrentBucketAccumulator(current_label, prior.acc, prior.tail,
-                                       cur_max_id, cur_now)
+                                       cur_max_id, cur_max_seq, cur_now)
         return _finalize_or_none(current_label, prior.acc, prior.tail), new
+
+    # #270 §8: any PRE-EXISTING row in the seq-delta (id <= reconciled_max_id) is
+    # an in-place update (a finalization UPSERT re-stamped its seq) — or the
+    # near-impossible clock-advance re-entry — that the incremental fold cannot
+    # safely reconcile (appending would double-count the already-folded partial).
+    # Discard the delta and cold-refold the whole current bucket (always
+    # byte-correct, bounded to this bucket). Checked BEFORE the fold-order gate so
+    # a timestamp-non-decreasing finalization (which sorts past `tail`, evading
+    # that gate) is caught here.
+    if any(eid <= prior.last_seen_id for eid, _e in delta):
+        acc, tail = _cold()
+        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id,
+                                       cur_max_seq, cur_now)
+        return _finalize_or_none(current_label, acc, tail), new
 
     # Guard: every folded delta row must sort AFTER the tail (a strict suffix).
     # tail None ⇒ prior folded nothing ⇒ the delta IS the full member set (each
-    # current member has id>last_seen OR ts>last_now), so appending == full fold.
+    # current member has mutation_seq>last_seen_seq OR ts>last_now), so appending
+    # == full fold.
     if prior.tail is not None and any(
         (e.timestamp, eid) <= prior.tail for eid, e in delta
     ):
         acc, tail = _cold()  # late-ingest mid-bucket fallback
-        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+        new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id,
+                                       cur_max_seq, cur_now)
         return _finalize_or_none(current_label, acc, tail), new
 
     acc = prior.acc  # mutate in place (module state, never published)
@@ -463,7 +572,8 @@ def accumulate_current_bucket(prior, *, current_label, cur_now, cur_max_id,
     for eid, e in delta:  # fetch_delta returns (timestamp_utc, id) ascending
         _fold_entry(acc, e, mode)
         tail = (e.timestamp, eid)
-    new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id, cur_now)
+    new = CurrentBucketAccumulator(current_label, acc, tail, cur_max_id,
+                                   cur_max_seq, cur_now)
     return _finalize_or_none(current_label, acc, tail), new
 
 
@@ -562,10 +672,16 @@ def build_cached_group_a(
     order, and updates this builder's last-seen state.
     """
     cur_max_id = _max_id(cache_conn, "session_entries")
+    # #270 §7c: split max_id's two duties — the incremental watermark + "any
+    # new work?" gate move to the O(1) `cache_meta` mutation counter (an
+    # id-stable in-place finalization advances the seq while `max_id` stays
+    # flat), while `max_id` stays the regression backstop below.
+    cur_max_seq = _entry_mutation_seq(cache_conn)
     state = _GROUP_A_LAST_SEEN.get(builder_key)
     full_invalidate = state is not None and (
         state.get("extra") != extra_signature
         or cur_max_id < int(state.get("max_id", 0))
+        or cur_max_seq < int(state.get("max_seq", 0))  # belt-and-suspenders
     )
     if full_invalidate:
         _GROUP_A_CACHE.drop_from(builder_key, lambda _lbl: True)
@@ -581,7 +697,11 @@ def build_cached_group_a(
         def dirty(_label: str) -> bool:
             return True
     else:
-        new_min_ts = new_min_timestamp(cache_conn, int(state.get("max_id", 0)))
+        # #270 §7b: the change-aware watermark over `mutation_min_ts` (the
+        # earliest event time any row CHANGED-since-last-tick has held), so an
+        # id-stable finalization that landed in / moved to a closed bucket marks
+        # it dirty. Reduces to `new_min_timestamp(max_id)` on a pure-insert tick.
+        new_min_ts = changed_min_timestamp(cache_conn, int(state.get("max_seq", 0)))
 
         def dirty(label: str) -> bool:
             if new_min_ts is None:
@@ -591,10 +711,13 @@ def build_cached_group_a(
 
     # #271 §8a/§8b: when the incremental accumulator is enabled, the current
     # bucket is produced by folding only the delta each tick instead of a full
-    # re-aggregate. The delta's id lower bound reuses the SAME previous-tick
-    # `state["max_id"]` the watermark path reads (via prior.last_seen_id inside
-    # the accumulator). Gated ON only by the sync-thread `_group_a_*_buckets`
-    # closures; every other caller leaves it off (byte-identical to today).
+    # re-aggregate. #270 §8: the delta's lower bound is now the mutation_seq
+    # watermark `cur_max_seq` (the same O(1) `cache_meta` counter the signature
+    # + Group A dirty-predicate read), reused via prior.last_seen_seq inside the
+    # accumulator, so an id-stable in-place finalization of a current-bucket row
+    # is caught (and cold-refolded). Gated ON only by the sync-thread
+    # `_group_a_*_buckets` closures; every other caller leaves it off
+    # (byte-identical to today).
     current_override = None
     if use_current_accumulator and current_label is not None:
         def current_override():
@@ -604,9 +727,10 @@ def build_cached_group_a(
                 current_label=current_label,
                 cur_now=now_utc,
                 cur_max_id=cur_max_id,
+                cur_max_seq=cur_max_seq,
                 fetch_all=lambda: current_all_fetch(current_label),
-                fetch_delta=lambda aid, ats: current_delta_fetch(
-                    current_label, aid, ats),
+                fetch_delta=lambda aseq, ats: current_delta_fetch(
+                    current_label, aseq, ats),
                 membership=membership_of,
                 mode="auto",
             )
@@ -623,7 +747,9 @@ def build_cached_group_a(
         aggregate_one=aggregate_one,
         current_override=current_override,
     )
-    _GROUP_A_LAST_SEEN[builder_key] = {"max_id": cur_max_id, "extra": extra_signature}
+    _GROUP_A_LAST_SEEN[builder_key] = {
+        "max_id": cur_max_id, "max_seq": cur_max_seq, "extra": extra_signature,
+    }
     return buckets
 
 
@@ -632,9 +758,9 @@ def build_cached_group_a(
 
 def affected_session_keys(
     cache_conn: sqlite3.Connection,
-    last_seen_max_id: int,
+    last_seen_seq: int,
 ) -> "set[str]":
-    """Resolved session identities for entries with ``id > last_seen`` (spec §5.2).
+    """Resolved session identities for entries CHANGED since ``last_seen_seq`` (§5.2).
 
     Mirrors ``_aggregate_claude_sessions`` grouping EXACTLY: identity is
     ``session_files.session_id`` when the ``LEFT JOIN`` on ``source_path``
@@ -649,14 +775,21 @@ def affected_session_keys(
     the join to ``session_files`` — so the returned keys key IDENTICALLY to
     the aggregator's session grouping (Codex F5). Returns an empty set on a
     missing table (fresh / partially-migrated DB) so callers never raise.
+
+    #270 (§7d, Codex-2c): keyed on ``mutation_seq > last_seen_seq``, NOT
+    ``id > last_seen`` — so an id-stable in-place finalization of an EXISTING
+    session's row (same id, advanced seq) surfaces that session as affected and
+    it re-aggregates. On a pure-insert interval every changed row carries a
+    fresh seq (> last_seen_seq) exactly when its id > last_seen, so the affected
+    set is byte-identical to the old id-keyed one.
     """
     try:
         rows = cache_conn.execute(
             "SELECT se.source_path, sf.session_id "
             "FROM session_entries se "
             "LEFT JOIN session_files sf ON sf.path = se.source_path "
-            "WHERE se.id > ? AND se.model != '<synthetic>'",
-            (last_seen_max_id,),
+            "WHERE se.mutation_seq > ? AND se.model != '<synthetic>'",
+            (last_seen_seq,),
         ).fetchall()
     except sqlite3.Error:
         return set()
@@ -731,25 +864,35 @@ def build_cached_sessions(
     fallback sessions), so the cache keys match ``affected_session_keys``.
     """
     cur_max_id = _max_id(cache_conn, "session_entries")
+    # #270 §7c/§7d: the warm "any new work?" gate + the affected-set query key
+    # on the `mutation_seq` counter (an id-stable in-place finalization of an
+    # EXISTING session advances the seq while `max_id` stays flat); `max_id`
+    # remains the cache.db-rebuild regression backstop.
+    cur_max_seq = _entry_mutation_seq(cache_conn)
     state = _SESSION_LAST_SEEN
     cold = (
         not state
         or state.get("extra") != extra_signature
         or cur_max_id < int(state.get("max_id", 0))
+        or cur_max_seq < int(state.get("max_seq", 0))  # belt-and-suspenders
     )
     if cold:
         _SESSION_CACHE.clear()
         for sess in aggregate_all():
             _SESSION_CACHE.put(sess.session_id, sess)
     else:
-        last_seen = int(state.get("max_id", 0))
-        if cur_max_id > last_seen:
-            affected = affected_session_keys(cache_conn, last_seen)
+        last_seen_seq = int(state.get("max_seq", 0))
+        if cur_max_seq > last_seen_seq:
+            affected = affected_session_keys(cache_conn, last_seen_seq)
             if affected:
-                for sess in reaggregate(last_seen, affected):
+                # `reaggregate` re-fetches each affected session's FULL in-window
+                # entry set (seq-keyed too — Codex-2c), so the aggregate is
+                # byte-identical to from-scratch even for an id-stable update.
+                for sess in reaggregate(last_seen_seq, affected):
                     _SESSION_CACHE.put(sess.session_id, sess)
     _SESSION_LAST_SEEN.clear()
     _SESSION_LAST_SEEN["max_id"] = cur_max_id
+    _SESSION_LAST_SEEN["max_seq"] = cur_max_seq
     _SESSION_LAST_SEEN["extra"] = extra_signature
     return list(_SESSION_CACHE.get_all().values())
 
@@ -939,54 +1082,66 @@ def cached_weekref_cost(*, week_start_at, week_end_at, now_utc, compute):
     return val
 
 
-def reconcile_weekref_cache(cache_conn, *, max_entry_id, reset_sig):
+def reconcile_weekref_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset_sig):
     """Once-per-non-idle-rebuild invalidation for the weekref-cost cache (spec §4).
 
     Driven by ``_tui_build_snapshot`` after the idle-path check, before the
     builders run, using the already-computed dispatch-signature legs
-    (``max_entry_id`` + ``reset_sig`` are passed in — no extra query for those):
+    (``max_entry_id`` + ``max_mutation_seq`` + ``reset_sig`` are passed in — no
+    extra query for those):
 
     - Cold (no last-seen): record last-seen, return — no eviction.
     - ``reset_sig`` changed OR ``max_entry_id < last_seen`` (cache.db rebuilt
-      out-of-process): full ``clear()``. A credit/reset re-shapes a past week's
-      cost; reset events are rare, so a conservative full clear is correct and
-      cheap. A max-id regression means the ids no longer map to the same rows.
-    - ``max_entry_id > last_seen``: evict cached weeks whose ``week_end_at`` is
-      ``>= new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row
-      could fall inside them (F1 late-ingest). The bound is ``>=``, NOT ``>``,
-      because ``_sum_cost_for_range`` / ``iter_entries`` sum an inclusive
+      out-of-process) OR ``max_mutation_seq < last_seen_seq``: full ``clear()``.
+      A credit/reset re-shapes a past week's cost; reset events are rare, so a
+      conservative full clear is correct and cheap. A max-id / seq regression
+      means the ids no longer map to the same rows.
+    - ``max_mutation_seq > last_seen_seq`` (#270 §7c — the seq gate, so an
+      id-stable in-place finalization with a flat ``max_entry_id`` still
+      evicts): evict cached weeks whose ``week_end_at`` is
+      ``>= changed_min_timestamp(cache_conn, last_seen_seq)`` — a
+      genuinely-changed row (new OR finalized-in-place) could fall inside them
+      (F1 late-ingest / #270 in-place). The bound is ``>=``, NOT ``>``, because
+      ``_sum_cost_for_range`` / ``iter_entries`` sum an inclusive
       ``[start, end]`` window, so a row whose timestamp lands exactly on
       ``week_end_at`` belongs to that week (Codex-1). Over-eviction is byte-safe
       (forces a recompute). Normally ``wm`` is recent and no closed week drops.
 
     Idempotent within a tick: after the first call updates last-seen, a later
-    call in the same tick sees no delta (``max_entry_id == last_seen``,
+    call in the same tick sees no delta (``max_mutation_seq == last_seen_seq``,
     ``reset_sig`` unchanged) and no-ops — never re-running the watermark query.
 
-    Connection lifecycle (Codex-4): the ``new_min_timestamp`` watermark query is
-    the only use of ``cache_conn`` and runs only on the
-    ``max_entry_id > last_seen`` branch; the caller passes a short-lived cache
-    connection, opened for that query.
+    Connection lifecycle (Codex-4): the ``changed_min_timestamp`` watermark query
+    is the only use of ``cache_conn`` and runs only on the
+    ``max_mutation_seq > last_seen_seq`` branch; the caller passes a short-lived
+    cache connection, opened for that query.
     """
     ls = _WEEKREF_COST_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
         return
-    if reset_sig != ls["reset_sig"] or max_entry_id < ls["max_id"]:
+    if (
+        reset_sig != ls["reset_sig"]
+        or max_entry_id < ls["max_id"]
+        or max_mutation_seq < ls["max_seq"]
+    ):
         _WEEKREF_COST_CACHE.clear()  # reset/credit, or cache.db rebuilt
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
         return
-    if max_entry_id > ls["max_id"]:
-        wm = new_min_timestamp(cache_conn, ls["max_id"])
+    if max_mutation_seq > ls["max_seq"]:
+        wm = changed_min_timestamp(cache_conn, ls["max_seq"])
         if wm is not None:
             for key in list(_WEEKREF_COST_CACHE):
                 # key = (start_iso, end_iso); inclusive [start,end] window, so
-                # evict when the week's end >= the earliest new event time.
+                # evict when the week's end >= the earliest changed event time.
                 if dt.datetime.fromisoformat(key[1]) >= wm:
                     del _WEEKREF_COST_CACHE[key]
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
 
 
@@ -1133,13 +1288,13 @@ def projects_env_week_put(week_iso, buckets_by_bp, total) -> None:
         _PROJECTS_ENV_WEEK_CACHE[(bp, week_iso)] = agg
 
 
-def accumulate_projects_current_week(*, week_key, cur_max_id,
+def accumulate_projects_current_week(*, week_key, cur_max_id, cur_max_seq,
                                      fetch_all_raw, fetch_delta_rows,
                                      finalize, fold):
     """Single-slot incremental fold of the projects-envelope CURRENT week (#271 §20).
 
     Returns ``(finalized_buckets, week_total)`` — the exact
-    ``_aggregate_projects_week`` public shape — folding only the new-by-id delta
+    ``_aggregate_projects_week`` public shape — folding only the changed-row delta
     each warm tick instead of re-folding the whole ~12K-entry current week
     (the closed weeks are already cache-served). The dashboard injects the
     fold/finalize/fetch callables so this module keeps no dashboard import
@@ -1149,10 +1304,11 @@ def accumulate_projects_current_week(*, week_key, cur_max_id,
     and the live conn on the dashboard side):
       ``fetch_all_raw() -> (mut_with_sessions_sets, week_total, tail)`` — the
         full-window raw fold (cold seed / fold-order fallback).
-      ``fetch_delta_rows(after_id) -> list[row]`` — rows with ``id > after_id``
-        in the current-week window, already membership/``<synthetic>``-filtered
-        AND sorted ``(timestamp_utc, id)`` (the rowid-seek delta, so ``rows[0]``
-        is the minimum genuine current-week entry).
+      ``fetch_delta_rows(after_seq) -> list[row]`` — rows with
+        ``mutation_seq > after_seq`` in the current-week window (#270 §8 re-key),
+        already membership/``<synthetic>``-filtered AND sorted
+        ``(timestamp_utc, id)``; ``row[0]`` is the ``id``, ``row[1]`` the
+        ``timestamp_utc``, so ``rows[0]`` is the minimum genuine current-week entry.
       ``fold(mut, row) -> entry_cost | None`` — the shared ``_fold_projects_entry``
         (byte-identical arithmetic to the cold path).
       ``finalize(mut) -> {bucket_path: agg}`` — the public finalize.
@@ -1160,26 +1316,39 @@ def accumulate_projects_current_week(*, week_key, cur_max_id,
     Simpler than the Group A accumulator (spec §20): the current-week aggregate
     is a pure function of ``(conn, cw_start)`` over the FIXED ``[cw_start, cw_end]``
     window (no moving-``now`` clamp), so there is no ``last_now`` field / empty-
-    delta-by-time machinery — the delta predicate is purely
-    ``id > reconciled_max_id``.
+    delta-by-time machinery.
+
+    #270 §8: the delta is re-keyed from ``id > reconciled_max_id`` to
+    ``mutation_seq > reconciled_max_seq`` — a strict superset (every insert
+    carries a fresh seq monotone with id, so on a pure-insert tick the delta row
+    set is byte-identical to today), so an id-stable in-place finalization of a
+    current-week row now appears in the delta. But the incremental fold cannot
+    un-fold that row's already-folded stale partial: any delta row that is a
+    PRE-EXISTING row (``id <= reconciled_max_id``) discards the delta and forces a
+    cold refold (checked BEFORE the fold-order gate, so a timestamp-non-decreasing
+    finalization that sorts past ``tail`` is still caught). Genuine new inserts
+    (``id > reconciled_max_id``) proceed through the unchanged fold-order gate +
+    append.
 
     - **Cold** (``prior is None``, ``label`` changed = Monday rollover / window
       slide, or ``cur_max_id < reconciled_max_id`` = cache.db rebuilt): seed the
       slot from ``fetch_all_raw()``; finalize and return.
-    - **Warm**: fetch the ``id > reconciled_max_id`` delta (empty when
-      ``cur_max_id`` did not advance — the fast path, no fetch). **Fold-order
-      gate:** the delta is ``(ts_iso, id)``-sorted, so ``rows[0]`` is the minimum;
-      if it sorts ``(ts_iso, id) <= tail`` a late older-timestamp backfill landed
-      mid-week → discard the delta and cold-refold (byte-safe; first-row-only is
-      sufficient under the total order). ``tail is None`` ⇒ prior folded nothing
-      ⇒ the delta is a pure suffix, so no gate. Otherwise ``fold`` each delta row
-      onto ``prior.mut`` in order.
-    - ``reconciled_max_id`` advances to ``cur_max_id`` on EVERY path (cold, empty
-      delta, append, fallback). It is the tick's GLOBAL ``MAX(session_entries.id)``,
-      DECOUPLED from ``tail`` (Codex-P2a): a quiet current week has a folded-max
-      far below the global max because high ids land in OTHER weeks (recent
-      backfills), so keying the delta on the folded-max would re-scan every tick
-      and let the ~63ms floor creep back.
+    - **Warm**: fetch the ``mutation_seq > reconciled_max_seq`` delta (empty when
+      ``cur_max_seq`` did not advance — the fast path, no fetch). **Pre-existing-row
+      cold-refold (#270 §8):** any delta ``row`` with ``row[0] <= reconciled_max_id``
+      → discard + cold refold. **Fold-order gate:** the delta is ``(ts_iso, id)``-
+      sorted, so ``rows[0]`` is the minimum; if it sorts ``(ts_iso, id) <= tail`` a
+      late older-timestamp backfill landed mid-week → discard the delta and cold-
+      refold (byte-safe; first-row-only is sufficient under the total order).
+      ``tail is None`` ⇒ prior folded nothing ⇒ the delta is a pure suffix, so no
+      gate. Otherwise ``fold`` each delta row onto ``prior.mut`` in order.
+    - ``reconciled_max_id`` / ``reconciled_max_seq`` advance to
+      ``cur_max_id`` / ``cur_max_seq`` on EVERY path (cold, empty delta, append,
+      fallback). They are the tick's GLOBAL ``MAX(session_entries.id)`` /
+      ``MAX(mutation_seq)``, DECOUPLED from ``tail`` (Codex-P2a): a quiet current
+      week has a folded-max far below the global max because high ids/seqs land in
+      OTHER weeks (recent backfills), so keying the delta on the folded-max would
+      re-scan every tick and let the ~63ms floor creep back.
 
     F7: the running ``mut`` is module state, never reachable from a published
     snapshot — ``finalize`` builds a FRESH bucket map each tick, so mutating
@@ -1193,13 +1362,19 @@ def accumulate_projects_current_week(*, week_key, cur_max_id,
     )
     rows: list = []
     if not cold:
-        if cur_max_id > prior["reconciled_max_id"]:
-            rows = fetch_delta_rows(prior["reconciled_max_id"])
+        if cur_max_seq > prior["reconciled_max_seq"]:
+            rows = fetch_delta_rows(prior["reconciled_max_seq"])
+        # #270 §8: any PRE-EXISTING row (id <= reconciled_max_id) is an id-stable
+        # in-place finalization the incremental fold cannot reconcile → cold
+        # refold. Checked BEFORE the fold-order gate (a timestamp-non-decreasing
+        # finalization sorts PAST tail and would evade that gate).
+        if rows and any(r[0] <= prior["reconciled_max_id"] for r in rows):
+            cold = True
         # Fold-order gate: rows are (ts_iso, id)-sorted so rows[0] is the
         # minimum; if it sorts <= tail, some genuinely-new row is out of the
         # from-scratch fold order → cold refold. (tail None ⇒ prior folded
         # nothing ⇒ the delta is a pure suffix; never gate against None.)
-        if (
+        elif (
             rows
             and prior["tail"] is not None
             and (rows[0][1], rows[0][0]) <= prior["tail"]
@@ -1213,6 +1388,7 @@ def accumulate_projects_current_week(*, week_key, cur_max_id,
             "week_total": week_total,
             "tail": tail,
             "reconciled_max_id": cur_max_id,
+            "reconciled_max_seq": cur_max_seq,
         }
         return finalize(mut), week_total
     # Warm: append the delta onto the running mut in (ts_iso, id) order. The
@@ -1230,42 +1406,50 @@ def accumulate_projects_current_week(*, week_key, cur_max_id,
     prior["week_total"] = week_total
     prior["tail"] = tail
     prior["reconciled_max_id"] = cur_max_id
+    prior["reconciled_max_seq"] = cur_max_seq
     return finalize(mut), week_total
 
 
-def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig):
+def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_mutation_seq,
+                                 max_wus_id, sf_sig):
     """Once-per-non-idle-rebuild invalidation for the projects-envelope cache.
 
     Driven by ``_tui_build_snapshot`` after the idle-path check, before the
     envelope builder runs, using the dispatch-signature legs (``max_entry_id``,
-    ``max_wus_id``) + a ``session_files`` signal (``sf_sig``) passed in:
+    ``max_mutation_seq``, ``max_wus_id``) + a ``session_files`` signal
+    (``sf_sig``) passed in:
 
     - Cold (no last-seen): record last-seen, return — no eviction.
     - ``sf_sig`` changed (attribution backfill, Codex-M4 P2) OR
-      ``max_entry_id < last_seen`` (cache.db rebuilt): full clear. Conservative
-      but byte-safe (recompute). ``max_wus_id`` stays tracked in last-seen
+      ``max_entry_id < last_seen`` (cache.db rebuilt) OR
+      ``max_mutation_seq < last_seen_seq``: full clear. Conservative but
+      byte-safe (recompute). ``max_wus_id`` stays tracked in last-seen
       but is deliberately NOT a full-clear trigger (#271 §9) — a `record-usage`
       write reuses this cost cache; the whole-envelope memo refreshes attribution.
-    - ``max_entry_id > last_seen``: evict cached weeks (and their bucket rows +
-      week total) whose ``week_end (= parse(week_iso) + 7d)`` is
-      ``>= new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row
-      could fall inside them (F1 late-ingest). The bound is ``>=`` (Codex-1);
-      over-eviction is byte-safe.
+    - ``max_mutation_seq > last_seen_seq`` (#270 §7c — the seq gate, so an
+      id-stable in-place finalization with a flat ``max_entry_id`` still evicts):
+      evict cached weeks (and their bucket rows + week total) whose
+      ``week_end (= parse(week_iso) + 7d)`` is
+      ``>= changed_min_timestamp(cache_conn, last_seen_seq)`` — a
+      genuinely-changed row could fall inside them (F1 late-ingest / #270
+      in-place). The bound is ``>=`` (Codex-1); over-eviction is byte-safe.
 
     Idempotent within a tick: after the first call updates last-seen, a later
     call with the same signature sees no delta and no-ops (never re-running the
     watermark query). The short-lived ``cache_conn`` is used only for the
-    watermark query on the ``max_entry_id > last_seen`` branch (Codex-4).
+    watermark query on the ``max_mutation_seq > last_seen_seq`` branch (Codex-4).
     """
     ls = _PROJECTS_ENV_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig
         return
     if (
         sf_sig != ls["sf_sig"]
         or max_entry_id < ls["max_id"]
+        or max_mutation_seq < ls["max_seq"]
     ):
         # NOTE (#271 §9): max_wus_id is deliberately NOT a full-clear trigger. The
         # cached per-(project, week) aggregates are session_entries-only; a WUS
@@ -1281,11 +1465,12 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
         # — an sf_sig move can re-key a current-week bucket_path, so cold-refold.
         reset_projects_env_current_state()
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig
         return
-    if max_entry_id > ls["max_id"]:
-        wm = new_min_timestamp(cache_conn, ls["max_id"])
+    if max_mutation_seq > ls["max_seq"]:
+        wm = changed_min_timestamp(cache_conn, ls["max_seq"])
         if wm is not None:
             dirty = [
                 wk
@@ -1297,6 +1482,7 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
                 for key in [k for k in _PROJECTS_ENV_WEEK_CACHE if k[1] == wk]:
                     del _PROJECTS_ENV_WEEK_CACHE[key]
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig
 
@@ -1320,21 +1506,23 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_wus_id, sf_sig
 # order (NOT a live dict — Codex-BK-4), so the row's stable cost-desc sort
 # tie-order (which depends on first-seen order) can never be mutated after caching.
 #
-# Two accepted trade-offs, IDENTICAL to the shipped #269 weekref cost cache — and
-# deliberately NOT closed here (closing them would be inconsistent with the
-# already-shipped caches):
-# - Id-stable in-place mutation (Codex-BK-1, shared #270 exposure). `sync_cache`'s
-#   `ON CONFLICT(msg_id, req_id) DO UPDATE` can finalize a streaming-intermediate
-#   entry in place (same `id`, changed tokens/cost/timestamp) inside a closed
-#   pre-credit window, advancing NEITHER `max_entry_id` NOR the
-#   `new_min_timestamp` watermark → a stale segment. This is the SAME exposure the
-#   weekref cost cache (`cached_weekref_cost` / `reconcile_weekref_cache`, above)
-#   and the Group A past-bucket caches already carry (spec §6 / first-review
-#   Codex-2); it is very narrow (append-only JSONL — a finalization lands in the
-#   window it started in, so only a cross-boundary message finalizing after the
-#   window closed leaves a stale CLOSED segment) and is tracked by #270 (a durable
-#   `session_entries` mutation signal in `compute_signature` that would harden
-#   every #268/#269/#271 cache at once).
+# Id-stable in-place mutation (Codex-BK-1) — RESOLVED by #270. `sync_cache`'s
+# `ON CONFLICT(msg_id, req_id) DO UPDATE` can finalize a streaming-intermediate
+# entry in place (same `id`, changed tokens/cost/timestamp) inside a closed
+# pre-credit window, advancing NEITHER `max_entry_id` NOR the old
+# `new_min_timestamp` watermark → a stale segment. This WAS the same exposure the
+# weekref cost cache and the Group A past-bucket caches carried (spec §6 /
+# first-review Codex-2). #270 closed it across every #268/#269/#271 cache at once
+# with the durable `session_entries.mutation_seq` change stamp: it is folded into
+# `compute_signature` (the `entry_mutation_seq` leg, so an id-stable finalization
+# leaves the idle path) AND drives `reconcile_bugk_cache`'s seq gate + the
+# `changed_min_timestamp(mutation_min_ts)` watermark below (so the affected CLOSED
+# segment — including one the finalization's timestamp MOVED the row across — is
+# recomputed). Regression: `test_reconcile_bugk_idstable_update_evicts`.
+#
+# One accepted trade-off remains, identical to the shipped #269 weekref cost cache
+# (deliberately NOT closed — closing it would be inconsistent with the already-
+# shipped caches):
 # - Pricing-at-cache-time (Codex-BK-3). Caching the folded `pre_cost` means an
 #   in-process embedded-pricing edit is not reflected in the Bug-K pre-credit cost
 #   until the segment invalidates — the SAME dashboard-only trade-off the weekref
@@ -1409,53 +1597,64 @@ def cached_bugk_segment(*, key, compute):
     return val
 
 
-def reconcile_bugk_cache(cache_conn, *, max_entry_id, reset_sig):
+def reconcile_bugk_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset_sig):
     """Once-per-non-idle-rebuild invalidation for the Bug-K segment cache (§18).
 
     Driven by ``_tui_build_snapshot`` after the idle-path check, before the
     builders run, ALONGSIDE ``reconcile_weekref_cache``, using the dispatch-
     signature legs already computed for the idle decision (``max_entry_id`` +
-    ``reset_sig`` passed in — no extra query for those):
+    ``max_mutation_seq`` + ``reset_sig`` passed in — no extra query for those):
 
     - Cold (no last-seen): record last-seen, return — no eviction.
     - ``reset_sig`` changed (credit events / their ``effective`` moments moved)
-      OR ``max_entry_id < last_seen`` (cache.db rebuilt out-of-process): full
-      ``clear()``. Credit events are rare, so a conservative full clear is correct
-      and cheap; a max-id regression means the ids no longer map to the same rows.
-    - ``max_entry_id > last_seen``: evict segments whose ``effective`` is
-      ``> new_min_timestamp(cache_conn, last_seen)`` — a genuinely-new row could
-      fall inside them (F1 late-ingest). The bound is ``>`` (STRICT), NOT ``>=``,
-      because the segment window is HALF-OPEN ``[original_start, effective)``
-      (Codex-BK-5): a new row EXACTLY at ``effective`` is OUTSIDE the segment
-      (never contributes), while a row at ``original_start`` .. just-below
-      ``effective`` evicts. This is the ONE semantic difference from the weekref
-      cache's inclusive ``>=`` (that window is ``[start, end]``). Over-eviction is
-      byte-safe (forces a recompute); normally ``wm`` is recent and nothing drops.
+      OR ``max_entry_id < last_seen`` (cache.db rebuilt out-of-process) OR
+      ``max_mutation_seq < last_seen_seq``: full ``clear()``. Credit events are
+      rare, so a conservative full clear is correct and cheap; a max-id / seq
+      regression means the ids no longer map to the same rows.
+    - ``max_mutation_seq > last_seen_seq`` (#270 §7c — the seq gate, so an
+      id-stable in-place finalization with a flat ``max_entry_id`` still evicts):
+      evict segments whose ``effective`` is
+      ``> changed_min_timestamp(cache_conn, last_seen_seq)`` — a genuinely-changed
+      row could fall inside them (F1 late-ingest / #270 in-place). The bound is
+      ``>`` (STRICT), NOT ``>=``, because the segment window is HALF-OPEN
+      ``[original_start, effective)`` (Codex-BK-5): a row EXACTLY at ``effective``
+      is OUTSIDE the segment (never contributes), while a row at
+      ``original_start`` .. just-below ``effective`` evicts. This is the ONE
+      semantic difference from the weekref cache's inclusive ``>=`` (that window
+      is ``[start, end]``). Over-eviction is byte-safe (forces a recompute);
+      normally ``wm`` is recent and nothing drops.
 
     Idempotent within a tick: after the first call updates last-seen, a later call
     with the same signature sees no delta and no-ops (never re-running the
     watermark query). The short-lived ``cache_conn`` is used only for the
-    ``new_min_timestamp`` query on the ``max_entry_id > last_seen`` branch
-    (Codex-4 lifecycle from §4).
+    ``changed_min_timestamp`` query on the ``max_mutation_seq > last_seen_seq``
+    branch (Codex-4 lifecycle from §4).
     """
     ls = _BUGK_SEGMENT_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
         return
-    if reset_sig != ls["reset_sig"] or max_entry_id < ls["max_id"]:
+    if (
+        reset_sig != ls["reset_sig"]
+        or max_entry_id < ls["max_id"]
+        or max_mutation_seq < ls["max_seq"]
+    ):
         _BUGK_SEGMENT_CACHE.clear()  # a credit event moved, or cache.db rebuilt
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig
         return
-    if max_entry_id > ls["max_id"]:
-        wm = new_min_timestamp(cache_conn, ls["max_id"])
+    if max_mutation_seq > ls["max_seq"]:
+        wm = changed_min_timestamp(cache_conn, ls["max_seq"])
         if wm is not None:
             for key in list(_BUGK_SEGMENT_CACHE):
                 # key = (orig_start_iso, eff_iso); half-open [start, eff) window,
-                # so evict when eff > the earliest new event time (a row AT eff is
-                # outside the segment; a row < eff could be inside it).
+                # so evict when eff > the earliest changed event time (a row AT
+                # eff is outside the segment; a row < eff could be inside it).
                 if dt.datetime.fromisoformat(key[1]) > wm:
                     del _BUGK_SEGMENT_CACHE[key]
         ls["max_id"] = max_entry_id
+        ls["max_seq"] = max_mutation_seq
         ls["reset_sig"] = reset_sig

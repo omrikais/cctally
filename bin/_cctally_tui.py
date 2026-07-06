@@ -1798,20 +1798,26 @@ def _tui_sessions_cached(
 
 def _fetch_affected_session_entries(
     cache_conn: "sqlite3.Connection",
-    last_seen_max_id: int,
+    last_seen_seq: int,
     range_start: dt.datetime,
     range_end: dt.datetime,
 ) -> "list":
-    """Fetch (timestamp-ASC) every entry of every session touched by a row with
-    ``id > last_seen`` — expanded across ``session_id`` siblings so a resumed
-    session re-aggregates WHOLE — within ``[range_start, range_end]``.
+    """Fetch (timestamp-ASC) every entry of every session touched by a row
+    CHANGED since ``last_seen_seq`` — expanded across ``session_id`` siblings so
+    a resumed session re-aggregates WHOLE — within ``[range_start, range_end]``.
 
     The column list + ``LEFT JOIN`` mirror ``get_claude_session_entries``
     EXACTLY (including the materialized ``speed`` column → ``usage_extra``), so
     the per-session aggregate is byte-identical to the from-scratch pass. The
     affected-source-paths set is inlined as a SQL subquery (parameterized only
-    by ``last_seen``) so the fetch stays a single timestamp-ordered result —
+    by ``last_seen_seq``) so the fetch stays a single timestamp-ordered result —
     no Python ``IN`` list to chunk, and stable first-seen model order.
+
+    #270 (§7d, Codex-2c): the two affected-path subqueries key on
+    ``mutation_seq > ?``, NOT ``id > ?`` — so an id-stable in-place finalization
+    of an EXISTING session's row (which leaves ``MAX(id)`` flat) still selects
+    that session's sibling paths and it re-aggregates WHOLE. On a pure-insert
+    interval ``{mutation_seq > last}`` == ``{id > last}``, so byte-identical.
     """
     c = _cctally()
     _JoinedClaudeEntry = c._JoinedClaudeEntry
@@ -1825,23 +1831,23 @@ def _fetch_affected_session_entries(
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ? "
         "  AND se.source_path IN ("
-        # Sibling paths of every session_id touched by a new row ...
+        # Sibling paths of every session_id touched by a changed row ...
         "    SELECT sf2.path FROM session_files sf2 WHERE sf2.session_id IN ("
         "      SELECT sf1.session_id FROM session_files sf1 "
         "      JOIN (SELECT DISTINCT source_path FROM session_entries "
-        "            WHERE id > ?) af "
+        "            WHERE mutation_seq > ?) af "
         "        ON af.source_path = sf1.path "
         "      WHERE sf1.session_id IS NOT NULL"
         "    )"
         # ... UNION the touched files themselves (covers fallback / not-yet-
         # backfilled session_files rows keyed by filename stem).
         "    UNION "
-        "    SELECT DISTINCT source_path FROM session_entries WHERE id > ?"
+        "    SELECT DISTINCT source_path FROM session_entries WHERE mutation_seq > ?"
         "  ) "
         "ORDER BY se.timestamp_utc ASC"
     )
     rows = cache_conn.execute(
-        sql, (start_iso, end_iso, last_seen_max_id, last_seen_max_id),
+        sql, (start_iso, end_iso, last_seen_seq, last_seen_seq),
     ).fetchall()
     return [
         _JoinedClaudeEntry(
@@ -2231,6 +2237,7 @@ def _tui_build_snapshot(
                         _sc.reconcile_weekref_cache(
                             _rc_cache_conn,
                             max_entry_id=dispatch_sig.max_entry_id,
+                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
                             reset_sig=dispatch_sig.reset_sig,
                         )
                         use_weekref_cost_cache = True
@@ -2242,6 +2249,7 @@ def _tui_build_snapshot(
                         _sc.reconcile_projects_env_cache(
                             _rc_cache_conn,
                             max_entry_id=dispatch_sig.max_entry_id,
+                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
                             max_wus_id=dispatch_sig.max_wus_id,
                             sf_sig=_sc.session_files_sig(_rc_cache_conn),
                         )
@@ -2255,6 +2263,7 @@ def _tui_build_snapshot(
                         _sc.reconcile_bugk_cache(
                             _rc_cache_conn,
                             max_entry_id=dispatch_sig.max_entry_id,
+                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
                             reset_sig=dispatch_sig.reset_sig,
                         )
                         use_bugk_segment_cache = True

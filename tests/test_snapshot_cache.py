@@ -40,7 +40,12 @@ CREATE TABLE session_entries (
     input_tokens        INTEGER NOT NULL DEFAULT 0,
     output_tokens       INTEGER NOT NULL DEFAULT 0,
     cache_create_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens   INTEGER NOT NULL DEFAULT 0
+    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+    -- #270: the per-row mutation stamps. The insert helpers set
+    -- mutation_seq == id and mutation_min_ts == timestamp_utc (the pure-insert
+    -- invariant), so the seq watermark behaves identically to the id watermark.
+    mutation_seq        INTEGER NOT NULL DEFAULT 0,
+    mutation_min_ts     TEXT
 );
 CREATE TABLE session_files (
     path             TEXT PRIMARY KEY,
@@ -115,13 +120,24 @@ def tmp_stats(tmp_path):
 
 
 # --- Row-insert helpers ----------------------------------------------------
+def _stamp_mutation(conn):
+    """#270: mirror production ingest — stamp the just-inserted row with
+    mutation_seq == id and mutation_min_ts == timestamp_utc (the pure-insert
+    invariant, so the seq watermark == the id watermark for these fixtures)."""
+    conn.execute(
+        "UPDATE session_entries SET mutation_seq = id, "
+        "mutation_min_ts = timestamp_utc WHERE id = last_insert_rowid()"
+    )
+    conn.commit()
+
+
 def _insert_session_entry(conn, ts, *, model="claude-opus-4-8", source="/p/a.jsonl"):
     conn.execute(
         "INSERT INTO session_entries "
         "(source_path, line_offset, timestamp_utc, model) VALUES (?, ?, ?, ?)",
         (source, 0, ts, model),
     )
-    conn.commit()
+    _stamp_mutation(conn)
 
 
 def _insert_codex_entry(conn, ts, *, source="/c/a.jsonl"):
@@ -429,7 +445,7 @@ def _insert_entry_at_path(conn, ts, source, *, model="claude-opus-4-8"):
         "(source_path, line_offset, timestamp_utc, model) VALUES (?, 0, ?, ?)",
         (source, ts, model),
     )
-    conn.commit()
+    _stamp_mutation(conn)
 
 
 def test_affected_session_keys_join_and_stem_fallback(tmp_cache):
@@ -690,11 +706,11 @@ def test_reconcile_weekref_evicts_late_ingest_week(tmp_cache):
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk_old)] = 1.0
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk_new)] = 2.0
     last = _max_id(tmp_cache)
-    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     # Late-ingest a row (new id) with an OLD timestamp inside wk_new.
     _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
     sc.reconcile_weekref_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(0, 0)
     )
     assert sc._weekref_key(*wk_new) not in sc._WEEKREF_COST_CACHE  # evicted
     assert sc._weekref_key(*wk_old) in sc._WEEKREF_COST_CACHE  # untouched
@@ -705,9 +721,9 @@ def test_reconcile_weekref_full_clear_on_reset_sig(tmp_cache):
 
     sc.reset_weekref_cost_state()
     sc._WEEKREF_COST_CACHE[("s", "e")] = 3.0
-    sc._WEEKREF_COST_LAST_SEEN.update(max_id=_max_id(tmp_cache), reset_sig=(1, 1))
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_seq=_max_id(tmp_cache), reset_sig=(1, 1))
     sc.reconcile_weekref_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(2, 2)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(2, 2)
     )
     assert sc._WEEKREF_COST_CACHE == {}  # reset/credit reshaped a past week
 
@@ -717,8 +733,8 @@ def test_reconcile_weekref_full_clear_on_maxid_regression(tmp_cache):
 
     sc.reset_weekref_cost_state()
     sc._WEEKREF_COST_CACHE[("s", "e")] = 3.0
-    sc._WEEKREF_COST_LAST_SEEN.update(max_id=100, reset_sig=(0, 0))
-    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=5, reset_sig=(0, 0))  # rebuilt
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=100, max_seq=100, reset_sig=(0, 0))
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=5, max_mutation_seq=5, reset_sig=(0, 0))  # rebuilt
     assert sc._WEEKREF_COST_CACHE == {}
 
 
@@ -732,10 +748,10 @@ def test_reconcile_weekref_boundary_equal_is_evicted(tmp_cache):
     wk = (dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc), we)
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
     last = _max_id(tmp_cache)
-    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly week_end
     sc.reconcile_weekref_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(0, 0)
     )
     assert sc._weekref_key(*wk) not in sc._WEEKREF_COST_CACHE  # >= evicts it
 
@@ -746,8 +762,8 @@ def test_reconcile_weekref_cold_records_last_seen(tmp_cache):
 
     sc.reset_weekref_cost_state()
     sc._WEEKREF_COST_CACHE[("s", "e")] = 5.0  # pre-seeded, must survive the cold call
-    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=7, reset_sig=(3, 4))
-    assert sc._WEEKREF_COST_LAST_SEEN == {"max_id": 7, "reset_sig": (3, 4)}
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=7, max_mutation_seq=7, reset_sig=(3, 4))
+    assert sc._WEEKREF_COST_LAST_SEEN == {"max_id": 7, "max_seq": 7, "reset_sig": (3, 4)}
     assert sc._WEEKREF_COST_CACHE == {("s", "e"): 5.0}
 
 
@@ -763,15 +779,15 @@ def test_reconcile_weekref_idempotent_within_tick(tmp_cache):
     )
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
     last = _max_id(tmp_cache)
-    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._WEEKREF_COST_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # in the future, keeps wk
     new_max = _max_id(tmp_cache)
-    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, reset_sig=(0, 0))
     assert sc._weekref_key(*wk) in sc._WEEKREF_COST_CACHE  # 2026-06-29 < 2026-07-04
     # Re-populate a would-be-dirty entry, then reconcile again with SAME sig:
     # no watermark re-query fires, so the entry survives (idempotent no-op).
     sc._WEEKREF_COST_CACHE[sc._weekref_key(*wk)] = 2.0
-    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    sc.reconcile_weekref_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, reset_sig=(0, 0))
     assert sc._weekref_key(*wk) in sc._WEEKREF_COST_CACHE
 
 
@@ -853,9 +869,11 @@ def test_reconcile_projects_env_cold_records_last_seen(tmp_cache):
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)  # survives the cold call
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=7, max_wus_id=3, sf_sig=(2, 9),
+        tmp_cache, max_entry_id=7, max_mutation_seq=7, max_wus_id=3, sf_sig=(2, 9),
     )
-    assert sc._PROJECTS_ENV_LAST_SEEN == {"max_id": 7, "max_wus_id": 3, "sf_sig": (2, 9)}
+    assert sc._PROJECTS_ENV_LAST_SEEN == {
+        "max_id": 7, "max_seq": 7, "max_wus_id": 3, "sf_sig": (2, 9),
+    }
     assert sc.projects_env_week_get(wk) is not None  # untouched by cold call
 
 
@@ -871,11 +889,11 @@ def test_reconcile_projects_env_keeps_cache_on_wus_change(tmp_cache):
     sc.reset_projects_env_state()
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     mid = _max_id(tmp_cache)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(0, 0))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_seq=mid, max_wus_id=3, sf_sig=(0, 0))
     sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
     # WUS bumps, entries/sf unchanged → the cost cache MUST survive.
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=mid, max_wus_id=4, sf_sig=(0, 0),
+        tmp_cache, max_entry_id=mid, max_mutation_seq=mid, max_wus_id=4, sf_sig=(0, 0),
     )
     assert sc.projects_env_week_get(wk) is not None
 
@@ -890,7 +908,10 @@ def test_projects_env_memo_key_includes_max_wus_id():
         pathlib.Path(__file__).resolve().parent.parent
         / "bin" / "_cctally_dashboard.py"
     ).read_text()
-    assert "memo_key = (max_id, max_wus_id, cw_key, weeks_back)" in src
+    assert (
+        "memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)"
+        in src
+    )
 
 
 def test_reconcile_projects_env_full_clear_on_sf_sig(tmp_cache):
@@ -899,10 +920,10 @@ def test_reconcile_projects_env_full_clear_on_sf_sig(tmp_cache):
     sc.reset_projects_env_state()
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(1, 1))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_seq=_max_id(tmp_cache), max_wus_id=3, sf_sig=(1, 1))
     # session_files attribution backfill moved rows WITHOUT a new entry/WUS row.
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=3, sf_sig=(2, 5),
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), max_wus_id=3, sf_sig=(2, 5),
     )
     assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
 
@@ -917,19 +938,19 @@ def test_reconcile_projects_env_current_slot_rides_full_clear(tmp_cache):
     mid = _max_id(tmp_cache)
     # sf_sig moves → full clear → current slot dropped.
     sc.reset_projects_env_state()
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(1, 1))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_seq=mid, max_wus_id=3, sf_sig=(1, 1))
     sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk", "reconciled_max_id": mid}
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=mid, max_wus_id=3, sf_sig=(2, 5),
+        tmp_cache, max_entry_id=mid, max_mutation_seq=mid, max_wus_id=3, sf_sig=(2, 5),
     )
     assert sc._PROJECTS_ENV_CURRENT["state"] is None
 
     # A WUS-only bump (record-usage write) must NOT drop the slot.
     sc.reset_projects_env_state()
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_wus_id=3, sf_sig=(2, 5))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=mid, max_seq=mid, max_wus_id=3, sf_sig=(2, 5))
     sc._PROJECTS_ENV_CURRENT["state"] = {"label": "wk", "reconciled_max_id": mid}
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=mid, max_wus_id=99, sf_sig=(2, 5),
+        tmp_cache, max_entry_id=mid, max_mutation_seq=mid, max_wus_id=99, sf_sig=(2, 5),
     )
     assert sc._PROJECTS_ENV_CURRENT["state"] is not None
 
@@ -940,9 +961,9 @@ def test_reconcile_projects_env_full_clear_on_maxid_regression(tmp_cache):
     sc.reset_projects_env_state()
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     sc.projects_env_week_put(wk, {"/p": ("a",)}, 1.0)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=100, max_wus_id=3, sf_sig=(0, 0))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=100, max_seq=100, max_wus_id=3, sf_sig=(0, 0))
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=5, max_wus_id=3, sf_sig=(0, 0),  # cache.db rebuilt
+        tmp_cache, max_entry_id=5, max_mutation_seq=5, max_wus_id=3, sf_sig=(0, 0),  # cache.db rebuilt
     )
     assert sc._PROJECTS_ENV_WEEK_CACHE == {} and sc._PROJECTS_ENV_WEEK_TOTALS == {}
 
@@ -956,11 +977,11 @@ def test_reconcile_projects_env_evicts_late_ingest_week(tmp_cache):
     sc.projects_env_week_put(wk_old, {"/p": ("old",)}, 1.0)
     sc.projects_env_week_put(wk_new, {"/p": ("new",)}, 2.0)
     last = _max_id(tmp_cache)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_seq=last, max_wus_id=0, sf_sig=(0, 0))
     # Late-ingest a row with an OLD timestamp inside wk_new (2026-06-22..06-29).
     _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
     )
     assert sc.projects_env_week_get(wk_new) is None      # week_end 06-29 >= wm
     assert sc.projects_env_week_get(wk_old) is not None   # week_end 06-22 < wm
@@ -978,10 +999,10 @@ def test_reconcile_projects_env_boundary_equal_evicted(tmp_cache):
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     sc.projects_env_week_put(wk, {"/p": ("x",)}, 2.0)  # week_end = 2026-06-29
     last = _max_id(tmp_cache)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_seq=last, max_wus_id=0, sf_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly week_end
     sc.reconcile_projects_env_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), max_wus_id=0, sf_sig=(0, 0),
     )
     assert sc.projects_env_week_get(wk) is None  # >= evicts it
 
@@ -993,21 +1014,21 @@ def test_reconcile_projects_env_idempotent_within_tick(tmp_cache, monkeypatch):
     wk = sc.projects_env_week_key(dt.datetime(2026, 6, 22, tzinfo=dt.timezone.utc))
     sc.projects_env_week_put(wk, {"/p": ("x",)}, 2.0)
     last = _max_id(tmp_cache)
-    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_wus_id=0, sf_sig=(0, 0))
+    sc._PROJECTS_ENV_LAST_SEEN.update(max_id=last, max_seq=last, max_wus_id=0, sf_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # future — keeps wk
     new_max = _max_id(tmp_cache)
-    real_nmt = sc.new_min_timestamp
+    real_cmt = sc.changed_min_timestamp
     calls = {"n": 0}
 
-    def spy(conn, last_id):
+    def spy(conn, last_seq):
         calls["n"] += 1
-        return real_nmt(conn, last_id)
+        return real_cmt(conn, last_seq)
 
-    monkeypatch.setattr(sc, "new_min_timestamp", spy)
-    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_wus_id=0, sf_sig=(0, 0))
+    monkeypatch.setattr(sc, "changed_min_timestamp", spy)
+    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, max_wus_id=0, sf_sig=(0, 0))
     assert calls["n"] == 1 and sc.projects_env_week_get(wk) is not None  # 06-29 < 07-04
     # Second call, SAME signature: no watermark re-query, entry survives.
-    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_wus_id=0, sf_sig=(0, 0))
+    sc.reconcile_projects_env_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, max_wus_id=0, sf_sig=(0, 0))
     assert calls["n"] == 1
 
 
@@ -1039,24 +1060,28 @@ def _make_cache_db(tmp_path, name="cache271.db"):
 
 def _insert_entry(conn, *, ts, model="claude-opus-4-8", input=0, output=0,
                   cache_create=0, cache_read=0, speed=None, cost_usd=None,
-                  source="/p/a.jsonl"):
+                  source="/p/a.jsonl", mutation_seq=None):
     """Insert one ``session_entries`` row (auto-incrementing ``line_offset``).
 
     ``timestamp_utc`` is stored in the SAME normalized form ``sync_cache`` uses
     (``.astimezone(utc).isoformat()`` → the ``+00:00`` suffix, not ``Z``), so
     the lexical ``timestamp_utc > ?`` / ``BETWEEN`` string comparisons behave
-    identically to production.
+    identically to production. ``mutation_seq`` (#270) defaults to the row's
+    ``line_offset + 1`` — a monotone stand-in mirroring the pure-insert
+    invariant ``seq == id`` — so the seq-keyed delta seek discriminates rows.
     """
     off = conn.execute(
         "SELECT COALESCE(MAX(line_offset), -1) + 1 FROM session_entries"
     ).fetchone()[0]
+    seq = off + 1 if mutation_seq is None else mutation_seq
     conn.execute(
         "INSERT INTO session_entries "
         "(source_path, line_offset, timestamp_utc, model, input_tokens, "
-        " output_tokens, cache_create_tokens, cache_read_tokens, speed, cost_usd_raw) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " output_tokens, cache_create_tokens, cache_read_tokens, speed, cost_usd_raw, "
+        " mutation_seq, mutation_min_ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (source, off, _dt(ts).isoformat(), model, input, output, cache_create,
-         cache_read, speed, cost_usd),
+         cache_read, speed, cost_usd, seq, _dt(ts).isoformat()),
     )
     conn.commit()
 
@@ -1125,14 +1150,21 @@ def _rows(*specs):
 
 
 def _acc_call(prior, *, label, now, max_id, all_rows, delta_rows,
-              member=lambda e: True):
+              max_seq=None, member=lambda e: True):
     import _lib_snapshot_cache as sc
 
+    # #270 §8: the delta is seq-keyed. These pure-accumulator fixtures use
+    # seq == id (the pure-insert invariant), so `max_seq` defaults to `max_id`
+    # and the injected delta closure filters `i > after_seq` (id == seq) —
+    # behaviourally identical to the old `i > after_id` leg.
+    if max_seq is None:
+        max_seq = max_id
     return sc.accumulate_current_bucket(
         prior, current_label=label, cur_now=_dt(now), cur_max_id=max_id,
+        cur_max_seq=max_seq,
         fetch_all=lambda: all_rows,
-        fetch_delta=lambda aid, ats: [
-            (i, e) for (i, e) in delta_rows if i > aid or e.timestamp > ats
+        fetch_delta=lambda aseq, ats: [
+            (i, e) for (i, e) in delta_rows if i > aseq or e.timestamp > ats
         ],
         membership=member, mode="auto")
 
@@ -1254,23 +1286,24 @@ def test_accumulate_published_bucket_not_mutated_by_later_append():
 # --- Task 4: the (id, UsageEntry) delta fetch sibling ----------------------
 def test_iter_entries_with_id_delta(tmp_path):
     """``iter_entries_with_id`` yields ``(id, UsageEntry)`` and restricts to the
-    ``(id > after_id OR timestamp_utc > after_ts)`` delta (#271 §7d)."""
+    ``(mutation_seq > after_seq OR timestamp_utc > after_ts)`` delta (#270 §8
+    re-key of #271 §7d). ``_insert_entry`` stamps ``mutation_seq == id`` here."""
     import _cctally_cache as cache
 
     conn = _make_cache_db(tmp_path)
     try:
-        _insert_entry(conn, ts="2026-07-01T00:00:00Z", input=1)  # id 1
-        _insert_entry(conn, ts="2026-07-01T01:00:00Z", input=2)  # id 2
-        _insert_entry(conn, ts="2026-07-01T02:00:00Z", input=3)  # id 3
+        _insert_entry(conn, ts="2026-07-01T00:00:00Z", input=1)  # id 1, seq 1
+        _insert_entry(conn, ts="2026-07-01T01:00:00Z", input=2)  # id 2, seq 2
+        _insert_entry(conn, ts="2026-07-01T02:00:00Z", input=3)  # id 3, seq 3
         lo, hi = _dt("2026-07-01T00:00:00Z"), _dt("2026-07-01T23:00:00Z")
-        # after_id=1, after_ts far-future → only id>1 (the id leg).
+        # after_seq=1, after_ts far-future → only seq>1 (the seq leg).
         got = cache.iter_entries_with_id(
-            conn, lo, hi, after_id=1, after_ts=_dt("2100-01-01T00:00:00Z")
+            conn, lo, hi, after_seq=1, after_ts=_dt("2100-01-01T00:00:00Z")
         )
         assert [i for i, _ in got] == [2, 3]
-        # after_id huge, after_ts=01:00 → only ts>01:00 (the ts leg, id 3).
+        # after_seq huge, after_ts=01:00 → only ts>01:00 (the ts leg, id 3).
         got2 = cache.iter_entries_with_id(
-            conn, lo, hi, after_id=10**9, after_ts=_dt("2026-07-01T01:00:00Z")
+            conn, lo, hi, after_seq=10**9, after_ts=_dt("2026-07-01T01:00:00Z")
         )
         assert [i for i, _ in got2] == [3]
         # No after-predicate → the whole window in (timestamp_utc, id) order.
@@ -1279,13 +1312,23 @@ def test_iter_entries_with_id_delta(tmp_path):
         # The UsageEntry side is fully built (tokens + timestamp).
         assert allrows[0][1].usage["input_tokens"] == 1
         assert allrows[2][1].timestamp == _dt("2026-07-01T02:00:00Z")
+        # #270 §8: an id-stable in-place UPSERT (same id, bumped seq) is now
+        # reachable by the seq leg even though its id is <= the prior watermark —
+        # the id leg would have missed it.
+        conn.execute(
+            "UPDATE session_entries SET mutation_seq = 99, input_tokens = 7 "
+            "WHERE id = 1")
+        conn.commit()
+        got3 = cache.iter_entries_with_id(
+            conn, lo, hi, after_seq=3, after_ts=_dt("2100-01-01T00:00:00Z"))
+        assert [i for i, _ in got3] == [1], "the id-stable re-stamp is in the seq delta"
     finally:
         conn.close()
 
 
 def test_iter_entries_with_id_query_plan_is_indexed(tmp_path):
     """The delta predicate stays index-driven — not a bare full-table scan
-    (#271 §7d / Codex-2)."""
+    (#270 §8 re-key of #271 §7d / Codex-2)."""
     import _cctally_cache as cache  # noqa: F401 (schema/module parity)
 
     conn = _make_cache_db(tmp_path)
@@ -1294,7 +1337,7 @@ def test_iter_entries_with_id_query_plan_is_indexed(tmp_path):
             "EXPLAIN QUERY PLAN "
             "SELECT id, timestamp_utc FROM session_entries "
             "WHERE timestamp_utc >= ? AND timestamp_utc <= ? "
-            "AND (id > ? OR timestamp_utc > ?) "
+            "AND (mutation_seq > ? OR timestamp_utc > ?) "
             "ORDER BY timestamp_utc ASC, id ASC",
             ("2026-07-01T00:00:00+00:00", "2026-07-01T23:00:00+00:00", 1,
              "2026-07-01T01:00:00+00:00"),
@@ -1508,11 +1551,11 @@ def test_reconcile_bugk_evicts_late_ingest_segment(tmp_cache):
     sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*old)] = seg
     sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*new)] = seg
     last = _max_id(tmp_cache)
-    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     # Late-ingest a row (new id) with an OLD timestamp inside the `new` window.
     _insert_session_entry(tmp_cache, ts="2026-06-25T10:00:00Z")
     sc.reconcile_bugk_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(0, 0)
     )
     assert sc._bugk_key(*new) not in sc._BUGK_SEGMENT_CACHE  # eff 06-29 > wm 06-25
     assert sc._bugk_key(*old) in sc._BUGK_SEGMENT_CACHE       # eff 06-15 < wm 06-25
@@ -1532,10 +1575,10 @@ def test_reconcile_bugk_boundary_at_effective_not_evicted(tmp_cache):
         models=(), entry_count=0,
     )
     last = _max_id(tmp_cache)
-    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-06-29T00:00:00Z")  # exactly effective
     sc.reconcile_bugk_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(0, 0)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(0, 0)
     )
     assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE  # eff == wm ⇒ kept (half-open)
 
@@ -1548,9 +1591,9 @@ def test_reconcile_bugk_full_clear_on_reset_sig(tmp_cache):
         input=0, output=0, cache_create=0, cache_read=0, cost=3.0,
         models=(), entry_count=0,
     )
-    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=_max_id(tmp_cache), reset_sig=(1, 1))
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=_max_id(tmp_cache), max_seq=_max_id(tmp_cache), reset_sig=(1, 1))
     sc.reconcile_bugk_cache(
-        tmp_cache, max_entry_id=_max_id(tmp_cache), reset_sig=(2, 2)
+        tmp_cache, max_entry_id=_max_id(tmp_cache), max_mutation_seq=_max_id(tmp_cache), reset_sig=(2, 2)
     )
     assert sc._BUGK_SEGMENT_CACHE == {}  # a credit event moved → full clear
 
@@ -1563,8 +1606,8 @@ def test_reconcile_bugk_full_clear_on_maxid_regression(tmp_cache):
         input=0, output=0, cache_create=0, cache_read=0, cost=3.0,
         models=(), entry_count=0,
     )
-    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=100, reset_sig=(0, 0))
-    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=5, reset_sig=(0, 0))  # rebuilt
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=100, max_seq=100, reset_sig=(0, 0))
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=5, max_mutation_seq=5, reset_sig=(0, 0))  # rebuilt
     assert sc._BUGK_SEGMENT_CACHE == {}
 
 
@@ -1578,8 +1621,8 @@ def test_reconcile_bugk_cold_records_last_seen(tmp_cache):
         models=(), entry_count=0,
     )
     sc._BUGK_SEGMENT_CACHE[("s", "e")] = keep  # must survive the cold call
-    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=7, reset_sig=(3, 4))
-    assert sc._BUGK_SEGMENT_LAST_SEEN == {"max_id": 7, "reset_sig": (3, 4)}
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=7, max_mutation_seq=7, reset_sig=(3, 4))
+    assert sc._BUGK_SEGMENT_LAST_SEEN == {"max_id": 7, "max_seq": 7, "reset_sig": (3, 4)}
     assert sc._BUGK_SEGMENT_CACHE == {("s", "e"): keep}
 
 
@@ -1599,13 +1642,13 @@ def test_reconcile_bugk_idempotent_within_tick(tmp_cache):
     )
     sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = seg
     last = _max_id(tmp_cache)
-    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, reset_sig=(0, 0))
+    sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=last, max_seq=last, reset_sig=(0, 0))
     _insert_session_entry(tmp_cache, ts="2026-07-04T10:00:00Z")  # future → keeps wk
     new_max = _max_id(tmp_cache)
-    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, reset_sig=(0, 0))
     assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE  # 06-29 < 07-04
     # Re-populate, reconcile again with the SAME sig: no watermark re-query, so
     # the entry survives (idempotent no-op).
     sc._BUGK_SEGMENT_CACHE[sc._bugk_key(*wk)] = seg
-    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, reset_sig=(0, 0))
+    sc.reconcile_bugk_cache(tmp_cache, max_entry_id=new_max, max_mutation_seq=new_max, reset_sig=(0, 0))
     assert sc._bugk_key(*wk) in sc._BUGK_SEGMENT_CACHE

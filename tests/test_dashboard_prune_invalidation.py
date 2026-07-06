@@ -321,10 +321,12 @@ def test_prune_then_rebuild_drops_pruned_project_from_live_envelope(env):
 
     ``_build_projects_envelope`` consults ``_PROJECTS_ENV_MEMO`` at the TOP,
     BEFORE the #269 per-week cache path. Its memo_key is
-    ``(max_id, max_wus_id, cw_key, weeks_back)`` — it carries NO generation
-    counter. A prune that deletes only NON-max ``session_entries`` rows leaves
-    ``MAX(id)`` unchanged (exactly the case the reconcile's max-id-regression
-    check cannot catch), so the memo_key still matches after the prune. Without
+    ``(max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)`` — it carries
+    NO generation counter. A prune that deletes only NON-max ``session_entries``
+    rows leaves ``MAX(id)`` unchanged (and cannot RAISE ``MAX(mutation_seq)``,
+    which only advances on a write), exactly the case the reconcile's
+    max-id-regression check cannot catch, so the memo_key still matches after the
+    prune. Without
     the prune-site ``_projects_reset_memo()`` clear the rebuild stale-serves the
     pre-prune envelope — still showing the deleted project and its cost — and the
     fresh ``_assemble_projects_via_cache`` recompute is never reached.

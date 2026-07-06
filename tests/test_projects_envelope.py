@@ -66,10 +66,11 @@ def test_aggregate_projects_week_raw_finalize_matches_public():
     assert isinstance(tail[0], str) and isinstance(tail[1], int)
 
 
-def test_projects_iter_after_id_filters_by_rowid():
-    """``after_id`` returns exactly the rows with ``id > after_id`` from the
-    ``[since, until]`` window (order-independent set equality) — the warm delta
-    seek is a correct subset of the full window fetch.
+def test_projects_iter_after_seq_filters_by_mutation_seq():
+    """``after_seq`` returns exactly the rows with ``mutation_seq > after_seq``
+    from the ``[since, until]`` window (order-independent set equality) — the warm
+    delta seek is a correct subset of the full window fetch. The fixture stamps
+    ``mutation_seq == id`` (#270 §8).
     """
     conn = _open(FIXTURE_DIR / "multi-week.db")
     ws = _cctally_dashboard._projects_week_start_monday_utc(NOW_UTC)
@@ -77,40 +78,57 @@ def test_projects_iter_after_id_filters_by_rowid():
     full = list(_cctally_dashboard._projects_iter_session_entries(
         conn, since=ws, until=we))
     assert full, "current week has rows"
-    ids = sorted(r[0] for r in full)
-    cut = ids[len(ids) // 2]  # a mid rowid
+    seqs = sorted(
+        r[0] for r in conn.execute(
+            "SELECT mutation_seq FROM session_entries").fetchall())
+    cut = seqs[len(seqs) // 2]  # a mid mutation_seq
     delta = list(_cctally_dashboard._projects_iter_session_entries(
-        conn, since=ws, until=we, after_id=cut))
-    expected = {r for r in full if r[0] > cut}
-    assert set(delta) == expected, "after_id must return exactly id>cut rows"
-    assert all(r[0] > cut for r in delta)
+        conn, since=ws, until=we, after_seq=cut))
+    seq_by_id = dict(conn.execute(
+        "SELECT id, mutation_seq FROM session_entries").fetchall())
+    expected = {r for r in full if seq_by_id[r[0]] > cut}
+    assert set(delta) == expected, "after_seq must return exactly mutation_seq>cut rows"
+    assert all(seq_by_id[r[0]] > cut for r in delta)
 
 
-def test_projects_after_id_uses_rowid_seek():
-    """#271 §20 Codex-P2b: the warm-delta ``after_id`` fetch seeks by the
-    INTEGER PRIMARY KEY (rowid), NOT a full ``idx_entries_timestamp`` scan over
-    the whole current week — otherwise the ~63ms floor creeps back. The
-    ``+e.timestamp_utc`` unary-plus no-op deprioritizes the timestamp index so
-    the planner drives off the rowid range. Mirrors the SQL emitted by
-    ``_projects_iter_session_entries``' ``after_id`` branch.
+def test_projects_after_seq_uses_mutation_seq_index():
+    """#270 §8 (re-key of #271 §20 Codex-P2b): the warm-delta ``after_seq`` fetch
+    seeks by ``idx_entries_mutation_seq``, NOT a full ``idx_entries_timestamp``
+    scan NOR a bare table ``SCAN`` over the whole current week — otherwise the
+    ~63ms floor creeps back. The ``+e.timestamp_utc`` unary-plus no-op deprioritizes
+    the timestamp index and ``ORDER BY e.mutation_seq`` matches the index's leading
+    column, so the planner drives off the mutation_seq seek WITHOUT ``INDEXED BY``
+    (unusable — production runs this against a TEMP VIEW). Mirrors the SQL emitted
+    by ``_projects_iter_session_entries``' ``after_seq`` branch, exercised BOTH on
+    the base table (here) AND on a view.
     """
     conn = _open(FIXTURE_DIR / "multi-week.db")
-    plan = conn.execute(
-        "EXPLAIN QUERY PLAN "
+    entries_sql = (
         "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
         "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
         "       e.cost_usd_raw, e.source_path, sf.session_id, sf.project_path "
-        "FROM session_entries e "
+        "FROM {tbl} e "
         "LEFT JOIN session_files sf ON sf.path = e.source_path "
-        "WHERE e.id > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
-        "ORDER BY e.id ASC",
-        (0, "2020-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
-    ).fetchall()
-    text = " ".join(str(r) for r in plan).lower()
-    assert "integer primary key" in text, \
-        f"driving table e must be seeked by rowid; plan was: {text}"
-    assert "idx_entries_timestamp" not in text, \
-        f"must NOT scan the current-week timestamp index; plan was: {text}"
+        "WHERE e.mutation_seq > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
+        "ORDER BY e.mutation_seq ASC"
+    )
+    # Also assert against a TEMP VIEW — the production wiring wraps
+    # `session_entries` as a view over the ATTACHed cache.db (so `INDEXED BY`
+    # would be invalid and a plan that only works on the base table is a trap).
+    conn.execute(
+        "CREATE TEMP VIEW se_view AS SELECT * FROM session_entries")
+    for tbl in ("session_entries", "se_view"):
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN " + entries_sql.format(tbl=tbl),
+            (0, "2020-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ).fetchall()
+        text = " ".join(str(r) for r in plan).lower()
+        assert "idx_entries_mutation_seq" in text, \
+            f"[{tbl}] must be seeked by the mutation_seq index; plan was: {text}"
+        assert "idx_entries_timestamp" not in text, \
+            f"[{tbl}] must NOT scan the current-week timestamp index; plan was: {text}"
+        assert "scan" not in text, \
+            f"[{tbl}] must NOT be a bare table SCAN; plan was: {text}"
 
 
 def test_current_week_rows_sorted_desc_by_cost():
@@ -416,11 +434,17 @@ def _seed_conn(rows):
     ``rows`` = list of ``(id, source_path, ts_iso, model, cost, session_id,
     project_path)``. Cost is threaded verbatim (mode=auto + cost_usd)."""
     conn = sqlite3.connect(":memory:")
+    # #270 §8: the projects delta seek is keyed on `mutation_seq`, so the
+    # in-memory table must carry the column + index; seed `mutation_seq == id`
+    # (the pure-insert invariant).
     conn.execute(
         "CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT, "
         "timestamp_utc TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
-        "cache_create_tokens INTEGER, cache_read_tokens INTEGER, cost_usd_raw REAL)")
+        "cache_create_tokens INTEGER, cache_read_tokens INTEGER, cost_usd_raw REAL, "
+        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT)")
     conn.execute("CREATE INDEX idx_entries_timestamp ON session_entries(timestamp_utc)")
+    conn.execute("CREATE INDEX idx_entries_mutation_seq "
+                 "ON session_entries(mutation_seq, mutation_min_ts)")
     conn.execute(
         "CREATE TABLE session_files (path TEXT, session_id TEXT, project_path TEXT)")
     files = {}
@@ -428,7 +452,8 @@ def _seed_conn(rows):
         conn.execute(
             "INSERT INTO session_entries (id, source_path, timestamp_utc, model, "
             "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
-            "cost_usd_raw) VALUES (?,?,?,?,0,0,0,0,?)", (eid, sp, ts, model, cost))
+            "cost_usd_raw, mutation_seq, mutation_min_ts) "
+            "VALUES (?,?,?,?,0,0,0,0,?,?,?)", (eid, sp, ts, model, cost, eid, ts))
         files[sp] = (sp, sid, pp)
     for f in files.values():
         conn.execute(
@@ -437,11 +462,15 @@ def _seed_conn(rows):
     return conn
 
 
-def _insert(conn, eid, sp, ts, model, cost, sid, pp):
+def _insert(conn, eid, sp, ts, model, cost, sid, pp, mutation_seq=None):
+    # #270 §8: stamp `mutation_seq` (defaults to `id`, the pure-insert invariant)
+    # so the seq-keyed warm delta discriminates the new row.
+    seq = eid if mutation_seq is None else mutation_seq
     conn.execute(
         "INSERT INTO session_entries (id, source_path, timestamp_utc, model, "
         "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
-        "cost_usd_raw) VALUES (?,?,?,?,0,0,0,0,?)", (eid, sp, ts, model, cost))
+        "cost_usd_raw, mutation_seq, mutation_min_ts) "
+        "VALUES (?,?,?,?,0,0,0,0,?,?,?)", (eid, sp, ts, model, cost, seq, ts))
     conn.execute(
         "INSERT OR REPLACE INTO session_files (path, session_id, project_path) "
         "VALUES (?,?,?)", (sp, sid, pp))
@@ -458,13 +487,23 @@ def _fresh(conn, cw_start=WK_MON, cw_end=WK_END):
         conn, week_start=cw_start, week_end=cw_end, resolver_cache={})
 
 
-def _acc_tick(conn, cur_max_id, cw_start=WK_MON, cw_end=WK_END, calls=None):
+def _max_seq(conn):
+    return conn.execute(
+        "SELECT COALESCE(MAX(mutation_seq), 0) FROM session_entries").fetchone()[0]
+
+
+def _acc_tick(conn, cur_max_id, cw_start=WK_MON, cw_end=WK_END, calls=None,
+              cur_max_seq=None):
     """Drive ONE `accumulate_projects_current_week` tick with the SAME closures
     `_assemble_projects_via_cache` builds. ``calls`` (optional dict) records
-    ``all_raw`` (cold-fold count) + ``delta_after_ids`` (the after_id watermark
-    each warm fetch used) for the spy-based tests."""
+    ``all_raw`` (cold-fold count) + ``delta_after_seqs`` (the after_seq watermark
+    each warm fetch used) for the spy-based tests. ``cur_max_seq`` defaults to
+    ``MAX(mutation_seq)`` off the conn (== ``cur_max_id`` under the seq==id
+    fixtures)."""
     d = _cctally_dashboard
     resolver_cache = {}
+    if cur_max_seq is None:
+        cur_max_seq = _max_seq(conn)
 
     def _fetch_all_raw():
         if calls is not None:
@@ -472,12 +511,12 @@ def _acc_tick(conn, cur_max_id, cw_start=WK_MON, cw_end=WK_END, calls=None):
         return d._aggregate_projects_week_raw(
             conn, week_start=cw_start, week_end=cw_end, resolver_cache=resolver_cache)
 
-    def _fetch_delta_rows(after_id):
+    def _fetch_delta_rows(after_seq):
         if calls is not None:
-            calls.setdefault("delta_after_ids", []).append(after_id)
+            calls.setdefault("delta_after_seqs", []).append(after_seq)
         out = []
         for r in d._projects_iter_session_entries(
-                conn, since=cw_start, until=cw_end, after_id=after_id):
+                conn, since=cw_start, until=cw_end, after_seq=after_seq):
             if r[2] == "<synthetic>":
                 continue
             ts = d.parse_iso_datetime(r[1], "session_entries.timestamp_utc")
@@ -490,6 +529,7 @@ def _acc_tick(conn, cur_max_id, cw_start=WK_MON, cw_end=WK_END, calls=None):
     return sc.accumulate_projects_current_week(
         week_key=sc.projects_env_week_key(cw_start),
         cur_max_id=cur_max_id,
+        cur_max_seq=cur_max_seq,
         fetch_all_raw=_fetch_all_raw,
         fetch_delta_rows=_fetch_delta_rows,
         finalize=d._finalize_projects_mut,
@@ -519,9 +559,9 @@ def test_accumulator_empty_delta_skips_fetch():
     calls = {}
     _acc_tick(conn, mid, calls=calls)          # cold
     assert calls["all_raw"] == 1
-    _acc_tick(conn, mid, calls=calls)          # warm, same max_id
+    _acc_tick(conn, mid, calls=calls)          # warm, same max_id/max_seq
     assert calls["all_raw"] == 1, "no full re-fold on empty-delta warm"
-    assert "delta_after_ids" not in calls, "no delta fetch when cur_max_id unchanged"
+    assert "delta_after_seqs" not in calls, "no delta fetch when cur_max_seq unchanged"
 
 
 def test_accumulator_warm_delta_dedups_resumed_session():
@@ -583,10 +623,11 @@ def test_accumulator_fold_order_gate_forces_cold_refold():
 
 
 def test_accumulator_quiet_current_week_uses_global_max_watermark():
-    """#271 §20 Codex-P2a: reconciled_max_id is the tick's GLOBAL max id, NOT the
-    max id FOLDED into the current week. A quiet current week (high ids landing in
-    a PAST week) must seek the delta by `id > global_max` (returning nothing),
-    never re-scan from the lower folded-max."""
+    """#271 §20 Codex-P2a (re-keyed to seq, #270 §8): reconciled_max_seq is the
+    tick's GLOBAL max mutation_seq, NOT the max seq FOLDED into the current week.
+    A quiet current week (high seqs landing in a PAST week) must seek the delta by
+    `mutation_seq > global_max` (returning nothing), never re-scan from the lower
+    folded-max."""
     sc.reset_projects_env_current_state()
     conn = _seed_conn([
         (1, "/j/a.jsonl", "2026-05-19T10:00:00Z", "claude-opus-4-8", 0.1, "s1", "/repos/foo"),
@@ -599,10 +640,10 @@ def test_accumulator_quiet_current_week_uses_global_max_watermark():
     # A NEW past-week entry → global max advances to 4, current week unchanged.
     _insert(conn, 4, "/j/p.jsonl", "2026-05-11T11:00:00Z", "claude-opus-4-8", 0.5, "s9", "/repos/past")
     warm, warm_total = _acc_tick(conn, _max_id(conn), calls=calls)
-    # The delta seek used the GLOBAL max (3) — the prior tick's cur_max_id — NOT
-    # the folded-max (2). (Both yield an empty in-window delta, but the watermark
-    # VALUE is the non-vacuous assertion.)
-    assert calls["delta_after_ids"] == [3]
+    # The delta seek used the GLOBAL max seq (3) — the prior tick's cur_max_seq —
+    # NOT the folded-max (2). (Both yield an empty in-window delta, but the
+    # watermark VALUE is the non-vacuous assertion.)
+    assert calls["delta_after_seqs"] == [3]
     assert calls["all_raw"] == 1, "quiet week must NOT cold-refold"
     fresh, fresh_total = _fresh(conn)
     assert warm == fresh and warm_total == fresh_total

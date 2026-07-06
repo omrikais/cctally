@@ -54,7 +54,9 @@ def cache_db(tmp_path):
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             usage_extra_json TEXT,
             cost_usd_raw REAL,
-            speed TEXT
+            speed TEXT,
+            mutation_seq INTEGER NOT NULL DEFAULT 0,
+            mutation_min_ts TEXT
         );
         CREATE UNIQUE INDEX idx_entries_dedup
             ON session_entries(msg_id, req_id)
@@ -74,8 +76,9 @@ INSERT INTO session_entries (
     source_path, line_offset, timestamp_utc, model,
     msg_id, req_id, input_tokens, output_tokens,
     cache_create_tokens, cache_read_tokens,
-    usage_extra_json, speed, cost_usd_raw
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    usage_extra_json, speed, cost_usd_raw,
+    mutation_seq, mutation_min_ts
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(msg_id, req_id)
 WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
 DO UPDATE SET
@@ -87,7 +90,11 @@ DO UPDATE SET
     cache_read_tokens = excluded.cache_read_tokens,
     usage_extra_json = excluded.usage_extra_json,
     speed = excluded.speed,
-    cost_usd_raw = excluded.cost_usd_raw
+    cost_usd_raw = excluded.cost_usd_raw,
+    mutation_seq = excluded.mutation_seq,
+    mutation_min_ts = MIN(COALESCE(session_entries.mutation_min_ts,
+                                   session_entries.timestamp_utc),
+                          excluded.timestamp_utc)
 WHERE
     (excluded.input_tokens + excluded.output_tokens
      + excluded.cache_create_tokens + excluded.cache_read_tokens)
@@ -106,13 +113,19 @@ WHERE
 """
 
 
-def _row(msg_id, req_id, out_tokens, *, speed=None, in_tokens=0, cc=0, cr=0):
+def _row(msg_id, req_id, out_tokens, *, speed=None, in_tokens=0, cc=0, cr=0,
+         seq=1):
     # #181: speed is materialized into its own column; usage_extra_json is
     # written NULL by production ingest. Mirror that here.
+    # #270: production ingest also stamps mutation_seq (a per-file counter) and
+    # mutation_min_ts (== timestamp_utc on insert). Mirror the two trailing
+    # VALUES so this copy stays byte-identical to bin/_cctally_cache.py's UPSERT.
+    ts = "2026-05-22T17:04:00Z"
     return (
-        "/tmp/fake.jsonl", 0, "2026-05-22T17:04:00Z", "claude-opus-4-7",
+        "/tmp/fake.jsonl", 0, ts, "claude-opus-4-7",
         msg_id, req_id, in_tokens, out_tokens, cc, cr,
         None, speed, None,
+        seq, ts,
     )
 
 

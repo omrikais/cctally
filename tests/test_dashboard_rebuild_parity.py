@@ -267,8 +267,14 @@ CREATE TABLE session_entries (
     source_path         TEXT    NOT NULL,
     line_offset         INTEGER NOT NULL,
     timestamp_utc       TEXT    NOT NULL,
-    model               TEXT    NOT NULL
+    model               TEXT    NOT NULL,
+    -- #270: the per-row mutation stamps + the cache_meta counter the seq
+    -- watermark / signature leg read. `_ins_entry` stamps mutation_seq == id
+    -- and advances the counter, so the seq path == the id path (pure inserts).
+    mutation_seq        INTEGER NOT NULL DEFAULT 0,
+    mutation_min_ts     TEXT
 );
+CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -284,6 +290,19 @@ def _ins_entry(conn, ts):
         "INSERT INTO session_entries (source_path, line_offset, timestamp_utc, model) "
         "VALUES ('/p/a.jsonl', 0, ?, 'claude-opus-4-8')",
         (ts,),
+    )
+    # #270: stamp mutation_seq == id + mutation_min_ts == ts, and advance the
+    # cache_meta counter `_entry_mutation_seq` reads, mirroring production so the
+    # seq watermark behaves identically to the id watermark for these fixtures.
+    conn.execute(
+        "UPDATE session_entries SET mutation_seq = id, "
+        "mutation_min_ts = timestamp_utc WHERE id = last_insert_rowid()"
+    )
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) "
+        "VALUES ('session_entries_mutation_seq', "
+        "        CAST((SELECT MAX(mutation_seq) FROM session_entries) AS TEXT)) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     )
     conn.commit()
 
@@ -1871,7 +1890,8 @@ def test_trend_view_cached_matches_from_scratch(monkeypatch, tmp_path):
             cache_conn, stats, generation=sc.current_generation(),
         )
         sc.reconcile_weekref_cache(
-            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+            cache_conn, max_entry_id=sig.max_entry_id,
+            max_mutation_seq=sig.entry_mutation_seq, reset_sig=sig.reset_sig,
         )
         cached = ns["build_trend_view"](
             stats, now_utc=NOW_UTC, n=8, display_tz=None, skip_sync=True,
@@ -1912,7 +1932,8 @@ def test_trend_view_cached_reuses_closed_reset_week(monkeypatch, tmp_path):
             cache_conn, stats, generation=sc.current_generation(),
         )
         sc.reconcile_weekref_cache(
-            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+            cache_conn, max_entry_id=sig.max_entry_id,
+            max_mutation_seq=sig.entry_mutation_seq, reset_sig=sig.reset_sig,
         )
         ns["build_trend_view"](
             stats, now_utc=NOW_UTC, n=8, skip_sync=True,
@@ -1991,7 +2012,8 @@ def test_forecast_dpp_cached_matches_from_scratch(monkeypatch, tmp_path):
             cache_conn, stats, generation=sc.current_generation(),
         )
         sc.reconcile_weekref_cache(
-            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+            cache_conn, max_entry_id=sig.max_entry_id,
+            max_mutation_seq=sig.entry_mutation_seq, reset_sig=sig.reset_sig,
         )
         cached = ns["build_forecast_view"](
             stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
@@ -2032,7 +2054,8 @@ def test_forecast_trailing_weeks_cache_hit_second_tick(monkeypatch, tmp_path):
             cache_conn, stats, generation=sc.current_generation(),
         )
         sc.reconcile_weekref_cache(
-            cache_conn, max_entry_id=sig.max_entry_id, reset_sig=sig.reset_sig,
+            cache_conn, max_entry_id=sig.max_entry_id,
+            max_mutation_seq=sig.entry_mutation_seq, reset_sig=sig.reset_sig,
         )
         ns["build_forecast_view"](
             stats, now_utc=NOW_UTC, targets=(100, 90), skip_sync=True,
@@ -2402,7 +2425,8 @@ def _proj_sig_legs(conn):
 
 def _proj_reconcile(sc, conn, mid, mw):
     sc.reconcile_projects_env_cache(
-        conn, max_entry_id=mid, max_wus_id=mw, sf_sig=sc.session_files_sig(conn),
+        conn, max_entry_id=mid, max_mutation_seq=sc._entry_mutation_seq(conn),
+        max_wus_id=mw, sf_sig=sc.session_files_sig(conn),
     )
 
 
@@ -2630,7 +2654,13 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
         "CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT, "
         "timestamp_utc TEXT, model TEXT, input_tokens INTEGER, "
         "output_tokens INTEGER, cache_create_tokens INTEGER, "
-        "cache_read_tokens INTEGER, cost_usd_raw REAL)"
+        "cache_read_tokens INTEGER, cost_usd_raw REAL, "
+        # #270 §8: the accumulator reads MAX(mutation_seq) + seeks the seq index.
+        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_entries_mutation_seq "
+        "ON session_entries(mutation_seq, mutation_min_ts)"
     )
     conn.execute(
         "CREATE TABLE session_files (path TEXT, session_id TEXT, project_path TEXT)"
@@ -2673,10 +2703,13 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
     cur_max_id = conn.execute(
         "SELECT COALESCE(MAX(id), 0) FROM session_entries"
     ).fetchone()[0]
+    cur_max_seq = conn.execute(
+        "SELECT COALESCE(MAX(mutation_seq), 0) FROM session_entries"
+    ).fetchone()[0]
     _, _, key_by_bucket = d._assemble_projects_via_cache(
         conn, weeks_full=[week1, week2, cw_start],
         cw_start=cw_start, cw_end=cw_start + dt.timedelta(days=7),
-        cur_max_id=cur_max_id,
+        cur_max_id=cur_max_id, cur_max_seq=cur_max_seq,
     )
 
     assert key_by_bucket[bp].display_key == "EARLY", (
@@ -3266,7 +3299,9 @@ def test_bugk_segment_cache_late_ingest_recomputes(monkeypatch, tmp_path):
     cconn = ns["open_cache_db"]()
     try:
         max0 = sc._max_id(cconn, "session_entries")
-        sc.reconcile_bugk_cache(cconn, max_entry_id=max0, reset_sig=RS)
+        seq0 = sc._entry_mutation_seq(cconn)
+        sc.reconcile_bugk_cache(cconn, max_entry_id=max0,
+                                max_mutation_seq=seq0, reset_sig=RS)
     finally:
         cconn.close()
     with ns["open_db"]() as conn:
@@ -3285,14 +3320,35 @@ def test_bugk_segment_cache_late_ingest_recomputes(monkeypatch, tmp_path):
             input_tokens=50_000, output_tokens=20_000,
             cache_create=200_000, cache_read=900_000,
         )
+        # #270: mirror production ingest — bump the mutation counter and stamp
+        # the just-seeded row (mutation_seq = the bumped counter, mutation_min_ts
+        # = its event time), so the #270 seq watermark reaches this late row.
+        cc.execute(
+            "INSERT INTO cache_meta(key, value) "
+            "VALUES ('session_entries_mutation_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value = CAST(cache_meta.value AS INTEGER) + 1"
+        )
+        _seqv = cc.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='session_entries_mutation_seq'"
+        ).fetchone()[0]
+        cc.execute(
+            "UPDATE session_entries SET mutation_seq = ?, "
+            "mutation_min_ts = timestamp_utc WHERE source_path = '/fake/sess.jsonl'",
+            (_seqv,),
+        )
 
-    # Tick 2: reconcile sees the new id → watermark 05-11 < effective 05-15 →
-    # the segment evicts.
+    # Tick 2: reconcile sees the advanced seq → watermark 05-11 < effective
+    # 05-15 → the segment evicts.
     cconn = ns["open_cache_db"]()
     try:
         max1 = sc._max_id(cconn, "session_entries")
+        seq1 = sc._entry_mutation_seq(cconn)
         assert max1 > max0
-        sc.reconcile_bugk_cache(cconn, max_entry_id=max1, reset_sig=RS)
+        assert seq1 > seq0
+        sc.reconcile_bugk_cache(cconn, max_entry_id=max1,
+                                max_mutation_seq=seq1, reset_sig=RS)
     finally:
         cconn.close()
     assert _bugk_expected_key(sc) not in sc._BUGK_SEGMENT_CACHE  # evicted
@@ -3306,3 +3362,274 @@ def test_bugk_segment_cache_late_ingest_recomputes(monkeypatch, tmp_path):
     warm_pre = next(r for r in warm if r.week_end_at == eff)
     assert warm_pre.cost_usd > cold_pre.cost_usd, "late row must raise the cost"
     assert warm == scratch, "post-eviction warm build == from-scratch"
+
+
+# ===========================================================================
+# #270 M2 — id-stable in-place finalization must recompute a CLOSED bucket.
+#
+# The primary #270 regression: a streaming-intermediate `session_entries` row
+# in a now-CLOSED bucket is finalized IN PLACE by an appended duplicate-
+# `(msg_id, req_id)` line (append-only JSONL) — same `id`, higher tokens, so
+# `MAX(session_entries.id)` stays flat. Pre-M2 the id watermark / id gate MISS
+# it → the Group A past bucket / Group B session serves a STALE aggregate.
+# With the `mutation_seq` watermark the warm rebuild recomputes the affected
+# bucket byte-identically to from-scratch. (Non-vacuity: reverting the Group A
+# watermark to `new_min_timestamp(...max_id)` turns the daily case RED — the
+# stash→RED proof in the M2 report.)
+# ===========================================================================
+
+
+def _tok_line(session_id, msg_id, req_id, *, ts, out_tokens, in_tokens=100,
+              model="claude-opus-4-8", cwd="/Users/u/proj"):
+    """One assistant JSONL line with EXPLICIT token counts (so a finalization
+    can raise the tokens of an existing (msg_id, req_id) row)."""
+    return json.dumps({
+        "type": "assistant", "uuid": f"u-{msg_id}", "sessionId": session_id,
+        "requestId": req_id, "timestamp": ts, "cwd": cwd,
+        "message": {
+            "role": "assistant", "id": msg_id, "model": model,
+            "content": [{"type": "text", "text": "x"}],
+            "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+def _write_single_file(tmp_path, name, text):
+    proj = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    p = proj / name
+    p.write_text(text)
+    return p
+
+
+@pytest.mark.parametrize("builder_name,n,label_attr,closed_ts,closed_label", [
+    ("_dashboard_build_daily_panel", 30, "date",
+     "2026-07-01T10:00:00Z", "2026-07-01"),
+    ("_dashboard_build_monthly_periods", 12, "label",
+     "2026-05-10T10:00:00Z", "2026-05"),
+])
+def test_group_a_idstable_finalization_recomputes_closed_bucket(
+    monkeypatch, tmp_path, builder_name, n, label_attr, closed_ts, closed_label
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    # A CLOSED past bucket carrying a streaming-intermediate row (low tokens),
+    # plus a current-bucket row so the builder has a live current label.
+    intermediate = _tok_line("s1", "mC", "rC", ts=closed_ts, out_tokens=5)
+    current = _tok_line("s1", "mNow", "rNow", ts="2026-07-04T09:00:00Z",
+                        out_tokens=40)
+    _write_single_file(tmp_path, "s1.jsonl", intermediate + current)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    dash = sys.modules["_cctally_dashboard"]
+    try:
+        sc.reset_group_a_state()
+        dash._GROUP_A_CACHE_ENABLED = True
+        cold = ns[builder_name](stats, NOW_UTC, n=n, skip_sync=True,
+                                use_group_a_cache=True)
+        cold_row = next(r for r in cold if getattr(r, label_attr) == closed_label)
+
+        # id-stable in-place finalization: APPEND a duplicate-(mC, rC) line with
+        # higher tokens (append-only JSONL). sync_cache tail-ingests it → the
+        # ON CONFLICT(msg_id, req_id) UPSERT finalizes the EXISTING row in place
+        # (same id → MAX(id) flat), advancing only mutation_seq.
+        finalization = _tok_line("s1", "mC", "rC", ts=closed_ts, out_tokens=9000)
+        _write_single_file(tmp_path, "s1.jsonl",
+                           intermediate + current + finalization)
+        _prime_cache(ns)
+
+        warm = ns[builder_name](stats, NOW_UTC, n=n, skip_sync=True,
+                                use_group_a_cache=True)
+        warm_row = next(r for r in warm if getattr(r, label_attr) == closed_label)
+        assert warm_row.cost_usd > cold_row.cost_usd, (
+            f"an id-stable finalization in CLOSED {closed_label} must recompute "
+            "it (pre-#270-M2 the id watermark missed it → stale)"
+        )
+        # Byte-identity to a fresh from-scratch build on the post-UPSERT DB.
+        sc.reset_group_a_state()
+        prev = dash._GROUP_A_CACHE_ENABLED
+        dash._GROUP_A_CACHE_ENABLED = False
+        try:
+            wide = ns[builder_name](stats, NOW_UTC, n=n, skip_sync=True,
+                                    use_group_a_cache=True)
+        finally:
+            dash._GROUP_A_CACHE_ENABLED = prev
+        assert warm == wide, "warm rebuild must equal from-scratch"
+    finally:
+        stats.close()
+
+
+def test_weekly_idstable_finalization_recomputes_closed_week(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    # A CLOSED past subscription week (mid-June) with a streaming-intermediate
+    # row + a current-week row.
+    intermediate = _tok_line("s1", "mW", "rW", ts="2026-06-16T10:00:00Z",
+                             out_tokens=5)
+    current = _tok_line("s1", "mNow", "rNow", ts="2026-07-02T09:00:00Z",
+                        out_tokens=40)
+    _write_single_file(tmp_path, "s1.jsonl", intermediate + current)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    try:
+        cold = _build_weekly(ns, stats, enabled=True)
+        cold_total = _weekly_total(cold)
+        finalization = _tok_line("s1", "mW", "rW", ts="2026-06-16T10:00:00Z",
+                                 out_tokens=9000)
+        _write_single_file(tmp_path, "s1.jsonl",
+                           intermediate + current + finalization)
+        _prime_cache(ns)
+        # Warm build WITHOUT resetting the Group A cache (mirrors the sync tick).
+        dash = sys.modules["_cctally_dashboard"]
+        dash._GROUP_A_CACHE_ENABLED = True
+        warm = ns["_dashboard_build_weekly_periods"](
+            stats, NOW_UTC, n=12, skip_sync=True, use_group_a_cache=True)
+        wide = _build_weekly(ns, stats, enabled=False)
+        assert warm == wide, "warm weekly rebuild must equal from-scratch"
+        assert _weekly_total(warm) > cold_total, (
+            "the id-stable finalization in a CLOSED week must recompute it"
+        )
+    finally:
+        stats.close()
+
+
+def test_group_a_timestamp_move_recomputes_both_buckets(monkeypatch, tmp_path):
+    """A finalization whose new timestamp MOVES the row to a different closed
+    day: the OLD day loses the row (mutation_min_ts reaches it) and the NEW day
+    gains it — both byte-match from-scratch (Codex-2a)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    intermediate = _tok_line("s1", "mC", "rC", ts="2026-07-01T10:00:00Z",
+                             out_tokens=5)
+    current = _tok_line("s1", "mNow", "rNow", ts="2026-07-04T09:00:00Z",
+                        out_tokens=40)
+    _write_single_file(tmp_path, "s1.jsonl", intermediate + current)
+    _prime_cache(ns)
+
+    stats = ns["open_db"]()
+    dash = sys.modules["_cctally_dashboard"]
+    try:
+        sc.reset_group_a_state()
+        dash._GROUP_A_CACHE_ENABLED = True
+        ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30, skip_sync=True,
+                                           use_group_a_cache=True)
+        # Finalization MOVES the row 07-01 → 07-02 (both closed days).
+        finalization = _tok_line("s1", "mC", "rC", ts="2026-07-02T08:00:00Z",
+                                 out_tokens=9000)
+        _write_single_file(tmp_path, "s1.jsonl",
+                           intermediate + current + finalization)
+        _prime_cache(ns)
+        warm = ns["_dashboard_build_daily_panel"](stats, NOW_UTC, n=30,
+                                                  skip_sync=True,
+                                                  use_group_a_cache=True)
+        wide = _build_daily(ns, stats, enabled=False)
+        assert warm == wide, "both old + new day must byte-match from-scratch"
+        # Non-vacuity: from-scratch really moved the row (07-02 has cost, and
+        # 07-01 lost its only row).
+        wide_0702 = next((r for r in wide if r.date == "2026-07-02"), None)
+        assert wide_0702 is not None and wide_0702.cost_usd > 0
+        wide_0701 = next((r for r in wide if r.date == "2026-07-01"), None)
+        assert wide_0701 is None or wide_0701.cost_usd == 0
+    finally:
+        stats.close()
+
+
+def test_sessions_idstable_finalization_reaggregates(monkeypatch, tmp_path):
+    """Group B: an id-stable in-place finalization of an EXISTING session's row
+    (appended duplicate (msg,req), higher tokens) must re-aggregate that session
+    even though MAX(id) is flat — via the seq gate + seq-keyed affected set +
+    seq-keyed _fetch_affected_session_entries (Codex-2c)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_snapshot_cache as sc
+
+    a = _tok_line("sess-a", "ma", "ra", ts="2026-07-04T09:00:00Z", out_tokens=40)
+    b_partial = _tok_line("sess-b", "mb", "rb", ts="2026-07-03T10:00:00Z",
+                          out_tokens=5)
+    _write_single_file(tmp_path, "sess-a.jsonl", a)
+    _write_single_file(tmp_path, "sess-b.jsonl", b_partial)
+    _prime_cache(ns)
+
+    tui = sys.modules["_cctally_tui"]
+    sc.reset_session_cache_state()
+    tui._SESSION_CACHE_ENABLED = True
+    cold = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True,
+                                     use_session_cache=True)
+    cold_b = next(r for r in cold if r.session_id == "sess-b")
+
+    # Finalize sess-b's row IN PLACE (same (mb, rb), higher tokens).
+    b_final = _tok_line("sess-b", "mb", "rb", ts="2026-07-03T10:00:00Z",
+                        out_tokens=9000)
+    _write_single_file(tmp_path, "sess-b.jsonl", b_partial + b_final)
+    _prime_cache(ns)
+
+    warm = ns["_tui_build_sessions"](NOW_UTC, skip_sync=True,
+                                     use_session_cache=True)
+    warm_b = next(r for r in warm if r.session_id == "sess-b")
+    assert warm_b.cost_usd > cold_b.cost_usd, (
+        "an id-stable finalization of an EXISTING session must re-aggregate it "
+        "(pre-#270-M2 the id gate missed it → stale)"
+    )
+    wide = _build_sessions(ns, enabled=False)
+    assert warm == wide, "warm sessions rebuild must equal from-scratch"
+
+
+def test_projects_env_outer_memo_busts_on_idstable_update(monkeypatch, tmp_path):
+    """#270 §7d (Codex-2b): the OUTER whole-envelope memo `_PROJECTS_ENV_MEMO`
+    must fold the mutation signal into its key, so an id-stable in-place
+    finalization (MAX(id) flat) advances the key and the memo does NOT serve the
+    stale envelope. Drives a LIVE `_build_projects_envelope` twice with a real
+    cache.db conn, asserting the memo key's `max_id` leg is flat but the whole
+    key changed via the `entry_mutation_seq` leg."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = sys.modules["_cctally_dashboard"]
+
+    intermediate = _tok_line("s1", "mC", "rC", ts="2026-07-01T10:00:00Z",
+                             out_tokens=5)
+    _write_single_file(tmp_path, "s1.jsonl", intermediate)
+    _prime_cache(ns)
+
+    dash._projects_reset_memo()
+    conn = ns["open_cache_db"]()
+    dash._build_projects_envelope(conn, now_utc=NOW_UTC, current_week=None)
+    key_before = dash._PROJECTS_ENV_MEMO["key"]
+    max_id_before = conn.execute(
+        "SELECT MAX(id) FROM session_entries").fetchone()[0]
+    conn.close()
+    assert key_before is not None
+
+    # id-stable in-place finalization: appended duplicate-(mC, rC), higher tokens.
+    finalization = _tok_line("s1", "mC", "rC", ts="2026-07-01T10:00:00Z",
+                             out_tokens=9000)
+    _write_single_file(tmp_path, "s1.jsonl", intermediate + finalization)
+    _prime_cache(ns)
+
+    conn = ns["open_cache_db"]()
+    max_id_after = conn.execute(
+        "SELECT MAX(id) FROM session_entries").fetchone()[0]
+    # A second live build WITHOUT resetting the memo — it must NOT serve stale.
+    dash._build_projects_envelope(conn, now_utc=NOW_UTC, current_week=None)
+    key_after = dash._PROJECTS_ENV_MEMO["key"]
+    conn.close()
+
+    assert max_id_after == max_id_before, "the finalization left MAX(id) flat"
+    assert key_before[0] == key_after[0], "the memo key's max_id leg is flat"
+    assert key_after != key_before, (
+        "the outer memo key must advance on an id-stable update (pre-#270 the "
+        "key was identical → the memo stale-served the envelope)"
+    )
+    # The entry_mutation_seq leg (index 2) carried the change.
+    assert key_after[2] > key_before[2], (
+        "the entry_mutation_seq memo-key leg must advance"
+    )

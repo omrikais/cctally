@@ -2310,7 +2310,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
             usage_extra_json    TEXT,
             cost_usd_raw        REAL,
-            speed               TEXT
+            speed               TEXT,
+            mutation_seq        INTEGER NOT NULL DEFAULT 0,
+            mutation_min_ts     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_entries_timestamp
             ON session_entries(timestamp_utc);
@@ -2474,6 +2476,30 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # after cost_usd_raw to match the CREATE TABLE order; cache migration 008
     # then backfills it from the legacy blob on existing rows.
     add_column_if_missing(conn, "session_entries", "speed", "TEXT")
+    # #270: the durable per-row mutation signal. ``mutation_seq`` is a change
+    # stamp bumped on every insert + every WHERE-passing in-place UPSERT (from a
+    # cache_meta counter, ingest side); ``mutation_min_ts`` records the EARLIEST
+    # event time the row has ever held, so a finalization that overwrites
+    # ``timestamp_utc`` and moves the row across a bucket boundary still lets the
+    # closed-bucket watermark reach the OLD bucket. Idempotent column-adds (no
+    # marker, no version — a pure column+index add, not a framework migration);
+    # ``INTEGER NOT NULL DEFAULT 0`` is a metadata-only add in SQLite (no table
+    # rewrite on a large session_entries). The covering index
+    # ``idx_entries_mutation_seq`` backs the one new query shape
+    # ``MIN(mutation_min_ts) WHERE mutation_seq > ?`` (index-only range-min over
+    # the delta) plus the ``WHERE mutation_seq > ?`` filters. Both the column
+    # adds AND the index MUST run BEFORE the legacy FTS early-return below (the
+    # ``_apply_cache_schema_legacy_early_return_before_new_table`` gotcha), so an
+    # old cache.db that early-returns still receives them. The index create is
+    # kept OUT of the top executescript on purpose: on an existing DB the CREATE
+    # TABLE there is a no-op, so the columns do not exist yet and an index over
+    # them would raise — it must follow the add_column_if_missing calls.
+    add_column_if_missing(
+        conn, "session_entries", "mutation_seq", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "session_entries", "mutation_min_ts", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entries_mutation_seq "
+        "ON session_entries(mutation_seq, mutation_min_ts)")
     # Existing-DB guard for the skill-content fold link (cctally-dev
     # skill-content-nesting): the message-level sourceToolUseID. Idempotent
     # column-add (no marker, no version); cache migration 006 then re-ingests
