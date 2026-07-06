@@ -67,7 +67,30 @@ LITELLM_PRICES_URL = (
 # or an intentionally-omitted in-scope model ({"model","reason"} — no field).
 # Guarded by `stale_allowlist_entries` (tests/test_pricing_check.py): an entry
 # that no longer corresponds to a real divergence fails the suite.
-PRICING_DRIFT_ALLOWLIST: list[dict] = []
+#
+# claude-sonnet-5 (#274): LiteLLM tracks the $2/$10-per-MTok *introductory* rate
+# (in effect through 2026-08-31); we deliberately embed the durable *standard*
+# $3/$15 rate because the table is date-blind and the promo expires soon (see
+# the CLAUDE_MODEL_PRICING note below). The non-vacuity guard forces these four
+# entries out once LiteLLM reverts to the standard rate post-cutover.
+PRICING_DRIFT_ALLOWLIST: list[dict] = [
+    {
+        "model": "claude-sonnet-5",
+        "field": field,
+        "reason": (
+            "LiteLLM tracks the claude-sonnet-5 introductory rate "
+            "($2/$10 per MTok, through 2026-08-31); we deliberately embed the "
+            "durable standard $3/$15 rate (the table is date-blind). Remove "
+            "once LiteLLM reverts post-cutover (#274)."
+        ),
+    }
+    for field in (
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_creation_input_token_cost",
+        "cache_read_input_token_cost",
+    )
+]
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
@@ -79,9 +102,13 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = []
 #   2026-07-01: added claude-sonnet-5 ($3/$15 per MTok; 1M context, flat-rate
 #   across the full window — no long-context premium, same shape as
 #   claude-sonnet-4-6). Embedded the STANDARD rate, not the $2/$10 introductory
-#   rate in effect through 2026-08-31, to match what LiteLLM will publish and
-#   the durable post-cutover price. LiteLLM has no sonnet-5 entry yet, so the
-#   table is ahead_of_litellm (not a drift finding).
+#   rate in effect through 2026-08-31, because the table is date-blind and
+#   $3/$15 is the durable post-cutover price.
+#   2026-07-06 (#274): LiteLLM published a sonnet-5 entry at the $2/$10
+#   introductory rate, so the deliberate standard-rate choice now surfaces as
+#   value_drift on all four cost fields. Suppressed via PRICING_DRIFT_ALLOWLIST
+#   above (the non-vacuity guard forces removal once LiteLLM reverts to the
+#   standard rate after 2026-08-31).
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
     "claude-3-5-haiku-20241022": {
         "input_cost_per_token": 8e-07,

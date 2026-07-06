@@ -211,6 +211,13 @@
     "cache_creation_input_token_cost": 3.75e-06,
     "cache_read_input_token_cost": 3e-07
   },
+  "claude-sonnet-5": {
+    "litellm_provider": "anthropic",
+    "input_cost_per_token": 2e-06,
+    "output_cost_per_token": 1e-05,
+    "cache_creation_input_token_cost": 2.5e-06,
+    "cache_read_input_token_cost": 2e-07
+  },
   "gpt-5": {
     "litellm_provider": "openai",
     "input_cost_per_token": 1.25e-06,
