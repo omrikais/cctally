@@ -2168,9 +2168,12 @@ def build_cache_report_snapshot(
 
     Pulls entries via ``get_claude_session_entries`` (uses the cache when
     warm, falls back to direct-JSONL parse on cache miss / lock
-    contention — same chain the CLI uses). Delegates aggregation +
-    anomaly classification to ``_lib_cache_report._build_cache_report``;
-    shapes the result into a frozen ``CacheReportSnapshot``.
+    contention — same chain the CLI uses). Aggregates per closed day via
+    ``_lib_cache_report.build_cached_days`` (served from the per-day cache
+    when ``use_cache_report_cache`` and reconciled), reconstructs fresh
+    rows (``reconstruct_cache_row``), runs the cross-row
+    ``classify_and_summarize`` + ``combine_day_project_partials`` restitch,
+    and shapes the result into a frozen ``CacheReportSnapshot``.
 
     ``window_days`` is hardcoded at 14 in v1 (spec §6.1 hardcodes
     ``anomaly_window_days`` too; ``anomaly_threshold_pp`` is the only
