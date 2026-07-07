@@ -47,3 +47,23 @@ def test_host_allowed_blocks_dns_rebinding():
     # Missing/empty Host → fail closed.
     assert ta.host_allowed_for_transcripts("", True) is False
     assert ta.host_allowed_for_transcripts(None, True) is False
+
+
+def test_debug_backend_allowed_matrix():
+    # /api/debug/backend gate (issue #276): PRIMARY = loopback TCP peer
+    # (unspoofable), DEFENSE-IN-DEPTH = IP-literal loopback Host. expose is
+    # NEVER a parameter — this diagnostic surface is loopback-only, always.
+    assert ta.debug_backend_allowed("127.0.0.1", "127.0.0.1:8789") is True
+    assert ta.debug_backend_allowed("::1", "[::1]:8789") is True
+    assert ta.debug_backend_allowed("127.5.5.5", "127.0.0.1:8789") is True   # 127/8 peer
+    # Spoofed loopback Host from a LAN peer: the peer (unspoofable) rejects it.
+    assert ta.debug_backend_allowed("192.168.0.9", "127.0.0.1:8789") is False
+    assert ta.debug_backend_allowed("192.168.0.9", "192.168.0.9:8789") is False
+    # Loopback peer but a hostname Host = DNS-rebinding vector → reject.
+    assert ta.debug_backend_allowed("127.0.0.1", "myhost.local:8789") is False
+    assert ta.debug_backend_allowed("127.0.0.1", "evil.attacker.com") is False
+    # Missing peer or Host → fail closed.
+    assert ta.debug_backend_allowed("127.0.0.1", None) is False
+    assert ta.debug_backend_allowed("127.0.0.1", "") is False
+    assert ta.debug_backend_allowed("", "127.0.0.1:8789") is False
+    assert ta.debug_backend_allowed(None, "127.0.0.1:8789") is False

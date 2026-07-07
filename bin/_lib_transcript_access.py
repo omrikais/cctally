@@ -55,6 +55,29 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def debug_backend_allowed(peer_ip, host) -> bool:
+    """Gate for the loopback-only ``/api/debug/backend`` diagnostic endpoint
+    (issue #276, Session A).
+
+    STRICTER than the transcript gate — it never opens to the LAN. Two checks:
+
+      * PRIMARY: the TCP peer (``client_address[0]``) must be a loopback
+        literal. This is the unspoofable signal — the dashboard can bind
+        ``0.0.0.0`` (``dashboard.bind = lan``), and a ``Host``-header-only
+        check would let a LAN client connect to the LAN socket while sending
+        ``Host: 127.0.0.1``. The peer address cannot be spoofed that way.
+      * DEFENSE-IN-DEPTH: the ``Host`` authority must ALSO be an IP-literal
+        loopback (anti-DNS-rebinding) — a hostname ``Host`` (a rebinding
+        vector) is rejected even from a loopback peer.
+
+    ``dashboard.expose_transcripts`` is NEVER consulted — this surface is
+    loopback-only, ALWAYS. Fail closed on a missing/empty peer or Host.
+    """
+    if not is_loopback(peer_ip):
+        return False
+    return is_loopback(authority_host(host))
+
+
 def transcripts_allowed(bind_host, expose: bool) -> bool:
     """Are transcripts served AT ALL on this bind? Loopback bind always; a
     non-loopback (LAN) bind only under the explicit ``expose`` opt-in."""

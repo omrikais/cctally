@@ -6567,6 +6567,112 @@ def _cached_file_sigs(conn, paths):
     return out
 
 
+# ── /api/debug/backend on-demand cache-state helpers (issue #276, Session A) ──
+# All read-only, cheap, and privacy-safe: they leak ONLY row counts, signature
+# legs (ints/tuples), pending-flag names, and the tool version — never prompt /
+# prose / paths. Computed on demand so cache_state is available even with
+# tracing off (the phase tree, by contrast, is present only when traced).
+
+# Safe cache-table names surfaced as `dataset` row counts (no content read).
+_DEBUG_CACHE_TABLES = (
+    "session_entries",
+    "session_files",
+    "conversation_messages",
+    "conversation_sessions",
+    "conversation_ai_titles",
+    "conversation_file_touches",
+    "codex_session_entries",
+    "codex_session_files",
+)
+
+
+def _debug_cache_table_counts(cache_conn) -> dict:
+    """Row counts per known cache table. Absent tables (partially-migrated /
+    fresh cache) are omitted rather than erroring."""
+    counts: dict = {}
+    for table in _DEBUG_CACHE_TABLES:
+        try:
+            row = cache_conn.execute(
+                f"SELECT COUNT(*) FROM {table}"  # noqa: S608 — fixed allowlist
+            ).fetchone()
+            counts[table] = int(row[0])
+        except sqlite3.Error:
+            pass
+    return counts
+
+
+def _debug_cache_state(cache_conn) -> dict:
+    """On-demand signature legs + pending-reingest flags + generation.
+
+    The signature legs are the canonical ``compute_signature`` fields (ints /
+    a small tuple). stats.db is opened READ-ONLY via a dispatcher-free URI
+    connection so this diagnostic never forward-migrates or creates a DB; if it
+    is absent the stats legs degrade (each ``_max_id`` / ``_reset_sig`` already
+    returns 0 on a missing table)."""
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+    state: dict = {"generation": sc.current_generation()}
+    stats_conn = None
+    try:
+        stats_conn = sqlite3.connect(
+            f"{_cctally_core.DB_PATH.as_uri()}?mode=ro", uri=True
+        )
+    except sqlite3.Error:
+        stats_conn = None
+    try:
+        if stats_conn is not None:
+            sig = sc.compute_signature(
+                cache_conn, stats_conn, generation=sc.current_generation()
+            )
+            state["signature"] = {
+                "max_entry_id": sig.max_entry_id,
+                "max_wus_id": sig.max_wus_id,
+                "max_wcs_id": sig.max_wcs_id,
+                "reset_sig": list(sig.reset_sig),
+                "max_codex_id": sig.max_codex_id,
+                "entry_mutation_seq": sig.entry_mutation_seq,
+            }
+        else:
+            state["signature"] = {
+                "max_entry_id": sc._max_id(cache_conn, "session_entries"),
+                "entry_mutation_seq": sc._entry_mutation_seq(cache_conn),
+            }
+    except sqlite3.Error as exc:
+        state["signature"] = {"_error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if stats_conn is not None:
+            stats_conn.close()
+    # Pending reingest / backfill flag NAMES (never values) set in cache_meta.
+    try:
+        rows = cache_conn.execute(
+            "SELECT key FROM cache_meta "
+            "WHERE key LIKE '%_pending' AND value IS NOT NULL"
+        ).fetchall()
+        state["pending_reingest"] = sorted(r[0] for r in rows)
+    except sqlite3.Error:
+        state["pending_reingest"] = []
+    # Walk-complete sentinel presence (bool only — no timestamp leak).
+    try:
+        state["walk_complete"] = cache_conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+        ).fetchone() is not None
+    except sqlite3.Error:
+        state["walk_complete"] = False
+    return state
+
+
+def _debug_tool_version() -> str:
+    """The running tool version (latest stamped CHANGELOG header), or
+    ``"unknown"``. Safe to expose (already on the public update surface)."""
+    try:
+        v = _cctally()._load_sibling(
+            "_lib_changelog"
+        )._read_latest_changelog_version()
+        return v[0] if v else "unknown"
+    except Exception:  # noqa: BLE001 — diagnostic must never raise
+        return "unknown"
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -6693,42 +6799,58 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._handle_share_history_get()
         elif path == "/api/doctor":
             self._handle_get_doctor()
+        elif path == "/api/debug/backend":
+            # Loopback-only backend diagnostic (issue #276): last-build phase
+            # timings + on-demand cache-state. Its own stricter gate (never
+            # expose_transcripts); see _handle_get_debug_backend.
+            self._handle_get_debug_backend()
         elif path == "/api/conversations/facets":
-            self._handle_get_conversations_facets()
+            with self._perf_gate().phase("endpoint.conversations_facets"):
+                self._handle_get_conversations_facets()
         elif path == "/api/conversations":
-            self._handle_get_conversations()
+            with self._perf_gate().phase("endpoint.conversations"):
+                self._handle_get_conversations()
         elif path == "/api/conversation/search":
-            self._handle_get_conversation_search()
+            with self._perf_gate().phase("endpoint.conversation_search"):
+                self._handle_get_conversation_search()
         elif path.startswith("/api/conversation/") and path.endswith("/payload"):
             # #178: on-demand load-full. Matched BEFORE the <id> reader
             # catch-all (same precedence as /api/conversation/search).
-            self._handle_get_conversation_payload(path)
+            with self._perf_gate().phase("endpoint.conversation_payload"):
+                self._handle_get_conversation_payload(path)
         elif path.startswith("/api/conversation/") and path.endswith("/media"):
             # #177 S4: on-demand media bytes. Matched BEFORE the <id> reader.
-            self._handle_get_conversation_media(path)
+            with self._perf_gate().phase("endpoint.conversation_media"):
+                self._handle_get_conversation_media(path)
         elif path.startswith("/api/conversation/") and path.endswith("/outline"):
             # #177 S5: full-session outline skeleton + stats. Matched BEFORE
             # the <id> reader catch-all (Codex F2 — same precedence as /payload).
-            self._handle_get_conversation_outline(path)
+            with self._perf_gate().phase("endpoint.conversation_outline"):
+                self._handle_get_conversation_outline(path)
         elif path.startswith("/api/conversation/") and path.endswith("/find"):
             # #177 S6: in-conversation find → rendered-turn anchors. Matched
             # BEFORE the <id> reader catch-all (same precedence as /outline).
-            self._handle_get_conversation_find(path)
+            with self._perf_gate().phase("endpoint.conversation_find"):
+                self._handle_get_conversation_find(path)
         elif path.startswith("/api/conversation/") and path.endswith("/events"):
             # Live-tail SSE for the open reader (spec §2). Matched BEFORE the
             # <id> reader catch-all.
-            self._handle_get_conversation_events(path)
+            with self._perf_gate().phase("endpoint.conversation_events"):
+                self._handle_get_conversation_events(path)
         elif path.startswith("/api/conversation/") and path.endswith("/export"):
             # #217 S5: whole-session Markdown export (F1/F5). Matched BEFORE the
             # <id> reader catch-all (same precedence as /outline).
-            self._handle_get_conversation_export(path)
+            with self._perf_gate().phase("endpoint.conversation_export"):
+                self._handle_get_conversation_export(path)
         elif path.startswith("/api/conversation/") and path.endswith("/prompts"):
             # #217 S7: ordered main-thread prompt spine for session comparison
             # (F10). Matched BEFORE the <id> reader catch-all (same precedence
             # as /outline).
-            self._handle_get_conversation_prompts(path)
+            with self._perf_gate().phase("endpoint.conversation_prompts"):
+                self._handle_get_conversation_prompts(path)
         elif path.startswith("/api/conversation/"):
-            self._handle_get_conversation_detail(path)
+            with self._perf_gate().phase("endpoint.conversation_detail"):
+                self._handle_get_conversation_detail(path)
         else:
             self.send_error(404, "not found")
 
@@ -6923,6 +7045,70 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._respond_403("transcripts not exposed")
             return False
         return True
+
+    @staticmethod
+    def _perf_gate():
+        """Lazy-load the opt-in backend phase-instrumentation collector (#276).
+        Near-noop when tracing is off (``phase()`` returns a shared singleton),
+        so the coarse ``endpoint.*`` wraps in ``do_GET`` cost nothing by
+        default."""
+        return sys.modules["cctally"]._load_sibling("_lib_perf")
+
+    def _require_debug_backend_allowed(self) -> bool:
+        """Gate for ``/api/debug/backend`` (issue #276) — STRICTER than the
+        transcript gate.
+
+        PRIMARY: the TCP peer (``client_address[0]``) must be loopback — the
+        unspoofable signal (the dashboard can bind ``0.0.0.0``, so a
+        ``Host``-only check is spoofable). DEFENSE-IN-DEPTH: the ``Host``
+        authority must ALSO be an IP-literal loopback (anti-DNS-rebinding).
+        ``expose_transcripts`` is NEVER consulted. 403 + ``False`` otherwise.
+        """
+        ta = self._transcript_gate()
+        peer = self.client_address[0] if self.client_address else ""
+        host = self.headers.get("Host")
+        if not ta.debug_backend_allowed(peer, host):
+            self._respond_403("forbidden")
+            return False
+        return True
+
+    def _handle_get_debug_backend(self) -> None:
+        """GET ``/api/debug/backend`` — loopback-only backend diagnostic (#276).
+
+        Returns the last completed snapshot build's phase-timing tree (present
+        only if the dashboard was started with ``CCTALLY_PERF_TRACE=1``; else
+        ``null`` + a ``tracing_disabled`` note) plus on-demand cache-table row
+        counts and signature legs. Leaks no prompt / prose / paths — timings,
+        counts, flag names, and safe cache-table names only. ``schemaVersion``
+        is 1 but the surface is documented UNSTABLE (a diagnostic, not a
+        consumer contract): phase names / nesting / fields may change without a
+        version bump.
+        """
+        if not self._require_debug_backend_allowed():
+            return
+        last = self._perf_gate().last_backend_perf()
+        dataset: dict = {}
+        cache_state: dict = {}
+        try:
+            conn = open_cache_db()
+            try:
+                dataset = _debug_cache_table_counts(conn)
+                cache_state = _debug_cache_state(conn)
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 — a diagnostic must not 500 loudly
+            cache_state = {"_error": f"{type(exc).__name__}: {exc}"}
+        body = {
+            "schemaVersion": 1,
+            "version": _debug_tool_version(),
+            "generated_at": (last or {}).get("generated_at"),
+            "dataset": dataset,
+            "phases": (last or {}).get("phases"),
+            "cache_state": cache_state,
+        }
+        if body["phases"] is None:
+            body["note"] = "tracing_disabled"
+        self._respond_json(200, body)
 
     def _handle_post_settings(self) -> None:
         """Persist a settings update and trigger an immediate SSE broadcast.
