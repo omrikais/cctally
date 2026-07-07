@@ -2889,15 +2889,19 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # (it runs before the wrapper sets CCTALLY_DATA_DIR, so APP_DIR is
         # still cctally-dev at this point). Same rationale class as doctor.
         return
-    if command == "_telemetry-beat":
-        # The detached telemetry worker must not re-enter this hook's
-        # telemetry gate. ``do_telemetry_beat`` now stamps its throttle
-        # marker FIRST on every non-disabled run (arm/grace/sent/failed),
-        # so ``telemetry_beat_due()`` reads False right after a worker run
-        # and the parent gate is already bounded to <=1 spawn/window — but
-        # this early-return stays as belt-and-suspenders (an internal
-        # worker never needs banners or background spawns anyway, and the
-        # guard is independent of the marker-timing behavior).
+    if command in ("_update-check", "_telemetry-beat"):
+        # Both hidden workers are detached and have already done their one job
+        # in their own command handler; neither must re-enter this hook.
+        # Without the guard the ``_update-check`` worker would fall through to
+        # the telemetry gate below and (throttle-bounded) spawn a
+        # ``_telemetry-beat`` — a worker spawning another worker. And
+        # ``do_telemetry_beat`` stamps its throttle marker FIRST on every
+        # non-disabled run (arm/grace/sent/failed), so ``telemetry_beat_due()``
+        # already reads False right after a worker run and the parent gate is
+        # bounded to <=1 spawn/window regardless — this early-return is the
+        # belt-and-suspenders that keeps the two dedicated workers symmetric
+        # and fully hook-free (an internal worker never needs banners or
+        # background spawns anyway).
         return
     # Self-heal: reconcile current_version with the running binary's
     # CHANGELOG. Cheap (one CHANGELOG read, write only on the first
@@ -2922,10 +2926,10 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     enabled, _reason = resolve_telemetry_state(config)
     if enabled and telemetry_beat_due():
         _spawn_background_telemetry_beat()
-    _maybe_print_telemetry_notice(command, args, config)
+    _maybe_print_telemetry_notice(command, config)
 
 
-def _maybe_print_telemetry_notice(command: str | None, args, config) -> None:
+def _maybe_print_telemetry_notice(command: str | None, config) -> None:
     """One-time interactive notice that anonymous install-count telemetry
     is active (spec review finding #2). Banner-gated (NOT beat-gated): it
     prints once to an interactive stderr and, once marked, never again.
@@ -2936,8 +2940,8 @@ def _maybe_print_telemetry_notice(command: str | None, args, config) -> None:
       - telemetry enabled (opt-outs / config / dev-checkout suppress it);
       - not already shown (the ``TELEMETRY_NOTICE_SHOWN`` marker);
       - command not in ``_BANNER_SUPPRESSED_COMMANDS`` — the same quiet
-        set the update banner honours (statusline / hook-tick / etc.), so
-        machine-consumed one-liners stay clean;
+        set the update banner honours (record-usage / hook-tick / blocks /
+        etc.), so machine-consumed one-liners stay clean;
       - stderr is a real TTY — never pollute piped or redirected output.
     """
     try:

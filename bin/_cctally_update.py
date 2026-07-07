@@ -1118,18 +1118,21 @@ def _do_update_check() -> None:
         c._save_update_state(state)
 
 
-def _spawn_background_update_check() -> None:
-    """Fire-and-forget the hidden `_update-check` worker.
+def _spawn_detached(command: str) -> None:
+    """Fire-and-forget a hidden self-subcommand as a detached worker.
 
-    Detached `subprocess.Popen` with `start_new_session=True` so a
-    parent exit (the user closes the shell) doesn't propagate SIGHUP
-    to the child. stdin/stdout/stderr are all `/dev/null` so the child
-    can't accidentally pollute the parent's terminal. Exceptions are
-    swallowed: a failed spawn must not break the parent command.
+    Detached `subprocess.Popen` with `start_new_session=True` so a parent
+    exit (the user closes the shell) doesn't propagate SIGHUP to the child;
+    stdin/stdout/stderr all `/dev/null` so the child can't pollute the
+    parent's terminal; exceptions swallowed so a failed spawn can't break
+    the parent command. Shared launch boilerplate for both dedicated
+    background workers below — `_update-check` and `_telemetry-beat` stay
+    deliberately separate spawns (spec review finding #1) and share only
+    this Popen shape.
     """
     try:
         subprocess.Popen(
-            [sys.executable, os.path.realpath(sys.argv[0]), "_update-check"],
+            [sys.executable, os.path.realpath(sys.argv[0]), command],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1139,6 +1142,11 @@ def _spawn_background_update_check() -> None:
     except Exception:
         # Fire-and-forget: never let a spawn failure propagate.
         pass
+
+
+def _spawn_background_update_check() -> None:
+    """Fire-and-forget the hidden ``_update-check`` worker (spec §3.6)."""
+    _spawn_detached("_update-check")
 
 
 def cmd_update_check_internal(args) -> int:
@@ -1171,26 +1179,11 @@ def _spawn_background_telemetry_beat() -> None:
     """Fire-and-forget the hidden ``_telemetry-beat`` worker.
 
     A DEDICATED detached worker, deliberately separate from
-    ``_update-check`` (spec review finding #1): the anonymous
-    install-count beat must never share a process, throttle marker, or
-    failure mode with the update check. Same detached ``Popen`` shape as
-    ``_spawn_background_update_check`` — ``start_new_session=True`` so a
-    parent exit (the user closes the shell) can't SIGHUP the child, all
-    fds to ``/dev/null`` so the child can't pollute the parent terminal,
-    and exceptions swallowed so a failed spawn never breaks the parent
-    command."""
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.realpath(sys.argv[0]), "_telemetry-beat"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except Exception:
-        # Fire-and-forget: never let a spawn failure propagate.
-        pass
+    ``_update-check`` (spec review finding #1): the anonymous install-count
+    beat must never share a process, throttle marker, or failure mode with
+    the update check. Only the launch boilerplate is shared, via
+    ``_spawn_detached``."""
+    _spawn_detached("_telemetry-beat")
 
 
 def cmd_telemetry_beat_internal(args) -> int:
@@ -1200,9 +1193,10 @@ def cmd_telemetry_beat_internal(args) -> int:
     NOTHING else — critically it must NOT read or write any update-check
     state (spec review finding #1: a dedicated worker fully decoupled
     from ``_update-check``). Always returns 0 so the parent's
-    spawn-and-forget contract holds; ``do_telemetry_beat`` itself never
-    raises, but the try/except is belt-and-suspenders for the
-    ``load_config`` read."""
+    spawn-and-forget contract holds. The try/except wraps both the
+    ``load_config`` read and ``do_telemetry_beat`` (which only guarantees
+    the network POST is swallowed, not that pure helper defects can't
+    raise), and its return value is unused."""
     c = _cctally()
     try:
         config = c.load_config()

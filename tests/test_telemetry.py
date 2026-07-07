@@ -73,10 +73,14 @@ def test_period_is_utc_month(cc):
 
 
 def test_payload_shape(cc, monkeypatch):
-    monkeypatch.setattr(cc, "resolve_client_version", lambda: "1.63.0")
-    monkeypatch.setattr(cc, "resolve_os_family", lambda: "macos")
+    # Patch to values that differ from any real host default so the assertion
+    # proves build_beat_payload reads THROUGH the (re-exported) resolvers
+    # rather than echoing the host — on a macOS runner os="macos" would pass
+    # vacuously.
+    monkeypatch.setattr(cc, "resolve_client_version", lambda: "9.9.9")
+    monkeypatch.setattr(cc, "resolve_os_family", lambda: "windows")
     p = cc.build_beat_payload("11111111-2222-3333-4444-555555555555")
-    assert set(p) == {"t", "v", "os"} and p["v"] == "1.63.0" and p["os"] == "macos"
+    assert set(p) == {"t", "v", "os"} and p["v"] == "9.9.9" and p["os"] == "windows"
 
 
 def test_version_unknown_when_unstamped(cc, monkeypatch):
@@ -242,25 +246,25 @@ def test_internal_worker_does_not_respawn(cc, monkeypatch):
 
 def test_notice_shown_once_on_interactive(cc, monkeypatch, capsys):
     monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
-    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    cc._maybe_print_telemetry_notice("report", {})
     assert "counts anonymous active installs" in capsys.readouterr().err
-    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    cc._maybe_print_telemetry_notice("report", {})
     assert capsys.readouterr().err == ""  # shown once
 
 
 def test_notice_suppressed_when_disabled(cc, monkeypatch, capsys):
     monkeypatch.setenv("DO_NOT_TRACK", "1")
     monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
-    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    cc._maybe_print_telemetry_notice("report", {})
     assert capsys.readouterr().err == ""
     assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()  # not marked
 
 
 def test_notice_suppressed_for_banner_suppressed_command(cc, monkeypatch, capsys):
-    # A quiet command (e.g. statusline) never prints the notice even on a TTY.
+    # A quiet command (e.g. hook-tick) never prints the notice even on a TTY.
     monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
     suppressed = next(iter(cc._BANNER_SUPPRESSED_COMMANDS))
-    cc._maybe_print_telemetry_notice(suppressed, _ns(command=suppressed), {})
+    cc._maybe_print_telemetry_notice(suppressed, {})
     assert capsys.readouterr().err == ""
     assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()  # not marked
 
@@ -268,7 +272,7 @@ def test_notice_suppressed_for_banner_suppressed_command(cc, monkeypatch, capsys
 def test_notice_suppressed_when_not_a_tty(cc, monkeypatch, capsys):
     # Non-interactive stderr (piped/redirected) must stay clean.
     monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: False, raising=False)
-    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    cc._maybe_print_telemetry_notice("report", {})
     assert capsys.readouterr().err == ""
     assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()
 

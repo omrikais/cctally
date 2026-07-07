@@ -105,12 +105,23 @@ def ensure_install_id() -> str:
         return existing
     p.parent.mkdir(parents=True, exist_ok=True)
     iid = str(uuid.uuid4())
-    # Write then chmod 0600 (match the cache-db sidecar-hardening posture).
-    p.write_text(iid + "\n", encoding="utf-8")
+    # Atomically create at 0600 (O_EXCL) rather than write-then-chmod, so the
+    # id file is never briefly world-readable in the umask window. install_id
+    # is a non-secret, resettable UUID that never leaves the machine, but 0600
+    # matches the cache-db sidecar-hardening posture. On a create race the
+    # loser gets FileExistsError and reads the winner's value.
     try:
-        os.chmod(p, 0o600)
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return read_install_id() or iid
     except OSError:
-        pass
+        # Any other open failure: fall back to a best-effort plain write.
+        p.write_text(iid + "\n", encoding="utf-8")
+        return iid
+    try:
+        os.write(fd, (iid + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
     return iid
 
 
