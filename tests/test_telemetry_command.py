@@ -139,6 +139,24 @@ def test_cmd_telemetry_status_is_read_only_never_mints(cc):
     assert not cc._cctally_core.TELEMETRY_INSTALL_ID_PATH.exists()
 
 
+def test_cmd_telemetry_status_writes_no_config(cc):
+    # Fix 2: bare status resolves state from a RAW guarded config read, NOT
+    # load_config() (which auto-creates config.json on a fresh install). On a
+    # fresh isolated APP_DIR neither config.json NOR install_id may appear.
+    assert not cc._cctally_core.CONFIG_PATH.exists()  # precondition: clean
+    assert cc.cmd_telemetry(argparse.Namespace(action=None, json=False)) == 0
+    assert not cc._cctally_core.CONFIG_PATH.exists()  # status wrote nothing
+    assert not cc._cctally_core.TELEMETRY_INSTALL_ID_PATH.exists()
+
+
+def test_cmd_telemetry_status_json_writes_no_config(cc):
+    # Same guarantee on the --json status path.
+    assert not cc._cctally_core.CONFIG_PATH.exists()
+    assert cc.cmd_telemetry(argparse.Namespace(action=None, json=True)) == 0
+    assert not cc._cctally_core.CONFIG_PATH.exists()
+    assert not cc._cctally_core.TELEMETRY_INSTALL_ID_PATH.exists()
+
+
 def test_cmd_telemetry_json_shape(cc, monkeypatch, capsys):
     monkeypatch.setattr(cc, "resolve_client_version", lambda: "1.63.0")
     monkeypatch.setattr(cc, "resolve_os_family", lambda: "macos")

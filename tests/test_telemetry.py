@@ -122,15 +122,39 @@ def test_disabled_never_beats(cc, monkeypatch):
     assert not cc._cctally_core.TELEMETRY_FIRST_SEEN_PATH.exists()
 
 
-def test_beat_throttled_when_recent(cc):
-    # Arm, backdate first-seen past the grace window, then stamp a fresh beat.
-    cc.mark_first_seen()
+def test_beat_attempt_throttles_parent_gate_during_grace(cc):
+    # Fix 1 (touch-first): the arming run stamps the last-beat-ATTEMPT marker,
+    # so the parent spawn gate (telemetry_beat_due) flips to False immediately
+    # and stays False for the whole throttle window. Without this the marker
+    # would be absent all through the 24h grace window and EVERY command would
+    # re-spawn a fresh detached worker.
+    assert cc.telemetry_beat_due() is True  # fresh APP_DIR: gate open
+    assert cc.do_telemetry_beat({}) == "armed"  # arms AND touches the marker
+    assert cc._cctally_core.TELEMETRY_LAST_BEAT_PATH.exists()  # stamped on arm
+    assert cc.telemetry_beat_due() is False  # within window → gate closed
+    within = _future(cc._cctally_core.TELEMETRY_BEAT_THROTTLE_SECONDS - 60)
+    assert cc.telemetry_beat_due(within) is False  # still closed just before
+    after = _future(cc._cctally_core.TELEMETRY_BEAT_THROTTLE_SECONDS + 60)
+    assert cc.telemetry_beat_due(after) is True  # reopens after the window
+
+
+def test_failed_beat_attempt_throttles_parent_gate(cc):
+    # Fix 1 core regression: even when the beat send FAILS (endpoint down /
+    # not yet deployed), the attempt marker is stamped, so the parent gate is
+    # throttled to ≤1 spawn/window. Under the OLD code a "failed" run left the
+    # marker absent and telemetry_beat_due() stayed True → unbounded re-spawn.
+    cc.mark_first_seen()  # arm
+    # Backdate first-seen so the grace window has already elapsed:
     os.utime(
         cc._cctally_core.TELEMETRY_FIRST_SEEN_PATH,
         (time.time() - cc._cctally_core.TELEMETRY_FIRST_BEAT_GRACE_SECONDS - 60,) * 2,
     )
-    cc.touch_last_beat()  # a beat just happened
-    assert cc.do_telemetry_beat({}) == "throttled"
+    assert not cc._cctally_core.TELEMETRY_LAST_BEAT_PATH.exists()  # no attempt yet
+    # Port 1 is unreachable → the POST raises → swallowed as "failed".
+    res = cc.do_telemetry_beat({}, endpoint="http://127.0.0.1:1/beat")
+    assert res == "failed"
+    assert cc._cctally_core.TELEMETRY_LAST_BEAT_PATH.exists()  # attempt stamped
+    assert cc.telemetry_beat_due() is False  # throttled within the window
 
 
 def test_beat_sends_expected_payload(cc, monkeypatch):
@@ -208,9 +232,9 @@ def test_spawn_fires_for_normal_command_when_enabled_and_due(cc, monkeypatch):
 
 def test_internal_worker_does_not_respawn(cc, monkeypatch):
     # The detached `_telemetry-beat` worker must NOT re-trigger the spawn from
-    # its own post-command hook. In grace/failed states telemetry_beat_due()
-    # stays True (last-beat is only stamped on a real send), so without the
-    # early-return guard the worker would fork-bomb.
+    # its own post-command hook. The `_telemetry-beat` early-return guard
+    # enforces this independently of marker timing (belt-and-suspenders now
+    # that touch-first already bounds the parent gate to ≤1 spawn/window).
     calls = _no_real_background(cc, monkeypatch)
     cc._post_command_update_hooks("_telemetry-beat", _ns(command="_telemetry-beat"))
     assert calls == []

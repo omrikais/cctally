@@ -33,7 +33,6 @@ import os
 import platform
 import sys
 import uuid
-import urllib.error
 import urllib.request
 
 
@@ -164,7 +163,13 @@ def _marker_age_seconds(path, now: _dt.datetime | None = None) -> float | None:
 
 
 def telemetry_beat_due(now=None) -> bool:
-    """True when no beat has been sent within the throttle window."""
+    """True when no beat has been *attempted* within the throttle window.
+
+    The last-beat marker records the last beat ATTEMPT (not just the last
+    successful send): ``do_telemetry_beat`` stamps it on every non-disabled
+    run — arm, grace, sent, or failed — so this predicate bounds the parent
+    spawn gate to at most one worker per window regardless of outcome (a
+    network outage / undeployed endpoint can't churn re-spawns)."""
     age = _marker_age_seconds(_core().TELEMETRY_LAST_BEAT_PATH, now)
     return age is None or age >= _core().TELEMETRY_BEAT_THROTTLE_SECONDS
 
@@ -189,7 +194,10 @@ def mark_first_seen(now=None) -> None:
 
 
 def touch_last_beat(now=None) -> None:
-    """Stamp the last-beat marker to now (resets the throttle window)."""
+    """Stamp the last-beat-attempt marker to now (resets the throttle window).
+
+    Called at the top of every non-disabled ``do_telemetry_beat`` run so the
+    marker tracks the last ATTEMPT, not just the last successful send."""
     _touch(_core().TELEMETRY_LAST_BEAT_PATH)
 
 
@@ -206,15 +214,39 @@ def _endpoint() -> str:
 
 
 def do_telemetry_beat(config: dict, *, now=None, endpoint=None) -> str:
-    """Orchestrate arm -> grace -> throttle -> beat. Returns a status string:
+    """Orchestrate arm -> grace -> beat. Returns a status string:
 
     ``disabled:<reason>`` (opt-out), ``armed`` (first eligibility recorded),
-    ``grace`` (still inside the first-beat grace window), ``throttled``
-    (beat sent recently), ``sent`` (POST succeeded), or ``failed`` (network
-    error, swallowed). Never raises."""
+    ``grace`` (still inside the first-beat grace window), ``sent`` (POST
+    succeeded), or ``failed`` (network error, swallowed).
+
+    Throttling to at most one beat per window is enforced at the PARENT
+    spawn gate (``_post_command_update_hooks``), which only spawns this
+    worker when ``telemetry_beat_due()`` is True. To make that bound hold
+    regardless of outcome, the last-beat-attempt marker is stamped FIRST —
+    immediately after the opt-out check, before the arm/grace/send branches
+    (mirroring ``_do_update_check``'s touch-the-marker-first crash-safety
+    pattern). Without this, the marker was stamped only on a successful
+    send, so the parent gate stayed True through the entire 24h grace
+    window and through any sustained outage (e.g. the endpoint not yet
+    deployed) — re-spawning a fresh detached worker on EVERY command,
+    including hot paths (statusline/record-usage/hook-tick).
+
+    Only the network POST is wrapped, so this swallows connection / DNS /
+    HTTP / timeout errors from the beat send (returning ``failed``); it is
+    not a blanket "never raises" — a defect in the pure marker/id helpers
+    would still surface (and the ``_telemetry-beat`` worker wraps the whole
+    call in its own try/except as belt-and-suspenders)."""
     enabled, reason = resolve_telemetry_state(config)
     if not enabled:
         return f"disabled:{reason}"
+    # Stamp the last-beat-attempt marker FIRST (crash-safe, outcome-
+    # independent) so the parent spawn gate is bounded to <=1 worker per
+    # throttle window whether this run arms, waits out grace, sends, or
+    # fails. The internal ``telemetry_beat_due`` re-check that used to sit
+    # below the grace branch is intentionally gone: the marker was just
+    # touched, so it would always read fresh here.
+    touch_last_beat(now)
     # Arm on first eligibility; do NOT beat until the grace window elapses.
     if _marker_age_seconds(_core().TELEMETRY_FIRST_SEEN_PATH) is None:
         mark_first_seen(now)
@@ -222,8 +254,6 @@ def do_telemetry_beat(config: dict, *, now=None, endpoint=None) -> str:
         return "armed"
     if not first_beat_grace_elapsed(now):
         return "grace"
-    if not telemetry_beat_due(now):
-        return "throttled"
     iid = ensure_install_id()
     payload = build_beat_payload(iid, now=now)
     try:
@@ -238,7 +268,8 @@ def do_telemetry_beat(config: dict, *, now=None, endpoint=None) -> str:
         )
         with urllib.request.urlopen(req, timeout=3):
             pass
-        touch_last_beat(now)
+        # NOTE: the marker was already stamped at the top of this function
+        # (touch-first), so no second touch is needed on the success path.
         return "sent"
     except Exception:
         return "failed"  # swallow — telemetry never affects UX
@@ -258,8 +289,10 @@ def cmd_telemetry(args) -> int:
     ``on``/``off`` flip the ``telemetry.enabled`` config key through the real
     ``cmd_config`` setter (its bool validation + atomic write). ``reset`` mints
     a fresh ``install_id``. The bare/status path is strictly READ-ONLY — it
-    resolves the opt-out state and previews the month token WITHOUT ever
-    minting an id (it calls ``read_install_id``, never ``ensure_install_id``).
+    resolves the opt-out state from a RAW guarded ``config.json`` read (NOT
+    ``load_config()``, which would auto-create config.json on a fresh install)
+    and previews the month token WITHOUT ever minting an id (it calls
+    ``read_install_id``, never ``ensure_install_id``). It writes nothing.
     """
     c = _cctally()
     action = getattr(args, "action", None)
@@ -272,9 +305,24 @@ def cmd_telemetry(args) -> int:
         print("telemetry: install id reset")
         return 0
 
-    # bare / status — read-only
-    config = c.load_config()
-    enabled, reason = resolve_telemetry_state(config)
+    # bare / status — strictly read-only. Resolve the opt-out state from a
+    # RAW guarded config read (mirroring _cctally_doctor's telemetry gather),
+    # NOT load_config(): load_config() calls ensure_dirs() and auto-creates
+    # config.json on a fresh install, which would contradict the documented
+    # "strictly read-only" / "never mints an install_id, writes config, or
+    # sends a beat" contract (docs/telemetry.md, docs/commands/telemetry.md).
+    # A missing/corrupt config degrades to `{}` (env/dev precedence still
+    # resolves correctly).
+    raw_config: dict = {}
+    try:
+        cfg_path = _core().CONFIG_PATH
+        if cfg_path.exists():
+            loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw_config = loaded
+    except Exception:
+        raw_config = {}
+    enabled, reason = resolve_telemetry_state(raw_config)
     iid = read_install_id()
     period = current_period()
     token = telemetry_token(iid, period) if iid else None

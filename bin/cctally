@@ -2891,15 +2891,13 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         return
     if command == "_telemetry-beat":
         # The detached telemetry worker must not re-enter this hook's
-        # telemetry gate. Unlike ``_update-check`` (self-limiting: it
-        # refreshes ``last_check_at`` so ``_is_update_check_due`` is
-        # False on re-entry), the beat only stamps its throttle marker on
-        # a SUCCESSFUL send — in the "armed"/"grace"/"failed" states
-        # ``telemetry_beat_due()`` stays True, so without this guard the
-        # worker would spawn another ``_telemetry-beat`` on every run
-        # during the 24h first-beat grace window or a network outage: an
-        # unbounded re-spawn (fork bomb). An internal worker never needs
-        # banners or background spawns anyway.
+        # telemetry gate. ``do_telemetry_beat`` now stamps its throttle
+        # marker FIRST on every non-disabled run (arm/grace/sent/failed),
+        # so ``telemetry_beat_due()`` reads False right after a worker run
+        # and the parent gate is already bounded to <=1 spawn/window — but
+        # this early-return stays as belt-and-suspenders (an internal
+        # worker never needs banners or background spawns anyway, and the
+        # guard is independent of the marker-timing behavior).
         return
     # Self-heal: reconcile current_version with the running binary's
     # CHANGELOG. Cheap (one CHANGELOG read, write only on the first
