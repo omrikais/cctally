@@ -44,6 +44,8 @@ def test_doctor_state_has_required_fields():
         "conv_rollup_sync_in_progress",
         # Preview channel (CCTALLY_CHANNEL=preview): surfaced in install.mode.
         "channel",
+        # Anonymous install-count telemetry (spec 2026-07-07): opt-out state.
+        "telemetry_enabled", "telemetry_reason",
     }
     assert fields == expected, fields ^ expected
 
@@ -890,7 +892,8 @@ def test_safety_update_available_details_omit_suppressed_when_irrelevant():
 def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
-        "install", "hooks", "auth", "db", "data", "pricing", "safety"
+        "install", "hooks", "auth", "db", "data", "pricing", "safety",
+        "telemetry",
     }
 
 
@@ -964,7 +967,10 @@ def test_serialize_json_top_level_shape():
     assert payload["generated_at"].endswith("Z")
     assert payload["cctally_version"] == "1.6.3"
     cat_ids = [c["id"] for c in payload["categories"]]
-    assert cat_ids == ["install", "hooks", "auth", "db", "data", "pricing", "safety"]
+    assert cat_ids == [
+        "install", "hooks", "auth", "db", "data", "pricing", "safety",
+        "telemetry",
+    ]
 
 
 def test_serialize_json_remediation_only_when_not_ok():

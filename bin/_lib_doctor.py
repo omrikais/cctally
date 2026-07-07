@@ -169,6 +169,14 @@ class DoctorState:
     # from the env; surfaced in the install.mode check. Defaulted (placed last)
     # so existing constructors stay valid and the prod path is unchanged.
     channel: str = "prod"
+    # Anonymous install-count telemetry (spec 2026-07-07): the resolved opt-out
+    # state + precedence reason from `resolve_telemetry_state`, computed by
+    # `doctor_gather_state` WITHOUT minting an install_id (read-only H1). Drives
+    # the always-OK `telemetry.state` check — a diagnostic surface, never a
+    # health failure. Defaulted (placed last) so existing constructors stay
+    # valid and default to the enabled (opt-out) posture.
+    telemetry_enabled: bool = True
+    telemetry_reason: str = "enabled"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1178,6 +1186,27 @@ def _check_safety_update_available(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_telemetry(s: DoctorState) -> CheckResult:
+    """Anonymous install-count telemetry opt-out state (spec 2026-07-07).
+
+    A read-only DIAGNOSTIC surface — "is telemetry on, and if off, why" — that
+    is ALWAYS ``ok``, never WARN/FAIL. Being disabled (env kill switch,
+    DO_NOT_TRACK, a dev checkout, or ``telemetry.enabled = false``) is a valid
+    user choice, not a health problem, so this check must never change doctor's
+    severity counts or exit code. The gather layer resolves `enabled`/`reason`
+    via `resolve_telemetry_state` WITHOUT minting an install_id.
+    """
+    enabled = bool(s.telemetry_enabled)
+    reason = s.telemetry_reason
+    return CheckResult(
+        id="telemetry.state", title="State",
+        severity="ok",
+        summary=f"{'enabled' if enabled else 'disabled'} ({reason})",
+        remediation=None,
+        details={"enabled": enabled, "reason": reason},
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1225,6 +1254,9 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("safety.update_state", "_check_safety_update_state"),
         ("safety.update_suppress", "_check_safety_update_suppress"),
         ("safety.update_available", "_check_safety_update_available"),
+    )),
+    ("telemetry", "Telemetry", (
+        ("telemetry.state", "_check_telemetry"),
     )),
 )
 

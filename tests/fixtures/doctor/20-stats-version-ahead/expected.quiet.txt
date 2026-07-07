@@ -18,5 +18,6 @@ Pricing
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
+Telemetry
 
-Summary: 20 OK · 5 WARN · 1 FAIL
+Summary: 21 OK · 5 WARN · 1 FAIL

@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- cctally now sends an anonymous, opt-out install-count beat at most once a day so the project can gauge how many people actually use it. It is deliberately minimal and private: the only thing transmitted is a one-way token that rotates every month (derived from a random local id that never leaves your machine and cannot be recovered from the token), plus the cctally version and a coarse operating-system family (macos/linux/windows/other) — no IP, username, file paths, project names, or usage data. Run `cctally telemetry` to see the current state, why it is on or off, and exactly what would be sent; `cctally telemetry off` disables it (`cctally telemetry on` re-enables), `cctally telemetry reset` rotates your local id, and `cctally doctor` shows a read-only telemetry line. It is also disabled by `CCTALLY_DISABLE_TELEMETRY=1`, the `DO_NOT_TRACK` convention, and automatically in development checkouts.
+
 ## [1.63.0] - 2026-07-07
 
 ### Added

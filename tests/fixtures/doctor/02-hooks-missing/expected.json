@@ -501,6 +501,23 @@
             "id": "safety",
             "severity": "warn",
             "title": "Safety"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "enabled": true,
+                        "reason": "enabled"
+                    },
+                    "id": "telemetry.state",
+                    "severity": "ok",
+                    "summary": "enabled (enabled)",
+                    "title": "State"
+                }
+            ],
+            "id": "telemetry",
+            "severity": "ok",
+            "title": "Telemetry"
         }
     ],
     "cctally_version": "<redacted>",
@@ -508,7 +525,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 18,
+            "ok": 19,
             "warn": 8
         },
         "severity": "warn"

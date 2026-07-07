@@ -16,3 +16,12 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # value so it can't leak into codex-* goldens (the codex harnesses pin HOME
 # to a fake tree whose .codex/sessions the fixtures populate).
 unset CODEX_HOME
+
+# Anonymous install-count telemetry (spec 2026-07-07): the `doctor` report
+# now carries a telemetry-state line whose resolved reason reads these env
+# opt-outs. Neutralize a dev's exported values so a maintainer with
+# DO_NOT_TRACK / CCTALLY_DISABLE_TELEMETRY set in their shell regenerates the
+# same goldens CI produces (both resolve to "enabled" under the suppressed
+# dev-checkout, since the harness also forces CCTALLY_DISABLE_DEV_AUTODETECT).
+unset DO_NOT_TRACK
+unset CCTALLY_DISABLE_TELEMETRY

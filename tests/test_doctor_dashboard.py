@@ -102,7 +102,10 @@ def test_api_doctor_get_returns_full_payload(tmp_path, monkeypatch):
 
     assert payload["schema_version"] == 1
     cats = {c["id"] for c in payload["categories"]}
-    assert cats == {"install", "hooks", "auth", "db", "data", "pricing", "safety"}
+    assert cats == {
+        "install", "hooks", "auth", "db", "data", "pricing", "safety",
+        "telemetry",
+    }
     assert set(payload["overall"]["counts"].keys()) == {"ok", "warn", "fail"}
     assert payload["overall"]["severity"] in {"ok", "warn", "fail"}
     assert payload["generated_at"].endswith("Z")

@@ -40,5 +40,7 @@ Safety
       → Run `cctally update --check` to populate
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
+Telemetry
+  ✓ State                    enabled (enabled)
 
-Summary: 18 OK · 7 WARN · 1 FAIL
+Summary: 19 OK · 7 WARN · 1 FAIL

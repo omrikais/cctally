@@ -416,6 +416,26 @@ def doctor_gather_state(
     except (json.JSONDecodeError, OSError):
         pass
 
+    # ── Telemetry (anonymous install-count, spec 2026-07-07) ─────────
+    # Resolve the opt-out state via the pure kernel predicate — it reads env
+    # + config + the dev-checkout fact and NEVER mints an install_id / touches
+    # any marker (read-only H1 invariant). Uses the same raw config read as the
+    # safety block so doctor never auto-creates config.json; a missing/corrupt
+    # config degrades to `{}` (env/dev precedence still resolves correctly).
+    telemetry_enabled = True
+    telemetry_reason = "enabled"
+    try:
+        raw_tele_cfg: dict = {}
+        if _cctally_core.CONFIG_PATH.exists():
+            loaded = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw_tele_cfg = loaded
+        telemetry_enabled, telemetry_reason = c.resolve_telemetry_state(raw_tele_cfg)
+    except Exception:
+        # Fail-soft: any read/parse/resolution error degrades to the enabled
+        # default (the check renders OK regardless — it never FAILs/WARNs).
+        telemetry_enabled, telemetry_reason = (True, "enabled")
+
     # config.json — RAW READ, never load_config(). load_config()
     # auto-creates on first run AND silently falls back to defaults
     # on corruption — both behaviors would hide diagnostic state
@@ -518,6 +538,10 @@ def doctor_gather_state(
         is_dev_checkout=_cctally_core._is_dev_checkout(),
         # Preview channel (CCTALLY_CHANNEL=preview): surfaced in install.mode.
         channel=("preview" if _cctally_core.is_preview_channel() else "prod"),
+        # Anonymous install-count telemetry (spec 2026-07-07): read-only
+        # opt-out state, resolved above without minting an install_id.
+        telemetry_enabled=telemetry_enabled,
+        telemetry_reason=telemetry_reason,
         # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
         pricing_coverage=pricing_coverage,
         # Conversation-sessions rollup consistency (#217 S1 / U9).

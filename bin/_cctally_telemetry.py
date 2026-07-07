@@ -25,6 +25,7 @@ dev-instance isolation) is honored.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import hashlib
 import json
@@ -241,3 +242,62 @@ def do_telemetry_beat(config: dict, *, now=None, endpoint=None) -> str:
         return "sent"
     except Exception:
         return "failed"  # swallow — telemetry never affects UX
+
+
+def _config_set_ns(key: str, value: str) -> argparse.Namespace:
+    """Synthesize the ``argparse.Namespace`` ``cmd_config``'s ``set`` path
+    consumes (``action``/``key``/``value``/``emit_json``). Routing ``on``/``off``
+    through the real config setter keeps a single validation + locking
+    chokepoint rather than re-implementing the read-modify-write here."""
+    return argparse.Namespace(action="set", key=key, value=value, emit_json=False)
+
+
+def cmd_telemetry(args) -> int:
+    """`cctally telemetry [on|off|reset]` + bare status (`--json`).
+
+    ``on``/``off`` flip the ``telemetry.enabled`` config key through the real
+    ``cmd_config`` setter (its bool validation + atomic write). ``reset`` mints
+    a fresh ``install_id``. The bare/status path is strictly READ-ONLY — it
+    resolves the opt-out state and previews the month token WITHOUT ever
+    minting an id (it calls ``read_install_id``, never ``ensure_install_id``).
+    """
+    c = _cctally()
+    action = getattr(args, "action", None)
+    if action == "off":
+        return c.cmd_config(_config_set_ns("telemetry.enabled", "false"))
+    if action == "on":
+        return c.cmd_config(_config_set_ns("telemetry.enabled", "true"))
+    if action == "reset":
+        reset_install_id()
+        print("telemetry: install id reset")
+        return 0
+
+    # bare / status — read-only
+    config = c.load_config()
+    enabled, reason = resolve_telemetry_state(config)
+    iid = read_install_id()
+    period = current_period()
+    token = telemetry_token(iid, period) if iid else None
+    info = {
+        "enabled": enabled,
+        "reason": reason,
+        "version": c.resolve_client_version(),
+        "os": c.resolve_os_family(),
+        "period": period,
+        "token_preview": token,
+        "fields": ["token", "version", "os"],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(info))
+        return 0
+    print(f"telemetry: {'enabled' if enabled else 'disabled'} ({reason})")
+    print(
+        f"  sends: rotating monthly token + version ({info['version']}) "
+        f"+ os ({info['os']})"
+    )
+    print(f"  token this month: {token or '(not yet armed)'}")
+    print(
+        "  opt out: cctally telemetry off  |  "
+        "CCTALLY_DISABLE_TELEMETRY=1  |  DO_NOT_TRACK=1"
+    )
+    return 0

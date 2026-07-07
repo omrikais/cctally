@@ -1042,6 +1042,7 @@ mark_first_seen = _cctally_telemetry.mark_first_seen
 touch_last_beat = _cctally_telemetry.touch_last_beat
 notice_already_shown = _cctally_telemetry.notice_already_shown
 mark_notice_shown = _cctally_telemetry.mark_notice_shown
+cmd_telemetry = _cctally_telemetry.cmd_telemetry
 
 
 # Phase F #22: ``bin/_cctally_dashboard.py`` is loaded eagerly per spec §4.8

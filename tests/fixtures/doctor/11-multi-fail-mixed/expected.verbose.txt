@@ -107,5 +107,10 @@ Safety
       details:
         current_version: None
         latest_version: None
+Telemetry
+  ✓ State                    enabled (enabled)
+      details:
+        enabled: True
+        reason: enabled
 
-Summary: 15 OK · 8 WARN · 3 FAIL
+Summary: 16 OK · 8 WARN · 3 FAIL

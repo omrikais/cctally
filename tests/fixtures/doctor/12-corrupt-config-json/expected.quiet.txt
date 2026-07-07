@@ -22,5 +22,6 @@ Safety
       → Fix or remove ~/.local/share/cctally/config.json
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
+Telemetry
 
-Summary: 18 OK · 7 WARN · 1 FAIL
+Summary: 19 OK · 7 WARN · 1 FAIL

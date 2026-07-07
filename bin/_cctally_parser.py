@@ -2225,6 +2225,47 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_unset.add_argument("key", help="Config key")
     cfg_unset.set_defaults(func=c.cmd_config)
 
+    # ---- telemetry (anonymous install-count opt-out, spec 2026-07-07) ----
+    tele_p = sub.add_parser(
+        "telemetry",
+        help="Show or change anonymous install-count telemetry",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent("""\
+            Anonymous install-count telemetry: what it sends, and how to opt out.
+
+            cctally sends, at most once a day, a minimal beat: a one-way
+            month-rotating token (never your install id), the client version,
+            and a coarse OS family (macos/linux/windows/other). No IP, no
+            username, no paths, no session content ever leaves the machine.
+
+            Actions:
+              (none)   Show the current state, resolved reason, what gets sent,
+                       and the token that would be used this month.
+              on       Enable telemetry (sets telemetry.enabled = true).
+              off      Disable telemetry (sets telemetry.enabled = false).
+              reset    Discard the local install id and mint a fresh one.
+
+            It is also disabled by CCTALLY_DISABLE_TELEMETRY=1, the DO_NOT_TRACK
+            convention, and in dev checkouts.
+
+            Examples:
+              cctally telemetry
+              cctally telemetry --json
+              cctally telemetry off
+              cctally telemetry on
+              cctally telemetry reset
+        """),
+    )
+    tele_p.add_argument(
+        "action", nargs="?", choices=("on", "off", "reset"),
+        help="on|off|reset (omit to show current status).",
+    )
+    tele_p.add_argument(
+        "--json", dest="json", action="store_true",
+        help="Emit the status as JSON (status output only).",
+    )
+    tele_p.set_defaults(func=c.cmd_telemetry)
+
     # ---- alerts (threshold-actions Task 6) ----
     p_alerts = sub.add_parser(
         "alerts",

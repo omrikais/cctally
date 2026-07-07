@@ -318,6 +318,7 @@ ALLOWED_CONFIG_KEYS = (
     "budget.projects",
     "budget.project_alerts_enabled",
     "budget.codex",
+    "telemetry.enabled",
 )
 
 
@@ -530,6 +531,25 @@ def _config_known_value(config: dict, key: str) -> "object":
         if not isinstance(block, dict):
             block = {}
         stored = block.get("live_tail")
+        if stored is None:
+            return True
+        if isinstance(stored, bool):
+            return stored
+        if isinstance(stored, str):
+            try:
+                return c._normalize_alerts_enabled_value(stored)
+            except ValueError:
+                return True
+        return True
+    if key == "telemetry.enabled":
+        # Boolean opt-OUT (anonymous install-count telemetry, spec 2026-07-07).
+        # Default TRUE — absence is ON. A hand-edited junk value surfaces the
+        # True default. Mirrors dashboard.live_tail exactly, under a top-level
+        # `telemetry` block instead of `dashboard`.
+        block = config.get("telemetry") if isinstance(config, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        stored = block.get("enabled")
         if stored is None:
             return True
         if isinstance(stored, bool):
@@ -1006,6 +1026,40 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"dashboard.live_tail={'true' if canonical else 'false'}")
         return 0
+    if key == "telemetry.enabled":
+        # Anonymous install-count telemetry opt-out (spec 2026-07-07). Mirror
+        # dashboard.live_tail exactly: validate the bool first, then
+        # read-modify-write under config_writer_lock with _load_config_unlocked
+        # (load_config under the lock self-deadlocks). Preserves any sibling
+        # telemetry.* keys. Re-message the shared normalizer's ValueError with
+        # the actual key name.
+        try:
+            canonical = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for telemetry.enabled: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("telemetry")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: telemetry config error: telemetry must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["enabled"] = canonical
+            config["telemetry"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"telemetry": {"enabled": canonical}}, indent=2))
+        else:
+            print(f"telemetry.enabled={'true' if canonical else 'false'}")
+        return 0
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -1408,6 +1462,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block["live_tail"]
                 if not block:
                     config.pop("dashboard", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "telemetry.enabled":
+        # Mirror the dashboard.live_tail unset branch: drop only the enabled
+        # leaf; if the telemetry block ends up empty, drop the parent too.
+        # Unsetting restores the True (opt-out) default at read time.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("telemetry")
+            if isinstance(block, dict) and "enabled" in block:
+                del block["enabled"]
+                if not block:
+                    config.pop("telemetry", None)
                 save_config(config)
             # idempotent: silent on missing key
         return 0

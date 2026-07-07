@@ -39,5 +39,7 @@ Safety
       → `rm ~/.local/share/cctally/update-state.json` (will be regenerated)
   ✓ update-suppress.json     parses cleanly
   ✓ Update available         no
+Telemetry
+  ✓ State                    enabled (enabled)
 
-Summary: 19 OK · 6 WARN · 1 FAIL
+Summary: 20 OK · 6 WARN · 1 FAIL
