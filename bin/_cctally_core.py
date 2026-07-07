@@ -69,6 +69,8 @@ def _init_paths_from_env() -> None:
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
     global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
     global CLAUDE_PROJECTS_DIR
+    global TELEMETRY_INSTALL_ID_PATH, TELEMETRY_LAST_BEAT_PATH
+    global TELEMETRY_NOTICE_SHOWN_PATH, TELEMETRY_FIRST_SEEN_PATH
 
     home = pathlib.Path.home()
 
@@ -123,6 +125,14 @@ def _init_paths_from_env() -> None:
     UPDATE_LOG_PATH = APP_DIR / "update.log"
     UPDATE_LOG_ROTATED_PATH = APP_DIR / "update.log.1"
     UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+
+    # Anonymous install-count telemetry markers (see spec 2026-07-07).
+    # All four derive from APP_DIR and are re-bound here so a redirected
+    # APP_DIR (tests, dev-instance isolation) carries them along.
+    TELEMETRY_INSTALL_ID_PATH = APP_DIR / "install_id"
+    TELEMETRY_LAST_BEAT_PATH = APP_DIR / "telemetry.last-beat"
+    TELEMETRY_NOTICE_SHOWN_PATH = APP_DIR / "telemetry.notice-shown"
+    TELEMETRY_FIRST_SEEN_PATH = APP_DIR / "telemetry.first-seen"
 
     CLAUDE_SETTINGS_PATH = home / ".claude" / "settings.json"
 
@@ -187,6 +197,25 @@ def _real_prod_data_dir() -> pathlib.Path:
 
 
 _init_paths_from_env()
+
+
+# === Telemetry constants (non-path; see spec 2026-07-07) =============
+#
+# These are static (not APP_DIR-derived) so they live outside
+# `_init_paths_from_env()`. The kernel `bin/_cctally_telemetry.py` reads
+# them at call time via its `_core()` accessor.
+#
+# Public, non-secret domain-separation constant folded into the monthly
+# rotating token (SHA-256, truncated to 32 hex). It only namespaces
+# cctally's token from any other consumer of the same install_id — it is
+# NOT a secret and leaking it discloses nothing about the install.
+TELEMETRY_PEPPER = "cctally-install-count-v1"
+# Default beat endpoint; overridable for tests via CCTALLY_TELEMETRY_ENDPOINT.
+TELEMETRY_ENDPOINT_DEFAULT = "https://count.cctally.dev/beat"
+# Send at most one beat per this many seconds (mtime-gated on the beat marker).
+TELEMETRY_BEAT_THROTTLE_SECONDS = 24 * 3600
+# Wait this long after first eligibility before sending the first beat.
+TELEMETRY_FIRST_BEAT_GRACE_SECONDS = 24 * 3600
 
 
 def _resolve_claude_projects_dirs() -> list[pathlib.Path]:

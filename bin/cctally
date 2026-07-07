@@ -214,6 +214,10 @@ make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
 _reset_aware_floor = _cctally_core._reset_aware_floor
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
+# Re-exported so the telemetry kernel's ``c._is_dev_checkout()`` accessor
+# call resolves on the ``cctally`` module (and tests can monkeypatch it
+# there). The canonical definition lives in _cctally_core.
+_is_dev_checkout = _cctally_core._is_dev_checkout
 
 # === Path constants — re-exported from _cctally_core ================
 #
@@ -1007,6 +1011,35 @@ _semver_gt = _cctally_update._semver_gt
 _compute_effective_update_available = _cctally_update._compute_effective_update_available
 _should_show_update_banner = _cctally_update._should_show_update_banner
 _format_update_banner = _cctally_update._format_update_banner
+
+
+# Anonymous install-count telemetry kernel (spec 2026-07-07). Eagerly
+# re-exported so tests reach the pure functions via the ``cctally``
+# namespace (mirroring the ``_check_npm_latest_version`` re-export above)
+# and so the kernel's moved bodies that call ``c.resolve_client_version``
+# / ``c.resolve_os_family`` / ``c._release_read_latest_release_version``
+# through the ``_cctally()`` accessor pick up any test monkeypatch on the
+# cctally module. Path constants (TELEMETRY_INSTALL_ID_PATH etc.) live on
+# _cctally_core and are read via ``_core()`` at call time; tests patch
+# them through ``monkeypatch.setattr(_cctally_core, "X", v)`` (conftest's
+# ``redirect_paths()`` covers the set).
+_cctally_telemetry = _load_sibling("_cctally_telemetry")
+resolve_telemetry_state = _cctally_telemetry.resolve_telemetry_state
+telemetry_token = _cctally_telemetry.telemetry_token
+current_period = _cctally_telemetry.current_period
+resolve_client_version = _cctally_telemetry.resolve_client_version
+resolve_os_family = _cctally_telemetry.resolve_os_family
+build_beat_payload = _cctally_telemetry.build_beat_payload
+read_install_id = _cctally_telemetry.read_install_id
+ensure_install_id = _cctally_telemetry.ensure_install_id
+reset_install_id = _cctally_telemetry.reset_install_id
+do_telemetry_beat = _cctally_telemetry.do_telemetry_beat
+telemetry_beat_due = _cctally_telemetry.telemetry_beat_due
+first_beat_grace_elapsed = _cctally_telemetry.first_beat_grace_elapsed
+mark_first_seen = _cctally_telemetry.mark_first_seen
+touch_last_beat = _cctally_telemetry.touch_last_beat
+notice_already_shown = _cctally_telemetry.notice_already_shown
+mark_notice_shown = _cctally_telemetry.mark_notice_shown
 
 
 # Phase F #22: ``bin/_cctally_dashboard.py`` is loaded eagerly per spec §4.8

@@ -327,6 +327,13 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "UPDATE_LOG_PATH": share / "update.log",
         "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
         "UPDATE_CHECK_LAST_FETCH_PATH": share / "update-check.last-fetch",
+        # Anonymous install-count telemetry markers (spec 2026-07-07). Pinned
+        # here so a beat/arm during a test writes install_id + markers to the
+        # per-test tmp APP_DIR, never the developer's real prod data dir.
+        "TELEMETRY_INSTALL_ID_PATH": share / "install_id",
+        "TELEMETRY_LAST_BEAT_PATH": share / "telemetry.last-beat",
+        "TELEMETRY_NOTICE_SHOWN_PATH": share / "telemetry.notice-shown",
+        "TELEMETRY_FIRST_SEEN_PATH": share / "telemetry.first-seen",
         "CLAUDE_SETTINGS_PATH": tmp_path / ".claude" / "settings.json",
     }
 
