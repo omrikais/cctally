@@ -1,6 +1,7 @@
 .DS_Store
 *.log
 .idea/
+.wrangler/
 __pycache__/
 .worktrees/
 .superpowers/

@@ -6,7 +6,7 @@ It is on by default and designed for the smallest possible data collection. If y
 
 ## What is sent
 
-At most once per day, the client POSTs a single JSON object with exactly three fields to `https://count.cctally.dev/beat`:
+At most once per day, the client POSTs a single JSON object with exactly three fields to `https://cctally-telemetry.cctally.workers.dev/beat`:
 
 | Field | Meaning | Example |
 | --- | --- | --- |
@@ -81,4 +81,4 @@ Because cctally is open source, the token algorithm is public, so a determined p
 
 ## Where the code lives
 
-The client half is `bin/_cctally_telemetry.py` (state resolution, token derivation, the beat, and the `cctally telemetry` command) — stdlib-only, and open in this repository for you to read. The server half is a Cloudflare Worker plus KV; the endpoint is `https://count.cctally.dev/beat`. There is no third-party analytics processor beyond Cloudflare acting as transport.
+The client half is `bin/_cctally_telemetry.py` (state resolution, token derivation, the beat, and the `cctally telemetry` command) — stdlib-only, and open in this repository for you to read. The server half is a Cloudflare Worker plus KV; the endpoint is `https://cctally-telemetry.cctally.workers.dev/beat`. There is no third-party analytics processor beyond Cloudflare acting as transport.

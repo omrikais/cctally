@@ -211,7 +211,7 @@ _init_paths_from_env()
 # NOT a secret and leaking it discloses nothing about the install.
 TELEMETRY_PEPPER = "cctally-install-count-v1"
 # Default beat endpoint; overridable for tests via CCTALLY_TELEMETRY_ENDPOINT.
-TELEMETRY_ENDPOINT_DEFAULT = "https://count.cctally.dev/beat"
+TELEMETRY_ENDPOINT_DEFAULT = "https://cctally-telemetry.cctally.workers.dev/beat"
 # Send at most one beat per this many seconds (mtime-gated on the beat marker).
 TELEMETRY_BEAT_THROTTLE_SECONDS = 24 * 3600
 # Wait this long after first eligibility before sending the first beat.
