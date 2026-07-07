@@ -48,7 +48,7 @@ The precise, defensible claim is narrow on purpose: **the token alone is cryptog
 Retention is by construction, not by a cleanup job:
 
 - Each token is stored with an expiry TTL of about **40 days** (one month plus slack), so every month's tokens auto-evaporate. There is no growing store and no trailing-window counting — counting is always scoped to a single calendar month.
-- A small monthly job snapshots just the **integer counts** (e.g. "July = 512", plus the version/OS breakdown totals) into a durable record, then lets the individual tokens expire. The maintainer keeps the aggregate number forever and keeps **zero per-install data**.
+- A small monthly job snapshots just the **integer active-install count** (e.g. "July = 512") into a durable record, then lets the individual tokens expire. That single number is all the maintainer keeps long-term — **zero per-install data**. The version/OS breakdown is not part of the durable record: it is computed on demand by `/stats` only while that month's tokens are still alive (within the ~40-day window) and is gone once they expire.
 - The maintainer-only `/stats` read endpoint (behind a bearer secret) returns **only aggregate counts** — it never returns raw tokens, so even the authenticated read surface cannot enumerate the membership set.
 
 ## Opting out
