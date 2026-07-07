@@ -73,9 +73,21 @@ class Phase:
 
     def __exit__(self, *exc):
         self.elapsed_ms = (time.perf_counter() - self._start) * 1000.0
-        self._stack.pop()
-        if self._stack:
-            self._stack[-1].children.append(self)
+        # Identity-aware unwind. If a nested phase leaked (its __exit__ was
+        # skipped — e.g. an exception escaped a manually CM-bracketed region),
+        # drop the leaked frames sitting above us so we never append a phase to
+        # its OWN children (which would make to_dict() self-recurse) and never
+        # strand a stack that hides the real root. Pop down to and including
+        # self; if self is not on the stack (double __exit__, or an ancestor
+        # already unwound us), do nothing.
+        stack = self._stack
+        if self not in stack:
+            return False
+        while stack and stack[-1] is not self:
+            stack.pop()               # discard a leaked descendant frame
+        stack.pop()                   # pop self
+        if stack:
+            stack[-1].children.append(self)
         else:
             _tls.root = self          # outermost phase closed -> the build root
         return False

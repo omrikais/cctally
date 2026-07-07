@@ -87,3 +87,26 @@ def test_stash_and_read_last():
     last = perf.last_backend_perf()
     assert last["generation"] == 7
     assert last["phases"]["name"] == "root"
+
+
+def test_leaked_inner_phase_does_not_corrupt_tree():
+    # Regression for the SDD review P1: the sync_cache/snapshot seams open
+    # phases via the raw CM protocol (_p.__enter__()/__exit__()) WITHOUT a
+    # try/finally, so an exception escaping a bracketed region skips the inner
+    # __exit__ and leaks its frame. The outer __exit__ must then NOT append a
+    # phase to its own children (self-reference -> to_dict() RecursionError)
+    # nor strand the stack so the real root is lost.
+    perf = _load_perf()
+    perf.set_enabled(True)
+    perf.reset_thread()
+    outer = perf.phase("outer")
+    outer.__enter__()
+    inner = perf.phase("inner")
+    inner.__enter__()
+    # inner LEAKS: its __exit__ is never called (simulated escaped exception).
+    outer.__exit__(None, None, None)
+    root = perf.current_root()
+    assert root is not None            # old code left the stack non-empty -> None
+    assert root.name == "outer"
+    d = root.to_dict()                 # old code: self-referential -> RecursionError
+    assert "outer" not in [c["name"] for c in d.get("children", [])]
