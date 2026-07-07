@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Opt-in backend performance instrumentation: set `CCTALLY_PERF_TRACE=1` to print a phase-timing trace to stderr on `cache-sync` (and the hidden `tui --render-once` build), and read live backend timings + cache state from the dashboard's loopback-only `/api/debug/backend` endpoint. The trace is off by default and never changes command output — it goes to stderr only, so stdout stays byte-identical. New [docs/backend-performance.md](docs/backend-performance.md) documents the read model, hot paths, and invariants.
+
 ## [1.64.0] - 2026-07-07
 
 ### Added
