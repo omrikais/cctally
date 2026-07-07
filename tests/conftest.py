@@ -187,6 +187,42 @@ def _reset_snapshot_dispatch_state():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_perf_state():
+    """Isolate the opt-in backend-perf collector (#276) between tests.
+
+    ``_lib_perf`` holds two pieces of process-global state: the module
+    ``_ENABLED`` flag and the ``_LAST_BACKEND_PERF`` stash slot. A test that
+    enables tracing and builds a snapshot (e.g. ``test_perf_snapshot``) stashes
+    a completed ``snapshot`` tree into that slot; without a reset the slot then
+    LEAKS into a later same-process test that reads ``last_backend_perf()`` —
+    the ``/api/debug/backend`` shape test asserts ``phases is None`` when
+    tracing is off, and a leaked stash flips it non-null. (It only survived the
+    parallel suite because the two files happened to land on different
+    pytest-xdist workers.) Force the flag off, clear the stash, and clear this
+    thread's in-flight tree before AND after every test. A no-op for the vast
+    majority that never load the module; mirrors ``_reset_snapshot_dispatch_state``.
+    """
+    try:
+        import _lib_perf as _perf  # bin/ is on sys.path (see top)
+    except Exception:
+        _perf = None
+
+    def _reset():
+        if _perf is None:
+            return
+        try:
+            _perf.set_enabled(False)
+            _perf.reset_thread()
+            _perf._LAST_BACKEND_PERF = None
+        except Exception:
+            pass
+
+    _reset()
+    yield
+    _reset()
+
+
 def load_script():
     """Execute the main script and return its globals dict.
 
