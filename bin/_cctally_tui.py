@@ -222,6 +222,11 @@ from _lib_display_tz import (
 )
 from _lib_aggregators import _aggregate_monthly
 from _lib_fmt import stable_sum
+# Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
+# stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
+# shared no-op singleton), so the _tui_build_snapshot seam wraps below cost
+# nothing on the default path.
+import _lib_perf as _perf
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -2092,6 +2097,13 @@ def _tui_build_snapshot(
     """
     import time
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+    # #276 perf: reset any prior tree on this thread, then bracket the whole
+    # snapshot build as the "snapshot" root phase. Opened via the context-
+    # manager protocol so the long body below is not reindented; closed +
+    # stashed at each return. Near-noop when CCTALLY_PERF_TRACE is unset.
+    _perf.reset_thread()
+    _p_snapshot = _perf.phase("snapshot")
+    _p_snapshot.__enter__()
     # Read config ONCE per rebuild and reuse it for the display-tz resolution
     # here AND the envelope precompute below (#268 M4) — the envelope used to
     # call ``load_config()`` twice per SSE client per tick.
@@ -2134,15 +2146,17 @@ def _tui_build_snapshot(
         # builders always read pure regardless (skip_sync is reassigned to
         # True below), so --no-sync means "no ingest, still read".
         do_ingest = not skip_sync
-        if do_ingest:
-            try:
-                cache_conn = _cctally().open_cache_db()
+        with _perf.phase("sync") as _p_sync:
+            _p_sync.set_meta(ingest=do_ingest)
+            if do_ingest:
                 try:
-                    sync_cache(cache_conn)
-                finally:
-                    cache_conn.close()
-            except Exception as exc:
-                errors.append(f"sync-cache: {exc}")
+                    cache_conn = _cctally().open_cache_db()
+                    try:
+                        sync_cache(cache_conn)
+                    finally:
+                        cache_conn.close()
+                except Exception as exc:
+                    errors.append(f"sync-cache: {exc}")
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
@@ -2193,11 +2207,12 @@ def _tui_build_snapshot(
         dispatch_key = None
         if precompute_envelope:
             dispatch_sig = None
-            try:
-                dispatch_sig = _tui_compute_dispatch_signature(conn)
-            except Exception as exc:
-                errors.append(f"dispatch-signature: {exc}")
-                dispatch_sig = None
+            with _perf.phase("signature"):
+                try:
+                    dispatch_sig = _tui_compute_dispatch_signature(conn)
+                except Exception as exc:
+                    errors.append(f"dispatch-signature: {exc}")
+                    dispatch_sig = None
             if dispatch_sig is not None:
                 # The idle decision keys on the DB signature AND a render key
                 # that captures the config-derived inputs the composite
@@ -2220,13 +2235,20 @@ def _tui_build_snapshot(
                         and dispatch_key == prior_key
                         and not _snapshot_period_rolled_over(
                             prior_snap, now_utc, _build_display_tz)):
-                    idle_snap = _tui_build_idle_snapshot(
-                        prior_snap, now_utc=now_utc,
-                        precompute_envelope=precompute_envelope,
-                        runtime_bind=runtime_bind, raw_config=raw_config,
-                        errors=errors,
-                    )
-                    _sc.store_dispatch_state(dispatch_key, idle_snap)
+                    with _perf.phase("idle-decision"):
+                        idle_snap = _tui_build_idle_snapshot(
+                            prior_snap, now_utc=now_utc,
+                            precompute_envelope=precompute_envelope,
+                            runtime_bind=runtime_bind, raw_config=raw_config,
+                            errors=errors,
+                        )
+                        _sc.store_dispatch_state(dispatch_key, idle_snap)
+                    _p_snapshot.__exit__(None, None, None)
+                    if _perf.enabled():
+                        _perf.stash_last(
+                            _perf.current_root(), generation=None,
+                            generated_at=now_utc.isoformat(),
+                        )
                     return idle_snap
                 # ── #269 M3.1: non-idle rebuild — reconcile the shared
                 # per-weekref immutable-cost cache ONCE here (spec §4/§6),
@@ -2241,39 +2263,48 @@ def _tui_build_snapshot(
                 try:
                     _rc_cache_conn = _cctally().open_cache_db()
                     try:
-                        _sc.reconcile_weekref_cache(
-                            _rc_cache_conn,
-                            max_entry_id=dispatch_sig.max_entry_id,
-                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
-                            reset_sig=dispatch_sig.reset_sig,
-                        )
-                        use_weekref_cost_cache = True
+                        with _perf.phase("reconcile.weekref") as _pr:
+                            _pr.set_meta(hit=False)
+                            _sc.reconcile_weekref_cache(
+                                _rc_cache_conn,
+                                max_entry_id=dispatch_sig.max_entry_id,
+                                max_mutation_seq=dispatch_sig.entry_mutation_seq,
+                                reset_sig=dispatch_sig.reset_sig,
+                            )
+                            use_weekref_cost_cache = True
+                            _pr.set_meta(hit=True)
                         # #269 M4.5: reconcile the projects-envelope cache with
                         # the SAME short-lived cache conn (session_files_sig +
                         # the new-entry watermark both live in cache.db). Only
                         # after this succeeds does `_build_projects_envelope`
                         # opt into the cache below.
-                        _sc.reconcile_projects_env_cache(
-                            _rc_cache_conn,
-                            max_entry_id=dispatch_sig.max_entry_id,
-                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
-                            max_wus_id=dispatch_sig.max_wus_id,
-                            sf_sig=_sc.session_files_sig(_rc_cache_conn),
-                        )
-                        use_projects_env_cache = True
+                        with _perf.phase("reconcile.projects_env") as _pr:
+                            _pr.set_meta(hit=False)
+                            _sc.reconcile_projects_env_cache(
+                                _rc_cache_conn,
+                                max_entry_id=dispatch_sig.max_entry_id,
+                                max_mutation_seq=dispatch_sig.entry_mutation_seq,
+                                max_wus_id=dispatch_sig.max_wus_id,
+                                sf_sig=_sc.session_files_sig(_rc_cache_conn),
+                            )
+                            use_projects_env_cache = True
+                            _pr.set_meta(hit=True)
                         # #271 M3: reconcile the Bug-K pre-credit segment cache
                         # with the SAME short-lived cache conn (its watermark
                         # query lives in cache.db), using the dispatch-signature
                         # legs already computed. Only after this succeeds does
                         # `_dashboard_build_weekly_periods` opt into the cache
                         # below (`use_bugk_segment_cache=True`).
-                        _sc.reconcile_bugk_cache(
-                            _rc_cache_conn,
-                            max_entry_id=dispatch_sig.max_entry_id,
-                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
-                            reset_sig=dispatch_sig.reset_sig,
-                        )
-                        use_bugk_segment_cache = True
+                        with _perf.phase("reconcile.bugk") as _pr:
+                            _pr.set_meta(hit=False)
+                            _sc.reconcile_bugk_cache(
+                                _rc_cache_conn,
+                                max_entry_id=dispatch_sig.max_entry_id,
+                                max_mutation_seq=dispatch_sig.entry_mutation_seq,
+                                reset_sig=dispatch_sig.reset_sig,
+                            )
+                            use_bugk_segment_cache = True
+                            _pr.set_meta(hit=True)
                         # #272: reconcile the cache-report per-day cache with the
                         # SAME short-lived cache conn (its watermark query +
                         # session_files_sig both live in cache.db), using the
@@ -2282,79 +2313,87 @@ def _tui_build_snapshot(
                         # `tz_key` full-clears on a display-tz change (every
                         # calendar-day key shifts). Only after this succeeds does
                         # `build_cache_report_snapshot` opt into the cache below.
-                        _sc.reconcile_cache_report_cache(
-                            _rc_cache_conn,
-                            max_entry_id=dispatch_sig.max_entry_id,
-                            max_mutation_seq=dispatch_sig.entry_mutation_seq,
-                            reset_sig=dispatch_sig.reset_sig,
-                            sf_sig=_sc.session_files_sig(_rc_cache_conn),
-                            # `_load_sibling` is the canonical idempotent
-                            # sibling-access idiom (it returns the already-loaded
-                            # cctally-bound kernel instance). `_lib_cache_report`
-                            # is loaded eagerly at import (bin/cctally), so this
-                            # is a plain re-fetch of a populated `sys.modules`
-                            # entry — NOT a first-tick KeyError guard.
-                            bucket_tz=_cctally()._load_sibling(
-                                "_lib_cache_report"
-                            )._resolve_bucket_tz(_build_display_tz),
-                            tz_key=str(_build_display_tz),
-                        )
-                        use_cache_report_cache = True
+                        with _perf.phase("reconcile.cache_report") as _pr:
+                            _pr.set_meta(hit=False)
+                            _sc.reconcile_cache_report_cache(
+                                _rc_cache_conn,
+                                max_entry_id=dispatch_sig.max_entry_id,
+                                max_mutation_seq=dispatch_sig.entry_mutation_seq,
+                                reset_sig=dispatch_sig.reset_sig,
+                                sf_sig=_sc.session_files_sig(_rc_cache_conn),
+                                # `_load_sibling` is the canonical idempotent
+                                # sibling-access idiom (it returns the already-loaded
+                                # cctally-bound kernel instance). `_lib_cache_report`
+                                # is loaded eagerly at import (bin/cctally), so this
+                                # is a plain re-fetch of a populated `sys.modules`
+                                # entry — NOT a first-tick KeyError guard.
+                                bucket_tz=_cctally()._load_sibling(
+                                    "_lib_cache_report"
+                                )._resolve_bucket_tz(_build_display_tz),
+                                tz_key=str(_build_display_tz),
+                            )
+                            use_cache_report_cache = True
+                            _pr.set_meta(hit=True)
                     finally:
                         _rc_cache_conn.close()
                 except Exception as exc:
                     errors.append(f"snapshot-cache-reconcile: {exc}")
-        try:
-            cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
-        except Exception as exc:
-            errors.append(f"current-week: {exc}")
+        with _perf.phase("build.current_week"):
+            try:
+                cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
+            except Exception as exc:
+                errors.append(f"current-week: {exc}")
         fc_view = None
-        try:
-            # Issue #57: build the ForecastView once so we capture both
-            # the legacy ``ForecastOutput`` (for ``snap.forecast``, which
-            # the many TUI panel consumers still read) and the surface
-            # fields the envelope adapter used to re-derive inline.
-            fc_view = _tui_build_forecast_view(
-                conn, now_utc, skip_sync=skip_sync,
-                use_weekref_cost_cache=use_weekref_cost_cache,
-            )
-            fc = fc_view.output if fc_view is not None else None
-        except Exception as exc:
-            errors.append(f"forecast: {exc}")
+        with _perf.phase("build.forecast"):
+            try:
+                # Issue #57: build the ForecastView once so we capture both
+                # the legacy ``ForecastOutput`` (for ``snap.forecast``, which
+                # the many TUI panel consumers still read) and the surface
+                # fields the envelope adapter used to re-derive inline.
+                fc_view = _tui_build_forecast_view(
+                    conn, now_utc, skip_sync=skip_sync,
+                    use_weekref_cost_cache=use_weekref_cost_cache,
+                )
+                fc = fc_view.output if fc_view is not None else None
+            except Exception as exc:
+                errors.append(f"forecast: {exc}")
         # Trend: source from build_trend_view so we capture the 3-sample
         # avg_dollars_per_pct alongside the rows. The TUI build path
         # historically called _tui_build_trend (which now wraps the
         # builder); calling the builder directly here saves one
         # `_aggregate_*` round-trip.
         trend_avg_dpp = None
-        try:
-            c = _cctally()
-            _trend_view = c.build_trend_view(
-                conn, now_utc=now_utc, n=8, display_tz=_build_display_tz,
-                skip_sync=skip_sync,
-                use_weekref_cost_cache=use_weekref_cost_cache,
-            )
-            trend = list(_trend_view.rows)
-            trend_avg_dpp = _trend_view.avg_dollars_per_pct
-        except Exception as exc:
-            errors.append(f"trend: {exc}")
-        try:
-            # The sessions aggregator goes through
-            # `get_claude_session_entries`, which runs `sync_cache` unless
-            # `skip_sync=True` is threaded through. Honor the caller's
-            # intent so `--no-sync` and the initial cache-only paint
-            # both avoid ingest latency/lock contention.
-            sessions = _tui_build_sessions(
-                now_utc, skip_sync=skip_sync, use_session_cache=True,
-            )
-        except Exception as exc:
-            errors.append(f"sessions: {exc}")
+        with _perf.phase("build.trend"):
+            try:
+                c = _cctally()
+                _trend_view = c.build_trend_view(
+                    conn, now_utc=now_utc, n=8, display_tz=_build_display_tz,
+                    skip_sync=skip_sync,
+                    use_weekref_cost_cache=use_weekref_cost_cache,
+                )
+                trend = list(_trend_view.rows)
+                trend_avg_dpp = _trend_view.avg_dollars_per_pct
+            except Exception as exc:
+                errors.append(f"trend: {exc}")
+        with _perf.phase("build.sessions"):
+            try:
+                # The sessions aggregator goes through
+                # `get_claude_session_entries`, which runs `sync_cache` unless
+                # `skip_sync=True` is threaded through. Honor the caller's
+                # intent so `--no-sync` and the initial cache-only paint
+                # both avoid ingest latency/lock contention.
+                sessions = _tui_build_sessions(
+                    now_utc, skip_sync=skip_sync, use_session_cache=True,
+                )
+            except Exception as exc:
+                errors.append(f"sessions: {exc}")
         # ---- v2 additions ----
-        try:
-            if cw is not None:
-                milestones = _tui_build_percent_milestones(conn)
-        except Exception as exc:
-            errors.append(f"milestones: {exc}")
+        with _perf.phase("build.milestones"):
+            try:
+                if cw is not None:
+                    milestones = _tui_build_percent_milestones(conn)
+            except Exception as exc:
+                errors.append(f"milestones: {exc}")
         history: list = []
         history_median_dpp: "float | None" = None
         try:
@@ -2386,23 +2425,24 @@ def _tui_build_snapshot(
         # ``test_weekly_envelope_total_matches_sum_of_visible_rows``.
         weekly_total_cost_usd = 0.0
         weekly_total_tokens = 0
-        try:
-            weekly_periods = _dashboard_build_weekly_periods(
-                conn, now_utc, n=12, skip_sync=skip_sync,
-                use_group_a_cache=True,
-                use_bugk_segment_cache=use_bugk_segment_cache,
-            )
-            # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
-            # so the envelope stays byte-stable with the pre-fix ``0.0`` shape
-            # (the dashboard fixture goldens assert exact JSON match).
-            weekly_total_cost_usd = stable_sum(
-                r.cost_usd for r in weekly_periods
-            )
-            weekly_total_tokens = sum(
-                (r.total_tokens for r in weekly_periods), 0,
-            )
-        except Exception as exc:
-            errors.append(f"weekly-periods: {exc}")
+        with _perf.phase("build.weekly_periods"):
+            try:
+                weekly_periods = _dashboard_build_weekly_periods(
+                    conn, now_utc, n=12, skip_sync=skip_sync,
+                    use_group_a_cache=True,
+                    use_bugk_segment_cache=use_bugk_segment_cache,
+                )
+                # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
+                # so the envelope stays byte-stable with the pre-fix ``0.0`` shape
+                # (the dashboard fixture goldens assert exact JSON match).
+                weekly_total_cost_usd = stable_sum(
+                    r.cost_usd for r in weekly_periods
+                )
+                weekly_total_tokens = sum(
+                    (r.total_tokens for r in weekly_periods), 0,
+                )
+            except Exception as exc:
+                errors.append(f"weekly-periods: {exc}")
         # Sync-thread view-model totals (spec §6.6): sum-over-visible-rows
         # (same invariant as weekly above). Monthly has no Bug-K analogue,
         # but coupling the footer total to the panel-row source of truth
@@ -2410,20 +2450,21 @@ def _tui_build_snapshot(
         # same arithmetic with no behavioral upside.
         monthly_total_cost_usd = 0.0
         monthly_total_tokens = 0
-        try:
-            monthly_periods = _dashboard_build_monthly_periods(
-                conn, now_utc, n=12, skip_sync=skip_sync,
-                use_group_a_cache=True,
-                display_tz=_build_display_tz,
-            )
-            monthly_total_cost_usd = stable_sum(
-                r.cost_usd for r in monthly_periods
-            )
-            monthly_total_tokens = sum(
-                (r.total_tokens for r in monthly_periods), 0,
-            )
-        except Exception as exc:
-            errors.append(f"monthly-periods: {exc}")
+        with _perf.phase("build.monthly_periods"):
+            try:
+                monthly_periods = _dashboard_build_monthly_periods(
+                    conn, now_utc, n=12, skip_sync=skip_sync,
+                    use_group_a_cache=True,
+                    display_tz=_build_display_tz,
+                )
+                monthly_total_cost_usd = stable_sum(
+                    r.cost_usd for r in monthly_periods
+                )
+                monthly_total_tokens = sum(
+                    (r.total_tokens for r in monthly_periods), 0,
+                )
+            except Exception as exc:
+                errors.append(f"monthly-periods: {exc}")
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
         # Issue #56: build the BlocksView once and read both rows
         # (presentation) and totals (envelope scalars) from the same
@@ -2504,6 +2545,11 @@ def _tui_build_snapshot(
         # all three tables. ATTACH/DETACH is cheap and scoped to this
         # sub-build; no schema migration / lock acquisition is needed.
         projects_envelope_block: dict | None = None
+        # #276 perf: time the projects-envelope build (ATTACH + walk + DETACH).
+        # CM protocol, not a ``with`` block, to avoid reindenting the ~40-line
+        # try/except/finally; the broad except + finally guarantee no escape.
+        _p_pe = _perf.phase("build.projects_envelope")
+        _p_pe.__enter__()
         try:
             c = _cctally()
             cache_db_path = _cctally_core.CACHE_DB_PATH
@@ -2545,6 +2591,7 @@ def _tui_build_snapshot(
                 conn.execute("DETACH DATABASE cache_db")
             except Exception:
                 pass
+        _p_pe.__exit__(None, None, None)
         # Late-bind disambiguated `project_key` onto each SessionsPanel
         # row so the SessionsPanel → ProjectsModal cross-nav (spec §4.1)
         # routes by the same identity the Projects envelope emits.
@@ -2639,18 +2686,20 @@ def _tui_build_snapshot(
         doctor_payload_block: "dict | None" = None
         envelope_precompute_block: "dict | None" = None
         if precompute_envelope:
-            try:
-                doctor_payload_block = _tui_precompute_doctor_payload(
-                    now_utc, runtime_bind,
-                )
-            except Exception as exc:
-                errors.append(f"doctor-precompute: {exc}")
-            try:
-                envelope_precompute_block = _tui_precompute_envelope_config(
-                    raw_config,
-                )
-            except Exception as exc:
-                errors.append(f"envelope-precompute: {exc}")
+            with _perf.phase("doctor"):
+                try:
+                    doctor_payload_block = _tui_precompute_doctor_payload(
+                        now_utc, runtime_bind,
+                    )
+                except Exception as exc:
+                    errors.append(f"doctor-precompute: {exc}")
+            with _perf.phase("envelope.precompute"):
+                try:
+                    envelope_precompute_block = _tui_precompute_envelope_config(
+                        raw_config,
+                    )
+                except Exception as exc:
+                    errors.append(f"envelope-precompute: {exc}")
 
         snap = DataSnapshot(
             current_week=cw,
@@ -2691,6 +2740,16 @@ def _tui_build_snapshot(
         if precompute_envelope and dispatch_key is not None:
             _cctally()._load_sibling("_lib_snapshot_cache").store_dispatch_state(
                 dispatch_key, snap,
+            )
+        # #276 perf: close the "snapshot" root and freeze the completed tree
+        # into the process-global slot for the loopback /api/debug/backend
+        # endpoint. Whole-dict atomic assignment; never mutated after. No-op
+        # when tracing is off.
+        _p_snapshot.__exit__(None, None, None)
+        if _perf.enabled():
+            _perf.stash_last(
+                _perf.current_root(), generation=None,
+                generated_at=now_utc.isoformat(),
             )
         return snap
     finally:
@@ -5500,6 +5559,10 @@ def _tui_render_once(
             )
         except Exception:
             snap = _tui_empty_snapshot(now_utc)
+        # #276 perf: flush the snapshot phase tree to stderr when tracing is on
+        # (the rendered frame still goes to stdout only). No-op when off.
+        if _perf.enabled():
+            _perf.flush_stderr(_perf.current_root())
 
     # --- Render -----------------------------------------------------------
     # Drift guards run at module import + inside _tui_build_theme itself,
