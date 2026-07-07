@@ -72,7 +72,14 @@ trap cleanup_scratch EXIT INT TERM
 
 # Discover every scenario directory under FIX_DIR (any subdir with an
 # args.txt). Sorted lexicographically for deterministic output ordering.
-mapfile -t SCENARIOS < <(
+# NOTE: a portable `while read` loop, NOT `mapfile`/`readarray` — those are
+# bash 4+ builtins and this harness runs under `#!/usr/bin/env bash`, which
+# on stock macOS resolves to /bin/bash 3.2. Process substitution keeps the
+# loop in the current shell so the `+=` appends persist.
+SCENARIOS=()
+while IFS= read -r _scn; do
+    SCENARIOS+=("$_scn")
+done < <(
     for d in "$FIX_DIR"/*/; do
         [ -f "${d}args.txt" ] || continue
         basename "${d%/}"
