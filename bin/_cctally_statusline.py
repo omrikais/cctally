@@ -218,6 +218,14 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         )
         ext_on = True
 
+    usage_only = _resolve(args.usage_only, "usage_only", False)
+    if not isinstance(usage_only, bool):
+        warn_once(
+            f"cctally statusline: invalid statusline.usage_only="
+            f"{usage_only!r}; using False"
+        )
+        usage_only = False
+
     tz_name = _resolve_statusline_tz(getattr(args, "timezone", None), cfg, warn_once)
 
     # Color: explicit CLI > NO_COLOR env > TTY detect.
@@ -232,6 +240,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         context_low_threshold=int(args.context_low_threshold),
         context_medium_threshold=int(args.context_medium_threshold),
         cctally_extensions=bool(ext_on),
+        usage_only=bool(usage_only),
         color=bool(color),
         display_tz_name=tz_name,
         debug=bool(args.debug),
@@ -633,5 +642,4 @@ def _build_statusline_injections(warn_once):
         context_pct=_context_pct,
         warn_once=warn_once,
     )
-
 

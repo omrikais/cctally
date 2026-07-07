@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `cctally statusline --usage-only` renders just the subscription usage chip (`5h X% · 7d Y%`), dropping the model, cost, burn-rate, context, and reset-countdown segments — for users who want a small quota indicator in their prompt without the cost telemetry. Persist it with `cctally config set statusline.usage_only true`; `--no-usage-only` forces the full statusline when the config key is on. Contributed by @nathanm4 (public PR #3).
+
 ## [1.62.0] - 2026-07-06
 
 ### Changed
