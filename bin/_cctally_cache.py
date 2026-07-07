@@ -176,6 +176,12 @@ _should_replace = _lib_jsonl._should_replace
 _lib_conversation = _load_lib("_lib_conversation")
 _iter_message_rows = _lib_conversation.iter_message_rows
 
+# Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
+# stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
+# shared no-op singleton), so the sync_cache seam wraps below cost nothing on
+# the default path.
+_perf = _load_lib("_lib_perf")
+
 # Shared by the fused per-file walk AND backfill_conversation_messages so the
 # column list, placeholders, and tuple order live in ONE place — a column
 # add/reorder can't silently desync the two ingest paths (which would land
@@ -857,7 +863,10 @@ def sync_cache(
 
     lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
     try:
-        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+        with _perf.phase("flock") as _p_flock:
+            _acquired = _acquire_cache_flock(lock_fh, timeout=lock_timeout)
+            _p_flock.set_meta(contended=not _acquired)
+        if not _acquired:
             eprint("[cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
@@ -1044,6 +1053,12 @@ def sync_cache(
         # path, which already cleared the flag and repopulates via the normal
         # walk). A path-less/:memory: conn has no cache_meta only if the schema
         # was never applied; the try/except tolerates that.
+        # #276 perf: bracket the (rare, upgrade-only) backfill/reingest region
+        # as one coarse "backfills" phase. Opened via the context-manager
+        # protocol rather than a ``with`` block so the ~150-line body below is
+        # not reindented. Near-noop when tracing is off (_NULL_PHASE).
+        _p_backfills = _perf.phase("backfills")
+        _p_backfills.__enter__()
         if not rebuild and not targeted:
             try:
                 _pending = conn.execute(
@@ -1191,12 +1206,15 @@ def sync_cache(
             # IGNORE). Touches ONLY conversation_file_touches, never
             # conversation_messages (P1-2).
             _consume_file_touches(conn)
+        _p_backfills.__exit__(None, None, None)
 
-        if targeted:
-            paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
-        else:
-            paths = list(_iter_claude_jsonl_files())
-        stats.files_total = len(paths)
+        with _perf.phase("discover") as _p_disc:
+            if targeted:
+                paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
+            else:
+                paths = list(_iter_claude_jsonl_files())
+            stats.files_total = len(paths)
+            _p_disc.set_count(len(paths))
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
@@ -1406,6 +1424,12 @@ def sync_cache(
         # zero-write-lock read/parse region, so it adds no DML there.
         touched_sessions: set = set()
 
+        # #276 perf: bracket the fused per-file ingest loop as ONE coarse
+        # "walk" phase (never per-row — Section 2 rule: volume is a count, not
+        # N timed phases). Opened via the context-manager protocol so the hot
+        # loop body below is not reindented; counts recorded after the loop.
+        _p_walk = _perf.phase("walk")
+        _p_walk.__enter__()
         for jp in paths:
             path_str = str(jp)
             # Backfill session_id/project_path for A2 `session` subcommand.
@@ -1683,6 +1707,13 @@ def sync_cache(
 
         if progress is not None:
             progress(stats)
+        _p_walk.__exit__(None, None, None)
+        _p_walk.set_count(stats.files_processed)
+        _p_walk.set_meta(
+            skipped=stats.files_skipped_unchanged,
+            failed=stats.files_failed,
+            rows=stats.rows_changed,
+        )
 
         # Browse-rail rollup maintenance (single post-walk recompute, under the
         # still-held flock, after every per-file commit and before the
@@ -1698,16 +1729,17 @@ def sync_cache(
         # ~1 session/tick). Both recomputes derive COUNT/MIN/MAX from the same
         # rows the rail's old live aggregate read, so the rollup stays
         # byte-identical to that aggregate.
-        if _conversation_sessions_backfill_pending(conn):
-            _recompute_conversation_sessions(conn)
-            conn.execute(
-                "DELETE FROM cache_meta "
-                "WHERE key='conversation_sessions_backfill_pending'"
-            )
-            conn.commit()
-        elif touched_sessions:
-            _recompute_conversation_sessions(conn, touched_sessions)
-            conn.commit()
+        with _perf.phase("recompute.conversation_sessions"):
+            if _conversation_sessions_backfill_pending(conn):
+                _recompute_conversation_sessions(conn)
+                conn.execute(
+                    "DELETE FROM cache_meta "
+                    "WHERE key='conversation_sessions_backfill_pending'"
+                )
+                conn.commit()
+            elif touched_sessions:
+                _recompute_conversation_sessions(conn, touched_sessions)
+                conn.commit()
 
         # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
         # held fcntl lock, before the finally-unlock. Only when the entire walk
@@ -3370,6 +3402,10 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     default is 'all'.
     """
     source = getattr(args, "source", "all")
+    # #276 perf: clear any prior tree on this thread so a leaked root can't be
+    # flushed, then (below) time the Claude sync_cache call as the "sync_cache"
+    # root phase and flush the tree to stderr when CCTALLY_PERF_TRACE is set.
+    _perf.reset_thread()
     conn = open_cache_db()
 
     # --prune-orphans: fast, targeted cleanup of cache rows whose source
@@ -3419,9 +3455,10 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     contended = False
 
     if source in ("claude", "all"):
-        stats = sync_cache(
-            conn, progress=_progress_stderr, rebuild=args.rebuild, lock_timeout=lt
-        )
+        with _perf.phase("sync_cache"):
+            stats = sync_cache(
+                conn, progress=_progress_stderr, rebuild=args.rebuild, lock_timeout=lt
+            )
         _progress_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
@@ -3456,4 +3493,8 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.rows_changed} rows changed"
             )
 
+    # #276 perf: when tracing is enabled, flush the completed "sync_cache"
+    # phase tree to stderr (stdout stays byte-identical). No-op when off.
+    if _perf.enabled():
+        _perf.flush_stderr(_perf.current_root())
     return 1 if contended else 0
