@@ -6,6 +6,7 @@ helper so ``_cctally_core``'s path constants — including the four
 ``TELEMETRY_*`` markers — point at a per-test tmp APP_DIR, never the
 developer's real prod data dir (the HOME-only-loader-reads-prod gotcha).
 """
+import argparse
 import datetime as dt
 import os
 import sys
@@ -14,6 +15,11 @@ import time
 import pytest
 
 from conftest import load_isolated_cctally_module
+
+
+def _ns(**kw):
+    """Minimal argparse.Namespace factory for the post-command hooks."""
+    return argparse.Namespace(**kw)
 
 
 @pytest.fixture
@@ -159,3 +165,98 @@ def test_beat_sends_expected_payload(cc, monkeypatch):
     srv.shutdown()
     assert set(captured) == {"t", "v", "os"} and captured["v"] == "1.63.0"
     assert captured["os"] == "linux"
+
+
+# ---- client wiring: spawn gate + notice (Task 2) ---------------------------
+
+
+def _no_real_background(cc, monkeypatch):
+    """Neutralise the update-check side of ``_post_command_update_hooks`` so
+    a call exercises only the telemetry gate — no detached process is spawned
+    and the update-due branch is inert. Returns the telemetry-spawn recorder."""
+    calls = []
+    monkeypatch.setattr(cc, "_spawn_background_telemetry_beat", lambda: calls.append(1))
+    monkeypatch.setattr(cc, "_spawn_background_update_check", lambda: None)
+    monkeypatch.setattr(cc, "_is_update_check_due", lambda cfg: False)
+    return calls
+
+
+def test_spawn_skipped_for_side_effect_unsafe_commands(cc, monkeypatch):
+    # `doctor` early-returns at the TOP of _post_command_update_hooks, so the
+    # telemetry gate at the bottom is never reached (inherited skip).
+    calls = _no_real_background(cc, monkeypatch)
+    cc._post_command_update_hooks("doctor", _ns(command="doctor"))
+    assert calls == []
+
+
+def test_env_kill_switch_blocks_spawn(cc, monkeypatch):
+    monkeypatch.setenv("CCTALLY_DISABLE_TELEMETRY", "1")
+    calls = _no_real_background(cc, monkeypatch)
+    cc._post_command_update_hooks("report", _ns(command="report"))
+    assert calls == []
+
+
+def test_spawn_fires_for_normal_command_when_enabled_and_due(cc, monkeypatch):
+    # Positive / non-vacuity case: a normal reporting command DOES spawn the
+    # beat when telemetry is enabled (cc fixture forces _is_dev_checkout ->
+    # False) and no beat has run yet (fresh tmp APP_DIR -> beat_due True).
+    calls = _no_real_background(cc, monkeypatch)
+    assert cc.telemetry_beat_due() is True  # precondition
+    cc._post_command_update_hooks("report", _ns(command="report"))
+    assert calls == [1]
+
+
+def test_internal_worker_does_not_respawn(cc, monkeypatch):
+    # The detached `_telemetry-beat` worker must NOT re-trigger the spawn from
+    # its own post-command hook. In grace/failed states telemetry_beat_due()
+    # stays True (last-beat is only stamped on a real send), so without the
+    # early-return guard the worker would fork-bomb.
+    calls = _no_real_background(cc, monkeypatch)
+    cc._post_command_update_hooks("_telemetry-beat", _ns(command="_telemetry-beat"))
+    assert calls == []
+
+
+def test_notice_shown_once_on_interactive(cc, monkeypatch, capsys):
+    monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
+    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    assert "counts anonymous active installs" in capsys.readouterr().err
+    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    assert capsys.readouterr().err == ""  # shown once
+
+
+def test_notice_suppressed_when_disabled(cc, monkeypatch, capsys):
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
+    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    assert capsys.readouterr().err == ""
+    assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()  # not marked
+
+
+def test_notice_suppressed_for_banner_suppressed_command(cc, monkeypatch, capsys):
+    # A quiet command (e.g. statusline) never prints the notice even on a TTY.
+    monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: True, raising=False)
+    suppressed = next(iter(cc._BANNER_SUPPRESSED_COMMANDS))
+    cc._maybe_print_telemetry_notice(suppressed, _ns(command=suppressed), {})
+    assert capsys.readouterr().err == ""
+    assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()  # not marked
+
+
+def test_notice_suppressed_when_not_a_tty(cc, monkeypatch, capsys):
+    # Non-interactive stderr (piped/redirected) must stay clean.
+    monkeypatch.setattr(cc.sys.stderr, "isatty", lambda: False, raising=False)
+    cc._maybe_print_telemetry_notice("report", _ns(command="report"), {})
+    assert capsys.readouterr().err == ""
+    assert not cc._cctally_core.TELEMETRY_NOTICE_SHOWN_PATH.exists()
+
+
+def test_cmd_telemetry_beat_internal_beats_and_returns_zero(cc, monkeypatch):
+    # The worker invokes do_telemetry_beat(load_config()) and returns 0
+    # WITHOUT touching any update-check state (dedicated-worker contract).
+    beats = []
+    update_touches = []
+    monkeypatch.setattr(cc, "do_telemetry_beat", lambda config, **kw: beats.append(config) or "armed")
+    monkeypatch.setattr(cc, "_do_update_check", lambda: update_touches.append(1))
+    rc = cc.cmd_telemetry_beat_internal(_ns(command="_telemetry-beat"))
+    assert rc == 0
+    assert len(beats) == 1  # beat invoked once, with the loaded config
+    assert update_touches == []  # update-check state never touched

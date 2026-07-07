@@ -1167,6 +1167,51 @@ def cmd_update_check_internal(args) -> int:
     return 0
 
 
+def _spawn_background_telemetry_beat() -> None:
+    """Fire-and-forget the hidden ``_telemetry-beat`` worker.
+
+    A DEDICATED detached worker, deliberately separate from
+    ``_update-check`` (spec review finding #1): the anonymous
+    install-count beat must never share a process, throttle marker, or
+    failure mode with the update check. Same detached ``Popen`` shape as
+    ``_spawn_background_update_check`` — ``start_new_session=True`` so a
+    parent exit (the user closes the shell) can't SIGHUP the child, all
+    fds to ``/dev/null`` so the child can't pollute the parent terminal,
+    and exceptions swallowed so a failed spawn never breaks the parent
+    command."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(sys.argv[0]), "_telemetry-beat"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        # Fire-and-forget: never let a spawn failure propagate.
+        pass
+
+
+def cmd_telemetry_beat_internal(args) -> int:
+    """Hidden ``_telemetry-beat`` subcommand handler.
+
+    The detached anonymous-install-count worker. It does the beat and
+    NOTHING else — critically it must NOT read or write any update-check
+    state (spec review finding #1: a dedicated worker fully decoupled
+    from ``_update-check``). Always returns 0 so the parent's
+    spawn-and-forget contract holds; ``do_telemetry_beat`` itself never
+    raises, but the try/except is belt-and-suspenders for the
+    ``load_config`` read."""
+    c = _cctally()
+    try:
+        config = c.load_config()
+        c.do_telemetry_beat(config)
+    except Exception:
+        pass
+    return 0
+
+
 # === User-facing `cctally update` (spec §4) ===
 # `cmd_update` routes by mode flag. Mode flags are mutually exclusive
 # (argparse enforces it; the dispatcher's redundant check is defense in

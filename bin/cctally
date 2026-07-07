@@ -986,6 +986,8 @@ _is_update_check_due = _cctally_update._is_update_check_due
 _do_update_check = _cctally_update._do_update_check
 _spawn_background_update_check = _cctally_update._spawn_background_update_check
 cmd_update_check_internal = _cctally_update.cmd_update_check_internal
+_spawn_background_telemetry_beat = _cctally_update._spawn_background_telemetry_beat
+cmd_telemetry_beat_internal = _cctally_update.cmd_telemetry_beat_internal
 SKIP_USE_STATE_LATEST = _cctally_update.SKIP_USE_STATE_LATEST
 _format_update_command = _cctally_update._format_update_command
 _prerelease_note = _cctally_update._prerelease_note
@@ -2886,6 +2888,18 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # (it runs before the wrapper sets CCTALLY_DATA_DIR, so APP_DIR is
         # still cctally-dev at this point). Same rationale class as doctor.
         return
+    if command == "_telemetry-beat":
+        # The detached telemetry worker must not re-enter this hook's
+        # telemetry gate. Unlike ``_update-check`` (self-limiting: it
+        # refreshes ``last_check_at`` so ``_is_update_check_due`` is
+        # False on re-entry), the beat only stamps its throttle marker on
+        # a SUCCESSFUL send — in the "armed"/"grace"/"failed" states
+        # ``telemetry_beat_due()`` stays True, so without this guard the
+        # worker would spawn another ``_telemetry-beat`` on every run
+        # during the 24h first-beat grace window or a network outage: an
+        # unbounded re-spawn (fork bomb). An internal worker never needs
+        # banners or background spawns anyway.
+        return
     # Self-heal: reconcile current_version with the running binary's
     # CHANGELOG. Cheap (one CHANGELOG read, write only on the first
     # command after a manual upgrade). Runs before load_config so a
@@ -2898,6 +2912,54 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         sys.stderr.write(_format_update_banner(state) + "\n")
     if _is_update_check_due(config):
         _spawn_background_update_check()
+    # Anonymous install-count telemetry (spec 2026-07-07). Broad-but-
+    # throttled, placed after the same early-returns that guard the update
+    # check so it inherits every side-effect skip (read-only/no-mutation
+    # commands, the CCTALLY_DISABLE_UPDATE_CHECK test seam, and the
+    # ``_telemetry-beat`` self-re-entry guard above). The env kill switches
+    # (CCTALLY_DISABLE_TELEMETRY / DO_NOT_TRACK), the config opt-out, and
+    # the dev-checkout guard all live inside ``resolve_telemetry_state`` —
+    # do not re-check them here.
+    enabled, _reason = resolve_telemetry_state(config)
+    if enabled and telemetry_beat_due():
+        _spawn_background_telemetry_beat()
+    _maybe_print_telemetry_notice(command, args, config)
+
+
+def _maybe_print_telemetry_notice(command: str | None, args, config) -> None:
+    """One-time interactive notice that anonymous install-count telemetry
+    is active (spec review finding #2). Banner-gated (NOT beat-gated): it
+    prints once to an interactive stderr and, once marked, never again.
+    Fully best-effort — the whole body is wrapped so any failure is
+    swallowed and can't perturb the parent command.
+
+    Gates (all must hold to print):
+      - telemetry enabled (opt-outs / config / dev-checkout suppress it);
+      - not already shown (the ``TELEMETRY_NOTICE_SHOWN`` marker);
+      - command not in ``_BANNER_SUPPRESSED_COMMANDS`` — the same quiet
+        set the update banner honours (statusline / hook-tick / etc.), so
+        machine-consumed one-liners stay clean;
+      - stderr is a real TTY — never pollute piped or redirected output.
+    """
+    try:
+        enabled, _reason = resolve_telemetry_state(config)
+        if not enabled or notice_already_shown():
+            return
+        if command in _BANNER_SUPPRESSED_COMMANDS:
+            return
+        if not (sys.stderr and sys.stderr.isatty()):
+            return
+        docs = "https://github.com/omrikais/cctally/blob/main/docs/telemetry.md"
+        sys.stderr.write(
+            "cctally counts anonymous active installs to gauge real usage.\n"
+            "What's sent: a rotating, un-linkable token + version + OS family.\n"
+            "No identity, no paths, no usage data, no IP stored. Auto-expires monthly.\n"
+            "Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)\n"
+            f"How it works:     {docs}\n"
+        )
+        mark_notice_shown()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

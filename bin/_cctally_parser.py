@@ -2649,6 +2649,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     uc.set_defaults(func=c.cmd_update_check_internal)
 
+    # ---- _telemetry-beat (internal — hidden, detached anonymous install-count worker) ----
+    tb = sub.add_parser(
+        "_telemetry-beat",
+        help=argparse.SUPPRESS,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Internal subcommand: detached anonymous install-count beat
+            worker, spawned broad-but-throttled from
+            `_post_command_update_hooks` (spec 2026-07-07). A dedicated
+            worker, decoupled from `_update-check` — it touches only the
+            telemetry markers, never update-check state. Honours every
+            opt-out (CCTALLY_DISABLE_TELEMETRY / DO_NOT_TRACK / config /
+            dev checkout) via `resolve_telemetry_state`. Always returns 0;
+            failures are swallowed.
+            """
+        ),
+    )
+    tb.set_defaults(func=c.cmd_telemetry_beat_internal)
+
     # ---- repair-symlinks (internal — hidden; npm-postinstall self-heal, issue #114) ----
     rs = sub.add_parser(
         "repair-symlinks",
