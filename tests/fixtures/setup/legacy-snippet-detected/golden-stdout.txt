@@ -22,3 +22,9 @@ cctally is ready (with 2 warning(s) above).
     cctally dashboard          # live web dashboard
     cctally tui                # terminal dashboard
     cctally setup --status     # verify install state
+
+cctally counts anonymous active installs to gauge real usage.
+What's sent: a rotating, un-linkable token + version + OS family.
+No identity, no paths, no usage data, no IP stored. Auto-expires monthly.
+Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)
+How it works:     https://github.com/omrikais/cctally/blob/main/docs/telemetry.md

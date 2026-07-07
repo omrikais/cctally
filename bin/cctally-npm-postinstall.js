@@ -36,5 +36,9 @@ process.stdout.write(
   '  cctally setup\n' +
   '\nThis installs additive Claude Code hooks (~/.claude/settings.json)\n' +
   'and bootstraps the local SQLite cache (~/.local/share/cctally/).\n' +
+  '\ncctally counts anonymous active installs (a rotating monthly token +\n' +
+  'version + OS family; no identity, paths, or usage data). Opt out with\n' +
+  '`cctally telemetry off`, CCTALLY_DISABLE_TELEMETRY=1, or DO_NOT_TRACK=1.\n' +
+  'How it works: https://github.com/omrikais/cctally/blob/main/docs/telemetry.md\n' +
   '\nDetails: https://github.com/omrikais/cctally#installation\n\n'
 );

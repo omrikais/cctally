@@ -40,6 +40,10 @@
     "session_cache_rows": 0,
     "oauth_status": null
   },
+  "telemetry": {
+    "enabled": true,
+    "reason": "enabled"
+  },
   "warnings_count": 1,
   "exit_code": 0
 }

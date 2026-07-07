@@ -154,6 +154,12 @@ If you also use OpenAI's Codex CLI, `cctally codex daily / monthly / session` ar
 
 `cctally doctor` gives you a read-only health check - install, hooks, sign-in, database, data freshness, pricing, and safety - and the same status shows up in the dashboard. `cctally pricing-check` warns you when the built-in model pricing is getting stale, `cctally db` manages the local database, and `cctally update` keeps your install current. The local cache is always safe to delete or rebuild.
 
+## Privacy & telemetry
+
+cctally sends an anonymous, opt-out **install-count beat** — at most once a day — so the project can gauge how many people actually use it (npm and GitHub numbers are drowned in bots and mirrors). The entire payload is a one-way token that rotates every month (derived from a random local id that never leaves your machine and can't be recovered from the token), the cctally version, and a coarse OS family (`macos`/`linux`/`windows`/`other`). No identity, file paths, prompts, usage data, or stored IP — ever. Nothing leaves your machine for at least 24 hours after first run, so you always have a window to opt out first.
+
+Turn it off any time with `cctally telemetry off` (or `cctally config set telemetry.enabled false`, `CCTALLY_DISABLE_TELEMETRY=1`, or the community-standard `DO_NOT_TRACK=1`); it's also off automatically in dev checkouts. Run `cctally telemetry` to see the current state and exactly what would be sent. The full transparency page — token construction, retention, and an honest threat model — is [docs/telemetry.md](docs/telemetry.md).
+
 ## A faster, local-first ccusage
 
 `cctally` started as a local replacement for [`ccusage`](https://github.com/ryoppippi/ccusage) and stays compatible at the level of common flows: `cctally claude <cmd>` is a drop-in for `ccusage claude <cmd>` (and `cctally codex <cmd>` for `ccusage codex <cmd>`), with the flat forms (`cctally daily`, `cctally codex-daily`, …) kept as aliases. Paste your ccusage commands verbatim - then reach for the dashboard, forecast, trend, conversation viewer, and alerts that ccusage doesn't have.
@@ -176,6 +182,7 @@ It's also fast. Pricing is built in and computed in-process from a local SQLite 
 - [Configuration](docs/configuration.md): `config.json` shape and week-start rules.
 - [Architecture](docs/architecture.md): data flow, caches, week boundaries.
 - [Runtime data](docs/runtime-data.md): what lives in `~/.local/share/cctally/`.
+- [Telemetry](docs/telemetry.md): the anonymous install-count beat, in full — and how to opt out.
 - [Command reference](docs/commands/): one page per subcommand.
 
 ## License

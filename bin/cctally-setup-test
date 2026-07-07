@@ -44,6 +44,13 @@
 
 set -uo pipefail
 
+# Regenerate goldens: CCTALLY_SETUP_REGENERATE=1 bin/cctally-setup-test
+# (rewrites each scenario's golden-stdout.txt from the current normalized
+# output; settings.json / symlinks / exit goldens are left as-is and still
+# verified, so a regen surfaces any unexpected drift there). Mirrors the
+# CCTALLY_DOCTOR_REGENERATE seam in bin/cctally-doctor-test.
+REGENERATE="${CCTALLY_SETUP_REGENERATE:-}"
+
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
@@ -278,7 +285,12 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
 
     local fail_local=0
 
-    if [ -f "$dir/golden-stdout.txt" ]; then
+    if [ -n "$REGENERATE" ]; then
+        # $norm carries NO trailing newline; write the golden the same way
+        # the comparison materializes the actual side (printf '%s').
+        printf '%s' "$norm" > "$dir/golden-stdout.txt"
+        echo "REGEN setup/$name/golden-stdout.txt"
+    elif [ -f "$dir/golden-stdout.txt" ]; then
         # $norm and golden-stdout.txt both carry NO trailing newline (the
         # harness has always compared via `printf '%s'`), so materialize
         # $norm the same way and diff the two real files — byte-exact.

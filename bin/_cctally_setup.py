@@ -2138,7 +2138,25 @@ def _setup_install(args: argparse.Namespace) -> int:
     out.append("    cctally tui                # terminal dashboard")
     out.append("    cctally setup --status     # verify install state")
 
+    # Install-time telemetry disclosure (spec 2026-07-07 §4). Text summary
+    # only — the --json envelope carries a structured `telemetry` field
+    # instead (never prose). Shown unconditionally as a factual disclosure of
+    # the on-by-default, opt-out install-count beat; the opt-out command +
+    # docs link are always surfaced so the fact is discoverable even when the
+    # interactive first-run notice never fires (headless / statusline-only).
+    out.append("")
+    out.append("cctally counts anonymous active installs to gauge real usage.")
+    out.append("What's sent: a rotating, un-linkable token + version + OS family.")
+    out.append("No identity, no paths, no usage data, no IP stored. Auto-expires monthly.")
+    out.append("Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)")
+    out.append("How it works:     https://github.com/omrikais/cctally/blob/main/docs/telemetry.md")
+
     if getattr(args, "json", False):
+        # JSON-safe telemetry disclosure (spec 2026-07-07 §4): a structured
+        # field, never prose. Resolved READ-ONLY via `resolve_telemetry_state`
+        # (side-effect-free — mints no install_id, writes no config), so the
+        # envelope reports the opt-out state without arming telemetry.
+        tele_enabled, tele_reason = c.resolve_telemetry_state(c.load_config())
         envelope = {
             "schema_version": 1,
             "mode": "install",
@@ -2173,6 +2191,10 @@ def _setup_install(args: argparse.Namespace) -> int:
             "bootstrap": {
                 "session_cache_rows": bootstrap_rows,
                 "oauth_status": bootstrap_oauth_status,
+            },
+            "telemetry": {
+                "enabled": tele_enabled,
+                "reason": tele_reason,
             },
             "warnings_count": warnings,
             "exit_code": 0,
