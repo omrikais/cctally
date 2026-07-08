@@ -105,3 +105,58 @@ def test_run_json_schema(tmp_path):
         # every entry carries the documented (possibly-None) meta keys
         for k in ("count", "bytes", "phases"):
             assert k in b, (name, k)
+
+
+# ── Task 3: compare / gate taxonomy (pure functions, no timing) ───────────
+
+def _bl(benches, label="darwin-arm64"):
+    return {"schemaVersion": 1, "machine_label": label, "benchmarks": benches}
+
+
+def test_compare_status_taxonomy():
+    bench = _load_bin("cctally-bench")
+    base = _bl({"a": {"median_ms": 100.0}, "b": {"median_ms": 10.0},
+                "gone": {"median_ms": 5.0}})
+    cur = _bl({"a": {"median_ms": 100.0}, "b": {"median_ms": 40.0},
+               "new": {"median_ms": 1.0}})
+    res = bench.classify(base, cur, pct=0.15, floor_ms=15.0)
+    assert res["a"]["status"] == "OK"          # unchanged
+    assert res["b"]["status"] == "REGRESSED"   # +30 > max(1.5, 15)
+    assert res["gone"]["status"] == "MISSING"
+    assert res["new"]["status"] == "NEW"
+
+
+def test_gate_exit_codes():
+    bench = _load_bin("cctally-bench")
+    base = _bl({"a": {"median_ms": 100.0}})
+    ok = _bl({"a": {"median_ms": 101.0}})
+    reg = _bl({"a": {"median_ms": 200.0}})
+    miss = _bl({"b": {"median_ms": 1.0}})
+    assert bench.gate_exit(bench.classify(base, ok, pct=0.15, floor_ms=15.0)) == 0
+    assert bench.gate_exit(bench.classify(base, reg, pct=0.15, floor_ms=15.0)) != 0
+    assert bench.gate_exit(bench.classify(base, miss, pct=0.15, floor_ms=15.0)) != 0
+
+
+def test_zero_baseline_uses_floor():
+    bench = _load_bin("cctally-bench")
+    base = _bl({"idle": {"median_ms": 0.0}})
+    cur = _bl({"idle": {"median_ms": 10.0}})
+    assert bench.classify(base, cur, pct=0.15, floor_ms=15.0)["idle"]["status"] == "OK"
+
+
+def test_malformed_baseline_gate_fails():
+    bench = _load_bin("cctally-bench")
+    cur = _bl({"a": {"median_ms": 1.0}})
+    res = bench.classify(None, cur, pct=0.15, floor_ms=15.0)
+    assert res["_meta"]["malformed"] is True
+    assert bench.gate_exit(res) != 0
+
+
+def test_machine_mismatch_flagged_not_gated():
+    bench = _load_bin("cctally-bench")
+    base = _bl({"a": {"median_ms": 100.0}}, label="linux-x86_64")
+    cur = _bl({"a": {"median_ms": 300.0}}, label="darwin-arm64")
+    res = bench.classify(base, cur, pct=0.15, floor_ms=15.0)
+    assert res["_meta"]["machine_mismatch"] is True
+    # regression present, but cross-machine → not gated on that alone
+    assert bench.gate_exit(res, allow_cross_machine=True) == 0

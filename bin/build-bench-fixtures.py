@@ -70,9 +70,9 @@ SCALES = {
     # practical build time — see bench/README.md and the committed baseline's
     # dataset_counts for the actual measured shape).
     "large": {
-        "sessions": 1400,
-        "turns_per_session": 24,
-        "large_session_turns": 3000,
+        "sessions": 5000,
+        "turns_per_session": 58,
+        "large_session_turns": 6000,
         "projects": 12,
     },
 }

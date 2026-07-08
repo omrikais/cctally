@@ -1,0 +1,126 @@
+{
+  "benchmarks": {
+    "conversations.filtered": {
+      "bytes": null,
+      "count": 50,
+      "max_ms": 27.2257,
+      "median_ms": 27.1795,
+      "min_ms": 26.7924,
+      "phases": null
+    },
+    "conversations.page1": {
+      "bytes": null,
+      "count": 50,
+      "max_ms": 27.269,
+      "median_ms": 26.8576,
+      "min_ms": 26.7107,
+      "phases": null
+    },
+    "conversations.sorted": {
+      "bytes": null,
+      "count": 50,
+      "max_ms": 92.1033,
+      "median_ms": 86.4886,
+      "min_ms": 84.3657,
+      "phases": null
+    },
+    "find.in_conversation": {
+      "bytes": null,
+      "count": 12000,
+      "max_ms": 190.3361,
+      "median_ms": 180.4304,
+      "min_ms": 174.13,
+      "phases": null
+    },
+    "outline.build": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 124.9025,
+      "median_ms": 119.5134,
+      "min_ms": 104.377,
+      "phases": null
+    },
+    "payload.assemble": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 93.7588,
+      "median_ms": 81.5117,
+      "min_ms": 80.5694,
+      "phases": null
+    },
+    "reconcile.cache_report": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 2.6357,
+      "median_ms": 2.1122,
+      "min_ms": 1.952,
+      "phases": null
+    },
+    "reconcile.projects_env": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 2.3551,
+      "median_ms": 2.0709,
+      "min_ms": 2.0437,
+      "phases": null
+    },
+    "search.cross_session": {
+      "bytes": null,
+      "count": 591884,
+      "max_ms": 2306.5665,
+      "median_ms": 2278.05,
+      "min_ms": 2257.1532,
+      "phases": null
+    },
+    "snapshot.cold": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 2111.669,
+      "median_ms": 2060.642,
+      "min_ms": 2020.638,
+      "phases": null
+    },
+    "snapshot.idle": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 1.8187,
+      "median_ms": 1.7792,
+      "min_ms": 1.5645,
+      "phases": null
+    },
+    "snapshot.warm": {
+      "bytes": null,
+      "count": null,
+      "max_ms": 34.0165,
+      "median_ms": 32.7248,
+      "min_ms": 32.4376,
+      "phases": null
+    },
+    "sync.delta": {
+      "bytes": null,
+      "count": 1,
+      "max_ms": 7.3141,
+      "median_ms": 7.2394,
+      "min_ms": 6.9306,
+      "phases": null
+    },
+    "sync.noop": {
+      "bytes": null,
+      "count": 5000,
+      "max_ms": 62.0133,
+      "median_ms": 58.3841,
+      "min_ms": 56.5803,
+      "phases": null
+    }
+  },
+  "cctally_version": "1.64.0",
+  "dataset_counts": {
+    "entries": 295942,
+    "messages": 591884,
+    "sessions": 5000
+  },
+  "machine_label": "darwin-arm64",
+  "scale": "large",
+  "schemaVersion": 1,
+  "seed": 42
+}

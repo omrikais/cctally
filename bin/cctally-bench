@@ -422,8 +422,95 @@ def render_table(result) -> str:
     return "\n".join(lines)
 
 
-# ── compare / gate (Task 3) ──────────────────────────────────────────────
-# Implemented in Task 3.
+# ── compare / gate ───────────────────────────────────────────────────────
+
+def classify(baseline, current, *, pct, floor_ms):
+    """Total per-benchmark status taxonomy (spec §4.3). Returns a dict keyed by
+    benchmark name plus a ``_meta`` entry. Statuses: ``OK`` / ``REGRESSED`` /
+    ``MISSING`` (in baseline, absent from current) / ``NEW`` (in current, absent
+    from baseline). ``REGRESSED`` iff ``current - baseline > max(pct*baseline,
+    floor_ms)`` — the floor stops sub-ms benches flapping and cleanly handles a
+    zero/near-zero baseline. A non-dict / keyless baseline is ``malformed``."""
+    if not isinstance(baseline, dict) or "benchmarks" not in baseline:
+        return {"_meta": {"malformed": True, "machine_mismatch": False}}
+    b = baseline["benchmarks"]
+    c = current["benchmarks"]
+    out = {"_meta": {
+        "malformed": False,
+        "machine_mismatch": baseline.get("machine_label") != current.get("machine_label"),
+    }}
+    for name, bv in b.items():
+        if name not in c:
+            out[name] = {"status": "MISSING", "baseline_ms": bv["median_ms"],
+                         "current_ms": None, "delta_ms": None}
+            continue
+        base_ms = bv["median_ms"]
+        cur_ms = c[name]["median_ms"]
+        delta = cur_ms - base_ms
+        tol = max(pct * base_ms, floor_ms)
+        out[name] = {
+            "status": "REGRESSED" if delta > tol else "OK",
+            "baseline_ms": base_ms, "current_ms": cur_ms, "delta_ms": delta,
+        }
+    for name in c:
+        if name not in b:
+            out[name] = {"status": "NEW", "baseline_ms": None,
+                         "current_ms": c[name]["median_ms"], "delta_ms": None}
+    return out
+
+
+def gate_exit(classified, *, allow_cross_machine=True):
+    """Exit code for ``--gate``: 2 if the baseline is malformed; 0 on a
+    cross-machine compare (when ``allow_cross_machine``) since those numbers are
+    advisory-only; 1 if any benchmark is ``REGRESSED`` or ``MISSING``; else 0."""
+    meta = classified.get("_meta", {})
+    if meta.get("malformed"):
+        return 2
+    if meta.get("machine_mismatch") and allow_cross_machine:
+        return 0
+    for name, r in classified.items():
+        if name == "_meta":
+            continue
+        if r["status"] in ("REGRESSED", "MISSING"):
+            return 1
+    return 0
+
+
+def _load_baseline():
+    try:
+        return json.loads(BASELINE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def render_compare(classified) -> str:
+    """Δ table + per-benchmark verdicts (advisory). Loud banner on a malformed
+    baseline or a cross-machine compare."""
+    meta = classified.get("_meta", {})
+    lines = []
+    if meta.get("malformed"):
+        return (f"!! baseline {BASELINE_PATH} is missing or malformed — cannot "
+                f"compare. Run `cctally-bench --update-baseline`.")
+    if meta.get("machine_mismatch"):
+        lines.append(
+            "!! machine-label mismatch — this comparison is CROSS-MACHINE and "
+            "advisory only; --gate will not fail on these numbers alone."
+        )
+    lines.append(f"{'benchmark':<26}{'baseline':>10}{'current':>10}"
+                 f"{'delta':>10}  status")
+    for name, r in classified.items():
+        if name == "_meta":
+            continue
+        base = "—" if r["baseline_ms"] is None else _fmt_ms(r["baseline_ms"])
+        cur = "—" if r["current_ms"] is None else _fmt_ms(r["current_ms"])
+        delta = "—" if r["delta_ms"] is None else f"{r['delta_ms']:+.1f}ms"
+        lines.append(f"{name:<26}{base:>10}{cur:>10}{delta:>10}  {r['status']}")
+    return "\n".join(lines)
+
+
+def _write_baseline(result):
+    BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BASELINE_PATH.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
 def _resolve_root(args):
@@ -470,7 +557,18 @@ def main(argv=None) -> int:
         trace=args.trace, root=root,
         data_dir=args.data_dir, claude_dir=args.claude_dir,
     )
-    # --compare / --gate / --update-baseline are wired in Task 3.
+    if args.update_baseline:
+        _write_baseline(result)
+        print(f"wrote baseline: {BASELINE_PATH}")
+        print(render_table(result))
+        return 0
+    if args.compare or args.gate:
+        classified = classify(
+            _load_baseline(), result,
+            pct=BENCH_TOLERANCE_PCT, floor_ms=BENCH_TOLERANCE_FLOOR_MS,
+        )
+        print(render_compare(classified))
+        return gate_exit(classified) if args.gate else 0
     if args.as_json:
         print(json.dumps(result, indent=2))
     else:
