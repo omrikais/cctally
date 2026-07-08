@@ -258,6 +258,18 @@ def _make_benchmarks(cctally, perf):
     def outline_build():
         return cq.get_conversation_outline(read_conn, large_sid)
 
+    # #278 Theme B: the memo-HIT rung. Measures the WARM path only — a single
+    # indexed watermark SELECT + LRU hit (sub-ms). time_body discards the first
+    # (warmup) call, which primes the memo on a miss, so every MEASURED iteration
+    # is a pure hit; the callable must NOT clear/prime per-iteration (that would
+    # fold a cold assemble into every sample). The cold payload.assemble /
+    # outline.build rungs above stay UNCHANGED as the baseline.
+    cq._assemble_memo_clear()
+    cq._assemble_session_memoized(read_conn, large_sid)   # prime once (untimed)
+
+    def outline_memo():
+        return cq._assemble_session_memoized(read_conn, large_sid)   # measured: hit
+
     # ── family 6: warm reconciles ──
     raw_config = cctally.load_config()
     display_tz = cctally._resolve_display_tz_obj(
@@ -329,6 +341,7 @@ def _make_benchmarks(cctally, perf):
          lambda r: (r or {}).get("total")),
         ("payload.assemble", payload_assemble, False, None),
         ("outline.build", outline_build, False, None),
+        ("payload.assemble_memo_hit", outline_memo, False, None),
         ("reconcile.cache_report", reconcile_cache_report, False, None),
         ("reconcile.projects_env", reconcile_projects_env, False, None),
     ]

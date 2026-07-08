@@ -115,7 +115,7 @@ _EXPECTED_BENCHMARKS = {
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",
-    "payload.assemble", "outline.build",
+    "payload.assemble", "outline.build", "payload.assemble_memo_hit",
     "reconcile.cache_report", "reconcile.projects_env",
 }
 
