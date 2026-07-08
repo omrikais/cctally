@@ -51,8 +51,9 @@ BASELINE_PATH = _BIN_DIR.parent / "bench" / "baselines" / "backend.json"
 # performance.md: the msg_count at which whole-session assembly crosses this is
 # the "materialize?" trigger. Tunable (see bench/README.md).
 ASSEMBLY_VISIBLE_MS = 100.0
-# The scan reads/writes its OWN baseline (Codex F7) — never backend.json.
-ASSEMBLY_BASELINE_PATH = _BIN_DIR.parent / "bench" / "baselines" / "assembly.json"
+# The committed evidence baseline lives at bench/baselines/assembly.json (Codex
+# F7 — a separate file from the default suite's backend.json); it is written by
+# the maintainer via `--assembly-scan --json > …`, not programmatically here.
 # The per-rung columns that are DETERMINISTIC (goldenable) — everything else is
 # a machine-variant *_ms timing (recorded, never asserted). The self-test drops
 # the timing keys and byte-compares the rest across two runs.
@@ -484,16 +485,21 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
 
             asm = cq._assemble_session(conn, sid)
             item_count = len(asm["items"])
-            # find on the common token must be non-empty (a vacuous find would
-            # measure the cheap early-out probe, not the assembly-backed path).
+            # A vacuous find would measure the cheap early-out probe, not the
+            # assembly-backed path. The SYNTHETIC fixture stamps the token into
+            # every message, so a miss there is a real bug → hard-fail (a plain
+            # `raise`, not a bare `assert` that `python -O` would strip). Real
+            # operator sessions (realism mode, ladder is None) may legitimately
+            # lack the token, so there the find stays advisory (no assert).
             fr = cq.find_in_conversation(conn, sid, token)
-            assert fr is not None and fr.get("total", 0) > 0, \
-                f"{sid}: find on {token!r} was vacuous"
+            if ladder is not None and not (fr is not None and fr.get("total", 0) > 0):
+                raise RuntimeError(f"{sid}: find on {token!r} was vacuous")
 
             # Deterministic payload bytes (materialization-footprint proxy +
             # real endpoint page bytes). json.dumps in the SAME wire form.
-            assembled_items_bytes = len(
-                json.dumps(cq._assemble_session(conn, sid)["items"]).encode())
+            # Reuse the `asm` assembled above — it is deterministic, so a second
+            # _assemble_session would only burn a whole-session assemble per rung.
+            assembled_items_bytes = len(json.dumps(asm["items"]).encode())
             page_bytes = {}
             for L in (200, 500, 1000):
                 page_bytes[L] = len(json.dumps(
