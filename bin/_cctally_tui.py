@@ -2396,20 +2396,21 @@ def _tui_build_snapshot(
                 errors.append(f"milestones: {exc}")
         history: list = []
         history_median_dpp: "float | None" = None
-        try:
-            # Issue #59: build the full TrendView so we capture the
-            # pre-computed 4-week-median-non-current scalar alongside
-            # the row list; the dashboard envelope adapter surfaces
-            # the scalar as ``trend.history_median_dpp`` so
-            # TrendModal.tsx stops re-deriving it client-side.
-            history_view = _tui_build_weekly_history_view(
-                conn, now_utc, skip_sync=skip_sync, display_tz=_build_display_tz,
-                use_weekref_cost_cache=use_weekref_cost_cache,
-            )
-            history = list(history_view.rows)
-            history_median_dpp = history_view.median_dpp_non_current_4w
-        except Exception as exc:
-            errors.append(f"weekly-history: {exc}")
+        with _perf.phase("build.weekly_history"):
+            try:
+                # Issue #59: build the full TrendView so we capture the
+                # pre-computed 4-week-median-non-current scalar alongside
+                # the row list; the dashboard envelope adapter surfaces
+                # the scalar as ``trend.history_median_dpp`` so
+                # TrendModal.tsx stops re-deriving it client-side.
+                history_view = _tui_build_weekly_history_view(
+                    conn, now_utc, skip_sync=skip_sync, display_tz=_build_display_tz,
+                    use_weekref_cost_cache=use_weekref_cost_cache,
+                )
+                history = list(history_view.rows)
+                history_median_dpp = history_view.median_dpp_non_current_4w
+            except Exception as exc:
+                errors.append(f"weekly-history: {exc}")
         # ---- v2.1 additions: dashboard Weekly / Monthly panels ----
         # Sync-thread view-model totals (spec §6.6): sum directly over
         # the panel rows the dashboard ACTUALLY renders. The previous
@@ -2473,20 +2474,21 @@ def _tui_build_snapshot(
         # kept as a thin shim for monkeypatch surfaces).
         blocks_total_cost_usd = 0.0
         blocks_total_tokens = 0
-        try:
-            if cw is not None:
-                _blocks_view = _dashboard_build_blocks_view(
-                    conn, now_utc,
-                    week_start_at=cw.week_start_at,
-                    week_end_at=cw.week_end_at,
-                    skip_sync=skip_sync,
-                    display_tz=_build_display_tz,
-                )
-                blocks_panel = list(_blocks_view.rows)
-                blocks_total_cost_usd = _blocks_view.total_cost_usd
-                blocks_total_tokens = _blocks_view.total_tokens
-        except Exception as exc:
-            errors.append(f"blocks-panel: {exc}")
+        with _perf.phase("build.blocks"):
+            try:
+                if cw is not None:
+                    _blocks_view = _dashboard_build_blocks_view(
+                        conn, now_utc,
+                        week_start_at=cw.week_start_at,
+                        week_end_at=cw.week_end_at,
+                        skip_sync=skip_sync,
+                        display_tz=_build_display_tz,
+                    )
+                    blocks_panel = list(_blocks_view.rows)
+                    blocks_total_cost_usd = _blocks_view.total_cost_usd
+                    blocks_total_tokens = _blocks_view.total_tokens
+            except Exception as exc:
+                errors.append(f"blocks-panel: {exc}")
         # Sync-thread view-model totals (Bundle 1 / spec §6.6):
         # sum-over-visible-rows (same invariant as weekly/monthly above).
         # Gap days in the materialized panel carry ``cost_usd=0.0`` /
@@ -2495,42 +2497,45 @@ def _tui_build_snapshot(
         # ``build_daily_view`` pass that did the same arithmetic.
         daily_total_cost_usd = 0.0
         daily_total_tokens = 0
-        try:
-            daily_panel = _dashboard_build_daily_panel(
-                conn, now_utc, n=30, skip_sync=skip_sync,
-                use_group_a_cache=True,
-                display_tz=_build_display_tz,
-            )
-            daily_total_cost_usd = stable_sum(
-                r.cost_usd for r in daily_panel
-            )
-            daily_total_tokens = sum(
-                (r.total_tokens for r in daily_panel), 0,
-            )
-        except Exception as exc:
-            errors.append(f"daily-panel: {exc}")
+        with _perf.phase("build.daily"):
+            try:
+                daily_panel = _dashboard_build_daily_panel(
+                    conn, now_utc, n=30, skip_sync=skip_sync,
+                    use_group_a_cache=True,
+                    display_tz=_build_display_tz,
+                )
+                daily_total_cost_usd = stable_sum(
+                    r.cost_usd for r in daily_panel
+                )
+                daily_total_tokens = sum(
+                    (r.total_tokens for r in daily_panel), 0,
+                )
+            except Exception as exc:
+                errors.append(f"daily-panel: {exc}")
         # ---- threshold-actions T5: alerts envelope array ----
         # Precomputed at sync time so `snapshot_to_envelope` stays a pure
         # renderer (no DB I/O on the dashboard hot path; mirrors how
         # `current_week.five_hour_block` is precomputed via
         # `_select_current_block_for_envelope`).
-        try:
-            alerts = _build_alerts_envelope_array(conn)
-        except Exception as exc:
-            errors.append(f"alerts: {exc}")
+        with _perf.phase("build.alerts"):
+            try:
+                alerts = _build_alerts_envelope_array(conn)
+            except Exception as exc:
+                errors.append(f"alerts: {exc}")
         # ---- 5h in-place credit (v1.7.x) ----
         # Load 5h milestones (pre + post credit) for the current
         # block's window so CurrentWeekModal can render a merged
         # chronological timeline alongside its weekly milestones.
         # Spec §5.3 (Codex r1 finding 3).
         fh_milestones: list[dict] = []
-        try:
-            win_key = None
-            if cw is not None and isinstance(cw.five_hour_block, dict):
-                win_key = cw.five_hour_block.get("five_hour_window_key")
-            fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
-        except Exception as exc:
-            errors.append(f"five-hour-milestones: {exc}")
+        with _perf.phase("build.five_hour_milestones"):
+            try:
+                win_key = None
+                if cw is not None and isinstance(cw.five_hour_block, dict):
+                    win_key = cw.five_hour_block.get("five_hour_window_key")
+                fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
+            except Exception as exc:
+                errors.append(f"five-hour-milestones: {exc}")
         # ---- Projects panel + modal envelope (spec §5.2, plan Task 1) -----
         # Per-tick aggregation lives on the sync thread; the dashboard's
         # pure ``snapshot_to_envelope`` reads ``snap.projects_envelope``
@@ -2653,28 +2658,29 @@ def _tui_build_snapshot(
         # on the DataSnapshot field and the client renders the empty
         # state.
         cache_report_block = None
-        try:
-            cfg_cr = load_config().get("cache_report") or {}
-            threshold_raw = cfg_cr.get("anomaly_threshold_pp", 15)
+        with _perf.phase("build.cache_report"):
             try:
-                threshold_pp = int(threshold_raw)
-            except (TypeError, ValueError):
-                threshold_pp = 15
-            if threshold_pp < 1 or threshold_pp > 100:
-                threshold_pp = 15
-            _dash_mod = sys.modules["_cctally_dashboard"]
-            _bcr = _dash_mod.build_cache_report_snapshot
-            cache_report_block = _bcr(
-                now_utc=now_utc,
-                anomaly_threshold_pp=threshold_pp,
-                # Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
-                anomaly_window_days=_dash_mod.CACHE_REPORT_ANOMALY_WINDOW_DAYS,
-                display_tz=_build_display_tz,
-                skip_sync=skip_sync,
-                use_cache_report_cache=use_cache_report_cache,
-            )
-        except Exception as exc:
-            errors.append(f"cache-report: {exc}")
+                cfg_cr = load_config().get("cache_report") or {}
+                threshold_raw = cfg_cr.get("anomaly_threshold_pp", 15)
+                try:
+                    threshold_pp = int(threshold_raw)
+                except (TypeError, ValueError):
+                    threshold_pp = 15
+                if threshold_pp < 1 or threshold_pp > 100:
+                    threshold_pp = 15
+                _dash_mod = sys.modules["_cctally_dashboard"]
+                _bcr = _dash_mod.build_cache_report_snapshot
+                cache_report_block = _bcr(
+                    now_utc=now_utc,
+                    anomaly_threshold_pp=threshold_pp,
+                    # Hardcoded for v1; F10 tracks lifting via cache_report.anomaly_window_days config.
+                    anomaly_window_days=_dash_mod.CACHE_REPORT_ANOMALY_WINDOW_DAYS,
+                    display_tz=_build_display_tz,
+                    skip_sync=skip_sync,
+                    use_cache_report_cache=use_cache_report_cache,
+                )
+            except Exception as exc:
+                errors.append(f"cache-report: {exc}")
 
         # ---- #268 M4: doctor / config / update-state precompute (spec §6) ----
         # Precompute the envelope's doctor / config / update-state reads ONCE
