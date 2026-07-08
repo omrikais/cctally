@@ -12,6 +12,17 @@ import _lib_conversation_query as cq
 _MODEL = "claude-opus-4-8"
 
 
+@pytest.fixture(autouse=True)
+def _clear_assembly_memo():
+    """#278: the _assemble_session memo is module-global process state. Clear it
+    before every test so a cached entry from a sibling test (same session_id +
+    watermark, distinct in-memory DB) can never leak across tests — the memo/
+    consumer tests populate it, and pytest-xdist runs a worker's tests in one
+    process sharing these globals."""
+    cq._assemble_memo_clear()
+    yield
+
+
 def _conn():
     c = sqlite3.connect(":memory:")
     db._apply_cache_schema(c)
@@ -4559,3 +4570,59 @@ def test_get_conversation_does_not_mutate_cached_asm(monkeypatch):
     # RETURNED page's copies are stamped, never the shared/cacheable asm items.
     assert all(it["anchor"]["session_id"] is None
                for it in captured["asm"]["items"])
+
+
+# ---------------------------------------------------------------------------
+# #278 Theme B / Task 4: all five consumers route through _assemble_session_memoized.
+# Parity — a warm (memo-hit) snapshot is deep-equal to the cold snapshot across
+# every consumer; find_in_conversation uses a MATCHED query so it actually
+# assembles (an unmatched query returns before assembly — Codex F6). Plus a
+# cross-consumer check that an outline computed AFTER a get_conversation call
+# (which populates + would, pre-fix, mutate the shared asm) equals a cold outline.
+# ---------------------------------------------------------------------------
+def test_all_consumers_parity_memo_vs_cold():
+    c = _conn(); _seed_memo_session(c)
+    matched_q = "hello"     # present in the seeded assistant text ("hello world")
+    def snapshot():
+        return (
+            cq.get_conversation(c, _MEMO_SID),
+            cq.get_conversation_outline(c, _MEMO_SID),
+            cq.get_conversation_prompts(c, _MEMO_SID),
+            cq.get_conversation_export(c, _MEMO_SID, "chat"),
+            cq.find_in_conversation(c, _MEMO_SID, matched_q),
+        )
+    cq._assemble_memo_clear()
+    cold = snapshot()                 # all cold
+    warm = snapshot()                 # all memo hits
+    assert warm == cold
+    assert cold[4]["total"] >= 1      # find genuinely matched -> it assembled
+
+
+def test_outline_after_detail_matches_cold():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    cold = cq.get_conversation_outline(c, _MEMO_SID)   # cold
+    cq._assemble_memo_clear()
+    cq.get_conversation(c, _MEMO_SID)                  # populate + (old bug) mutate
+    warm = cq.get_conversation_outline(c, _MEMO_SID)   # memo hit
+    assert warm == cold                                # no corruption
+
+
+def test_consumers_share_one_cold_assemble(monkeypatch):
+    # Non-vacuity for the swap (Task 4): with all five consumers routed through
+    # the memo, five calls on the same session at one watermark trigger exactly
+    # ONE cold _assemble_session (RED pre-swap: five direct calls).
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    calls = {"n": 0}
+    real = cq._assemble_session
+    def counting(conn, sid):
+        calls["n"] += 1
+        return real(conn, sid)
+    monkeypatch.setattr(cq, "_assemble_session", counting)
+    cq.get_conversation(c, _MEMO_SID)
+    cq.get_conversation_outline(c, _MEMO_SID)
+    cq.get_conversation_prompts(c, _MEMO_SID)
+    cq.get_conversation_export(c, _MEMO_SID, "chat")
+    cq.find_in_conversation(c, _MEMO_SID, "hello")
+    assert calls["n"] == 1     # all five share ONE cold assemble via the memo

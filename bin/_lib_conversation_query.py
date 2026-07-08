@@ -1917,7 +1917,7 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     _det.set_meta(cursor=("after" if after is not None else
                           "before" if before is not None else
                           "tail" if tail else "none"))
-    asm = _assemble_session(conn, session_id)
+    asm = _assemble_session_memoized(conn, session_id)
     if asm is None:
         _det.__exit__(None, None, None)
         return None
@@ -2089,7 +2089,7 @@ def get_conversation_outline(conn, session_id):
     every consumer tolerate it. Stats derive from the SAME assembled items the
     reader pages (Codex F8). Returns None for an unknown session.
     """
-    asm = _assemble_session(conn, session_id)
+    asm = _assemble_session_memoized(conn, session_id)
     if asm is None:
         return None
     items, logical = asm["items"], asm["logical"]
@@ -2235,7 +2235,7 @@ def get_conversation_prompts(conn, session_id):
     (the handler's 404 sentinel) — the same contract ``get_conversation_outline``
     uses (``asm is None``).
     """
-    asm = _assemble_session(conn, session_id)
+    asm = _assemble_session_memoized(conn, session_id)
     if asm is None:
         return None
     from _lib_conversation_export import extract_prompt_entries
@@ -2253,7 +2253,7 @@ def get_conversation_export(conn, session_id, scope):
     or ``None`` for an unknown session (the handler's 404 sentinel). ``scope`` is
     pre-validated by the handler (an unknown scope never reaches here)."""
     from _lib_conversation_export import export_session_markdown
-    asm = _assemble_session(conn, session_id)
+    asm = _assemble_session_memoized(conn, session_id)
     if asm is None:
         return None
     items = asm["items"]
@@ -3301,7 +3301,7 @@ def find_in_conversation(conn, session_id, query, *, kind="all",
             conn, session_id, q, kind, depth, fts_available)
     if not matched:
         return {**base, "mode": mode}
-    asm = _assemble_session(conn, session_id)
+    asm = _assemble_session_memoized(conn, session_id)
     if asm is None:
         return None
     anchors = _find_anchors_from_matched(asm, matched)
