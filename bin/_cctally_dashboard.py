@@ -9183,6 +9183,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b": keep-alive\n\n")
                     self.wfile.flush()
 
+            # #278 Theme B: signal that this connection is ACTIVELY live-tailing
+            # (not degraded to keep-alive). The client sets `live` only on this, so
+            # passive/cache-open-failed streams fall back to the memo-backed global
+            # tick instead of stranding updates (Codex F4). Passive branch above
+            # emits only ': keep-alive', so 'ready' is unambiguous.
+            self.wfile.write(b"event: ready\ndata: {}\n\n")
+            self.wfile.flush()
+
             files = _resolve()
             # Best-effort connect ingest for immediacy, then baseline `seen`
             # from the cache's own offsets (session_files) so any pre-connect

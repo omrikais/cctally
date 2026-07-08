@@ -239,3 +239,42 @@ def test_events_passive_under_no_sync(tmp_path, monkeypatch):
             s.close()
     finally:
         srv.shutdown()
+
+
+def test_events_emits_ready_when_active(tmp_path, monkeypatch):
+    """#278 Theme B: an ACTIVE (non-passive) live-tail stream emits a one-time
+    ``event: ready`` at the top of the loop so the client can distinguish real
+    server liveness from a merely-open socket."""
+    ns = load_script()
+    srv, _projects, _jsonl = _boot(ns, tmp_path, monkeypatch,
+                                   bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        s = _open_sse(port, "/api/conversation/s1/events")
+        try:
+            frame = _read_event(s, marker="event: ready", deadline=8.0)
+            assert frame.startswith("event: ready")
+        finally:
+            s.close()
+    finally:
+        srv.shutdown()
+
+
+def test_events_passive_emits_no_ready(tmp_path, monkeypatch):
+    """Under ``--no-sync`` the passive stream sends only ``: keep-alive`` — never
+    ``event: ready`` — so the client leaves ``live`` false and falls back to the
+    memo-backed global tick (Codex F4)."""
+    ns = load_script()
+    srv, _projects, _jsonl = _boot(ns, tmp_path, monkeypatch,
+                                   bind="127.0.0.1", expose=False, no_sync=True)
+    try:
+        port = srv.server_address[1]
+        s = _open_sse(port, "/api/conversation/s1/events")
+        try:
+            frame = _read_event(s, marker="event: ready", deadline=3.0,
+                                allow_timeout=True)
+            assert frame is None
+        finally:
+            s.close()
+    finally:
+        srv.shutdown()
