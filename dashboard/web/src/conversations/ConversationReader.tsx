@@ -181,7 +181,9 @@ const ReaderItem = forwardRef<HTMLDivElement, Record<string, unknown>>(
 // toggle button can reflect open/closed state; Tasks 4/5 consume it further
 // (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
 // below is independent of it (it observes the reader's own rendered turns).
-export function ConversationReader({ sessionId, mobileBack, outline }: { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null }) {
+export function ConversationReader({ sessionId, mobileBack, outline, growthNonce, live }:
+  { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null;
+    growthNonce?: number; live?: boolean }) {
   // #217 S3 E2 — compute the open intent ONCE per session open so the hook's
   // FIRST request is precedence-correct (Codex P1; no head-fetch-then-redirect).
   // Precedence: (1) a deep-link / jump anchor for THIS session wins; (2) else a
@@ -220,7 +222,7 @@ export function ConversationReader({ sessionId, mobileBack, outline }: { session
     if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
     return s;
   }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids, growthNonce, live });
   // #232 — the imperative Virtuoso handle (scrollToIndex for jumps / keyboard
   // nav / the "↓ N new" pill) and a live mirror of the firstItemIndex so
   // `itemContent`'s array-index math (`virtualIndex − firstItemIndex`) reads the

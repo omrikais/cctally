@@ -5,6 +5,7 @@ import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useIsWide } from '../hooks/useIsWide';
 import { useConversationOutline } from '../hooks/useConversationOutline';
+import { useConversationLiveTail } from '../hooks/useConversationLiveTail';
 import { useFindHotkey } from '../hooks/useFindHotkey';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { ConversationRail } from './ConversationRail';
@@ -55,7 +56,13 @@ export function ConversationsView() {
   // #227 — pass null while a comparison is open: the compare branch returns
   // before `outline` is consumed, so this hook would otherwise double-fetch A's
   // outline (selected === compare.a) alongside ComparisonView's own A hook.
-  const { outline } = useConversationOutline(compare !== null ? null : selected);
+  // #278 Theme B — mount the single shared live-tail signal for the active
+  // single-reader session (null in comparison mode, mirroring the outline gate so
+  // the comparison stays static), and feed { growthNonce, live } into BOTH the
+  // outline hook and (via props) the reader's useConversation.
+  const liveSid = compare !== null ? null : selected;
+  const { growthNonce, live } = useConversationLiveTail(liveSid);
+  const { outline } = useConversationOutline(liveSid, { growthNonce, live });
 
   useKeymap(CONVERSATIONS_BINDINGS);
   // #217 S4 / I-1.5 — Cmd/Ctrl+F intercept (capture-phase; the central keymap
@@ -134,7 +141,7 @@ export function ConversationsView() {
         {selected == null
           ? <ConversationRail />
           : <>
-              <ConversationReader sessionId={selected} outline={outline} mobileBack />
+              <ConversationReader sessionId={selected} outline={outline} growthNonce={growthNonce} live={live} mobileBack />
               {outlineSheet(selected)}
             </>}
       </div>
@@ -153,7 +160,7 @@ export function ConversationsView() {
     >
       <ConversationRail />
       {selected != null
-        ? <ConversationReader sessionId={selected} outline={outline} />
+        ? <ConversationReader sessionId={selected} outline={outline} growthNonce={growthNonce} live={live} />
         : <div className="conv-reader conv-reader--empty">
             <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><ChatIcon /></span>
               <div className="conv-state-title">Select a conversation</div>
