@@ -3,6 +3,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useIsDesktopBento } from '../hooks/useIsDesktopBento';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
@@ -168,7 +169,11 @@ export function DailyPanel() {
       </div>
       <div className="panel-body" id="panel-daily-body">
         {rows.length === 0 ? (
-          <div className="panel-empty">No usage history yet.</div>
+          env?.hydrating ? (
+            <PanelSkeleton />
+          ) : (
+            <div className="panel-empty">No usage history yet.</div>
+          )
         ) : (
           <>
             <div className="daily-legend" aria-label="Color intensity legend">

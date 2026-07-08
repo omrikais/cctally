@@ -14,6 +14,7 @@ import type { CSSProperties, MouseEvent } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { openShareModal } from '../store/shareSlice';
@@ -26,6 +27,10 @@ export function ProjectsPanel() {
   const cw = env?.projects?.current_week;
   const rows = cw?.rows ?? [];
   const isUnavailable = env?.projects == null;
+  // #278 §1.4: during the cheap first-paint seed the projects envelope is
+  // still null / empty; show a loading skeleton instead of the "restart the
+  // dashboard" / "no activity" copy, which would wrongly imply a broken instance.
+  const hydrating = !!env?.hydrating;
 
   // ShareIcon + PanelGrip render in BOTH the populated and the
   // unavailable-envelope branches per spec §2.6 ("ShareIcon still
@@ -75,9 +80,13 @@ export function ProjectsPanel() {
       >
         {header}
         <div className="panel-body projects-body">
-          <div className="panel-empty">
-            Projects data unavailable — restart the dashboard.
-          </div>
+          {hydrating ? (
+            <PanelSkeleton />
+          ) : (
+            <div className="panel-empty">
+              Projects data unavailable — restart the dashboard.
+            </div>
+          )}
         </div>
       </section>
     );
@@ -124,9 +133,13 @@ export function ProjectsPanel() {
       {header}
       <div className="panel-body projects-body">
         {rows.length === 0 ? (
-          <div className="panel-empty">
-            No project activity yet this week.
-          </div>
+          hydrating ? (
+            <PanelSkeleton />
+          ) : (
+            <div className="panel-empty">
+              No project activity yet this week.
+            </div>
+          )
         ) : (
           <>
             {top.map((r) => {

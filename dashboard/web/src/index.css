@@ -1004,6 +1004,27 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
     100% { background-position: 0 0; }
   }
 }
+/* #278 Theme A — per-panel first-paint hydration skeleton. Rendered inside a
+   heavy panel's body while the envelope is `hydrating` and the panel has no
+   data yet, in place of its definitive empty/"unavailable" copy. Mirrors the
+   cold-start .panel.is-skeleton lines + shimmer (gated on reduced-motion). */
+.panel-skeleton { padding: 4px 0; }
+.panel-skeleton .skel {
+  background: var(--surface-faint);
+  border-radius: var(--radius-sm);
+}
+.panel-skeleton .skel-line { height: 12px; width: 100%; margin-bottom: 10px; }
+.panel-skeleton .skel-line.short { width: 60%; }
+@media (prefers-reduced-motion: no-preference) {
+  .panel-skeleton .skel {
+    background: linear-gradient(90deg,
+      var(--surface-faint) 25%,
+      rgba(255, 255, 255, 0.12) 37%,
+      var(--surface-faint) 63%);
+    background-size: 400% 100%;
+    animation: skel-shimmer 1.4s ease-in-out infinite;
+  }
+}
 /* #248 — cold-start hero-strip placeholder (echoes the at-a-glance hero). */
 .skel-hero {
   height: 96px;

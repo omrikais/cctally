@@ -78,6 +78,13 @@ export interface Envelope {
   // Additive-optional, like update?/doctor?/dashboard_prefs? — a Python
   // without the marker leaves it absent. Drives the header PREVIEW pill.
   channel?: 'preview';
+  // #278 Theme A first-paint latch: true only while data is still being
+  // assembled — the cheap bind-before-build seed and A2's progressive
+  // partial republishes. Heavy panels that are still empty render a loading
+  // skeleton while this is true; a populated-but-incomplete panel shows its
+  // partial data as-is. False/absent on every complete snapshot. Additive-
+  // optional — a Python without the field leaves it absent → treat as false.
+  hydrating?: boolean;
 }
 
 // Cache Report envelope (spec 2026-05-21).

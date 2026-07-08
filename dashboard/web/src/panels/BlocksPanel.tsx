@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
@@ -153,7 +154,11 @@ export function BlocksPanel() {
       </div>
       <div className="panel-body" id="panel-blocks-body">
         {rows.length === 0 ? (
-          <div className="panel-empty">No activity blocks this week yet.</div>
+          env?.hydrating ? (
+            <PanelSkeleton />
+          ) : (
+            <div className="panel-empty">No activity blocks this week yet.</div>
+          )
         ) : (
           rows.map((r) => (
             <Row

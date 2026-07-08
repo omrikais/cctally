@@ -33,6 +33,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ExpandButton } from '../components/ExpandButton';
 import { CacheSparkline } from '../modals/CacheSparkline';
 import { CacheNetBars } from '../modals/CacheNetBars';
@@ -96,6 +97,15 @@ export function CacheReportPanel() {
             <PanelGrip />
           </div>
         </div>
+        {/* #278 §1.4: during the cheap first-paint seed the cache-report block
+            hasn't been built yet; show a loading skeleton body. When NOT
+            hydrating, `!cr` is a build-failure/no-cache edge — keep the
+            header-only minimal placeholder. */}
+        {env?.hydrating && (
+          <div className="panel-body">
+            <PanelSkeleton lines={2} />
+          </div>
+        )}
       </section>
     );
   }

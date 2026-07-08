@@ -11,6 +11,7 @@ import {
 import { SessionsControls } from '../components/SessionsControls';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { openMostRecentSessionModal } from '../store/actions';
@@ -171,6 +172,11 @@ export function SessionsPanel() {
       </div>
       {isMobile && <SessionsControls />}
       <div className="panel-body panel-body--scroll" id="panel-sessions-body">
+        {env?.hydrating && filtered.length === 0 ? (
+          // #278 §1.4: the cheap first-paint seed hasn't built sessions yet;
+          // show a loading skeleton rather than an empty table shell.
+          <PanelSkeleton lines={4} />
+        ) : (
         <table className="sess-table">
           <SortableHeader
             columns={columns}
@@ -295,6 +301,7 @@ export function SessionsPanel() {
             })}
           </tbody>
         </table>
+        )}
       </div>
     </section>
   );

@@ -3,6 +3,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { Sparkline } from '../components/Sparkline';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
+import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
@@ -99,6 +100,12 @@ export function TrendPanel() {
         </div>
       </div>
       <div className="panel-body">
+        {env?.hydrating && data.length === 0 ? (
+          // #278 §1.4: the cheap first-paint seed hasn't built the trend rows
+          // yet; show a loading skeleton instead of an empty sparkline/table.
+          <PanelSkeleton />
+        ) : (
+        <>
         {/* #265 B — the chart leads and stays pinned; the table scrolls beneath
             it (`.trend-table-wrap`), so a thin history no longer pushes the
             sparkline + legend below the S4 in-card fold. */}
@@ -145,6 +152,8 @@ export function TrendPanel() {
             </tbody>
           </table>
         </div>
+        </>
+        )}
       </div>
     </section>
   );
