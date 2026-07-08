@@ -6205,6 +6205,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
 
     return {
         "envelope_version": 2,
+        # #278 Theme A: single additive first-paint hydration latch. True only
+        # on the cheap seed + A2's partial republishes (data still being
+        # assembled); False on every complete/stable snapshot. ``getattr``
+        # default keeps positionally-constructed fixture snapshots serializing.
+        "hydrating":        bool(getattr(snap, "hydrating", False)),
         "generated_at":     _iso_z(snap.generated_at),
         # last_sync_at in DataSnapshot is a monotonic float, not a wall
         # clock — the envelope's wall-clock moment is unknowable from

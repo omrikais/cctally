@@ -1727,6 +1727,7 @@
     "vs_last_week_delta": null,
     "week_label": "Apr 13\u2013Apr 20"
   },
+  "hydrating": false,
   "last_sync_at": null,
   "last_sync_error": null,
   "monthly": {

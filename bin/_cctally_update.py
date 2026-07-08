@@ -2015,6 +2015,11 @@ class _DashboardUpdateCheckThread(threading.Thread):
             envelope_precompute=(
                 c._cctally_tui._tui_precompute_envelope_config(load_config())
             ),
+            # #278 §1.4.1: a version-banner refresh republishes complete data;
+            # force the hydration latch clear so a republish that happens to
+            # carry a prior hydrating seed/partial doesn't freeze the client's
+            # loading skeletons.
+            hydrating=False,
         )
         self._ref.set(fresh)
         self._hub.publish(fresh)

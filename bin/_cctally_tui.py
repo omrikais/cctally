@@ -1109,6 +1109,22 @@ class DataSnapshot:
     # keep working, and both are carried forward on a sync crash (Codex F6).
     doctor_payload: dict | None = None
     envelope_precompute: dict | None = None
+    # ---- #278 Theme A: first-paint hydration latch ----
+    # ``True`` ONLY on data that is genuinely still being assembled — the
+    # cheap first-paint seed (``_dashboard_initial_snapshot`` on a normal
+    # launch) and A2's throttled partial republishes (set on a
+    # ``dataclasses.replace`` copy for the PUBLISH only, never dirtying the
+    # object the dispatch memo retains). Every path that yields
+    # complete/stable data leaves/forces it ``False``: a fresh full build is
+    # ``False`` for free (this default), and each ``dataclasses.replace``
+    # clone site that copies a prior snapshot's value (idle short-circuit,
+    # update-check republish, run-sync/settings republish) forces it back to
+    # ``False``. Serialized into the dashboard envelope by
+    # ``snapshot_to_envelope`` (additive key ``"hydrating"``); consumers
+    # tolerate unknown keys, and it appears in NO ``--json``/CLI surface.
+    # Placed LAST with a default so positional fixture constructors keep
+    # working.
+    hydrating: bool = False
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -2959,6 +2975,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         last_sync_error=("; ".join(errors) if errors else None),
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
+        # #278 §1.4.1: an idle snapshot means the data-version signature is
+        # unchanged (data stable) → force the hydration latch clear even if
+        # ``prior`` was a hydrating seed/partial.
+        hydrating=False,
     )
 
 
@@ -5189,8 +5209,11 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 # Mirror the startup override: suppress the monotonic sync
                 # stamp so the envelope keeps emitting sync_age_s=None and
                 # the client keeps rendering "sync paused" after the user
-                # hits r / clicks the sync chip.
-                snap = dataclasses.replace(snap, last_sync_at=None)
+                # hits r / clicks the sync chip. #278 §1.4.1: this build is a
+                # complete full snapshot — force the hydration latch clear
+                # (default False from _tui_build_snapshot, restated here since
+                # this is a replace() clone site).
+                snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
             ref.set(snap)
             hub.publish(snap)
         except Exception as exc:
@@ -5199,6 +5222,10 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 prev,
                 last_sync_error=f"sync crashed: {exc}",
                 generated_at=dt.datetime.now(dt.timezone.utc),
+                # #278 §1.4.1: a crash-carry snapshot is stable (not mid-
+                # assembly); clear the latch even if ``prev`` was a hydrating
+                # seed/partial, so the client doesn't stay stuck in skeletons.
+                hydrating=False,
             )
             ref.set(crashed)
             hub.publish(crashed)

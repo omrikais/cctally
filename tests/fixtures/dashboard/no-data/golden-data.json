@@ -85,6 +85,7 @@
     "vs_last_week_delta": null,
     "week_label": null
   },
+  "hydrating": false,
   "last_sync_at": null,
   "last_sync_error": null,
   "monthly": {
