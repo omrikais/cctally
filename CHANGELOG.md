@@ -11,6 +11,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The opt-in `CCTALLY_PERF_TRACE` backend trace now breaks whole-session conversation assembly into named sub-phases (read, dedup, build, correlate, fold, classify, cost, finalize) under the reader's detail/paginate phases, and the loopback `/api/debug/backend` diagnostic can now surface a conversation-open trace (list/search/outline/find/export/prompts/detail) as well as the data-snapshot build — so a slow transcript open is attributable to a specific stage on a live dashboard; off by default, no command output changes.
 - `cctally-bench --assembly-scan` (dev/maintainer tool): sweeps the cost of assembling a whole conversation across a size ladder against its own isolated fixture and baseline (`bench/baselines/assembly.json`), the measurement behind the recorded decision to defer materializing pre-rendered conversation turns — assembly stays well under a 100 ms visibility budget for all but pathologically large (multi-thousand-turn) sessions, and the reader already caps payload bytes. See [docs/backend-performance.md](docs/backend-performance.md) §5.
 
+### Changed
+- Conversation reader no longer re-processes an open conversation on every background refresh — it now recomputes only when the conversation actually grows, cutting idle CPU/battery use for anyone leaving a transcript open (#278).
+
 ## [1.64.0] - 2026-07-07
 
 ### Added
