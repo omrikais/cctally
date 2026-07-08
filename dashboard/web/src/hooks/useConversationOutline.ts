@@ -14,11 +14,18 @@ import type { ConversationOutline } from '../types/conversation';
 // growth); ComparisonView passes false so its two finished-run snapshots open
 // once and don't re-fetch on every dashboard tick (the comparison never
 // live-tails by design).
+// #278 Theme B — `growthNonce`/`live` are the shared live-tail signal (from
+// useConversationLiveTail via ConversationsView). When `live` (server actively
+// live-tailing), the per-tick revalidation is skipped and the outline refetches
+// only on a genuine growth push (`growthNonce`); when live-tail is off/passive,
+// the global tick stays as the fallback. Defaults keep pre-#278 behavior.
 export function useConversationOutline(
   sessionId: string | null,
-  opts?: { revalidateOnTick?: boolean },
+  opts?: { revalidateOnTick?: boolean; growthNonce?: number; live?: boolean },
 ) {
   const revalidateOnTick = opts?.revalidateOnTick ?? true;
+  const growthNonce = opts?.growthNonce ?? 0;
+  const live = opts?.live ?? false;
   const [outline, setOutline] = useState<ConversationOutline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -77,9 +84,21 @@ export function useConversationOutline(
     // #227 — skip the SSE-tick revalidation entirely when the caller opted out
     // (ComparisonView's static two-run snapshot). The initial-load effect above
     // is unaffected, so a non-revalidating caller still gets its first fetch.
+    // #278 — also skip the global tick while the server is actively live-tailing
+    // (`live`); growth arrives via growthNonce below. The tick stays a fallback
+    // when live-tail is off/passive.
+    if (revalidateOnTick && !live && outlineRef.current) void refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generatedAt, revalidateOnTick, live]);
+
+  // #278 — genuine per-conversation growth push → refetch the whole-session
+  // outline. (ComparisonView passes revalidateOnTick:false and no live-tail, so
+  // both effects stay inert for it.)
+  useEffect(() => {
+    if (growthNonce === 0) return;
     if (revalidateOnTick && outlineRef.current) void refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generatedAt, revalidateOnTick]);
+  }, [growthNonce]);
 
   return { outline, loading, error };
 }

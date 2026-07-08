@@ -129,6 +129,44 @@ describe('useConversationOutline', () => {
     expect(result.current.loading).toBe(false);
   });
 
+  it('with live=true, a generated_at tick does NOT refetch (#278)', async () => {
+    mockOnce(outline('s'));
+    const { result, rerender } = renderHook(
+      ({ live }) => useConversationOutline('s', { live }),
+      { initialProps: { live: true } });
+    await waitFor(() => expect(result.current.outline?.session_id).toBe('s'));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    // Two ticks while live-tailing: no refetch (growth arrives via growthNonce).
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender({ live: true }); await Promise.resolve(); });
+    mockGeneratedAt = 't2';
+    await act(async () => { rerender({ live: true }); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
+  it('a growthNonce bump refetches even while live (#278)', async () => {
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 1 } }));
+    const { result, rerender } = renderHook(
+      ({ nonce, live }) => useConversationOutline('s', { growthNonce: nonce, live }),
+      { initialProps: { nonce: 0, live: true } });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(1));
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } }));
+    await act(async () => { rerender({ nonce: 1, live: true }); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
+  });
+
+  it('with live=false, a generated_at tick still refetches (fallback)', async () => {
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 1 } }));
+    const { result, rerender } = renderHook(
+      ({ live }) => useConversationOutline('s', { live }),
+      { initialProps: { live: false } });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(1));
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } }));
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender({ live: false }); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
+  });
+
   it('drops a stale-session response when the session switched mid-fetch', async () => {
     // s1's fetch is held pending; we switch to s2 (resolves immediately) and
     // only THEN resolve s1. The stale s1 body must not land under s2.
