@@ -55,6 +55,65 @@ from _lib_conversation import (
     _strip_remote_control_prefix,
 )
 
+# ── Opt-in phase instrumentation (issue #276, Session C / M5) ────────────────
+# This kernel is imported DIRECTLY by several tests (tests/test_conversation_*),
+# NOT always through cctally._load_sibling, so it must NOT reach through
+# sys.modules["cctally"]._load_sibling("_lib_perf") (Codex F1 — that becomes
+# import-order dependent / KeyErrors when the kernel is loaded standalone). It
+# instead resolves the SHARED _lib_perf instance so the assemble.* sub-tree
+# nests under an endpoint / bench --trace root on the SAME thread-local stack:
+# an `import _lib_perf` first (a hit in sys.modules — set by the dashboard's
+# _perf_gate / bench pin / conftest — or resolvable via bin/ on sys.path), then
+# a __file__-relative path-load registered under "_lib_perf" so later importers
+# reuse it, then a no-op shim so a perf-import failure never breaks assembly.
+import importlib.util as _importlib_util
+import pathlib as _pathlib
+import sys as _sys
+
+
+class _PerfShim:
+    """No-op _lib_perf stand-in: phase() returns a context-manager no-op so the
+    kernel never hard-fails when the sibling is somehow unloadable."""
+
+    class _NullPhase:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def set_count(self, *_a):
+            pass
+
+        def set_meta(self, **_kw):
+            pass
+
+    def phase(self, *_a, **_k):
+        return self._NullPhase()
+
+
+_PERF = None
+
+
+def _perf():
+    """Return the shared _lib_perf collector (near-noop when tracing is off)."""
+    global _PERF
+    if _PERF is None:
+        try:
+            import _lib_perf as _mod
+            _PERF = _mod
+        except Exception:
+            try:
+                _p = _pathlib.Path(__file__).with_name("_lib_perf.py")
+                _spec = _importlib_util.spec_from_file_location("_lib_perf", _p)
+                _mod = _importlib_util.module_from_spec(_spec)
+                _sys.modules.setdefault("_lib_perf", _mod)
+                _spec.loader.exec_module(_mod)
+                _PERF = _mod
+            except Exception:
+                _PERF = _PerfShim()
+    return _PERF
+
 
 _TITLE_MAX = 120
 
@@ -1271,10 +1330,21 @@ def _assemble_session(conn, session_id):
     BY CONSTRUCTION (Codex F8 — one grouping pass, never two implementations).
     Returns None for an unknown session.
     """
+    # Opt-in phase instrumentation (issue #276 M5): an outer `assemble` root
+    # wrapping eight structural child seams. Explicit __enter__/__exit__ (not a
+    # `with` re-indent) so the existing body stays byte-for-byte unchanged; each
+    # stage is closed before the next opens, and the identity-aware Phase.__exit__
+    # makes the outer close survive the unknown-session early return. Near-noop
+    # when CCTALLY_PERF_TRACE is off (sp.phase() -> the shared _NULL_PHASE).
+    sp = _perf()
+    _root = sp.phase("assemble"); _root.__enter__()
+    _ph = sp.phase("assemble.read"); _ph.__enter__()
     exists = conn.execute(
         "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
         (session_id,)).fetchone()
     if exists is None:
+        _ph.__exit__(None, None, None)
+        _root.__exit__(None, None, None)
         return None
 
     # Pull the session ordered; dedup logical messages by (session_id, uuid),
@@ -1290,7 +1360,9 @@ def _assemble_session(conn, session_id):
         "       source_tool_use_id, stop_reason, attribution_skill, attribution_plugin "
         "FROM conversation_messages WHERE session_id=? "
         "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
+    _ph.set_count(len(raw)); _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.dedup"); _ph.__enter__()
     seen_uuid = set()
     logical = []   # canonical physical rows, in order
     for row in raw:
@@ -1299,7 +1371,9 @@ def _assemble_session(conn, session_id):
             continue
         seen_uuid.add(u)
         logical.append(row)
+    _ph.set_count(len(logical)); _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.build"); _ph.__enter__()
     # Group assistant fragments sharing (msg_id, req_id) into one turn item over
     # the WHOLE logical list — NOT by adjacency. Real tool-using transcripts
     # interleave a tool_result (a `user`/tool_result item) between fragments of
@@ -1353,7 +1427,9 @@ def _assemble_session(conn, session_id):
             items.append(it)
             if etype == "assistant":             # null-msg_id assistant: index its uses too
                 _index_tool_uses(it)
+    _ph.set_count(len(items)); _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.correlate"); _ph.__enter__()
     # ---- Subagent-kind correlation (#166); MUST run before Phase 2 fold ----
     # Reads AND strips (pop) the parser-only keys in one pass, so the returned
     # tool_call/tool_result block shapes are unchanged — the only new output is
@@ -1473,7 +1549,9 @@ def _assemble_session(conn, session_id):
         _entry["parent_subagent_key"] = _owner["subagent_key"]
         _entry["spawn_uuid"] = _owner["anchor"]["uuid"]
         _entry["spawn_tool_use_id"] = _tuid
+    _ph.set_meta(subagents=len(subagent_meta)); _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.fold"); _ph.__enter__()
     # ---- Phase 2: fold each tool_result item into its owning assistant item ----
     drop = set()                                 # id() of folded placeholder items
     for tr in tool_result_items:
@@ -1545,7 +1623,9 @@ def _assemble_session(conn, session_id):
 
     # ---- Phase 3b: fold the Task* op stream into per-run checklist snapshots ----
     _fold_task_runs(items, task_link)
+    _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.classify"); _ph.__enter__()
     # ---- Phase 4: classify injected meta items (skill / command / context) ----
     # `meta` rows (the parser's isMeta classification) AND — only while the 005
     # reingest is still pending — not-yet-reingested `human` rows whose body is a
@@ -1620,7 +1700,16 @@ def _assemble_session(conn, session_id):
         _skill_drop.add(id(it))
     if _skill_drop:
         items = [it for it in items if id(it) not in _skill_drop]
+    _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.cost"); _ph.__enter__()
+    # DB-read shape (Codex F4): _turn_cost_map / _turn_usage_map each chunk their
+    # session_entries reads at 400 keys, so a big session is many SELECTs in the
+    # cost stage, not two. Record the key count + both chunk counts.
+    _turn_keys = len(turn_index)
+    _cost_chunks = (_turn_keys + 399) // 400 if _turn_keys else 0
+    _ph.set_meta(turn_keys=_turn_keys, cost_chunks=_cost_chunks,
+                 usage_chunks=_cost_chunks)
     costs = _turn_cost_map(conn, list(turn_index))
     # #177: per-turn token usage from the SAME deduped session_entries row cost
     # uses (a separate map; _turn_cost_map is unchanged for the search path).
@@ -1646,7 +1735,9 @@ def _assemble_session(conn, session_id):
             del it["_req_id"]
             it.pop("_has_prose", None)
     header_cost = round(header_cost, 6)
+    _ph.__exit__(None, None, None)
 
+    _ph = sp.phase("assemble.finalize"); _ph.__enter__()
     # §4 1c — async completion. A background subagent's launch result carries
     # status:"async_launched" and NO totals; completion arrives as a separate
     # <task-notification> meta row (text populated by Phase 4). Join it back, and
@@ -1712,6 +1803,7 @@ def _assemble_session(conn, session_id):
     # order-dependent). Healthy turns get no key (absent, not zero). Shared
     # assembly -> the flag reaches BOTH the reader detail and the outline.
     _stamp_cache_failures(items)
+    _ph.set_count(len(items)); _ph.__exit__(None, None, None)
 
     # Strip the internal Phase-4b threading key from EVERY item (meta/human items
     # carry it too, not just assistant turns) so it never surfaces in the public
@@ -1719,6 +1811,7 @@ def _assemble_session(conn, session_id):
     for it in items:
         it.pop("_source_tool_use_id", None)
 
+    _root.__exit__(None, None, None)
     return {"items": items, "logical": logical,
             "subagent_meta": subagent_meta, "header_cost": header_cost}
 
@@ -1745,8 +1838,18 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     if sum(1 for x in (after is not None, before is not None, bool(tail)) if x) > 1:
         raise ValueError("after/before/tail are mutually exclusive")
     limit = max(1, min(int(limit), 1000))
+    # Reader-path phases (#276 M5): an outer `conversation.detail` (cursor meta)
+    # nesting the `assemble` sub-tree, plus a `conversation.paginate` child over
+    # the page slice. Explicit __enter__/__exit__ so the multiple early returns
+    # each close cleanly. Near-noop when tracing is off.
+    _rp = _perf()
+    _det = _rp.phase("conversation.detail"); _det.__enter__()
+    _det.set_meta(cursor=("after" if after is not None else
+                          "before" if before is not None else
+                          "tail" if tail else "none"))
     asm = _assemble_session(conn, session_id)
     if asm is None:
+        _det.__exit__(None, None, None)
         return None
     items = asm["items"]
     logical = asm["logical"]
@@ -1812,12 +1915,14 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     elif before is not None:
         b = _idx(before)
         if b is None:                       # stale cursor → empty page (M1)
+            _det.__exit__(None, None, None)
             return _stale_empty_page()
         end = b
         start = max(0, end - limit)
     elif after is not None:
         a = _idx(after)
         if a is None:                       # stale cursor → empty page (M1)
+            _det.__exit__(None, None, None)
             return _stale_empty_page()
         start = a + 1
         end = min(start + limit, N)
@@ -1825,6 +1930,7 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
         start = 0
         end = min(limit, N)
 
+    _pg = _rp.phase("conversation.paginate"); _pg.__enter__()
     page = items[start:end]
     has_more = end < N
     has_prev = start > 0
@@ -1845,12 +1951,14 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
         for b in it["blocks"]:
             if b.get("kind") in ("text", "thinking") and b.get("text"):
                 b["text"] = _strip_ansi(b["text"])
+    _pg.set_count(len(page)); _pg.__exit__(None, None, None)
 
     first = logical[0]
     last = logical[-1]
     # #243: main-session models first (r[6]=model, r[12]=source_path,
     # r[9]=is_sidechain) so opus outranks a haiku subagent, not sorted().
     models = _models_main_first((r[6], r[12], r[9]) for r in logical)
+    _det.__exit__(None, None, None)
     return {
         "session_id": session_id,
         "title": _title,
