@@ -50,6 +50,11 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
 export function TrendPanel() {
   const env = useSnapshot();
   const data = buildTrendSparkData(env);
+  // #278 Theme A (ui-qa P3): header sub-label predicate — while hydrating with
+  // no rows yet the sub-label reads "(loading)" instead of the misleading
+  // "(0 weeks)" final-state copy (mirrors CacheReportPanel's header). Same
+  // hydrating+empty condition the body's skeleton branch uses below.
+  const hydratingEmpty = !!env?.hydrating && data.length === 0;
   const trendOverride = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.trendSortOverride,
@@ -83,7 +88,7 @@ export function TrendPanel() {
           <use href="/static/icons.svg#bar-chart" />
         </svg>
         <h2>
-          $/1% Trend <span className="sub">({data.length} week{data.length === 1 ? '' : 's'})</span>
+          $/1% Trend <span className="sub">{hydratingEmpty ? '(loading)' : `(${data.length} week${data.length === 1 ? '' : 's'})`}</span>
         </h2>
         <div className="panel-header-actions">
           <ShareIcon

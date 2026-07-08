@@ -80,6 +80,11 @@ export function SessionsPanel() {
     [oneModel, transcriptsOn, display.offsetLabel],
   );
   const filtered = getRenderedRows();
+  // #278 Theme A (ui-qa P3): header sub-label predicate — while hydrating with
+  // no rows yet the sub-label reads "(loading)" instead of the misleading
+  // "(0 total)" final-state copy (mirrors CacheReportPanel's header). Same
+  // hydrating+empty condition the body's skeleton branch uses below.
+  const hydratingEmpty = !!env?.hydrating && filtered.length === 0;
   // Match indices (as produced by the store's _recomputeSearch) are
   // positions into `filtered` — the exact same array we paint below —
   // so the rendered .search-match rows align with n/N navigation.
@@ -130,7 +135,7 @@ export function SessionsPanel() {
             <use href="/static/icons.svg#clock" />
           </svg>
           <h2>
-            Recent Sessions <span className="sub">({total} total)</span>
+            Recent Sessions <span className="sub">{hydratingEmpty ? '(loading)' : `(${total} total)`}</span>
           </h2>
           {oneModel && (
             <span className="sess-model-caption" title={`All sessions use ${oneModelRaw}`}>

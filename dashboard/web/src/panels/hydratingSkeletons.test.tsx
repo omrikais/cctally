@@ -7,6 +7,7 @@ import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ProjectsPanel } from './ProjectsPanel';
 import { SessionsPanel } from './SessionsPanel';
+import { TrendPanel } from './TrendPanel';
 import { _resetForTests, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
 
@@ -46,7 +47,10 @@ describe('per-panel hydrating skeletons (#278)', () => {
   it('ProjectsPanel renders a loading skeleton (not the "restart" copy) when hydrating and unavailable', () => {
     updateSnapshot({ ...baseEnvelope(), hydrating: true });
     render(<ProjectsPanel />);
-    expect(screen.getByText(/Loading/i)).toBeInTheDocument();
+    // Target the skeleton's role="status" element specifically: the header
+    // sub-label now also reads "(loading)" (matches /Loading/i), so a text
+    // query would find two elements.
+    expect(screen.getByRole('status')).toBeInTheDocument();
     expect(screen.queryByText(/restart the dashboard/i)).toBeNull();
     expect(screen.queryByText(/Projects data unavailable/i)).toBeNull();
   });
@@ -61,12 +65,101 @@ describe('per-panel hydrating skeletons (#278)', () => {
   it('SessionsPanel renders a loading skeleton when hydrating and no sessions', () => {
     updateSnapshot({ ...baseEnvelope(), hydrating: true });
     render(<SessionsPanel />);
-    expect(screen.getByText(/Loading/i)).toBeInTheDocument();
+    // role="status" targets the skeleton specifically — the header sub-label
+    // now also reads "(loading)" (matches /Loading/i).
+    expect(screen.getByRole('status')).toBeInTheDocument();
   });
 
   it('SessionsPanel does NOT render a skeleton when not hydrating (empty is a real steady state)', () => {
     updateSnapshot({ ...baseEnvelope(), hydrating: false });
     render(<SessionsPanel />);
+    expect(screen.queryByRole('status')).toBeNull();
     expect(screen.queryByText(/Loading/i)).toBeNull();
+  });
+});
+
+// #278 Theme A (ui-qa P3) — hydration-aware panel HEADERS. During the cheap
+// first-paint seed the Projects / Trend / Sessions header sub-labels used to
+// show their final-state copy ("(unavailable)" / "(0 weeks)" / "(0 total)"),
+// which reads as a broken instance. They must mirror CacheReportPanel and show
+// "(loading)" while hydrating+empty, then flip to the real count once hydrated.
+// The literal parens target the header sub-span specifically (PanelSkeleton's
+// body copy is "Loading…", no parens).
+describe('per-panel hydrating headers (#278)', () => {
+  it('ProjectsPanel header shows "(loading)" (not "(unavailable)") when hydrating and empty', () => {
+    updateSnapshot({ ...baseEnvelope(), hydrating: true });
+    render(<ProjectsPanel />);
+    expect(screen.getByText('(loading)')).toBeInTheDocument();
+    expect(screen.queryByText('(unavailable)')).toBeNull();
+  });
+
+  it('ProjectsPanel header shows the real count when hydrated', () => {
+    updateSnapshot({
+      ...baseEnvelope(),
+      hydrating: false,
+      projects: {
+        current_week: {
+          week_label: 'wk May 13',
+          week_start_date: null,
+          week_start_at: null,
+          total_cost_usd: 10,
+          rows: [
+            {
+              key: 'proj-a',
+              bucket_path: '/proj-a',
+              cost_usd: 10,
+              attributed_pct: 100,
+              sessions_count: 1,
+            },
+          ],
+        },
+        trend: { window_weeks: 12, weeks: [], projects: [] },
+      },
+    });
+    render(<ProjectsPanel />);
+    expect(screen.getByText('(1 this week)')).toBeInTheDocument();
+    expect(screen.queryByText('(loading)')).toBeNull();
+  });
+
+  it('TrendPanel header shows "(loading)" (not "(0 weeks)") when hydrating and empty', () => {
+    updateSnapshot({ ...baseEnvelope(), hydrating: true });
+    render(<TrendPanel />);
+    expect(screen.getByText('(loading)')).toBeInTheDocument();
+    expect(screen.queryByText(/0 weeks/i)).toBeNull();
+  });
+
+  it('TrendPanel header shows the real week count when hydrated', () => {
+    updateSnapshot({
+      ...baseEnvelope(),
+      hydrating: false,
+      trend: {
+        weeks: [
+          { label: 'w1', used_pct: 10, dollar_per_pct: 1, delta: null, is_current: true },
+        ],
+        spark_heights: [1],
+        history: [],
+      },
+    });
+    render(<TrendPanel />);
+    expect(screen.getByText('(1 week)')).toBeInTheDocument();
+    expect(screen.queryByText('(loading)')).toBeNull();
+  });
+
+  it('SessionsPanel header shows "(loading)" (not "(0 total)") when hydrating and empty', () => {
+    updateSnapshot({ ...baseEnvelope(), hydrating: true });
+    render(<SessionsPanel />);
+    expect(screen.getByText('(loading)')).toBeInTheDocument();
+    expect(screen.queryByText(/0 total/i)).toBeNull();
+  });
+
+  it('SessionsPanel header shows the real total when hydrated', () => {
+    updateSnapshot({
+      ...baseEnvelope(),
+      hydrating: false,
+      sessions: { total: 2, sort_key: 'started_desc', rows: [] },
+    });
+    render(<SessionsPanel />);
+    expect(screen.getByText('(2 total)')).toBeInTheDocument();
+    expect(screen.queryByText('(loading)')).toBeNull();
   });
 });

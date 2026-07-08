@@ -5215,10 +5215,12 @@ def _make_a2_progress_cb(*, ref, hub, build_partial, throttle, monotonic,
 
     On proceed it builds a partial via ``build_partial()`` (a fresh, complete
     ``skip_sync=True`` snapshot over the current committed cache — NOT nested in
-    another build), stores the clean non-hydrating object on ``ref`` and in the
-    dispatch memo, and publishes a ``hydrating=True`` COPY over the hub (§1.4.1
-    shared-object-leak: only the publish carries the latch, so the memo's
-    retained object stays clean). Suppressed entirely while perf tracing is
+    another build) and stores the clean non-hydrating object on ``ref``, then
+    publishes a ``hydrating=True`` COPY over the hub (§1.4.1 shared-object-leak:
+    only the publish carries the latch, so the memo's retained object stays
+    clean). The dispatch-memo write itself happens inside ``build_partial()`` /
+    ``_tui_build_snapshot`` (its snapshot-cache reconcile step), NOT in this cb.
+    Suppressed entirely while perf tracing is
     active (spec §2.2): progressive fill is a UX nicety, and a partial build's
     ``_perf.reset_thread`` would clobber the standalone ``sync_cache``'s
     in-flight trace phases. Trace-off (all normal use) is unaffected.
@@ -5292,6 +5294,13 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 )
                 cache_conn = _cctally().open_cache_db()
                 try:
+                    # Under CCTALLY_PERF_TRACE the phase tree this standalone
+                    # sync_cache builds is intentionally NOT surfaced in the live
+                    # dashboard trace: the final _build(skip_sync=True) below runs
+                    # _tui_build_snapshot, which resets the thread perf stack, so
+                    # these phases never reach an emitter. §0's trace-attribution
+                    # target is `cctally-bench --trace`, which builds directly
+                    # (no decoupled standalone ingest) and keeps its phase tree.
                     sync_cache(cache_conn, progress=cb)
                 except Exception as exc:  # noqa: BLE001 — surfaced on the snap
                     sync_error = f"sync-cache: {exc}"

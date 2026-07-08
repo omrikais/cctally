@@ -436,3 +436,34 @@ def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
         env_direct, sort_keys=True
     )
     assert decoupled.hydrating is False
+
+
+def test_a2_decouple_threads_sync_cache_error(monkeypatch, tmp_path):
+    # A raising standalone sync_cache in the decoupled skip_sync=False path must
+    # surface on the merged last_sync_error with the `sync-cache:` prefix —
+    # matching the INTERNAL _tui_build_snapshot(skip_sync=False) error surface
+    # (its `sync` phase records errors[0] = f"sync-cache: {exc}"). This locks the
+    # sync-error-threading parity: decoupling the ingest must not change the
+    # error wording the UI sees.
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+
+    def boom_sync(conn, *, progress=None, **kw):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setitem(ns, "sync_cache", boom_sync)
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=EMPTY_NOW, display_tz_pref_override=None,
+    )
+    locked(skip_sync=False)
+    # boom_sync raises before firing any partial → exactly one (final) publish.
+    assert len(hub.published) == 1
+    published = hub.published[-1]
+    assert published.last_sync_error is not None
+    assert published.last_sync_error.startswith("sync-cache: ")
+    assert "disk gone" in published.last_sync_error
+    # The final build still completed and cleared the hydration latch — the sync
+    # error is threaded through, not fatal.
+    assert published.hydrating is False

@@ -31,6 +31,11 @@ export function ProjectsPanel() {
   // still null / empty; show a loading skeleton instead of the "restart the
   // dashboard" / "no activity" copy, which would wrongly imply a broken instance.
   const hydrating = !!env?.hydrating;
+  // #278 Theme A (ui-qa P3): mirror CacheReportPanel's header — while hydrating
+  // with no data yet, the sub-label reads "(loading)" instead of the misleading
+  // final-state "(unavailable)" (which re-implies a broken instance) or
+  // "(0 this week)". Flips off automatically once the panel hydrates.
+  const showLoadingSub = hydrating && rows.length === 0;
 
   // ShareIcon + PanelGrip render in BOTH the populated and the
   // unavailable-envelope branches per spec §2.6 ("ShareIcon still
@@ -46,7 +51,11 @@ export function ProjectsPanel() {
         <h2>
           Projects{' '}
           <span className="sub">
-            {isUnavailable ? '(unavailable)' : `(${rows.length} this week)`}
+            {showLoadingSub
+              ? '(loading)'
+              : isUnavailable
+                ? '(unavailable)'
+                : `(${rows.length} this week)`}
           </span>
         </h2>
       </div>
