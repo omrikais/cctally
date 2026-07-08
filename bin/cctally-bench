@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""In-process backend benchmark runner (issue #276, M3 / Session B).
+
+Times the backend hot paths against a deterministic synthetic fixture and
+prints a human table / ``--json``; ``--compare``/``--gate`` diff a run against
+the committed advisory baseline. A dev / maintainer tool (like
+``bin/cctally-release``), NOT a ``cctally`` subcommand — it never ships to npm
+and is never wired into ``cctally-test-all`` (the self-test
+``bin/cctally-bench-test`` is; it asserts structure only, never timings).
+
+Six benchmark families (14 benchmarks) exercise the #268-#275 perf wins:
+  1. snapshot spine  — _tui_build_snapshot cold / warm / idle (precompute_envelope)
+  2. ingest          — sync_cache no-op over many files + a one-file delta
+  3. conversations   — list_conversations page1 / sorted / filtered
+  4. search / find   — search_conversations cross-session + find_in_conversation
+  5. payload/outline — _assemble_session + get_conversation_outline (measure-only)
+  6. warm reconciles — projects-envelope + cache-report reconcile helpers
+
+The runner is a PURE CONSUMER: every call is the real read/build path against
+the isolated fixture. It adds no timing hooks inside the modules (Session A's
+M2 phase collector already did that) and changes no semantics of the code
+under test. ``--trace`` flips the M2 collector on per body and captures its
+phase sub-tree, so the bench and /api/debug/backend speak one phase vocabulary.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import platform
+import statistics
+import sys
+import time
+
+# ── Tunable constants (documented in bench/README.md; tune after first run) ──
+BENCH_TOLERANCE_PCT = 0.15        # proportional regression tolerance
+BENCH_TOLERANCE_FLOOR_MS = 15.0   # absolute floor (same-machine run-to-run noise)
+DEFAULT_ITERATIONS = 5            # first discarded as warmup, median of the rest
+DEFAULT_SEED = 42
+DEFAULT_SCALE = "large"
+SCHEMA_VERSION = 1
+
+_BIN_DIR = pathlib.Path(__file__).resolve().parent
+BASELINE_PATH = _BIN_DIR.parent / "bench" / "baselines" / "backend.json"
+
+# Process-local accelerator caches reset for a COLD snapshot build — the set
+# the production self-heal path (_dashboard_self_heal_orphans) resets.
+_COLD_RESETS = (
+    "reset_dispatch_state",
+    "reset_group_a_state",
+    "reset_group_a_current_state",
+    "reset_session_cache_state",
+    "reset_doctor_memo",
+    "reset_weekref_cost_state",
+    "reset_projects_env_state",
+    "reset_projects_env_current_state",
+    "reset_bugk_segment_state",
+    "reset_cache_report_state",
+)
+
+
+# ── loaders ──────────────────────────────────────────────────────────────
+
+def _load_gen():
+    """Path-load the sibling generator (hyphenated filename)."""
+    path = _BIN_DIR / "build-bench-fixtures.py"
+    loader = importlib.machinery.SourceFileLoader("build_bench_fixtures", str(path))
+    spec = importlib.util.spec_from_loader("build_bench_fixtures", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _pin_and_import(data_dir, claude_dir):
+    """Pin BOTH env axes before loading cctally (paths captured at import), then
+    re-resolve the path globals so the process targets THIS scratch dir."""
+    os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(claude_dir)
+    os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    if str(_BIN_DIR) not in sys.path:
+        sys.path.insert(0, str(_BIN_DIR))
+    # Reuse the generator's extensionless-cctally loader so both halves share
+    # ONE sys.modules["cctally"] instance.
+    cctally = _load_gen().load_cctally()
+    cctally._cctally_core._init_paths_from_env()
+    perf = cctally._load_sibling("_lib_perf")
+    return cctally, perf
+
+
+# ── timing loop ──────────────────────────────────────────────────────────
+
+def time_body(fn, iterations):
+    """Run ``fn`` ``iterations + 1`` times, discard the first (warmup), and
+    return ``(median_ms, min_ms, max_ms, last_return)``."""
+    samples = []
+    last = None
+    for i in range(iterations + 1):
+        t0 = time.perf_counter()
+        last = fn()
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        if i > 0:
+            samples.append(dt_ms)
+    return statistics.median(samples), min(samples), max(samples), last
+
+
+def _reset_perf(perf):
+    perf.set_enabled(False)
+    perf.reset_thread()
+    perf._LAST_BACKEND_PERF = None
+
+
+def _capture_phases(name, body, perf, has_own_root):
+    """Run ``body`` once with the M2 collector on and return its phase tree.
+
+    Bodies with their own root phase (``_tui_build_snapshot`` opens ``snapshot``
+    and calls ``reset_thread`` itself) run bare; the rest are wrapped in an
+    outer ``perf.phase(name)`` so a direct ``sync_cache`` / query call still
+    produces a captured tree (spec §4.2 tracing mechanics)."""
+    perf.set_enabled(True)
+    perf.reset_thread()
+    try:
+        if has_own_root:
+            body()
+        else:
+            with perf.phase(name):
+                body()
+        root = perf.current_root()
+        return root.to_dict() if root is not None else None
+    finally:
+        _reset_perf(perf)
+
+
+# ── benchmark registry ───────────────────────────────────────────────────
+
+def _make_benchmarks(cctally, perf):
+    """Build the registry. Returns ``(benchmarks, cleanup)`` where each
+    benchmark is ``(name, body, has_own_root, count_of)`` and ``cleanup`` closes
+    the shared read connection."""
+    sc = cctally._load_sibling("_lib_snapshot_cache")
+    cr = cctally._load_sibling("_lib_cache_report")
+    cq = cctally._load_sibling("_lib_conversation_query")
+
+    # Shared read connection for the query families (read-only; reused across
+    # iterations to isolate query cost from connection-open cost).
+    read_conn = cctally.open_cache_db()
+
+    def _scalar(sql, params=()):
+        row = read_conn.execute(sql, params).fetchone()
+        return row[0] if row else None
+
+    large_sid = _scalar(
+        "SELECT session_id FROM conversation_sessions "
+        "ORDER BY msg_count DESC, session_id LIMIT 1"
+    )
+    proj_label = _scalar(
+        "SELECT project_label FROM conversation_sessions "
+        "WHERE project_label IS NOT NULL AND project_label != '' "
+        "ORDER BY session_id LIMIT 1"
+    )
+    delta_path = _scalar(
+        "SELECT path FROM session_files ORDER BY size_bytes ASC, path LIMIT 1"
+    )
+    num_files = _scalar("SELECT COUNT(*) FROM session_files") or 0
+
+    # ── family 1: snapshot spine ──
+    def _snapshot():
+        return cctally._tui_build_snapshot(
+            skip_sync=True, precompute_envelope=True, runtime_bind=None
+        )
+
+    def _reset_cold():
+        sc.bump_generation()
+        for fn_name in _COLD_RESETS:
+            getattr(sc, fn_name)()
+
+    def snapshot_cold():
+        _reset_cold()
+        return _snapshot()
+
+    def snapshot_warm():
+        sc.bump_generation()            # move the signature → full rebuild
+        return _snapshot()
+
+    def snapshot_idle():
+        return _snapshot()              # unchanged signature → reuse (near-zero)
+
+    # ── family 2: ingest ──
+    def sync_noop():
+        conn = cctally.open_cache_db()
+        try:
+            return cctally.sync_cache(conn)
+        finally:
+            conn.close()
+
+    def sync_delta():
+        conn = cctally.open_cache_db()
+        try:
+            if delta_path:
+                # Reset the file's ingest cursor so this one file re-ingests
+                # from offset 0 each call (idempotent UPSERT — no duplication,
+                # semantic content stable); measures single-file delta cost.
+                conn.execute("DELETE FROM session_files WHERE path=?", (delta_path,))
+                conn.commit()
+                return cctally.sync_cache(conn, only_paths={delta_path})
+            return cctally.sync_cache(conn)
+        finally:
+            conn.close()
+
+    # ── family 3: conversations rail ──
+    def conv_page1():
+        return cq.list_conversations(read_conn, sort="recent", limit=50, offset=0)
+
+    def conv_sorted():
+        return cq.list_conversations(read_conn, sort="cost", limit=50, offset=0)
+
+    def conv_filtered():
+        return cq.list_conversations(
+            read_conn, sort="recent", limit=50, offset=0,
+            projects=[proj_label] if proj_label else None,
+            date_from="2025-01-01",
+        )
+
+    # ── family 4: search / find ──
+    def search_cross():
+        return cq.search_conversations(read_conn, "benchmark", limit=50)
+
+    def find_in_conv():
+        return cq.find_in_conversation(read_conn, large_sid, "benchmark")
+
+    # ── family 5: payload / outline (measurement-only) ──
+    def payload_assemble():
+        return cq._assemble_session(read_conn, large_sid)
+
+    def outline_build():
+        return cq.get_conversation_outline(read_conn, large_sid)
+
+    # ── family 6: warm reconciles ──
+    raw_config = cctally.load_config()
+    display_tz = cctally._resolve_display_tz_obj(
+        cctally._apply_display_tz_override(raw_config, None)
+    )
+    bucket_tz = cr._resolve_bucket_tz(display_tz)
+    tz_key = str(display_tz)
+
+    def _dispatch_sig():
+        stats_conn = cctally.open_db()
+        try:
+            return cctally._cctally_tui._tui_compute_dispatch_signature(stats_conn)
+        finally:
+            stats_conn.close()
+
+    # Prime the two reconcile caches cold once (untimed) so the warmup call is
+    # the cold-record path and the measured iterations are warm/idempotent.
+    sc.reset_projects_env_state()
+    sc.reset_projects_env_current_state()
+    sc.reset_cache_report_state()
+
+    def reconcile_projects_env():
+        sig = _dispatch_sig()
+        conn = cctally.open_cache_db()
+        try:
+            sc.reconcile_projects_env_cache(
+                conn,
+                max_entry_id=sig.max_entry_id,
+                max_mutation_seq=sig.entry_mutation_seq,
+                max_wus_id=sig.max_wus_id,
+                sf_sig=sc.session_files_sig(conn),
+            )
+        finally:
+            conn.close()
+
+    def reconcile_cache_report():
+        sig = _dispatch_sig()
+        conn = cctally.open_cache_db()
+        try:
+            sc.reconcile_cache_report_cache(
+                conn,
+                max_entry_id=sig.max_entry_id,
+                max_mutation_seq=sig.entry_mutation_seq,
+                reset_sig=sig.reset_sig,
+                sf_sig=sc.session_files_sig(conn),
+                bucket_tz=bucket_tz,
+                tz_key=tz_key,
+            )
+        finally:
+            conn.close()
+
+    def _len_conversations(r):
+        return len(r["conversations"]) if isinstance(r, dict) else None
+
+    def _total(r):
+        return r.get("total") if isinstance(r, dict) else None
+
+    benchmarks = [
+        ("snapshot.cold", snapshot_cold, True, None),
+        ("snapshot.warm", snapshot_warm, True, None),
+        ("snapshot.idle", snapshot_idle, True, None),
+        ("sync.noop", sync_noop, False, lambda r: num_files),
+        ("sync.delta", sync_delta, False, lambda r: 1 if delta_path else 0),
+        ("conversations.page1", conv_page1, False, _len_conversations),
+        ("conversations.sorted", conv_sorted, False, _len_conversations),
+        ("conversations.filtered", conv_filtered, False, _len_conversations),
+        ("search.cross_session", search_cross, False, _total),
+        ("find.in_conversation", find_in_conv, False,
+         lambda r: (r or {}).get("total")),
+        ("payload.assemble", payload_assemble, False, None),
+        ("outline.build", outline_build, False, None),
+        ("reconcile.cache_report", reconcile_cache_report, False, None),
+        ("reconcile.projects_env", reconcile_projects_env, False, None),
+    ]
+
+    def cleanup():
+        try:
+            read_conn.close()
+        except Exception:
+            pass
+
+    return benchmarks, cleanup
+
+
+def _machine_label():
+    return f"{platform.system()}-{platform.machine()}".lower()
+
+
+def _bench_version(cctally):
+    try:
+        v = cctally._share_resolve_version()
+        if v:
+            return v
+    except Exception:
+        pass
+    return "unknown"
+
+
+def run_all(*, scale, seed, iterations, trace, root=None,
+            data_dir=None, claude_dir=None):
+    """Build/reuse the fixture (or use the operator-supplied realism roots),
+    time every registered benchmark, and return the ``--json`` result dict."""
+    gen = _load_gen()
+    if data_dir is not None and claude_dir is not None:
+        data_dir = pathlib.Path(data_dir)
+        claude_dir = pathlib.Path(claude_dir)
+    else:
+        if root is None:
+            raise ValueError("run_all requires root= unless data_dir+claude_dir given")
+        data_dir = gen.build_fixture(scale=scale, seed=seed, root=root)
+        claude_dir = pathlib.Path(root) / "claude"
+
+    cctally, perf = _pin_and_import(data_dir, claude_dir)
+
+    conn = cctally.open_cache_db()
+    try:
+        dcounts = gen.dataset_counts(conn)
+    finally:
+        conn.close()
+
+    benchmarks, cleanup = _make_benchmarks(cctally, perf)
+    results = {}
+    try:
+        for name, body, has_own_root, count_of in benchmarks:
+            _reset_perf(perf)
+            median, mn, mx, last = time_body(body, iterations)
+            count = None
+            if count_of is not None:
+                try:
+                    count = count_of(last)
+                except Exception:
+                    count = None
+            entry = {
+                "median_ms": round(median, 4),
+                "min_ms": round(mn, 4),
+                "max_ms": round(mx, 4),
+                "count": count,
+                "bytes": None,
+                "phases": None,
+            }
+            if trace:
+                entry["phases"] = _capture_phases(name, body, perf, has_own_root)
+            results[name] = entry
+    finally:
+        _reset_perf(perf)
+        cleanup()
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "cctally_version": _bench_version(cctally),
+        "machine_label": _machine_label(),
+        "scale": scale,
+        "seed": seed,
+        "dataset_counts": dcounts,
+        "benchmarks": results,
+    }
+
+
+# ── output ───────────────────────────────────────────────────────────────
+
+def _fmt_ms(v):
+    return f"{v:.1f}ms"
+
+
+def render_table(result) -> str:
+    lines = []
+    dc = result["dataset_counts"]
+    lines.append(
+        f"backend bench · cctally {result['cctally_version']} · "
+        f"scale={result['scale']} · seed={result['seed']} · "
+        f"machine={result['machine_label']}"
+    )
+    lines.append(
+        f"dataset: {dc['sessions']:,} sessions · {dc['entries']:,} entries · "
+        f"{dc['messages']:,} messages"
+    )
+    lines.append("─" * 62)
+    lines.append(f"{'benchmark':<26}{'median':>10}  {'range':>16}  {'count':>8}")
+    for name, b in result["benchmarks"].items():
+        rng = f"{b['min_ms']:.1f}–{b['max_ms']:.1f}ms"
+        count = "—" if b["count"] is None else f"{b['count']:,}"
+        lines.append(f"{name:<26}{_fmt_ms(b['median_ms']):>10}  {rng:>16}  {count:>8}")
+    return "\n".join(lines)
+
+
+# ── compare / gate (Task 3) ──────────────────────────────────────────────
+# Implemented in Task 3.
+
+
+def _resolve_root(args):
+    if args.root:
+        return pathlib.Path(args.root).expanduser()
+    env_data = os.environ.get("CCTALLY_DATA_DIR", "").strip()
+    if env_data:
+        return pathlib.Path(env_data).expanduser().parent
+    import tempfile
+    return (pathlib.Path(tempfile.gettempdir()) / "cctally-bench"
+            / f"{args.scale}-seed{args.seed}")
+
+
+def _build_parser():
+    ap = argparse.ArgumentParser(
+        description="In-process backend benchmark runner (issue #276, M3)."
+    )
+    ap.add_argument("--scale", choices=("small", "large"), default=DEFAULT_SCALE)
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
+    ap.add_argument("--trace", action="store_true",
+                    help="capture the M2 phase sub-tree per benchmark.")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--root", default=None,
+                    help="scratch root for the synthetic fixture.")
+    ap.add_argument("--data-dir", default=None,
+                    help="realism mode: an operator-COPIED CCTALLY_DATA_DIR.")
+    ap.add_argument("--claude-dir", default=None,
+                    help="realism mode: an operator-COPIED Claude root.")
+    ap.add_argument("--compare", action="store_true",
+                    help="diff against the committed baseline (advisory, exit 0).")
+    ap.add_argument("--gate", action="store_true",
+                    help="like --compare but exit non-zero on regression/missing.")
+    ap.add_argument("--update-baseline", action="store_true", dest="update_baseline",
+                    help="rerun and overwrite bench/baselines/backend.json.")
+    return ap
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    root = _resolve_root(args)
+    result = run_all(
+        scale=args.scale, seed=args.seed, iterations=args.iterations,
+        trace=args.trace, root=root,
+        data_dir=args.data_dir, claude_dir=args.claude_dir,
+    )
+    # --compare / --gate / --update-baseline are wired in Task 3.
+    if args.as_json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_table(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
