@@ -4482,6 +4482,21 @@ def test_memo_misses_on_growth():
     assert second is not first         # watermark changed -> miss
 
 
+def test_memo_misses_on_shrink():
+    # AC4 (#278): prune/shrink -> different key -> miss. Same key mechanism as
+    # growth, opposite direction; pinned explicitly (review Minor #3).
+    c = _conn(); _seed_memo_session(c)
+    _append_message_and_bump_rollup(c)              # now 2 assistant turns
+    cq._assemble_memo_clear()
+    first = cq._assemble_session_memoized(c, _MEMO_SID)
+    c.execute("DELETE FROM conversation_messages WHERE session_id=? AND uuid=?",
+              (_MEMO_SID, f"{_MEMO_SID}-a2"))         # prune the appended turn
+    cc._recompute_conversation_sessions(c)
+    c.commit()
+    second = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert second is not first         # msg_count/last_activity shrank -> miss
+
+
 def test_memo_misses_on_entry_mutation_seq_bump():
     c = _conn(); _seed_memo_session(c)
     cq._assemble_memo_clear()
@@ -4570,6 +4585,49 @@ def test_get_conversation_does_not_mutate_cached_asm(monkeypatch):
     # RETURNED page's copies are stamped, never the shared/cacheable asm items.
     assert all(it["anchor"]["session_id"] is None
                for it in captured["asm"]["items"])
+
+
+def test_get_conversation_page_copy_strips_ansi_without_mutating_cached_blocks(monkeypatch):
+    # Codex review Minor #2 (#278): pin the BLOCK-text half of the page copy
+    # NON-VACUOUSLY. The prior mutation test only proved the anchor.session_id
+    # stamp (fixtures had no ANSI), so a revert of just the block-text copy would
+    # pass. Seed an assistant turn whose text/thinking BLOCKS carry raw SGR: the
+    # returned page must be ANSI-stripped while the cached asm keeps the raw bytes.
+    c = _conn()
+    RAW = "\x1b[31mred\x1b[0m answer"
+    _msg(c, session_id=_MEMO_SID, uuid=f"{_MEMO_SID}-h",
+         source_path=f"{_MEMO_SID}.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
+         text="hi", cwd="/home/u/proj", git_branch="main")
+    _msg(c, session_id=_MEMO_SID, uuid=f"{_MEMO_SID}-a",
+         source_path=f"{_MEMO_SID}.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
+         text=RAW, model=_MODEL, msg_id=f"{_MEMO_SID}-m1", req_id=f"{_MEMO_SID}-r1",
+         blocks_json=_json.dumps([{"kind": "thinking", "text": RAW},
+                                  {"kind": "text", "text": RAW}]))
+    _entry(c, source_path=f"{_MEMO_SID}.jsonl", line_offset=1, model=_MODEL,
+           msg_id=f"{_MEMO_SID}-m1", req_id=f"{_MEMO_SID}-r1", inp=1000, out=500)
+    cc._recompute_conversation_sessions(c)
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('session_entries_mutation_seq','1')")
+    c.commit()
+
+    captured = {}
+    real = cq._assemble_session
+    def capturing(conn, sid):
+        asm = real(conn, sid); captured["asm"] = asm; return asm
+    monkeypatch.setattr(cq, "_assemble_session", capturing)
+
+    page = cq.get_conversation(c, _MEMO_SID)
+
+    def _block_texts(items):
+        return [b["text"] for it in items for b in it.get("blocks", [])
+                if b.get("kind") in ("text", "thinking")]
+    returned = _block_texts(page["items"])
+    cached = _block_texts(captured["asm"]["items"])
+    assert returned, "expected text/thinking blocks in the returned page"
+    assert all("\x1b[" not in t for t in returned)   # returned page: ANSI stripped
+    assert any("\x1b[" in t for t in cached)          # cached asm: raw SGR preserved (copy, not mutate)
 
 
 # ---------------------------------------------------------------------------
