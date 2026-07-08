@@ -4388,3 +4388,151 @@ def test_get_conversation_models_main_session_first():
     _seed_main_opus_subagent_haiku(c)
     out = cq.get_conversation(c, "sx", after=None, limit=500)
     assert out["models"] == ["claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+
+# ---------------------------------------------------------------------------
+# #278 Theme B: assembly memo — a thread-safe capacity-4 LRU in front of
+# _assemble_session, keyed by (session_id, msg_count, last_activity_utc,
+# entry_mutation_seq). These tests direct-seed conversation_messages + a cost
+# row, then recompute the conversation_sessions rollup so the memo watermark
+# key resolves (production maintains the rollup under sync_cache's flock).
+# ---------------------------------------------------------------------------
+_MEMO_SID = "memo_s1"
+_FIVE_SIDS = [f"memo_multi_{i}" for i in range(5)]
+
+
+def _seed_memo_session(c, sid=_MEMO_SID):
+    """A small human+assistant session with a cost row; recompute the rollup so
+    the memo watermark (msg_count, last_activity_utc) resolves, and arm the #270
+    session_entries_mutation_seq counter (production stamps it every ingest; a
+    direct seed does not, so the seq-leg bump test has a row to increment)."""
+    _msg(c, session_id=sid, uuid=f"{sid}-h", source_path=f"{sid}.jsonl",
+         byte_offset=0, timestamp_utc="2026-06-01T00:00:00Z",
+         entry_type="human", text="hi there", cwd="/home/u/proj",
+         git_branch="main")
+    _msg(c, session_id=sid, uuid=f"{sid}-a", source_path=f"{sid}.jsonl",
+         byte_offset=1, timestamp_utc="2026-06-01T00:00:05Z",
+         entry_type="assistant", text="hello world", model=_MODEL,
+         msg_id=f"{sid}-m1", req_id=f"{sid}-r1")
+    _entry(c, source_path=f"{sid}.jsonl", line_offset=1, model=_MODEL,
+           msg_id=f"{sid}-m1", req_id=f"{sid}-r1", inp=1000, out=500)
+    cc._recompute_conversation_sessions(c)
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('session_entries_mutation_seq','1')")
+    c.commit()
+
+
+def _seed_memo_multi(c):
+    for sid in _FIVE_SIDS:
+        _seed_memo_session(c, sid)
+
+
+def _append_message_and_bump_rollup(c, sid=_MEMO_SID):
+    """Simulate live-tail growth: insert a NEW assistant turn + recompute the
+    rollup so (msg_count, last_activity_utc) advance."""
+    _msg(c, session_id=sid, uuid=f"{sid}-a2", source_path=f"{sid}.jsonl",
+         byte_offset=2, timestamp_utc="2026-06-01T00:10:00Z",
+         entry_type="assistant", text="more text", model=_MODEL,
+         msg_id=f"{sid}-m2", req_id=f"{sid}-r2")
+    _entry(c, source_path=f"{sid}.jsonl", line_offset=2, model=_MODEL,
+           msg_id=f"{sid}-m2", req_id=f"{sid}-r2", inp=100, out=50)
+    cc._recompute_conversation_sessions(c)
+    c.commit()
+
+
+def test_memo_hit_returns_identical_object():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    a = cq._assemble_session_memoized(c, _MEMO_SID)
+    b = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert a is b                      # same cached object on a hit
+
+
+def test_memo_non_vacuous_single_cold_assemble(monkeypatch):
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    calls = {"n": 0}
+    real = cq._assemble_session
+    def counting(conn, sid):
+        calls["n"] += 1
+        return real(conn, sid)
+    monkeypatch.setattr(cq, "_assemble_session", counting)
+    cq._assemble_session_memoized(c, _MEMO_SID)
+    cq._assemble_session_memoized(c, _MEMO_SID)
+    assert calls["n"] == 1             # second call hit the memo
+
+
+def test_memo_misses_on_growth():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    first = cq._assemble_session_memoized(c, _MEMO_SID)
+    _append_message_and_bump_rollup(c)   # INSERT row + recompute watermark
+    second = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert second is not first         # watermark changed -> miss
+
+
+def test_memo_misses_on_entry_mutation_seq_bump():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    first = cq._assemble_session_memoized(c, _MEMO_SID)
+    c.execute("UPDATE cache_meta SET value=CAST(value AS INTEGER)+1 "
+              "WHERE key='session_entries_mutation_seq'")
+    c.commit()
+    second = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert second is not first         # seq changed -> miss (Codex F1)
+
+
+def test_memo_bypasses_and_clears_when_non_authoritative():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    cq._assemble_session_memoized(c, _MEMO_SID)          # populate
+    assert len(cq._ASM_MEMO) == 1
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('conversation_sessions_backfill_pending','1')")
+    c.commit()
+    cq._assemble_session_memoized(c, _MEMO_SID)          # non-authoritative
+    assert len(cq._ASM_MEMO) == 0                        # cleared (Codex F2)
+
+
+def test_memo_bypasses_on_missing_rollup_row():
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    c.execute("DELETE FROM conversation_sessions WHERE session_id=?", (_MEMO_SID,))
+    c.commit()
+    assert cq._assemble_session_memoized(c, _MEMO_SID) is not None   # uncached, still works
+    assert len(cq._ASM_MEMO) == 0
+
+
+def test_memo_capacity_evicts_lru():
+    c = _conn(); _seed_memo_multi(c)
+    cq._assemble_memo_clear()
+    for sid in _FIVE_SIDS:                       # cap is 4
+        cq._assemble_session_memoized(c, sid)
+    assert len(cq._ASM_MEMO) == 4
+
+
+def test_memo_concurrent_access_safe(tmp_path):
+    import threading
+    dbpath = tmp_path / "cache.db"
+    seed = sqlite3.connect(str(dbpath))
+    db._apply_cache_schema(seed)
+    _seed_memo_session(seed)
+    seed.close()
+    cq._assemble_memo_clear()
+    errs = []
+    def worker():
+        # A per-thread connection to the same on-disk DB — exercises the memo
+        # LOCK under real concurrency (a shared :memory: conn would be a
+        # different empty DB; a shared file conn would test sqlite threading).
+        conn = sqlite3.connect(str(dbpath))
+        try:
+            for _ in range(50):
+                cq._assemble_session_memoized(conn, _MEMO_SID)
+        except Exception as e:      # noqa
+            errs.append(e)
+        finally:
+            conn.close()
+    ts = [threading.Thread(target=worker) for _ in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert not errs

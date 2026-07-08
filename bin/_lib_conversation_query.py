@@ -1816,6 +1816,76 @@ def _assemble_session(conn, session_id):
             "subagent_meta": subagent_meta, "header_cost": header_cost}
 
 
+# --- Assembly memo (issue #278 Theme B) ------------------------------------
+# A tiny thread-safe LRU in FRONT of _assemble_session so the always-open reader
+# stops re-running the full pipeline on every idle SSE tick. Keyed by the
+# conversation_sessions watermark PLUS the #270 session_entries_mutation_seq
+# (the latter catches id-stable cost/token finalization the watermark misses —
+# Codex F1). Bypassed (and cleared) when the rollup is non-authoritative so a
+# destructive reingest can never serve a stale entry under an unchanged
+# watermark (Codex F2). Module-level + threading.Lock, following the
+# _DOCTOR_MEMO precedent (the dashboard is a threading HTTP server).
+import threading as _threading
+from collections import OrderedDict as _OrderedDict
+
+_ASM_MEMO_LOCK = _threading.Lock()
+_ASM_MEMO: "_OrderedDict" = _OrderedDict()   # key -> asm dict
+_ASM_MEMO_CAP = 4                            # main reader + comparison pair + 1 switch
+
+
+def _assemble_memo_clear() -> None:
+    """Drop every memo entry (tests; and the non-authoritative bypass)."""
+    with _ASM_MEMO_LOCK:
+        _ASM_MEMO.clear()
+
+
+def _assemble_memo_key(conn, session_id):
+    """Return (session_id, msg_count, last_activity_utc, entry_mutation_seq), or
+    None to signal 'bypass the memo' — a missing rollup row or an unreadable
+    cache_meta (bare/path-less conn). The caller has already confirmed the
+    rollup is authoritative."""
+    try:
+        row = conn.execute(
+            "SELECT msg_count, last_activity_utc FROM conversation_sessions "
+            "WHERE session_id=?", (session_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        seq_row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='session_entries_mutation_seq'").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 0
+    return (session_id, row[0], row[1], seq)
+
+
+def _assemble_session_memoized(conn, session_id):
+    """Memoized _assemble_session. Same return contract (dict or None)."""
+    if not _rollup_authoritative(conn):
+        _assemble_memo_clear()               # Codex F2: no pre-reingest survivors
+        return _assemble_session(conn, session_id)
+    key = _assemble_memo_key(conn, session_id)
+    if key is None:
+        return _assemble_session(conn, session_id)
+    with _ASM_MEMO_LOCK:
+        hit = _ASM_MEMO.get(key)
+        if hit is not None:
+            _ASM_MEMO.move_to_end(key)
+            return hit
+    asm = _assemble_session(conn, session_id)
+    if asm is None:
+        return None                          # don't cache unknown-session negatives
+    with _ASM_MEMO_LOCK:
+        _ASM_MEMO[key] = asm
+        _ASM_MEMO.move_to_end(key)
+        while len(_ASM_MEMO) > _ASM_MEMO_CAP:
+            _ASM_MEMO.popitem(last=False)
+    return asm
+
+
 def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
                      limit=500):
     """Reader payload for one session (spec §3.2). Returns None for an unknown
