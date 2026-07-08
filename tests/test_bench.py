@@ -128,7 +128,9 @@ def test_run_json_schema(tmp_path):
     for k in ("cctally_version", "machine_label", "scale", "seed",
               "dataset_counts", "benchmarks"):
         assert k in result, k
-    assert _EXPECTED_BENCHMARKS <= set(result["benchmarks"])
+    # Exact set equality (Codex F6): an accidental extra default benchmark must
+    # fail the test, not slip through as a NEW compare row.
+    assert set(result["benchmarks"]) == _EXPECTED_BENCHMARKS
     for name, b in result["benchmarks"].items():
         assert b["median_ms"] >= 0, name
         assert b["min_ms"] <= b["median_ms"] <= b["max_ms"], name
@@ -203,3 +205,61 @@ def test_realism_partial_args_error(tmp_path, data_dir, claude_dir):
     with pytest.raises(ValueError, match="BOTH --data-dir and --claude-dir"):
         bench.run_all(scale="small", seed=1, iterations=1, trace=False,
                       root=tmp_path, data_dir=dd, claude_dir=cd)
+
+
+# ── Task 4: --assembly-scan structure (Session C / M5) ────────────────────
+
+_EXPECTED_RUNG_KEYS = {
+    "turn_count", "msg_count", "item_count",
+    "assemble_ms", "detail_tail_ms", "detail_page_ms", "outline_ms",
+    "find_hit_ms", "open_pair_ms",
+    "assembled_items_bytes", "page_bytes_200", "page_bytes_500",
+    "page_bytes_1000", "outline_bytes",
+}
+# Structural (deterministic) columns — everything else is a machine-variant ms.
+_STRUCTURAL_KEYS = {
+    "turn_count", "msg_count", "item_count", "assembled_items_bytes",
+    "page_bytes_200", "page_bytes_500", "page_bytes_1000", "outline_bytes",
+}
+
+
+def test_assembly_scan_structure_and_determinism(tmp_path):
+    bench = _load_bin("cctally-bench")
+    gen = _load_build_bench()
+    ladder = gen.ASSEMBLY_TURN_LADDER_SMALL
+
+    a = bench.run_assembly_scan(ladder_scale="small", iterations=1,
+                                root=tmp_path / "a")
+    assert a["schemaVersion"] == 1
+    assert a["ladder_scale"] == "small"
+    for k in ("cctally_version", "machine_label", "dataset_counts", "rungs",
+              "visible_ms"):
+        assert k in a, k
+    assert len(a["rungs"]) == len(ladder)
+    for i, r in enumerate(a["rungs"]):
+        assert set(r) == _EXPECTED_RUNG_KEYS, sorted(set(r) ^ _EXPECTED_RUNG_KEYS)
+        # ladder shape (Codex F8): turn_count + msg_count == 2 * turns.
+        assert r["turn_count"] == ladder[i], (i, r["turn_count"])
+        assert r["msg_count"] == 2 * ladder[i], (i, r["msg_count"])
+        assert r["item_count"] > 0
+        # never assert absolute timings — only ordering sanity (non-negative).
+        for msk in ("assemble_ms", "outline_ms", "find_hit_ms", "open_pair_ms"):
+            assert r[msk] >= 0.0, msk
+
+    # Structural columns are byte-stable across an independent second build.
+    b = bench.run_assembly_scan(ladder_scale="small", iterations=1,
+                                root=tmp_path / "b")
+
+    def _structural(res):
+        return [{k: r[k] for k in _STRUCTURAL_KEYS} for r in res["rungs"]]
+
+    assert _structural(a) == _structural(b)
+
+
+def test_assembly_scan_incompatible_with_default_baseline_flags():
+    """Codex F7: --assembly-scan + a default-suite baseline flag errors."""
+    bench = _load_bin("cctally-bench")
+    for flag in ("--compare", "--gate", "--update-baseline"):
+        with pytest.raises(SystemExit) as ei:
+            bench.main(["--assembly-scan", flag])
+        assert ei.value.code == 2   # argparse parser.error exit code

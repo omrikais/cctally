@@ -46,6 +46,21 @@ SCHEMA_VERSION = 1
 _BIN_DIR = pathlib.Path(__file__).resolve().parent
 BASELINE_PATH = _BIN_DIR.parent / "bench" / "baselines" / "backend.json"
 
+# ── Session C (M5): the --assembly-scan mode ─────────────────────────────────
+# The visibility budget used by the threshold analysis in docs/backend-
+# performance.md: the msg_count at which whole-session assembly crosses this is
+# the "materialize?" trigger. Tunable (see bench/README.md).
+ASSEMBLY_VISIBLE_MS = 100.0
+# The scan reads/writes its OWN baseline (Codex F7) — never backend.json.
+ASSEMBLY_BASELINE_PATH = _BIN_DIR.parent / "bench" / "baselines" / "assembly.json"
+# The per-rung columns that are DETERMINISTIC (goldenable) — everything else is
+# a machine-variant *_ms timing (recorded, never asserted). The self-test drops
+# the timing keys and byte-compares the rest across two runs.
+_ASSEMBLY_STRUCTURAL_KEYS = (
+    "turn_count", "msg_count", "item_count", "assembled_items_bytes",
+    "page_bytes_200", "page_bytes_500", "page_bytes_1000", "outline_bytes",
+)
+
 # Process-local accelerator caches reset for a COLD snapshot build — the set
 # the production self-heal path (_dashboard_self_heal_orphans) resets.
 _COLD_RESETS = (
@@ -104,6 +119,11 @@ def time_body(fn, iterations):
         if i > 0:
             samples.append(dt_ms)
     return statistics.median(samples), min(samples), max(samples), last
+
+
+def _time_median(fn, iterations):
+    """Median-of-N wall-clock ms for ``fn`` (warmup discarded)."""
+    return time_body(fn, iterations)[0]
 
 
 def _reset_perf(perf):
@@ -400,6 +420,161 @@ def run_all(*, scale, seed, iterations, trace, root=None,
     }
 
 
+# ── --assembly-scan mode (Session C / M5) ─────────────────────────────────
+
+def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
+                      root=None, data_dir=None, claude_dir=None):
+    """Sweep the conversation-assembly cost across a size ladder — one session
+    per rung — and return a per-rung report (spec §3).
+
+    ``ladder_scale`` selects the ladder: ``small`` → the fast ``assembly-small``
+    scale (``ASSEMBLY_TURN_LADDER_SMALL``), ``large`` → the full ``assembly``
+    scale (``ASSEMBLY_TURN_LADDER``). Uses the ``assembly`` fixture INTERNALLY
+    (Codex F7) — never the default ``--scale`` corpus — under a pinned scratch
+    ``CCTALLY_DATA_DIR`` + ``CLAUDE_CONFIG_DIR`` (the B/M3 dual-env isolation).
+
+    Per rung it records deterministic counts + payload bytes (goldenable) and
+    median-of-N wall-clock timings (advisory — the repeated-reassembly paths
+    ``detail_*``/``outline``/``find_hit``/``open_pair`` that drive the
+    materialization decision, since pagination caps payload bytes but NOT
+    assembly cost). Structural columns are stable run-to-run; timings are not.
+    """
+    gen = _load_gen()
+    scale = "assembly" if ladder_scale == "large" else "assembly-small"
+    if data_dir is not None or claude_dir is not None:
+        # Optional realism cross-check (advisory, non-committed): scan an
+        # operator-copied cache. Both axes required, same XOR guard as run_all.
+        if data_dir is None or claude_dir is None:
+            raise ValueError(
+                "realism mode needs BOTH --data-dir and --claude-dir")
+        data_dir = pathlib.Path(data_dir)
+        claude_dir = pathlib.Path(claude_dir)
+        ladder = None                     # bucket real sessions by size instead
+    else:
+        if root is None:
+            raise ValueError("run_assembly_scan requires root= unless "
+                             "data_dir+claude_dir given")
+        data_dir = gen.build_fixture(scale=scale, seed=DEFAULT_SEED, root=root)
+        claude_dir = pathlib.Path(root) / "claude"
+        ladder = (gen.ASSEMBLY_TURN_LADDER if scale == "assembly"
+                  else gen.ASSEMBLY_TURN_LADDER_SMALL)
+
+    cctally, perf = _pin_and_import(data_dir, claude_dir)
+    cq = cctally._load_sibling("_lib_conversation_query")
+    token = gen._SEARCH_TOKEN
+
+    conn = cctally.open_cache_db()
+    try:
+        dcounts = gen.dataset_counts(conn)
+        if ladder is not None:
+            sids = [f"sess-{i}" for i in range(len(ladder))]
+            turn_of = {f"sess-{i}": t for i, t in enumerate(ladder)}
+        else:
+            # Realism: the largest session per size bucket (advisory).
+            sids = [r[0] for r in conn.execute(
+                "SELECT session_id FROM conversation_sessions "
+                "ORDER BY msg_count DESC, session_id LIMIT 6").fetchall()]
+            turn_of = {}
+
+        rungs = []
+        for sid in sids:
+            msg_count = conn.execute(
+                "SELECT msg_count FROM conversation_sessions WHERE session_id=?",
+                (sid,)).fetchone()[0]
+
+            asm = cq._assemble_session(conn, sid)
+            item_count = len(asm["items"])
+            # find on the common token must be non-empty (a vacuous find would
+            # measure the cheap early-out probe, not the assembly-backed path).
+            fr = cq.find_in_conversation(conn, sid, token)
+            assert fr is not None and fr.get("total", 0) > 0, \
+                f"{sid}: find on {token!r} was vacuous"
+
+            # Deterministic payload bytes (materialization-footprint proxy +
+            # real endpoint page bytes). json.dumps in the SAME wire form.
+            assembled_items_bytes = len(
+                json.dumps(cq._assemble_session(conn, sid)["items"]).encode())
+            page_bytes = {}
+            for L in (200, 500, 1000):
+                page_bytes[L] = len(json.dumps(
+                    cq.get_conversation(conn, sid, tail=True, limit=L)).encode())
+            outline_bytes = len(json.dumps(
+                cq.get_conversation_outline(conn, sid)).encode())
+
+            # Advisory timings (median-of-N, warmup discarded). Bind sid per
+            # loop via a default arg so the lambda captures THIS rung.
+            assemble_ms = _time_median(
+                lambda s=sid: cq._assemble_session(conn, s), iterations)
+            detail_tail_ms = _time_median(
+                lambda s=sid: cq.get_conversation(conn, s, tail=True, limit=200),
+                iterations)
+            detail_page_ms = _time_median(
+                lambda s=sid: cq.get_conversation(conn, s, tail=True, limit=500),
+                iterations)
+            outline_ms = _time_median(
+                lambda s=sid: cq.get_conversation_outline(conn, s), iterations)
+            find_hit_ms = _time_median(
+                lambda s=sid: cq.find_in_conversation(conn, s, token), iterations)
+            open_pair_ms = detail_tail_ms + outline_ms
+
+            rungs.append({
+                "turn_count": turn_of.get(sid),
+                "msg_count": msg_count,
+                "item_count": item_count,
+                "assemble_ms": round(assemble_ms, 4),
+                "detail_tail_ms": round(detail_tail_ms, 4),
+                "detail_page_ms": round(detail_page_ms, 4),
+                "outline_ms": round(outline_ms, 4),
+                "find_hit_ms": round(find_hit_ms, 4),
+                "open_pair_ms": round(open_pair_ms, 4),
+                "assembled_items_bytes": assembled_items_bytes,
+                "page_bytes_200": page_bytes[200],
+                "page_bytes_500": page_bytes[500],
+                "page_bytes_1000": page_bytes[1000],
+                "outline_bytes": outline_bytes,
+            })
+    finally:
+        conn.close()
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "cctally_version": _bench_version(cctally),
+        "machine_label": _machine_label(),
+        "ladder_scale": ladder_scale,
+        "visible_ms": ASSEMBLY_VISIBLE_MS,
+        "dataset_counts": dcounts,
+        "rungs": rungs,
+    }
+
+
+def render_assembly_table(result) -> str:
+    lines = []
+    dc = result["dataset_counts"]
+    lines.append(
+        f"assembly scan · cctally {result['cctally_version']} · "
+        f"ladder={result['ladder_scale']} · machine={result['machine_label']} · "
+        f"visible={result['visible_ms']:.0f}ms"
+    )
+    lines.append(
+        f"dataset: {dc['sessions']:,} sessions · {dc['entries']:,} entries · "
+        f"{dc['messages']:,} messages"
+    )
+    lines.append("─" * 96)
+    lines.append(
+        f"{'turns':>7}{'msgs':>8}{'items':>7}{'assemble':>10}{'outline':>9}"
+        f"{'find':>9}{'open_pair':>11}{'items_b':>10}{'page1k_b':>10}"
+    )
+    for r in result["rungs"]:
+        tc = "—" if r["turn_count"] is None else f"{r['turn_count']:,}"
+        lines.append(
+            f"{tc:>7}{r['msg_count']:>8,}{r['item_count']:>7,}"
+            f"{_fmt_ms(r['assemble_ms']):>10}{_fmt_ms(r['outline_ms']):>9}"
+            f"{_fmt_ms(r['find_hit_ms']):>9}{_fmt_ms(r['open_pair_ms']):>11}"
+            f"{r['assembled_items_bytes']:>10,}{r['page_bytes_1000']:>10,}"
+        )
+    return "\n".join(lines)
+
+
 # ── output ───────────────────────────────────────────────────────────────
 
 def _fmt_ms(v):
@@ -529,6 +704,19 @@ def _resolve_root(args):
             / f"{args.scale}-seed{args.seed}")
 
 
+def _resolve_assembly_root(args):
+    """A DEDICATED scratch root for --assembly-scan, keyed by the assembly scale
+    so the ladder fixture NEVER shares a dir with Session B's small/large corpus
+    (a marker mismatch would otherwise rebuild-over one of them). An explicit
+    --root is respected (the operator then owns isolation)."""
+    if args.root:
+        return pathlib.Path(args.root).expanduser()
+    import tempfile
+    scale = "assembly" if args.assembly_ladder_scale == "large" else "assembly-small"
+    return (pathlib.Path(tempfile.gettempdir()) / "cctally-bench"
+            / f"{scale}-seed{DEFAULT_SEED}")
+
+
 def _build_parser():
     ap = argparse.ArgumentParser(
         description="In-process backend benchmark runner (issue #276, M3)."
@@ -551,11 +739,35 @@ def _build_parser():
                     help="like --compare but exit non-zero on regression/missing.")
     ap.add_argument("--update-baseline", action="store_true", dest="update_baseline",
                     help="rerun and overwrite bench/baselines/backend.json.")
+    ap.add_argument("--assembly-scan", action="store_true", dest="assembly_scan",
+                    help="Session C (M5) mode: sweep conversation-assembly cost "
+                         "across a size ladder. Uses its own baseline "
+                         "(bench/baselines/assembly.json); incompatible with "
+                         "--compare/--gate/--update-baseline (backend.json).")
+    ap.add_argument("--assembly-ladder-scale", choices=("small", "large"),
+                    default="small", dest="assembly_ladder_scale",
+                    help="ladder size for --assembly-scan (default: small).")
     return ap
 
 
 def main(argv=None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.assembly_scan:
+        if args.compare or args.gate or args.update_baseline:
+            parser.error(
+                "--assembly-scan uses its own baseline (bench/baselines/"
+                "assembly.json) and is incompatible with "
+                "--compare/--gate/--update-baseline (which target backend.json).")
+        result = run_assembly_scan(
+            ladder_scale=args.assembly_ladder_scale, iterations=args.iterations,
+            root=_resolve_assembly_root(args),
+            data_dir=args.data_dir, claude_dir=args.claude_dir)
+        if args.as_json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(render_assembly_table(result))
+        return 0
     root = _resolve_root(args)
     result = run_all(
         scale=args.scale, seed=args.seed, iterations=args.iterations,

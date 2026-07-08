@@ -87,8 +87,12 @@ need = {
     "payload.assemble", "outline.build",
     "reconcile.cache_report", "reconcile.projects_env",
 }
-missing = need - set(d["benchmarks"])
+got = set(d["benchmarks"])
+missing = need - got
 assert not missing, f"missing benchmarks: {sorted(missing)}"
+# Exact set (Codex F6): an accidental extra default benchmark must fail too.
+unexpected = got - need
+assert not unexpected, f"unexpected benchmarks: {sorted(unexpected)}"
 for name, b in d["benchmarks"].items():
     for k in ("median_ms", "min_ms", "max_ms", "count", "bytes", "phases"):
         assert k in b, f"{name} missing meta key {k!r}"
