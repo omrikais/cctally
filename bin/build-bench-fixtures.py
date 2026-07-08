@@ -58,6 +58,14 @@ _WORDS = [
     "xray", "yankee", "zulu", "cache", "token", "window", "reset", "usage",
 ]
 
+# Session C (M5): a graduated turn-count ladder for the `cctally-bench
+# --assembly-scan` sweep. One session per rung; each rung emits paired
+# user+assistant rows so msg_count ~= 2 * turns. Tunable after the first
+# evidence run (a change here busts ONLY the `assembly` scratch cache via the
+# marker's params_hash — Codex F5).
+ASSEMBLY_TURN_LADDER = [250, 500, 1000, 2000, 4000, 8000]   # full evidence run
+ASSEMBLY_TURN_LADDER_SMALL = [10, 40]                        # fast self-test
+
 SCALES = {
     # Tiny — the self-test + fast local iteration.
     "small": {
@@ -75,6 +83,13 @@ SCALES = {
         "large_session_turns": 6000,
         "projects": 12,
     },
+    # Session C (M5): one session per ladder rung (NOT uniform sessions). The
+    # `ladder` key routes _emit_corpus to the per-session turn list; the marker
+    # carries a params_hash over this shape so a ladder edit busts ONLY this
+    # scale. Used internally by `cctally-bench --assembly-scan`, never a `--scale`
+    # choice for the default suite.
+    "assembly": {"ladder": ASSEMBLY_TURN_LADDER, "projects": 3},
+    "assembly-small": {"ladder": ASSEMBLY_TURN_LADDER_SMALL, "projects": 2},
 }
 
 
@@ -156,14 +171,30 @@ def emit_session_jsonl(
 
 
 def _emit_corpus(projects_dir: pathlib.Path, params: dict, rng: random.Random) -> None:
-    """Emit ``params['sessions']`` sessions across ``params['projects']``
-    git-roots / rotating models, with session 0 the deliberately-large one."""
-    for i in range(params["sessions"]):
+    """Emit the fixture corpus.
+
+    Two shapes, one code path:
+      * uniform (``small``/``large``): ``params['sessions']`` sessions with
+        ``turns_per_session`` turns each, session 0 the deliberately-large one.
+      * ladder (``assembly``/``assembly-small``, Session C M5): when
+        ``params['ladder']`` is present, emit exactly ``len(ladder)`` sessions —
+        session ``i`` gets ``ladder[i]`` turns — so the `--assembly-scan` sweep
+        has one graduated session per rung. ``sessions`` / ``turns_per_session``
+        / ``large_session_turns`` are ignored in this branch.
+    Both keep ``session_id=f"sess-{i}"`` and rotate model/project as before."""
+    ladder = params.get("ladder")
+    if ladder is not None:
+        turn_counts = list(ladder)
+    else:
+        turn_counts = [
+            params["large_session_turns"] if i == 0 else params["turns_per_session"]
+            for i in range(params["sessions"])
+        ]
+    for i, n in enumerate(turn_counts):
         model = MODELS[i % len(MODELS)]
         proj = f"proj{i % params['projects']}"
         cwd = f"/bench/{proj}"
         enc = projects_dir / f"-bench-{proj}"
-        n = params["large_session_turns"] if i == 0 else params["turns_per_session"]
         emit_session_jsonl(
             enc / f"sess-{i}.jsonl",
             session_id=f"sess-{i}",
@@ -221,7 +252,20 @@ def _marker_payload(cctally, *, seed, scale) -> dict:
         pricing_date = cctally._lib_pricing.PRICING_SNAPSHOT_DATE
     except Exception:
         pricing_date = "unknown"
-    return {"seed": int(seed), "scale": str(scale), "pricing_date": pricing_date}
+    payload = {"seed": int(seed), "scale": str(scale), "pricing_date": pricing_date}
+    params = SCALES.get(scale, {})
+    if "ladder" in params:
+        # Session C (M5) / Codex F5: fold a stable hash of the exact ladder +
+        # generator shape into the marker so a ladder edit busts the cached
+        # JSONL/cache.db for the `assembly` scale ONLY. The small/large markers
+        # carry no `ladder` key, so their payloads stay
+        # {seed, scale, pricing_date} — Session B's scratch caches + semantic
+        # hashes are untouched.
+        shape = json.dumps(
+            {"ladder": params["ladder"], "projects": params["projects"]},
+            sort_keys=True)
+        payload["params_hash"] = hashlib.sha256(shape.encode()).hexdigest()[:16]
+    return payload
 
 
 def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:

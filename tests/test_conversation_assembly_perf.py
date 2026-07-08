@@ -100,6 +100,55 @@ def _conn():
     return c
 
 
+@pytest.fixture(autouse=True)
+def _isolate_assembly_env():
+    """The assembly fixture builder pins CCTALLY_DATA_DIR + CLAUDE_CONFIG_DIR via
+    os.environ directly (so a freshly-loaded cctally targets the scratch dir) and
+    leaves them set. Snapshot + restore them so a build in a Task-3 test can't
+    leak an override into a sibling test on the same pytest-xdist worker (mirrors
+    tests/test_bench.py::_isolate_bench_env). Also resets the perf collector so a
+    tracing-on Task-1/2 test never leaks state into a neighbor."""
+    import os as _os
+    keys = ("CCTALLY_DATA_DIR", "CLAUDE_CONFIG_DIR")
+    saved = {k: _os.environ.get(k) for k in keys}
+    yield
+    for k, v in saved.items():
+        if v is None:
+            _os.environ.pop(k, None)
+        else:
+            _os.environ[k] = v
+    mod = sys.modules.get("cctally")
+    if mod is not None:
+        try:
+            mod._cctally_core._init_paths_from_env()
+        except Exception:
+            pass
+    try:
+        perf.set_enabled(False)
+        perf.reset_thread()
+        perf._LAST_BACKEND_PERF = None
+    except Exception:
+        pass
+
+
+def _load_build_bench():
+    """Path-load the hyphenated generator fresh (like tests/test_bench.py)."""
+    spec = importlib.util.spec_from_file_location(
+        "build_bench_fixtures", BIN / "build-bench-fixtures.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _build_small_assembly_fixture(tmp_path):
+    import os
+    os.environ["CCTALLY_DATA_DIR"] = str(tmp_path / "data")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
+    gen = _load_build_bench()
+    data_dir = gen.build_fixture(scale="assembly-small", seed=1, root=tmp_path)
+    return gen, data_dir
+
+
 # ── Task 1: non-vacuous kernel instrumentation ────────────────────────────
 
 _ASSEMBLE_CHILDREN = {
@@ -219,3 +268,43 @@ def test_perf_scope_stashes_conversation_tree(tmp_path, monkeypatch):
         dperf.set_enabled(False)
         dperf.reset_thread()
         dperf._LAST_BACKEND_PERF = None
+
+
+# ── Task 3: the `assembly` fixture ladder + params_hash ───────────────────
+
+def test_assembly_fixture_shape_deterministic(tmp_path):
+    """The assembly-small ladder builds deterministically (same semantic hash
+    under two different roots) and each rung's msg_count == 2 * turns."""
+    gen_a, data_a = _build_small_assembly_fixture(tmp_path / "a")
+    gen_b, data_b = _build_small_assembly_fixture(tmp_path / "b")
+    ca = sqlite3.connect(str(pathlib.Path(data_a) / "cache.db"))
+    cb = sqlite3.connect(str(pathlib.Path(data_b) / "cache.db"))
+    try:
+        assert gen_a.semantic_hash(ca) == gen_b.semantic_hash(cb)
+        ladder = gen_a.ASSEMBLY_TURN_LADDER_SMALL
+        # one session per rung, sess-i has ladder[i] turns => 2*turns rows.
+        rows = dict(ca.execute(
+            "SELECT session_id, msg_count FROM conversation_sessions").fetchall())
+        assert len(ladder) == 2
+        for i, turns in enumerate(ladder):
+            assert rows[f"sess-{i}"] == 2 * turns, (i, rows)
+    finally:
+        ca.close()
+        cb.close()
+
+
+def test_assembly_marker_carries_params_hash_only_for_ladder(tmp_path):
+    """Codex F5: the assembly marker carries a params_hash; the small/large
+    markers stay {seed, scale, pricing_date} (Session B untouched)."""
+    gen = _load_build_bench()
+    cctally = gen._pin_env(tmp_path / "d", tmp_path / "c")
+    small = gen._marker_payload(cctally, seed=42, scale="small")
+    large = gen._marker_payload(cctally, seed=42, scale="large")
+    asm = gen._marker_payload(cctally, seed=1, scale="assembly")
+    asm_small = gen._marker_payload(cctally, seed=1, scale="assembly-small")
+    assert "params_hash" not in small
+    assert "params_hash" not in large
+    assert set(small) == {"seed", "scale", "pricing_date"}
+    assert "params_hash" in asm and "params_hash" in asm_small
+    # a ladder edit changes the hash (distinct ladders => distinct hashes).
+    assert asm["params_hash"] != asm_small["params_hash"]
