@@ -4536,3 +4536,26 @@ def test_memo_concurrent_access_safe(tmp_path):
     for t in ts: t.start()
     for t in ts: t.join()
     assert not errs
+
+
+# ---------------------------------------------------------------------------
+# #278 Theme B / Task 3: get_conversation page-copy mutation safety. Because the
+# assembled items are now shared out of the memo, get_conversation must COPY the
+# page items it stamps (anchor.session_id) + ANSI-strips rather than mutating in
+# place. Proven non-vacuously by capturing the exact assembled object and
+# asserting it stays session-agnostic after the call.
+# ---------------------------------------------------------------------------
+def test_get_conversation_does_not_mutate_cached_asm(monkeypatch):
+    c = _conn(); _seed_memo_session(c)
+    real = cq._assemble_session
+    captured = {}
+    def capturing(conn, sid):
+        asm = real(conn, sid)
+        captured["asm"] = asm
+        return asm
+    monkeypatch.setattr(cq, "_assemble_session", capturing)
+    cq.get_conversation(c, _MEMO_SID)          # returns a page, stamps session_id
+    # every assembled anchor stays session-agnostic (session_id None) — only the
+    # RETURNED page's copies are stamped, never the shared/cacheable asm items.
+    assert all(it["anchor"]["session_id"] is None
+               for it in captured["asm"]["items"])

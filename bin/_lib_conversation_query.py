@@ -2014,13 +2014,26 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     # item before emit, so a pre-fix row already indexed with raw SGR renders
     # clean (the read-time half of the no-forced-reingest contract). tool_result
     # blocks are EXCLUDED — Bash AnsiText (#177 S3) renders their SGR colors.
+    # #278: page items are shared out of the assembly memo, so build COPIES here
+    # rather than mutating in place. Bounded to <=1000 page items; cheap next to a
+    # full assemble, and it makes the memo provably safe.
+    patched = []
     for it in page:
-        it["anchor"]["session_id"] = session_id
-        if it.get("text"):
-            it["text"] = _strip_ansi(it["text"])
+        nit = dict(it)
+        nit["anchor"] = {**it["anchor"], "session_id": session_id}
+        if nit.get("text"):
+            nit["text"] = _strip_ansi(nit["text"])
+        new_blocks = []
         for b in it["blocks"]:
             if b.get("kind") in ("text", "thinking") and b.get("text"):
-                b["text"] = _strip_ansi(b["text"])
+                nb = dict(b)
+                nb["text"] = _strip_ansi(nb["text"])
+                new_blocks.append(nb)
+            else:
+                new_blocks.append(b)
+        nit["blocks"] = new_blocks
+        patched.append(nit)
+    page = patched
     _pg.set_count(len(page)); _pg.__exit__(None, None, None)
 
     first = logical[0]
