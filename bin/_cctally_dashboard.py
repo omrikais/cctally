@@ -2600,13 +2600,35 @@ class SSEHub:
         import queue as _queue
         with self._lock:
             self._last = snapshot
-            queues = list(self._queues)
-        for q in queues:
-            try:
-                q.put_nowait(snapshot)
-            except _queue.Full:
-                # Slow client — drop this frame; the next tick re-sends.
-                pass
+            # Latest-wins coalescing (#278 §2.6): every published snapshot is a
+            # COMPLETE state replacement, so a client only ever needs the
+            # newest. On a full queue drop the STALE queued frame and enqueue
+            # the newest, so a slow subscriber (e.g. one filled by A2's rapid
+            # partial republishes) still converges to the final hydrating=false
+            # frame instead of dropping it — and a lagging client jumps to the
+            # current state rather than replaying stale frames.
+            #
+            # Held under the hub lock so concurrent producers (the sync tick +
+            # the update-check thread) can't interleave a get/put on the same
+            # queue. All ops are non-blocking (put_nowait / get_nowait), so
+            # holding the lock never back-pressures the producer, and the SSE
+            # consumer only ever get()s (never puts), so after we make room the
+            # re-put cannot lose to it.
+            for q in self._queues:
+                try:
+                    q.put_nowait(snapshot)
+                except _queue.Full:
+                    try:
+                        q.get_nowait()  # discard the oldest, stale frame
+                    except _queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(snapshot)
+                    except _queue.Full:
+                        # Defensive: a consumer racing between our get and put
+                        # could only have removed items, so this is unreachable
+                        # under the lock — but never raise out of publish().
+                        pass
 
 
 STATIC_DIR = pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "static"
