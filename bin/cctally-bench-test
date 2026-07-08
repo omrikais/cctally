@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Structural / determinism self-test for the backend benchmark harness
+# (issue #276, M3 / Session B). Runs bin/cctally-bench at --scale small and
+# asserts the --json schema (all 14 benchmark families, finite ordered
+# medians) + isolation (the real ~/.local/share/cctally and ~/.claude are
+# untouched). It NEVER asserts wall-clock timings — the only committed
+# timings live in bench/baselines/backend.json as advisory data.
+#
+# Auto-discovered by bin/cctally-test-all via its bin/cctally-*-test glob once
+# `chmod +x`'d (no registration needed). Emits the standard `PASS <name>` /
+# `FAIL <name>` lines + a final `passed: N   failed: M` summary the aggregator
+# parses.
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BENCH="$REPO_ROOT/bin/cctally-bench"
+
+pass_count=0
+fail_count=0
+
+report() {
+    local status="$1" name="$2" detail="${3:-}"
+    if [ "$status" = PASS ]; then
+        printf 'PASS %s\n' "$name"
+        pass_count=$((pass_count + 1))
+    else
+        printf 'FAIL %s%s\n' "$name" "${detail:+: $detail}"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Portable signature of a path (mtime_ns + size, or MISSING). Used to prove the
+# real prod / Claude dirs were not touched by the run.
+realsig() {
+    python3 - "$1" <<'PY'
+import os, sys
+try:
+    st = os.stat(sys.argv[1])
+    print(f"{st.st_mtime_ns}:{st.st_size}")
+except FileNotFoundError:
+    print("MISSING")
+PY
+}
+
+REAL_CACHE="$HOME/.local/share/cctally"
+REAL_CLAUDE="$HOME/.claude/projects"
+cache_before=$(realsig "$REAL_CACHE")
+claude_before=$(realsig "$REAL_CLAUDE")
+
+SCRATCH=$(mktemp -d -t cctally-bench-selftest-XXXXXX)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# Pin BOTH env axes (Codex-P1 isolation) + TZ + dev-autodetect off, and pass an
+# explicit scratch --root so the trap cleans everything the run wrote.
+out=$(CCTALLY_DATA_DIR="$SCRATCH/data" \
+      CLAUDE_CONFIG_DIR="$SCRATCH/claude" \
+      CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+      TZ=Etc/UTC \
+      "$BENCH" --scale small --iterations 2 --json --root "$SCRATCH" \
+      2>"$SCRATCH/err")
+rc=$?
+
+if [ $rc -ne 0 ]; then
+    report FAIL bench-run "cctally-bench exited $rc"
+    echo "---- bench stderr ----" >&2
+    sed -n '1,40p' "$SCRATCH/err" >&2
+else
+    report PASS bench-run
+    # Schema + benchmark-name assertions (no timing thresholds). The JSON is
+    # passed via BENCH_JSON (not stdin) because the here-doc already redirects
+    # stdin to feed python3 its program text.
+    if BENCH_JSON="$out" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["BENCH_JSON"])
+assert d["schemaVersion"] == 1, f"schemaVersion={d.get('schemaVersion')}"
+for k in ("cctally_version", "machine_label", "scale", "seed",
+          "dataset_counts", "benchmarks"):
+    assert k in d, f"missing top-level key {k!r}"
+need = {
+    "snapshot.cold", "snapshot.warm", "snapshot.idle",
+    "sync.noop", "sync.delta",
+    "conversations.page1", "conversations.sorted", "conversations.filtered",
+    "search.cross_session", "find.in_conversation",
+    "payload.assemble", "outline.build",
+    "reconcile.cache_report", "reconcile.projects_env",
+}
+missing = need - set(d["benchmarks"])
+assert not missing, f"missing benchmarks: {sorted(missing)}"
+for name, b in d["benchmarks"].items():
+    for k in ("median_ms", "min_ms", "max_ms", "count", "bytes", "phases"):
+        assert k in b, f"{name} missing meta key {k!r}"
+    m, lo, hi = b["median_ms"], b["min_ms"], b["max_ms"]
+    assert lo <= m <= hi, f"{name} unordered: min={lo} median={m} max={hi}"
+    assert m >= 0, f"{name} negative median {m}"
+PY
+    then
+        report PASS json-schema
+    else
+        report FAIL json-schema "schema assertion failed"
+    fi
+fi
+
+# Isolation: the real prod cache dir + Claude root must be byte-untouched.
+cache_after=$(realsig "$REAL_CACHE")
+claude_after=$(realsig "$REAL_CLAUDE")
+if [ "$cache_before" = "$cache_after" ]; then
+    report PASS isolation-cache-dir
+else
+    report FAIL isolation-cache-dir "$REAL_CACHE changed: $cache_before -> $cache_after"
+fi
+if [ "$claude_before" = "$claude_after" ]; then
+    report PASS isolation-claude-root
+else
+    report FAIL isolation-claude-root "$REAL_CLAUDE changed: $claude_before -> $claude_after"
+fi
+
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ] || exit 1
