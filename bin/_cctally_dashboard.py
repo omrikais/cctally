@@ -10048,24 +10048,93 @@ def _dashboard_wait_for_signal(
 
 
 def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
-    """#179: build the dashboard's first snapshot WITHOUT the heavy sync so the
-    HTTP port binds promptly. The background ``_DashboardSyncThread`` (started in
-    cmd_dashboard before the ThreadingHTTPServer bind) runs the first full
-    ``sync_cache`` — including any pending conversation reingest — and SSE-pushes
-    the populated snapshot on completion. ``--no-sync`` already passed
-    ``skip_sync=True`` here, so that path is byte-identical; only the normal launch
-    changes (its previously-redundant foreground sync is removed, not duplicated —
-    the background thread's first tick was always going to sync anyway)."""
-    return sys.modules["cctally"]._tui_build_snapshot(
-        now_utc=pinned_now, skip_sync=True,
-        display_tz_pref_override=display_tz_pref_override,
-        # #268 M4: precompute doctor / config / update-state on the initial
-        # snapshot too, so the envelope is pure from the very first paint AND
-        # under --no-sync (where no later sync tick would set them). One
-        # `security` fork here is negligible next to the heavy sync #179 moved
-        # to the background thread. ``getattr`` so minimal test ``args``
-        # namespaces (no ``host``) still build an initial snapshot.
-        precompute_envelope=True, runtime_bind=getattr(args, "host", None),
+    """#278 Theme A (A1): build the dashboard's first snapshot as a CHEAP
+    partial on a normal launch so the HTTP port binds in ~110ms instead of
+    waiting on the ~2.2s full aggregation. #179 already deferred the *ingest*
+    half of cold start (the background ``_DashboardSyncThread`` owns
+    ``sync_cache``); this defers the *aggregation* half too.
+
+    Normal launch (``not args.no_sync``): populate only the two sub-ms headline
+    panels — ``current_week`` + ``forecast`` — plus the real doctor +
+    envelope-config precompute, and set ``hydrating=True``; every heavy panel
+    stays at its empty default. The background thread's first tick runs the
+    full cold build + SSE-publish, and the client hydrates the heavy panels
+    from that frame. Built via the INDIVIDUAL builder helpers, NOT
+    ``_tui_build_snapshot`` — so it never calls ``store_dispatch_state`` and
+    never poisons the idle memo / accelerator caches (§1.1): the dispatch memo
+    stays empty, so the first background tick sees ``prior_key=None`` →
+    non-idle → a full cold build, and idle-reuse can never serve the partial.
+    ``_tui_build_current_week`` / ``_tui_build_forecast_view`` touch no
+    process-local cache state with their default args (Codex P3), so the seed
+    leaves every accelerator pristine.
+
+    ``--no-sync`` (§1.2): there is no background thread to fill the partial in,
+    so the cheap seed would become the PERMANENT state (heavy panels never
+    populate). Keep the full pre-bind build (``hydrating=False``) — a ~2s bind
+    in niche frozen-data mode is acceptable since nothing hydrates later.
+
+    §1.3: ``snapshot_to_envelope`` runs the REAL doctor inline PER CONNECTION
+    when ``doctor_payload is None`` and KeyErrors on an ``envelope_precompute``
+    missing ``"config"`` / the update fields, so a None-doctor seed would be
+    WRONG (worse: every SSE client's first serialization would re-run doctor).
+    The seed therefore runs BOTH precomputes for real (~110ms total). ``getattr``
+    so minimal test ``args`` namespaces (no ``host`` / ``no_sync``) still build.
+    """
+    c = _cctally()
+    tui = c._cctally_tui
+    if getattr(args, "no_sync", False):
+        # Route _tui_build_snapshot through the cctally module (its re-export)
+        # so ``monkeypatch.setitem(ns, "_tui_build_snapshot", spy)`` in tests
+        # propagates — identical to the pre-change call form.
+        return c._tui_build_snapshot(
+            now_utc=pinned_now, skip_sync=True,
+            display_tz_pref_override=display_tz_pref_override,
+            precompute_envelope=True, runtime_bind=getattr(args, "host", None),
+        )
+
+    import time as _time
+    now_utc = pinned_now or dt.datetime.now(dt.timezone.utc)
+    runtime_bind = getattr(args, "host", None)
+    base = tui._tui_empty_snapshot(now_utc)
+    errors: list[str] = []
+    cw = None
+    fc = None
+    fc_view = None
+    conn = open_db()
+    try:
+        try:
+            cw = tui._tui_build_current_week(conn, now_utc, skip_sync=True)
+        except Exception as exc:  # noqa: BLE001 — never block the bind
+            errors.append(f"current-week: {exc}")
+        try:
+            fc_view = tui._tui_build_forecast_view(conn, now_utc, skip_sync=True)
+            fc = fc_view.output if fc_view is not None else None
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"forecast: {exc}")
+    finally:
+        conn.close()
+    # §1.3: run BOTH precomputes for real so the envelope serializes cleanly
+    # without the per-connection inline-doctor fork or the config/update KeyErrors.
+    doctor_payload = None
+    envelope_precompute = None
+    try:
+        envelope_precompute = tui._tui_precompute_envelope_config(load_config())
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"envelope-precompute: {exc}")
+    try:
+        doctor_payload = tui._tui_precompute_doctor_payload(now_utc, runtime_bind)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"doctor-precompute: {exc}")
+    return dataclasses.replace(
+        base,
+        current_week=cw,
+        forecast=fc,
+        forecast_view=fc_view,
+        last_sync_at=_time.monotonic(),
+        last_sync_error=("; ".join(errors) if errors else None),
+        doctor_payload=doctor_payload,
+        envelope_precompute=envelope_precompute,
+        hydrating=True,
     )
 
 
