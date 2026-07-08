@@ -340,6 +340,11 @@ def run_all(*, scale, seed, iterations, trace, root=None,
     """Build/reuse the fixture (or use the operator-supplied realism roots),
     time every registered benchmark, and return the ``--json`` result dict."""
     gen = _load_gen()
+    if (data_dir is None) != (claude_dir is None):
+        raise ValueError(
+            "realism mode needs BOTH --data-dir and --claude-dir — the "
+            "cache/stats dir and the JSONL source are independent axes; "
+            "passing only one would silently fall back to the synthetic fixture")
     if data_dir is not None and claude_dir is not None:
         data_dir = pathlib.Path(data_dir)
         claude_dir = pathlib.Path(claude_dir)

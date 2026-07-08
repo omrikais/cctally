@@ -190,3 +190,16 @@ def test_machine_mismatch_flagged_not_gated():
     assert res["_meta"]["machine_mismatch"] is True
     # regression present, but cross-machine → not gated on that alone
     assert bench.gate_exit(res, allow_cross_machine=True) == 0
+
+
+@pytest.mark.parametrize("data_dir,claude_dir", [("d", None), (None, "c")])
+def test_realism_partial_args_error(tmp_path, data_dir, claude_dir):
+    """Passing exactly one of --data-dir / --claude-dir must error loudly, not
+    silently fall back to the synthetic fixture (review M2). The XOR guard
+    raises before any fixture build, so no real run is needed."""
+    bench = _load_bin("cctally-bench")
+    dd = str(tmp_path / data_dir) if data_dir else None
+    cd = str(tmp_path / claude_dir) if claude_dir else None
+    with pytest.raises(ValueError, match="BOTH --data-dir and --claude-dir"):
+        bench.run_all(scale="small", seed=1, iterations=1, trace=False,
+                      root=tmp_path, data_dir=dd, claude_dir=cd)
