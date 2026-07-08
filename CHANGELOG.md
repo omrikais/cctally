@@ -13,6 +13,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Conversation reader no longer re-processes an open conversation on every background refresh — it now recomputes only when the conversation actually grows, cutting idle CPU/battery use for anyone leaving a transcript open (#278).
+- The dashboard now opens instantly on a heavy-history instance: it binds and paints the current-week and forecast panels almost immediately instead of waiting for the full ~2s data aggregation, and the heavier panels (sessions, projects, weekly, monthly, blocks, daily, trend, cache report) hydrate over the live stream showing a brief loading skeleton (respecting reduced-motion) rather than flashing a misleading "no data" / "restart the dashboard" empty state that then fills in (#278).
+- A first-run or long-gap dashboard now fills in progressively as session history is ingested, instead of sitting blank and then snapping to fully-loaded in one jump; a warm returning session is unaffected, and a slow or backgrounded browser tab always converges to the latest data instead of getting stuck on a stale frame (#278).
 
 ## [1.64.0] - 2026-07-07
 
