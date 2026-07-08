@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
-import { getState, selectLiveTailEnabled, subscribeStore } from '../store/store';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
 import { planTrim } from '../conversations/windowedCap';
 import { VIRTUAL_INDEX_BASE, applyFirstItemDelta } from '../conversations/virtuosoFirstIndex';
@@ -130,10 +129,17 @@ export interface UseConversationOptions {
   // reader assembles the set and passes it in. The trim skips any page holding a
   // member of this set.
   protectedUuids?: Set<string>;
+  // #278 Theme B — the shared live-tail signal (from useConversationLiveTail via
+  // ConversationsView → ConversationReader). `live` true = the server is actively
+  // live-tailing, so growth arrives via `growthNonce` and the global-tick refetch
+  // is skipped; false = fall back to the memo-backed global tick. Defaults keep
+  // pre-#278 behavior (live=false → global tick still fires).
+  growthNonce?: number;
+  live?: boolean;
 }
 
 export function useConversation(sessionId: string | null, opts: UseConversationOptions = {}): UseConversation {
-  const { outlineTurns, openIntent, protectedUuids } = opts;
+  const { outlineTurns, openIntent, protectedUuids, growthNonce = 0, live = false } = opts;
   // Live mirror so the ref-stable trim effect reads the latest protected set
   // without re-creating itself (mirrors outlineTurnsRef).
   const protectedUuidsRef = useRef<Set<string> | undefined>(protectedUuids);
@@ -720,27 +726,29 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     }
   }, [setDetailSynced, emitOp]);
 
-  // Trigger on each SSE tick, but only while fully paged at the bottom.
+  // #278: the global-tick refetch is now only a FALLBACK — when the server is
+  // actively live-tailing (`live`), genuine growth arrives via `growthNonce`
+  // (below), so an idle unchanged reader issues no per-tick request. When live-
+  // tail is off/passive/degraded (`live` never true) the global tick stays as the
+  // fallback, made cheap by the #278 backend assembly memo.
   const env = useSnapshot();
   const generatedAt = env?.generated_at ?? '';
   useEffect(() => {
+    if (live) return;                       // live-tail covers growth; memo-backed fallback only when off
     if (detailRef.current && !hasMoreRef.current) void pollTail();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generatedAt]);
+  }, [generatedAt, live]);
 
-  // Live-tail (spec §3.1): a dedicated per-conversation EventSource that fires
-  // pollTail() the instant the server sees this session's JSONL grow.
-  const transcriptsEnabled = env?.transcriptsEnabled ?? false;
-  const liveTailEnabled = useSyncExternalStore(subscribeStore, () => selectLiveTailEnabled(getState()));
+  // #278: genuine per-conversation growth push (from the shared live-tail hook,
+  // via the `ready`/`tail` events). pollTail self-guards to the bottom edge
+  // (hasMoreRef), so a head-open large conversation is a no-op here and catches
+  // up when the user scrolls down (Codex F5) — unchanged behavior. Only the
+  // trigger moves from the deleted local EventSource to this nonce.
   useEffect(() => {
-    if (!sessionId || !transcriptsEnabled || !liveTailEnabled) return;
-    if (typeof EventSource === 'undefined') return;
-    const es = new EventSource(`/api/conversation/${encodeURIComponent(sessionId)}/events`);
-    es.addEventListener('tail', () => { void pollTail(); });
-    es.addEventListener('open', () => { void pollTail(); });  // (re)connect catch-up
-    return () => es.close();
+    if (growthNonce === 0) return;          // 0 is the initial value; initial load is handled elsewhere
+    if (detailRef.current && !hasMoreRef.current) void pollTail();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transcriptsEnabled, liveTailEnabled]);
+  }, [growthNonce]);
 
   // ── #228 S3 B3 — the decoupled windowed-DOM-cap trim ───────────────────────
   // Applied on a FOLLOW-UP passive effect keyed on `lastOp.rev`, NEVER in the

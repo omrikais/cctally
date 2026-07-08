@@ -4,37 +4,13 @@ import { useConversation } from './useConversation';
 import { VIRTUAL_INDEX_BASE } from '../conversations/virtuosoFirstIndex';
 import type { OutlineTurn } from '../types/conversation';
 
-// Minimal EventSource mock (copied from __tests__/sse.test.ts). The live-tail
-// effect opens one of these per conversation and fires pollTail() on the `tail`
-// event and on `open`.
-class MockEventSource {
-  static instances: MockEventSource[] = [];
-  url: string;
-  listeners: Record<string, ((ev: MessageEvent) => void)[]> = {};
-  closed = false;
-  constructor(url: string) { this.url = url; MockEventSource.instances.push(this); }
-  addEventListener(name: string, fn: (ev: MessageEvent) => void): void {
-    (this.listeners[name] ||= []).push(fn);
-  }
-  close(): void { this.closed = true; }
-  emit(name: string, data: unknown = {}): void {
-    (this.listeners[name] || []).forEach((fn) => fn({ data: JSON.stringify(data) } as MessageEvent));
-  }
-}
-
-// Mock the snapshot store so we can drive `generated_at` (the SSE-tick signal
-// the live-tail backstop effect keys on) and `transcriptsEnabled` (the gate on
-// the dedicated live-tail EventSource) deterministically between renders.
-// Mirrors the useConversations test setup.
+// #278: the per-conversation EventSource was lifted OUT of useConversation into
+// useConversationLiveTail (tested separately). useConversation now consumes a
+// shared { growthNonce, live } signal, so this test only drives `generated_at`
+// (the global-tick fallback) plus the two new props.
 let mockGeneratedAt = 't0';
-let mockTranscripts = true;
-let mockLiveTail = true;
 vi.mock('./useSnapshot', () => ({
-  useSnapshot: () => ({ generated_at: mockGeneratedAt, transcriptsEnabled: mockTranscripts }),
-}));
-vi.mock('../store/store', async (orig) => ({
-  ...(await orig<typeof import('../store/store')>()),
-  selectLiveTailEnabled: () => mockLiveTail,
+  useSnapshot: () => ({ generated_at: mockGeneratedAt }),
 }));
 
 function detail(items: unknown[], next_after: number | null, over: Record<string, unknown> = {}) {
@@ -56,10 +32,6 @@ function mockOnce(body: unknown, status = 200) {
 beforeEach(() => {
   globalThis.fetch = vi.fn();
   mockGeneratedAt = 't0';
-  mockTranscripts = true;
-  mockLiveTail = true;
-  (globalThis as unknown as { EventSource: typeof MockEventSource }).EventSource = MockEventSource;
-  MockEventSource.instances = [];
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -589,58 +561,51 @@ describe('useConversation', () => {
   });
 });
 
-// live-tail spec §3.1 — the dedicated per-conversation EventSource. Opens
-// `/api/conversation/<id>/events`, fires the EXISTING pollTail() on a `tail`
-// ping (and on `open`, for (re)connect catch-up), gated on transcriptsEnabled
-// + selectLiveTailEnabled. The slow generated_at backstop above stays
-// untouched.
-describe('useConversation live-tail EventSource', () => {
-  it('opens a per-conversation EventSource and pollTails on a tail ping', async () => {
-    mockOnce(detail([it1, it2], null));
-    const { result } = renderHook(() => useConversation('s'));
+// #278 Theme B — the reader consumes a shared { growthNonce, live } signal
+// (from useConversationLiveTail via ConversationsView/ConversationReader) instead
+// of owning its own EventSource. The global-tick refetch is a FALLBACK gated on
+// !live; a growthNonce bump is the genuine-growth trigger (still bottom-edge
+// gated by pollTail's hasMore guard, unchanged).
+describe('useConversation — #278 live-tail gate', () => {
+  it('with live=true, a global tick does NOT pollTail', async () => {
+    mockOnce(detail([it1, it2], null));   // fully paged (next_after null)
+    const { result, rerender } = renderHook(
+      ({ nonce, live }) => useConversation('s', { growthNonce: nonce, live }),
+      { initialProps: { nonce: 0, live: true } });
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
-    const es = MockEventSource.instances.find((e) => e.url.includes('/api/conversation/s/events'));
-    expect(es).toBeTruthy();
-    // A tail ping triggers pollTail(), which fetches the §6 overlap window
-    // (cursor null — 2 items ≤ TAIL_WINDOW) and appends the genuinely-new turn.
+    const before = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    // Advance the global tick: no refetch — the live-tail push owns growth.
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender({ nonce: 0, live: true }); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+  });
+
+  it('a growthNonce bump pollTails and appends the new turn (fully paged, live=true)', async () => {
+    mockOnce(detail([it1, it2], null));
+    const { result, rerender } = renderHook(
+      ({ nonce, live }) => useConversation('s', { growthNonce: nonce, live }),
+      { initialProps: { nonce: 0, live: true } });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    // Bump the nonce: pollTail fetches the §6 overlap window (cursor null — 2 ≤
+    // TAIL_WINDOW) and appends the genuinely-new turn.
     mockOnce(detail([it1, it2, it3], null));
-    await act(async () => { es!.emit('tail', { sessionId: 's' }); await Promise.resolve(); });
+    await act(async () => { rerender({ nonce: 1, live: true }); await Promise.resolve(); });
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
     expect(result.current.detail?.items.map((i) => i.anchor.id)).toEqual([1, 2, 3]);
     expect(String((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0])).not.toContain('after=');
   });
 
-  it('closes the EventSource when the session changes', async () => {
-    mockOnce(detail([], null));
-    const { rerender } = renderHook(({ id }) => useConversation(id), { initialProps: { id: 's' } });
-    await waitFor(() =>
-      expect(MockEventSource.instances.some((e) => e.url.includes('/api/conversation/s/events'))).toBe(true),
-    );
-    const first = MockEventSource.instances.find((e) => e.url.includes('/api/conversation/s/events'))!;
-    mockOnce(detail([], null));
-    rerender({ id: 's2' });
-    expect(first.closed).toBe(true);
-    await waitFor(() =>
-      expect(MockEventSource.instances.some((e) => e.url.includes('/api/conversation/s2/events'))).toBe(true),
-    );
-  });
-
-  it('does NOT open an EventSource when live_tail is off', async () => {
-    mockLiveTail = false;
-    mockOnce(detail([], null));
-    renderHook(() => useConversation('s'));
-    await waitFor(() =>
-      expect(MockEventSource.instances.every((e) => !e.url.includes('/events'))).toBe(true),
-    );
-  });
-
-  it('does NOT open an EventSource when transcripts are disabled', async () => {
-    mockTranscripts = false;
-    mockOnce(detail([], null));
-    renderHook(() => useConversation('s'));
-    await waitFor(() =>
-      expect(MockEventSource.instances.every((e) => !e.url.includes('/events'))).toBe(true),
-    );
+  it('with live=false, the global tick still pollTails (memo-backed fallback)', async () => {
+    mockOnce(detail([it1, it2], null));
+    const { result, rerender } = renderHook(
+      ({ nonce, live }) => useConversation('s', { growthNonce: nonce, live }),
+      { initialProps: { nonce: 0, live: false } });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    // Global tick fires pollTail because live-tail is off.
+    mockOnce(detail([it1, it2, it3], null));
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender({ nonce: 0, live: false }); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
   });
 });
 
