@@ -5175,6 +5175,67 @@ def _tui_refresh_interval_type(s: str) -> float:
     return v
 
 
+# ── #278 Theme A (A2): progressive first-run ingest fill ─────────────────────
+# A first-run / long-gap dashboard sync walks many files and takes seconds to
+# tens-of-seconds; before this it published exactly once at the end (empty →
+# single jump). A2 wires the existing ``sync_cache(progress=…)`` seam to a
+# THROTTLED partial republish so the heavy panels fill progressively. It is
+# self-limiting to first-run: a warm returning user's sync finishes under T, so
+# the throttle never fires and A2 is a pure no-op (exactly one publish). Not
+# user-configurable (YAGNI).
+_A2_PARTIAL_THROTTLE_S = 2.0  # T
+
+
+class _A2ThrottleClock:
+    """Completion-measured throttle for A2 partial republishes.
+
+    ``should_fire(now)`` is True at most once per ``interval_s``, measured from
+    the LAST fire's COMPLETION — call ``mark_done(now)`` after the partial build
+    finishes so a slow partial self-spaces rather than stacking (spec §2.2).
+    Seeded at the sync's START, so the first partial waits a full interval and a
+    sub-T warm sync fires zero partials.
+    """
+    __slots__ = ("_interval", "_last")
+
+    def __init__(self, interval_s: float, *, start: float):
+        self._interval = interval_s
+        self._last = start
+
+    def should_fire(self, now: float) -> bool:
+        return (now - self._last) >= self._interval
+
+    def mark_done(self, now: float) -> None:
+        self._last = now
+
+
+def _make_a2_progress_cb(*, ref, hub, build_partial, throttle, monotonic,
+                         perf=_perf):
+    """Build the A2 throttled ``sync_cache`` progress callback (extracted so the
+    throttle + suppression logic is unit-testable with injected deps).
+
+    On proceed it builds a partial via ``build_partial()`` (a fresh, complete
+    ``skip_sync=True`` snapshot over the current committed cache — NOT nested in
+    another build), stores the clean non-hydrating object on ``ref`` and in the
+    dispatch memo, and publishes a ``hydrating=True`` COPY over the hub (§1.4.1
+    shared-object-leak: only the publish carries the latch, so the memo's
+    retained object stays clean). Suppressed entirely while perf tracing is
+    active (spec §2.2): progressive fill is a UX nicety, and a partial build's
+    ``_perf.reset_thread`` would clobber the standalone ``sync_cache``'s
+    in-flight trace phases. Trace-off (all normal use) is unaffected.
+    """
+    def cb(_stats) -> None:
+        if perf.enabled():
+            return
+        now = monotonic()
+        if not throttle.should_fire(now):
+            return
+        snap = build_partial()
+        ref.set(snap)
+        hub.publish(dataclasses.replace(snap, hydrating=True))
+        throttle.mark_done(monotonic())
+    return cb
+
+
 def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                               runtime_bind=None):
     """Return a closure that does the snapshot-rebuild + SSE-publish work.
@@ -5192,28 +5253,71 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
     DASHBOARD-only factory, so every rebuild here precomputes the envelope's
     doctor / config / update-state onto the snapshot (``precompute_envelope=True``)
     — keeping ``snapshot_to_envelope`` a pure renderer across all SSE clients.
+
+    #278 A2 (§2.1): the ``skip_sync=False`` path DECOUPLES the ingest from the
+    build — it runs ``sync_cache`` STANDALONE (with a throttled progress cb),
+    then builds the final snapshot with ``skip_sync=True``. Routing the ingest
+    through ``_tui_build_snapshot`` instead would be unsafe: that function
+    unconditionally ``_perf.reset_thread()``s (corrupting the trace §0 fixes),
+    writes dispatch state, and mutates single-writer accelerator caches — so a
+    re-entrant partial build from inside its ``sync`` phase would corrupt all
+    three. The decoupled final build reads the same post-sync cache and computes
+    the same post-sync dispatch signature, so it is byte-identical to today's
+    ``_tui_build_snapshot(skip_sync=False)``. The ``skip_sync=True`` path (POST
+    /api/settings) stays the single-build path.
     """
+    def _build(skip_sync: bool):
+        # Resolve _tui_build_snapshot via cctally's namespace so the eager
+        # re-export AND ``monkeypatch.setitem(ns, "_tui_build_snapshot", spy)``
+        # in tests propagate into this closure body (a bare-name lookup would
+        # resolve in this sibling's __dict__ and miss the cctally-side patch).
+        return sys.modules["cctally"]._tui_build_snapshot(
+            now_utc=pinned_now, skip_sync=skip_sync,
+            display_tz_pref_override=display_tz_pref_override,
+            precompute_envelope=True, runtime_bind=runtime_bind,
+        )
+
     def _locked(skip_sync: bool) -> None:
         try:
-            # Resolve _tui_build_snapshot via cctally's namespace so the
-            # eager re-export AND ``monkeypatch.setitem(ns, "_tui_build_snapshot", spy)``
-            # in tests/test_dashboard_api_sync_refresh.py propagate into
-            # this closure body (the bare-name lookup would resolve in
-            # this sibling's __dict__ and miss the cctally-side patch).
-            snap = sys.modules["cctally"]._tui_build_snapshot(
-                now_utc=pinned_now, skip_sync=skip_sync,
-                display_tz_pref_override=display_tz_pref_override,
-                precompute_envelope=True, runtime_bind=runtime_bind,
-            )
-            if skip_sync:
-                # Mirror the startup override: suppress the monotonic sync
-                # stamp so the envelope keeps emitting sync_age_s=None and
-                # the client keeps rendering "sync paused" after the user
-                # hits r / clicks the sync chip. #278 §1.4.1: this build is a
-                # complete full snapshot — force the hydration latch clear
-                # (default False from _tui_build_snapshot, restated here since
-                # this is a replace() clone site).
-                snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
+            if not skip_sync:
+                # ── Decoupled ingest + build (§2.1) ─────────────────────────
+                import time as _time
+                sync_error = None
+                start = _time.monotonic()
+                throttle = _A2ThrottleClock(_A2_PARTIAL_THROTTLE_S, start=start)
+                cb = _make_a2_progress_cb(
+                    ref=ref, hub=hub,
+                    build_partial=lambda: _build(skip_sync=True),
+                    throttle=throttle, monotonic=_time.monotonic,
+                )
+                cache_conn = _cctally().open_cache_db()
+                try:
+                    sync_cache(cache_conn, progress=cb)
+                except Exception as exc:  # noqa: BLE001 — surfaced on the snap
+                    sync_error = f"sync-cache: {exc}"
+                finally:
+                    cache_conn.close()
+                snap = _build(skip_sync=True)  # final: hydrating=False (default)
+                if sync_error is not None:
+                    # Thread the standalone sync error into last_sync_error, sync
+                    # error FIRST (mirrors the internal path where the `sync`
+                    # phase's error is errors[0]) so the surface is unchanged.
+                    existing = snap.last_sync_error
+                    merged = (sync_error if not existing
+                              else f"{sync_error}; {existing}")
+                    snap = dataclasses.replace(snap, last_sync_error=merged)
+                ref.set(snap)
+                hub.publish(snap)
+                return
+            # ── skip_sync=True: single-build path (POST /api/settings) ──────
+            snap = _build(skip_sync=True)
+            # Mirror the startup override: suppress the monotonic sync stamp so
+            # the envelope keeps emitting sync_age_s=None and the client keeps
+            # rendering "sync paused" after the user hits r / clicks the sync
+            # chip. #278 §1.4.1: force the hydration latch clear (default False
+            # from _tui_build_snapshot, restated here since this is a replace()
+            # clone site).
+            snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
             ref.set(snap)
             hub.publish(snap)
         except Exception as exc:

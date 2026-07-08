@@ -180,27 +180,56 @@ def test_sync_cache_consumes_reingest_and_rebuild_clears_cursor(env):
     assert _get_meta(conn, CURSOR_KEY) is None and _get_meta(conn, GEN_KEY) is None
 
 
-def test_dashboard_initial_snapshot_never_syncs(monkeypatch):
-    """Fix #1: the foreground initial snapshot must use skip_sync=True regardless
-    of args.no_sync, so binding the port never blocks on (or consumes) the heavy
-    sync / reingest — that work is owned by the background _DashboardSyncThread."""
+def test_dashboard_initial_snapshot_never_syncs(monkeypatch, tmp_path):
+    """#179 + #278 A1: the foreground initial snapshot must never run the heavy
+    sync — that work is owned by the background _DashboardSyncThread.
+
+    --no-sync keeps the full pre-bind build via _tui_build_snapshot(skip_sync=True).
+    A NORMAL launch now uses the cheap A1 seed, which bypasses _tui_build_snapshot
+    entirely and calls the current_week / forecast builders directly with
+    skip_sync=True — so it likewise never ingests before the bind."""
     import types
     ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
     import cctally  # the loaded main module namespace
-    captured = {}
+    import _cctally_tui as tui
+    import _cctally_dashboard as dash
+
+    # --no-sync: the full pre-bind build, skip_sync=True.
+    cap_full = {}
 
     def fake_build(*a, **kw):
-        captured["skip_sync"] = kw.get("skip_sync")
+        cap_full["skip_sync"] = kw.get("skip_sync")
         return object()  # opaque snapshot; helper just returns it
 
     monkeypatch.setattr(cctally, "_tui_build_snapshot", fake_build)
-    import _cctally_dashboard as dash
-    for no_sync in (False, True):
-        captured.clear()
-        args = types.SimpleNamespace(no_sync=no_sync)
-        dash._dashboard_initial_snapshot(
-            args, pinned_now=None, display_tz_pref_override=None)
-        assert captured["skip_sync"] is True, f"no_sync={no_sync} must still skip_sync"
+    dash._dashboard_initial_snapshot(
+        types.SimpleNamespace(no_sync=True), pinned_now=None,
+        display_tz_pref_override=None)
+    assert cap_full["skip_sync"] is True, "--no-sync must still skip_sync"
+
+    # Normal launch: the cheap seed bypasses _tui_build_snapshot and calls the
+    # headline builders directly with skip_sync=True (never ingesting).
+    cap_full.clear()
+    seed_calls = {}
+
+    def fake_cw(conn, now_utc, *, skip_sync=False, **kw):
+        seed_calls["cw"] = skip_sync
+        return None
+
+    def fake_fc(conn, now_utc, *, skip_sync=False, **kw):
+        seed_calls["fc"] = skip_sync
+        return None
+
+    monkeypatch.setattr(tui, "_tui_build_current_week", fake_cw)
+    monkeypatch.setattr(tui, "_tui_build_forecast_view", fake_fc)
+    dash._dashboard_initial_snapshot(
+        types.SimpleNamespace(no_sync=False), pinned_now=None,
+        display_tz_pref_override=None)
+    assert seed_calls == {"cw": True, "fc": True}
+    assert "skip_sync" not in cap_full, (
+        "a normal launch must NOT route through _tui_build_snapshot (cheap seed)"
+    )
 
 
 # --- U8-G1: real-server bind-before-sync (#179 regression, #217 S1) ---------

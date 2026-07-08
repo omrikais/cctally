@@ -242,3 +242,189 @@ def test_bind_before_build_timing(tmp_path):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# A2 — decoupled throttled progressive ingest fill (§2.1-§2.5).
+# ---------------------------------------------------------------------------
+
+EMPTY_NOW = dt.datetime(2026, 7, 8, 12, 0, tzinfo=dt.timezone.utc)
+
+
+class _CapturingHub:
+    """Minimal SSEHub stand-in that records every published snapshot."""
+
+    def __init__(self):
+        self.published = []
+
+    def publish(self, snap):
+        self.published.append(snap)
+
+
+def test_a2_throttle_clock_is_completion_measured(monkeypatch, tmp_path):
+    load_script()
+    import _cctally_tui as tui
+    clk = tui._A2ThrottleClock(2.0, start=100.0)
+    assert clk.should_fire(101.9) is False   # < T since sync start
+    assert clk.should_fire(102.0) is True    # == T since sync start
+    clk.mark_done(102.5)                      # a partial completed at 102.5
+    assert clk.should_fire(104.0) is False   # < T since completion
+    assert clk.should_fire(104.5) is True    # == T since completion
+
+
+def test_a2_progress_cb_fires_throttled_and_publishes_hydrating(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+    clock = {"t": 100.0}
+    throttle = tui._A2ThrottleClock(2.0, start=100.0)
+    perf_off = types.SimpleNamespace(enabled=lambda: False)
+    cb = tui._make_a2_progress_cb(
+        ref=ref, hub=hub,
+        build_partial=lambda: ns["_empty_dashboard_snapshot"](),
+        throttle=throttle, monotonic=lambda: clock["t"], perf=perf_off,
+    )
+    cb(None)  # t=100 → < T → no fire
+    assert hub.published == []
+    clock["t"] = 102.0
+    cb(None)  # ≥ T → fire
+    assert len(hub.published) == 1
+    assert hub.published[0].hydrating is True   # publish carries the latch
+    assert ref.get().hydrating is False         # ref/memo keep the clean object
+    clock["t"] = 103.0
+    cb(None)  # < T since completion(102) → no fire
+    assert len(hub.published) == 1
+    clock["t"] = 104.0
+    cb(None)  # ≥ T since completion → fire
+    assert len(hub.published) == 2
+
+
+def test_a2_progress_cb_suppressed_under_perf_tracing(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+    throttle = tui._A2ThrottleClock(0.0, start=0.0)  # would otherwise always fire
+    perf_on = types.SimpleNamespace(enabled=lambda: True)
+    cb = tui._make_a2_progress_cb(
+        ref=ref, hub=hub,
+        build_partial=lambda: ns["_empty_dashboard_snapshot"](),
+        throttle=throttle, monotonic=lambda: 999.0, perf=perf_on,
+    )
+    cb(None)
+    cb(None)
+    assert hub.published == []  # progressive fill suppressed during a trace
+
+
+def test_a2_warm_sync_yields_single_publish(monkeypatch, tmp_path):
+    # Empty CLAUDE dir → the real sync_cache finishes far under T → the throttle
+    # never fires → exactly one publish (the final, hydrating=False).
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=EMPTY_NOW, display_tz_pref_override=None,
+    )
+    locked(skip_sync=False)
+    assert len(hub.published) == 1
+    assert hub.published[0].hydrating is False
+
+
+def test_a2_progressive_multi_frame(monkeypatch, tmp_path):
+    # A slow first-run sync (faked: progress fires twice) crossing T (patched to
+    # 0) yields MULTIPLE hydrating=true partial frames, ending in a
+    # hydrating=false complete frame. Non-vacuous vs the pre-change single frame.
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+
+    def fake_sync(conn, *, progress=None, **kw):
+        if progress is not None:
+            progress(None)
+            progress(None)
+        return None
+
+    monkeypatch.setitem(ns, "sync_cache", fake_sync)
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=EMPTY_NOW, display_tz_pref_override=None,
+    )
+    locked(skip_sync=False)
+    hydrating_frames = [s for s in hub.published if getattr(s, "hydrating", False)]
+    assert len(hydrating_frames) >= 2, f"expected ≥2 partials, got {hub.published}"
+    assert hub.published[-1].hydrating is False, "final frame must be complete"
+
+
+def test_a2_perf_trace_suppresses_partials_integration(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    import _lib_perf as perf
+    monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+
+    def fake_sync(conn, *, progress=None, **kw):
+        if progress is not None:
+            progress(None)
+            progress(None)
+        return None
+
+    monkeypatch.setitem(ns, "sync_cache", fake_sync)
+    perf.set_enabled(True)
+    try:
+        locked = ns["_make_run_sync_now_locked"](
+            ref=ref, hub=hub, pinned_now=EMPTY_NOW, display_tz_pref_override=None,
+        )
+        locked(skip_sync=False)
+    finally:
+        perf.set_enabled(False)
+        perf.reset_thread()
+    hydrating_frames = [s for s in hub.published if getattr(s, "hydrating", False)]
+    assert hydrating_frames == []          # partials suppressed during a trace
+    assert len(hub.published) == 1         # only the final full build
+    assert hub.published[0].hydrating is False
+
+
+def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
+    # The decoupled path's final published snapshot is byte-identical to today's
+    # _tui_build_snapshot(skip_sync=False) over the same cache — proving the
+    # decoupling (and any intermediate partials) don't change the final result.
+    ns = _load_with_fixture(monkeypatch, tmp_path, "ok")
+    import _lib_snapshot_cache as sc
+    import json
+    BIND = "127.0.0.1"
+
+    sc.reset_dispatch_state()
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=OK_AS_OF,
+        display_tz_pref_override=None, runtime_bind=BIND,
+    )
+    locked(skip_sync=False)
+    decoupled = hub.published[-1]
+    env_decoupled = ns["snapshot_to_envelope"](
+        decoupled, now_utc=OK_AS_OF, monotonic_now=None, runtime_bind=BIND,
+    )
+
+    # A fresh, non-idle direct full build over the same (unchanged) cache.
+    sc.reset_dispatch_state()
+    direct = ns["_tui_build_snapshot"](
+        now_utc=OK_AS_OF, skip_sync=False,
+        precompute_envelope=True, runtime_bind=BIND,
+    )
+    env_direct = ns["snapshot_to_envelope"](
+        direct, now_utc=OK_AS_OF, monotonic_now=None, runtime_bind=BIND,
+    )
+
+    assert json.dumps(env_decoupled, sort_keys=True) == json.dumps(
+        env_direct, sort_keys=True
+    )
+    assert decoupled.hydrating is False
