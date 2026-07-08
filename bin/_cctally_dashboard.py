@@ -6805,13 +6805,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # expose_transcripts); see _handle_get_debug_backend.
             self._handle_get_debug_backend()
         elif path == "/api/conversations/facets":
-            with self._perf_gate().phase("endpoint.conversations_facets"):
+            with self._perf_scope("endpoint.conversations_facets"):
                 self._handle_get_conversations_facets()
         elif path == "/api/conversations":
-            with self._perf_gate().phase("endpoint.conversations"):
+            with self._perf_scope("endpoint.conversations"):
                 self._handle_get_conversations()
         elif path == "/api/conversation/search":
-            with self._perf_gate().phase("endpoint.conversation_search"):
+            with self._perf_scope("endpoint.conversation_search"):
                 self._handle_get_conversation_search()
         elif path.startswith("/api/conversation/") and path.endswith("/payload"):
             # #178: on-demand load-full. Matched BEFORE the <id> reader
@@ -6825,12 +6825,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/conversation/") and path.endswith("/outline"):
             # #177 S5: full-session outline skeleton + stats. Matched BEFORE
             # the <id> reader catch-all (Codex F2 — same precedence as /payload).
-            with self._perf_gate().phase("endpoint.conversation_outline"):
+            with self._perf_scope("endpoint.conversation_outline"):
                 self._handle_get_conversation_outline(path)
         elif path.startswith("/api/conversation/") and path.endswith("/find"):
             # #177 S6: in-conversation find → rendered-turn anchors. Matched
             # BEFORE the <id> reader catch-all (same precedence as /outline).
-            with self._perf_gate().phase("endpoint.conversation_find"):
+            with self._perf_scope("endpoint.conversation_find"):
                 self._handle_get_conversation_find(path)
         elif path.startswith("/api/conversation/") and path.endswith("/events"):
             # Live-tail SSE for the open reader (spec §2). Matched BEFORE the
@@ -6840,16 +6840,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/conversation/") and path.endswith("/export"):
             # #217 S5: whole-session Markdown export (F1/F5). Matched BEFORE the
             # <id> reader catch-all (same precedence as /outline).
-            with self._perf_gate().phase("endpoint.conversation_export"):
+            with self._perf_scope("endpoint.conversation_export"):
                 self._handle_get_conversation_export(path)
         elif path.startswith("/api/conversation/") and path.endswith("/prompts"):
             # #217 S7: ordered main-thread prompt spine for session comparison
             # (F10). Matched BEFORE the <id> reader catch-all (same precedence
             # as /outline).
-            with self._perf_gate().phase("endpoint.conversation_prompts"):
+            with self._perf_scope("endpoint.conversation_prompts"):
                 self._handle_get_conversation_prompts(path)
         elif path.startswith("/api/conversation/"):
-            with self._perf_gate().phase("endpoint.conversation_detail"):
+            with self._perf_scope("endpoint.conversation_detail"):
                 self._handle_get_conversation_detail(path)
         else:
             self.send_error(404, "not found")
@@ -7053,6 +7053,31 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         so the coarse ``endpoint.*`` wraps in ``do_GET`` cost nothing by
         default."""
         return sys.modules["cctally"]._load_sibling("_lib_perf")
+
+    @contextlib.contextmanager
+    def _perf_scope(self, name):
+        """Like ``_perf_gate().phase(name)`` but ALSO stashes the completed root
+        so the loopback ``/api/debug/backend`` surface can read a CONVERSATION
+        trace, not just the ``/api/data`` snapshot tree (Session C / M5 — the
+        Session A dead-end: no ``stash_last`` ran on a request thread). On enter
+        it ``reset_thread()``s (each conversation handler runs on its own request
+        thread, so this can't clobber the snapshot-build thread's tree) and opens
+        ``phase(name)``; on clean exit it stashes ``current_root()``. Near-noop
+        when ``CCTALLY_PERF_TRACE`` is off — ``phase()`` returns ``_NULL_PHASE``,
+        no root is pushed, so ``current_root()`` is ``None`` and ``stash_last``
+        early-returns. Used ONLY for the short-lived, assembly-relevant routes;
+        the long-lived ``/events`` SSE keeps a plain, non-stashing wrap (Codex F3)
+        so it can never overwrite the last useful assembly trace on disconnect."""
+        perf = self._perf_gate()
+        perf.reset_thread()
+        with perf.phase(name):
+            yield
+        try:
+            perf.stash_last(
+                perf.current_root(),
+                generated_at=dt.datetime.now(dt.timezone.utc).isoformat())
+        except Exception:  # noqa: BLE001 — a diagnostic stash must never 500
+            pass
 
     def _require_debug_backend_allowed(self) -> bool:
         """Gate for ``/api/debug/backend`` (issue #276) — STRICTER than the

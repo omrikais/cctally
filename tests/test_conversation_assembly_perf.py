@@ -155,3 +155,67 @@ def test_assemble_unknown_session_closes_cleanly():
     finally:
         perf.set_enabled(False)
         perf.reset_thread()
+
+
+# ── Task 2: /api/debug/backend plumbing (the dead-end fix) ─────────────────
+
+def _find_node(tree, name):
+    """Depth-first search for a phase node by name in a to_dict() tree."""
+    if tree is None:
+        return None
+    if tree.get("name") == name:
+        return tree
+    for ch in tree.get("children", ()):
+        hit = _find_node(ch, name)
+        if hit is not None:
+            return hit
+    return None
+
+
+def test_perf_scope_stashes_conversation_tree(tmp_path, monkeypatch):
+    """A conversation request run under the handler's _perf_scope stashes an
+    `endpoint.conversation_detail` tree onto last_backend_perf() — so
+    /api/debug/backend surfaces the conversation trace, not just the snapshot
+    (Session A's dead-end). And a subsequent plain (non-stashing) /events wrap
+    does NOT clobber it (Codex F3 carve-out)."""
+    from conftest import load_script, redirect_paths
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    # Resolve the SHARED perf + kernel the handler uses (load_script does not
+    # purge _lib_* siblings, so these are the same sys.modules instances the
+    # handler's _perf_gate() / the kernel's _perf() resolve).
+    dperf = ns["_load_sibling"]("_lib_perf")
+    dcq = ns["_load_sibling"]("_lib_conversation_query")
+
+    conn = ns["open_cache_db"]()
+    _seed_small_session(conn)
+    conn.commit()
+
+    H = ns["DashboardHTTPHandler"]
+    handler = H.__new__(H)     # _perf_scope only needs the staticmethod _perf_gate
+
+    dperf.set_enabled(True)
+    dperf.reset_thread()
+    dperf._LAST_BACKEND_PERF = None
+    try:
+        with handler._perf_scope("endpoint.conversation_detail"):
+            dcq.get_conversation(conn, "s1", tail=True, limit=50)
+        last = dperf.last_backend_perf()
+        assert last is not None, "the /events dead-end is unfixed — nothing stashed"
+        assert last["phases"]["name"] == "endpoint.conversation_detail"
+        # The assemble sub-tree nests under the endpoint root (end-to-end proof
+        # that /api/debug/backend would surface the whole conversation trace).
+        assert _find_node(last["phases"], "assemble") is not None
+        assert _find_node(last["phases"], "conversation.detail") is not None
+
+        # F3: a plain, non-stashing /events wrap must NOT overwrite the stash.
+        dperf.reset_thread()
+        with dperf.phase("endpoint.conversation_events"):
+            pass
+        still = dperf.last_backend_perf()
+        assert still["phases"]["name"] == "endpoint.conversation_detail"
+    finally:
+        conn.close()
+        dperf.set_enabled(False)
+        dperf.reset_thread()
+        dperf._LAST_BACKEND_PERF = None
