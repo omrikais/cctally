@@ -12,6 +12,11 @@
 # parses.
 set -uo pipefail
 
+# Shared dev-autodetect suppressor preamble (exports
+# CCTALLY_DISABLE_DEV_AUTODETECT=1); coverage enforced by
+# tests/test_harness_dev_autodetect_coverage.py.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BENCH="$REPO_ROOT/bin/cctally-bench"
 
@@ -29,23 +34,21 @@ report() {
     fi
 }
 
-# Portable signature of a path (mtime_ns + size, or MISSING). Used to prove the
-# real prod / Claude dirs were not touched by the run.
-realsig() {
-    python3 - "$1" <<'PY'
-import os, sys
-try:
-    st = os.stat(sys.argv[1])
-    print(f"{st.st_mtime_ns}:{st.st_size}")
-except FileNotFoundError:
-    print("MISSING")
-PY
-}
+# True iff the path exists (any type).
+exists() { [ -e "$1" ] && echo yes || echo no; }
 
+# Isolation is asserted POSITIVELY — the bench must write its cache.db into the
+# scratch CCTALLY_DATA_DIR, which only happens when CCTALLY_DATA_DIR is honored
+# (an un-pinned bench would write the REAL ~/.local/share/cctally/cache.db and
+# the scratch cache.db would never appear). This is robust against a live
+# cctally instance concurrently writing the real dir (statusline / hook-tick),
+# which a strict "real dir byte-frozen" assertion would false-flag. As a
+# clean-machine backstop we also check the real dirs were not CREATED from
+# absent.
 REAL_CACHE="$HOME/.local/share/cctally"
 REAL_CLAUDE="$HOME/.claude/projects"
-cache_before=$(realsig "$REAL_CACHE")
-claude_before=$(realsig "$REAL_CLAUDE")
+cache_existed=$(exists "$REAL_CACHE")
+claude_existed=$(exists "$REAL_CLAUDE")
 
 SCRATCH=$(mktemp -d -t cctally-bench-selftest-XXXXXX)
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -100,18 +103,34 @@ PY
     fi
 fi
 
-# Isolation: the real prod cache dir + Claude root must be byte-untouched.
-cache_after=$(realsig "$REAL_CACHE")
-claude_after=$(realsig "$REAL_CLAUDE")
-if [ "$cache_before" = "$cache_after" ]; then
-    report PASS isolation-cache-dir
+# Isolation (positive): the bench wrote its cache.db into the scratch
+# CCTALLY_DATA_DIR — proving CCTALLY_DATA_DIR was honored, so it did NOT write
+# the real ~/.local/share/cctally/cache.db.
+if [ -s "$SCRATCH/data/cache.db" ]; then
+    report PASS isolation-scratch-cache-db
 else
-    report FAIL isolation-cache-dir "$REAL_CACHE changed: $cache_before -> $cache_after"
+    report FAIL isolation-scratch-cache-db "scratch cache.db missing/empty — CCTALLY_DATA_DIR not honored?"
 fi
-if [ "$claude_before" = "$claude_after" ]; then
-    report PASS isolation-claude-root
+# Isolation (positive): the generator wrote synthetic JSONL under the scratch
+# Claude root — proving CLAUDE_CONFIG_DIR was the ingest source, not real ~/.claude.
+if [ -n "$(find "$SCRATCH/claude/projects" -name '*.jsonl' -print -quit 2>/dev/null)" ]; then
+    report PASS isolation-scratch-claude-root
 else
-    report FAIL isolation-claude-root "$REAL_CLAUDE changed: $claude_before -> $claude_after"
+    report FAIL isolation-scratch-claude-root "no synthetic JSONL under scratch Claude root"
+fi
+# Isolation (clean-machine backstop): the real dirs must not be CREATED from
+# absent by the run. On a machine where they already exist (a live cctally
+# install), a concurrent statusline/hook-tick write is not the bench's doing,
+# so we don't compare mtimes — the scratch checks above are the real guard.
+if [ "$cache_existed" = no ] && [ "$(exists "$REAL_CACHE")" = yes ]; then
+    report FAIL isolation-real-cache-dir "$REAL_CACHE was created by the run"
+else
+    report PASS isolation-real-cache-dir
+fi
+if [ "$claude_existed" = no ] && [ "$(exists "$REAL_CLAUDE")" = yes ]; then
+    report FAIL isolation-real-claude-root "$REAL_CLAUDE was created by the run"
+else
+    report PASS isolation-real-claude-root
 fi
 
 echo "passed: $pass_count   failed: $fail_count"

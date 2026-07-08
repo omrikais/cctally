@@ -13,10 +13,40 @@ they are path-loaded via importlib rather than imported by name.
 """
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import sqlite3
+import sys
+
+import pytest
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bench_env():
+    """The generator + runner pin CCTALLY_DATA_DIR + CLAUDE_CONFIG_DIR via
+    os.environ directly (so a freshly-loaded cctally targets the scratch dir),
+    and leave them set. Snapshot + restore them here so the mutation can't leak
+    into a sibling test on the same pytest-xdist worker — a leaked
+    CCTALLY_DATA_DIR override otherwise wins over that test's HOME-based path
+    resolution and points APP_DIR at this test's since-deleted tmp dir."""
+    keys = ("CCTALLY_DATA_DIR", "CLAUDE_CONFIG_DIR")
+    saved = {k: os.environ.get(k) for k in keys}
+    yield
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    # Re-resolve the path globals from the restored env so a later test that
+    # reuses the cached cctally module sees clean prod-layout paths.
+    mod = sys.modules.get("cctally")
+    if mod is not None:
+        try:
+            mod._cctally_core._init_paths_from_env()
+        except Exception:
+            pass
 
 
 def _load_path(mod_name, file_name):
