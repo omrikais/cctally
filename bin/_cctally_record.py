@@ -111,8 +111,30 @@ What stays in bin/cctally:
   ``_RESET_PCT_DROP_THRESHOLD`` — boundary helpers, already-extracted
   subsystems, or constants reached through the cctally namespace
   (``_RESET_PCT_DROP_THRESHOLD`` now lives in ``bin/_cctally_weekrefs.py``,
-  re-exported on the cctally ns). All accessed via the same shim/``c.X``
-  pattern.
+  re-exported on the cctally ns). Accessed via the shim/``c.X`` pattern
+  EXCEPT the names honest-imported by the #279 S4 F5 collapse below.
+
+  #279 S4 F5 (the #50 treatment): the forwarding shims for
+  ``open_cache_db`` (→ ``_cctally_cache``), ``_floor_to_hour`` (→
+  ``_lib_blocks``), ``_resolve_display_tz_obj`` (→ ``_lib_display_tz``),
+  ``_build_alert_payload_{weekly,five_hour,budget,project_budget,
+  codex_budget,projected}`` (→ ``_lib_alerts_payload``), and
+  ``_get_oauth_usage_config`` (→ ``_cctally_refresh``) were replaced by
+  honest top-level imports — each real def lives in a sibling
+  bin/cctally eager-loads BEFORE _cctally_record, and none is
+  monkeypatched through the cctally namespace / this module's route.
+  The remaining 38 shims below STAY: patched surfaces (``load_config``,
+  ``sync_cache``, ``_dispatch_alert_notification``, ``compute_budget_status``,
+  ``_apply_reset_events_to_weekrefs``, ``resolve_display_tz``,
+  ``_sum_cost_by_project``, ``_project_budget_labels``,
+  ``get_claude_session_entries``, ``_compute_cost_for_weekref``,
+  ``_get_canonical_boundary_for_date``, ``_hook_tick_oauth_refresh``),
+  bin/cctally-homed residues (``_resolve_primary_model_for_block``,
+  ``_warn_alerts_bad_config_once``, ``_warn_budget_bad_config_once``,
+  ``_hook_tick_make_mock_refresh``, ``cmd_sync_week``), and names whose
+  real home (``_cctally_milestones`` / ``_cctally_forecast`` /
+  ``_cctally_weekrefs``) bin/cctally eager-loads AFTER _cctally_record —
+  honest-importing those at module top would force an early sibling load.
 
 §5.6 audit on this extraction's monkeypatch surface:
 - ``cmd_record_usage`` — patched via ``monkeypatch.setitem(ns, …)``
@@ -236,15 +258,40 @@ from _lib_record import (
     ARM_MARKER,
 )
 
+# === #279 S4 F5: forwarding-shim wall collapse (the #50 treatment) =========
+# Names whose real def lives in a sibling that bin/cctally eager-loads BEFORE
+# _cctally_record (so these are sys.modules hits in every load context) AND
+# that no test monkeypatches through the cctally namespace / _cctally_record
+# route are honest-imported here instead of routed through a
+# ``sys.modules["cctally"].X`` shim. The audit (full table in the commit body)
+# used the suite as the authority; every name below survived the full
+# bin/cctally-test-all. Patched / bin/cctally-homed / post-889-homed names
+# keep their shims below.
+from _cctally_cache import open_cache_db
+from _lib_blocks import _floor_to_hour
+from _lib_display_tz import _resolve_display_tz_obj
+from _lib_alerts_payload import (
+    _build_alert_payload_weekly,
+    _build_alert_payload_five_hour,
+    _build_alert_payload_budget,
+    _build_alert_payload_project_budget,
+    _build_alert_payload_codex_budget,
+    _build_alert_payload_projected,
+)
+from _cctally_refresh import _get_oauth_usage_config
 
-# Module-level back-ref shims. Each shim resolves
-# ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
-# monkeypatches on cctally's namespace propagate into the moved code
-# unchanged. `load_config` and `get_claude_session_entries` STAY as
-# shims even though their natural homes are decentralized
-# (_cctally_config / _cctally_cache) — tests monkeypatch them via
-# `ns["X"]` (21 sites total, audited 2026-05-17); direct imports would
-# silently bypass the patches.
+
+# Module-level back-ref shims (the REMAINING wall after the #279 S4 F5
+# collapse above pulled 10 unpatched, pre-889-homed names up to honest
+# imports). Each shim below resolves ``sys.modules['cctally'].X`` at CALL
+# TIME (not bind time), so monkeypatches on cctally's namespace propagate
+# into the moved code unchanged. `load_config` and
+# `get_claude_session_entries` STAY as shims even though their natural
+# homes are decentralized (_cctally_config / _cctally_cache) — tests
+# monkeypatch them via `ns["X"]`; direct imports would silently bypass the
+# patches. The rest stay because they are patched, bin/cctally-homed, or
+# their real home is eager-loaded AFTER this module (see the F5 note in the
+# module docstring for the full STAY/COLLAPSE audit).
 # See spec §3.5 (carve-out) and §3.7 (stays-on-shim allowlist).
 def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
@@ -254,16 +301,8 @@ def get_claude_session_entries(*args, **kwargs):
     return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
 
 
-def open_cache_db(*args, **kwargs):
-    return sys.modules["cctally"].open_cache_db(*args, **kwargs)
-
-
 def sync_cache(*args, **kwargs):
     return sys.modules["cctally"].sync_cache(*args, **kwargs)
-
-
-def _floor_to_hour(*args, **kwargs):
-    return sys.modules["cctally"]._floor_to_hour(*args, **kwargs)
 
 
 def _get_canonical_boundary_for_date(*args, **kwargs):
@@ -304,30 +343,6 @@ def cmd_sync_week(*args, **kwargs):
 
 def _resolve_primary_model_for_block(*args, **kwargs):
     return sys.modules["cctally"]._resolve_primary_model_for_block(*args, **kwargs)
-
-
-def _resolve_display_tz_obj(*args, **kwargs):
-    return sys.modules["cctally"]._resolve_display_tz_obj(*args, **kwargs)
-
-
-def _build_alert_payload_weekly(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_weekly(*args, **kwargs)
-
-
-def _build_alert_payload_five_hour(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_five_hour(*args, **kwargs)
-
-
-def _build_alert_payload_budget(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_budget(*args, **kwargs)
-
-
-def _build_alert_payload_project_budget(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_project_budget(*args, **kwargs)
-
-
-def _build_alert_payload_codex_budget(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_codex_budget(*args, **kwargs)
 
 
 def _budget_crossings(*args, **kwargs):
@@ -390,10 +405,6 @@ def _projected_levels_already_latched(*args, **kwargs):
     return sys.modules["cctally"]._projected_levels_already_latched(*args, **kwargs)
 
 
-def _build_alert_payload_projected(*args, **kwargs):
-    return sys.modules["cctally"]._build_alert_payload_projected(*args, **kwargs)
-
-
 def _fetch_current_week_snapshots(*args, **kwargs):
     return sys.modules["cctally"]._fetch_current_week_snapshots(*args, **kwargs)
 
@@ -424,10 +435,6 @@ def _warn_alerts_bad_config_once(*args, **kwargs):
 
 def _warn_budget_bad_config_once(*args, **kwargs):
     return sys.modules["cctally"]._warn_budget_bad_config_once(*args, **kwargs)
-
-
-def _get_oauth_usage_config(*args, **kwargs):
-    return sys.modules["cctally"]._get_oauth_usage_config(*args, **kwargs)
 
 
 def _hook_tick_oauth_refresh(*args, **kwargs):
@@ -515,6 +522,8 @@ _logged_window_key_coerce_failure = False
 #   c._RESET_PCT_DROP_THRESHOLD       — bin/_cctally_weekrefs.py constant (re-exported on cctally ns)
 #   c._is_reset_drop                  — bin/_cctally_weekrefs.py helper (re-exported on cctally ns)
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
+# (#279 S4 F5 collapsed only function-forwarding shims to honest imports;
+#  these call-time constant/helper accessors are untouched.)
 
 
 def _resolve_active_five_hour_reset_event_id(
