@@ -2734,6 +2734,12 @@ def cmd_record_credit(args) -> int:
                   f"{plan.from_pct:g}% -> {plan.to_pct:g}% "
                   f"(effective {plan.effective_iso})")
         return 0
+    except _cctally().StatsDbCorruptError:
+        # #279 S1 F4: the global corrupt-DB contract (one-line diagnosis +
+        # exit 2) wins over record-credit's documented exit-3 DB-error mapping.
+        # StatsDbCorruptError subclasses sqlite3.DatabaseError, so without this
+        # re-raise the handler below would swallow it and return 3.
+        raise
     except sqlite3.DatabaseError as e:
         # Documented exit 3 (docs/commands/record-credit.md "3 — a database
         # error"). The inner ValueError->2 / EOFError paths return before

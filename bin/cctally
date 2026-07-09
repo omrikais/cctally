@@ -791,6 +791,7 @@ _MIGRATION_NAME_RE = _cctally_db._MIGRATION_NAME_RE
 Migration = _cctally_db.Migration
 DowngradeDetected = _cctally_db.DowngradeDetected
 ProdMigrationRefused = _cctally_db.ProdMigrationRefused
+StatsDbCorruptError = _cctally_db.StatsDbCorruptError
 _STATS_MIGRATIONS = _cctally_db._STATS_MIGRATIONS
 _CACHE_MIGRATIONS = _cctally_db._CACHE_MIGRATIONS
 _make_migration_decorator = _cctally_db._make_migration_decorator
@@ -2809,6 +2810,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ProdMigrationRefused as exc:
         eprint(f"{exc}")  # message already carries the 'cctally:' prefix
+        return 2
+    except StatsDbCorruptError as exc:
+        # #279 S1 F4: corrupt stats.db (non-re-derivable) — one-line diagnosis
+        # + recovery guidance, exit 2. Caught before the generic handler so it
+        # never renders as a raw traceback.
+        eprint(f"cctally: {exc}")
         return 2
     except Exception as exc:  # pragma: no cover
         eprint(f"Error: {exc}")

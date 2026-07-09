@@ -237,6 +237,19 @@ class ProdMigrationRefused(Exception):
         )
 
 
+class StatsDbCorruptError(sqlite3.DatabaseError):
+    """stats.db failed the open-time probe (#279 S1 F4).
+
+    Subclasses ``sqlite3.DatabaseError`` so graceful-degrade sites (doctor,
+    dashboard/TUI background threads, the 5h-anchor fallback) keep treating it
+    as a DB failure exactly as before — but command-level handlers that map DB
+    errors to OTHER exit codes must re-raise it so the global exit-2 diagnosis
+    wins (``cmd_record_credit`` does; its documented DB-error exit is 3). NOT
+    auto-recreated: stats.db is the non-re-derivable DB (recorded usage
+    history), unlike cache.db.
+    """
+
+
 class MigrationGateNotMet(Exception):
     """Migration cannot run yet because a cross-DB prerequisite is unsatisfied.
 

@@ -927,19 +927,40 @@ def open_db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    # Explicit for intent + symmetry with open_cache_db (bin/_cctally_cache.py).
-    # sqlite3.connect()'s default timeout=5.0 ALREADY maps to busy_timeout=5000,
-    # so this is not a behavior change — it makes the multi-writer retry window
-    # an explicit contract beside the WAL pragmas instead of an inherited
-    # default a reader has to know about. NOTE: busy_timeout does NOT absorb
-    # SQLITE_BUSY_SNAPSHOT (a WAL read-then-write transaction whose snapshot is
-    # invalidated by a competing commit raises "database is locked" instantly,
-    # bypassing the busy handler). The write paths defend against that by taking
-    # the write lock up front — BEGIN IMMEDIATE, or a write as the transaction's
-    # first DML. See cctally-dev#87.
-    conn.execute("PRAGMA busy_timeout=5000")
+    # #279 S1 F4: probe connect + initial PRAGMAs so a corrupt stats.db (the
+    # non-re-derivable DB) surfaces as a one-line diagnosis + exit 2 instead of
+    # a raw traceback. The catch boundary is DELIBERATELY narrow — ONLY the
+    # connect/PRAGMA/probe below. The DDL + `_run_pending_migrations` region
+    # further down is NOT wrapped: migration-handler failures have their own
+    # logging/suppression contract and must not be mislabeled as corruption
+    # (corruption that only surfaces mid-DDL stays a raw error; the probe
+    # catches the common case).
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # Explicit for intent + symmetry with open_cache_db (bin/_cctally_cache.py).
+        # sqlite3.connect()'s default timeout=5.0 ALREADY maps to busy_timeout=5000,
+        # so this is not a behavior change — it makes the multi-writer retry window
+        # an explicit contract beside the WAL pragmas instead of an inherited
+        # default a reader has to know about. NOTE: busy_timeout does NOT absorb
+        # SQLITE_BUSY_SNAPSHOT (a WAL read-then-write transaction whose snapshot is
+        # invalidated by a competing commit raises "database is locked" instantly,
+        # bypassing the busy handler). The write paths defend against that by taking
+        # the write lock up front — BEGIN IMMEDIATE, or a write as the transaction's
+        # first DML. See cctally-dev#87.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("SELECT 1").fetchone()
+    except sqlite3.DatabaseError as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise c.StatsDbCorruptError(
+            f"stats.db appears corrupt or unreadable ({exc}). path: {DB_PATH}. "
+            f"Not auto-recreated — it holds your recorded usage history. "
+            f'Recovery: back up the file, then try `sqlite3 "{DB_PATH}" ".recover"`, '
+            f"or move it aside to start fresh. If this recurs, please file an issue."
+        ) from exc
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS weekly_usage_snapshots (
