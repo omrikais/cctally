@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Release tooling (maintainer): the npm-publish poll now hard-fails on timeout with `--resume` guidance instead of silently reporting success; `--npm-soft-timeout` restores the old exit-0 behavior and marks the final line "published (npm pending verification)".
+
+### Fixed
+- `cctally setup` now installs the `cctally-budget` symlink (it existed but was never linked); a drift-guard test keeps the wrapper list and the installer in sync.
+- `CCTALLY_ALLOW_PROD_MIGRATION=0`, `CCTALLY_DISABLE_DEV_AUTODETECT=0`, `CCTALLY_DEBUG=0`, and `CCTALLY_DISABLE_UPDATE_CHECK=0` now mean "disabled" — previously any value, including `0`, enabled these flags.
+- A corrupt `stats.db` now produces a one-line diagnosis with recovery guidance and exit 2 instead of a raw traceback.
+- Piping output to a closed reader (`cctally daily | head`) now exits 0 quietly instead of `Error: [Errno 32] Broken pipe`.
+- The dashboard share endpoints now cap request bodies at 64 KiB and the dashboard server sets a 60s socket timeout (slow-loris hardening); server-sent-event streams treat a send timeout as a normal client disconnect.
+- `cache.db` now opens with `PRAGMA synchronous=NORMAL` (a fully re-derivable database; fewer fsyncs during ingest).
+
 ## [1.65.0] - 2026-07-09
 
 ### Added
