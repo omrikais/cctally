@@ -47,10 +47,8 @@ def _core():
 
 
 def _truthy_env(name: str) -> bool:
-    """A ``1``/``true``/``yes``/any-non-empty env value is truthy; unset,
-    empty, ``0``, ``false``, ``no`` are falsey."""
-    v = os.environ.get(name)
-    return v is not None and v.strip().lower() not in ("", "0", "false", "no")
+    """Canonical implementation lives in ``_cctally_core`` (#279 S1 F1)."""
+    return _core()._truthy_env(name)
 
 
 def resolve_telemetry_state(config: dict) -> tuple[bool, str]:

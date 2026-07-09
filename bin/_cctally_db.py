@@ -480,7 +480,7 @@ def _would_block_prod_migration(conn: sqlite3.Connection) -> bool:
     never trip it; HOME-faking-immune via _real_prod_data_dir (password DB, not
     $HOME); suppressor-INDEPENDENT raw .git check so it still fires under the
     test-suite's CCTALLY_DISABLE_DEV_AUTODETECT. Escape: CCTALLY_ALLOW_PROD_MIGRATION."""
-    if os.environ.get("CCTALLY_ALLOW_PROD_MIGRATION"):
+    if _cctally_core._truthy_env("CCTALLY_ALLOW_PROD_MIGRATION"):
         return False
     if not (_cctally_core._repo_root() / ".git").exists():
         return False
@@ -875,7 +875,7 @@ def _run_pending_migrations(
             # outcome (apply OR gate-defer) clears any prior failure log
             # for this migration's qualified name.
             _clear_migration_error_log_entries(qualified_name)
-            if os.environ.get("CCTALLY_DEBUG"):
+            if _cctally_core._truthy_env("CCTALLY_DEBUG"):
                 eprint(
                     f"[migration {qualified_name}] deferred: {gate_exc}"
                 )

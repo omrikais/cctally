@@ -149,6 +149,20 @@ def _init_paths_from_env() -> None:
     CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
 
 
+def _truthy_env(name: str) -> bool:
+    """A ``1``/``true``/``yes``/any-other-non-empty env value is truthy;
+    unset, empty, ``0``, ``false``, ``no`` are falsey (case-insensitive,
+    whitespace-stripped).
+
+    Canonical home for boolean env-flag parsing (#279 S1 F1) — presence-only
+    ``os.environ.get(...)`` checks made ``FLAG=0`` mean *enabled*, which for
+    ``CCTALLY_ALLOW_PROD_MIGRATION`` / ``CCTALLY_DISABLE_DEV_AUTODETECT`` was
+    the exact opposite of intent. ``_cctally_telemetry._truthy_env`` delegates
+    here."""
+    v = os.environ.get(name)
+    return v is not None and v.strip().lower() not in ("", "0", "false", "no")
+
+
 def _repo_root() -> pathlib.Path:
     """Repo root when running from a source checkout: this file lives at
     ``<repo>/bin/_cctally_core.py``, so the root is two parents up. Factored
@@ -165,7 +179,7 @@ def _is_dev_checkout() -> bool:
     the ``setup`` guard (which protects WHICH BINARY gets wired into
     ~/.claude/settings.json), not the data-dir relocation. The npm/brew
     install copies ship without ``.git`` so they never read True."""
-    if os.environ.get("CCTALLY_DISABLE_DEV_AUTODETECT"):
+    if _truthy_env("CCTALLY_DISABLE_DEV_AUTODETECT"):
         return False
     return (_repo_root() / ".git").exists()
 

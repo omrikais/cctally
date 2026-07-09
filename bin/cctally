@@ -2868,7 +2868,7 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     otherwise races that detached writer re-creating the dir after the
     command returns. Setting this env var makes such harnesses
     deterministic without disabling the feature for real users."""
-    if os.environ.get("CCTALLY_DISABLE_UPDATE_CHECK"):
+    if _cctally_core._truthy_env("CCTALLY_DISABLE_UPDATE_CHECK"):
         return
     if command == "setup" and getattr(args, "uninstall", False):
         return
