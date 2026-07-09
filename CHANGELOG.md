@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.65.0] - 2026-07-09
+
 ### Added
 - Opt-in backend performance instrumentation: set `CCTALLY_PERF_TRACE=1` to print a phase-timing trace to stderr on `cache-sync` (and the hidden `tui --render-once` build), and read live backend timings + cache state from the dashboard's loopback-only `/api/debug/backend` endpoint. The trace is off by default and never changes command output — it goes to stderr only, so stdout stays byte-identical. New [docs/backend-performance.md](docs/backend-performance.md) documents the read model, hot paths, and invariants.
 - Reproducible backend benchmark suite (`bin/cctally-bench` + `bin/build-bench-fixtures.py`, a dev/maintainer tool — never shipped): in-process timings for the dashboard snapshot (cold/warm/idle), cache ingest (no-op/delta), the conversation rail/search/find/payload/outline, and the warm reconcile paths, measured against a deterministic synthetic fixture, with a committed advisory baseline and an opt-in `--compare`/`--gate` (never a CI gate) that guard the recent backend performance wins from silent regression. See [bench/README.md](bench/README.md).
