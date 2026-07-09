@@ -72,3 +72,43 @@ def test_parse_cost_entry_null_keys_pass_through_with_none_ids():
     assert res is not None
     _entry, msg_id, req_id = res
     assert msg_id is None and req_id is None
+
+
+def test_classify_cost_entry_non_numeric_costusd_degrades_to_none():
+    """#279 S3 / Codex gate F1: a malformed costUSD must not raise — it
+    degrades to cost_usd=None (token-derived cost still computes later)."""
+    obj = {
+        "type": "assistant",
+        "timestamp": "2026-07-01T10:00:00Z",
+        "requestId": "req-1",
+        "message": {
+            "id": "msg-1",
+            "model": "claude-opus-4-8",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        },
+        "costUSD": "not-a-number",
+    }
+    parsed = lj.parse_cost_entry(obj, "/tmp/x.jsonl")
+    assert parsed is not None
+    entry, msg_id, req_id = parsed
+    assert entry.cost_usd is None
+    assert msg_id == "msg-1" and req_id == "req-1"
+
+
+def test_classify_cost_entry_dict_costusd_degrades_to_none():
+    """A non-scalar costUSD (dict) must also degrade to None rather than
+    raising TypeError from float()."""
+    obj = {
+        "type": "assistant",
+        "timestamp": "2026-07-01T10:00:00Z",
+        "requestId": "req-2",
+        "message": {
+            "id": "msg-2",
+            "model": "claude-opus-4-8",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+        "costUSD": {"nested": True},
+    }
+    parsed = lj.parse_cost_entry(obj, "/tmp/x.jsonl")
+    assert parsed is not None
+    assert parsed[0].cost_usd is None

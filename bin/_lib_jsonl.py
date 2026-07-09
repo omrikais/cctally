@@ -109,6 +109,13 @@ def _parse_usage_entries(
 ) -> list[UsageEntry]:
     """Parse one JSONL file's assistant entries within [range_start, range_end].
 
+    Per-line gating is `parse_cost_entry`'s — the SINGLE implementation shared
+    with the cache-ingest path (#279 S3 F2). This fallback (used when cache.db
+    can't be opened) no longer re-implements the type -> timestamp -> usage ->
+    model -> synthetic -> costUSD gating inline, so the two paths can never
+    drift. The only fallback-specific step is the range filter, applied to the
+    constructed `entry.timestamp` (inclusive bounds preserved).
+
     Dedup contract (matches ccusage's `push_deduped_entry`):
     - Entries with non-null (msg_id, req_id) go into `dedupe_map`; if a key
       already maps to an entry, replace iff `_should_replace(candidate, existing)`.
@@ -117,13 +124,14 @@ def _parse_usage_entries(
       land in a separate list — partial UNIQUE index on the cache mirrors
       this behavior.
     - `<synthetic>` model rows are dropped entirely (matches ccusage's
-      claude_loader.rs:454).
+      claude_loader.rs:454) — `parse_cost_entry` returns None for them.
 
     Caller is responsible for sorting the returned list by timestamp if
     needed; `_collect_entries_direct` does this once across all files
     after flattening `dedupe_map.values()`.
     """
     no_key_entries: list[UsageEntry] = []
+    path_str = str(jsonl_path)
     try:
         with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -134,60 +142,12 @@ def _parse_usage_entries(
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
-                if obj.get("type") != "assistant":
+                parsed = parse_cost_entry(obj, path_str)
+                if parsed is None:
                     continue
-
-                ts_raw = obj.get("timestamp")
-                if not isinstance(ts_raw, str) or not ts_raw.strip():
+                entry, msg_id, req_id = parsed
+                if entry.timestamp < range_start or entry.timestamp > range_end:
                     continue
-
-                msg = obj.get("message")
-                if not isinstance(msg, dict):
-                    msg = obj
-
-                usage = msg.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-
-                model = msg.get("model") or obj.get("model")
-                if not isinstance(model, str) or not model.strip():
-                    continue
-                model = model.strip()
-                if model == "<synthetic>":
-                    # Matches ccusage's claude_loader.rs:454 — synthetic
-                    # placeholder rows carry no billable usage.
-                    continue
-
-                try:
-                    ts = dt.datetime.fromisoformat(
-                        ts_raw.strip().replace("Z", "+00:00")
-                    )
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=dt.timezone.utc)
-                except ValueError:
-                    continue
-
-                if ts < range_start or ts > range_end:
-                    continue
-
-                msg_id = msg.get("id")
-                req_id = obj.get("requestId")
-                cost_usd_raw = obj.get("costUSD")
-                cost_usd = (
-                    float(cost_usd_raw)
-                    if cost_usd_raw is not None
-                    else None
-                )
-
-                entry = UsageEntry(
-                    timestamp=ts,
-                    model=model,
-                    usage=usage,
-                    cost_usd=cost_usd,
-                    source_path=str(jsonl_path),
-                )
-
                 if msg_id is None or req_id is None:
                     no_key_entries.append(entry)
                     continue
@@ -251,7 +211,13 @@ def _classify_cost_entry(obj, path_str: str):
     msg_id = msg.get("id")
     req_id = obj.get("requestId")
     cost_usd_raw = obj.get("costUSD")
-    cost_usd = float(cost_usd_raw) if cost_usd_raw is not None else None
+    try:
+        cost_usd = float(cost_usd_raw) if cost_usd_raw is not None else None
+    except (TypeError, ValueError):
+        # Drift-hardened (#279 S3, Codex gate F1): a malformed costUSD must
+        # not abort a whole sync/read — degrade to "no raw cost"; the
+        # token-derived cost still computes at query time.
+        cost_usd = None
 
     return (
         UsageEntry(
