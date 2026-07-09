@@ -181,6 +181,48 @@ from _lib_five_hour import _canonical_5h_window_key
 from _lib_pricing import _calculate_entry_cost
 
 
+import importlib.util as _ilu
+
+
+def _ensure_sibling_loaded(name: str) -> None:
+    """Register a NON-eager-loaded ``_lib_*`` sibling in ``sys.modules``.
+
+    Every ``_lib_*`` this module imports at body-time is eager-loaded by
+    ``bin/cctally`` EXCEPT the #279 S4 kernels (``_lib_credit``,
+    ``_lib_record``) — those are consumer-only and were deliberately kept
+    out of ``bin/cctally``'s eager-load block so ``bin/cctally`` stays
+    byte-untouched (spec §2 re-export continuity). Under the
+    ``SourceFileLoader`` harness path (``bin/`` absent from ``sys.path``) a
+    bare ``from _lib_X import`` would then miss, so this pre-registers the
+    sibling ``__file__``-relative first — mirroring ``_cctally_cache.
+    _load_lib`` and ``_lib_conversation_query``'s ``_lib_perf`` fallback.
+    The honest ``from _lib_X import`` that follows is a ``sys.modules`` hit
+    in every load context (prod script, conftest, harness).
+    """
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)  # bin/ on sys.path: prod script / conftest / pytest
+        return
+    except ModuleNotFoundError:
+        pass
+    _p = os.path.join(os.path.dirname(__file__), f"{name}.py")
+    _spec = _ilu.spec_from_file_location(name, _p)
+    _mod = _ilu.module_from_spec(_spec)
+    sys.modules[name] = _mod
+    _spec.loader.exec_module(_mod)
+
+
+_ensure_sibling_loaded("_lib_credit")
+from _lib_credit import (
+    _PERCENT_NORMALIZE_DECIMALS,
+    _normalize_percent,
+    CreditPlan,
+    _parse_credit_at,
+    _build_credit_plan,
+)
+
+
 # Module-level back-ref shims. Each shim resolves
 # ``sys.modules['cctally'].X`` at CALL TIME (not bind time), so
 # monkeypatches on cctally's namespace propagate into the moved code
@@ -400,10 +442,10 @@ def _hook_tick_make_mock_refresh(*args, **kwargs):
 # ``cmd_hook_tick`` for the three rewrites.
 
 
-# Constants referenced by the moved bodies. Defined here (rather than
-# `c.X`-routed) because they're pure literals — no monkeypatch surface
-# and no dependency on cctally's module instance.
-_PERCENT_NORMALIZE_DECIMALS = 10
+# ``_PERCENT_NORMALIZE_DECIMALS`` + ``_normalize_percent`` now live in
+# ``bin/_lib_credit.py`` (#279 S4 F1); re-imported at module top so
+# ``bin/cctally``'s ``_cctally_record._PERCENT_NORMALIZE_DECIMALS`` /
+# ``_normalize_percent`` re-exports keep resolving unchanged.
 
 # Plausibility band for --resets-at / --five-hour-resets-at (issue #112).
 # Out-of-band epochs are guarded at cmd_record_usage ingress before any
@@ -459,27 +501,6 @@ _logged_window_key_coerce_failure = False
 #   c._RESET_PCT_DROP_THRESHOLD       — bin/_cctally_weekrefs.py constant (re-exported on cctally ns)
 #   c._is_reset_drop                  — bin/_cctally_weekrefs.py helper (re-exported on cctally ns)
 #   c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS
-
-
-def _normalize_percent(value: "float | int | None") -> "float | None":
-    """Flush IEEE 754 ULP noise out of an ingress percent value.
-
-    Single chokepoint applied at every site where a raw percent enters
-    cctally's runtime path (OAuth fetch, hook-tick OAuth refresh, and
-    the cmd_record_usage CLI ingress). Downstream consumers — HWM
-    files, ``weekly_usage_snapshots.{weekly,five_hour}_percent`` REAL
-    columns, ``five_hour_blocks.final_five_hour_percent``, milestone
-    crossing values, and the SSE envelope's ``used_percent`` field —
-    all read the cleaned value, so a single round here stops
-    ``5h=7.000000000000001`` style strings from reaching any log or
-    serialized surface.
-
-    ``None`` is the canonical absent-percent sentinel; preserve it
-    unchanged so the optional-5h branches stay simple.
-    """
-    if value is None:
-        return None
-    return round(float(value), _PERCENT_NORMALIZE_DECIMALS)
 
 
 def _resolve_active_five_hour_reset_event_id(
@@ -2175,85 +2196,10 @@ def _read_reset_zero_marker():
     return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
 
 
-@dataclass(frozen=True)
-class CreditPlan:
-    week_start_date: str
-    week_start_at: str
-    week_end_at: str
-    cur_end_canon: str
-    from_pct: float
-    from_source: str          # "hwm" | "explicit" | "prior_credit"
-    to_pct: float
-    effective_iso: str        # weekly_credit_floors.effective_at_utc (floored to hour)
-    captured_iso: str         # synthetic snapshot captured_at_utc (un-floored), 'Z'
-
-
-def _parse_credit_at(value, now):
-    """Parse --at as an aware UTC datetime; default to `now`. Naive => UTC
-    (mirrors bin/_cctally_five_hour.py:88), NOT parse_iso_datetime (host-local)."""
-    if value is None:
-        return now
-    try:
-        parsed = dt.datetime.fromisoformat(value)
-    except ValueError as e:
-        raise ValueError(f"--at: {e}") from e
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc)
-
-
-def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
-                       from_pct, from_source, to_pct, at_dt, now,
-                       effective_override=None):
-    """Validate inputs and build a CreditPlan. Pure (no DB/file I/O).
-    Raises ValueError(msg) on any violation — caller maps to exit 2.
-
-    `effective_override` (an ISO string) is the completion-path reuse of an
-    EXISTING `weekly_credit_floors.effective_at_utc` (spec §4a): when present,
-    the plan's effective is that value rather than `floor_to_hour(at)`, so a
-    rerun of a half-applied credit at a later wall-clock keeps the original
-    floor moment and never leaks a stale pre-credit replay into the floored
-    MAX. The synthetic snapshot's captured timestamp stays the un-floored
-    `at` either way."""
-    to_pct = _normalize_percent(to_pct)
-    from_pct = _normalize_percent(from_pct)
-    # Defensive None-guard (issue #212 N3). `_normalize_percent` returns None
-    # for a None input. The CLI never reaches here with None (`--to` is
-    # required + type=float; `--from` always resolves to a float or the caller
-    # errors out first), but this is a public pure helper called directly by
-    # tests and any future non-CLI caller — surface a None as a clear ValueError
-    # (caller -> exit 2) instead of a TypeError from the `0.0 <= None` compare
-    # immediately below.
-    if to_pct is None or from_pct is None:
-        raise ValueError("--to/--from must be numeric")
-    if not (0.0 <= to_pct <= 100.0) or not (0.0 <= from_pct <= 100.0):
-        raise ValueError("--to/--from must be in [0, 100]")
-    if to_pct >= from_pct:
-        raise ValueError(f"not a credit: to >= from ({to_pct} >= {from_pct})")
-    ws = parse_iso_datetime(week_start_at, "week_start_at")
-    we = parse_iso_datetime(week_end_at, "week_end_at")
-    if not (ws <= at_dt < we):
-        raise ValueError(f"--at {at_dt.isoformat()} is outside the week window")
-    if at_dt > now:
-        raise ValueError("--at is in the future")
-    if effective_override is not None:
-        effective_iso = parse_iso_datetime(
-            effective_override, "effective_override"
-        ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
-    else:
-        effective_iso = _floor_to_hour(at_dt).isoformat(timespec="seconds")
-    cur_end_canon = _canonicalize_optional_iso(week_end_at, "record-credit.week_end")
-    return CreditPlan(
-        week_start_date=week_start_date,
-        week_start_at=week_start_at,
-        week_end_at=week_end_at,
-        cur_end_canon=cur_end_canon,
-        from_pct=from_pct,
-        from_source=from_source,
-        to_pct=to_pct,
-        effective_iso=effective_iso,
-        captured_iso=at_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
-    )
+# ``CreditPlan`` / ``_parse_credit_at`` / ``_build_credit_plan`` now live in
+# ``bin/_lib_credit.py`` (#279 S4 F1); re-imported at module top so the
+# ``bin/cctally`` re-exports and this module's own callers
+# (``cmd_record_credit``) resolve them unchanged.
 
 
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
