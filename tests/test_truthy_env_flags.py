@@ -123,6 +123,11 @@ def _reset_cctally_logger():
     root = logging.getLogger("cctally")
     for h in list(root.handlers):
         root.removeHandler(h)
+    # Restore the stdlib default as well as removing our handlers. Pytest
+    # 9.1+ attaches capture handlers directly to non-propagating loggers at
+    # test start; leaving this False makes _lib_log mistake pytest's handler
+    # for its own configure-once latch in the next test.
+    root.propagate = True
 
 
 def test_debug_flag_zero_suppresses_defer_message(db_module, tmp_path, monkeypatch, capsys):
