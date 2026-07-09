@@ -228,6 +228,37 @@ from _lib_fmt import stable_sum
 # nothing on the default path.
 import _lib_perf as _perf
 
+import importlib.util as _ilu
+
+
+def _ensure_sibling_loaded(name: str) -> None:
+    """Register a NON-eager-loaded ``_lib_*`` sibling in ``sys.modules``.
+
+    ``_lib_forecast`` (#279 S4 F2) is a NEW consumer-only sibling — kept out
+    of ``bin/cctally``'s eager-load block so ``bin/cctally`` stays
+    byte-untouched (spec §2). Under the ``SourceFileLoader`` harness path
+    (``bin/`` absent from ``sys.path``) a bare ``from _lib_forecast import``
+    would miss, so this pre-registers the sibling ``__file__``-relative when
+    it is not already importable (mirrors ``_cctally_cache._load_lib``). The
+    honest import that follows is a ``sys.modules`` hit in every load context.
+    """
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)  # bin/ on sys.path: prod script / conftest / pytest
+        return
+    except ModuleNotFoundError:
+        pass
+    _p = os.path.join(os.path.dirname(__file__), f"{name}.py")
+    _spec = _ilu.spec_from_file_location(name, _p)
+    _mod = _ilu.module_from_spec(_spec)
+    sys.modules[name] = _mod
+    _spec.loader.exec_module(_mod)
+
+
+_ensure_sibling_loaded("_lib_forecast")
+from _lib_forecast import _compute_forecast, ForecastInputs, ForecastOutput, BudgetRow
+
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
 # Each shim resolves ``sys.modules['cctally'].X`` at CALL TIME (not bind
@@ -255,10 +286,6 @@ def _apply_display_tz_override(*args, **kwargs):
 
 def _apply_midweek_reset_override(*args, **kwargs):
     return sys.modules["cctally"]._apply_midweek_reset_override(*args, **kwargs)
-
-
-def _compute_forecast(*args, **kwargs):
-    return sys.modules["cctally"]._compute_forecast(*args, **kwargs)
 
 
 def _resolve_forecast_now(*args, **kwargs):
@@ -313,20 +340,11 @@ def sync_cache(*args, **kwargs):
     return sys.modules["cctally"].sync_cache(*args, **kwargs)
 
 
-# Forecast dataclass shims — used as bare-name constructors inside
-# ``_tui_build_forecast``. The classes themselves stay in bin/cctally
-# alongside the forecast subcommand (``cmd_forecast``); call-time
-# resolution keeps monkeypatches in sync.
-def ForecastInputs(*args, **kwargs):
-    return sys.modules["cctally"].ForecastInputs(*args, **kwargs)
-
-
-def ForecastOutput(*args, **kwargs):
-    return sys.modules["cctally"].ForecastOutput(*args, **kwargs)
-
-
-def BudgetRow(*args, **kwargs):
-    return sys.modules["cctally"].BudgetRow(*args, **kwargs)
+# ``_compute_forecast`` + the forecast dataclasses (``ForecastInputs`` /
+# ``ForecastOutput`` / ``BudgetRow``) now live in ``bin/_lib_forecast.py``
+# (#279 S4 F2) and are honest-imported at module top — used as bare-name
+# constructors inside ``_tui_build_forecast``. Single class def per name in
+# ``_lib_forecast``; everything imports it, so class identity stays unique.
 
 
 # Dashboard back-refs consumed by the TUI's snapshot builders.

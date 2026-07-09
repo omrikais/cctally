@@ -51,37 +51,48 @@ from _cctally_core import (
     BUDGET_PERIODS as _CCTALLY_BUDGET_PERIODS,
 )
 
+import importlib.util as _ilu
+
+
+def _ensure_sibling_loaded(name: str) -> None:
+    """Register a NON-eager-loaded ``_lib_*`` sibling in ``sys.modules``.
+
+    ``_lib_forecast`` (#279 S4 F2) is a NEW consumer-only sibling —
+    deliberately kept out of ``bin/cctally``'s eager-load block so
+    ``bin/cctally`` stays byte-untouched (spec §2 re-export continuity).
+    Under the ``SourceFileLoader`` harness path (``bin/`` absent from
+    ``sys.path``) a bare ``from _lib_forecast import`` would miss, so this
+    pre-registers the sibling ``__file__``-relative when it is not already
+    importable (mirrors ``_cctally_cache._load_lib``). The honest import
+    that follows is a ``sys.modules`` hit in every load context.
+    """
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)  # bin/ on sys.path: prod script / conftest / pytest
+        return
+    except ModuleNotFoundError:
+        pass
+    _p = os.path.join(os.path.dirname(__file__), f"{name}.py")
+    _spec = _ilu.spec_from_file_location(name, _p)
+    _mod = _ilu.module_from_spec(_spec)
+    sys.modules[name] = _mod
+    _spec.loader.exec_module(_mod)
+
+
+_ensure_sibling_loaded("_lib_forecast")
+from _lib_forecast import ForecastInputs, BudgetRow, ForecastOutput, _compute_forecast
+
 
 def _cctally():
     """Resolve the current `cctally` module at call-time (§2)."""
     return sys.modules["cctally"]
 
 
-# === moved verbatim from bin/cctally (class ForecastInputs -> _build_budget_no_budget_snapshot) ===
-@dataclass
-class ForecastInputs:
-    now_utc: dt.datetime
-    week_start_at: dt.datetime
-    week_end_at: dt.datetime
-    elapsed_hours: float
-    elapsed_fraction: float
-    remaining_hours: float
-    remaining_days: float
-    # Current state
-    p_now: float
-    five_hour_percent: float | None
-    spent_usd: float
-    snapshot_count: int
-    latest_snapshot_at: dt.datetime
-    # Rate inputs
-    p_24h_ago: float | None
-    t_24h_actual_hours: float | None
-    # $/1% selection
-    dollars_per_percent: float
-    dollars_per_percent_source: str  # "this_week" | "trailing_4wk_median" | "this_week_sparse"
-    # Confidence
-    confidence: str  # "high" | "low"
-    low_confidence_reasons: list[str]
+# ``ForecastInputs`` / ``BudgetRow`` / ``ForecastOutput`` / ``_compute_forecast``
+# now live in ``bin/_lib_forecast.py`` (#279 S4 F2); honest-imported at module
+# top so the ``bin/cctally`` re-exports and this module's own callers resolve
+# them unchanged.
 
 
 def _resolve_forecast_now(as_of: str | None) -> dt.datetime:
@@ -519,99 +530,7 @@ def _load_forecast_inputs(
     )
 
 
-@dataclass
-class BudgetRow:
-    target_percent: int
-    pct_headroom: float | None     # None when already past target
-    dollars_per_day: float | None
-    percent_per_day: float | None
-
-
-@dataclass
-class ForecastOutput:
-    inputs: ForecastInputs
-    r_avg: float                   # pct per hour, week-avg
-    r_recent: float | None         # pct per hour, 24h recent; None if no prior sample
-    final_percent_low: float
-    final_percent_high: float
-    week_avg_projection_pct: float  # p_now + r_avg*remaining (smooth estimator)
-    projected_cap: bool
-    already_capped: bool
-    cap_at: dt.datetime | None
-    budgets: list[BudgetRow]
-
-
-def _compute_forecast(inputs: ForecastInputs, targets: list[int]) -> ForecastOutput:
-    """Implements spec §2. targets are sorted desc for stable output (100, 90, …)."""
-    c = _cctally()
-    # Rate methods
-    r_avg = inputs.p_now / inputs.elapsed_hours if inputs.elapsed_hours > 0 else 0.0
-    if inputs.p_24h_ago is not None and inputs.t_24h_actual_hours:
-        r_recent: float | None = max(
-            0.0, (inputs.p_now - inputs.p_24h_ago) / inputs.t_24h_actual_hours
-        )
-    else:
-        r_recent = None
-
-    # Projected final % — routed through the shared project_linear primitive
-    # (spec F1). r_recent is None ⇒ collapse to the average projection.
-    if r_recent is None:
-        final_low, final_high = c.project_linear(
-            inputs.p_now, inputs.remaining_hours, r_avg, r_avg
-        )
-    else:
-        a, b = c.project_linear(
-            inputs.p_now, inputs.remaining_hours, r_avg, r_recent
-        )
-        final_low, final_high = min(a, b), max(a, b)
-
-    # Smooth week-average projection (additive surface field). Distinct from
-    # the displayed band (which keys off final_high): this is the conservative
-    # week-average value the projected-pace alert axis fires on.
-    # p_now + r_avg*remaining (== project_linear collapsed to the single rate).
-    week_avg_projection_pct = inputs.p_now + r_avg * inputs.remaining_hours
-
-    already_capped = inputs.p_now >= 100.0
-    projected_cap = already_capped or final_high >= 100.0
-
-    cap_at: dt.datetime | None = None
-    if not already_capped and projected_cap:
-        r_pessimistic = max(r_avg, r_recent or 0.0)
-        if r_pessimistic > 0:
-            hours_to_cap = (100.0 - inputs.p_now) / r_pessimistic
-            if hours_to_cap < inputs.remaining_hours:
-                cap_at = inputs.now_utc + dt.timedelta(hours=hours_to_cap)
-
-    # Budgets
-    budgets: list[BudgetRow] = []
-    if not already_capped:
-        for t in sorted(targets, reverse=True):
-            headroom = t - inputs.p_now
-            if headroom <= 0 or inputs.remaining_days <= 0:
-                budgets.append(BudgetRow(target_percent=t, pct_headroom=None,
-                                         dollars_per_day=None, percent_per_day=None))
-                continue
-            dollars_day = (headroom * inputs.dollars_per_percent) / inputs.remaining_days
-            pct_day = headroom / inputs.remaining_days
-            budgets.append(BudgetRow(
-                target_percent=t,
-                pct_headroom=headroom,
-                dollars_per_day=dollars_day,
-                percent_per_day=pct_day,
-            ))
-
-    return ForecastOutput(
-        inputs=inputs,
-        r_avg=r_avg,
-        r_recent=r_recent,
-        final_percent_low=final_low,
-        final_percent_high=final_high,
-        week_avg_projection_pct=week_avg_projection_pct,
-        projected_cap=projected_cap,
-        already_capped=already_capped,
-        cap_at=cap_at,
-        budgets=budgets,
-    )
+# (moved to bin/_lib_forecast.py, #279 S4 F2 — honest-imported at module top)
 
 
 def _parse_forecast_targets(raw: str) -> list[int]:

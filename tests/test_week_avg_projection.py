@@ -7,9 +7,11 @@ the projected-pace alert axis will fire on:
     week_avg_projection_pct = p_now + r_avg * remaining_hours
     where r_avg = p_now / elapsed_hours   (forecast's week-average rate)
 
-_compute_forecast resolves project_linear via _cctally() -> sys.modules
-["cctally"], so the test loads the full bin/cctally module (the canonical
-isolated loader) rather than the sibling in isolation.
+_compute_forecast honest-imports project_linear from _lib_budget (its pure
+home) — the forecast kernel moved to bin/_lib_forecast.py in #279 S4 F2.
+The test still loads the full bin/cctally module (the canonical isolated
+loader) and constructs mod.ForecastInputs(...) via the re-export, which
+resolves to _lib_forecast.ForecastInputs unchanged.
 """
 from __future__ import annotations
 
