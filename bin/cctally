@@ -436,6 +436,10 @@ _parse_blocks_token_limit = _lib_blocks._parse_blocks_token_limit
 _lib_statusline = _load_sibling("_lib_statusline")
 STATUSLINE_BURN_RATE_BANDS = _lib_statusline.STATUSLINE_BURN_RATE_BANDS
 
+# #279 S2 F2: stdlib-logging chokepoint (CCTALLY_DEBUG tracebacks on the
+# top-level catch-all; adopted by the dashboard log_error surface).
+_lib_log = _load_sibling("_lib_log")
+
 _lib_changelog = _load_sibling("_lib_changelog")
 # Backward-compat re-export: callers and tests reach the helper through
 # ``cctally._release_read_latest_release_version`` (incl. monkeypatch
@@ -2832,6 +2836,13 @@ def main(argv: list[str] | None = None) -> int:
         eprint(f"cctally: {exc}")
         return 2
     except Exception as exc:  # pragma: no cover
+        # #279 S2 F2: CCTALLY_DEBUG=1 surfaces the full traceback on stderr
+        # via the _lib_log chokepoint; default mode stays byte-identical.
+        if _lib_log.debug_enabled():
+            _lib_log.get_logger("cli").debug(
+                "unhandled exception in %r",
+                getattr(args, "command", None), exc_info=True,
+            )
         eprint(f"Error: {exc}")
         rc = 1
     # Post-command update hooks (spec §4.2). Best-effort: any exception

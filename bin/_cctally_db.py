@@ -91,6 +91,11 @@ from _cctally_core import (
     parse_iso_datetime,
 )
 
+# #279 S2 F2: demonstration adopter of the stdlib-logging chokepoint —
+# the migration gate-defer diagnostic routes through _lib_log so
+# CCTALLY_DEBUG verbosity is decided in one place.
+import _lib_log
+
 # Stats migration 008 needs the same per-entry cost computation used by
 # the live cost-report path. Direct import keeps the kernel single-sourced
 # (no shim drift); _lib_pricing is a stdlib-only leaf module so no cycle
@@ -888,8 +893,8 @@ def _run_pending_migrations(
             # outcome (apply OR gate-defer) clears any prior failure log
             # for this migration's qualified name.
             _clear_migration_error_log_entries(qualified_name)
-            if _cctally_core._truthy_env("CCTALLY_DEBUG"):
-                eprint(
+            if _lib_log.debug_enabled():
+                _lib_log.get_logger("db").debug(
                     f"[migration {qualified_name}] deferred: {gate_exc}"
                 )
             # D2 — ``continue``, NOT ``break``. A gate-defer leaves the DB

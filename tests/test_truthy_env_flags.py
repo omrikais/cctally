@@ -118,16 +118,38 @@ def _run_gate_defer(db_module, tmp_path, monkeypatch):
         conn.close()
 
 
+def _reset_cctally_logger():
+    import logging
+    root = logging.getLogger("cctally")
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+
 def test_debug_flag_zero_suppresses_defer_message(db_module, tmp_path, monkeypatch, capsys):
+    # #279 S2 F2: the gate-defer diagnostic now routes through the
+    # _lib_log chokepoint, whose debug flag is import-cached with a
+    # set_debug() test seam (mirrors _lib_perf.set_enabled). Drive it via
+    # set_debug rather than a runtime setenv (which the cached flag won't
+    # pick up). =0 stays off (pins S1 F1 semantics: 0 is falsey).
     monkeypatch.setenv("CCTALLY_DEBUG", "0")
-    _run_gate_defer(db_module, tmp_path, monkeypatch)
-    assert "deferred:" not in capsys.readouterr().err
+    db_module._lib_log.set_debug(db_module._lib_log._env_truthy("CCTALLY_DEBUG"))
+    try:
+        _run_gate_defer(db_module, tmp_path, monkeypatch)
+        assert "deferred:" not in capsys.readouterr().err
+    finally:
+        db_module._lib_log.set_debug(False)
+        _reset_cctally_logger()
 
 
 def test_debug_flag_one_emits_defer_message(db_module, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CCTALLY_DEBUG", "1")
-    _run_gate_defer(db_module, tmp_path, monkeypatch)
-    assert "deferred:" in capsys.readouterr().err
+    db_module._lib_log.set_debug(db_module._lib_log._env_truthy("CCTALLY_DEBUG"))
+    try:
+        _run_gate_defer(db_module, tmp_path, monkeypatch)
+        assert "deferred:" in capsys.readouterr().err
+    finally:
+        db_module._lib_log.set_debug(False)
+        _reset_cctally_logger()
 
 
 # ── CCTALLY_DISABLE_UPDATE_CHECK site (bin/cctally._post_command_update_hooks) ──
