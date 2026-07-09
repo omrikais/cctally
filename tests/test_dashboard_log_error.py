@@ -136,3 +136,25 @@ def test_normal_200_emits_nothing(monkeypatch, tmp_path, capfd):
     err = capfd.readouterr().err
     assert "[cctally.dashboard]" not in err
     _reset_logger()
+
+
+def test_stdlib_code_form_logs_at_500_and_drops_below(monkeypatch, tmp_path, capfd):
+    """S2 review P3-1: drive log_error directly with the exact stdlib
+    send_error fmt/args shape — "code %d, message %s" — proving the filter
+    boundary: 499 (and every <500) is dropped, 500 is logged. This covers
+    the send_error(500) sites that have no explicit handler-authored
+    log_error call, which no endpoint test exercises (the /api/doctor 500
+    responds via _respond_json, not send_error)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _reset_logger()
+    H = ns["DashboardHTTPHandler"]
+    h = H.__new__(H)  # no socket plumbing: log_error only reads client_address
+    h.client_address = ("127.0.0.1", 54321)
+    h.log_error("code %d, message %s", 499, "almost")
+    assert "[cctally.dashboard]" not in capfd.readouterr().err
+    h.log_error("code %d, message %s", 500, "boom")
+    err = capfd.readouterr().err
+    assert "[cctally.dashboard] ERROR" in err
+    assert "code 500, message boom" in err
+    _reset_logger()
