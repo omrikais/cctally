@@ -271,8 +271,10 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
-        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
-            # Client hung up mid-response; benign on a local dashboard.
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError, socket.timeout)):
+            # Client hung up mid-response (or stalled past the handler timeout);
+            # benign on a local dashboard. #279 S1 F3 adds socket.timeout.
             return
         super().handle_error(request, client_address)
 
@@ -733,6 +735,12 @@ _LIVE_TAIL_POLL_INTERVAL = 1.0      # seconds between stat polls of the open fil
 _LIVE_TAIL_DEBOUNCE = 0.25          # settle window after first detected growth
 _LIVE_TAIL_KEEPALIVE = 15.0         # idle keep-alive cadence (proxy guard)
 _LIVE_TAIL_FILE_RESET_EVERY = 10    # re-resolve the session file set every N cycles
+
+# #279 S1 F3: cap on /api/share/* POST bodies. The share composer sends bigger
+# payloads than the 4 KB settings POSTs (a multi-panel compose recipe), but
+# must still be bounded — 64 KiB comfortably exceeds any real payload (render is
+# one panel; compose is ~8 panels each with a small options recipe).
+_SHARE_POST_MAX_BYTES = 64 * 1024
 
 
 # === Dashboard bind validators (config + cmd_dashboard) ====================
@@ -6720,6 +6728,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         run_sync_now   : () -> None      (v2, staticmethod)
     """
 
+    # #279 S1 F3: bound request-parse reads and stalled sends. SSE streams
+    # write keep-alives every <=15s, so a 60s stalled send == dead client;
+    # http.server treats a socket timeout as close_connection. Slow-loris guard.
+    timeout = 60
+
     hub: "SSEHub" = None                     # type: ignore[assignment]
     snapshot_ref: "_SnapshotRef" = None       # type: ignore[assignment]
     static_dir: pathlib.Path = STATIC_DIR
@@ -8102,6 +8115,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
             length = 0
+        if length > _SHARE_POST_MAX_BYTES:
+            # #279 S1 F3: bound the body before reading it (memory/slow-loris).
+            # length == 0 stays allowed below (empty body -> {}); cap only the top.
+            self._respond_json(400, {"error": "body too large (max 64 KiB)"})
+            return
         try:
             raw = self.rfile.read(length) if length > 0 else b""
             req = json.loads(raw) if raw else {}
@@ -8297,6 +8315,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
             length = 0
+        if length > _SHARE_POST_MAX_BYTES:
+            # #279 S1 F3: bound the body before reading it (memory/slow-loris).
+            # length == 0 stays allowed below (empty body -> {}); cap only the top.
+            self._respond_json(400, {"error": "body too large (max 64 KiB)"})
+            return
         try:
             raw = self.rfile.read(length) if length > 0 else b""
             req = json.loads(raw) if raw else {}
@@ -8520,6 +8543,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
             length = 0
+        if length > _SHARE_POST_MAX_BYTES:
+            # #279 S1 F3: bound the body before reading it (memory/slow-loris).
+            # length == 0 stays allowed below (empty body -> {}); cap only the top.
+            self._respond_json(400, {"error": "body too large (max 64 KiB)"})
+            return
         try:
             raw = self.rfile.read(length) if length > 0 else b""
             req = json.loads(raw) if raw else {}
@@ -8671,6 +8699,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
             length = 0
+        if length > _SHARE_POST_MAX_BYTES:
+            # #279 S1 F3: bound the body before reading it (memory/slow-loris).
+            # length == 0 stays allowed below (empty body -> {}); cap only the top.
+            self._respond_json(400, {"error": "body too large (max 64 KiB)"})
+            return
         try:
             raw = self.rfile.read(length) if length > 0 else b""
             req = json.loads(raw) if raw else {}
@@ -9282,7 +9315,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
                     files = _resolve()
                     seen = {p: s for p, s in seen.items() if p in set(files)}
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, socket.timeout):
+            # #279 S1 F3: a stalled send past the handler timeout raises
+            # socket.timeout inside the SSE loop — treat it as a client
+            # disconnect (same as the other peer-gone classes), not an error.
             pass            # client disconnect is normal
         finally:
             if conn is not None:
@@ -9803,7 +9840,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, socket.timeout):
+            # #279 S1 F3: a stalled send past the handler timeout raises
+            # socket.timeout inside the SSE loop — treat it as a client
+            # disconnect (same as the other peer-gone classes), not an error.
             # Client disconnect is normal. No-op.
             pass
         finally:
@@ -9993,7 +10034,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 msg = f"event: {ev_type}\ndata: {ev_data}\n\n"
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, socket.timeout):
+            # #279 S1 F3: a stalled send past the handler timeout raises
+            # socket.timeout inside the SSE loop — treat it as a client
+            # disconnect (same as the other peer-gone classes), not an error.
             # Browser disconnected mid-stream. The worker keeps
             # running; subsequent reconnects can poll /api/update/status.
             pass

@@ -982,3 +982,32 @@ def test_history_delete_csrf_gate(dashboard_server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=5)
     assert exc.value.code == 403
+
+
+# ---------- #279 S1 F3 — share POST body cap ----------
+
+
+_SHARE_POST_CAP = 64 * 1024
+
+
+@pytest.mark.parametrize("endpoint", ["render", "compose", "presets", "history"])
+def test_share_post_body_cap(dashboard_server, endpoint):
+    """Oversized (> 64 KiB) POST bodies to the share endpoints are rejected
+    with 400 before the body is read/parsed. Under-cap happy paths stay
+    covered by the render/compose/presets/history success tests above.
+
+    Slow-loris / memory-exhaustion hardening: every other POST (settings,
+    alerts test) already caps at 4 KB; the share composer legitimately sends
+    larger multi-panel payloads, so these cap at a generous 64 KiB.
+    """
+    port, _ = dashboard_server
+    big = b"{" + b" " * (_SHARE_POST_CAP + 1) + b"}"   # Content-Length > cap
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/{endpoint}",
+        data=big, method="POST", headers=_csrf_headers(port),
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+    body = json.loads(exc.value.read())
+    assert "too large" in body["error"].lower()
