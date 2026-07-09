@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversationFacets } from '../hooks/useConversationFacets';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { modelChipClass } from '../lib/model';
 import type { ConversationFilters } from '../types/conversation';
 
 // Browse-list filters popover (filters spec §4). Holds all four filter axes —
@@ -133,6 +134,14 @@ export function ConversationFiltersPopover() {
     patch({ projects: next });
   };
 
+  // #278 Theme C — mirror toggleProject for the model-family multi-select.
+  const toggleModel = (fam: string): void => {
+    const next = filters.models.includes(fam)
+      ? filters.models.filter((m) => m !== fam)
+      : [...filters.models, fam];
+    patch({ models: next });
+  };
+
   return (
     <div
       className="conv-rail-filters"
@@ -210,6 +219,28 @@ export function ConversationFiltersPopover() {
               <span className="conv-rail-filters-proj-name">{p.project_label}</span>
               <span className="conv-rail-filters-proj-count">{p.count}</span>
             </label>
+          ))}
+        </div>
+      </section>
+
+      <section className="conv-rail-filters-sec">
+        <div className="conv-rail-filters-label">Model</div>
+        <div className="conv-rail-filters-chips">
+          {facets.models.length === 0 && (
+            <div className="conv-rail-filters-empty">No models.</div>
+          )}
+          {facets.models.map((m) => (
+            <button
+              key={m.family}
+              type="button"
+              // Reuse the family palette (modelChipClass) on the filter chip so
+              // Opus/Sonnet/Haiku/Fable carry their established colour.
+              className={`conv-rail-filters-chip chip ${modelChipClass(m.family)}${filters.models.includes(m.family) ? ' is-on' : ''}`}
+              aria-pressed={filters.models.includes(m.family)}
+              onClick={() => toggleModel(m.family)}
+            >
+              {m.family} <span className="conv-rail-filters-proj-count">{m.count}</span>
+            </button>
           ))}
         </div>
       </section>

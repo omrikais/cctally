@@ -768,6 +768,26 @@ describe('ConversationRail', () => {
     expect(getState().conversationFilters.projects).toEqual(['projB']);
   });
 
+  it('renders a removable model chip per selected family (#278 Theme C)', () => {
+    // Row has NO model so the only "opus"/"sonnet" text is the active-filter chip.
+    browseRows = [summary({ session_id: 'a', models: [] })];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { models: ['opus', 'sonnet'] } }));
+    const opusChip = screen.getByText('opus').closest('button')!;
+    fireEvent.click(opusChip);   // removing opus leaves sonnet
+    expect(getState().conversationFilters.models).toEqual(['sonnet']);
+  });
+
+  it('a model-only filter lights the filtered-to-zero empty state (#278 Theme C)', () => {
+    // Proves anyFilterActive() counts the model axis: zero rows + a model-only
+    // filter shows the distinct "no matches" copy, not the generic empty copy.
+    browseRows = [];
+    render(<ConversationRail />);
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { models: ['opus'] } }));
+    const empty = document.querySelector('.conv-rail-empty')!;
+    expect(empty.textContent).toContain('No conversations match these filters');
+  });
+
   it('keeps Filters enabled while searching and KEEPS chips visible (#217 S4 / I-2.5)', () => {
     // Filters now apply to BOTH browse and search (the shared-filter decision),
     // so the button stays enabled and the active chips stay rendered in search

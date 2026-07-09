@@ -15,11 +15,12 @@ function displayEnvelope(resolvedTz: string, generatedAt = '2026-07-01T03:00:00Z
   } as unknown as Envelope;
 }
 
-// Stub the facets hook so the project multi-select renders from a fixture, not a
-// live fetch (mirrors the ConversationRail.test.tsx hook-stub convention).
+// Stub the facets hook so the project + model multi-selects render from a
+// fixture, not a live fetch (mirrors the ConversationRail.test.tsx hook-stub).
 let facetProjects = [{ project_label: 'projA', count: 4 }, { project_label: 'projB', count: 1 }];
+let facetModels = [{ family: 'opus', count: 3 }, { family: 'sonnet', count: 1 }];
 vi.mock('../hooks/useConversationFacets', () => ({
-  useConversationFacets: () => ({ projects: facetProjects }),
+  useConversationFacets: () => ({ projects: facetProjects, models: facetModels }),
 }));
 
 beforeEach(() => {
@@ -28,6 +29,7 @@ beforeEach(() => {
   clearRailPrefs();
   _resetForTests();
   facetProjects = [{ project_label: 'projA', count: 4 }, { project_label: 'projB', count: 1 }];
+  facetModels = [{ family: 'opus', count: 3 }, { family: 'sonnet', count: 1 }];
   vi.useFakeTimers();
 });
 afterEach(() => {
@@ -116,6 +118,50 @@ describe('ConversationFiltersPopover', () => {
     render(<ConversationFiltersPopover />);
     fireEvent.click(screen.getByRole('button', { name: '≥$5' }));
     expect(getState().conversationFilters.costMin).toBe(5);
+  });
+
+  // ---- #278 Theme C: Model section ----
+
+  it('renders the Model section from the facets models (family + count)', () => {
+    render(<ConversationFiltersPopover />);
+    expect(screen.getByText('Model')).toBeTruthy();
+    // Each family renders as a toggle whose accessible name carries family+count.
+    expect(screen.getByRole('button', { name: /opus/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /sonnet/ })).toBeTruthy();
+  });
+
+  it('toggling a model family patches the models axis (multi-select unions)', () => {
+    render(<ConversationFiltersPopover />);
+    fireEvent.click(screen.getByRole('button', { name: /opus/ }));
+    expect(getState().conversationFilters.models).toEqual(['opus']);
+    // A second family unions.
+    fireEvent.click(screen.getByRole('button', { name: /sonnet/ }));
+    expect(getState().conversationFilters.models).toEqual(['opus', 'sonnet']);
+    // Clicking opus again removes only opus.
+    fireEvent.click(screen.getByRole('button', { name: /opus/ }));
+    expect(getState().conversationFilters.models).toEqual(['sonnet']);
+  });
+
+  it('reflects an active model selection with aria-pressed', () => {
+    dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { models: ['sonnet'] } });
+    render(<ConversationFiltersPopover />);
+    const sonnet = screen.getByRole('button', { name: /sonnet/ });
+    expect(sonnet.getAttribute('aria-pressed')).toBe('true');
+    const opus = screen.getByRole('button', { name: /opus/ });
+    expect(opus.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('shows "No models." when the models facet is empty', () => {
+    facetModels = [];
+    render(<ConversationFiltersPopover />);
+    expect(screen.getByText(/no models/i)).toBeTruthy();
+  });
+
+  it('Clear all resets the models axis', () => {
+    dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { models: ['opus'] } });
+    render(<ConversationFiltersPopover />);
+    fireEvent.click(screen.getByRole('button', { name: 'Clear all' }));
+    expect(getState().conversationFilters.models).toEqual([]);
   });
 
   it('a rebuild preset chip sets rebuildMin', () => {

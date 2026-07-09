@@ -82,6 +82,7 @@ function anyFilterActive(f: ConversationFilters): boolean {
     f.dateFrom != null ||
     f.dateTo != null ||
     f.projects.length > 0 ||
+    f.models.length > 0 ||
     f.costMin != null ||
     f.costMax != null ||
     f.rebuildMin != null
@@ -109,6 +110,17 @@ function activeFilterChips(f: ConversationFilters): FilterChip[] {
       remove: () => dispatch({
         type: 'SET_CONVERSATION_FILTERS',
         patch: { projects: f.projects.filter((p) => p !== proj) },
+      }),
+    });
+  }
+  // #278 Theme C — one removable chip per selected model family; each removes
+  // only its own family (mirroring the project chips).
+  for (const fam of f.models) {
+    chips.push({
+      key: `model:${fam}`, label: fam,
+      remove: () => dispatch({
+        type: 'SET_CONVERSATION_FILTERS',
+        patch: { models: f.models.filter((m) => m !== fam) },
       }),
     });
   }
