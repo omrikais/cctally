@@ -33,6 +33,8 @@ The reconciles run **once per rebuild** (not once per SSE client): they refresh 
 
 Ingest is the other hot path, shared by every JSONL-reading command through the read-through delta cache. Its coarse seams, under the `sync_cache` root: `flock` (acquire the exclusive `cache.db.lock`), `backfills` (the rare, upgrade-only reingest/backfill flags), `discover` (glob + stat, `count` = files), `walk` (the fused per-file parse-and-write loop as **one** phase, `count` = files processed — parse, session-entry writes, conversation-message inserts, file-touch maintenance, and AI-title upserts are fused into one per-file transaction, and FTS is trigger-driven behind the message inserts), and `recompute.conversation_sessions` (the post-walk browse-rollup re-derive). The `walk` loop is never instrumented per-row; volume is a `count`.
 
+As of #279 S2, `cctally cache-sync` traces one shared `cache-sync` root with `sync_cache` (the Claude ingest) and `sync_codex_cache` (the Codex ingest) as children, so a single flushed tree carries both vendors. The Codex sync now carries the same coarse `flock`/`discover`/`walk` seams as the Claude sync (its `walk` counts `files_processed`, never per-row).
+
 ### Cache-state diagnostics
 
 The signature legs, per-cache-table row counts, and pending reingest flags are all queryable from `cache.db` on demand — they are **not** timed phases. `/api/debug/backend` computes them at request time so they are available even when tracing is off.

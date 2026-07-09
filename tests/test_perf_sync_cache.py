@@ -36,3 +36,29 @@ def test_cache_sync_stdout_byte_identical_and_stderr_trace(tmp_path):
     assert "backend-perf:" in on.stderr            # non-vacuous: trace really emits
     assert "backend-perf:" not in off.stderr
     assert "sync_cache" in on.stderr
+
+
+def test_cache_sync_trace_covers_both_vendors(tmp_path):
+    # #279 S2 F4: `cache-sync --source all` flushes ONE tree with a
+    # `cache-sync` root and BOTH `sync_cache` and `sync_codex_cache`
+    # children (the codex sync was previously untraced). Point CODEX_HOME
+    # at an empty dir so the codex walk is deterministic and empty.
+    codex_home = tmp_path / "codex"
+    (codex_home / "sessions").mkdir(parents=True, exist_ok=True)
+    home = tmp_path / "home"
+    (home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    full_env = dict(os.environ)
+    full_env.pop("CCTALLY_PERF_TRACE", None)
+    full_env["HOME"] = str(home)
+    full_env["CCTALLY_DATA_DIR"] = str(data)
+    full_env["CCTALLY_PERF_TRACE"] = "1"
+    full_env["CODEX_HOME"] = str(codex_home)
+    proc = subprocess.run(
+        [sys.executable, str(CCTALLY), "cache-sync", "--source", "all"],
+        capture_output=True, text=True, env=full_env,
+    )
+    assert "cache-sync" in proc.stderr          # shared root
+    assert "sync_cache" in proc.stderr          # claude child
+    assert "sync_codex_cache" in proc.stderr    # codex child (was untraced)

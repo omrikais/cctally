@@ -2976,7 +2976,10 @@ def sync_codex_cache(
 
     lock_fh = open(_cctally_core.CACHE_LOCK_CODEX_PATH, "w")
     try:
-        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+        with _perf.phase("flock") as _p_flock:
+            _acquired = _acquire_cache_flock(lock_fh, timeout=lock_timeout)
+            _p_flock.set_meta(contended=not _acquired)
+        if not _acquired:
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
@@ -2993,8 +2996,10 @@ def sync_codex_cache(
         roots = _cctally()._codex_session_roots()
         # Pure read (glob + is_file only); safe to run before the SELECT and
         # the per-file loop, where no cache.db write lock may be held.
-        paths: list[pathlib.Path] = list(_iter_codex_jsonl_paths(roots))
-        stats.files_total = len(paths)
+        with _perf.phase("discover") as _p_disc:
+            paths: list[pathlib.Path] = list(_iter_codex_jsonl_paths(roots))
+            stats.files_total = len(paths)
+            _p_disc.set_count(len(paths))
 
         # Scope the cache to the CURRENT root set: drop rows ingested under a
         # prior $CODEX_HOME (issue #108). iter_codex_entries() has NO root
@@ -3055,6 +3060,11 @@ def sync_codex_cache(
             )
         }
 
+        # #279 S2 F4: ONE coarse `walk` phase bracketing the per-file loop
+        # (count = files_processed, never per-row — §2 rule). Manual CM so
+        # the loop stays flat, mirroring sync_cache's walk seam.
+        _p_walk = _perf.phase("walk")
+        _p_walk.__enter__()
         for jp in paths:
             path_str = str(jp)
             try:
@@ -3225,6 +3235,10 @@ def sync_codex_cache(
 
         if progress is not None:
             progress(stats)
+        _p_walk.__exit__(None, None, None)
+        _p_walk.set_count(stats.files_processed)
+        _p_walk.set_meta(skipped=stats.files_skipped_unchanged,
+                         rows=stats.rows_changed)
         # #279 S2 F1: rolling parse-health record (codex half). Same
         # anomaly-delta gate as the Claude tail; SQLite serializes the
         # cache.db write against a concurrent Claude sync.
@@ -3593,6 +3607,13 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     lt = _REBUILD_LOCK_TIMEOUT_SECONDS if args.rebuild else None
     contended = False
 
+    # #279 S2 F4: one shared `cache-sync` root so a single flushed tree
+    # carries BOTH vendors — with two sequential sync roots,
+    # flush_stderr(current_root()) would show only the last one. Opened
+    # after the --prune-orphans early returns so they can't leak a root.
+    _p_root = _perf.phase("cache-sync")
+    _p_root.__enter__()
+
     if source in ("claude", "all"):
         with _perf.phase("sync_cache"):
             stats = sync_cache(
@@ -3616,9 +3637,11 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             )
 
     if source in ("codex", "all"):
-        stats = sync_codex_cache(
-            conn, progress=_progress_codex_stderr, rebuild=args.rebuild, lock_timeout=lt
-        )
+        with _perf.phase("sync_codex_cache"):
+            stats = sync_codex_cache(
+                conn, progress=_progress_codex_stderr, rebuild=args.rebuild,
+                lock_timeout=lt,
+            )
         _progress_codex_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
@@ -3636,8 +3659,11 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.token_events_skipped} drift-skipped"
             )
 
-    # #276 perf: when tracing is enabled, flush the completed "sync_cache"
+    _p_root.__exit__(None, None, None)
+    # #276 perf: when tracing is enabled, flush the completed "cache-sync"
     # phase tree to stderr (stdout stays byte-identical). No-op when off.
+    # As of #279 S2 F4 the root carries both the sync_cache and
+    # sync_codex_cache children, so one flushed tree covers both vendors.
     if _perf.enabled():
         _perf.flush_stderr(_perf.current_root())
     return 1 if contended else 0
