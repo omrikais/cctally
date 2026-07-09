@@ -1174,16 +1174,25 @@ def _resolve_search_session_filter(conn, filters):
     any_axis = any(filters[k] is not None for k in _FILTER_KEYS)
     if not any_axis:
         return "", [], False
+    # #278 Theme C: resolve the model-family clause once and AND it onto whatever
+    # session-scope restriction this returns — including the model-only case
+    # (where the model clause BECOMES the restriction). It applies on BOTH
+    # branches and never degrades (model is not a rollup-only axis).
+    model_clause = _model_clause(conn, filters["models"])
+    mc_sql, mc_params = model_clause
     if _rollup_authoritative(conn):
-        where, params = _rollup_where(filters)
+        where, params = _rollup_where(filters, model_clause)   # model folded in
         return "SELECT session_id FROM conversation_sessions" + where, params, False
-    # Live fallback: only the date axis is expressible over raw messages.
+    # Live fallback: only the date axis + the (live-expressible) model axis apply
+    # over raw messages; the rollup-only axes drop and degrade.
     degraded = any(filters[k] is not None for k in _ROLLUP_ONLY_FILTER_KEYS)
     having, hparams = _live_having(filters)
+    where_extra = (" AND " + mc_sql) if mc_sql else ""
     sub = (
         "SELECT session_id FROM conversation_messages "
-        "WHERE session_id IS NOT NULL GROUP BY session_id" + having)
-    return sub, hparams, degraded
+        "WHERE session_id IS NOT NULL" + where_extra +
+        " GROUP BY session_id" + having)
+    return sub, [*mc_params, *hparams], degraded
 
 
 def _list_session_rows_rollup(conn, order, limit, offset, filters=None,
@@ -2579,7 +2588,8 @@ def _search_depth(conn) -> str:
 def search_conversations(conn, query, *, limit=50, offset=0,
                          kind="all", fts_available=None,
                          date_from=None, date_to=None, projects=None,
-                         cost_min=None, cost_max=None, rebuild_min=None) -> dict:
+                         cost_min=None, cost_max=None, rebuild_min=None,
+                         models=None) -> dict:
     """Cross-session search (spec §3.3). Uses FTS5 when available (bm25 rank +
     snippet); else a LIKE scan with a manual snippet. Hits deduped by
     (session_id, uuid); each carries the turn's cost. `fts_available` overrides
@@ -2627,10 +2637,10 @@ def search_conversations(conn, query, *, limit=50, offset=0,
         "date_from": date_from, "date_to": date_to,
         "projects": list(projects) if projects else None,
         "cost_min": cost_min, "cost_max": cost_max, "rebuild_min": rebuild_min,
-        # #278 Theme C: the model axis is wired in Task 2 (search_conversations
-        # gains a `models=` param); the key must exist now so the widened
-        # _FILTER_KEYS iteration in _resolve_search_session_filter never KeyErrors.
-        "models": None,
+        # #278 Theme C: the model-family axis, folded in verbatim like projects.
+        # Applies to EVERY search kind via _resolve_search_session_filter, on
+        # both the rollup and live branches, and never degrades.
+        "models": list(models) if models else None,
     }
     filt_sql, filt_params, degraded = _resolve_search_session_filter(conn, filters)
     if degraded:

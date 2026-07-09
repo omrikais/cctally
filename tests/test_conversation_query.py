@@ -4802,3 +4802,43 @@ def test_browse_model_only_never_degrades_on_live_branch(live_pending_conn):
 def test_browse_no_model_filter_byte_stable(seeded_conn):
     assert cq.list_conversations(seeded_conn) == \
            cq.list_conversations(seeded_conn, models=None)
+
+
+# --- Theme C: model axis in cross-session search --------------------------
+# LIKE mode (fts_available=False) keeps these deterministic across FTS5-less
+# builds: the LIKE scan matches 'the-needle' directly on conversation_messages.
+
+def test_search_model_filter_rollup(seeded_conn):
+    res = cq.search_conversations(seeded_conn, "the-needle", models=["opus"],
+                                  fts_available=False)
+    sids = {h["session_id"] for h in res["hits"]}
+    assert sids == {"s_op", "s_op_haiku", "s_op2"}     # sonnet-only excluded
+    assert "filter_degraded" not in res
+
+
+def test_search_model_only_never_degrades_live(live_pending_conn):
+    # Model is not a rollup-only axis: a model-only search under a pending
+    # rollup still restricts AND does NOT set filter_degraded.
+    res = cq.search_conversations(live_pending_conn, "the-needle",
+                                  models=["opus"], fts_available=False)
+    sids = {h["session_id"] for h in res["hits"]}
+    assert sids == {"s_op", "s_op_haiku", "s_op2"}
+    assert "filter_degraded" not in res
+    # Contrast: a project-only filter in the SAME live state DOES degrade
+    # (project is a rollup-only axis the live fallback can't express).
+    proj = cq.search_conversations(live_pending_conn, "the-needle",
+                                   projects=["proj"], fts_available=False)
+    assert proj.get("filter_degraded") is True
+
+
+def test_search_model_present_but_empty_matches_nothing(seeded_conn):
+    res = cq.search_conversations(seeded_conn, "the-needle", models=["fable"],
+                                  fts_available=False)
+    assert res["hits"] == [] and res["total"] == 0
+
+
+def test_search_no_model_filter_byte_stable(seeded_conn):
+    assert cq.search_conversations(seeded_conn, "the-needle",
+                                   fts_available=False) == \
+           cq.search_conversations(seeded_conn, "the-needle", models=None,
+                                   fts_available=False)
