@@ -7596,6 +7596,13 @@ mark.current {
 }
 .conv-rail-filters-proj-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-rail-filters-proj-count { color: var(--text-faint); font-size: var(--fs-eyebrow); }
+/* #278 Theme C — the model-family chip nests its session count inside the chip
+   button, whose background is the family colour (unselected) or accent-blue
+   (.is-on). The faint grey above is then low-contrast on both; inherit the
+   chip's own text colour (slightly de-emphasised) so the count stays legible in
+   either state. Scoped to counts INSIDE a filter chip, so the Project rows
+   (which are not .conv-rail-filters-chip) keep the faint grey. */
+.conv-rail-filters-chip .conv-rail-filters-proj-count { color: inherit; opacity: 0.75; }
 .conv-rail-filters-empty { color: var(--text-faint); font-size: 11px; padding: var(--space-1) 2px; }
 .conv-rail-filters-footer {
   display: flex;
