@@ -316,6 +316,9 @@ from _lib_pricing import _calculate_entry_cost, _chip_for_model, _short_model_na
 from _lib_five_hour import _canonical_5h_window_key
 from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
+# #279 S2 F3: stdlib-logging chokepoint — server errors reach stderr via
+# the real log_error override below (leaf import, no cycle).
+import _lib_log
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
@@ -6761,12 +6764,25 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # (`_require_transcripts_allowed`) ANDs this with the request Host.
     cctally_expose_transcripts: bool = False
 
-    # Silence the default per-request access log — noisy in the parent
-    # terminal. Deliberate. NOTE: stdlib log_error() delegates to
-    # log_message(), so server-error lines are currently swallowed too; the
-    # real log_error override + logging chokepoint land in #279 S2.
+    # Access log stays silent (deliberate — noisy in the parent terminal),
+    # but server errors are REAL as of #279 S2: log_error routes through
+    # the _lib_log chokepoint. stdlib send_error() calls
+    # log_error("code %d, message %s", code, message) for EVERY error
+    # response — routine 400/403/404 rejections included — so the
+    # stdlib-generated form is filtered: <500 drops, >=500 logs (covers
+    # send_error(500) sites with no explicit log_error call).
+    # Handler-authored log_error calls always log.
     def log_message(self, fmt: str, *args) -> None:
         pass
+
+    def log_error(self, fmt: str, *args) -> None:
+        if fmt.startswith("code ") and args and isinstance(args[0], int) \
+                and args[0] < 500:
+            return
+        _lib_log.get_logger("dashboard").error(
+            "%s - %s", self.address_string(),
+            (fmt % args) if args else fmt,
+        )
 
     def _method_not_allowed_for_settings(self) -> bool:
         """If the request targets /api/settings, send 405 and return True.
