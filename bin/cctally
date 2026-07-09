@@ -2803,8 +2803,22 @@ def main(argv: list[str] | None = None) -> int:
     _print_migration_error_banner_if_needed(args)
     try:
         rc = int(args.func(args))
+        # Flush now, inside the guard, so a buffered broken pipe (small output
+        # that never filled the pipe buffer, e.g. `cctally daily | head`)
+        # surfaces HERE and is handled below — not as an "Exception ignored in
+        # sys.stdout" at interpreter shutdown (CPython exit code 120). #279 S1 F5.
+        sys.stdout.flush()
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:
+        # Reader went away (`cctally daily | head`). Not an error: redirect
+        # stdout to /dev/null so the interpreter's shutdown-flush doesn't emit
+        # an "Exception ignored" line, then exit 0 immediately — skipping the
+        # post-command update hooks (stdout is dead, banners are pointless).
+        # Mirrors the KeyboardInterrupt immediate-return precedent. #279 S1 F5.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
     except DowngradeDetected as exc:
         eprint(f"cctally: {exc}")
         return 2
