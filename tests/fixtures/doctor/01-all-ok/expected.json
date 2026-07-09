@@ -17,13 +17,13 @@
                 {
                     "details": {
                         "missing": [],
-                        "present": 13,
+                        "present": 14,
                         "stale": [],
-                        "total": 13
+                        "total": 14
                     },
                     "id": "install.symlinks",
                     "severity": "ok",
-                    "summary": "13/13 available",
+                    "summary": "14/14 available",
                     "title": "Symlinks"
                 },
                 {

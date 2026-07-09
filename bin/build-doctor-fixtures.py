@@ -125,7 +125,7 @@ def _scenario_body(slug: str) -> str:
             # Seed install + hooks + OAuth + valid update-state + 1 fresh snapshot.
             # Symlink every cctally-* binary so install.symlinks is OK.
             # Keep this list aligned with SETUP_SYMLINK_NAMES in bin/cctally.
-            for name in cctally cctally-alerts cctally-dashboard \\
+            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\
@@ -314,15 +314,15 @@ def _scenario_body(slug: str) -> str:
     # required (unlike the setup harness): doctor runs the dev binary.
     if slug == "brew_stale_links":
         # spec §5.3 b: dangling AND live Cellar ~/.local/bin links → the
-        # `stale` symlink state. <prefix>/bin (all 13 cmds) on PATH makes
+        # `stale` symlink state. <prefix>/bin (all 14 cmds) on PATH makes
         # every command reachable elsewhere, so the leftover keg links are
         # cleanable cruft (`stale`), not broken (`wrong`). Expect:
-        # "13/13 available; 2 stale link(s) to clean" (cctally + cctally-tui).
+        # "14/14 available; 2 stale link(s) to clean" (cctally + cctally-tui).
         return textwrap.dedent("""\
             # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
             # Reachability source for the empty ~/.local/bin slots → `ok`.
             mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in cctally cctally-alerts cctally-dashboard \\
+            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\
@@ -349,12 +349,12 @@ def _scenario_body(slug: str) -> str:
         # ~/.local/bin is OFF PATH (DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1 +
         # DOCTOR_INCLUDE_PREFIX_BIN=1). cctally lives on <prefix>/bin only;
         # path_includes_local_bin is False yet cctally_reachable_on_path is
-        # True → install.path passes ("cctally reachable on $PATH"). All 13
-        # cmds on <prefix>/bin so install.symlinks is a clean "13/13 available"
+        # True → install.path passes ("cctally reachable on $PATH"). All 14
+        # cmds on <prefix>/bin so install.symlinks is a clean "14/14 available"
         # (empty ~/.local/bin slots reachable-elsewhere → ok).
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in cctally cctally-alerts cctally-dashboard \\
+            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\

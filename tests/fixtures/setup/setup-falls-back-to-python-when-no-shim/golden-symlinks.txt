@@ -1,5 +1,6 @@
 cctally -> /REPO/node_modules/cctally/bin/cctally
 cctally-alerts -> /REPO/node_modules/cctally/bin/cctally-alerts
+cctally-budget -> /REPO/node_modules/cctally/bin/cctally-budget
 cctally-dashboard -> /REPO/node_modules/cctally/bin/cctally-dashboard
 cctally-dollar-per-percent -> /REPO/node_modules/cctally/bin/cctally-dollar-per-percent
 cctally-five-hour-blocks -> /REPO/node_modules/cctally/bin/cctally-five-hour-blocks

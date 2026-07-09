@@ -1,7 +1,7 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
-  ⚠ Symlinks                 0/13 available; missing/broken cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
+  ⚠ Symlinks                 0/14 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
       → Run `cctally setup`
   ⚠ PATH                     cctally not reachable on $PATH
       → Append `export PATH="$HOME/.local/bin:$PATH"` to your shell rc, or run `cctally setup`

@@ -1,7 +1,7 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
-  ⚠ Symlinks                 13/13 available; 2 stale link(s) to clean
+  ⚠ Symlinks                 14/14 available; 2 stale link(s) to clean
       → Run `cctally setup` to clean stale links
 Hooks
   ⚠ Recent activity (24h)    0 fires

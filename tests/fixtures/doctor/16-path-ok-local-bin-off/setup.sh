@@ -55,7 +55,7 @@ write_canonical_settings() {
 JSON
 }
 mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-for name in cctally cctally-alerts cctally-dashboard \
+for name in cctally cctally-alerts cctally-budget cctally-dashboard \
            cctally-dollar-per-percent cctally-five-hour-blocks \
            cctally-five-hour-breakdown cctally-forecast cctally-project \
            cctally-refresh-usage cctally-statusline cctally-sync-week \

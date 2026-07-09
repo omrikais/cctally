@@ -7,11 +7,11 @@ Install
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
         channel: prod
-  ⚠ Symlinks                 13/13 available; 2 stale link(s) to clean
+  ⚠ Symlinks                 14/14 available; 2 stale link(s) to clean
       → Run `cctally setup` to clean stale links
       details:
-        present: 13
-        total: 13
+        present: 14
+        total: 14
         missing: []
         stale: ['cctally', 'cctally-tui']
   ✓ PATH                     cctally reachable on $PATH

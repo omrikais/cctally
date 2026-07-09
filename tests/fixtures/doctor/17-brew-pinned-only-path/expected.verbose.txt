@@ -7,12 +7,12 @@ Install
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
         channel: prod
-  ⚠ Symlinks                 0/13 available; missing/broken cctally, cctally-alerts, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
+  ⚠ Symlinks                 0/14 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
       → cctally is reachable only through a legacy ~/.local/bin link to a Homebrew keg. Put <prefix>/bin on your PATH (e.g. `eval "$(brew shellenv)"`), then run `cctally setup` to remove the legacy link.
       details:
         present: 0
-        total: 13
-        missing: ['cctally', 'cctally-alerts', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-statusline', 'cctally-sync-week', 'cctally-tui', 'cctally-update']
+        total: 14
+        missing: ['cctally', 'cctally-alerts', 'cctally-budget', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-statusline', 'cctally-sync-week', 'cctally-tui', 'cctally-update']
         stale: []
   ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected

@@ -1,5 +1,5 @@
 Install
-  Symlinks       13/13 available at /FAKE/.local/bin/  ✓
+  Symlinks       13/14 available at /FAKE/.local/bin/  ✗
   PATH           brew: commands via /FAKE/opt/homebrew/bin                 ✓
 Hooks (/FAKE/.claude/settings.json)
   PostToolBatch  missing                  ✗

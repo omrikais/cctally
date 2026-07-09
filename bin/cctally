@@ -141,6 +141,7 @@ HOOK_TICK_DEFAULT_THROTTLE_SECONDS = 30.0
 SETUP_SYMLINK_NAMES = (
     "cctally",
     "cctally-alerts",
+    "cctally-budget",
     "cctally-dashboard",
     "cctally-dollar-per-percent",
     "cctally-five-hour-blocks",

@@ -352,9 +352,18 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
             $fake_real_sed \
             -e "s|$fake|/FAKE|g" \
             -e "s|$REPO_ROOT|/REPO|g")
-        # golden-symlinks.txt ends in \n; _golden_diff_str materializes the
-        # actual via `printf '%s\n'`, matching the old comparison.
-        _golden_diff_str "symlinks" "$dir/golden-symlinks.txt" "$norm_listing" 50 || fail_local=1
+        if [ -n "$REGENERATE" ]; then
+            # golden-symlinks.txt ends in \n; materialize the actual side the
+            # same way the comparison does (printf '%s\n'). Regenerating this
+            # golden alongside golden-stdout keeps a SETUP_SYMLINK_NAMES change
+            # (e.g. #279 S1 F2 adding cctally-budget) re-blessable in one pass.
+            printf '%s\n' "$norm_listing" > "$dir/golden-symlinks.txt"
+            echo "REGEN setup/$name/golden-symlinks.txt"
+        else
+            # golden-symlinks.txt ends in \n; _golden_diff_str materializes the
+            # actual via `printf '%s\n'`, matching the old comparison.
+            _golden_diff_str "symlinks" "$dir/golden-symlinks.txt" "$norm_listing" 50 || fail_local=1
+        fi
     fi
 
     # Scenario-specific post-run checks (e.g. data dir absence after purge).

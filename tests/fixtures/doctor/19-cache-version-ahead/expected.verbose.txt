@@ -7,10 +7,10 @@ Install
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
         channel: prod
-  ✓ Symlinks                 13/13 available
+  ✓ Symlinks                 14/14 available
       details:
-        present: 13
-        total: 13
+        present: 14
+        total: 14
         missing: []
         stale: []
   ✓ PATH                     cctally reachable on $PATH

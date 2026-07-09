@@ -17,17 +17,17 @@
                 {
                     "details": {
                         "missing": [],
-                        "present": 13,
+                        "present": 14,
                         "stale": [
                             "cctally",
                             "cctally-tui"
                         ],
-                        "total": 13
+                        "total": 14
                     },
                     "id": "install.symlinks",
                     "remediation": "Run `cctally setup` to clean stale links",
                     "severity": "warn",
-                    "summary": "13/13 available; 2 stale link(s) to clean",
+                    "summary": "14/14 available; 2 stale link(s) to clean",
                     "title": "Symlinks"
                 },
                 {
