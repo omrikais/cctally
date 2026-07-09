@@ -3354,6 +3354,11 @@ def open_cache_db() -> sqlite3.Connection:
 
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Re-derivable DB under WAL: NORMAL risks at most the tail transaction on
+    # power loss, and cache.db can always be rebuilt (cache-sync --rebuild).
+    # Fewer ingest fsyncs than the default FULL. Matches stats.db
+    # (bin/_cctally_core.py open_db). #279 S1 F8.
+    conn.execute("PRAGMA synchronous=NORMAL")
 
     # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
     # indexes, the session_id / project_path column adds on session_files
