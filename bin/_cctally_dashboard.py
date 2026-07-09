@@ -6762,7 +6762,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     cctally_expose_transcripts: bool = False
 
     # Silence the default per-request access log — noisy in the parent
-    # terminal, and we pipe it through our own logger in cmd_dashboard.
+    # terminal. Deliberate. NOTE: stdlib log_error() delegates to
+    # log_message(), so server-error lines are currently swallowed too; the
+    # real log_error override + logging chokepoint land in #279 S2.
     def log_message(self, fmt: str, *args) -> None:
         pass
 
