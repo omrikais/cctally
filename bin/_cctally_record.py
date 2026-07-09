@@ -3783,12 +3783,14 @@ def _hook_tick_session_short(sid: str) -> str:
 
 
 def _hook_tick_format_log_line(
-    event: str, session: str, ingested: int, oauth_status: str, dur_ms: int
+    event: str, session: str, ingested: int, oauth_status: str, dur_ms: int,
+    *, malformed: int = 0, skipped: int = 0,
 ) -> str:
     ts = now_utc_iso()
     return (
         f"{ts} event={event:14s} session={session} "
-        f"ingested={ingested} oauth={oauth_status} dur_ms={dur_ms}"
+        f"ingested={ingested} malformed={malformed} skipped={skipped} "
+        f"oauth={oauth_status} dur_ms={dur_ms}"
     )
 
 
@@ -3886,6 +3888,10 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     # --- Steps 3-7: wrap remainder in try/except (always exit 0 in normal mode) ---
     start = time.monotonic()
     ingested = 0
+    # #279 S2 F1: parse-health counters from the local sync, surfaced on the
+    # hook-tick log line (uniform fields — always emitted, defaulted to 0).
+    parse_malformed = 0
+    parse_skipped = 0
     oauth_status = "skipped-no-oauth" if no_oauth else "throttled(age=?s)"
     # Pre-fetch throttle state captured for --explain output. The OAuth
     # block re-touches the throttle marker after a successful fetch, so
@@ -3904,6 +3910,8 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
             try:
                 stats = sync_cache(cache_conn)
                 ingested = int(stats.rows_changed)
+                parse_malformed = int(stats.lines_malformed)
+                parse_skipped = int(stats.assistant_lines_skipped)
             finally:
                 try:
                     cache_conn.close()
@@ -3964,6 +3972,8 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         ingested=ingested,
         oauth_status=oauth_status,
         dur_ms=dur_ms,
+        malformed=parse_malformed,
+        skipped=parse_skipped,
     )
     _hook_tick_log_line(line)
     _hook_tick_log_rotate_if_needed()

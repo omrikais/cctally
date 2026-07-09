@@ -3610,7 +3610,9 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] claude done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_changed} rows changed"
+                f"{stats.rows_changed} rows changed, "
+                f"{stats.lines_malformed} malformed, "
+                f"{stats.assistant_lines_skipped} drift-skipped"
             )
 
     if source in ("codex", "all"):
@@ -3629,7 +3631,9 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"[cache-sync] codex done: {stats.files_processed} processed, "
                 f"{stats.files_skipped_unchanged} skipped, "
                 f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_changed} rows changed"
+                f"{stats.rows_changed} rows changed, "
+                f"{stats.lines_malformed} malformed, "
+                f"{stats.token_events_skipped} drift-skipped"
             )
 
     # #276 perf: when tracing is enabled, flush the completed "sync_cache"
