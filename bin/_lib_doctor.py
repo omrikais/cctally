@@ -177,6 +177,23 @@ class DoctorState:
     # valid and default to the enabled (opt-out) posture.
     telemetry_enabled: bool = True
     telemetry_reason: str = "enabled"
+    # #279 S2 (F5a): rolling ingest parse-health records read from
+    # cache_meta keys parse_health_claude / parse_health_codex (JSON
+    # dicts; see _cctally_cache._update_parse_health_meta). None = key
+    # absent (pre-first-sync) or cache unreadable — check degrades OK.
+    parse_health_claude: Optional[dict] = None
+    parse_health_codex: Optional[dict] = None
+    # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
+    # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
+    # rebuild loop calls the gather every rebuild and quick_check on a
+    # large cache.db costs seconds. "ok" | first error line |
+    # "open failed: ..." | None = not run.
+    stats_db_quick_check: Optional[str] = None
+    cache_db_quick_check: Optional[str] = None
+    # #279 S2 (F5c): non-blocking flock probes on the two sync lock files
+    # (name -> True held / False free / None unreadable). Probe never
+    # creates files (doctor read-only contract). None = probe errored.
+    locks_held: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1207,6 +1224,122 @@ def _check_telemetry(s: DoctorState) -> CheckResult:
     )
 
 
+_PARSE_HEALTH_RECENCY_DAYS = 7
+
+
+def _check_data_parse_health(s: DoctorState) -> CheckResult:
+    details = {"claude": s.parse_health_claude, "codex": s.parse_health_codex}
+    recent, historical_total = [], 0
+    for label, ph in (("claude", s.parse_health_claude),
+                      ("codex", s.parse_health_codex)):
+        if not isinstance(ph, dict):
+            continue
+        malformed = int(ph.get("lines_malformed", 0) or 0)
+        skipped = int(ph.get("lines_skipped", 0) or 0)
+        historical_total += malformed + skipped
+        last_anomaly = ph.get("last_anomaly_at")
+        if not last_anomaly or (malformed + skipped) == 0:
+            continue
+        try:
+            at = dt.datetime.fromisoformat(
+                str(last_anomaly).replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        if (s.now_utc - at).total_seconds() <= \
+                _PARSE_HEALTH_RECENCY_DAYS * 86400.0:
+            reasons = ph.get("reasons") \
+                if isinstance(ph.get("reasons"), dict) else {}
+            top = max(reasons.items(), key=lambda kv: kv[1])[0] \
+                if reasons else None
+            recent.append((label, malformed, skipped, top))
+    if recent:
+        parts = []
+        for label, malformed, skipped, top in recent:
+            frag = f"{label}: {malformed} malformed / {skipped} drift-skipped"
+            if top:
+                frag += f" (top reason: {top})"
+            parts.append(frag)
+        return CheckResult(
+            id="data.parse_health", title="Ingest parse health",
+            severity="warn",
+            summary="; ".join(parts)
+                    + f" within {_PARSE_HEALTH_RECENCY_DAYS}d",
+            remediation=(
+                "JSONL lines are failing to parse — a Claude Code / Codex "
+                "update may have changed the session format. Check for a "
+                "cctally update or file an issue; `cctally cache-sync "
+                "--rebuild` re-baselines the counters."),
+            details=details,
+        )
+    if s.parse_health_claude is None and s.parse_health_codex is None:
+        summary = "no parse-health data yet (pre-first-sync)"
+    elif historical_total:
+        summary = (f"no recent anomalies ({historical_total} historical; "
+                   f"see details)")
+    else:
+        summary = "no parse anomalies"
+    return CheckResult(
+        id="data.parse_health", title="Ingest parse health",
+        severity="ok", summary=summary, remediation=None, details=details,
+    )
+
+
+def _check_db_integrity(s: DoctorState) -> CheckResult:
+    details = {"stats_quick_check": s.stats_db_quick_check,
+               "cache_quick_check": s.cache_db_quick_check}
+    if s.stats_db_quick_check is not None and s.stats_db_quick_check != "ok":
+        return CheckResult(
+            id="db.integrity", title="Integrity", severity="fail",
+            summary=f"stats.db quick_check: {s.stats_db_quick_check}",
+            remediation=(
+                "stats.db (the non-re-derivable DB) reports corruption. "
+                "Back up the file FIRST, then try "
+                "`sqlite3 <path> \".recover\"` into a fresh file; "
+                "`cctally db recover` does not repair corruption. Please "
+                "file a bug. Do not delete the file."),
+            details=details,
+        )
+    if s.cache_db_quick_check is not None and s.cache_db_quick_check != "ok":
+        return CheckResult(
+            id="db.integrity", title="Integrity", severity="warn",
+            summary=f"cache.db quick_check: {s.cache_db_quick_check}",
+            remediation=("cache.db is re-derivable — run "
+                         "`cctally cache-sync --rebuild`."),
+            details=details,
+        )
+    if s.stats_db_quick_check is None and s.cache_db_quick_check is None:
+        return CheckResult(
+            id="db.integrity", title="Integrity", severity="ok",
+            summary="not checked (fast gather — run `cctally doctor`)",
+            remediation=None, details=details,
+        )
+    return CheckResult(
+        id="db.integrity", title="Integrity", severity="ok",
+        summary="quick_check ok", remediation=None, details=details,
+    )
+
+
+def _check_db_lock_state(s: DoctorState) -> CheckResult:
+    locks = s.locks_held if isinstance(s.locks_held, dict) else {}
+    held = sorted(k for k, v in locks.items() if v is True)
+    details = {"locks": s.locks_held}
+    if held:
+        return CheckResult(
+            id="db.lock_state", title="Locks", severity="ok",
+            summary=(", ".join(held) + " held — an active sync or "
+                     "dashboard is running; a hold persisting across "
+                     "repeated doctor runs may indicate a wedged process"),
+            remediation=None, details=details,
+        )
+    return CheckResult(
+        id="db.lock_state", title="Locks", severity="ok",
+        summary="free" if locks else "no lock files present",
+        remediation=None, details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1232,14 +1365,17 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     ("db", "Database", (
         ("db.stats.file", "_check_db_stats_file"),
         ("db.cache.file", "_check_db_cache_file"),
+        ("db.integrity", "_check_db_integrity"),
         ("db.version_ahead", "_check_db_version_ahead"),
         ("db.migrations.applied", "_check_db_migrations_applied"),
         ("db.migrations.pending", "_check_db_migrations_pending"),
+        ("db.lock_state", "_check_db_lock_state"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
+        ("data.parse_health", "_check_data_parse_health"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),
         ("data.conversation_sessions_rollup",

@@ -46,6 +46,10 @@ def test_doctor_state_has_required_fields():
         "channel",
         # Anonymous install-count telemetry (spec 2026-07-07): opt-out state.
         "telemetry_enabled", "telemetry_reason",
+        # #279 S2 F5: parse-health / deep quick_check / lock-state probes.
+        "parse_health_claude", "parse_health_codex",
+        "stats_db_quick_check", "cache_db_quick_check",
+        "locks_held",
     }
     assert fields == expected, fields ^ expected
 
@@ -1081,3 +1085,123 @@ def test_render_text_summary_includes_counts():
     counts = rep.counts
     assert f"{counts['ok']} OK" in out
     assert f"{counts['fail']} FAIL" in out
+
+
+# ── #279 S2 F5: parse-health / db.integrity / db.lock_state ──────────
+
+def _iso(dt_obj):
+    return dt_obj.replace(tzinfo=dt.timezone.utc).isoformat()
+
+
+_NOW = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+
+
+def test_parse_health_absent_is_ok():
+    r = L._check_data_parse_health(_state(parse_health_claude=None,
+                                          parse_health_codex=None))
+    assert r.severity == "ok"
+    assert "pre-first-sync" in r.summary
+
+
+def test_parse_health_recent_anomaly_warns_with_top_reason():
+    ph = {"schema": 1, "lines_seen": 100, "lines_malformed": 3,
+          "lines_skipped": 2, "reasons": {"no-usage": 2, "no-model": 1},
+          "last_anomaly_at": _iso(_NOW - dt.timedelta(days=1))}
+    r = L._check_data_parse_health(_state(now_utc=_NOW, parse_health_claude=ph))
+    assert r.severity == "warn"
+    assert "3 malformed" in r.summary
+    assert "no-usage" in r.summary  # dominant reason
+    assert "cache-sync --rebuild" in r.remediation
+
+
+def test_parse_health_boundary_exactly_7d_is_warn():
+    ph = {"schema": 1, "lines_seen": 10, "lines_malformed": 1,
+          "lines_skipped": 0, "reasons": {"bad-timestamp": 1},
+          "last_anomaly_at": _iso(_NOW - dt.timedelta(days=7))}
+    r = L._check_data_parse_health(_state(now_utc=_NOW, parse_health_codex=ph))
+    assert r.severity == "warn"  # boundary inclusive (<= 7d)
+
+
+def test_parse_health_stale_anomaly_is_ok_historical():
+    ph = {"schema": 1, "lines_seen": 10, "lines_malformed": 5,
+          "lines_skipped": 0, "reasons": {"bad-timestamp": 5},
+          "last_anomaly_at": _iso(_NOW - dt.timedelta(days=30))}
+    r = L._check_data_parse_health(_state(now_utc=_NOW, parse_health_claude=ph))
+    assert r.severity == "ok"
+    assert "historical" in r.summary
+
+
+def test_parse_health_zero_counts_is_ok():
+    ph = {"schema": 1, "lines_seen": 500, "lines_malformed": 0,
+          "lines_skipped": 0, "reasons": {},
+          "last_anomaly_at": None}
+    r = L._check_data_parse_health(_state(parse_health_claude=ph))
+    assert r.severity == "ok"
+    assert "no parse anomalies" in r.summary
+
+
+def test_db_integrity_not_checked_is_ok():
+    r = L._check_db_integrity(_state(stats_db_quick_check=None,
+                                     cache_db_quick_check=None))
+    assert r.severity == "ok"
+    assert "not checked" in r.summary
+
+
+def test_db_integrity_stats_corrupt_is_fail_no_delete():
+    r = L._check_db_integrity(_state(
+        stats_db_quick_check="malformed database schema",
+        cache_db_quick_check="ok"))
+    assert r.severity == "fail"
+    assert "backup" in r.remediation.lower() or "back up" in r.remediation.lower()
+    assert ".recover" in r.remediation
+    assert "delete" in r.remediation.lower()  # "Do not delete"
+
+
+def test_db_integrity_cache_corrupt_stats_ok_is_warn():
+    r = L._check_db_integrity(_state(
+        stats_db_quick_check="ok",
+        cache_db_quick_check="database disk image is malformed"))
+    assert r.severity == "warn"
+    assert "cache-sync --rebuild" in r.remediation
+
+
+def test_db_integrity_both_ok():
+    r = L._check_db_integrity(_state(stats_db_quick_check="ok",
+                                     cache_db_quick_check="ok"))
+    assert r.severity == "ok"
+    assert "ok" in r.summary
+
+
+def test_db_lock_state_held_is_ok_and_named():
+    r = L._check_db_lock_state(_state(locks_held={"cache.db.lock": True,
+                                                  "cache.db.codex.lock": False}))
+    assert r.severity == "ok"  # NEVER warn
+    assert "cache.db.lock" in r.summary
+
+
+def test_db_lock_state_free_is_ok():
+    r = L._check_db_lock_state(_state(locks_held={"cache.db.lock": False}))
+    assert r.severity == "ok"
+    assert "free" in r.summary
+
+
+def test_db_lock_state_none_is_ok():
+    r = L._check_db_lock_state(_state(locks_held=None))
+    assert r.severity == "ok"
+
+
+def test_doctorstate_all_new_fields_default():
+    # A DoctorState built with only the pre-existing required fields still
+    # constructs — every new S2 field is defaulted (Codex P1-3).
+    s = _state()
+    assert s.parse_health_claude is None
+    assert s.parse_health_codex is None
+    assert s.stats_db_quick_check is None
+    assert s.cache_db_quick_check is None
+    assert s.locks_held is None
+
+
+def test_new_checks_registered_and_run():
+    rep = L.run_checks(_state())
+    ids = {c.id for cat in rep.categories for c in cat.checks}
+    assert {"data.parse_health", "db.integrity", "db.lock_state"} <= ids

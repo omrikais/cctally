@@ -202,3 +202,95 @@ def test_doctor_writes_nothing_to_app_dir_on_fresh_home(tmp_path):
         f"doctor created APP_DIR on fresh HOME: "
         f"{sorted(p.name for p in app_dir.rglob('*'))}"
     )
+
+
+# ── #279 S2 F5: in-process gather tests (deep quick_check, guarded head) ──
+
+import sqlite3  # noqa: E402
+import sys as _sys  # noqa: E402
+from conftest import load_script, redirect_paths  # noqa: E402
+
+
+def _valid_sqlite(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.commit()
+    conn.close()
+
+
+def _gather(ns, monkeypatch, tmp_path, **kw):
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    return ns["doctor_gather_state"](**kw)
+
+
+def test_gather_deep_false_skips_quick_check(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    state = ns["doctor_gather_state"](deep=False)
+    assert state.stats_db_quick_check is None
+    assert state.cache_db_quick_check is None
+
+
+def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    state = ns["doctor_gather_state"](deep=True)
+    assert state.stats_db_quick_check == "ok"
+    assert state.cache_db_quick_check == "ok"
+
+
+def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.DB_PATH.write_bytes(b"this is not a sqlite database at all")
+    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    state = ns["doctor_gather_state"](deep=True)
+    assert state.stats_db_quick_check is not None
+    assert state.stats_db_quick_check != "ok"
+
+
+def test_gather_head_guard_survives_repo_root_raise(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _boom():
+        raise RuntimeError("repo-root-blew-up")
+
+    monkeypatch.setitem(ns, "_setup_resolve_repo_root", _boom)
+    # Without the guarded head (F5d), the raise would kill the whole
+    # gather. With it, the gather must still return a usable DoctorState.
+    state = ns["doctor_gather_state"](deep=False)
+    assert state is not None
+    assert state.now_utc is not None
+    # run_checks must still render a full report from the degraded state.
+    import _lib_doctor
+    rep = _lib_doctor.run_checks(state)
+    assert rep.schema_version == 1
+
+
+def test_gather_lock_probe_creates_no_files_on_fresh_dir(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # No lock files exist. The probe must report them free/absent WITHOUT
+    # creating them (doctor read-only contract, Codex P2-6).
+    state = ns["doctor_gather_state"](deep=True)
+    assert not _cctally_core.CACHE_LOCK_PATH.exists()
+    assert not _cctally_core.CACHE_LOCK_CODEX_PATH.exists()
+    assert state.locks_held == {"cache.db.lock": False,
+                                "cache.db.codex.lock": False}

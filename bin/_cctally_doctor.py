@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import pathlib
 import shutil
@@ -45,12 +46,18 @@ def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
     runtime_bind: "str | None" = None,
+    deep: bool = False,
 ):
     """I/O chokepoint for `cctally doctor` (spec §7.2).
 
     H1 invariant: config.json is read RAW (NOT via load_config), since
     load_config auto-creates the file on first run — a read-only
     diagnostic command must never mutate user state.
+
+    `deep=True` (CLI cmd_doctor only) additionally runs `PRAGMA
+    quick_check(1)` on each DB (#279 S2 F5b); the dashboard/TUI callers
+    stay `deep=False` — the rebuild loop calls the gather every rebuild
+    and quick_check on a large cache.db costs seconds.
     """
     import _lib_doctor
 
@@ -59,8 +66,17 @@ def doctor_gather_state(
         now_utc = _now_utc()
 
     # ── Install ──────────────────────────────────────────────────────
-    repo_root = c._setup_resolve_repo_root()
-    dst_dir = c._setup_local_bin_dir()
+    # #279 S2 F5d: guard the only two unguarded statements in the
+    # otherwise fail-soft gather — an exception here would kill the whole
+    # report. Downstream consumers already degrade on None.
+    try:
+        repo_root = c._setup_resolve_repo_root()
+    except Exception:
+        repo_root = None
+    try:
+        dst_dir = c._setup_local_bin_dir()
+    except Exception:
+        dst_dir = None
     try:
         symlink_state = c._setup_compute_symlink_state(repo_root, dst_dir)
     except Exception:
@@ -382,6 +398,81 @@ def doctor_gather_state(
     except Exception:
         pass
 
+    # ── Parse health (#279 S2 F5a) ───────────────────────────────────
+    parse_health_claude = parse_health_codex = None
+    try:
+        if _cctally_core.CACHE_DB_PATH.exists():
+            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+            try:
+                for _key in ("parse_health_claude", "parse_health_codex"):
+                    try:
+                        row = conn.execute(
+                            "SELECT value FROM cache_meta WHERE key = ?",
+                            (_key,),
+                        ).fetchone()
+                        if row and row[0]:
+                            _parsed = json.loads(row[0])
+                            if isinstance(_parsed, dict):
+                                if _key == "parse_health_claude":
+                                    parse_health_claude = _parsed
+                                else:
+                                    parse_health_codex = _parsed
+                    except (sqlite3.OperationalError, ValueError):
+                        pass
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    # ── Integrity (deep only — #279 S2 F5b) ──────────────────────────
+    stats_db_quick_check = cache_db_quick_check = None
+    if deep:
+        for _label, _path in (("stats", _cctally_core.DB_PATH),
+                              ("cache", _cctally_core.CACHE_DB_PATH)):
+            _result = None
+            try:
+                if _path.exists():
+                    _conn = sqlite3.connect(str(_path))
+                    try:
+                        _row = _conn.execute(
+                            "PRAGMA quick_check(1)").fetchone()
+                        _result = (str(_row[0])
+                                   if _row and _row[0] is not None else None)
+                    finally:
+                        _conn.close()
+            except sqlite3.DatabaseError as exc:
+                _result = f"open failed: {exc}"
+            except Exception:
+                _result = None
+            if _label == "stats":
+                stats_db_quick_check = _result
+            else:
+                cache_db_quick_check = _result
+
+    # ── Lock state (#279 S2 F5c) — read-only: never create files ─────
+    locks_held: "dict | None" = None
+    try:
+        locks_held = {}
+        for _name, _lp in (
+            ("cache.db.lock", _cctally_core.CACHE_LOCK_PATH),
+            ("cache.db.codex.lock", _cctally_core.CACHE_LOCK_CODEX_PATH),
+        ):
+            if not _lp.exists():
+                locks_held[_name] = False
+                continue
+            try:
+                with open(_lp, "r") as _lf:
+                    try:
+                        fcntl.flock(_lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(_lf, fcntl.LOCK_UN)
+                        locks_held[_name] = False
+                    except OSError:
+                        locks_held[_name] = True
+            except OSError:
+                locks_held[_name] = None
+    except Exception:
+        locks_held = None
+
     # ── Safety ───────────────────────────────────────────────────────
     # `dashboard.bind` is read via the same chokepoint that powers
     # `cctally config get dashboard.bind` — `_config_known_value`
@@ -548,6 +639,13 @@ def doctor_gather_state(
         conv_sessions_rollup_count=conv_sessions_rollup_count,
         conv_messages_distinct_sessions=conv_messages_distinct_sessions,
         conv_rollup_sync_in_progress=conv_rollup_sync_in_progress,
+        # #279 S2 F5: parse-health records, deep quick_check results, and
+        # non-blocking lock-file probes (appended after the defaulted tail).
+        parse_health_claude=parse_health_claude,
+        parse_health_codex=parse_health_codex,
+        stats_db_quick_check=stats_db_quick_check,
+        cache_db_quick_check=cache_db_quick_check,
+        locks_held=locks_held,
     )
 
 
@@ -572,7 +670,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if quiet and verbose:
         eprint("doctor: --quiet and --verbose are mutually exclusive")
         return 2
-    state = c.doctor_gather_state()
+    # #279 S2 F5b: deep=True runs PRAGMA quick_check(1) — CLI-only (the
+    # dashboard/TUI gather callers stay deep=False so their per-rebuild
+    # gather never pays the multi-second cost on a large cache.db).
+    state = c.doctor_gather_state(deep=True)
     report = _lib_doctor.run_checks(state)
     if getattr(args, "json", False):
         print(json.dumps(
