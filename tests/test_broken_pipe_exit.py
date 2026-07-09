@@ -7,15 +7,20 @@ interpreter's shutdown-flush noise, and returns 0 immediately — skipping the
 post-command update hooks (stdout is dead, banners are pointless), mirroring
 the KeyboardInterrupt immediate-return precedent.
 
-Subprocess-level so it exercises the real binary end-to-end. Determinism: the
-child's stdout is a pipe with NO reader (the parent closes both ends and
-close_fds hides them from the child), so the child's first stdout write raises
-EPIPE regardless of output size or timing — no flaky reader-vs-writer race.
+Two layers: a subprocess test exercising the real binary end-to-end
+(determinism: the child's stdout is a pipe with NO reader — the parent closes
+both ends and close_fds hides them from the child — so the child's first
+stdout write raises EPIPE regardless of output size or timing), plus an
+in-process unit test pinning the hooks-skipped contract, which the subprocess
+test can't observe (it pins CCTALLY_DISABLE_UPDATE_CHECK=1, so the hook
+short-circuits regardless).
 """
 import os
 import pathlib
 import subprocess
 import sys
+
+from conftest import load_isolated_cctally_module
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -51,3 +56,30 @@ def test_broken_pipe_pipeline_exits_zero_quietly(tmp_path):
     assert "Errno 32" not in err_text, err_text
     assert "Broken pipe" not in err_text, err_text
     assert "Traceback" not in err_text, err_text
+
+
+def test_broken_pipe_skips_post_command_hooks(tmp_path, monkeypatch):
+    """The dispatcher returns 0 IMMEDIATELY on BrokenPipeError — the
+    post-command update hooks must not run (stdout is dead; mirrors the
+    KeyboardInterrupt precedent). The hook itself is monkeypatched to a
+    sentinel, so this holds regardless of CCTALLY_DISABLE_UPDATE_CHECK."""
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+
+    calls = []
+
+    def _boom(args):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(mod, "cmd_daily", _boom)
+    monkeypatch.setattr(mod, "_post_command_update_hooks",
+                        lambda *a, **kw: calls.append("hooks"))
+    # Neutralize the handler's fd surgery: dup2'ing devnull onto the real
+    # fd 1 corrupts pytest's --capture=fd teardown (which is why the
+    # pipeline test above is subprocess-level). The contract under test
+    # here is control flow (rc 0 + hooks skipped), not the redirect.
+    monkeypatch.setattr(os, "dup2", lambda *a: None)
+
+    rc = mod.main(["daily"])
+
+    assert rc == 0
+    assert calls == []   # hooks skipped — returned before the hook block
