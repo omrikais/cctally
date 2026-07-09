@@ -3525,6 +3525,88 @@ def _debug_tool_version() -> str:
         return "unknown"
 
 
+# === Table-driven route dispatch (#279 S5 F5, spec §7) =====================
+# Ordered, first-match-wins tables — evaluated top-to-bottom so semantics are
+# if/elif-identical to the pre-S5 chains. Each entry is
+#   (kind, pattern, handler_method_name, perf, wants_path)
+# where:
+#   kind        ∈ {"exact", "prefix", "prefix+suffix"} ("prefix+suffix" pattern
+#               is a (prefix, suffix) pair, matched startswith AND endswith).
+#   perf        None | ("scope", label) | ("phase", label) — the 11 per-route
+#               conversation instrumentation wraps (8 _perf_scope + 3
+#               _perf_gate().phase); their clean-exit stash_last feeds
+#               /api/debug/backend's #276 trace, so this column is load-bearing
+#               even though goldens run trace-off (gate P2-1).
+#   wants_path  True → the handler is called with the query-stripped path
+#               (the 11 path-taking handlers); False → called with no args.
+# ``_dispatch`` resolves getattr(self, name) at request time (a monkeypatched
+# handler method still intercepts). CSRF / privacy gates stay INSIDE the
+# handlers — the table carries no security semantics. Order copies the former
+# do_GET/do_POST/do_DELETE chains verbatim: the exact /api/conversations +
+# /api/conversation/search entries and the seven /api/conversation/<id>/<suffix>
+# prefix+suffix entries ALL precede the bare /api/conversation/ catch-all.
+_GET_ROUTES = (
+    ("exact", "/api/data", "_serve_api_data", None, False),
+    ("exact", "/api/events", "_serve_api_events", None, False),
+    ("prefix", "/api/session/", "_handle_get_session_detail", None, True),
+    ("prefix", "/api/project/", "_handle_get_project_detail", None, False),
+    ("prefix", "/api/block/", "_handle_get_block_detail", None, True),
+    ("exact", "/api/update/status", "_handle_get_update_status", None, False),
+    ("prefix", "/api/update/stream/", "_handle_get_update_stream", None, True),
+    ("exact", "/api/share/templates", "_handle_share_templates_get", None, False),
+    ("exact", "/api/share/presets", "_handle_share_presets_get", None, False),
+    ("exact", "/api/share/history", "_handle_share_history_get", None, False),
+    ("exact", "/api/doctor", "_handle_get_doctor", None, False),
+    ("exact", "/api/debug/backend", "_handle_get_debug_backend", None, False),
+    ("exact", "/api/conversations/facets", "_handle_get_conversations_facets",
+     ("scope", "endpoint.conversations_facets"), False),
+    ("exact", "/api/conversations", "_handle_get_conversations",
+     ("scope", "endpoint.conversations"), False),
+    ("exact", "/api/conversation/search", "_handle_get_conversation_search",
+     ("scope", "endpoint.conversation_search"), False),
+    ("prefix+suffix", ("/api/conversation/", "/payload"),
+     "_handle_get_conversation_payload",
+     ("phase", "endpoint.conversation_payload"), True),
+    ("prefix+suffix", ("/api/conversation/", "/media"),
+     "_handle_get_conversation_media",
+     ("phase", "endpoint.conversation_media"), True),
+    ("prefix+suffix", ("/api/conversation/", "/outline"),
+     "_handle_get_conversation_outline",
+     ("scope", "endpoint.conversation_outline"), True),
+    ("prefix+suffix", ("/api/conversation/", "/find"),
+     "_handle_get_conversation_find",
+     ("scope", "endpoint.conversation_find"), True),
+    ("prefix+suffix", ("/api/conversation/", "/events"),
+     "_handle_get_conversation_events",
+     ("phase", "endpoint.conversation_events"), True),
+    ("prefix+suffix", ("/api/conversation/", "/export"),
+     "_handle_get_conversation_export",
+     ("scope", "endpoint.conversation_export"), True),
+    ("prefix+suffix", ("/api/conversation/", "/prompts"),
+     "_handle_get_conversation_prompts",
+     ("scope", "endpoint.conversation_prompts"), True),
+    ("prefix", "/api/conversation/", "_handle_get_conversation_detail",
+     ("scope", "endpoint.conversation_detail"), True),
+)
+
+_POST_ROUTES = (
+    ("exact", "/api/sync", "_handle_post_sync", None, False),
+    ("exact", "/api/settings", "_handle_post_settings", None, False),
+    ("exact", "/api/alerts/test", "_handle_post_alerts_test", None, False),
+    ("exact", "/api/update", "_handle_post_update", None, False),
+    ("exact", "/api/update/dismiss", "_handle_post_update_dismiss", None, False),
+    ("exact", "/api/share/render", "_handle_share_render_post", None, False),
+    ("exact", "/api/share/compose", "_handle_share_compose_post", None, False),
+    ("exact", "/api/share/presets", "_handle_share_presets_post", None, False),
+    ("exact", "/api/share/history", "_handle_share_history_post", None, False),
+)
+
+_DELETE_ROUTES = (
+    ("prefix", "/api/share/presets/", "_handle_share_presets_delete", None, False),
+    ("exact", "/api/share/history", "_handle_share_history_delete", None, False),
+)
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     """Routes:
         GET /                       → dashboard.html
@@ -3618,6 +3700,42 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _dispatch(self, table) -> bool:
+        """First-match-wins dispatch over a module-level route table (§7).
+
+        Returns True when a route matched (and its handler ran), False when
+        none matched — the caller then sends the method's exact 404/501
+        fallback. Byte-identical to the former if/elif chains: same order,
+        same match predicates, same per-route perf wrap. ``getattr`` resolves
+        the handler at request time so a monkeypatched method still
+        intercepts; ``wants_path`` threads the query-stripped path into the
+        eleven path-taking handlers. (NOTE: returning a bool, not ``fn()`` —
+        the void handlers all return None, so a None-return contract could not
+        tell "handled" from "unmatched".)
+        """
+        path = self.path.split("?", 1)[0]
+        for kind, pattern, name, perf, wants_path in table:
+            if kind == "exact":
+                hit = path == pattern
+            elif kind == "prefix":
+                hit = path.startswith(pattern)
+            else:  # "prefix+suffix": pattern is (prefix, suffix)
+                hit = path.startswith(pattern[0]) and path.endswith(pattern[1])
+            if not hit:
+                continue
+            fn = getattr(self, name)
+            args = (path,) if wants_path else ()
+            if perf is None:
+                fn(*args)
+            elif perf[0] == "scope":
+                with self._perf_scope(perf[1]):
+                    fn(*args)
+            else:  # "phase"
+                with self._perf_gate().phase(perf[1]):
+                    fn(*args)
+            return True
+        return False
+
     def do_GET(self) -> None:  # noqa: N802 — stdlib API
         if self._method_not_allowed_for_settings():
             return
@@ -3625,14 +3743,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_static_file(self.static_dir / "dashboard.html",
                                     "text/html; charset=utf-8")
-        elif path == "/favicon.ico":
+            return
+        if path == "/favicon.ico":
             # #207 D11 — serve the SVG favicon for the browser's default
             # /favicon.ico request so it stops 404-ing even absent the
             # <link rel="icon"> in dashboard.html. Vite copies public/ verbatim
             # into the build output, so favicon.svg lands under static_dir.
             self._serve_static_file(self.static_dir / "favicon.svg",
                                     "image/svg+xml")
-        elif path.startswith("/static/"):
+            return
+        if path.startswith("/static/"):
             # Defense in depth: a lexical ".." pre-check is bypassable via
             # percent-encoding (e.g., %2e%2e), so the authoritative guard is the
             # resolve() + relative_to() containment check below. The pre-check
@@ -3649,104 +3769,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
             ctype = self._content_type_for(candidate)
             self._serve_static_file(candidate, ctype)
-        elif path == "/api/data":
-            self._serve_api_data()
-        elif path == "/api/events":
-            self._serve_api_events()
-        elif path.startswith("/api/session/"):
-            self._handle_get_session_detail(path)
-        elif path.startswith("/api/project/"):
-            self._handle_get_project_detail()
-        elif path.startswith("/api/block/"):
-            self._handle_get_block_detail(path)
-        elif path == "/api/update/status":
-            self._handle_get_update_status()
-        elif path.startswith("/api/update/stream/"):
-            self._handle_get_update_stream(path)
-        elif path == "/api/share/templates":
-            self._handle_share_templates_get()
-        elif path == "/api/share/presets":
-            self._handle_share_presets_get()
-        elif path == "/api/share/history":
-            self._handle_share_history_get()
-        elif path == "/api/doctor":
-            self._handle_get_doctor()
-        elif path == "/api/debug/backend":
-            # Loopback-only backend diagnostic (issue #276): last-build phase
-            # timings + on-demand cache-state. Its own stricter gate (never
-            # expose_transcripts); see _handle_get_debug_backend.
-            self._handle_get_debug_backend()
-        elif path == "/api/conversations/facets":
-            with self._perf_scope("endpoint.conversations_facets"):
-                self._handle_get_conversations_facets()
-        elif path == "/api/conversations":
-            with self._perf_scope("endpoint.conversations"):
-                self._handle_get_conversations()
-        elif path == "/api/conversation/search":
-            with self._perf_scope("endpoint.conversation_search"):
-                self._handle_get_conversation_search()
-        elif path.startswith("/api/conversation/") and path.endswith("/payload"):
-            # #178: on-demand load-full. Matched BEFORE the <id> reader
-            # catch-all (same precedence as /api/conversation/search).
-            with self._perf_gate().phase("endpoint.conversation_payload"):
-                self._handle_get_conversation_payload(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/media"):
-            # #177 S4: on-demand media bytes. Matched BEFORE the <id> reader.
-            with self._perf_gate().phase("endpoint.conversation_media"):
-                self._handle_get_conversation_media(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/outline"):
-            # #177 S5: full-session outline skeleton + stats. Matched BEFORE
-            # the <id> reader catch-all (Codex F2 — same precedence as /payload).
-            with self._perf_scope("endpoint.conversation_outline"):
-                self._handle_get_conversation_outline(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/find"):
-            # #177 S6: in-conversation find → rendered-turn anchors. Matched
-            # BEFORE the <id> reader catch-all (same precedence as /outline).
-            with self._perf_scope("endpoint.conversation_find"):
-                self._handle_get_conversation_find(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/events"):
-            # Live-tail SSE for the open reader (spec §2). Matched BEFORE the
-            # <id> reader catch-all.
-            with self._perf_gate().phase("endpoint.conversation_events"):
-                self._handle_get_conversation_events(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/export"):
-            # #217 S5: whole-session Markdown export (F1/F5). Matched BEFORE the
-            # <id> reader catch-all (same precedence as /outline).
-            with self._perf_scope("endpoint.conversation_export"):
-                self._handle_get_conversation_export(path)
-        elif path.startswith("/api/conversation/") and path.endswith("/prompts"):
-            # #217 S7: ordered main-thread prompt spine for session comparison
-            # (F10). Matched BEFORE the <id> reader catch-all (same precedence
-            # as /outline).
-            with self._perf_scope("endpoint.conversation_prompts"):
-                self._handle_get_conversation_prompts(path)
-        elif path.startswith("/api/conversation/"):
-            with self._perf_scope("endpoint.conversation_detail"):
-                self._handle_get_conversation_detail(path)
-        else:
+            return
+        if not self._dispatch(_GET_ROUTES):
             self.send_error(404, "not found")
 
     def do_POST(self) -> None:  # noqa: N802 — stdlib API
-        path = self.path.split("?", 1)[0]
-        if path == "/api/sync":
-            self._handle_post_sync()
-        elif path == "/api/settings":
-            self._handle_post_settings()
-        elif path == "/api/alerts/test":
-            self._handle_post_alerts_test()
-        elif path == "/api/update":
-            self._handle_post_update()
-        elif path == "/api/update/dismiss":
-            self._handle_post_update_dismiss()
-        elif path == "/api/share/render":
-            self._handle_share_render_post()
-        elif path == "/api/share/compose":
-            self._handle_share_compose_post()
-        elif path == "/api/share/presets":
-            self._handle_share_presets_post()
-        elif path == "/api/share/history":
-            self._handle_share_history_post()
-        else:
+        # No _method_not_allowed_for_settings() guard here (gate P1-3): POST
+        # /api/settings must route to _handle_post_settings, not 405.
+        if not self._dispatch(_POST_ROUTES):
             self.send_error(404, "not found")
 
     # --- 405 overrides for /api/settings -------------------------------
@@ -3763,14 +3793,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802 — stdlib API
         if self._method_not_allowed_for_settings():
             return
-        path = self.path.split("?", 1)[0]
-        if path.startswith("/api/share/presets/"):
-            self._handle_share_presets_delete()
-            return
-        if path == "/api/share/history":
-            self._handle_share_history_delete()
-            return
-        self.send_error(501, "Unsupported method ('DELETE')")
+        if not self._dispatch(_DELETE_ROUTES):
+            self.send_error(501, "Unsupported method ('DELETE')")
 
     def do_PATCH(self) -> None:  # noqa: N802 — stdlib API
         if self._method_not_allowed_for_settings():
