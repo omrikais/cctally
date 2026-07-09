@@ -218,7 +218,45 @@ re-export** carve-out per spec §4.8 (same precedent as Phase E
   time. The accessor resolves at every call so the latest binding
   wins; mocks propagate without sibling-side patches.
 
-Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §7.2
+#279 S5 decomposition — four consumer-only ``_cctally_dashboard_*`` siblings
+(this module re-imports every moved symbol, so all ``ns["X"]`` reads and
+``sys.modules["_cctally_dashboard"].X`` reaches above keep resolving):
+
+- ``_cctally_dashboard_share`` (F1): the five share-CLI accessor shims
+  (``_share_load_lib`` … ``_share_iso``), ``_SHARE_POST_MAX_BYTES`` + the
+  share-panel period constants, the share-period pipeline + the 20 per-panel
+  builders, and the ten share handler methods as ``*_impl(handler, …)`` free
+  functions (thin bound delegators stay on ``DashboardHTTPHandler``).
+- ``_cctally_dashboard_envelope`` (F2): ``snapshot_to_envelope`` +
+  ``_session_detail_to_envelope`` + ``_iso_z`` + ``_compute_intensity_buckets``
+  + ``_select_current_block_for_envelope`` + ``_model_breakdowns_to_models`` +
+  the five ``_envelope_rows_*`` + ``_ENVELOPE_AXIS_MAPPERS`` +
+  ``_build_alerts_envelope_array``.
+- ``_cctally_dashboard_cache_report`` (F3): the cache-report snapshot builder
+  (``build_cache_report_snapshot`` + its dataclasses / helpers) and the
+  ``cache_report`` settings validator cluster.
+- ``_cctally_dashboard_conversation`` (F4): the conversation constants
+  (``_CONV_SEARCH_KINDS`` / ``_CONV_FIND_KINDS`` / ``_BadConversationFilter`` /
+  ``_cached_file_sigs``), the query plumbing, and the eleven
+  ``_handle_get_conversation*_impl(handler, …)`` handlers (thin delegators stay
+  on the class; the privacy gates + the ``/api/debug/backend`` debug surface
+  STAY here).
+
+Each sibling is bootstrapped via ``_ensure_sibling_loaded`` (self-registration
+under the ``SourceFileLoader`` harness path) then honest-imported. Moved code
+keeps its ``sys.modules["cctally"].X`` reaches verbatim and adds two late-
+binding classes: (a) ``sys.modules["_cctally_dashboard"].X`` for symbols tests
+patch on THIS module object whose call site moved —
+``get_claude_session_entries`` (rebuild-parity + share) and ``open_cache_db``
+(conversation-endpoints); (b) ``sys.modules["cctally"].X`` inlines of the
+cctally-forwarding accessor shims (spec §2.1 "fully-qualify cross-module refs").
+
+F5 route dispatch: ``do_GET`` / ``do_POST`` / ``do_DELETE`` are table-driven
+via ``_GET_ROUTES`` / ``_POST_ROUTES`` / ``_DELETE_ROUTES`` + ``_dispatch`` —
+first-match-wins, order + perf-wraps + 404/405/501 fallbacks byte-identical.
+
+Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §7.2;
+      docs/superpowers/specs/2026-07-10-279-s5-dashboard-split-design.md
 """
 from __future__ import annotations
 

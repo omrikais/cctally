@@ -16,6 +16,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Release tooling (maintainer): the npm-publish poll now hard-fails on timeout with `--resume` guidance instead of silently reporting success; `--npm-soft-timeout` restores the old exit-0 behavior and marks the final line "published (npm pending verification)".
 - Internal: the record write path (resets-at plausibility, weekly credit / reset-to-zero debounce, 5h in-place credit, the reset-aware HWM clamp + monotonic HWM files, 5h milestone ranges, and the projected-pace alert crossings) and the forecast projection now route their decision logic through pure, unit-tested kernels (`_lib_record.py`, `_lib_credit.py`, `_lib_forecast.py`, `_lib_five_hour.py`); no behavior change (#279).
+- Internal: the dashboard server module (`_cctally_dashboard.py`, ~10.5K lines) is split into four consumer-only sibling modules (share, envelope, cache-report, conversation) and its HTTP request routing is now table-driven; every endpoint's response bytes and status codes are byte-identical, verified against a real data corpus (#279).
 
 ### Fixed
 - `cctally setup` now installs the `cctally-budget` symlink (it existed but was never linked); a drift-guard test keeps the wrapper list and the installer in sync.
@@ -23,6 +24,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A corrupt `stats.db` now produces a one-line diagnosis with recovery guidance and exit 2 instead of a raw traceback.
 - Piping output to a closed reader (`cctally daily | head`) now exits 0 quietly instead of `Error: [Errno 32] Broken pipe`.
 - The dashboard share endpoints now cap request bodies at 64 KiB and the dashboard server sets a 60s socket timeout (slow-loris hardening); server-sent-event streams treat a send timeout as a normal client disconnect.
+- The dashboard `/api/data` endpoint now returns a JSON `500 {"error": "internal error"}` on an internal error instead of dropping the connection with no response, and a server-sent-event stream that fails mid-flight is now logged and closed cleanly instead of dying silently (#279).
 - `cache.db` now opens with `PRAGMA synchronous=NORMAL` (a fully re-derivable database; fewer fsyncs during ingest).
 - Codex resume tracking now persists the ingest iterator's actual dedup watermark (the cumulative token counter it compares against) rather than a reconstructed sum of per-turn deltas, closing a latent double-count/skip on rollouts whose cumulative and per-turn token accounting diverge; healthy sessions are unaffected and need no re-ingest (#279).
 - The direct-JSONL fallback (used when `cache.db` can't be opened) now parses with the same single implementation as the cache path so the two can't drift, and a malformed `costUSD` value in a session line no longer aborts the read — it degrades to the token-derived cost like every other cost path (#279).
