@@ -221,6 +221,20 @@ from _lib_credit import (
     _parse_credit_at,
     _build_credit_plan,
 )
+_ensure_sibling_loaded("_lib_record")
+from _lib_record import (
+    check_resets_at_plausibility,
+    plan_weekly_credit_debounce,
+    plan_five_hour_credit,
+    hwm_clamp_applies,
+    milestone_coverage_owes,
+    hwm_file_next,
+    projected_crossings,
+    FIRE_IMMEDIATE,
+    CONFIRM_RESET,
+    CLEAR_MARKER,
+    ARM_MARKER,
+)
 
 
 # Module-level back-ref shims. Each shim resolves
@@ -1337,16 +1351,18 @@ def maybe_record_projected_alert(
                     proj = _weekly_pct_week_avg_projection(conn, now_utc)
                     if proj is not None and not proj[1]:
                         value = proj[0]
-                        for t in levels:
-                            if value + 1e-9 >= t:
-                                pending.append(dict(
-                                    week_start_at=week_key,
-                                    period="subscription-week",
-                                    metric="weekly_pct",
-                                    threshold=t,
-                                    projected_value=value,
-                                    denominator=100.0,
-                                ))
+                        # weekly_pct comparand == raw threshold (denominator 100).
+                        for t in projected_crossings(
+                            value, [(t, float(t)) for t in levels]
+                        ):
+                            pending.append(dict(
+                                week_start_at=week_key,
+                                period="subscription-week",
+                                metric="weekly_pct",
+                                threshold=t,
+                                projected_value=value,
+                                denominator=100.0,
+                            ))
 
         # ── budget_usd leg (any Claude period — #135; shared factory) ────────
         if budget_on:
@@ -1380,16 +1396,19 @@ def maybe_record_projected_alert(
                         status = compute_budget_status(inputs)
                         if not status.low_confidence:
                             value = status.week_avg_projection_usd
-                            for t in thresholds:
-                                if value + 1e-9 >= (t / 100.0) * float(target):
-                                    pending.append(dict(
-                                        week_start_at=b_week_key,
-                                        period=claude_period,
-                                        metric="budget_usd",
-                                        threshold=t,
-                                        projected_value=value,
-                                        denominator=float(target),
-                                    ))
+                            # budget comparand == (t/100)*target (glue pre-scales).
+                            for t in projected_crossings(
+                                value,
+                                [(t, (t / 100.0) * float(target)) for t in thresholds],
+                            ):
+                                pending.append(dict(
+                                    week_start_at=b_week_key,
+                                    period=claude_period,
+                                    metric="budget_usd",
+                                    threshold=t,
+                                    projected_value=value,
+                                    denominator=float(target),
+                                ))
 
         # ── codex_budget_usd leg (#135; skip_sync=False — R5) ────────────────
         if codex_on:
@@ -1426,16 +1445,19 @@ def maybe_record_projected_alert(
                         c_status = compute_budget_status(c_inputs)
                         if not c_status.low_confidence:
                             value = c_status.week_avg_projection_usd
-                            for t in c_thresholds:
-                                if value + 1e-9 >= (t / 100.0) * float(c_target):
-                                    pending.append(dict(
-                                        week_start_at=c_week_key,
-                                        period=c_period,
-                                        metric="codex_budget_usd",
-                                        threshold=t,
-                                        projected_value=value,
-                                        denominator=float(c_target),
-                                    ))
+                            # codex comparand == (t/100)*target (glue pre-scales).
+                            for t in projected_crossings(
+                                value,
+                                [(t, (t / 100.0) * float(c_target)) for t in c_thresholds],
+                            ):
+                                pending.append(dict(
+                                    week_start_at=c_week_key,
+                                    period=c_period,
+                                    metric="codex_budget_usd",
+                                    threshold=t,
+                                    projected_value=value,
+                                    denominator=float(c_target),
+                                ))
 
         # ── arm (set-then-dispatch): INSERT + stamp alerted_at in one txn ────
         fired: list[dict[str, Any]] = []
@@ -2720,9 +2742,11 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
     # of silently reporting success on a dropped payload.
     now_dt = _command_as_of()
     now_epoch = int(now_dt.timestamp())
-    if not (now_epoch - _RECORD_USAGE_WEEK_PAST_SLACK_S
-            <= resets_at
-            <= now_epoch + _RECORD_USAGE_WEEK_FUTURE_BAND_S):
+    if not check_resets_at_plausibility(
+        resets_at, now_epoch,
+        past_slack_s=_RECORD_USAGE_WEEK_PAST_SLACK_S,
+        future_band_s=_RECORD_USAGE_WEEK_FUTURE_BAND_S,
+    ):
         eprint(
             f"[record-usage] rejecting --resets-at={resets_at}: outside "
             f"plausibility band [now-30d, now+8d]; "
@@ -2751,9 +2775,11 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         #       _compute_block_totals charges entries past the real
         #       reset to this block). Dropping the 5h portion here
         #       skips maybe_update_five_hour_block entirely.
-        if not (now_epoch - _RECORD_USAGE_5H_PAST_SLACK_S
-                <= five_hour_resets_at_epoch
-                <= now_epoch + _RECORD_USAGE_5H_FUTURE_BAND_S):
+        if not check_resets_at_plausibility(
+            five_hour_resets_at_epoch, now_epoch,
+            past_slack_s=_RECORD_USAGE_5H_PAST_SLACK_S,
+            future_band_s=_RECORD_USAGE_5H_FUTURE_BAND_S,
+        ):
             eprint(
                 f"[record-usage] dropping --five-hour-resets-at="
                 f"{five_hour_resets_at_epoch}: outside plausibility band "
@@ -2932,14 +2958,28 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     # reachable. See the spec for the midpoint rationale.
                     prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
                     if prior_end_dt > now_utc and prior_pct is not None:
-                        drop = float(prior_pct) - float(weekly_percent)
-                        big_drop = drop >= c._RESET_PCT_DROP_THRESHOLD
-                        zero_only = (
-                            (not big_drop)
-                            and float(weekly_percent) <= c._RESET_ZERO_FLOOR_PCT
-                            and drop >= c._RESET_ZERO_MIN_DROP_PCT
+                        # Read the pending reset-to-zero marker up front (pure
+                        # file read) and compute whether it is armed for THIS
+                        # window; the debounce CLASSIFIER (pure) decides the
+                        # action from those values + the c._RESET_* constants,
+                        # then the glue below executes the decided I/O. The 5
+                        # branch outcomes (fire-immediate / confirm / clear /
+                        # arm / none) map 1:1 to the pre-extraction structure.
+                        marker = _read_reset_zero_marker()
+                        armed = (
+                            marker is not None
+                            and marker[0] == week_start_date
+                            and marker[1] == cur_end_canon
                         )
-                        if big_drop:
+                        decision = plan_weekly_credit_debounce(
+                            prior_pct, weekly_percent,
+                            drop_threshold=c._RESET_PCT_DROP_THRESHOLD,
+                            zero_floor_pct=c._RESET_ZERO_FLOOR_PCT,
+                            zero_min_drop_pct=c._RESET_ZERO_MIN_DROP_PCT,
+                            marker_armed=armed,
+                            marker_baseline=(marker[2] if armed else None),
+                        ).action
+                        if decision == FIRE_IMMEDIATE:
                             # >=25pp goodwill credit — fire immediately, never
                             # debounced. Clear any pending arm (now moot).
                             _clear_reset_zero_marker()
@@ -2948,53 +2988,42 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                 observed_pre_credit_pct=float(prior_pct),
                                 effective_dt=_floor_to_hour(now_utc),
                             )
-                        else:
-                            marker = _read_reset_zero_marker()
-                            armed = (
-                                marker is not None
-                                and marker[0] == week_start_date
-                                and marker[1] == cur_end_canon
+                        elif decision == CONFIRM_RESET:
+                            # Second reading stayed low → confirm. Anchor the
+                            # reset at the FIRST-zero instant from the marker
+                            # (UTC-normalized like the backfill in-place path).
+                            first_zero_dt = parse_iso_datetime(
+                                marker[3], "reset_zero_marker.first_zero"
+                            ).astimezone(dt.timezone.utc)
+                            _fire_in_place_credit(
+                                conn, week_start_date, cur_end_canon,
+                                weekly_percent,
+                                observed_pre_credit_pct=marker[2],
+                                effective_dt=_floor_to_hour(first_zero_dt),
                             )
-                            if armed:
-                                baseline_pct = marker[2]
-                                if float(weekly_percent) <= baseline_pct / 2.0:
-                                    # Second reading stayed low → confirm. Anchor
-                                    # the reset at the FIRST-zero instant from the
-                                    # marker (UTC-normalized like the backfill
-                                    # in-place path).
-                                    first_zero_dt = parse_iso_datetime(
-                                        marker[3], "reset_zero_marker.first_zero"
-                                    ).astimezone(dt.timezone.utc)
-                                    _fire_in_place_credit(
-                                        conn, week_start_date, cur_end_canon,
-                                        weekly_percent,
-                                        observed_pre_credit_pct=baseline_pct,
-                                        effective_dt=_floor_to_hour(first_zero_dt),
-                                    )
-                                    # Clear ONLY after the fire completes (P2a):
-                                    # a mid-fire crash leaves the marker armed so
-                                    # the next zero re-confirms + re-runs the
-                                    # idempotent pivots.
-                                    _clear_reset_zero_marker()
-                                else:
-                                    # Recovered toward baseline → transient zero,
-                                    # not a reset. Clear, do not fire.
-                                    _clear_reset_zero_marker()
-                            elif zero_only:
-                                # First ~0 → arm; do NOT fire. The write clamp
-                                # suppresses this 0 (no event row yet), so the
-                                # prior snapshot stays at the baseline and this
-                                # shape re-evaluates next tick. first_zero_iso is
-                                # the _command_as_of() value (now_utc), NOT
-                                # wall-clock — it becomes the effective anchor.
-                                _arm_reset_zero_marker(
-                                    week_start_date, cur_end_canon,
-                                    baseline_pct=float(prior_pct),
-                                    first_zero_iso=now_utc.isoformat(timespec="seconds"),
-                                )
-                            # else: not a reset shape and not armed → nothing.
-                            #       A non-matching stale marker is inert (ignored
-                            #       on key mismatch, overwritten by the next arm).
+                            # Clear ONLY after the fire completes (P2a): a
+                            # mid-fire crash leaves the marker armed so the next
+                            # zero re-confirms + re-runs the idempotent pivots.
+                            _clear_reset_zero_marker()
+                        elif decision == CLEAR_MARKER:
+                            # Recovered toward baseline → transient zero, not a
+                            # reset. Clear, do not fire.
+                            _clear_reset_zero_marker()
+                        elif decision == ARM_MARKER:
+                            # First ~0 → arm; do NOT fire. The write clamp
+                            # suppresses this 0 (no event row yet), so the prior
+                            # snapshot stays at the baseline and this shape
+                            # re-evaluates next tick. first_zero_iso is the
+                            # _command_as_of() value (now_utc), NOT wall-clock —
+                            # it becomes the effective anchor.
+                            _arm_reset_zero_marker(
+                                week_start_date, cur_end_canon,
+                                baseline_pct=float(prior_pct),
+                                first_zero_iso=now_utc.isoformat(timespec="seconds"),
+                            )
+                        # else NO_ACTION: not a reset shape and not armed →
+                        #     nothing. A non-matching stale marker is inert
+                        #     (ignored on key mismatch, overwritten by next arm).
 
             # ── 5h in-place credit detection (parallel to weekly above) ──
             # Spec §2.2 of
@@ -3050,10 +3079,10 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         # outer try block from
                         # ``dt.datetime.now(dt.timezone.utc)``; reuse it
                         # so both branches see the same instant.
-                        if (
-                            prior_5h_resets_dt > now_utc
-                            and (prior_5h_pct - float(five_hour_percent))
-                                >= c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD
+                        if plan_five_hour_credit(
+                            prior_5h_pct, float(five_hour_percent),
+                            drop_threshold=c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD,
+                            prior_resets_in_future=(prior_5h_resets_dt > now_utc),
                         ):
                             # Pair-check dedup pre-check (spec §2.2;
                             # refined by Codex r4 P1 finding). The
@@ -3257,7 +3286,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
             """,
             (week_start_date, clamp_floor_iso),
         ).fetchone()
-        if max_row and max_row["v"] is not None and round(weekly_percent, 1) < round(float(max_row["v"]), 1):
+        if hwm_clamp_applies(weekly_percent, max_row["v"] if max_row else None):
             should_insert = False
         else:
             # 5-hour usage is monotonically non-decreasing within a window
@@ -3302,11 +3331,8 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     """,
                     (int(five_hour_window_key), int(five_hour_window_key)),
                 ).fetchone()
-                if (
-                    max_5h_row
-                    and max_5h_row["v"] is not None
-                    and round(five_hour_percent, 1)
-                        < round(float(max_5h_row["v"]), 1)
+                if hwm_clamp_applies(
+                    five_hour_percent, max_5h_row["v"] if max_5h_row else None
                 ):
                     five_hour_percent = float(max_5h_row["v"])
 
@@ -3402,9 +3428,12 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         "WHERE week_start_date = ? AND reset_event_id = ?",
                         (week_start_date, heal_segment),
                     ).fetchone()
-                    if max_existing is None or max_existing["m"] is None:
-                        need_milestone_heal = True
-                    elif int(max_existing["m"]) < latest_floor:
+                    existing_m = (
+                        int(max_existing["m"])
+                        if max_existing and max_existing["m"] is not None
+                        else None
+                    )
+                    if milestone_coverage_owes(existing_m, latest_floor):
                         need_milestone_heal = True
 
                 # Probe 2: do we owe a 5h-block update? Either no row
@@ -3467,14 +3496,14 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     "  AND reset_event_id = ?",
                                     (int(window_key), heal_5h_segment),
                                 ).fetchone()
-                                if (
-                                    max_5h_existing is None
-                                    or max_5h_existing["m"] is None
-                                ):
-                                    need_5h_heal = True
-                                elif (
+                                existing_5h_m = (
                                     int(max_5h_existing["m"])
-                                    < latest_5h_floor
+                                    if max_5h_existing
+                                    and max_5h_existing["m"] is not None
+                                    else None
+                                )
+                                if milestone_coverage_owes(
+                                    existing_5h_m, latest_5h_floor
                                 ):
                                     need_5h_heal = True
             finally:
@@ -3603,7 +3632,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 existing_hwm = float(parts[1])
         except (FileNotFoundError, ValueError, OSError):
             pass
-        if weekly_percent >= existing_hwm:
+        if hwm_file_next(existing_hwm, weekly_percent) is not None:
             hwm_path.write_text(f"{week_start_date} {weekly_percent}\n")
     except OSError:
         pass
@@ -3626,7 +3655,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                     existing_hwm5 = float(parts5[1])
             except (FileNotFoundError, ValueError, OSError):
                 pass
-            if five_hour_percent >= existing_hwm5:
+            if hwm_file_next(existing_hwm5, five_hour_percent) is not None:
                 hwm5_path.write_text(f"{five_resets_key} {five_hour_percent}\n")
         except OSError:
             pass
