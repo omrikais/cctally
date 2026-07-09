@@ -18,6 +18,9 @@ export function filterParams(f: ConversationFilters): string {
   if (f.costMin != null) p.set('cost_min', String(f.costMin));
   if (f.costMax != null) p.set('cost_max', String(f.costMax));
   if (f.rebuildMin != null) p.set('rebuild_min', String(f.rebuildMin));
+  // #278 Theme C — repeated ?models= per selected family, absent when empty (so
+  // the unfiltered base URL stays byte-identical), mirroring `projects`.
+  for (const m of f.models) p.append('models', m);
   const s = p.toString();
   return s ? `&${s}` : '';
 }

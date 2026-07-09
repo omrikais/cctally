@@ -9,12 +9,15 @@ import type { ConversationFacets } from '../types/conversation';
 // the AbortController cancels the in-flight fetch on unmount so a late resolve
 // can't set state on a torn-down component.
 export function useConversationFacets(): ConversationFacets {
-  const [facets, setFacets] = useState<ConversationFacets>({ projects: [] });
+  const [facets, setFacets] = useState<ConversationFacets>({ projects: [], models: [] });
   useEffect(() => {
     const ctl = new AbortController();
     fetchJson<ConversationFacets>('/api/conversations/facets', ctl.signal)
-      .then(setFacets)
-      .catch((e) => { if (!isAbortError(e)) setFacets({ projects: [] }); });
+      // #278 Theme C — normalize on the SUCCESS path, not just initial/error
+      // state: an older or mocked response carrying only `{ projects }` would
+      // otherwise set `models: undefined` and crash the popover's `.map`.
+      .then((r) => setFacets({ projects: r.projects ?? [], models: r.models ?? [] }))
+      .catch((e) => { if (!isAbortError(e)) setFacets({ projects: [], models: [] }); });
     return () => ctl.abort();
   }, []);
   return facets;

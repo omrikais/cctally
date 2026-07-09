@@ -331,17 +331,23 @@ export interface ConversationFilters {
   costMin: number | null;
   costMax: number | null;
   rebuildMin: number | null;
+  // #278 Theme C — selected model families (opus/sonnet/haiku/fable). OR within
+  // the axis, AND across axes — exactly like `projects`. Empty = axis inactive.
+  models: string[];
 }
 
 export const EMPTY_FILTERS: ConversationFilters = {
   dateFrom: null, dateTo: null, datePreset: null,
-  projects: [], costMin: null, costMax: null, rebuildMin: null,
+  projects: [], costMin: null, costMax: null, rebuildMin: null, models: [],
 };
 
 // GET /api/conversations/facets — sorted distinct project labels + per-label
-// conversation count, for the filter popover's project multi-select.
+// conversation count, for the filter popover's project multi-select. #278 Theme
+// C adds `models`: per-model-family session counts (families-present-only,
+// excluding 'other', in the backend's fixed opus/sonnet/haiku/fable order).
 export interface ConversationFacets {
   projects: { project_label: string; count: number }[];
+  models: { family: string; count: number }[];
 }
 
 // #166: per-subagent kind + toolUseResult meta, keyed by subagent_key (the same

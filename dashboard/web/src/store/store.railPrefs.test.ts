@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { _resetForTests, dispatch, getState, loadInitialForTests } from './store';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { RAIL_PREFS_KEY, clearRailPrefs, loadRailPrefs } from './conversationRailPrefs';
+import { filterParams } from '../hooks/conversationFilterParams';
 
 beforeEach(() => {
   clearRailPrefs();
@@ -60,5 +61,23 @@ describe('conversationRailSort + railPrefs persistence (#217 S4 / I-2.2)', () =>
     }));
     const s = loadInitialForTests();
     expect(s.conversationRailSort).toBe('recent');
+  });
+
+  // #278 Theme C — a prefs blob persisted BEFORE the model axis existed has no
+  // `models` key; coerceFilters must default it to [] so filterParams / the
+  // popover never crash on `.map`/`.length` of undefined.
+  it('defaults a missing models key to [] (additive load crash-guard)', () => {
+    localStorage.setItem(RAIL_PREFS_KEY, JSON.stringify({
+      // NOTE: deliberately no `models` key (pre-Theme-C blob shape).
+      filters: {
+        dateFrom: null, dateTo: null, datePreset: null,
+        projects: ['proj'], costMin: null, costMax: null, rebuildMin: null,
+      },
+      sort: 'recent',
+    }));
+    const prefs = loadRailPrefs();
+    expect(prefs.filters.models).toEqual([]);
+    // And it must not throw when serialized.
+    expect(() => filterParams(prefs.filters)).not.toThrow();
   });
 });

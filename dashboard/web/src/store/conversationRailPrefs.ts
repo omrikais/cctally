@@ -49,6 +49,10 @@ function coerceFilters(raw: unknown): ConversationFilters {
     costMin: num(r.costMin),
     costMax: num(r.costMax),
     rebuildMin: num(r.rebuildMin),
+    // #278 Theme C — a blob persisted before the model axis existed has no
+    // `models` key; strArr defaults it to [] so filterParams / the popover
+    // never crash on `.map`/`.length` of undefined.
+    models: strArr(r.models),
   };
 }
 
