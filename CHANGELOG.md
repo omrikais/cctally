@@ -15,6 +15,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Release tooling (maintainer): the npm-publish poll now hard-fails on timeout with `--resume` guidance instead of silently reporting success; `--npm-soft-timeout` restores the old exit-0 behavior and marks the final line "published (npm pending verification)".
+- Internal: the record write path (resets-at plausibility, weekly credit / reset-to-zero debounce, 5h in-place credit, the reset-aware HWM clamp + monotonic HWM files, 5h milestone ranges, and the projected-pace alert crossings) and the forecast projection now route their decision logic through pure, unit-tested kernels (`_lib_record.py`, `_lib_credit.py`, `_lib_forecast.py`, `_lib_five_hour.py`); no behavior change (#279).
 
 ### Fixed
 - `cctally setup` now installs the `cctally-budget` symlink (it existed but was never linked); a drift-guard test keeps the wrapper list and the installer in sync.
