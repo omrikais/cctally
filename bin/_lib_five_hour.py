@@ -23,9 +23,43 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import datetime as dt
+import math
 
 
 _FIVE_HOUR_JITTER_FLOOR_SECONDS = 600  # 10 minutes; tolerance band for resets_at jitter
+
+
+def five_hour_milestone_range(pct: float, max_existing: "int | None") -> range:
+    """Which integer 5h-% thresholds ``maybe_update_five_hour_block`` should
+    attempt to record for ``pct``, given the ACTIVE segment's highest already-
+    recorded threshold ``max_existing`` (#279 S4 F4).
+
+    Mirrors the milestone-detection loop's fencing exactly (glue call site:
+    ``maybe_update_five_hour_block``'s 5h-% milestone loop):
+
+      - ``current_floor = math.floor(pct + 1e-9)`` — the 1e-9 snap flushes the
+        ``0.50 * 100 == 49.99…`` ULP so the N threshold is not missed.
+      - ``current_floor < 1`` → empty range (the ``if current_floor >= 1``
+        glue guard).
+      - ``start_threshold = current_floor`` when ``max_existing is None``
+        (first observation records ONLY the current floor — no synthetic
+        1..floor-1 backfill), else ``int(max_existing) + 1``.
+      - result = ``range(start_threshold, current_floor + 1)`` — empty when
+        ``start_threshold > current_floor`` (already at/above the floor),
+        which the glue reads as ``if milestone_range:``.
+
+    Pure: the MAX(percent_threshold) probe that yields ``max_existing``, the
+    marginal-cost lookup, the per-threshold INSERT, and the alert plumbing all
+    stay in glue. (The weekly ``maybe_record_milestone`` loop shares this
+    fencing formula but keeps its own range in glue — its crossing decision
+    early-returns BEFORE the cost sync when covered, a structure this
+    range-only kernel does not encapsulate; spec §6 defers it.)
+    """
+    current_floor = math.floor(pct + 1e-9)
+    if current_floor < 1:
+        return range(0)
+    start_threshold = current_floor if max_existing is None else int(max_existing) + 1
+    return range(start_threshold, current_floor + 1)
 
 
 def _floor_to_ten_minutes(d: dt.datetime) -> dt.datetime:

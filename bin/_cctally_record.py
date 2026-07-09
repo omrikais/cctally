@@ -177,7 +177,7 @@ from _cctally_core import (
     _BudgetConfigError,
     _command_as_of,
 )
-from _lib_five_hour import _canonical_5h_window_key
+from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
 from _lib_pricing import _calculate_entry_cost
 
 
@@ -1908,12 +1908,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                 ).fetchone()
                 max_existing = row["m"] if row and row["m"] is not None else None
 
-                if max_existing is None:
-                    start_threshold = current_floor   # first observation: only current floor
-                else:
-                    start_threshold = int(max_existing) + 1
+                # Which integer 5h-% thresholds to attempt: the pure fencing
+                # decision (floor snap + first-obs / resume-above-max rule).
+                # `milestone_range.start` is the start_threshold used for the
+                # marginal-cost check below; a non-empty range is exactly the
+                # old `start_threshold <= current_floor` guard.
+                milestone_range = five_hour_milestone_range(
+                    float(five_hour_percent), max_existing
+                )
+                start_threshold = milestone_range.start
 
-                if start_threshold <= current_floor:
+                if milestone_range:
                     # block_id was resolved above (before the children writes) and
                     # is still in scope here.
 
@@ -1936,7 +1941,7 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                         if prev_row is not None:
                             prior_cost = float(prev_row["block_cost_usd"])
 
-                    for pct in range(start_threshold, current_floor + 1):
+                    for pct in milestone_range:
                         if pct == start_threshold and prior_cost is not None:
                             marginal: float | None = totals["cost_usd"] - prior_cost
                         else:
