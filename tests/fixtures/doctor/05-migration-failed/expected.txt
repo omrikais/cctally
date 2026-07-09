@@ -23,7 +23,7 @@ Database
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       30 pending
+  ⚠ Pending migrations       31 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
 Data

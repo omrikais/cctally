@@ -69,15 +69,26 @@ def _insert_snapshots_date_only(stats_conn, week_start: dt.datetime, week_end: d
         )
 
 
+# Globally-monotonic line_offset so every inserted row carries a UNIQUE
+# (source_path, line_offset) — a scenario that calls _insert_entries more than
+# once restarts the per-list `i`, which would otherwise reuse /fx/session-0.jsonl
+# at offset 0 and now collide on the production idx_entries_physical UNIQUE index
+# (#279 S3 F3). line_offset never appears in forecast output, so goldens stay
+# byte-identical.
+_LINE_SEQ = [0]
+
+
 def _insert_entries(cache_conn, entries: list[tuple[dt.datetime, str, int, int, int, int]]) -> None:
     """entries: list of (ts, model, input_tok, output_tok, cache_create, cache_read).
     Writes to the cache.db connection."""
     for i, (ts, model, input_t, output_t, cc, cr) in enumerate(entries):
+        line = _LINE_SEQ[0]
+        _LINE_SEQ[0] += 1
         cache_conn.execute(
             "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
             "model, input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (f"/fx/session-{i}.jsonl", 0, _iso(ts), model, input_t, output_t, cc, cr),
+            (f"/fx/session-{i}.jsonl", line, _iso(ts), model, input_t, output_t, cc, cr),
         )
 
 

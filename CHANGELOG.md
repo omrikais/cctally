@@ -11,6 +11,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The dashboard now logs server errors (HTTP 500) to the terminal running it, instead of swallowing them silently; routine client errors and the per-request access log stay quiet (#279).
 - `cctally doctor` gains a SQLite integrity check (`PRAGMA quick_check`, run only from the CLI where it's affordable — FAILs on stats.db corruption with safe recovery guidance, WARNs on the re-derivable cache.db) and an informational lock-state check that reports whether a sync lock is currently held (#279).
 - `CCTALLY_PERF_TRACE=1 cctally cache-sync` now traces both the Claude and Codex ingest under one shared `cache-sync` phase tree, with the Codex sync carrying the same flock/discover/walk timing seams as the Claude sync (#279).
+- New cache migration `020_session_entries_physical_unique` adds a `UNIQUE(source_path, line_offset)` backstop to the Claude session cache (matching the Codex table) so an offset-bookkeeping regression can never silently double-count your cost data — a collision fails loudly and rolls back that file instead. It dedups any pre-existing duplicates (keeping the first-ingested row) and runs automatically; `cache.db` is re-derivable, so `cache-sync --rebuild` remains the escape hatch (#279).
 
 ### Changed
 - Release tooling (maintainer): the npm-publish poll now hard-fails on timeout with `--resume` guidance instead of silently reporting success; `--npm-soft-timeout` restores the old exit-0 behavior and marks the final line "published (npm pending verification)".
@@ -22,6 +23,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Piping output to a closed reader (`cctally daily | head`) now exits 0 quietly instead of `Error: [Errno 32] Broken pipe`.
 - The dashboard share endpoints now cap request bodies at 64 KiB and the dashboard server sets a 60s socket timeout (slow-loris hardening); server-sent-event streams treat a send timeout as a normal client disconnect.
 - `cache.db` now opens with `PRAGMA synchronous=NORMAL` (a fully re-derivable database; fewer fsyncs during ingest).
+- Codex resume tracking now persists the ingest iterator's actual dedup watermark (the cumulative token counter it compares against) rather than a reconstructed sum of per-turn deltas, closing a latent double-count/skip on rollouts whose cumulative and per-turn token accounting diverge; healthy sessions are unaffected and need no re-ingest (#279).
+- The direct-JSONL fallback (used when `cache.db` can't be opened) now parses with the same single implementation as the cache path so the two can't drift, and a malformed `costUSD` value in a session line no longer aborts the read — it degrades to the token-derived cost like every other cost path (#279).
 
 ## [1.65.0] - 2026-07-09
 

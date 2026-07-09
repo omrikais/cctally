@@ -18,11 +18,11 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 12 known
-  ✓ cache.db                 version 0 / 19 known
+  ✓ cache.db                 version 0 / 20 known
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/31 applied
-  ⚠ Pending migrations       31 pending
+  ✓ Migrations               0/32 applied
+  ⚠ Pending migrations       32 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
 Data

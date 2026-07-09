@@ -125,12 +125,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 19,
+                        "registry_size": 20,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 19 known",
+                    "summary": "version 99 / 20 known",
                     "title": "cache.db"
                 },
                 {
@@ -147,7 +147,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 19,
+                            "registry_size": 20,
                             "user_version": 99
                         },
                         "stats.db": {
@@ -159,7 +159,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v19) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v20) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -187,7 +187,8 @@
                                     "016_drop_search_aux",
                                     "017_arm_nested_agent_reingest",
                                     "018_create_conversation_title_fts",
-                                    "019_create_conversation_file_touches"
+                                    "019_create_conversation_file_touches",
+                                    "020_session_entries_physical_unique"
                                 ],
                                 "skipped": []
                             },
@@ -214,7 +215,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/31 applied",
+                    "summary": "0/32 applied",
                     "title": "Migrations"
                 },
                 {
@@ -343,13 +344,17 @@
                             [
                                 "cache.db",
                                 "019_create_conversation_file_touches"
+                            ],
+                            [
+                                "cache.db",
+                                "020_session_entries_physical_unique"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "31 pending",
+                    "summary": "32 pending",
                     "title": "Pending migrations"
                 },
                 {

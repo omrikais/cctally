@@ -296,18 +296,26 @@ def test_009_recomputes_closed_AND_active_blocks(tmp_path, monkeypatch):
     _stage_cache_with_entries(
         cache_path,
         entries=[
+            # Two entries in the SAME file MUST carry distinct line_offsets —
+            # real ingested rows never share a byte offset, and cache migration
+            # 020's physical-key dedup (run by the eager-apply on this cache)
+            # would otherwise collapse the block-A + block-B session1 rows into
+            # one, undercounting block B (#279 S3 F3).
             {
                 "source": "/tmp/session1.jsonl",
+                "line": 0,
                 "ts": "2026-05-18T02:00:00Z",
                 "out": 1000,
             },
             {
                 "source": "/tmp/session1.jsonl",
+                "line": 100,
                 "ts": "2026-05-22T10:30:00Z",
                 "out": 1000,
             },
             {
                 "source": "/tmp/session2.jsonl",
+                "line": 0,
                 "ts": "2026-05-22T11:00:00Z",
                 "out": 1000,
             },
