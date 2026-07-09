@@ -229,7 +229,7 @@ def _conv_row_tuple(m, path_str):
     )
 
 
-def _iter_sync_entries(fh, path_str):
+def _iter_sync_entries(fh, path_str, stats: "IngestStats | None" = None):
     """Fused single-pass sync walker (#138). Yields
     ``(byte_offset, cost_or_None, msgrow_or_None, aititle_or_None)`` for each
     JSONL line from ``fh``'s current position that produces a cost entry, a
@@ -269,11 +269,25 @@ def _iter_sync_entries(fh, path_str):
         stripped = line.strip()
         if not stripped:
             continue
+        # #279 S2 F1: passive parse-health counters over the new-byte span.
+        # lines_seen counts non-blank lines (malformed included).
+        if stats is not None:
+            stats.lines_seen += 1
         try:
             obj = json.loads(stripped)
         except json.JSONDecodeError:
+            if stats is not None:
+                stats.lines_malformed += 1
             continue
         cost = _lib_jsonl.parse_cost_entry(obj, path_str)
+        if cost is None and stats is not None:
+            # Assistant-typed line rejected for a NON-deliberate reason
+            # (schema-drift tripwire; <synthetic>/non-assistant are normal).
+            reason = _lib_jsonl.assistant_skip_reason(obj)
+            if reason is not None:
+                stats.assistant_lines_skipped += 1
+                stats.skip_reasons[reason] = \
+                    stats.skip_reasons.get(reason, 0) + 1
         mrow = _lib_conversation.parse_message_row(obj, offset)
         ai = _lib_conversation.parse_ai_title(obj, offset)
         if cost is not None or mrow is not None or ai is not None:
@@ -497,6 +511,16 @@ class IngestStats:
     # and are otherwise unaffected.
     files_failed: int = 0
     deferred_reason: "str | None" = None
+    # #279 S2 F1 parse-health counters — passive observers over the new-byte
+    # span this sync walked. lines_seen counts non-blank lines (malformed
+    # included); assistant_lines_skipped counts assistant-typed lines
+    # parse_cost_entry rejected for a NON-deliberate reason (schema-drift
+    # tripwire; `<synthetic>` and non-assistant lines are normal). Reason
+    # vocabulary in _lib_jsonl._classify_cost_entry.
+    lines_seen: int = 0
+    lines_malformed: int = 0
+    assistant_lines_skipped: int = 0
+    skip_reasons: dict = field(default_factory=dict)
 
     @property
     def targeted_clean(self) -> bool:
@@ -1484,7 +1508,7 @@ def sync_cache(
                     # walk over the identical span — the "identical span"
                     # invariant is now structural (a single stop point) rather
                     # than a prose-enforced ``>= final_offset`` runtime break.
-                    for offset, cost, mrow, ai in _iter_sync_entries(fh, path_str):
+                    for offset, cost, mrow, ai in _iter_sync_entries(fh, path_str, stats=stats):
                         if cost is not None:
                             entry, msg_id, req_id = cost
                             usage = entry.usage

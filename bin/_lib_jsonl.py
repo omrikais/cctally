@@ -203,24 +203,25 @@ def _parse_usage_entries(
     return no_key_entries
 
 
-def parse_cost_entry(obj, path_str: str):
-    """Pure per-line cost parser: given a parsed JSONL object, return
-    ``(UsageEntry, msg_id, req_id)`` when it is a billable assistant entry, or
-    ``None`` otherwise (non-assistant, missing/invalid usage, model, or
-    timestamp, or a ``<synthetic>`` placeholder). No I/O, no byte offset — the
-    caller owns the readline()+tell() loop.
+_DELIBERATE_SKIP_REASONS = ("not-assistant", "synthetic")
 
-    Extracted (#138) so the streaming ``_iter_jsonl_entries_with_offsets`` reader
-    and the fused single-pass sync walker (``_cctally_cache._iter_sync_entries``)
-    share ONE gating implementation — each JSONL line is ``json.loads``-parsed
-    once and classified once, never re-parsed for a separate second walk.
+
+def _classify_cost_entry(obj, path_str: str):
+    """Reason-returning core of ``parse_cost_entry`` (#279 S2 F1). Returns
+    ``(parsed, reason)`` where exactly one is non-None; ``parsed`` is the
+    ``(UsageEntry, msg_id, req_id)`` tuple. Reasons: ``not-assistant`` /
+    ``synthetic`` (deliberate skips) and the drift trio ``bad-timestamp`` /
+    ``no-usage`` / ``no-model``. The gating ORDER is the contract — it must
+    stay identical to the pre-#279 ``parse_cost_entry`` body (type ->
+    raw-timestamp -> usage -> model -> synthetic -> timestamp-parse) so the
+    public wrapper's behavior is unchanged.
     """
     if obj.get("type") != "assistant":
-        return None
+        return None, "not-assistant"
 
     ts_raw = obj.get("timestamp")
     if not isinstance(ts_raw, str) or not ts_raw.strip():
-        return None
+        return None, "bad-timestamp"
 
     msg = obj.get("message")
     if not isinstance(msg, dict):
@@ -228,24 +229,24 @@ def parse_cost_entry(obj, path_str: str):
 
     usage = msg.get("usage")
     if not isinstance(usage, dict):
-        return None
+        return None, "no-usage"
 
     model = msg.get("model") or obj.get("model")
     if not isinstance(model, str) or not model.strip():
-        return None
+        return None, "no-model"
     model = model.strip()
     if model == "<synthetic>":
         # Matches ccusage's claude_loader.rs:454. Filtered here so the cache
         # ingest path can't accidentally store these rows even if a downstream
         # loop forgets to double-check (see `sync_cache` in _cctally_cache.py).
-        return None
+        return None, "synthetic"
 
     try:
         ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=dt.timezone.utc)
     except ValueError:
-        return None
+        return None, "bad-timestamp"
 
     msg_id = msg.get("id")
     req_id = obj.get("requestId")
@@ -262,7 +263,41 @@ def parse_cost_entry(obj, path_str: str):
         ),
         msg_id,
         req_id,
-    )
+    ), None
+
+
+def parse_cost_entry(obj, path_str: str):
+    """Pure per-line cost parser: given a parsed JSONL object, return
+    ``(UsageEntry, msg_id, req_id)`` when it is a billable assistant entry, or
+    ``None`` otherwise (non-assistant, missing/invalid usage, model, or
+    timestamp, or a ``<synthetic>`` placeholder). No I/O, no byte offset — the
+    caller owns the readline()+tell() loop.
+
+    Extracted (#138) so the streaming ``_iter_jsonl_entries_with_offsets`` reader
+    and the fused single-pass sync walker (``_cctally_cache._iter_sync_entries``)
+    share ONE gating implementation — each JSONL line is ``json.loads``-parsed
+    once and classified once, never re-parsed for a separate second walk.
+
+    The body now delegates to ``_classify_cost_entry`` (#279 S2 F1) so the
+    parse-health drift classifier and this cost parser can never disagree on
+    the gating order; the public contract (returns the tuple or ``None``) is
+    unchanged.
+    """
+    parsed, _reason = _classify_cost_entry(obj, path_str)
+    return parsed
+
+
+def assistant_skip_reason(obj) -> "str | None":
+    """Drift classifier for parse-health counters (#279 S2 F1): the reason
+    a line that LOOKS like an assistant cost entry was skipped, or None
+    when the skip is deliberate (non-assistant, ``<synthetic>``) or the
+    line parses fine. Callers invoke this only for lines where
+    ``parse_cost_entry`` returned None, so the double-classify cost is
+    bounded to skipped lines."""
+    parsed, reason = _classify_cost_entry(obj, "")
+    if parsed is not None or reason in _DELIBERATE_SKIP_REASONS:
+        return None
+    return reason
 
 
 def _iter_jsonl_entries_with_offsets(fh, path_str: str):
