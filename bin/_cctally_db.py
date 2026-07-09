@@ -2518,6 +2518,24 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_entries_mutation_seq "
         "ON session_entries(mutation_seq, mutation_min_ts)")
+    # #279 S3 F3: DB-level idempotency backstop mirroring
+    # codex_session_entries' UNIQUE(source_path, line_offset). Guarded and
+    # OUTSIDE the top executescript: this function runs on EVERY open BEFORE the
+    # migration dispatcher, so a legacy cache.db holding historical
+    # physical-key duplicates must tolerate the index being ABSENT until cache
+    # migration 020 dedups it — an unguarded CREATE UNIQUE INDEX here would
+    # brick every open of such a DB before 020 could ever run. Fresh and clean
+    # DBs get the index immediately; a dirty legacy one gets it from 020 (or the
+    # first open after 020 dedups the duplicates). Kept after the
+    # add_column_if_missing calls (like idx_entries_mutation_seq) so the columns
+    # exist, and BEFORE the legacy-FTS early-return so an old-shape DB still
+    # receives it.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_physical "
+            "ON session_entries(source_path, line_offset)")
+    except sqlite3.IntegrityError:
+        pass
     # Existing-DB guard for the skill-content fold link (cctally-dev
     # skill-content-nesting): the message-level sourceToolUseID. Idempotent
     # column-add (no marker, no version); cache migration 006 then re-ingests
@@ -3881,6 +3899,60 @@ def _019_create_conversation_file_touches(conn: sqlite3.Connection) -> None:
     backfill no-ops). Mirrors 018's flag-only arm."""
     _set_cache_meta(conn, "conversation_reingest_file_touches_pending", "1")
     conn.commit()
+
+
+@cache_migration("020_session_entries_physical_unique")
+def _020_session_entries_physical_unique(conn: sqlite3.Connection) -> None:
+    """#279 S3 F3: dedup historical (source_path, line_offset) duplicates
+    (keep-first-id) and ensure the physical-key UNIQUE backstop index exists.
+
+    Duplicated physical keys are strictly ingest-bug artifacts (spec §4: correct
+    offset bookkeeping cannot produce them) with no principled winner; MIN(id)
+    keeps the first-ingested row, matching the pre-bug state. cache.db is
+    re-derivable — `cache-sync --rebuild` remains the escape hatch. Mirrors
+    cache 001's flock-then-BEGIN-IMMEDIATE pattern (#105): mutual exclusion with
+    a mid-walk sync_cache, deferring via MigrationGateNotMet on contention.
+
+    Fresh installs never run this handler: the dispatcher stamps it WITHOUT
+    running (the fresh-install branch), and `_apply_cache_schema` already created
+    the index on the fresh DB. NO self-stamp — the dispatcher central-stamps on a
+    clean return (#140). Run-twice safe: the DELETE is idempotent (no dupes left
+    on a second run) and the index create is `IF NOT EXISTS`; safe on an empty
+    table.
+    """
+    lock_path = _cache_db_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.lock held by a concurrent sync_cache; deferring "
+                "cache 020 physical-unique dedup (#279 S3)"
+            )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "DELETE FROM session_entries WHERE id NOT IN ("
+                "SELECT MIN(id) FROM session_entries "
+                "GROUP BY source_path, line_offset)")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_physical "
+                "ON session_entries(source_path, line_offset)")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===

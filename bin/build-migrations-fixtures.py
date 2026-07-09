@@ -3258,6 +3258,155 @@ def build_per_migration_019_create_conversation_file_touches(scenario_dir: Path)
     _build_post(pre, post)
 
 
+def build_per_migration_020_session_entries_physical_unique(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``020_session_entries_physical_unique``
+    (#279 S3 F3 — the physical-key UNIQUE backstop on session_entries).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``)
+        with the ``idx_entries_physical`` index DROPPED (a genuine pre-020 DB
+        lacks it — that is what makes seeding physical-key duplicates possible),
+        ``schema_migrations`` carrying cache migrations 001-019 (an existing
+        install at the 019 head), and seeded session_entries: two NULL-keyed rows
+        sharing ``(source_path, line_offset)`` (the audit's stated gap — NULL keys
+        bypass the logical dedup index) + a keyed pair sharing the same physical
+        slot but with DISTINCT ``(msg_id, req_id)`` (the content-rewrite/offset-
+        regression class) + one clean row.
+      * ``post.sqlite`` — same DB after running the production 020 handler:
+        keep-first-id dedup (MIN(id) per physical key) collapses each dup group,
+        the ``idx_entries_physical`` UNIQUE index is (re)created, and the
+        dispatcher's 020 marker is stamped (reproduced here with a PINNED
+        applied_at_utc so the committed golden is rebuild-deterministic, #197).
+
+    Loaded by ``tests/test_cache_migration_020_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 019-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the physical-unique backstop).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+        "010_conversation_search_split",
+        "011_conversation_promote_command_args",
+        "012_create_conversation_ai_titles",
+        "013_create_conversation_sessions",
+        "014_conversation_queued_prompt_reingest",
+        "015_conversation_sessions_filter_columns",
+        "016_drop_search_aux",
+        "017_arm_nested_agent_reingest",
+        "018_create_conversation_title_fts",
+        "019_create_conversation_file_touches",
+    )
+
+    _SEED_INSERT = (
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, msg_id, req_id, "
+        " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+        " usage_extra_json, speed, cost_usd_raw) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    # (source_path, line_offset, ts, model, msg_id, req_id, in, out, cc, cr).
+    # Insertion order fixes the AUTOINCREMENT ids so MIN(id) is deterministic.
+    _SEED_ROWS = [
+        # NULL-keyed physical dup (id 1 kept, id 2 dropped).
+        ("/fake/.claude/projects/p1/nullkeyed.jsonl", 0, "2026-07-01T10:00:00Z",
+         "claude-opus-4-8", None, None, 1, 1, 0, 0, None, None, None),
+        ("/fake/.claude/projects/p1/nullkeyed.jsonl", 0, "2026-07-01T11:00:00Z",
+         "claude-opus-4-8", None, None, 2, 2, 0, 0, None, None, None),
+        # Keyed pair sharing the physical slot with DISTINCT logical keys
+        # (id 3 kept, id 4 dropped).
+        ("/fake/.claude/projects/p1/keyed.jsonl", 0, "2026-07-01T12:00:00Z",
+         "claude-opus-4-8", "k1", "k1r", 3, 3, 0, 0, None, None, None),
+        ("/fake/.claude/projects/p1/keyed.jsonl", 0, "2026-07-01T13:00:00Z",
+         "claude-opus-4-8", "k2", "k2r", 4, 4, 0, 0, None, None, None),
+        # Clean, uniquely-keyed row (id 5 kept).
+        ("/fake/.claude/projects/p1/clean.jsonl", 0, "2026-07-01T14:00:00Z",
+         "claude-opus-4-8", "c1", "c1r", 5, 5, 0, 0, None, None, None),
+    ]
+
+    TS_020_APPLIED_PIN = "2026-07-09T12:00:00Z"
+
+    def _load_db():
+        spec = ilu.spec_from_file_location("_cctally_db", bin_dir / "_cctally_db.py")
+        mod = ilu.module_from_spec(spec)
+        sys.modules["_cctally_db"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_db()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            # A genuine pre-020 DB lacks the physical index — drop it so we can
+            # seed physical-key duplicates the migration then dedups.
+            conn.execute("DROP INDEX IF EXISTS idx_entries_physical")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-09T11:00:00Z"),
+                )
+            conn.executemany(_SEED_INSERT, _SEED_ROWS)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_db()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "020_session_entries_physical_unique":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("020_session_entries_physical_unique not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Production handler: keep-first-id dedup + create the UNIQUE index.
+            handler(conn)
+            # Reproduce the dispatcher's central stamp (#140) with a PINNED
+            # timestamp so the committed golden is rebuild-deterministic.
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("020_session_entries_physical_unique", TS_020_APPLIED_PIN),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -3327,6 +3476,9 @@ def main() -> int:
     )
     build_per_migration_019_create_conversation_file_touches(
         FIXTURES_ROOT / "per-migration" / "019_create_conversation_file_touches"
+    )
+    build_per_migration_020_session_entries_physical_unique(
+        FIXTURES_ROOT / "per-migration" / "020_session_entries_physical_unique"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

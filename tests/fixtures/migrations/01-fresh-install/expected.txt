@@ -14,7 +14,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 13 known
   · 012_unify_budget_milestones_vendor             pending
   · 013_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 20 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 21 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
@@ -34,7 +34,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 20 known
   · 017_arm_nested_agent_reingest                  pending
   · 018_create_conversation_title_fts              pending
   · 019_create_conversation_file_touches           pending
-  · 020_test_cache_migration                       pending
+  · 020_session_entries_physical_unique            pending
+  · 021_test_cache_migration                       pending
 ## stderr
 
 ## exit

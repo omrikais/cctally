@@ -66,6 +66,13 @@ CREATE TABLE session_entries (
     cost_usd_raw REAL,
     speed TEXT
 );
+-- #279 S3 F3: physical-key UNIQUE backstop, mirroring the production
+-- _apply_cache_schema index. This builder carries its own explicit schema
+-- (not _apply_cache_schema), so the index MUST be added here too or the #197
+-- byte-idempotency guard would pass against a stale schema while production
+-- moved (Codex gate finding 4).
+CREATE UNIQUE INDEX idx_entries_physical
+    ON session_entries(source_path, line_offset);
 CREATE TABLE cache_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
