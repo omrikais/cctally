@@ -290,6 +290,47 @@ def current_generation() -> int:
         return _GENERATION
 
 
+# === Owner-thread tripwire (#279 S5 F6.3, spec §8) =========================
+# The snapshot caches are single-writer-AT-A-TIME, under ``sync_lock`` — NOT
+# "the periodic sync thread only": /api/sync and /api/settings legitimately
+# rebuild on REQUEST threads while holding the lock (gate P1-1). So ownership
+# means "the thread currently holding sync_lock for this rebuild", marked
+# overwrite-on-call at the entry of the locked rebuild body
+# (bin/_cctally_tui.py::_make_run_sync_now_locked._locked). Unarmed (never
+# marked) => _assert_owner is a NO-OP, so every existing test and the TUI
+# (which never arm) are untouched; a raise (not a log) on an armed foreign-
+# thread mutation is deliberate — silent cache corruption is the failure mode
+# being priced out.
+_OWNER_THREAD_IDENT: int | None = None
+
+
+def mark_owner_thread() -> None:
+    """Record the calling thread as the cache owner (overwrite-on-call).
+
+    Called at the entry of the locked rebuild body
+    (``_make_run_sync_now_locked._locked``) — ownership means "the thread
+    currently holding ``sync_lock``", NOT "the periodic sync thread":
+    /api/sync and /api/settings legitimately rebuild on request threads
+    (#279 S5 gate P1-1). Unarmed (never marked) => _assert_owner is a
+    no-op, so tests and the TUI need no changes.
+    """
+    global _OWNER_THREAD_IDENT
+    _OWNER_THREAD_IDENT = threading.get_ident()
+
+
+def reset_owner_thread() -> None:
+    global _OWNER_THREAD_IDENT
+    _OWNER_THREAD_IDENT = None
+
+
+def _assert_owner() -> None:
+    if _OWNER_THREAD_IDENT is not None and threading.get_ident() != _OWNER_THREAD_IDENT:
+        raise RuntimeError(
+            "snapshot-cache mutation from non-owner thread; rebuilds must "
+            "run under sync_lock (see mark_owner_thread)"
+        )
+
+
 # === Task 0.4 — Group A bucket cache holder ================================
 
 
@@ -431,6 +472,7 @@ def reset_group_a_state() -> None:
     cached bucket and reset the watermarks so the next rebuild recomputes
     from scratch (spec §7 / Codex F4).
     """
+    _assert_owner()
     _GROUP_A_CACHE.clear()
     _GROUP_A_LAST_SEEN.clear()
     reset_group_a_current_state()
@@ -470,6 +512,7 @@ _GROUP_A_CURRENT: "dict[str, CurrentBucketAccumulator]" = {}
 
 def reset_group_a_current_state() -> None:
     """Drop every builder's current-bucket accumulator (prune-site + full-invalidate)."""
+    _assert_owner()
     _GROUP_A_CURRENT.clear()
 
 
@@ -671,6 +714,7 @@ def build_cached_group_a(
     labels, fresh recompute for current + dirty), in ``all_bucket_labels``
     order, and updates this builder's last-seen state.
     """
+    _assert_owner()
     cur_max_id = _max_id(cache_conn, "session_entries")
     # #270 §7c: split max_id's two duties — the incremental watermark + "any
     # new work?" gate move to the O(1) `cache_meta` mutation counter (an
@@ -829,6 +873,7 @@ def reset_session_cache_state() -> None:
     cached session and reset the watermark so the next rebuild re-aggregates
     the whole window from scratch (spec §7 / Codex F4).
     """
+    _assert_owner()
     _SESSION_CACHE.clear()
     _SESSION_LAST_SEEN.clear()
 
@@ -863,6 +908,7 @@ def build_cached_sessions(
     its resolved ``session_id`` (which the aggregator sets to the stem for
     fallback sessions), so the cache keys match ``affected_session_keys``.
     """
+    _assert_owner()
     cur_max_id = _max_id(cache_conn, "session_entries")
     # #270 §7c/§7d: the warm "any new work?" gate + the affected-set query key
     # on the `mutation_seq` counter (an id-stable in-place finalization of an
@@ -997,6 +1043,7 @@ def store_dispatch_state(dispatch_key: object, snapshot: object) -> None:
     Called once per rebuild (idle or full) so the next tick compares against the
     key the just-published snapshot was built from.
     """
+    _assert_owner()
     global _LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT
     _LAST_DISPATCH_KEY = dispatch_key
     _LAST_PUBLISHED_SNAPSHOT = snapshot
@@ -1010,6 +1057,7 @@ def reset_dispatch_state() -> None:
     part of the M5.2 prune invalidation — the generation bump (a signature leg)
     already forces the next rebuild off the idle path.
     """
+    _assert_owner()
     global _LAST_DISPATCH_KEY, _LAST_PUBLISHED_SNAPSHOT
     _LAST_DISPATCH_KEY = None
     _LAST_PUBLISHED_SNAPSHOT = None
@@ -1056,6 +1104,7 @@ def reset_weekref_cost_state():
     possibly WITHOUT lowering ``MAX(id)``, so the reconcile's max-id-regression
     check cannot catch it — the explicit clear must) and as a test hook.
     """
+    _assert_owner()
     _WEEKREF_COST_CACHE.clear()
     _WEEKREF_COST_LAST_SEEN.clear()
 
@@ -1116,6 +1165,7 @@ def reconcile_weekref_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset
     ``max_mutation_seq > last_seen_seq`` branch; the caller passes a short-lived
     cache connection, opened for that query.
     """
+    _assert_owner()
     ls = _WEEKREF_COST_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
@@ -1207,6 +1257,7 @@ def reset_projects_env_state():
     current-week slot rides this same clear (spec §20): a prune can re-key a
     current-week bucket_path, so it must cold-refold next tick.
     """
+    _assert_owner()
     _PROJECTS_ENV_WEEK_CACHE.clear()
     _PROJECTS_ENV_WEEK_TOTALS.clear()
     _PROJECTS_ENV_LAST_SEEN.clear()
@@ -1222,6 +1273,7 @@ def reset_projects_env_current_state():
     / prune / cache.db rebuild cold-refolds the current week the same tick the
     closed-week cache clears.
     """
+    _assert_owner()
     _PROJECTS_ENV_CURRENT["state"] = None
 
 
@@ -1283,6 +1335,7 @@ def projects_env_week_put(week_iso, buckets_by_bp, total) -> None:
     computed-empty week is a HIT (not a perpetual miss). Values are stored
     as-is (immutable); this never mutates a stored aggregate in place.
     """
+    _assert_owner()
     _PROJECTS_ENV_WEEK_TOTALS[week_iso] = total
     for bp, agg in buckets_by_bp.items():
         _PROJECTS_ENV_WEEK_CACHE[(bp, week_iso)] = agg
@@ -1354,6 +1407,7 @@ def accumulate_projects_current_week(*, week_key, cur_max_id, cur_max_seq,
     snapshot — ``finalize`` builds a FRESH bucket map each tick, so mutating
     ``mut`` next tick cannot tear a prior snapshot.
     """
+    _assert_owner()
     prior = _PROJECTS_ENV_CURRENT["state"]
     cold = (
         prior is None
@@ -1439,6 +1493,7 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_mutation_seq,
     watermark query). The short-lived ``cache_conn`` is used only for the
     watermark query on the ``max_mutation_seq > last_seen_seq`` branch (Codex-4).
     """
+    _assert_owner()
     ls = _PROJECTS_ENV_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
@@ -1574,6 +1629,7 @@ def reset_bugk_segment_state():
     possibly WITHOUT lowering ``MAX(id)``, so the reconcile's max-id-regression
     check cannot catch it — the explicit clear must) and as a test hook.
     """
+    _assert_owner()
     _BUGK_SEGMENT_CACHE.clear()
     _BUGK_SEGMENT_LAST_SEEN.clear()
 
@@ -1630,6 +1686,7 @@ def reconcile_bugk_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset_si
     ``changed_min_timestamp`` query on the ``max_mutation_seq > last_seen_seq``
     branch (Codex-4 lifecycle from §4).
     """
+    _assert_owner()
     ls = _BUGK_SEGMENT_LAST_SEEN
     if not ls:  # cold
         ls["max_id"] = max_entry_id
@@ -1682,6 +1739,7 @@ def reset_cache_report_state():
     as a test hook. Mirrors ``reset_bugk_segment_state`` /
     ``reset_projects_env_state``.
     """
+    _assert_owner()
     _CACHE_REPORT_DAY_CACHE.clear()
     _CACHE_REPORT_LAST_SEEN.clear()
 
@@ -1693,6 +1751,7 @@ def cache_report_day_get(date_key):
 
 def cache_report_day_store(date_key, value) -> None:
     """Store one CLOSED day's immutable ``CachedCacheReportDay`` (never mutated)."""
+    _assert_owner()
     _CACHE_REPORT_DAY_CACHE[date_key] = value
 
 
@@ -1711,6 +1770,7 @@ def cache_report_day_evict_before(oldest_key) -> None:
     byte-safe (a re-needed day just re-populates on the next cold tick), so the
     predicate is a plain lexical ``<`` on the ``YYYY-MM-DD`` keys.
     """
+    _assert_owner()
     for date_key in [d for d in _CACHE_REPORT_DAY_CACHE if d < oldest_key]:
         del _CACHE_REPORT_DAY_CACHE[date_key]
 
@@ -1762,6 +1822,7 @@ def reconcile_cache_report_cache(
        same-signature second call sees ``max_mutation_seq == last_seen_seq`` and
        no sig delta → no watermark re-query, no eviction.
     """
+    _assert_owner()
     ls = _CACHE_REPORT_LAST_SEEN
     if not ls:  # cold
         ls.update(

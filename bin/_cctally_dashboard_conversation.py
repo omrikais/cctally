@@ -456,6 +456,12 @@ def _handle_get_conversation_events_impl(handler, path: str) -> None:
         # socket.timeout inside the SSE loop — treat it as a client
         # disconnect (same as the other peer-gone classes), not an error.
         pass            # client disconnect is normal
+    except Exception as exc:  # noqa: BLE001
+        # #279 S5 F6.2 (spec §8): a genuine bug mid-stream used to kill the
+        # live-tail SSE silently via handle_error. Headers are already
+        # committed — route the operator signal through the _lib_log chokepoint
+        # (handler.log_error) + a deliberate clean close via the finally below.
+        handler.log_error("api/conversation/events stream failed: %r", exc)
     finally:
         if conn is not None:
             conn.close()

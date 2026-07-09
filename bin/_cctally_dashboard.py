@@ -945,9 +945,6 @@ class SSEHub:
                         pass
 
 
-STATIC_DIR = pathlib.Path(__file__).resolve().parent.parent / "dashboard" / "static"
-
-
 def _format_url(host: str, port: int) -> str:
     """Build a browser-ready URL, bracketing IPv6 hosts per RFC 3986.
 
@@ -4951,48 +4948,55 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_api_data(self) -> None:
-        snap = self.snapshot_ref.get()
-        # Resolve oauth_usage cfg out here so snapshot_to_envelope stays
-        # pure (no per-request FS read on the dashboard hot path).
-        # Tolerate user config typos -- fall back to defaults rather than
-        # 500 the dashboard endpoint.
         try:
-            cfg_oauth = _get_oauth_usage_config(load_config())
-        except OauthUsageConfigError:
-            cfg_oauth = dict(sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS)
-        # Resolve the per-request transcript gate ONCE and use it for both the
-        # in-envelope session `title` gate (#264 S3) and the `transcriptsEnabled`
-        # client signal below — one predicate, two consumers, desync impossible.
-        visible = self._transcripts_visible_to_request()
-        env = snapshot_to_envelope(
-            snap,
-            # `_now_utc()` honors CCTALLY_AS_OF for harness determinism;
-            # zero production impact (the env var is never set outside
-            # fixture tests). Without this, the doctor block's now_utc
-            # flows from wall clock and severity flips on borderline-age
-            # checks between parallel test runs, churning goldens.
-            now_utc=_now_utc(),
-            monotonic_now=time.monotonic(),
-            oauth_usage_cfg=cfg_oauth,
-            display_tz_pref_override=type(self).display_tz_pref_override,
-            runtime_bind=type(self).cctally_host,
-            transcripts_visible=visible,
-        )
-        # Conversation viewer (Plan 2, spec §5): inject the client signal
-        # PER-REQUEST and Host-aware — NOT inside snapshot_to_envelope (the
-        # request-independent SSE snapshot has no Host header). Routes through
-        # the SAME predicate as the transcript GET-route gate so a LAN-hostname
-        # request that the transcript GETs would 403 shows
-        # transcriptsEnabled=false, never enabled-then-403 (the pass-2 P2
-        # finding) — one predicate, two consumers, desync impossible.
-        env["transcriptsEnabled"] = visible
-        body = json.dumps(env, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+            snap = self.snapshot_ref.get()
+            # Resolve oauth_usage cfg out here so snapshot_to_envelope stays
+            # pure (no per-request FS read on the dashboard hot path).
+            # Tolerate user config typos -- fall back to defaults rather than
+            # 500 the dashboard endpoint.
+            try:
+                cfg_oauth = _get_oauth_usage_config(load_config())
+            except OauthUsageConfigError:
+                cfg_oauth = dict(sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS)
+            # Resolve the per-request transcript gate ONCE and use it for both the
+            # in-envelope session `title` gate (#264 S3) and the `transcriptsEnabled`
+            # client signal below — one predicate, two consumers, desync impossible.
+            visible = self._transcripts_visible_to_request()
+            env = snapshot_to_envelope(
+                snap,
+                # `_now_utc()` honors CCTALLY_AS_OF for harness determinism;
+                # zero production impact (the env var is never set outside
+                # fixture tests). Without this, the doctor block's now_utc
+                # flows from wall clock and severity flips on borderline-age
+                # checks between parallel test runs, churning goldens.
+                now_utc=_now_utc(),
+                monotonic_now=time.monotonic(),
+                oauth_usage_cfg=cfg_oauth,
+                display_tz_pref_override=type(self).display_tz_pref_override,
+                runtime_bind=type(self).cctally_host,
+                transcripts_visible=visible,
+            )
+            # Conversation viewer (Plan 2, spec §5): inject the client signal
+            # PER-REQUEST and Host-aware — NOT inside snapshot_to_envelope (the
+            # request-independent SSE snapshot has no Host header). Routes through
+            # the SAME predicate as the transcript GET-route gate so a LAN-hostname
+            # request that the transcript GETs would 403 shows
+            # transcriptsEnabled=false, never enabled-then-403 (the pass-2 P2
+            # finding) — one predicate, two consumers, desync impossible.
+            env["transcriptsEnabled"] = visible
+            body = json.dumps(env, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            # #279 S5 F6.1 (spec §8): a snapshot/envelope/dumps failure used to
+            # escape to _QuietThreadingHTTPServer.handle_error (stdlib traceback +
+            # dropped socket, no 500). Mirror _handle_get_doctor: log + JSON 500.
+            self.log_error("api/data failed: %r", exc)
+            self._respond_json(500, {"error": "internal error"})
 
     def _handle_get_doctor(self) -> None:
         """`GET /api/doctor` — full kernel-serialized doctor report (spec §5.6).
@@ -5345,6 +5349,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # disconnect (same as the other peer-gone classes), not an error.
             # Client disconnect is normal. No-op.
             pass
+        except Exception as exc:  # noqa: BLE001
+            # #279 S5 F6.2 (spec §8): a genuine bug mid-stream (envelope build
+            # etc.) used to kill the SSE silently via handle_error's stdlib
+            # traceback. Headers are already committed — no 500 is possible; the
+            # win is routing the operator signal through the _lib_log chokepoint
+            # (self.log_error) + a deliberate clean close via the finally below.
+            self.log_error("api/events stream failed: %r", exc)
         finally:
             self.hub.unsubscribe(q)
 

@@ -5298,6 +5298,12 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         )
 
     def _locked(skip_sync: bool) -> None:
+        # #279 S5 F6.3 (gate P1-1): arm the snapshot-cache owner-thread tripwire
+        # for whichever thread holds sync_lock for THIS rebuild — the periodic
+        # sync thread, or a /api/sync / /api/settings request thread. Overwrite-
+        # on-call, so ownership transfers to the current rebuilder; the guards in
+        # _lib_snapshot_cache then catch a lock-bypassing foreign-thread mutation.
+        _cctally()._load_sibling("_lib_snapshot_cache").mark_owner_thread()
         try:
             if not skip_sync:
                 # ── Decoupled ingest + build (§2.1) ─────────────────────────
