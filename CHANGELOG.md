@@ -17,6 +17,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The dashboard now opens instantly on a heavy-history instance: it binds and paints the current-week and forecast panels almost immediately instead of waiting for the full ~2s data aggregation, and the heavier panels (sessions, projects, weekly, monthly, blocks, daily, trend, cache report) hydrate over the live stream showing a brief loading skeleton (respecting reduced-motion) rather than flashing a misleading "no data" / "restart the dashboard" empty state that then fills in (#278).
 - A first-run or long-gap dashboard now fills in progressively as session history is ingested, instead of sitting blank and then snapping to fully-loaded in one jump; a warm returning session is unaffected, and a slow or backgrounded browser tab always converges to the latest data instead of getting stuck on a stale frame (#278).
 
+### Fixed
+- The conversation filter popover now retries once if its filter options (the Project and Model lists) fail to load on a transient hiccup, instead of coming up empty and staying that way until it is reopened (#278).
+
 ## [1.64.0] - 2026-07-07
 
 ### Added

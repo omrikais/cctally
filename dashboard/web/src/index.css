@@ -7603,6 +7603,15 @@ mark.current {
    either state. Scoped to counts INSIDE a filter chip, so the Project rows
    (which are not .conv-rail-filters-chip) keep the faint grey. */
 .conv-rail-filters-chip .conv-rail-filters-proj-count { color: inherit; opacity: 0.75; }
+/* #278 Theme C P3 follow-up — the model-family chip borrows the `.chip` palette
+   for its family colour, but the `.chip` base also carries a heavier weight (800)
+   + 1px tracking (its model-chip "vocabulary"), which read bolder than the sibling
+   filter chips (Date/Cost/Cache — plain `.conv-rail-filters-chip`, no `.chip`).
+   Inside the filter popover, normalize weight + tracking to the siblings so the
+   Model section reads uniformly; `inherit` picks up the same value the siblings
+   compute from the shared ancestor. Colour + pill shape are untouched. (0,2,0
+   beats the bare `.chip`'s 0,1,0.) */
+.conv-rail-filters-chip.chip { font-weight: inherit; letter-spacing: inherit; }
 .conv-rail-filters-empty { color: var(--text-faint); font-size: 11px; padding: var(--space-1) 2px; }
 .conv-rail-filters-footer {
   display: flex;
