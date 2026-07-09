@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- The cache sync now counts JSONL lines it can't parse (malformed) or has to drift-skip (usage/model/timestamp no longer parse), per vendor, and surfaces them on the `cache-sync` done lines, the hook-tick log line, and a new `cctally doctor` "Ingest parse health" check — so a Claude Code / Codex session-format change that would silently affect your cost numbers becomes visible instead of vanishing (#279).
+- `CCTALLY_DEBUG=1` now makes `cctally` print the full Python traceback on stderr when a command crashes (default output is unchanged), and `CCTALLY_DEBUG_LOG=<path>` additionally appends the backend log to a file — so a bug is reportable without editing source (#279).
+- The dashboard now logs server errors (HTTP 500) to the terminal running it, instead of swallowing them silently; routine client errors and the per-request access log stay quiet (#279).
+- `cctally doctor` gains a SQLite integrity check (`PRAGMA quick_check`, run only from the CLI where it's affordable — FAILs on stats.db corruption with safe recovery guidance, WARNs on the re-derivable cache.db) and an informational lock-state check that reports whether a sync lock is currently held (#279).
+- `CCTALLY_PERF_TRACE=1 cctally cache-sync` now traces both the Claude and Codex ingest under one shared `cache-sync` phase tree, with the Codex sync carrying the same flock/discover/walk timing seams as the Claude sync (#279).
+
 ### Changed
 - Release tooling (maintainer): the npm-publish poll now hard-fails on timeout with `--resume` guidance instead of silently reporting success; `--npm-soft-timeout` restores the old exit-0 behavior and marks the final line "published (npm pending verification)".
 

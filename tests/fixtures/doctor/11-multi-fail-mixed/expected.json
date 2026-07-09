@@ -157,6 +157,16 @@
                 },
                 {
                     "details": {
+                        "cache_quick_check": null,
+                        "stats_quick_check": "ok"
+                    },
+                    "id": "db.integrity",
+                    "severity": "ok",
+                    "summary": "quick_check ok",
+                    "title": "Integrity"
+                },
+                {
+                    "details": {
                         "cache.db": {
                             "ahead": false,
                             "registry_size": 19,
@@ -366,6 +376,18 @@
                     "severity": "warn",
                     "summary": "30 pending",
                     "title": "Pending migrations"
+                },
+                {
+                    "details": {
+                        "locks": {
+                            "cache.db.codex.lock": false,
+                            "cache.db.lock": false
+                        }
+                    },
+                    "id": "db.lock_state",
+                    "severity": "ok",
+                    "summary": "free",
+                    "title": "Locks"
                 }
             ],
             "id": "db",
@@ -404,6 +426,16 @@
                     "severity": "ok",
                     "summary": "none (no Codex session JSONL found)",
                     "title": "Codex cache"
+                },
+                {
+                    "details": {
+                        "claude": null,
+                        "codex": null
+                    },
+                    "id": "data.parse_health",
+                    "severity": "ok",
+                    "summary": "no parse-health data yet (pre-first-sync)",
+                    "title": "Ingest parse health"
                 },
                 {
                     "details": {
@@ -532,7 +564,7 @@
     "overall": {
         "counts": {
             "fail": 3,
-            "ok": 16,
+            "ok": 19,
             "warn": 8
         },
         "severity": "fail"

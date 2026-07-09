@@ -19,15 +19,18 @@ Auth
 Database
   ✓ stats.db                 version 0 / 12 known
   ⚠ cache.db                 absent (fresh install)
+  ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
   ⚠ Pending migrations       30 pending
       → Run any cctally command — opens the DB and applies pending migrations
+  ✓ Locks                    free
 Data
   ✓ Latest snapshot          2s ago
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
   ✓ Conversation rollup      no data
@@ -43,4 +46,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 19 OK · 7 WARN · 1 FAIL
+Summary: 22 OK · 7 WARN · 1 FAIL
