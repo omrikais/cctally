@@ -25,6 +25,7 @@
     "bin/_cctally_core.py",
     "bin/_cctally_dashboard.py",
     "bin/_cctally_dashboard_cache_report.py",
+    "bin/_cctally_dashboard_conversation.py",
     "bin/_cctally_dashboard_envelope.py",
     "bin/_cctally_dashboard_share.py",
     "bin/_cctally_db.py",
