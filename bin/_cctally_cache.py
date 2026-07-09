@@ -1305,6 +1305,13 @@ def sync_cache(
 
         with _perf.phase("discover") as _p_disc:
             if targeted:
+                # A requested path that vanished (session rotated/deleted
+                # mid-live-tail) is deliberately DROPPED here without flagging
+                # failure: marking files_failed would wedge the watch loop's
+                # targeted_clean advance forever for a file that will never
+                # return; the orphan-prune path owns its stale rows on the next
+                # full sync. Pinned by tests/test_cache_accepted_behaviors.py
+                # (#279 S3 F4).
                 paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
             else:
                 paths = list(_iter_claude_jsonl_files())
