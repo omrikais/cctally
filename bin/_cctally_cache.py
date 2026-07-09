@@ -2850,6 +2850,13 @@ class CodexIngestStats:
     # $CODEX_HOME root set (issue #108 — a prior-root purge, not a delta).
     files_pruned: int = 0
     lock_contended: bool = False
+    # #279 S2 F1 parse-health counters — folded from each file's
+    # _CodexIterState after its drain. Same vocabulary as the iterator
+    # (info-non-dict / no-last-token-usage / bad-timestamp / no-session-id).
+    lines_seen: int = 0
+    lines_malformed: int = 0
+    token_events_skipped: int = 0
+    skip_reasons: dict = field(default_factory=dict)
 
 
 def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> None:
@@ -3050,6 +3057,16 @@ def sync_codex_cache(
                         running_total += int(entry.total_tokens or 0)
                         yielded_count += 1
                     final_offset = fh.tell()
+                    # #279 S2 F1: fold this file's iterator counters into the
+                    # sync-level stats. iter_state is per-file, so += is
+                    # exact. Folded inside the try: an OSError mid-read drops
+                    # this file's partial counters AND its offset advance
+                    # together, so re-walked lines are never double-counted.
+                    stats.lines_seen += iter_state.lines_seen
+                    stats.lines_malformed += iter_state.lines_malformed
+                    stats.token_events_skipped += iter_state.token_events_skipped
+                    for _r, _n in iter_state.skip_reasons.items():
+                        stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
                 continue

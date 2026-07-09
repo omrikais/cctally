@@ -25,7 +25,7 @@ import json
 import pathlib
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -355,6 +355,20 @@ class _CodexIterState:
     session_id: str | None = None
     model: str | None = None
     total_tokens: int = 0
+    # #279 S2 F1 parse-health counters — per-iterator-call; sync_codex_cache
+    # folds them into CodexIngestStats after each file drains. Reason
+    # vocabulary: info-non-dict / no-last-token-usage / bad-timestamp /
+    # no-session-id. Rate-limit-only events (info None) and cumulative-dedup
+    # re-emissions are NORMAL and never counted.
+    lines_seen: int = 0
+    lines_malformed: int = 0
+    token_events_skipped: int = 0
+    skip_reasons: dict = field(default_factory=dict)
+
+
+def _codex_skip(state: "_CodexIterState", reason: str) -> None:
+    state.token_events_skipped += 1
+    state.skip_reasons[reason] = state.skip_reasons.get(reason, 0) + 1
 
 
 def _iter_codex_jsonl_entries_with_offsets(
@@ -430,9 +444,11 @@ def _iter_codex_jsonl_entries_with_offsets(
         stripped = line.strip()
         if not stripped:
             continue
+        state.lines_seen += 1  # #279 S2 F1: non-blank lines (malformed included)
         try:
             obj = json.loads(stripped)
         except json.JSONDecodeError:
+            state.lines_malformed += 1
             continue
 
         rtype = obj.get("type")
@@ -456,10 +472,14 @@ def _iter_codex_jsonl_entries_with_offsets(
         if payload.get("type") != "token_count":
             continue
         info = payload.get("info")
+        if info is None:
+            continue  # rate-limit-only event — normal, not drift
         if not isinstance(info, dict):
+            _codex_skip(state, "info-non-dict")
             continue
         ltu = info.get("last_token_usage")
         if not isinstance(ltu, dict):
+            _codex_skip(state, "no-last-token-usage")
             continue
 
         # Dedupe re-emitted token_count events. Codex re-emits `last_token_usage`
@@ -480,12 +500,14 @@ def _iter_codex_jsonl_entries_with_offsets(
 
         ts_raw = obj.get("timestamp")
         if not isinstance(ts_raw, str) or not ts_raw.strip():
+            _codex_skip(state, "bad-timestamp")
             continue
         try:
             ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=dt.timezone.utc)
         except ValueError:
+            _codex_skip(state, "bad-timestamp")
             continue
 
         session_id = state.session_id
@@ -499,6 +521,7 @@ def _iter_codex_jsonl_entries_with_offsets(
                 filename_session_id_warned = True
             if session_id is None:
                 # No session_meta and no parseable filename UUID — skip row.
+                _codex_skip(state, "no-session-id")
                 continue
 
         model = state.model or "unknown"
