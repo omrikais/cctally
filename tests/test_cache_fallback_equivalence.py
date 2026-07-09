@@ -93,6 +93,16 @@ def _write_rich_fixture(tmp_path: pathlib.Path) -> None:
         # OUT-OF-RANGE non-numeric costUSD -> excluded by both range filters
         _assistant_line(msg_id="mA7", req_id="rA7", ts="2026-06-01T00:00:00Z",
                         inp=9, out=9, cost_usd="oops2"),
+        # Range-boundary rows (review P3-1): both paths treat the window as
+        # INCLUSIVE on both ends — rows exactly AT the bounds must appear in
+        # both, and a row one second past the end in neither. An
+        # inclusive-vs-exclusive drift in either filter diverges the multisets.
+        _assistant_line(msg_id="mB0", req_id="rB0", ts="2026-07-01T00:00:00Z",
+                        inp=11, out=11),   # == RANGE_START
+        _assistant_line(msg_id="mB8", req_id="rB8", ts="2026-07-08T00:00:00Z",
+                        inp=12, out=12),   # == RANGE_END
+        _assistant_line(msg_id="mB9", req_id="rB9", ts="2026-07-08T00:00:01Z",
+                        inp=13, out=13),   # just past RANGE_END -> excluded
     ]
     (proj_a / "sess-a.jsonl").write_text("\n".join(a_lines) + "\n")
 
@@ -162,3 +172,10 @@ def test_cache_and_fallback_paths_are_equivalent(tmp_path, monkeypatch):
 
     assert len(cache_entries) > 0, "fixture must actually parse into rows"
     assert _project(cache_entries) == _project(fallback_entries)
+    # Boundary pins (review P3-1): the two at-bound rows are IN, the
+    # past-the-end row is OUT — in BOTH paths (the multiset equality above
+    # proves the paths agree; these prove the agreed behavior is inclusive).
+    projected = _project(cache_entries)
+    in_tokens = {p[2] for p in projected}
+    assert 11 in in_tokens and 12 in in_tokens, "at-bound rows must be included"
+    assert 13 not in in_tokens, "past-the-end row must be excluded"
