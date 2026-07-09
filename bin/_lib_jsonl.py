@@ -320,6 +320,12 @@ class _CodexIterState:
     """
     session_id: str | None = None
     model: str | None = None
+    # #279 S3 F1: the REAL dedup watermark. Seeded by the caller (non-zero
+    # wins over the initial_total_tokens kwarg) and STAMPED by the iterator on
+    # every yield to the cumulative `total_token_usage.total_tokens` the guard
+    # admitted — so after the iterator drains this equals the guard's terminal
+    # watermark by construction, and the caller persists exactly it (replacing
+    # the old reconstructed initial+Σ(per-turn) sum, which could diverge).
     total_tokens: int = 0
     # #279 S2 F1 parse-health counters — per-iterator-call; sync_codex_cache
     # folds them into CodexIngestStats after each file drains. Reason
@@ -390,7 +396,14 @@ def _iter_codex_jsonl_entries_with_offsets(
         state.session_id = initial_session_id
     if state.model is None and initial_model is not None:
         state.model = initial_model
-    last_total_tokens: int = int(initial_total_tokens or 0)
+    # #279 S3 F1: the state carries the REAL dedup watermark. Seeding
+    # precedence mirrors session_id/model: a caller-supplied NON-ZERO state
+    # wins; the kwarg seeds otherwise. (total_tokens has no None sentinel —
+    # 0 IS the unset value; a genuine 0 watermark and "unset" are the same
+    # thing: both mean "dedupe against nothing".)
+    if state.total_tokens == 0 and initial_total_tokens:
+        state.total_tokens = int(initial_total_tokens)
+    last_total_tokens: int = state.total_tokens
     # Suppress the filename-UUID fallback warning when we already have a
     # seeded session_id (delta resume path). Without this, every resume
     # into a slice of the file that doesn't re-observe session_meta would
@@ -515,5 +528,10 @@ def _iter_codex_jsonl_entries_with_offsets(
         )
         # Advance the cumulative watermark only after a successful yield so
         # resume-from-offset continues to dedupe against the last counted turn.
+        # #279 S3 F1: stamp the state too — after the iterator drains,
+        # state.total_tokens IS the guard's terminal watermark, which the
+        # caller persists (the old reconstructed initial+Σ(per-turn) sum could
+        # diverge from it and double-count/skip on resume).
         if isinstance(ttu, dict) and cumulative is not None:
             last_total_tokens = cumulative
+            state.total_tokens = cumulative

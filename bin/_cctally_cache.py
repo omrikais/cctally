@@ -3113,15 +3113,19 @@ def sync_codex_cache(
             # ends on a metadata-only tail would lose the terminal
             # session_id/model and the next resume would mis-attribute the
             # first post-resume token_count.
+            # #279 S3 F1: the state is BOTH the seed carrier for the dedup
+            # watermark and the sink the iterator stamps it into. Seeding it
+            # with initial_total_tokens (the prior resume's persisted
+            # cumulative) means iter_state.total_tokens holds the guard's
+            # terminal watermark once the iterator drains — which we persist
+            # directly, replacing the former initial+Σ(per-turn) reconstruction
+            # that could diverge from the true cumulative and double-count/skip
+            # on the next resume.
             iter_state = _CodexIterState(
                 session_id=initial_session_id,
                 model=initial_model,
+                total_tokens=initial_total_tokens,
             )
-            # Track the cumulative `total_token_usage.total_tokens` across this
-            # call. The iterator only yields when the cumulative strictly
-            # advances by the current turn's `last_token_usage.total_tokens`,
-            # so summing the per-turn totals reconstructs the final cumulative.
-            running_total = initial_total_tokens
             yielded_count = 0
             try:
                 with open(jp, "r", encoding="utf-8", errors="replace") as fh:
@@ -3146,7 +3150,6 @@ def sync_codex_cache(
                             entry.reasoning_output_tokens,
                             entry.total_tokens,
                         ))
-                        running_total += int(entry.total_tokens or 0)
                         yielded_count += 1
                     final_offset = fh.tell()
                     # #279 S2 F1: fold this file's iterator counters into the
@@ -3179,11 +3182,13 @@ def sync_codex_cache(
                 else initial_model
             )
 
-            # Persist the running cumulative if we yielded this call. Otherwise
-            # preserve the prior value — never overwrite with 0, which would
-            # re-enable double-counting on the next resume.
+            # Persist the iterator's stamped cumulative watermark if we yielded
+            # this call (iter_state.total_tokens == the dedup guard's terminal
+            # value by construction, #279 S3 F1). Otherwise preserve the prior
+            # value — never overwrite with 0, which would re-enable
+            # double-counting on the next resume.
             new_last_total_tokens: int | None = (
-                running_total if yielded_count > 0 else prev_total_tokens
+                iter_state.total_tokens if yielded_count > 0 else prev_total_tokens
             )
 
             # Python's sqlite3 module starts an implicit transaction on the
