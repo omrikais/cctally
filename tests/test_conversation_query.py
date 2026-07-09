@@ -4792,6 +4792,12 @@ def test_browse_model_present_but_empty_matches_nothing(seeded_conn):
     assert cq.list_conversations(seeded_conn, models=["fable"])["conversations"] == []
 
 
+def test_browse_model_present_but_empty_matches_nothing_live(live_pending_conn):
+    # Present-but-empty must match NOTHING on the LIVE branch too — the
+    # match-nothing sentinel is branch-independent (never widen to all rows).
+    assert cq.list_conversations(live_pending_conn, models=["fable"])["conversations"] == []
+
+
 def test_browse_model_only_never_degrades_on_live_branch(live_pending_conn):
     res = cq.list_conversations(live_pending_conn, models=["opus"])
     ids = {r["session_id"] for r in res["conversations"]}
@@ -4833,6 +4839,13 @@ def test_search_model_only_never_degrades_live(live_pending_conn):
 
 def test_search_model_present_but_empty_matches_nothing(seeded_conn):
     res = cq.search_conversations(seeded_conn, "the-needle", models=["fable"],
+                                  fts_available=False)
+    assert res["hits"] == [] and res["total"] == 0
+
+
+def test_search_model_present_but_empty_matches_nothing_live(live_pending_conn):
+    # Live/backfill-pending branch: present-but-empty still matches nothing.
+    res = cq.search_conversations(live_pending_conn, "the-needle", models=["fable"],
                                   fts_available=False)
     assert res["hits"] == [] and res["total"] == 0
 
