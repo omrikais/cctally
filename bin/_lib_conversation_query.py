@@ -21,7 +21,7 @@ from datetime import datetime as _datetime, timezone as _timezone
 # Public surface (Plan 2): shipped in the npm tarball + brew formula + public
 # mirror — imported by the dashboard's conversation endpoints at runtime.
 
-from _lib_pricing import _calculate_entry_cost
+from _lib_pricing import _calculate_entry_cost, _chip_for_model
 # #178: the on-demand load-full re-read helper re-stringifies a raw tool_result
 # content block the same way the parser does at ingest — reuse the parser's
 # _stringify so the full (un-capped) result text matches the cached/capped one.
@@ -1033,9 +1033,13 @@ def _rollup_authoritative(conn) -> bool:
 # last_activity_utc string, so the caller MUST pass UTC-ISO bounds in the same
 # format (...Z) — see bin/_lib_dashboard_dates.parse_filter_date_range.
 _FILTER_KEYS = ("date_from", "date_to", "projects",
-                "cost_min", "cost_max", "rebuild_min")
+                "cost_min", "cost_max", "rebuild_min", "models")
 # The rollup-only axes — the ones the live fallback cannot express. Used to set
 # the page's filter_degraded flag when one is requested under the live branch.
+# NOTE (#278 Theme C): "models" is deliberately NOT here. The model axis is a
+# live session_id IN (…conversation_messages.model…) restriction that applies on
+# BOTH branches, so a model-only filter under a pending rollup still applies and
+# must NEVER set filter_degraded.
 _ROLLUP_ONLY_FILTER_KEYS = ("projects", "cost_min", "cost_max", "rebuild_min")
 
 
@@ -1045,7 +1049,50 @@ def _empty_filters() -> dict:
     return {k: None for k in _FILTER_KEYS}
 
 
-def _rollup_where(filters):
+def _model_clause(conn, families):
+    """Resolve a model-family filter to a ``session_id`` predicate fragment
+    (#278 Theme C). Returns ``(clause_sql, params)``:
+
+      * ``families`` falsy (axis ABSENT)         -> ``("", [])``  (no restriction —
+        the byte-stable unfiltered path).
+      * ``families`` present, resolves to ids    -> a ``session_id IN (subquery)``
+        predicate over ``conversation_messages.model``.
+      * ``families`` present, resolves to NO ids -> a match-NOTHING predicate.
+
+    The middle/last split is load-bearing: an axis that is PRESENT but matches no
+    models (a family with no sessions, an 'other'/synthetic-only selection, a
+    typo'd family in a hand-crafted URL) must restrict to ZERO rows, never widen
+    to everything. Family classification goes through ``_chip_for_model`` — the
+    SAME classifier ``list_conversation_facets`` uses — so a family's facet count
+    equals the rows its chip yields, and 'any appearance' semantics + correct
+    'other'-exclusion come for free. 'other' is unreachable as a selectable
+    family (never emitted by the client) and is simply never collected here.
+
+    The fragment ANDs into any WHERE that has a ``session_id`` column, so the
+    IDENTICAL string composes into both the ``conversation_sessions`` rollup and
+    the ``conversation_messages`` live branch verbatim (spec §1)."""
+    if not families:
+        return "", []
+    wanted = set(families)
+    ids = [
+        m for (m,) in conn.execute(
+            "SELECT DISTINCT model FROM conversation_messages "
+            "WHERE model IS NOT NULL AND model != ''"
+        )
+        if _chip_for_model(m) in wanted
+    ]
+    if not ids:
+        # Present-but-empty: match nothing (NOT ("", []) which would be unfiltered).
+        return "session_id IN (SELECT session_id FROM conversation_messages WHERE 0)", []
+    ph = ",".join("?" for _ in ids)
+    return (
+        "session_id IN (SELECT DISTINCT session_id FROM conversation_messages "
+        "WHERE session_id IS NOT NULL AND model IN (%s))" % ph,
+        ids,
+    )
+
+
+def _rollup_where(filters, model_clause=("", [])):
     """(sql_fragment, params) for the ROLLUP branch — all four axes are stored
     columns. Returns (" WHERE ...", [params]) or ("", []) when no axis is set.
     Project IN-list naturally excludes empty/NULL project_label (neither the ''
@@ -1056,7 +1103,12 @@ def _rollup_where(filters):
     (``<``) emitted by ``_lib_dashboard_dates.parse_filter_date_range``. The
     strict ``<`` is load-bearing: it makes the lex compare against the stored
     mixed-precision ``last_activity_utc`` (whole-second AND millisecond ``...Z``)
-    chronologically correct at the day edge (review Finding 1)."""
+    chronologically correct at the day edge (review Finding 1).
+
+    ``model_clause`` (#278 Theme C) is the precomputed ``(clause_sql, params)``
+    from ``_model_clause`` — resolved ONCE per request by the caller (which has
+    ``conn``), so ``_rollup_where`` stays connection-free. The model predicate is
+    a ``session_id IN (…)`` fragment that ANDs cleanly into the rollup WHERE."""
     clauses, params = [], []
     if filters["date_from"] is not None:
         clauses.append("last_activity_utc >= ?"); params.append(filters["date_from"])
@@ -1071,6 +1123,9 @@ def _rollup_where(filters):
         clauses.append("cost_usd <= ?"); params.append(filters["cost_max"])
     if filters["rebuild_min"] is not None:
         clauses.append("cache_rebuild_count >= ?"); params.append(filters["rebuild_min"])
+    mc_sql, mc_params = model_clause
+    if mc_sql:
+        clauses.append(mc_sql); params.extend(mc_params)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -1131,7 +1186,8 @@ def _resolve_search_session_filter(conn, filters):
     return sub, hparams, degraded
 
 
-def _list_session_rows_rollup(conn, order, limit, offset, filters=None):
+def _list_session_rows_rollup(conn, order, limit, offset, filters=None,
+                              model_clause=("", [])):
     """FAST path: read the pre-aggregated rail rows straight from the
     conversation_sessions rollup (spec §3). No GROUP BY, no temp B-tree for the
     ``recent`` sort. Returns (session_id, msg_count, started, last_activity)
@@ -1139,8 +1195,9 @@ def _list_session_rows_rollup(conn, order, limit, offset, filters=None):
     assembly is identical. The optional ``filters`` dict pushes the four-axis
     browse predicate (date/project/cost/rebuild — all stored columns) into the
     WHERE BEFORE LIMIT/OFFSET, so ``has_more``/``next_offset`` stay correct over
-    the filtered set."""
-    where, params = _rollup_where(filters or _empty_filters())
+    the filtered set. ``model_clause`` (#278 Theme C) is the precomputed model
+    predicate folded into the same WHERE."""
+    where, params = _rollup_where(filters or _empty_filters(), model_clause)
     return conn.execute(
         "SELECT session_id, msg_count, "
         "       started_utc AS started, last_activity_utc AS last_activity "
@@ -1151,7 +1208,8 @@ def _list_session_rows_rollup(conn, order, limit, offset, filters=None):
     ).fetchall()
 
 
-def _list_session_rows_live(conn, order, limit, offset, filters=None):
+def _list_session_rows_live(conn, order, limit, offset, filters=None,
+                            model_clause=("", [])):
     """RETAINED fallback (Codex gate BLOCKER 2): the original live GROUP BY over
     conversation_messages, used while the rollup is not authoritative (the flag
     is set — e.g. an existing install before its first sync, or permanently
@@ -1159,17 +1217,25 @@ def _list_session_rows_live(conn, order, limit, offset, filters=None):
     construction; ``order`` here is the _SORTS_LIVE aggregate expression. The
     optional ``filters`` dict applies ONLY the date axis (via HAVING over
     MAX(timestamp_utc)); the rollup-only axes (project/cost/rebuild) cannot be
-    expressed here and are dropped — the caller flags filter_degraded."""
+    expressed here and are dropped — the caller flags filter_degraded.
+
+    ``model_clause`` (#278 Theme C) IS expressible here (the model lives on
+    ``conversation_messages``), so it folds into the WHERE (before GROUP BY) and
+    the axis never degrades. The existing ``session_id IS NOT NULL`` guard ANDs
+    cleanly with the model predicate; ``mc_params`` precede ``hparams`` because
+    the model clause precedes the HAVING in the SQL text."""
     having, hparams = _live_having(filters or _empty_filters())
+    mc_sql, mc_params = model_clause
+    where_extra = (" AND " + mc_sql) if mc_sql else ""
     return conn.execute(
         "SELECT session_id, COUNT(*) AS msg_count, "
         "       MIN(timestamp_utc) AS started, MAX(timestamp_utc) AS last_activity "
         "FROM conversation_messages "
-        "WHERE session_id IS NOT NULL "
+        "WHERE session_id IS NOT NULL" + where_extra + " "
         "GROUP BY session_id"
         + having +
         " ORDER BY " + order + " LIMIT ? OFFSET ?",
-        (*hparams, limit + 1, offset),
+        (*mc_params, *hparams, limit + 1, offset),
     ).fetchall()
 
 
@@ -1190,7 +1256,8 @@ def list_conversation_facets(conn) -> dict:
 
 def list_conversations(conn, *, sort="recent", limit=50, offset=0,
                        date_from=None, date_to=None, projects=None,
-                       cost_min=None, cost_max=None, rebuild_min=None) -> dict:
+                       cost_min=None, cost_max=None, rebuild_min=None,
+                       models=None) -> dict:
     """All-history per-session browse rows (spec §3.1). NOT 365-day bounded.
 
     Reads the conversation_sessions rollup (Task A) when it is authoritative —
@@ -1220,12 +1287,18 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         "cost_min": cost_min,
         "cost_max": cost_max,
         "rebuild_min": rebuild_min,
+        "models": list(models) if models else None,
     }
+    # Resolve the model-family clause ONCE (needs conn; the WHERE builders stay
+    # connection-free). It applies on BOTH branches and never degrades — model is
+    # NOT a rollup-only axis (#278 Theme C).
+    model_clause = _model_clause(conn, filters["models"])
     degraded = False
     sort_degraded = False
     if _rollup_authoritative(conn):
         order = _SORTS.get(sort, _SORTS["recent"])
-        rows = _list_session_rows_rollup(conn, order, limit, offset, filters)
+        rows = _list_session_rows_rollup(conn, order, limit, offset, filters,
+                                         model_clause)
     else:
         order = _SORTS_LIVE.get(sort, _SORTS_LIVE["recent"])
         degraded = any(
@@ -1234,7 +1307,8 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         # an unknown sort ALSO falls back to recent here (via _SORTS_LIVE.get),
         # but must stay byte-stable, so only the known rollup-only sorts flag it.
         sort_degraded = sort in _DEGRADABLE_SORTS
-        rows = _list_session_rows_live(conn, order, limit, offset, filters)
+        rows = _list_session_rows_live(conn, order, limit, offset, filters,
+                                       model_clause)
     has_more = len(rows) > limit
     rows = rows[:limit]
     session_ids = [r[0] for r in rows]
@@ -2553,6 +2627,10 @@ def search_conversations(conn, query, *, limit=50, offset=0,
         "date_from": date_from, "date_to": date_to,
         "projects": list(projects) if projects else None,
         "cost_min": cost_min, "cost_max": cost_max, "rebuild_min": rebuild_min,
+        # #278 Theme C: the model axis is wired in Task 2 (search_conversations
+        # gains a `models=` param); the key must exist now so the widened
+        # _FILTER_KEYS iteration in _resolve_search_session_filter never KeyErrors.
+        "models": None,
     }
     filt_sql, filt_params, degraded = _resolve_search_session_filter(conn, filters)
     if degraded:

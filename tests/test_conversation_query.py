@@ -4684,3 +4684,121 @@ def test_consumers_share_one_cold_assemble(monkeypatch):
     cq.get_conversation_export(c, _MEMO_SID, "chat")
     cq.find_in_conversation(c, _MEMO_SID, "hello")
     assert calls["n"] == 1     # all five share ONE cold assemble via the memo
+
+
+# ---------------------------------------------------------------------------
+# Theme C (#278 S3): per-model-family browse/search/facet filter axis
+# ---------------------------------------------------------------------------
+# Family classification rides the SAME _chip_for_model the dashboard chips use
+# (opus/sonnet/haiku/fable/other; 'other' never selectable). The axis is a live
+# session_id IN (SELECT ... conversation_messages.model ...) restriction, so it
+# applies on BOTH the rollup-authoritative and live-fallback branches and NEVER
+# sets filter_degraded (it is deliberately absent from _ROLLUP_ONLY_FILTER_KEYS).
+_C_OP = "claude-opus-4-8"
+_C_OP1 = "claude-opus-4-1"
+_C_HAIKU = "claude-haiku-4-5"
+_C_SON = "claude-sonnet-5"
+
+
+def _seed_models(c):
+    """Four sessions spanning the model families, each carrying 'the-needle' in
+    prose so ONE fixture exercises browse AND search (LIKE mode):
+
+      s_op       — one Opus assistant turn.
+      s_op_haiku — an Opus MAIN turn + a Haiku SIDECHAIN turn (any-appearance:
+                   matches BOTH opus and haiku).
+      s_son      — one Sonnet assistant turn.
+      s_op2      — two Opus POINT-RELEASES (claude-opus-4-8 + claude-opus-4-1) so
+                   the facet fold-then-count proves a session counts ONCE under
+                   opus despite two distinct opus model ids.
+    """
+    _msg(c, session_id="s_op", uuid="op1", source_path="op.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         text="the-needle in opus", model=_C_OP, msg_id="mop", req_id="rop",
+         cwd="/home/u/proj")
+    _msg(c, session_id="s_op_haiku", uuid="oh1", source_path="oh.jsonl",
+         byte_offset=0, timestamp_utc="2026-06-02T00:00:00Z",
+         entry_type="assistant", text="the-needle opus main", model=_C_OP,
+         msg_id="moh", req_id="roh", cwd="/home/u/proj")
+    _msg(c, session_id="s_op_haiku", uuid="oh2", source_path="oh.jsonl",
+         byte_offset=1, timestamp_utc="2026-06-02T00:00:05Z",
+         entry_type="assistant", text="the-needle haiku sub", model=_C_HAIKU,
+         msg_id="moh2", req_id="roh2", cwd="/home/u/proj", is_sidechain=1)
+    _msg(c, session_id="s_son", uuid="sn1", source_path="sn.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-03T00:00:00Z", entry_type="assistant",
+         text="the-needle in sonnet", model=_C_SON, msg_id="msn", req_id="rsn",
+         cwd="/home/u/proj")
+    _msg(c, session_id="s_op2", uuid="o21", source_path="o2.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-04T00:00:00Z", entry_type="assistant",
+         text="the-needle opus eight", model=_C_OP, msg_id="mo21", req_id="ro21",
+         cwd="/home/u/proj")
+    _msg(c, session_id="s_op2", uuid="o22", source_path="o2.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-04T00:00:05Z", entry_type="assistant",
+         text="the-needle opus one", model=_C_OP1, msg_id="mo22", req_id="ro22",
+         cwd="/home/u/proj")
+
+
+@pytest.fixture
+def seeded_conn():
+    """Rollup AUTHORITATIVE: recompute the conversation_sessions rollup so the
+    browse/search filter runs the fast (rollup) branch (no backfill flag)."""
+    c = _conn()
+    _seed_models(c)
+    cc._recompute_conversation_sessions(c)
+    return c
+
+
+@pytest.fixture
+def live_pending_conn():
+    """Rollup PENDING: arm the durable backfill flag so _rollup_authoritative is
+    False and the LIVE GROUP-BY fallback serves the query (rollup left empty)."""
+    c = _conn()
+    _seed_models(c)
+    c.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+              "VALUES('conversation_sessions_backfill_pending','1')")
+    return c
+
+
+def test_model_clause_absent_is_no_restriction():
+    c = _conn(); _seed_models(c)
+    assert cq._model_clause(c, None) == ("", [])
+    assert cq._model_clause(c, []) == ("", [])
+
+
+def test_browse_model_filter_rollup(seeded_conn):
+    res = cq.list_conversations(seeded_conn, models=["opus"])
+    ids = {r["session_id"] for r in res["conversations"]}
+    assert ids == {"s_op", "s_op_haiku", "s_op2"}      # sonnet-only excluded
+    assert "filter_degraded" not in res["page"]
+
+
+def test_browse_model_filter_any_appearance(seeded_conn):
+    # s_op_haiku matches BOTH opus (main) and haiku (sidechain).
+    ids = {r["session_id"]
+           for r in cq.list_conversations(seeded_conn, models=["haiku"])
+           ["conversations"]}
+    assert ids == {"s_op_haiku"}
+
+
+def test_browse_model_multi_select_is_union(seeded_conn):
+    ids = {r["session_id"]
+           for r in cq.list_conversations(seeded_conn, models=["opus", "sonnet"])
+           ["conversations"]}
+    assert ids == {"s_op", "s_op_haiku", "s_op2", "s_son"}
+
+
+def test_browse_model_present_but_empty_matches_nothing(seeded_conn):
+    # No Fable sessions in the fixture -> a PRESENT axis returns ZERO, not all.
+    assert cq.list_conversations(seeded_conn, models=["fable"])["conversations"] == []
+
+
+def test_browse_model_only_never_degrades_on_live_branch(live_pending_conn):
+    res = cq.list_conversations(live_pending_conn, models=["opus"])
+    ids = {r["session_id"] for r in res["conversations"]}
+    assert ids == {"s_op", "s_op_haiku", "s_op2"}
+    assert "filter_degraded" not in res["page"]
+
+
+def test_browse_no_model_filter_byte_stable(seeded_conn):
+    assert cq.list_conversations(seeded_conn) == \
+           cq.list_conversations(seeded_conn, models=None)
