@@ -316,6 +316,77 @@ clear_conversation_messages = _cctally_db_sib.clear_conversation_messages
 _set_cache_meta = _cctally_db_sib._set_cache_meta
 
 
+_PARSE_HEALTH_SCHEMA = 1
+
+
+def _update_parse_health_meta(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    lines_seen: int,
+    lines_malformed: int,
+    lines_skipped: int,
+    skip_reasons: dict,
+    rebuild: bool,
+) -> None:
+    """Anomaly-delta-gated rolling parse-health record (#279 S2 F1 /
+    Codex P1-2). Writes ONLY when (a) this sync's malformed+skipped delta
+    is nonzero, (b) rebuild=True (baseline reset — write fresh from that
+    walk's counters), or (c) the key is absent (first adoption). Healthy
+    steady-state syncs — including the ~1s live-tail targeted ingests —
+    never write, so the cumulative ``lines_seen`` denominator advances
+    only at these writes ("as of the last write"); doctor reasons from
+    counts + recency, never a precise ratio.
+
+    Caller holds the sync flock. Runs at end-of-sync, OUTSIDE every
+    per-file ``[before, after]`` total_changes window, so
+    ``stats.rows_changed`` stays byte-identical (#270); never bumps
+    ``mutation_seq``. Commits its own write (mirrors the walk-complete
+    sentinel's commit discipline). Fail-soft: a corrupt prior value is
+    treated as absent.
+    """
+    anomaly_delta = int(lines_malformed) + int(lines_skipped)
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    prior = None
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ?", (key,)
+        ).fetchone()
+        if row and row[0]:
+            loaded = json.loads(row[0])
+            if isinstance(loaded, dict):
+                prior = loaded
+    except (sqlite3.DatabaseError, ValueError):
+        prior = None
+    if not rebuild and prior is not None and anomaly_delta == 0:
+        return  # steady state: zero-write
+    if rebuild or prior is None:
+        prior = {"lines_seen": 0, "lines_malformed": 0, "lines_skipped": 0,
+                 "reasons": {}, "last_anomaly_at": None, "since": now_iso}
+    record = {
+        "schema": _PARSE_HEALTH_SCHEMA,
+        "lines_seen": int(prior.get("lines_seen", 0) or 0) + int(lines_seen),
+        "lines_malformed": (int(prior.get("lines_malformed", 0) or 0)
+                            + int(lines_malformed)),
+        "lines_skipped": (int(prior.get("lines_skipped", 0) or 0)
+                          + int(lines_skipped)),
+        "last_anomaly_at": (now_iso if anomaly_delta > 0
+                            else prior.get("last_anomaly_at")),
+        "last_write_at": now_iso,
+        "since": prior.get("since") or now_iso,
+    }
+    reasons = dict(prior.get("reasons") or {}) \
+        if isinstance(prior.get("reasons"), dict) else {}
+    for r, n in (skip_reasons or {}).items():
+        reasons[r] = int(reasons.get(r, 0) or 0) + int(n)
+    record["reasons"] = reasons
+    try:
+        _set_cache_meta(conn, key, json.dumps(record, sort_keys=True))
+        conn.commit()
+    except sqlite3.DatabaseError:
+        conn.rollback()  # observability must never fail the sync
+
+
 # === BEGIN MOVED REGIONS ===
 # Path constants APP_DIR / CACHE_DB_PATH / CACHE_LOCK_PATH /
 # CACHE_LOCK_CODEX_PATH live in _cctally_core (promoted 2026-05-22, #84);
@@ -1780,6 +1851,17 @@ def sync_cache(
                 (dt.datetime.now(dt.timezone.utc).isoformat(),),
             )
             conn.commit()
+        # #279 S2 F1: rolling parse-health record. Anomaly-delta-gated so
+        # steady-state (incl. targeted live-tail) syncs stay zero-write;
+        # targeted syncs still accumulate — they ingest real new bytes.
+        _update_parse_health_meta(
+            conn, "parse_health_claude",
+            lines_seen=stats.lines_seen,
+            lines_malformed=stats.lines_malformed,
+            lines_skipped=stats.assistant_lines_skipped,
+            skip_reasons=stats.skip_reasons,
+            rebuild=rebuild,
+        )
         # At-rest hardening (Plan 2, spec §5). Runs here — at the end of the
         # write transaction, while the cache.db.lock flock is still held (so a
         # concurrent writer can't be mid-checkpoint) AND after at least one
@@ -3143,6 +3225,17 @@ def sync_codex_cache(
 
         if progress is not None:
             progress(stats)
+        # #279 S2 F1: rolling parse-health record (codex half). Same
+        # anomaly-delta gate as the Claude tail; SQLite serializes the
+        # cache.db write against a concurrent Claude sync.
+        _update_parse_health_meta(
+            conn, "parse_health_codex",
+            lines_seen=stats.lines_seen,
+            lines_malformed=stats.lines_malformed,
+            lines_skipped=stats.token_events_skipped,
+            skip_reasons=stats.skip_reasons,
+            rebuild=rebuild,
+        )
         return stats
     finally:
         try:
