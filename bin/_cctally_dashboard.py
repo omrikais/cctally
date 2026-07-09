@@ -9003,13 +9003,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         on bad input). On success returns a dict of ``list_conversations``
         kwargs: ``date_from``/``date_to`` (UTC-ISO bounds), ``projects``
         (list[str] | None), ``cost_min``/``cost_max`` (float | None),
-        ``rebuild_min`` (int | None). Empty/blank params drop to ``None``.
+        ``rebuild_min`` (int | None), ``models`` (list[str] | None — the #278
+        Theme C model-family axis). Empty/blank params drop to ``None``.
 
         Numeric axes validate strictly (a non-numeric cost / non-integer
         rebuild threshold is a hard 400). Date bounds route through the pure
         ``_lib_dashboard_dates.parse_filter_date_range`` helper, which resolves
         naive date-only bounds in ``display.tz`` and raises ``ValueError`` (→
-        400) on a malformed date. Projects accept BOTH repeated
+        400) on a malformed date. Projects AND models accept BOTH repeated
         ``?projects=a&projects=b`` and a single comma-joined ``?projects=a,b``.
         """
         def _float(name):
@@ -9044,6 +9045,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if projects and len(projects) == 1 and "," in projects[0]:
             projects = [s for s in projects[0].split(",") if s] or None
 
+        # #278 Theme C: the model-family axis, mirroring projects. Accepts both
+        # repeated ?models=opus&models=sonnet and a single comma-joined
+        # ?models=opus,sonnet; blank/empty -> None. No numeric validation (enum-ish
+        # strings); an unknown/typo'd family is a PRESENT axis that resolves to
+        # zero ids in _model_clause -> zero results, never a silent unrestrict.
+        models = [m for m in q.get("models", []) if m] or None
+        if models and len(models) == 1 and "," in models[0]:
+            models = [s for s in models[0].split(",") if s] or None
+
         date_from = _qs_str(q, "date_from", "") or None
         date_to = _qs_str(q, "date_to", "") or None
         if date_from or date_to:
@@ -9070,6 +9080,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             "cost_min": cost_min,
             "cost_max": cost_max,
             "rebuild_min": rebuild_min,
+            "models": models,
         }
 
     def _handle_get_conversations(self) -> None:

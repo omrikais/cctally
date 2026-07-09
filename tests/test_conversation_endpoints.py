@@ -1670,3 +1670,50 @@ def test_filter_degraded_absent_on_live_branch_date_only(tmp_path, monkeypatch):
     finally:
         srv.shutdown()
 
+
+
+def test_conversations_model_filter_and_facets(tmp_path, monkeypatch):
+    """#278 Theme C: the model-family axis parses (repeated + comma-joined) and
+    restricts BOTH browse and search; the facets route gains a `models` array.
+    The seeded sessions s1 / sess-clean / sess-rebuild use claude-opus-4-8; s2 is
+    a human-only session with no model."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        # Browse: repeated ?models=opus restricts to the opus sessions.
+        status, body = _get(port, "/api/conversations?models=opus")
+        assert status == 200, (status, body)
+        sids = {r["session_id"] for r in json.loads(body)["conversations"]}
+        assert sids == {"s1", "sess-clean", "sess-rebuild"}, sids
+
+        # Present-but-empty: a family with no sessions returns ZERO, not all.
+        status, body = _get(port, "/api/conversations?models=haiku")
+        assert status == 200, (status, body)
+        assert json.loads(body)["conversations"] == []
+
+        # Comma-joined single value is split (opus,sonnet -> opus; no sonnet).
+        status, body = _get(port, "/api/conversations?models=opus,sonnet")
+        assert status == 200, (status, body)
+        sids = {r["session_id"] for r in json.loads(body)["conversations"]}
+        assert sids == {"s1", "sess-clean", "sess-rebuild"}, sids
+
+        # Search: the same axis restricts hits (only s1 carries "token").
+        status, body = _get(port, "/api/conversation/search?q=token&models=opus")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert {h["session_id"] for h in out["hits"]} == {"s1"}, out
+        assert "filter_degraded" not in out
+        status, body = _get(port, "/api/conversation/search?q=token&models=fable")
+        assert status == 200, (status, body)
+        assert json.loads(body)["hits"] == []
+
+        # Facets: models array present; opus count = 3.
+        status, body = _get(port, "/api/conversations/facets")
+        assert status == 200, (status, body)
+        fac = json.loads(body)
+        counts = {m["family"]: m["count"] for m in fac["models"]}
+        assert counts == {"opus": 3}, counts
+    finally:
+        srv.shutdown()

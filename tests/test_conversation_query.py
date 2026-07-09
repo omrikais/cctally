@@ -4842,3 +4842,20 @@ def test_search_no_model_filter_byte_stable(seeded_conn):
                                    fts_available=False) == \
            cq.search_conversations(seeded_conn, "the-needle", models=None,
                                    fts_available=False)
+
+
+# --- Theme C: facets per-family session counts (fold-then-count) -----------
+
+def test_facets_models_fold_then_count(seeded_conn):
+    fac = cq.list_conversation_facets(seeded_conn)
+    counts = {m["family"]: m["count"] for m in fac["models"]}
+    # s_op2 used TWO opus point-releases -> counts ONCE under opus.
+    # opus sessions: s_op, s_op_haiku, s_op2 = 3.
+    assert counts["opus"] == 3
+    assert counts["haiku"] == 1          # s_op_haiku (sidechain) counts under haiku
+    assert counts["sonnet"] == 1         # s_son
+    assert "other" not in counts and "fable" not in counts  # no fable; other never emitted
+    # Fixed display order among present families (opus, sonnet, haiku, fable).
+    assert [m["family"] for m in fac["models"]] == ["opus", "sonnet", "haiku"]
+    # projects key unchanged / still present.
+    assert "projects" in fac

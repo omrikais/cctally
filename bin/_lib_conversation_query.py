@@ -1248,19 +1248,53 @@ def _list_session_rows_live(conn, order, limit, offset, filters=None,
     ).fetchall()
 
 
+_MODEL_FAMILY_ORDER = ("opus", "sonnet", "haiku", "fable")  # display order; 'other' excluded
+
+
 def list_conversation_facets(conn) -> dict:
-    """Distinct projects (+ conversation counts) for the browse filter
-    multi-select (spec §2). Reads the rollup; cheap GROUP BY. Empty/NULL
-    project labels are dropped (a no-cwd session stores '' and a not-yet-filled
-    row stores NULL — neither is a real selectable project). Sorted ascending
-    by label so the popover renders a stable list. Returns
-    ``{"projects": [{"project_label": str, "count": int}, ...]}``."""
+    """Distinct projects (+ conversation counts) AND per-model-family session
+    counts for the browse filter multi-selects (spec §2 + #278 Theme C).
+
+    ``projects`` reads the rollup; cheap GROUP BY. Empty/NULL project labels are
+    dropped (a no-cwd session stores '' and a not-yet-filled row stores NULL —
+    neither is a real selectable project). Sorted ascending by label so the
+    popover renders a stable list.
+
+    ``models`` folds distinct ``(session_id, model)`` pairs from
+    ``conversation_messages`` (where ``session_id IS NOT NULL`` — matching the
+    browse/live row sources, so a null-session row can't inflate a count above
+    the filterable sessions) to distinct ``(session_id, family)`` via
+    ``_chip_for_model``, then counts sessions per family. Fold-then-count, NOT
+    sum-of-per-model-distinct: a session that used two Opus point-releases counts
+    ONCE under opus, and an Opus+Haiku session counts under BOTH. Families are
+    emitted present-only, excluding ``other``, in a fixed display order so the
+    popover list is stable — so a family's facet count equals the rows selecting
+    its chip yields (self-consistent with the §1 filter semantics).
+
+    Returns ``{"projects": [{"project_label", "count"}, ...],
+                "models": [{"family", "count"}, ...]}``."""
     rows = conn.execute(
         "SELECT project_label, COUNT(*) FROM conversation_sessions "
         "WHERE project_label IS NOT NULL AND project_label != '' "
         "GROUP BY project_label ORDER BY project_label"
     ).fetchall()
-    return {"projects": [{"project_label": p, "count": n} for p, n in rows]}
+    projects = [{"project_label": p, "count": n} for p, n in rows]
+
+    fam_sessions: dict = {}
+    for sid, model in conn.execute(
+        "SELECT DISTINCT session_id, model FROM conversation_messages "
+        "WHERE session_id IS NOT NULL AND model IS NOT NULL AND model != ''"
+    ):
+        fam = _chip_for_model(model)
+        if fam == "other":
+            continue
+        fam_sessions.setdefault(fam, set()).add(sid)
+    models = [
+        {"family": fam, "count": len(fam_sessions[fam])}
+        for fam in _MODEL_FAMILY_ORDER
+        if fam in fam_sessions
+    ]
+    return {"projects": projects, "models": models}
 
 
 def list_conversations(conn, *, sort="recent", limit=50, offset=0,

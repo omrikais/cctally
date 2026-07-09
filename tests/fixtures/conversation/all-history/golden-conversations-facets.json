@@ -1,4 +1,10 @@
 {
+  "models": [
+    {
+      "count": 5,
+      "family": "opus"
+    }
+  ],
   "projects": [
     {
       "count": 1,
