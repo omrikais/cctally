@@ -3,7 +3,10 @@
 #
 # Each scenario lives at tests/fixtures/npm-postinstall/<name>/ with:
 #   golden-exit.txt              : single integer (required).
-#   golden-stdout-substr.txt     : substring assertion (required, may be empty).
+#   golden-stdout-substr.txt     : TRI-STATE (#279 S7 W5) — ABSENT = no
+#                                  assertion; EXISTS-and-EMPTY = stdout MUST be
+#                                  empty (whitespace-trimmed); NON-EMPTY =
+#                                  substring must appear.
 #   golden-stdout-not-substr.txt : optional; stdout MUST NOT contain it.
 #   golden-stderr-substr.txt     : optional; stderr MUST contain it.
 #   golden-stderr-not-substr.txt : optional; stderr MUST NOT contain it.
@@ -40,10 +43,22 @@ shopt -s nullglob
 for dir in "$FIXTURES_DIR"/*/; do
     name=$(basename "$dir")
     expected_exit=$(tr -d '\n' < "$dir/golden-exit.txt")
-    expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
-    expected_not_stdout=""; expected_stderr=""; expected_not_stderr=""
+    # Tri-state substr goldens (#279 S7 W5): ABSENT = no assertion;
+    # EXISTS-and-EMPTY = the stream MUST be empty (whitespace-trimmed);
+    # NON-EMPTY = the stream MUST contain the substring. Track existence so an
+    # empty golden is a real positive-empty assertion (pre-#279 the `[ -n ... ]`
+    # guard made every empty golden vacuous — quiet-suppresses-all /
+    # local-install-noop asserted stdout emptiness only via negative not-substr).
+    have_stdout_golden=0; expected_stdout=""
+    if [ -f "$dir/golden-stdout-substr.txt" ]; then
+        have_stdout_golden=1; expected_stdout=$(cat "$dir/golden-stdout-substr.txt")
+    fi
+    have_stderr_golden=0; expected_stderr=""
+    if [ -f "$dir/golden-stderr-substr.txt" ]; then
+        have_stderr_golden=1; expected_stderr=$(cat "$dir/golden-stderr-substr.txt")
+    fi
+    expected_not_stdout=""; expected_not_stderr=""
     [ -f "$dir/golden-stdout-not-substr.txt" ] && expected_not_stdout=$(cat "$dir/golden-stdout-not-substr.txt")
-    [ -f "$dir/golden-stderr-substr.txt" ] && expected_stderr=$(cat "$dir/golden-stderr-substr.txt")
     [ -f "$dir/golden-stderr-not-substr.txt" ] && expected_not_stderr=$(cat "$dir/golden-stderr-not-substr.txt")
 
     work="$SCRATCH_DIR/$name"; mkdir -p "$work/bin" "$work/PATH"
@@ -83,14 +98,26 @@ EOF
 
     fail=0; msg=""
     [ "$actual_exit" != "$expected_exit" ] && { fail=1; msg="exit ${actual_exit} != ${expected_exit}"; }
-    if [ -n "$expected_stdout" ] && ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
-        fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
+    if [ "$have_stdout_golden" = "1" ]; then
+        if [ -z "$expected_stdout" ]; then
+            if [ -n "$(printf '%s' "$actual_stdout" | tr -d '[:space:]')" ]; then
+                fail=1; msg="${msg:+$msg; }stdout expected EMPTY, got content"
+            fi
+        elif ! grep -qF "$expected_stdout" <<<"$actual_stdout"; then
+            fail=1; msg="${msg:+$msg; }stdout missing '$expected_stdout'"
+        fi
     fi
     if [ -n "$expected_not_stdout" ] && grep -qF "$expected_not_stdout" <<<"$actual_stdout"; then
         fail=1; msg="${msg:+$msg; }stdout unexpectedly contains '$expected_not_stdout'"
     fi
-    if [ -n "$expected_stderr" ] && ! grep -qF "$expected_stderr" <<<"$actual_stderr"; then
-        fail=1; msg="${msg:+$msg; }stderr missing '$expected_stderr'"
+    if [ "$have_stderr_golden" = "1" ]; then
+        if [ -z "$expected_stderr" ]; then
+            if [ -n "$(printf '%s' "$actual_stderr" | tr -d '[:space:]')" ]; then
+                fail=1; msg="${msg:+$msg; }stderr expected EMPTY, got content"
+            fi
+        elif ! grep -qF "$expected_stderr" <<<"$actual_stderr"; then
+            fail=1; msg="${msg:+$msg; }stderr missing '$expected_stderr'"
+        fi
     fi
     if [ -n "$expected_not_stderr" ] && grep -qF "$expected_not_stderr" <<<"$actual_stderr"; then
         fail=1; msg="${msg:+$msg; }stderr unexpectedly contains '$expected_not_stderr'"
