@@ -37,8 +37,9 @@ def _top_choices(parser):
     return {}
 
 
-def test_private_shape_has_preview(mod):
-    assert "__preview" in _top_choices(mod.build_parser())
+def test_current_shape_matches_preview_availability(mod):
+    choices = _top_choices(mod.build_parser())
+    assert ("__preview" in choices) is (mod.cmd_preview is not None)
 
 
 def test_public_shape_without_preview(mod, monkeypatch):
@@ -65,8 +66,12 @@ def test_table_stores_callables_not_resolved_bindings(mod):
 
 
 def test_table_covers_top_level_choices(mod):
-    # Every registered top-level parser name comes from a table row (private
-    # shape, which includes __preview).
+    # Every registered top-level parser name comes from an enabled table row.
+    # The public mirror disables __preview because cmd_preview is absent.
     choices = set(_top_choices(mod.build_parser()))
-    table_names = {r.name for r in _registration()}
+    table_names = {
+        r.name
+        for r in _registration()
+        if r.predicate is None or r.predicate(mod)
+    }
     assert choices == table_names, choices ^ table_names
