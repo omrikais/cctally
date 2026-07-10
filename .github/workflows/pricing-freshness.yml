@@ -30,6 +30,7 @@ jobs:
     # push-only guard in ci.yml.)
     if: github.repository == 'omrikais/cctally-dev'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # a network fetch + issue update; ample headroom (#279 S7 W4)
     env:
       # Pin gh's target repo so issue ops can never accidentally hit the
       # public mirror, and supply the token in the env — `permissions:`

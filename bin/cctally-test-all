@@ -143,6 +143,17 @@ if python3 -m pytest --version >/dev/null 2>&1; then
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$JOBS")
     fi
+    # pytest-timeout, optional-by-detection (mirrors the xdist pattern above):
+    # a hung test wedges the whole suite (and, in CI, a job for GitHub's default
+    # 6h) with no signal. When the plugin is importable, cap every test at
+    # CCTALLY_PYTEST_TIMEOUT seconds (default 120 — generous headroom for the
+    # self-hosted runner) with the thread method so a wedged C call / uncatchable
+    # loop still trips it. Absence falls back to today's behavior exactly (no
+    # flag, byte-compatible for direct pytest users) — the runtime CLI stays
+    # stdlib-only and the plugin is a test-time optional dep.
+    if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
+        pytest_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
+    fi
     if (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1; then
         pytest_status="PASS"
     else

@@ -9,3 +9,10 @@
 # bin/cctally-test-all detects it at runtime and passes -n "$JOBS"
 # when available; absence falls back to serial pytest with no error.
 pytest-xdist
+# pytest-timeout caps each test's wall-clock so a hung test can't wedge the
+# whole suite (or a CI job for GitHub's default 6h). bin/cctally-test-all
+# detects it at runtime and passes --timeout=${CCTALLY_PYTEST_TIMEOUT:-120}
+# --timeout-method=thread when available; absence falls back to no timeout with
+# no error (optional-by-detection, mirroring pytest-xdist). Keeping it optional
+# preserves the stdlib-only ethos for local runs.
+pytest-timeout

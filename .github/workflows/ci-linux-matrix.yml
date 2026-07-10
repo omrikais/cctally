@@ -21,6 +21,7 @@ jobs:
       github.repository == 'omrikais/cctally' ||
       (github.repository == 'omrikais/cctally-dev' && github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # headroom over the observed run so a hung test can't wedge the job for GitHub's default 6h (#279 S7 W4)
     strategy:
       fail-fast: false                                 # see all three results
       matrix:
@@ -61,6 +62,6 @@ jobs:
           fi
           sqlite3 --version
       - name: Install Python test deps
-        run: python -m pip install --upgrade pip pytest pytest-xdist rich
+        run: python -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
       - name: Run the suite
         run: bin/cctally-test-all

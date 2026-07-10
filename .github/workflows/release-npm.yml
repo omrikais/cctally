@@ -19,6 +19,7 @@ jobs:
     # on every release. Gate the job so it no-ops on the private repo.
     if: github.repository == 'omrikais/cctally'
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # checkout + npm publish; headroom over the observed run (#279 S7 W4)
     steps:
       - uses: actions/checkout@v5
 

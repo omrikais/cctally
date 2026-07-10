@@ -31,6 +31,9 @@ jobs:
     # vetting.
     if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]
+    # Real headroom over observed wall-clock (the full suite runs in ~3 min) so
+    # a hung test can't wedge this job for GitHub's default 6h (#279 S7 W4).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -79,7 +82,7 @@ jobs:
           # too (rich + pytest then importable).
           python3 -m venv .venv
           source .venv/bin/activate
-          python3 -m pip install --upgrade pip pytest rich
+          python3 -m pip install --upgrade pip pytest pytest-timeout rich
           bin/cctally-test-all
 
   dashboard-build-stability:
@@ -88,6 +91,7 @@ jobs:
     # rebuild check still runs on every push to main.
     if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
+    timeout-minutes: 20  # npm ci + vite build; headroom over the observed few-min run (#279 S7 W4)
     steps:
       - uses: actions/checkout@v5
 
