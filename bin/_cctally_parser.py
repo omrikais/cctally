@@ -91,6 +91,17 @@ def _add_mode_arg(parser, *, noop: bool = False) -> None:
     )
 
 
+def _add_since_until_args(parser, *, metavar_since, metavar_until,
+                          help_since, help_until) -> None:
+    """Shared -s/--since -u/--until pair; metavars/help passed verbatim
+    per command (the YYYYMMDD vs YYYY-MM-DD drift is data, not unified —
+    #279 S6 W3; --help bytes must not move)."""
+    parser.add_argument("-s", "--since", default=None,
+                        metavar=metavar_since, help=help_since)
+    parser.add_argument("-u", "--until", default=None,
+                        metavar=metavar_until, help=help_until)
+
+
 def _add_ccusage_alias_args(parser, *, ansi_emit: bool) -> None:
     """Attach the Session A ccusage alias surface to a Claude-cmd subparser.
 
@@ -418,18 +429,10 @@ def _build_daily_parser(subparsers, name, *, help_text, xref):
               cctally daily -i --project-aliases repos=Repos
         """),
     )
-    p.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    p.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
+    _add_since_until_args(
+        p, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     p.add_argument(
         "-b", "--breakdown",
         action="store_true",
@@ -500,18 +503,10 @@ def _build_monthly_parser(subparsers, name, *, help_text, xref):
               cctally monthly --order desc
         """),
     )
-    p.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    p.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
+    _add_since_until_args(
+        p, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     p.add_argument(
         "-b", "--breakdown",
         action="store_true",
@@ -563,10 +558,10 @@ def _build_weekly_parser(subparsers, name, *, help_text, xref):
               cctally weekly --order desc
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
-                   help="Filter from date (inclusive).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
-                   help="Filter until date (inclusive).")
+    _add_since_until_args(
+        p, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     p.add_argument("-b", "--breakdown", action="store_true",
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
@@ -604,10 +599,10 @@ def _build_session_parser(subparsers, name, *, help_text, xref):
               cctally session --order desc
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
-                   help="Filter from date (inclusive).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
-                   help="Filter until date (inclusive).")
+    _add_since_until_args(
+        p, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     p.add_argument("-b", "--breakdown", action="store_true",
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
@@ -658,18 +653,10 @@ def _build_blocks_parser(subparsers, name, *, help_text, xref):
               cctally blocks --since 20260414 --json
         """),
     )
-    p.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    p.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
+    _add_since_until_args(
+        p, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     p.add_argument(
         "-b", "--breakdown",
         action="store_true",
@@ -926,10 +913,10 @@ def _build_codex_daily_parser(subparsers, name, *, help_text, xref):
               cctally codex-daily --order desc
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    _add_since_until_args(
+        p, metavar_since="YYYY-MM-DD", metavar_until="YYYY-MM-DD",
+        help_since="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).",
+        help_until="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
     p.add_argument("-b", "--breakdown", action="store_true",
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
@@ -957,10 +944,10 @@ def _build_codex_monthly_parser(subparsers, name, *, help_text, xref):
               cctally codex-monthly --json
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    _add_since_until_args(
+        p, metavar_since="YYYY-MM-DD", metavar_until="YYYY-MM-DD",
+        help_since="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).",
+        help_until="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
     p.add_argument("-b", "--breakdown", action="store_true",
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
@@ -992,10 +979,10 @@ def _build_codex_weekly_parser(subparsers, name, *, help_text, xref):
               cctally codex-weekly --order desc
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    _add_since_until_args(
+        p, metavar_since="YYYY-MM-DD", metavar_until="YYYY-MM-DD",
+        help_since="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).",
+        help_until="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
     p.add_argument("-b", "--breakdown", action="store_true",
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
@@ -1023,10 +1010,10 @@ def _build_codex_session_parser(subparsers, name, *, help_text, xref):
               cctally codex-session --json
         """),
     )
-    p.add_argument("-s", "--since", default=None, metavar="YYYY-MM-DD",
-                   help="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
-    p.add_argument("-u", "--until", default=None, metavar="YYYY-MM-DD",
-                   help="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
+    _add_since_until_args(
+        p, metavar_since="YYYY-MM-DD", metavar_until="YYYY-MM-DD",
+        help_since="Filter from date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).",
+        help_until="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
                    help="Sort direction by last activity (default: asc — earliest first).")
     p.add_argument("--json", action="store_true", dest="json",
@@ -1910,18 +1897,10 @@ def build_parser() -> argparse.ArgumentParser:
               cctally five-hour-blocks --breakdown project --json
         """),
     )
-    fhb.add_argument(
-        "-s", "--since",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter from date (inclusive).",
-    )
-    fhb.add_argument(
-        "-u", "--until",
-        default=None,
-        metavar="YYYYMMDD",
-        help="Filter until date (inclusive).",
-    )
+    _add_since_until_args(
+        fhb, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Filter from date (inclusive).",
+        help_until="Filter until date (inclusive).")
     fhb.add_argument(
         "--breakdown",
         choices=("model", "project"),
@@ -2044,10 +2023,10 @@ def build_parser() -> argparse.ArgumentParser:
               cctally project --group full-path --json
         """),
     )
-    p_project.add_argument("-s", "--since", default=None, metavar="YYYYMMDD",
-                           help="Inclusive start date (YYYY-MM-DD or YYYYMMDD).")
-    p_project.add_argument("-u", "--until", default=None, metavar="YYYYMMDD",
-                           help="Inclusive end date (YYYY-MM-DD or YYYYMMDD).")
+    _add_since_until_args(
+        p_project, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
+        help_since="Inclusive start date (YYYY-MM-DD or YYYYMMDD).",
+        help_until="Inclusive end date (YYYY-MM-DD or YYYYMMDD).")
     p_project.add_argument("--weeks", type=int, default=None,
                            help="Last N subscription weeks ending now.")
     p_project.add_argument("--project", action="append", default=[], metavar="PATTERN",
