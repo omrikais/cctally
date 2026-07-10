@@ -27,8 +27,11 @@ def test_pricing_constants_present_and_wellformed():
     assert pricing.LITELLM_PRICES_URL.startswith("https://")
     assert isinstance(pricing.PRICING_DRIFT_ALLOWLIST, list)
     for e in pricing.PRICING_DRIFT_ALLOWLIST:
-        assert set(e) <= {"model", "field", "reason"}
+        assert set(e) <= {"model", "field", "reason", "expires"}
         assert e["model"] and e["reason"]
+        # Optional `expires` (#279 S7 W7) must parse as an ISO date.
+        if "expires" in e:
+            dt.date.fromisoformat(e["expires"])
 
 
 pc = _load("_lib_pricing_check")
@@ -134,6 +137,24 @@ def test_stale_allowlist_entries_flags_resolved_divergence():
     assert len(stale) == 1 and stale[0]["model"] == "claude-b"
 
 
+def test_expired_allowlist_entries_strict_cutover():
+    # #279 S7 W7: an entry expiring ON 2026-08-31 is valid THROUGH that date and
+    # only flagged the day AFTER; a no-`expires` entry never expires.
+    allow = [
+        {"model": "claude-sonnet-5", "field": "input_cost_per_token",
+         "reason": "intro rate", "expires": "2026-08-31"},
+        {"model": "claude-durable", "field": "output_cost_per_token",
+         "reason": "no cutover"},
+    ]
+    assert pc.expired_allowlist_entries(allow, "2026-07-10") == []
+    assert pc.expired_allowlist_entries(allow, "2026-08-31") == []  # valid THROUGH
+    got = pc.expired_allowlist_entries(allow, "2026-09-01")
+    assert len(got) == 1 and got[0]["model"] == "claude-sonnet-5"
+    # Accepts a full ISO datetime / date object too (uses the date prefix).
+    assert pc.expired_allowlist_entries(allow, "2026-09-01T12:00:00Z")[0]["model"] == "claude-sonnet-5"
+    assert pc.expired_allowlist_entries([], "2026-09-01") == []
+
+
 def test_stale_allowlist_entries_empty_when_divergence_real():
     claude = {"claude-b": {"input_cost_per_token": 2e-6}}  # still differs
     litellm = {"claude-b": {"input_cost_per_token": 3e-6}}
@@ -217,13 +238,15 @@ import json as _json
 _CCTALLY = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally"
 
 
-def _run_cctally(args, home):
+def _run_cctally(args, home, extra_env=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["TZ"] = "Etc/UTC"
     # Force prod data-dir layout under the fake HOME (never touch the dev
     # checkout's own data dir) — mirrors the harness's _lib-harness-env.sh.
     env["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(_CCTALLY), *args],
         capture_output=True, text=True, env=env,
@@ -478,6 +501,53 @@ def test_pricing_check_offline_finding_exit1(tmp_path):
                for g in doc["coverage"]), doc
 
 
+def test_pricing_check_offline_today_no_suppressions(tmp_path):
+    # #279 S7 W7: today (pre-cutover) the sonnet-5 intro-rate suppression is NOT
+    # expired, and staleSuppressions is SKIPPED offline (no network) — so both
+    # additive keys are empty and exit 0.
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 0, r.stderr
+    doc = _json.loads(r.stdout)
+    assert doc["staleSuppressions"] == []
+    assert doc["expiredSuppressions"] == []
+    # staleSuppressions is network-derived → skipped offline, NOT a degradation.
+    assert "litellm" not in doc["degraded_components"]
+
+
+def test_pricing_check_offline_expired_suppression_exit1(tmp_path):
+    # Past the sonnet-5 cutover (2026-09-01), the four intro-rate suppressions
+    # are expired → expiredSuppressions non-empty → actionable → exit 1. Date-
+    # derived, so it fires OFFLINE via the CCTALLY_AS_OF clock seam.
+    r = _run_cctally(
+        ["pricing-check", "--offline", "--json"], home=tmp_path,
+        extra_env={"CCTALLY_AS_OF": "2026-09-01T00:00:00Z"},
+    )
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert len(doc["expiredSuppressions"]) == 4, doc["expiredSuppressions"]
+    assert all(e["model"] == "claude-sonnet-5" for e in doc["expiredSuppressions"])
+
+
+def test_pricing_issue_findings_present_stale_expired():
+    # The cron treats a stale OR expired suppression as issue-worthy (create/
+    # update), independent of value_drift / missing_from_us.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pricing_issue",
+        pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts" / "pricing_issue.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    empty = {"drift": {"value_drift": [], "missing_from_us": []},
+             "staleSuppressions": [], "expiredSuppressions": []}
+    assert mod._findings_present(empty) is False
+    assert mod._findings_present({**empty, "staleSuppressions": [{"model": "x"}]}) is True
+    assert mod._findings_present({**empty, "expiredSuppressions": [{"model": "y"}]}) is True
+    # And the pure kernel maps that to create/update.
+    assert pc.pricing_issue_action(True, False) == "create"
+    assert pc.pricing_issue_action(True, True) == "update"
+
+
 def test_pricing_check_offline_all_history_ignores_window(tmp_path):
     # The subcommand's coverage is ALL-HISTORY (vs doctor's 30-day). An
     # unpriced model 45 days old (out of doctor's window) STILL trips it.
@@ -607,17 +677,17 @@ def _load_issue_script():
     return mod
 
 
-def test_issue_script_drift_present_predicate():
+def test_issue_script_findings_present_predicate():
     pi = _load_issue_script()
-    assert pi._drift_present({"drift": {"value_drift": [{"model": "x"}],
+    assert pi._findings_present({"drift": {"value_drift": [{"model": "x"}],
                                         "missing_from_us": []}}) is True
-    assert pi._drift_present({"drift": {"value_drift": [],
+    assert pi._findings_present({"drift": {"value_drift": [],
                                         "missing_from_us": ["claude-new"]}}) is True
     # ahead_of_litellm is informational only — never drift (invariant #2).
-    assert pi._drift_present({"drift": {"value_drift": [], "missing_from_us": [],
+    assert pi._findings_present({"drift": {"value_drift": [], "missing_from_us": [],
                                         "ahead_of_litellm": ["claude-lead"]}}) is False
-    assert pi._drift_present({"drift": {"value_drift": [], "missing_from_us": []}}) is False
-    assert pi._drift_present({}) is False
+    assert pi._findings_present({"drift": {"value_drift": [], "missing_from_us": []}}) is False
+    assert pi._findings_present({}) is False
 
 
 def test_issue_script_build_body_renders():

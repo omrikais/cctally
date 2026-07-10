@@ -50,7 +50,7 @@ must act; `status` reports whether the check was complete.
 
 | Code | Meaning |
 | --- | --- |
-| `1` | **Any actionable finding** — a coverage gap, value drift, a missing-from-us model, **or** an existence gap — **even if a network leg degraded**. Findings always win over degradation. |
+| `1` | **Any actionable finding** — a coverage gap, value drift, a missing-from-us model, an existence gap, **or a stale/expired `PRICING_DRIFT_ALLOWLIST` suppression** — **even if a network leg degraded**. Findings always win over degradation. |
 | `0` | **No actionable findings** — a fully clean run **or** a partially/fully network-degraded run that surfaced nothing actionable. The `--json` payload still carries `"status": "degraded"` so a caller can tell "clean" from "couldn't fully check." |
 | `2` | Argument/usage error (argparse convention). |
 
@@ -91,7 +91,16 @@ only and does not affect the exit code.
   "existence": {
     "status": "ok",
     "unpriced_vendor_models": ["claude-brand-new"]
-  }
+  },
+  "staleSuppressions": [],
+  "expiredSuppressions": [
+    {
+      "model": "claude-sonnet-5",
+      "field": "input_cost_per_token",
+      "expires": "2026-08-31",
+      "reason": "…"
+    }
+  ]
 }
 ```
 
@@ -107,6 +116,8 @@ only and does not affect the exit code.
 | `drift.missing_from_us` | `string[]` | Scoped LiteLLM models absent from our tables. Actionable. |
 | `drift.ahead_of_litellm` | `string[]` | Models we price that scoped LiteLLM lacks. **Informational, never actionable.** |
 | `existence` | object | `{status, unpriced_vendor_models}`. See below — the existence block is **Anthropic-only**. |
+| `staleSuppressions` | `AllowlistEntry[]` | `PRICING_DRIFT_ALLOWLIST` entries whose divergence no longer exists against LiteLLM. **Actionable** (remove the entry). Network-derived → **empty under `--offline`** (skipped, not degraded). |
+| `expiredSuppressions` | `AllowlistEntry[]` | Allowlist entries past their optional `expires` cutover date. **Actionable** (remove / re-sync). Date-derived → present even under `--offline` (uses the `CCTALLY_AS_OF` clock). |
 
 Consumers MUST tolerate unknown keys.
 

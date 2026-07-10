@@ -7,7 +7,8 @@ matching `gh` command. The decision logic lives in the unit-tested kernel
 (`bin/_lib_pricing_check.pricing_issue_action`); this script is the thin
 `gh` shell around it.
 
-drift_present := any `value_drift` OR any `missing_from_us`. (The existence
+findings_present := any `value_drift` OR `missing_from_us` OR
+`staleSuppressions` OR `expiredSuppressions` (#279 S7 W7). (The existence
 leg never runs in the cron — no OAuth — and `ahead_of_litellm` is
 informational only, never actionable; spec invariant #2. Offline coverage
 gaps are a LOCAL signal, surfaced by `doctor`, not the cron's job.)
@@ -39,8 +40,10 @@ ISSUE_LABEL = "pricing-drift"
 ISSUE_TITLE = "Pricing drift: embedded tables diverge from LiteLLM"
 
 
-def _drift_present(payload: dict) -> bool:
-    """True iff the payload carries an actionable LiteLLM-drift finding.
+def _findings_present(payload: dict) -> bool:
+    """True iff the payload carries an actionable finding the cron tracks:
+    value drift, missing-from-us, OR (as of #279 S7 W7) a stale/expired
+    allowlist suppression.
 
     Deliberately ignores `existence.unpriced_vendor_models`: the cron has no
     OAuth, so the `/v1/models` existence leg always auto-degrades and reports
@@ -48,7 +51,12 @@ def _drift_present(payload: dict) -> bool:
     existence-only finding would otherwise go un-tracked by the drift issue.
     """
     drift = payload.get("drift") or {}
-    return bool(drift.get("value_drift")) or bool(drift.get("missing_from_us"))
+    return (
+        bool(drift.get("value_drift"))
+        or bool(drift.get("missing_from_us"))
+        or bool(payload.get("staleSuppressions"))
+        or bool(payload.get("expiredSuppressions"))
+    )
 
 
 def _run_gh(args: list[str], *, capture: bool = False) -> str:
@@ -133,6 +141,36 @@ def _build_body(payload: dict) -> str:
             lines.append(f"- `{model}`")
         lines.append("")
 
+    stale = payload.get("staleSuppressions") or []
+    expired = payload.get("expiredSuppressions") or []
+    if stale or expired:
+        lines.append("### Stale / expired suppressions")
+        lines.append("")
+        if stale:
+            lines.append(
+                "These `PRICING_DRIFT_ALLOWLIST` entries no longer map to a "
+                "real divergence (LiteLLM now agrees / the model is present) — "
+                "**remove them** so stale ignores can't accumulate:"
+            )
+            lines.append("")
+            for e in stale:
+                fld = f".`{e.get('field')}`" if e.get("field") else ""
+                lines.append(f"- `{e.get('model')}`{fld}")
+            lines.append("")
+        if expired:
+            lines.append(
+                "These entries are past their `expires` cutover — **remove the "
+                "allowlist entry / re-sync the embedded snapshot** so the "
+                "deliberate divergence doesn't ossify past its stated date:"
+            )
+            lines.append("")
+            for e in expired:
+                fld = f".`{e.get('field')}`" if e.get("field") else ""
+                lines.append(
+                    f"- `{e.get('model')}`{fld} (expired {e.get('expires')})"
+                )
+            lines.append("")
+
     if ahead:
         lines.append(
             "### Ahead of LiteLLM (informational — NOT actionable)"
@@ -182,9 +220,12 @@ def _run_comment(payload: dict) -> str:
     drift = payload.get("drift") or {}
     nv = len(drift.get("value_drift") or [])
     nm = len(drift.get("missing_from_us") or [])
+    ns = len(payload.get("staleSuppressions") or [])
+    ne = len(payload.get("expiredSuppressions") or [])
     return (
-        f"Re-checked {_today()}: still drifting "
-        f"({nv} value-drift field(s), {nm} missing-from-us model(s))."
+        f"Re-checked {_today()}: still open "
+        f"({nv} value-drift field(s), {nm} missing-from-us model(s), "
+        f"{ns} stale suppression(s), {ne} expired suppression(s))."
     )
 
 
@@ -260,14 +301,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"[pricing_issue] cannot read payload: {exc}\n")
         return 2
 
-    drift_present = _drift_present(payload)
+    findings_present = _findings_present(payload)
     # In --dry-run we don't query gh for the open-issue state (no network /
     # auth assumed); model "no open issue" so the action is purely a function
     # of the payload. Live runs query the real state.
     issue_number = None if args.dry_run else _find_open_issue()
     existing_open = issue_number is not None
 
-    action = _lib_pricing_check.pricing_issue_action(drift_present, existing_open)
+    action = _lib_pricing_check.pricing_issue_action(findings_present, existing_open)
     _act(action, payload, issue_number, dry_run=args.dry_run)
     return 0
 

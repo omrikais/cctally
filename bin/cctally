@@ -293,6 +293,7 @@ classify_coverage = _lib_pricing_check.classify_coverage
 scope_litellm = _lib_pricing_check.scope_litellm
 diff_pricing = _lib_pricing_check.diff_pricing
 stale_allowlist_entries = _lib_pricing_check.stale_allowlist_entries
+expired_allowlist_entries = _lib_pricing_check.expired_allowlist_entries
 check_table_shapes = _lib_pricing_check.check_table_shapes
 pricing_issue_action = _lib_pricing_check.pricing_issue_action
 CoverageGap = _lib_pricing_check.CoverageGap

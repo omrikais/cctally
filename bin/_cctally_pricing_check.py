@@ -283,6 +283,14 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
 
     drift = {"value_drift": [], "missing_from_us": [], "ahead_of_litellm": []}
     existence = {"status": "skipped", "unpriced_vendor_models": []}
+    # staleSuppressions is network-derived (needs the LiteLLM scoped table), so
+    # under --offline it is SKIPPED, not degraded — matching the offline branch,
+    # which leaves degraded_components empty (#279 S7 W7). expiredSuppressions is
+    # date-derived and runs OFFLINE too, off the _command_as_of() clock seam.
+    stale_suppressions: list = []
+    expired_suppressions = _lib_pricing_check.expired_allowlist_entries(
+        c.PRICING_DRIFT_ALLOWLIST, now_utc,
+    )
 
     if not args.offline:
         litellm, ok = _fetch_litellm_prices()
@@ -297,6 +305,10 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
                 "missing_from_us": list(res.missing_from_us),
                 "ahead_of_litellm": list(res.ahead_of_litellm),
             }
+            stale_suppressions = _lib_pricing_check.stale_allowlist_entries(
+                c.PRICING_DRIFT_ALLOWLIST, c.CLAUDE_MODEL_PRICING,
+                c.CODEX_MODEL_PRICING, scoped,
+            )
         else:
             status = "degraded"
             degraded.append("litellm")
@@ -307,11 +319,15 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
 
     # Actionable = any finding on a leg that ran. `ahead_of_litellm` is
     # NEVER actionable (invariant #2). A degraded leg contributes no finding.
+    # A stale OR expired suppression is actionable (remove the allowlist entry /
+    # re-sync the snapshot) — both wired in explicitly (#279 S7 W7).
     actionable = (
         bool(coverage)
         or bool(drift["value_drift"])
         or bool(drift["missing_from_us"])
         or bool(existence["unpriced_vendor_models"])
+        or bool(stale_suppressions)
+        or bool(expired_suppressions)
     )
 
     payload = {
@@ -322,6 +338,12 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
         "coverage": [dataclasses.asdict(g) for g in coverage],
         "drift": drift,
         "existence": existence,
+        # Additive keys on the existing schemaVersion 1 envelope (no bump — CLI
+        # contract additive rule). staleSuppressions: allowlist entries whose
+        # divergence no longer exists (network). expiredSuppressions: allowlist
+        # entries past their `expires` cutover (date).
+        "staleSuppressions": list(stale_suppressions),
+        "expiredSuppressions": list(expired_suppressions),
         "litellmSource": c.LITELLM_PRICES_URL,
     }
 
@@ -385,6 +407,23 @@ def _render_pricing_check_text(payload: dict, *, offline: bool, actionable: bool
                 out("\n  Existence: all vendor models priced.\n")
         elif ex["status"] == "degraded":
             out("\n  Existence: /v1/models unavailable (skipped).\n")
+        stale = payload.get("staleSuppressions") or []
+        if stale:
+            out(f"\n  Stale suppressions ({len(stale)}) — the divergence no "
+                f"longer exists, remove the allowlist entry:\n")
+            for e in stale:
+                fld = f".{e['field']}" if e.get("field") else ""
+                out(f"    • {e['model']}{fld}\n")
+
+    # Expired suppressions are date-derived, so they render in BOTH offline and
+    # online modes.
+    expired = payload.get("expiredSuppressions") or []
+    if expired:
+        out(f"\n  Expired suppressions ({len(expired)}) — past their `expires` "
+            f"cutover, remove the allowlist entry / re-sync the snapshot:\n")
+        for e in expired:
+            fld = f".{e['field']}" if e.get("field") else ""
+            out(f"    • {e['model']}{fld} (expired {e.get('expires')})\n")
 
     # Single-sourced from cmd_pricing_check's exit-code predicate (don't
     # recompute the four-clause boolean here — it would drift).

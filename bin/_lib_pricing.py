@@ -77,6 +77,11 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
     {
         "model": "claude-sonnet-5",
         "field": field,
+        # Structured cutover date (#279 S7 W7): the intro rate is in effect
+        # THROUGH 2026-08-31, so this suppression is valid through then and
+        # `expired_allowlist_entries` flags it the day after. Keep the prose in
+        # `reason`; the date here is what the offline expiry check + the cron read.
+        "expires": "2026-08-31",
         "reason": (
             "LiteLLM tracks the claude-sonnet-5 introductory rate "
             "($2/$10 per MTok, through 2026-08-31); we deliberately embed the "

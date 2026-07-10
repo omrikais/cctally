@@ -162,6 +162,23 @@ def stale_allowlist_entries(allowlist, claude_tbl, codex_tbl, litellm_scoped) ->
     return stale
 
 
+def expired_allowlist_entries(allowlist, as_of_date) -> list:
+    """Return allowlist entries whose optional ``expires`` (``YYYY-MM-DD``) date
+    has PASSED as of ``as_of_date`` (a date/datetime or ISO string).
+
+    Date-derived, so it needs no network (runs offline too — #279 S7 W7): an
+    expired suppression is a signal to remove the entry / re-sync the embedded
+    snapshot even before LiteLLM has reverted, so the deliberate divergence
+    doesn't silently ossify past its stated cutover. An entry with no
+    ``expires`` field never expires. Comparison is strict — an entry expiring ON
+    a date is still valid THROUGH that date and only expired the day AFTER."""
+    as_of = str(as_of_date)[:10]
+    return [
+        e for e in (allowlist or [])
+        if e.get("expires") and str(e["expires"])[:10] < as_of
+    ]
+
+
 _CLAUDE_REQUIRED = ("input_cost_per_token", "output_cost_per_token",
                     "cache_creation_input_token_cost", "cache_read_input_token_cost")
 _CODEX_REQUIRED = ("input_cost_per_token", "cache_read_input_token_cost",
@@ -194,8 +211,13 @@ def check_table_shapes(claude_tbl, codex_tbl, zero_sentinels) -> list:
     return problems
 
 
-def pricing_issue_action(drift_present: bool, existing_open: bool) -> str:
-    """Decide the cron's GitHub-issue action. Pure; the YAML executes it."""
-    if drift_present:
+def pricing_issue_action(findings_present: bool, existing_open: bool) -> str:
+    """Decide the cron's GitHub-issue action. Pure; the YAML executes it.
+
+    ``findings_present`` is ANY actionable finding the cron tracks — value
+    drift, missing-from-us, OR (as of #279 S7 W7) a stale/expired allowlist
+    suppression. The name generalizes the former ``drift_present``; the
+    two-state machine is unchanged."""
+    if findings_present:
         return "update" if existing_open else "create"
     return "close" if existing_open else "noop"
