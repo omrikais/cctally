@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 import textwrap
+from typing import NamedTuple
 
 from _cctally_core import WEEKDAY_MAP
 from _lib_display_tz import _argparse_tz
@@ -1023,67 +1024,35 @@ def _build_codex_session_parser(subparsers, name, *, help_text, xref):
     return p
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _build_sync_week_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `sync-week` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
     c = _cctally()
-    p = argparse.ArgumentParser(
-        prog="cctally",
+    py = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Track Claude subscription weekly usage percent and weekly cost
-            in a local SQLite database.
+                    """\
+                    Compute and store weekly cost (USD) for a selected week window.
 
-            Data flow:
-              1) Claude Code status line captures rate limit data after each API call.
-              2) record-usage stores usage snapshots and triggers percent milestones.
-              3) sync-week computes weekly USD cost from Claude Code session data.
-              4) report computes dollars per 1% and shows trend history.
-            """
-        ),
+                    Week selection priority:
+                      1) Explicit --week-start/--week-end (date based)
+                      2) Latest usage snapshot weekStartAt/weekEndAt (hour-accurate)
+                      3) Current week from configured week-start rule
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Quick start:
-              # Add record-usage call to ~/.claude/statusline-command.sh (see record-usage --help)
-              cctally sync-week
-              cctally report
-            """
-        ),
-    )
-    p.add_argument(
-        "-v", "--version",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Print cctally version (from CHANGELOG.md latest release header) and exit",
-    )
-    sub = p.add_subparsers(
-        dest="command",
-        required=False,
-        title="commands",
-        metavar="<command>",
-    )
-
-    py = sub.add_parser(
-        "sync-week",
-        help="Compute weekly cost from session data and store in SQLite",
-        formatter_class=CLIHelpFormatter,
-        description=textwrap.dedent(
-            """\
-            Compute and store weekly cost (USD) for a selected week window.
-
-            Week selection priority:
-              1) Explicit --week-start/--week-end (date based)
-              2) Latest usage snapshot weekStartAt/weekEndAt (hour-accurate)
-              3) Current week from configured week-start rule
-            """
-        ),
-        epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally sync-week
-              cctally sync-week --week-start 2026-02-05 --week-end 2026-02-12
-              cctally sync-week --mode calculate --offline --json
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally sync-week
+                      cctally sync-week --week-start 2026-02-05 --week-end 2026-02-12
+                      cctally sync-week --mode calculate --offline --json
+                    """
+                ),
     )
     py.add_argument(
         "--week-start",
@@ -1131,28 +1100,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     py.set_defaults(func=c.cmd_sync_week)
 
-    pr = sub.add_parser(
-        "report",
-        help="Show current and trend dollars-per-1%% statistics",
+def _build_report_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `report` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    pr = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Report current and historical dollars per 1% weekly usage.
+                    """\
+                    Report current and historical dollars per 1% weekly usage.
 
-            For each week, report joins:
-              - latest usage snapshot (%)
-              - latest cost snapshot (USD)
-            then computes USD / percent.
-            """
-        ),
+                    For each week, report joins:
+                      - latest usage snapshot (%)
+                      - latest cost snapshot (USD)
+                    then computes USD / percent.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally report
-              cctally report --sync-current
-              cctally report --weeks 12 --json
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally report
+                      cctally report --sync-current
+                      cctally report --weeks 12 --json
+                    """
+                ),
     )
     pr.add_argument(
         "--weeks",
@@ -1207,30 +1183,37 @@ def build_parser() -> argparse.ArgumentParser:
     _add_share_args(pr)
     pr.set_defaults(func=c.cmd_report)
 
-    fc = sub.add_parser(
-        "forecast",
-        help="Project current-week usage to reset; show daily budgets",
+def _build_forecast_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `forecast` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    fc = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Forecast end-of-week usage % and daily $ / % budgets to stay under
-            target ceilings (default 100% and 90%). Reads current-week
-            `weekly_usage_snapshots` + `session_entries`; never writes.
-            """
-        ),
+                    """\
+                    Forecast end-of-week usage % and daily $ / % budgets to stay under
+                    target ceilings (default 100% and 90%). Reads current-week
+                    `weekly_usage_snapshots` + `session_entries`; never writes.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally forecast
-              cctally forecast --json
-              cctally forecast --status-line --no-sync
-              cctally forecast --targets 100,95,85
+                    """\
+                    Examples:
+                      cctally forecast
+                      cctally forecast --json
+                      cctally forecast --status-line --no-sync
+                      cctally forecast --targets 100,95,85
 
-            Status-line integration (add to ~/.claude/statusline-command.sh):
-              forecast_seg=$(cctally forecast --status-line --no-sync 2>/dev/null)
-              # ...then include "$forecast_seg" in your prompt composition.
-            """
-        ),
+                    Status-line integration (add to ~/.claude/statusline-command.sh):
+                      forecast_seg=$(cctally forecast --status-line --no-sync 2>/dev/null)
+                      # ...then include "$forecast_seg" in your prompt composition.
+                    """
+                ),
     )
     fc.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
                     help="In --format output, show real project basenames instead of "
@@ -1246,40 +1229,41 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip sync_cache(); recommended for status-line use.")
     fc.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                     help="Color output control (also honors NO_COLOR).")
-    # Dev-only: override "now" for deterministic fixture tests. Hidden from --help.
     fc.add_argument("--as-of", dest="as_of", default=None, help=argparse.SUPPRESS)
     _add_share_args(fc, has_status_line=True)
     fc.set_defaults(func=c.cmd_forecast)
 
-    # budget — cctally-original (NOT a ccusage drop-in), so flat surface only;
-    # no claude/codex subgroup. `--config` is honored read-only on bare status
-    # but rejected on set/unset (F4). `--reveal-projects` is accepted for share
-    # surface parity but inert (no per-project axis). `--tz` follows the sibling
-    # reporting commands' precedence.
-    bg = sub.add_parser(
-        "budget",
-        help="Weekly equivalent-$ budget + pace + spend alerts",
+def _build_budget_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `budget` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    bg = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Track Claude equivalent-$ spend for the current subscription week
-            against a weekly budget. Shows spend, pace, projected end-of-week,
-            and a verdict (ok / warn / over). `budget set <amount>` and
-            `budget unset` manage the budget; spend-crossing alerts fire from
-            record-usage (see `cctally alerts`).
-            """
-        ),
+                    """\
+                    Track Claude equivalent-$ spend for the current subscription week
+                    against a weekly budget. Shows spend, pace, projected end-of-week,
+                    and a verdict (ok / warn / over). `budget set <amount>` and
+                    `budget unset` manage the budget; spend-crossing alerts fire from
+                    record-usage (see `cctally alerts`).
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally budget
-              cctally budget set 300
-              cctally budget unset
-              cctally budget set 25 --project
-              cctally budget --json
-              cctally budget --format md
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally budget
+                      cctally budget set 300
+                      cctally budget unset
+                      cctally budget set 25 --project
+                      cctally budget --json
+                      cctally budget --format md
+                    """
+                ),
     )
     bg.add_argument("action", nargs="?", choices=["set", "unset"], default=None,
                     help="`set <amount>` to set the weekly budget, `unset` to clear it.")
@@ -1319,25 +1303,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_share_args(bg)
     bg.set_defaults(func=c.cmd_budget)
 
-    pb = sub.add_parser(
-        "percent-breakdown",
-        help="Show per-percent cost milestones for a week",
+def _build_percent_breakdown_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `percent-breakdown` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    pb = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Show the cumulative and marginal cost at each integer percent threshold
-            for a given week. Milestones are recorded automatically when
-            record-usage stores a snapshot crossing a new integer percent.
-            """
-        ),
+                    """\
+                    Show the cumulative and marginal cost at each integer percent threshold
+                    for a given week. Milestones are recorded automatically when
+                    record-usage stores a snapshot crossing a new integer percent.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally percent-breakdown
-              cctally percent-breakdown --week-start 2026-03-20
-              cctally percent-breakdown --json
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally percent-breakdown
+                      cctally percent-breakdown --week-start 2026-03-20
+                      cctally percent-breakdown --json
+                    """
+                ),
     )
     pb.add_argument(
         "--week-start",
@@ -1363,25 +1354,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pb.set_defaults(func=c.cmd_percent_breakdown)
 
-    fhbd = sub.add_parser(
-        "five-hour-breakdown",
-        help="Per-percent milestones inside one 5h block (mirror of percent-breakdown)",
+def _build_five_hour_breakdown_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `five-hour-breakdown` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    fhbd = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Show cumulative + marginal cost at each integer percent threshold
-            inside one 5h block. Mirrors percent-breakdown for the 5h axis.
-            """
-        ),
+                    """\
+                    Show cumulative + marginal cost at each integer percent threshold
+                    inside one 5h block. Mirrors percent-breakdown for the 5h axis.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally five-hour-breakdown
-              cctally five-hour-breakdown --block-start 2026-04-30T19:30
-              cctally five-hour-breakdown --ago 1
-              cctally five-hour-breakdown --json
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally five-hour-breakdown
+                      cctally five-hour-breakdown --block-start 2026-04-30T19:30
+                      cctally five-hour-breakdown --ago 1
+                      cctally five-hour-breakdown --json
+                    """
+                ),
     )
     fhbd.add_argument(
         "--block-start",
@@ -1417,33 +1415,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fhbd.set_defaults(func=c.cmd_five_hour_breakdown)
 
-    tp = sub.add_parser(
-        "tui",
-        help="Live refreshing dashboard (current week, forecast, trend, sessions)",
+def _build_tui_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `tui` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    tp = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Live terminal dashboard with four refreshing panels:
-              - Current week % and 5-hour window
-              - Forecast verdict + projections + daily $ budgets
-              - $/1% trend over the last 8 weeks (with sparkline)
-              - Recent Claude sessions (last 100, scrollable)
+                    """\
+                    Live terminal dashboard with four refreshing panels:
+                      - Current week % and 5-hour window
+                      - Forecast verdict + projections + daily $ budgets
+                      - $/1% trend over the last 8 weeks (with sparkline)
+                      - Recent Claude sessions (last 100, scrollable)
 
-            Two visual variants — conventional 2x2 grid and expressive
-            hero layout — toggleable at runtime with `v`.
+                    Two visual variants — conventional 2x2 grid and expressive
+                    hero layout — toggleable at runtime with `v`.
 
-            Requires the `rich` Python package.
-            """
-        ),
+                    Requires the `rich` Python package.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally tui
-              cctally tui --expressive
-              cctally tui --refresh 2 --sync-interval 30
-              cctally tui --no-sync
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally tui
+                      cctally tui --expressive
+                      cctally tui --refresh 2 --sync-interval 30
+                      cctally tui --no-sync
+                    """
+                ),
     )
     tp.add_argument(
         "--variant",
@@ -1493,34 +1498,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
-    # Dev-only: pin "now" for deterministic fixture tests.
     tp.add_argument("--as-of", dest="as_of", default=None, help=argparse.SUPPRESS)
-    # Dev-only: fixture injection — render one frame from a Python module that
-    # exposes `SNAPSHOT` (DataSnapshot) and exits.
     tp.add_argument(
         "--snapshot-module", dest="snapshot_module", default=None, help=argparse.SUPPRESS
     )
-    # Dev-only: one-shot render for golden capture.
     tp.add_argument(
         "--render-once", action="store_true", dest="render_once", help=argparse.SUPPRESS
     )
-    # Dev-only: force terminal size for --render-once.
     tp.add_argument(
         "--force-size", dest="force_size", default=None, metavar="WxH",
         help=argparse.SUPPRESS
     )
     tp.set_defaults(func=c.cmd_tui)
 
-    # ---- dashboard subcommand --------------------------------------------
-    dp = sub.add_parser(
-        "dashboard",
-        help="Launch the live web dashboard on http://localhost:8789",
-        description=(
-            "Start a local web server rendering a live dashboard of your "
-            "subscription usage, weekly cost trend, and recent sessions. "
-            "Press Ctrl-C to stop. Two variants are served by the companion "
-            "'tui' subcommand for terminal-only use."
-        ),
+def _build_dashboard_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `dashboard` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    dp = subparsers.add_parser(
+        name,
+        help=help_text,
+        description="Start a local web server rendering a live dashboard of your "
+                    "subscription usage, weekly cost trend, and recent sessions. "
+                    "Press Ctrl-C to stop. Two variants are served by the companion "
+                    "'tui' subcommand for terminal-only use.",
     )
     dp.add_argument(
         "--port",
@@ -1560,33 +1564,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dp.set_defaults(func=c.cmd_dashboard)
 
-    ru = sub.add_parser(
-        "record-usage",
-        help="Record usage data from Claude Code status line",
+def _build_record_usage_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `record-usage` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    ru = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Record usage percentage from Claude Code status line rate_limits data.
-            Called automatically by the status line script after each assistant message.
-            """
-        ),
+                    """\
+                    Record usage percentage from Claude Code status line rate_limits data.
+                    Called automatically by the status line script after each assistant message.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally record-usage --percent 14.2 --resets-at 1744531200
-              cctally record-usage --percent 14.2 --resets-at 1744531200 \\
-                --five-hour-percent 38.5 --five-hour-resets-at 1744502400
+                    """\
+                    Examples:
+                      cctally record-usage --percent 14.2 --resets-at 1744531200
+                      cctally record-usage --percent 14.2 --resets-at 1744531200 \\
+                        --five-hour-percent 38.5 --five-hour-resets-at 1744502400
 
-            Status line integration (add to ~/.claude/statusline-command.sh):
-              if [ -n "$week_pct" ] && [ -n "$week_resets" ]; then
-                  record_args="--percent $week_pct --resets-at ${week_resets%.*}"
-                  if [ -n "$five_pct" ] && [ -n "$five_resets" ]; then
-                      record_args="$record_args --five-hour-percent $five_pct --five-hour-resets-at ${five_resets%.*}"
-                  fi
-                  cctally record-usage $record_args &
-              fi
-            """
-        ),
+                    Status line integration (add to ~/.claude/statusline-command.sh):
+                      if [ -n "$week_pct" ] && [ -n "$week_resets" ]; then
+                          record_args="--percent $week_pct --resets-at ${week_resets%.*}"
+                          if [ -n "$five_pct" ] && [ -n "$five_resets" ]; then
+                              record_args="$record_args --five-hour-percent $five_pct --five-hour-resets-at ${five_resets%.*}"
+                          fi
+                          cctally record-usage $record_args &
+                      fi
+                    """
+                ),
     )
     ru.add_argument(
         "--percent",
@@ -1612,32 +1623,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ru.set_defaults(func=c.cmd_record_usage)
 
-    rc = sub.add_parser(
-        "record-credit",
-        help="Record an in-place weekly credit the auto-detector misses",
+def _build_record_credit_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `record-credit` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    rc = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Record an in-place weekly (7d) credit that the auto-detector
-            misses (a sub-25pp, non-zero drop — e.g. Anthropic lowered your
-            7d % from 46 to 31 without a clean reset). Writes a
-            weekly_credit_floors clamp row (no week re-anchor — the same week
-            continues), lowers hwm-7d, and inserts a post-credit snapshot so
-            reports and the statusline read the credited value.
-            Preview + confirm by default.
-            """
-        ),
+                    """\
+                    Record an in-place weekly (7d) credit that the auto-detector
+                    misses (a sub-25pp, non-zero drop — e.g. Anthropic lowered your
+                    7d % from 46 to 31 without a clean reset). Writes a
+                    weekly_credit_floors clamp row (no week re-anchor — the same week
+                    continues), lowers hwm-7d, and inserts a post-credit snapshot so
+                    reports and the statusline read the credited value.
+                    Preview + confirm by default.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally record-credit --to 31              # baseline auto-read from HWM
-              cctally record-credit --to 31 --dry-run    # preview, write nothing
-              cctally record-credit --to 31 --yes        # apply without prompting
+                    """\
+                    Examples:
+                      cctally record-credit --to 31              # baseline auto-read from HWM
+                      cctally record-credit --to 31 --dry-run    # preview, write nothing
+                      cctally record-credit --to 31 --yes        # apply without prompting
 
-            Exit codes: 0 success (incl. --dry-run and an interactive decline),
-            2 validation/refuse, 3 on a database error.
-            """
-        ),
+                    Exit codes: 0 success (incl. --dry-run and an interactive decline),
+                    2 validation/refuse, 3 on a database error.
+                    """
+                ),
     )
     rc.add_argument("--to", required=True, type=float,
                     help="New post-credit weekly %% (0-100).")
@@ -1657,36 +1675,43 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Machine output (schemaVersion 1).")
     rc.set_defaults(func=c.cmd_record_credit)
 
-    rfu = sub.add_parser(
-        "refresh-usage",
-        help="Force-fetch 7d/5h percent from OAuth API and record it",
+def _build_refresh_usage_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `refresh-usage` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    rfu = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Force a fresh fetch of seven_day.utilization and five_hour.utilization
-            from Anthropic's OAuth usage API, persist it via the same path
-            record-usage uses (HWM, percent_milestones, weekly_usage_snapshots),
-            and bust the statusline OAuth cache file at
-            /tmp/claude-statusline-usage-cache.json so the next status-line tick
-            also gets fresh data.
+                    """\
+                    Force a fresh fetch of seven_day.utilization and five_hour.utilization
+                    from Anthropic's OAuth usage API, persist it via the same path
+                    record-usage uses (HWM, percent_milestones, weekly_usage_snapshots),
+                    and bust the statusline OAuth cache file at
+                    /tmp/claude-statusline-usage-cache.json so the next status-line tick
+                    also gets fresh data.
 
-            Use this when the displayed 7d percent is stale (e.g., you've
-            been away from Claude Code and the status-line hasn't fired
-            recently). Otherwise the status-line script handles refresh
-            automatically every minute.
-            """
-        ),
+                    Use this when the displayed 7d percent is stale (e.g., you've
+                    been away from Claude Code and the status-line hasn't fired
+                    recently). Otherwise the status-line script handles refresh
+                    automatically every minute.
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              ccusage-refresh-usage                  # one-liner output
-              ccusage-refresh-usage --json | jq .    # scriptable
-              ccusage-refresh-usage --quiet          # silent (exit code only)
+                    """\
+                    Examples:
+                      ccusage-refresh-usage                  # one-liner output
+                      ccusage-refresh-usage --json | jq .    # scriptable
+                      ccusage-refresh-usage --quiet          # silent (exit code only)
 
-            Exit codes: 0 success / 2 no OAuth token / 3 network failure
-            / 4 malformed API response / 5 record-usage internal failure.
-            """
-        ),
+                    Exit codes: 0 success / 2 no OAuth token / 3 network failure
+                    / 4 malformed API response / 5 record-usage internal failure.
+                    """
+                ),
     )
     rfu.add_argument("--json", action="store_true",
                      help="Emit schema_version=1 JSON to stdout instead of one-liner.")
@@ -1698,30 +1723,37 @@ def build_parser() -> argparse.ArgumentParser:
                      help="HTTP timeout in seconds (default: 5.0).")
     rfu.set_defaults(func=c.cmd_refresh_usage)
 
-    pc = sub.add_parser(
-        "cache-report",
-        help="Show daily cache hit rates per model from ccusage data",
+def _build_cache_report_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `cache-report` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    pc = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Query ccusage for daily token breakdown and display cache hit
-            percentages per model. Useful for spotting caching regressions
-            after Claude Code updates.
+                    """\
+                    Query ccusage for daily token breakdown and display cache hit
+                    percentages per model. Useful for spotting caching regressions
+                    after Claude Code updates.
 
-            Cache hit % = cacheReadTokens / (input + cacheCreate + cacheRead)
-            """
-        ),
+                    Cache hit % = cacheReadTokens / (input + cacheCreate + cacheRead)
+                    """
+                ),
         epilog=textwrap.dedent(
-            """\
-            Examples:
-              cctally cache-report
-              cctally cache-report --days 14
-              cctally cache-report --since 2026-04-10 --until 2026-04-18
-              cctally cache-report --by-session --days 14
-              cctally cache-report --by-session --sort cache
-              cctally cache-report --json
-            """
-        ),
+                    """\
+                    Examples:
+                      cctally cache-report
+                      cctally cache-report --days 14
+                      cctally cache-report --since 2026-04-10 --until 2026-04-18
+                      cctally cache-report --by-session --days 14
+                      cctally cache-report --by-session --sort cache
+                      cctally cache-report --json
+                    """
+                ),
     )
     pc.add_argument(
         "--days",
@@ -1802,25 +1834,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
-    # Session A (spec §7.6): ansi_emit=False; existing `--offline` is
-    # skipped by the helper's `_argparse_has_arg` guard (the collision
-    # case spec §7.1.2 calls out explicitly).
     _add_ccusage_alias_args(pc, ansi_emit=False)
     pc.set_defaults(func=c.cmd_cache_report)
 
-    # -- range-cost --
-    rc = sub.add_parser(
-        "range-cost",
-        help="Compute USD cost for a time range from session data",
+def _build_range_cost_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `range-cost` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    rc = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description="Compute USD cost for Claude Code usage between start/end timestamps.",
         epilog=textwrap.dedent("""\
-            Examples:
-              cctally range-cost -s "2026-04-10T10:00:00+03:00"
-              cctally range-cost -s "2026-04-10T10:00:00Z" -e "2026-04-12T10:00:00Z" --breakdown
-              cctally range-cost -s "2026-04-10T10:00:00Z" --json
-              cctally range-cost -s "2026-04-10T10:00:00Z" --total-only
-        """),
+                    Examples:
+                      cctally range-cost -s "2026-04-10T10:00:00+03:00"
+                      cctally range-cost -s "2026-04-10T10:00:00Z" -e "2026-04-12T10:00:00Z" --breakdown
+                      cctally range-cost -s "2026-04-10T10:00:00Z" --json
+                      cctally range-cost -s "2026-04-10T10:00:00Z" --total-only
+                """),
     )
     rc.add_argument(
         "-s", "--start",
@@ -1860,42 +1895,29 @@ def build_parser() -> argparse.ArgumentParser:
         dest="total_only",
         help="Print numeric USD total only.",
     )
-    # Session A (spec §7.6): ansi_emit=False. range-cost has no --tz of
-    # its own (ISO timestamps carry zone info), but the helper-added
-    # -z/--timezone still lands on the namespace; the bridge promotes
-    # it onto args.tz where the rest of the pipeline treats it as a
-    # documented no-op (cmd_range_cost does not consume args.tz).
     _add_ccusage_alias_args(rc, ansi_emit=False)
     rc.set_defaults(func=c.cmd_range_cost)
 
-    # -- blocks --
-    _build_blocks_parser(
-        sub, "blocks",
-        help_text="Show usage report grouped by 5-hour session blocks",
-        xref="Alias of `cctally claude blocks` (the canonical form).")
+def _build_five_hour_blocks_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `five-hour-blocks` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    # -- statusline --
-    _build_statusline_parser(
-        sub, "statusline",
-        help_text="Compact one-line status for Claude Code hooks",
-        xref="Alias of `cctally claude statusline` (the canonical form).")
-
-    # -- five-hour-blocks --
-    fhb = sub.add_parser(
-        "five-hour-blocks",
-        help="List API-anchored 5h blocks with rollup totals + 7d-drift columns",
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    fhb = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
-        description=(
-            "Show usage grouped by API-anchored 5-hour blocks (analytics view, "
-            "distinct from `cctally blocks` upstream-parity drop-in)."
-        ),
+        description="Show usage grouped by API-anchored 5-hour blocks (analytics view, "
+                    "distinct from `cctally blocks` upstream-parity drop-in).",
         epilog=textwrap.dedent("""\
-            Examples:
-              cctally five-hour-blocks
-              cctally five-hour-blocks --since 20260420
-              cctally five-hour-blocks --breakdown model
-              cctally five-hour-blocks --breakdown project --json
-        """),
+                    Examples:
+                      cctally five-hour-blocks
+                      cctally five-hour-blocks --since 20260420
+                      cctally five-hour-blocks --breakdown model
+                      cctally five-hour-blocks --breakdown project --json
+                """),
     )
     _add_since_until_args(
         fhb, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
@@ -1928,20 +1950,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
-    # Session A (spec §7.6 / §7.6.3): ansi_emit=False. fhb already
-    # declares --no-color (refreshed to no-op text in spec §7.6.3); the
-    # helper's --no-color add is short-circuited by the existing-arg
-    # guard. The helper's --color add lands as a parsed-and-ignored
-    # no-op (the renderer emits plain text).
     _add_ccusage_alias_args(fhb, ansi_emit=False)
     _add_mode_arg(fhb, noop=True)
     _add_share_args(fhb)
     fhb.set_defaults(func=c.cmd_five_hour_blocks)
 
-    # -- cache-sync --
-    p_cache_sync = sub.add_parser(
-        "cache-sync",
-        help="Sync (or rebuild) the session-entry cache",
+def _build_cache_sync_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `cache-sync` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    p_cache_sync = subparsers.add_parser(
+        name,
+        help=help_text,
     )
     p_cache_sync.add_argument(
         "--rebuild",
@@ -1962,66 +1985,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cache_sync.set_defaults(func=c.cmd_cache_sync)
 
-    # -- daily --
-    _build_daily_parser(
-        sub, "daily",
-        help_text="Show usage report grouped by date",
-        xref="Alias of `cctally claude daily` (the canonical form).")
+def _build_project_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `project` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    # -- monthly --
-    _build_monthly_parser(
-        sub, "monthly",
-        help_text="Show usage report grouped by month",
-        xref="Alias of `cctally claude monthly` (the canonical form).")
-
-    # -- weekly --
-    _build_weekly_parser(
-        sub, "weekly",
-        help_text="Show usage grouped by subscription week (with Used %% and $/1%%)",
-        xref="Alias of `cctally claude weekly` (the canonical form).")
-
-    # -- codex-daily --
-    _build_codex_daily_parser(
-        sub, "codex-daily",
-        help_text="Show Codex usage report grouped by date (drop-in for `ccusage-codex daily`)",
-        xref="Alias of `cctally codex daily` (the canonical form).")
-
-    # -- codex-monthly --
-    _build_codex_monthly_parser(
-        sub, "codex-monthly",
-        help_text="Show Codex usage grouped by month (drop-in for `ccusage-codex monthly`)",
-        xref="Alias of `cctally codex monthly` (the canonical form).")
-
-    # -- codex-weekly --
-    _build_codex_weekly_parser(
-        sub, "codex-weekly",
-        help_text="Show Codex usage grouped by week (week-start from config.json)",
-        xref="Alias of `cctally codex weekly` (the canonical form).")
-
-    # -- codex-session --
-    _build_codex_session_parser(
-        sub, "codex-session",
-        help_text="Show Codex usage grouped by session (drop-in for `ccusage-codex session`)",
-        xref="Alias of `cctally codex session` (the canonical form).")
-
-    # -- project --
-    p_project = sub.add_parser(
-        "project",
-        help="Roll usage up by project (git-root), with per-project Used %% attribution",
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    p_project = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
-        description=(
-            "Aggregate Claude usage by project (git-root resolved). Default range is "
-            "the current subscription week; use --since/--until or --weeks N to extend."
-        ),
+        description="Aggregate Claude usage by project (git-root resolved). Default range is "
+                    "the current subscription week; use --since/--until or --weeks N to extend.",
         epilog=textwrap.dedent("""\
-            Examples:
-              cctally project
-              cctally project --weeks 4
-              cctally project --since 20260401 --until 20260414
-              cctally project --project ccusage --model sonnet
-              cctally project --breakdown --sort used --order desc
-              cctally project --group full-path --json
-        """),
+                    Examples:
+                      cctally project
+                      cctally project --weeks 4
+                      cctally project --since 20260401 --until 20260414
+                      cctally project --project ccusage --model sonnet
+                      cctally project --breakdown --sort used --order desc
+                      cctally project --group full-path --json
+                """),
     )
     _add_since_until_args(
         p_project, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
@@ -2050,18 +2035,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
                            help="Display timezone: local, utc, or IANA name. "
                                 "Overrides config display.tz for this call.")
-    # Session A (spec §7.6): ansi_emit=True. project is one of the two
-    # real ANSI emitters. The helper skips its --no-color add (already
-    # declared at p_project above) and adds the new bool --color flag
-    # whose precedence flows through _resolve_color_enabled (§7.3).
     _add_ccusage_alias_args(p_project, ansi_emit=True)
     _add_share_args(p_project)
     p_project.set_defaults(func=c.cmd_project)
 
-    # -- diff --
-    diff_p = sub.add_parser(
-        "diff",
-        help="Compare Claude usage between two windows.",
+def _build_diff_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `diff` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    diff_p = subparsers.add_parser(
+        name,
+        help=help_text,
     )
     diff_p.add_argument("--a", required=True,
         help="Window A token (this-week | last-week | Nw-ago | this-month | last-month | Nm-ago | last-Nd | prev-Nd | YYYY-MM-DD..YYYY-MM-DD)")
@@ -2089,34 +2076,24 @@ def build_parser() -> argparse.ArgumentParser:
     diff_p.add_argument("--json", dest="emit_json", action="store_true")
     diff_p.add_argument("--width", type=int, help=argparse.SUPPRESS)
     diff_p.add_argument("--debug-now", action="store_true", help=argparse.SUPPRESS)
-    # Session A (spec §7.6): ansi_emit=True. diff is the other real
-    # ANSI emitter. The helper skips its --no-color add (declared
-    # above) and adds the new bool --color flag wired through
-    # _resolve_color_enabled (§7.3). Note: --debug here collides with
-    # diff's existing `--debug-now` (SUPPRESS'd internal flag) but
-    # `--debug-now` is a different option string; the helper still
-    # adds plain `--debug` cleanly.
     _add_ccusage_alias_args(diff_p, ansi_emit=True)
     diff_p.set_defaults(func=c.cmd_diff)
 
-    # -- session --
-    _build_session_parser(
-        sub, "session",
-        help_text="Show Claude usage grouped by sessionId (merges resumed-across-files sessions)",
-        xref="Alias of `cctally claude session` (the canonical form).")
+def _build_claude_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `claude` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    # --- `claude` subgroup (drop-in for `ccusage claude …`); issue #86 Session B ---
-    # Build-once, register-twice: these reuse the same nine builders as the flat
-    # forms above. Nested subparsers reuse dest="command" so args.command resolves
-    # to the leaf name (e.g. "blocks"), keeping banner suppression byte-identical
-    # to the flat form with zero hook-path changes.
-    claude_p = sub.add_parser(
-        "claude",
-        help="Claude-source reports (drop-in for `ccusage claude …`)",
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    claude_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description="Claude-source usage reports. Each subcommand is a drop-in for the "
-                    "matching `ccusage claude <cmd>` and shares its engine with the "
-                    "top-level `cctally <cmd>` alias.")
+                            "matching `ccusage claude <cmd>` and shares its engine with the "
+                            "top-level `cctally <cmd>` alias.",
+    )
     claude_sub = claude_p.add_subparsers(dest="command", required=True, metavar="<command>")
     _build_daily_parser(claude_sub, "daily",
         help_text="Show usage grouped by date",
@@ -2138,14 +2115,21 @@ def build_parser() -> argparse.ArgumentParser:
         xref="Canonical `cctally claude statusline` (flat alias: `cctally statusline`). "
              "Drop-in for `ccusage statusline` plus cctally extension segments.")
 
-    # --- `codex` subgroup (drop-in for `ccusage codex …`); issue #86 Session B ---
-    codex_p = sub.add_parser(
-        "codex",
-        help="Codex-source reports (drop-in for `ccusage codex …`)",
+def _build_codex_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `codex` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    codex_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description="Codex-source usage reports. daily/monthly/session are drop-ins for "
-                    "`ccusage codex <cmd>`; weekly is a cctally extension. Each shares its "
-                    "engine with the matching `cctally codex-<cmd>` alias.")
+                            "`ccusage codex <cmd>`; weekly is a cctally extension. Each shares its "
+                            "engine with the matching `cctally codex-<cmd>` alias.",
+    )
     codex_sub = codex_p.add_subparsers(dest="command", required=True, metavar="<command>")
     _build_codex_daily_parser(codex_sub, "daily",
         help_text="Show Codex usage grouped by date",
@@ -2161,32 +2145,38 @@ def build_parser() -> argparse.ArgumentParser:
         xref="cctally extension (no upstream `ccusage codex weekly`). Same engine as "
              "`cctally codex-weekly`.")
 
-    # ---- config (persisted user preferences) ----
-    cfg_p = sub.add_parser(
-        "config",
-        help="Get / set / unset persisted user preferences",
+def _build_config_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `config` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    cfg_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent("""\
-            Manage cctally user preferences in ~/.local/share/cctally/config.json.
+                    Manage cctally user preferences in ~/.local/share/cctally/config.json.
 
-            Currently supported keys:
-              display.tz       Display timezone. Values: 'local' (default; host
-                               zone via the OS locale), 'utc', or any IANA name
-                               like 'America/New_York'. Per-call --tz flag on
-                               any subcommand still wins over the persisted value.
-              alerts.enabled   Enable/disable threshold alerts (true/false).
-              dashboard.bind   Host the `dashboard` subcommand binds. Values:
-                               'loopback' (default; binds 127.0.0.1 —
-                               loopback-only), 'lan' (binds 0.0.0.0 —
-                               LAN-accessible), or any literal IP / hostname.
+                    Currently supported keys:
+                      display.tz       Display timezone. Values: 'local' (default; host
+                                       zone via the OS locale), 'utc', or any IANA name
+                                       like 'America/New_York'. Per-call --tz flag on
+                                       any subcommand still wins over the persisted value.
+                      alerts.enabled   Enable/disable threshold alerts (true/false).
+                      dashboard.bind   Host the `dashboard` subcommand binds. Values:
+                                       'loopback' (default; binds 127.0.0.1 —
+                                       loopback-only), 'lan' (binds 0.0.0.0 —
+                                       LAN-accessible), or any literal IP / hostname.
 
-            Examples:
-              cctally config get
-              cctally config get display.tz
-              cctally config set display.tz America/New_York
-              cctally config set dashboard.bind lan
-              cctally config unset dashboard.bind
-        """),
+                    Examples:
+                      cctally config get
+                      cctally config get display.tz
+                      cctally config set display.tz America/New_York
+                      cctally config set dashboard.bind lan
+                      cctally config unset dashboard.bind
+                """),
     )
     cfg_sub = cfg_p.add_subparsers(dest="action", required=True)
     cfg_get = cfg_sub.add_parser("get", help="Print current value(s)")
@@ -2204,36 +2194,42 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_unset.add_argument("key", help="Config key")
     cfg_unset.set_defaults(func=c.cmd_config)
 
-    # ---- telemetry (anonymous install-count opt-out, spec 2026-07-07) ----
-    tele_p = sub.add_parser(
-        "telemetry",
-        help="Show or change anonymous install-count telemetry",
+def _build_telemetry_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `telemetry` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    tele_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent("""\
-            Anonymous install-count telemetry: what it sends, and how to opt out.
+                    Anonymous install-count telemetry: what it sends, and how to opt out.
 
-            cctally sends, at most once a day, a minimal beat: a one-way
-            month-rotating token (never your install id), the client version,
-            and a coarse OS family (macos/linux/windows/other). No IP, no
-            username, no paths, no session content ever leaves the machine.
+                    cctally sends, at most once a day, a minimal beat: a one-way
+                    month-rotating token (never your install id), the client version,
+                    and a coarse OS family (macos/linux/windows/other). No IP, no
+                    username, no paths, no session content ever leaves the machine.
 
-            Actions:
-              (none)   Show the current state, resolved reason, what gets sent,
-                       and the token that would be used this month.
-              on       Enable telemetry (sets telemetry.enabled = true).
-              off      Disable telemetry (sets telemetry.enabled = false).
-              reset    Discard the local install id and mint a fresh one.
+                    Actions:
+                      (none)   Show the current state, resolved reason, what gets sent,
+                               and the token that would be used this month.
+                      on       Enable telemetry (sets telemetry.enabled = true).
+                      off      Disable telemetry (sets telemetry.enabled = false).
+                      reset    Discard the local install id and mint a fresh one.
 
-            It is also disabled by CCTALLY_DISABLE_TELEMETRY=1, the DO_NOT_TRACK
-            convention, and in dev checkouts.
+                    It is also disabled by CCTALLY_DISABLE_TELEMETRY=1, the DO_NOT_TRACK
+                    convention, and in dev checkouts.
 
-            Examples:
-              cctally telemetry
-              cctally telemetry --json
-              cctally telemetry off
-              cctally telemetry on
-              cctally telemetry reset
-        """),
+                    Examples:
+                      cctally telemetry
+                      cctally telemetry --json
+                      cctally telemetry off
+                      cctally telemetry on
+                      cctally telemetry reset
+                """),
     )
     tele_p.add_argument(
         "action", nargs="?", choices=("on", "off", "reset"),
@@ -2245,24 +2241,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tele_p.set_defaults(func=c.cmd_telemetry)
 
-    # ---- alerts (threshold-actions Task 6) ----
-    p_alerts = sub.add_parser(
-        "alerts",
-        help="Manage threshold alerts",
+def _build_alerts_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `alerts` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    p_alerts = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent("""\
-            Manage cctally threshold alerts.
+                    Manage cctally threshold alerts.
 
-            Subcommands:
-              test    Send a synthetic test alert through the dispatch
-                      pipeline (osascript spawn + alerts.log line). Logs
-                      with mode=test so it doesn't pollute real-alert
-                      history.
+                    Subcommands:
+                      test    Send a synthetic test alert through the dispatch
+                              pipeline (osascript spawn + alerts.log line). Logs
+                              with mode=test so it doesn't pollute real-alert
+                              history.
 
-            Examples:
-              cctally alerts test
-              cctally alerts test --axis five-hour --threshold 95
-        """),
+                    Examples:
+                      cctally alerts test
+                      cctally alerts test --axis five-hour --threshold 95
+                """),
     )
     alerts_sub = p_alerts.add_subparsers(dest="alerts_command", required=True)
     p_alerts_test = alerts_sub.add_parser(
@@ -2327,25 +2329,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_alerts_test.set_defaults(func=c.cmd_alerts_test)
 
-    # ---- setup (onboarding spec §2) ----
-    sp = sub.add_parser(
-        "setup",
-        help="Install cctally into Claude Code (hooks + symlinks)",
+def _build_setup_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `setup` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    sp = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Install cctally into Claude Code by adding hook entries to
-            ~/.claude/settings.json (additive, idempotent) and creating
-            user-facing symlinks under ~/.local/bin/.
+                    """\
+                    Install cctally into Claude Code by adding hook entries to
+                    ~/.claude/settings.json (additive, idempotent) and creating
+                    user-facing symlinks under ~/.local/bin/.
 
-            Modes (mutually exclusive):
-              cctally setup                    # install (default)
-              cctally setup --dry-run          # show planned changes, change nothing
-              cctally setup --status           # report current install state
-              cctally setup --uninstall        # remove hooks + symlinks (keep data)
-              cctally setup --uninstall --purge   # also wipe ~/.local/share/cctally/
-            """
-        ),
+                    Modes (mutually exclusive):
+                      cctally setup                    # install (default)
+                      cctally setup --dry-run          # show planned changes, change nothing
+                      cctally setup --status           # report current install state
+                      cctally setup --uninstall        # remove hooks + symlinks (keep data)
+                      cctally setup --uninstall --purge   # also wipe ~/.local/share/cctally/
+                    """
+                ),
     )
     mode = sp.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help="Report current install state")
@@ -2362,8 +2370,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force-dev", action="store_true", dest="force_dev",
                     help="Allow setup to run from a dev checkout (writes "
                          "dev-pointing hooks into ~/.claude/settings.json)")
-    # Legacy bespoke-hook migration flags (install-mode only — see cmd_setup
-    # post-parse validation). Spec Section 2 mode×flag matrix.
     mig_group = sp.add_mutually_exclusive_group()
     mig_group.add_argument(
         "--migrate-legacy-hooks", action="store_true", dest="migrate_legacy_hooks",
@@ -2375,39 +2381,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=c.cmd_setup)
 
-    # ---- db (migration framework — spec §4) ----
-    db_parser = sub.add_parser(
-        "db",
-        help="Migration / DB management (status, skip, unskip)",
+def _build_db_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `db` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    db_parser = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Inspect and manage cctally's SQLite migration state.
+                    """\
+                    Inspect and manage cctally's SQLite migration state.
 
-            Subcommands:
-              status   List migrations + applied/pending/failed/skipped
-                       state across stats.db and cache.db. Glyphs:
-                         ✓ applied   ✗ failed   · pending   ~ skipped
-              skip     Mark a migration as skipped (manual poison-pill
-                       escape — bypass an offending migration).
-              unskip   Remove a skip mark; the migration runs on next
-                       open.
+                    Subcommands:
+                      status   List migrations + applied/pending/failed/skipped
+                               state across stats.db and cache.db. Glyphs:
+                                 ✓ applied   ✗ failed   · pending   ~ skipped
+                      skip     Mark a migration as skipped (manual poison-pill
+                               escape — bypass an offending migration).
+                      unskip   Remove a skip mark; the migration runs on next
+                               open.
 
-            Migration names accept either bare ("003_…") or qualified
-            ("stats.db:003_…" / "cache.db:003_…") forms. Bare names are
-            rejected with exit 2 if the same NNN_… exists in both
-            registries.
+                    Migration names accept either bare ("003_…") or qualified
+                    ("stats.db:003_…" / "cache.db:003_…") forms. Bare names are
+                    rejected with exit 2 if the same NNN_… exists in both
+                    registries.
 
-            Examples:
-              cctally db status
-              cctally db status --json
-              cctally db skip 003_merge_5h_block_duplicates_v1 --reason "perf hot"
-              cctally db unskip stats.db:003_merge_5h_block_duplicates_v1
-            """
-        ),
+                    Examples:
+                      cctally db status
+                      cctally db status --json
+                      cctally db skip 003_merge_5h_block_duplicates_v1 --reason "perf hot"
+                      cctally db unskip stats.db:003_merge_5h_block_duplicates_v1
+                    """
+                ),
     )
     db_sub = db_parser.add_subparsers(dest="db_action", required=True)
-
     db_status = db_sub.add_parser(
         "status",
         help="List migrations + applied/pending/failed/skipped state",
@@ -2418,7 +2429,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit JSON to stdout",
     )
     db_status.set_defaults(func=c.cmd_db_status)
-
     db_skip = db_sub.add_parser(
         "skip",
         help="Mark a migration as skipped",
@@ -2432,7 +2442,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Free-text reason (shown in db status)",
     )
     db_skip.set_defaults(func=c.cmd_db_skip)
-
     db_unskip = db_sub.add_parser(
         "unskip",
         help="Remove a skip mark; migration runs on next open",
@@ -2442,7 +2451,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Migration name (NNN_… or qualified)",
     )
     db_unskip.set_defaults(func=c.cmd_db_unskip)
-
     db_recover = db_sub.add_parser(
         "recover",
         help="Revert a version-ahead DB to the known schema head (#145)",
@@ -2460,27 +2468,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     db_recover.set_defaults(func=c.cmd_db_recover)
 
-    # ─── doctor (Diagnostics) ───────────────────────────────────────────
-    doctor_p = sub.add_parser(
-        "doctor",
-        help="Diagnose data freshness and install state",
+def _build_doctor_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `doctor` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    doctor_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Run all read-only diagnostic checks and emit a report.
+                    """\
+                    Run all read-only diagnostic checks and emit a report.
 
-            Categories: install, hooks, auth, db, data, safety. Each
-            category renders a severity (✓ ok / ⚠ warn / ✗ fail) and
-            actionable remediation guidance for non-OK rows.
+                    Categories: install, hooks, auth, db, data, safety. Each
+                    category renders a severity (✓ ok / ⚠ warn / ✗ fail) and
+                    actionable remediation guidance for non-OK rows.
 
-            Exit code: 0 unless any check is FAIL (then exit 2). WARN
-            rows do not change the exit code — doctor is a read-only
-            diagnostic and warn-class findings are advisories.
+                    Exit code: 0 unless any check is FAIL (then exit 2). WARN
+                    rows do not change the exit code — doctor is a read-only
+                    diagnostic and warn-class findings are advisories.
 
-            See docs/commands/doctor.md for the full check inventory
-            and JSON schema reference.
-            """
-        ),
+                    See docs/commands/doctor.md for the full check inventory
+                    and JSON schema reference.
+                    """
+                ),
     )
     doctor_p.add_argument(
         "--json", action="store_true",
@@ -2497,40 +2511,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor_p.set_defaults(func=c.cmd_doctor)
 
-    # ---- pricing-check (standalone diagnostic — NOT under claude/codex) ----
-    pc_p = sub.add_parser(
-        "pricing-check",
-        help="Detect stale or missing embedded model pricing",
+def _build_pricing_check_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `pricing-check` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    pc_p = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Check whether cctally's embedded model pricing is stale or
-            missing, across three independently-degrading legs:
+                    """\
+                    Check whether cctally's embedded model pricing is stale or
+                    missing, across three independently-degrading legs:
 
-              • coverage  (offline, all-history) — models in your cached
-                session data that cctally cannot price (Claude $0) or only
-                approximates (Codex gpt-5 fallback).
-              • drift     (network, LiteLLM) — embedded price values vs the
-                LiteLLM snapshot (direction-aware; allowlist-suppressed).
-              • existence (network, Anthropic /v1/models) — vendor models the
-                API offers that our table lacks. Maintainer-local (needs
-                OAuth); degrades to skipped/degraded otherwise.
+                      • coverage  (offline, all-history) — models in your cached
+                        session data that cctally cannot price (Claude $0) or only
+                        approximates (Codex gpt-5 fallback).
+                      • drift     (network, LiteLLM) — embedded price values vs the
+                        LiteLLM snapshot (direction-aware; allowlist-suppressed).
+                      • existence (network, Anthropic /v1/models) — vendor models the
+                        API offers that our table lacks. Maintainer-local (needs
+                        OAuth); degrades to skipped/degraded otherwise.
 
-            Exit codes:
-              0 — no actionable findings (fully clean, OR partially/fully
-                  network-degraded but nothing actionable; --json still
-                  carries "status":"degraded").
-              1 — any actionable finding (a coverage gap, value drift,
-                  missing-from-us, or an existence gap) — EVEN IF a network
-                  leg degraded. Findings always win over degradation.
-              2 — argument/usage error.
+                    Exit codes:
+                      0 — no actionable findings (fully clean, OR partially/fully
+                          network-degraded but nothing actionable; --json still
+                          carries "status":"degraded").
+                      1 — any actionable finding (a coverage gap, value drift,
+                          missing-from-us, or an existence gap) — EVEN IF a network
+                          leg degraded. Findings always win over degradation.
+                      2 — argument/usage error.
 
-            "status" (ok|degraded) reports check completeness; the exit code
-            reports whether you must act. They are orthogonal.
+                    "status" (ok|degraded) reports check completeness; the exit code
+                    reports whether you must act. They are orthogonal.
 
-            See docs/commands/pricing-check.md for the JSON schema.
-            """
-        ),
+                    See docs/commands/pricing-check.md for the JSON schema.
+                    """
+                ),
     )
     pc_p.add_argument(
         "--json", action="store_true",
@@ -2542,24 +2562,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pc_p.set_defaults(func=c.cmd_pricing_check)
 
-    # `release` is its own standalone entry-point (bin/cctally-release);
-    # no `release` subparser is registered on the main `cctally` CLI.
-    # See docs/RELEASE.md.
+def _build_hook_tick_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `hook-tick` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    # ---- hook-tick (internal — hidden from --help, see onboarding spec §3) ----
-    ht = sub.add_parser(
-        "hook-tick",
-        help=argparse.SUPPRESS,
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    ht = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Internal subcommand invoked by Claude Code hooks.
+                    """\
+                    Internal subcommand invoked by Claude Code hooks.
 
-            Reads CC's hook payload from stdin, runs sync_cache, and
-            conditionally refreshes the OAuth usage cache (throttled).
-            Returns 0 unconditionally in normal mode.
-            """
-        ),
+                    Reads CC's hook payload from stdin, runs sync_cache, and
+                    conditionally refreshes the OAuth usage cache (throttled).
+                    Returns 0 unconditionally in normal mode.
+                    """
+                ),
     )
     ht.add_argument("--explain", action="store_true",
                     help="Run synchronously, print decision tree, exit informative code")
@@ -2574,42 +2596,52 @@ def build_parser() -> argparse.ArgumentParser:
                     help=argparse.SUPPRESS)  # JSON string fed to mock fetch (tests only)
     ht.set_defaults(func=c.cmd_hook_tick)
 
-    # ---- __preview (internal — maintainer-local preview channel) ----
-    # The preview modules are maintainer-only (excluded from the public
-    # mirror). On a public build `c.cmd_preview` is None — its load in
-    # bin/cctally is wrapped in a tolerant try/except — so skip registering
-    # the hidden subcommand entirely rather than wiring a None handler.
-    if getattr(c, "cmd_preview", None) is not None:
-        pv = sub.add_parser("__preview", help=argparse.SUPPRESS,
-                            formatter_class=CLIHelpFormatter,
-                            description="Internal: provision/manage the preview-channel data dir.")
-        pv_sub = pv.add_subparsers(dest="action", required=True)
-        pv_ensure = pv_sub.add_parser("ensure", help=argparse.SUPPRESS)
-        pv_ensure.add_argument("--no-refresh", action="store_true")
-        pv_ensure.add_argument("--reseed", action="store_true")
-        pv_ensure.set_defaults(func=c.cmd_preview)
-        pv_clean = pv_sub.add_parser("clean", help=argparse.SUPPRESS)
-        pv_clean.add_argument("--dry-run", action="store_true")
-        pv_clean.set_defaults(func=c.cmd_preview)
-        pv_status = pv_sub.add_parser("status", help=argparse.SUPPRESS)
-        pv_status.set_defaults(func=c.cmd_preview)
+def _build_preview_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `__preview` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    # ---- update (user-facing self-update subcommand; spec §4) ----
-    sub_update = sub.add_parser(
-        "update",
-        help="Update cctally to the latest version",
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    pv = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description="Internal: provision/manage the preview-channel data dir.",
+    )
+    pv_sub = pv.add_subparsers(dest="action", required=True)
+    pv_ensure = pv_sub.add_parser("ensure", help=argparse.SUPPRESS)
+    pv_ensure.add_argument("--no-refresh", action="store_true")
+    pv_ensure.add_argument("--reseed", action="store_true")
+    pv_ensure.set_defaults(func=c.cmd_preview)
+    pv_clean = pv_sub.add_parser("clean", help=argparse.SUPPRESS)
+    pv_clean.add_argument("--dry-run", action="store_true")
+    pv_clean.set_defaults(func=c.cmd_preview)
+    pv_status = pv_sub.add_parser("status", help=argparse.SUPPRESS)
+    pv_status.set_defaults(func=c.cmd_preview)
+
+def _build_update_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `update` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    sub_update = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Update cctally to the latest version (npm/brew installs only).
+                    """\
+                    Update cctally to the latest version (npm/brew installs only).
 
-            Modes:
-              cctally update                 install the latest version
-              cctally update --check         show update info without installing
-              cctally update --skip [VER]    don't remind about VER (default: latest)
-              cctally update --remind-later [DAYS]  defer the banner (default: 7)
-            """
-        ),
+                    Modes:
+                      cctally update                 install the latest version
+                      cctally update --check         show update info without installing
+                      cctally update --skip [VER]    don't remind about VER (default: latest)
+                      cctally update --remind-later [DAYS]  defer the banner (default: 7)
+                    """
+                ),
     )
     update_modes = sub_update.add_mutually_exclusive_group()
     update_modes.add_argument(
@@ -2626,14 +2658,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Defer reminders by N days (default: 7)",
     )
-    # `--version` here is local to the update subparser. The subparser's
-    # value is bound to `args.install_version` (NOT `args.version`) to
-    # avoid a namespace collision with the top-level `--version`
-    # (store_true) flag handled in `main()` before subcommand dispatch:
-    # if both used `dest="version"`, `cctally update --version 1.2.3`
-    # would set `args.version="1.2.3"`, which `main()`'s truthy check
-    # would treat as "global --version requested" and short-circuit to
-    # print the version banner before `cmd_update` ever ran.
     sub_update.add_argument(
         "--version", metavar="X.Y.Z", default=None, dest="install_version",
         help="Install a specific version (npm only; brew has no versioned formulae)",
@@ -2652,71 +2676,184 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_update.set_defaults(func=c.cmd_update)
 
-    # ---- _update-check (internal — hidden, detached-refresh worker for `cctally update`) ----
-    uc = sub.add_parser(
-        "_update-check",
-        help=argparse.SUPPRESS,
+def _build_update_check_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_update-check` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    uc = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Internal subcommand: detached version-check worker spawned
-            by `cctally update` (spec §3.6). Touches the throttle
-            marker, fetches the latest version from npm or homebrew
-            depending on install method, and writes update-state.json.
-            Always returns 0; failures are logged to update.log.
-            """
-        ),
+                    """\
+                    Internal subcommand: detached version-check worker spawned
+                    by `cctally update` (spec §3.6). Touches the throttle
+                    marker, fetches the latest version from npm or homebrew
+                    depending on install method, and writes update-state.json.
+                    Always returns 0; failures are logged to update.log.
+                    """
+                ),
     )
     uc.set_defaults(func=c.cmd_update_check_internal)
 
-    # ---- _telemetry-beat (internal — hidden, detached anonymous install-count worker) ----
-    tb = sub.add_parser(
-        "_telemetry-beat",
-        help=argparse.SUPPRESS,
+def _build_telemetry_beat_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_telemetry-beat` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    tb = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Internal subcommand: detached anonymous install-count beat
-            worker, spawned broad-but-throttled from
-            `_post_command_update_hooks` (spec 2026-07-07). A dedicated
-            worker, decoupled from `_update-check` — it touches only the
-            telemetry markers, never update-check state. Honours every
-            opt-out (CCTALLY_DISABLE_TELEMETRY / DO_NOT_TRACK / config /
-            dev checkout) via `resolve_telemetry_state`. Always returns 0;
-            failures are swallowed.
-            """
-        ),
+                    """\
+                    Internal subcommand: detached anonymous install-count beat
+                    worker, spawned broad-but-throttled from
+                    `_post_command_update_hooks` (spec 2026-07-07). A dedicated
+                    worker, decoupled from `_update-check` — it touches only the
+                    telemetry markers, never update-check state. Honours every
+                    opt-out (CCTALLY_DISABLE_TELEMETRY / DO_NOT_TRACK / config /
+                    dev checkout) via `resolve_telemetry_state`. Always returns 0;
+                    failures are swallowed.
+                    """
+                ),
     )
     tb.set_defaults(func=c.cmd_telemetry_beat_internal)
 
-    # ---- repair-symlinks (internal — hidden; npm-postinstall self-heal, issue #114) ----
-    rs = sub.add_parser(
-        "repair-symlinks",
-        help=argparse.SUPPRESS,
+def _build_repair_symlinks_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `repair-symlinks` parser (registered via _REGISTRATION; #279 S6 W3).
+
+    Move-only extraction of the former inline build_parser() block;
+    call-time `c = _cctally()` binding, --help bytes unchanged.
+    """
+    c = _cctally()
+    rs = subparsers.add_parser(
+        name,
+        help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Internal subcommand: additively create any missing
-            ~/.local/bin/ symlinks for cctally subcommands (issue #114).
+                    """\
+                    Internal subcommand: additively create any missing
+                    ~/.local/bin/ symlinks for cctally subcommands (issue #114).
 
-            Invoked best-effort by the npm postinstall on upgrade so new
-            cctally-* binaries become reachable without re-running
-            `cctally setup`. Gated to existing installs (>=1 symlink
-            already present); a fresh install is a silent no-op. Touches
-            only symlinks — no hooks, settings.json, or cache. Refuses
-            from a dev checkout.
-            """
-        ),
+                    Invoked best-effort by the npm postinstall on upgrade so new
+                    cctally-* binaries become reachable without re-running
+                    `cctally setup`. Gated to existing installs (>=1 symlink
+                    already present); a fresh install is a silent no-op. Touches
+                    only symlinks — no hooks, settings.json, or cache. Refuses
+                    from a dev checkout.
+                    """
+                ),
     )
     rs.set_defaults(func=c.cmd_repair_symlinks)
 
-    # Python 3.14 leaks `==SUPPRESS==` for hidden subparsers in --help; strip
-    # the pseudo-action so the row disappears entirely. (The choice still
-    # appears in the `{...}` choices header — there's no clean way to hide
-    # that without a custom formatter, and it's harmless.)
+
+class _Reg(NamedTuple):
+    name: str
+    builder: object
+    help_text: object
+    xref: object
+    predicate: object
+
+
+_REGISTRATION = (
+    _Reg('sync-week', _build_sync_week_parser, "Compute weekly cost from session data and store in SQLite", None, None),
+    _Reg('report', _build_report_parser, "Show current and trend dollars-per-1%% statistics", None, None),
+    _Reg('forecast', _build_forecast_parser, "Project current-week usage to reset; show daily budgets", None, None),
+    _Reg('budget', _build_budget_parser, "Weekly equivalent-$ budget + pace + spend alerts", None, None),
+    _Reg('percent-breakdown', _build_percent_breakdown_parser, "Show per-percent cost milestones for a week", None, None),
+    _Reg('five-hour-breakdown', _build_five_hour_breakdown_parser, "Per-percent milestones inside one 5h block (mirror of percent-breakdown)", None, None),
+    _Reg('tui', _build_tui_parser, "Live refreshing dashboard (current week, forecast, trend, sessions)", None, None),
+    _Reg('dashboard', _build_dashboard_parser, "Launch the live web dashboard on http://localhost:8789", None, None),
+    _Reg('record-usage', _build_record_usage_parser, "Record usage data from Claude Code status line", None, None),
+    _Reg('record-credit', _build_record_credit_parser, "Record an in-place weekly credit the auto-detector misses", None, None),
+    _Reg('refresh-usage', _build_refresh_usage_parser, "Force-fetch 7d/5h percent from OAuth API and record it", None, None),
+    _Reg('cache-report', _build_cache_report_parser, "Show daily cache hit rates per model from ccusage data", None, None),
+    _Reg('range-cost', _build_range_cost_parser, "Compute USD cost for a time range from session data", None, None),
+    _Reg('blocks', _build_blocks_parser, "Show usage report grouped by 5-hour session blocks", "Alias of `cctally claude blocks` (the canonical form).", None),
+    _Reg('statusline', _build_statusline_parser, "Compact one-line status for Claude Code hooks", "Alias of `cctally claude statusline` (the canonical form).", None),
+    _Reg('five-hour-blocks', _build_five_hour_blocks_parser, "List API-anchored 5h blocks with rollup totals + 7d-drift columns", None, None),
+    _Reg('cache-sync', _build_cache_sync_parser, "Sync (or rebuild) the session-entry cache", None, None),
+    _Reg('daily', _build_daily_parser, "Show usage report grouped by date", "Alias of `cctally claude daily` (the canonical form).", None),
+    _Reg('monthly', _build_monthly_parser, "Show usage report grouped by month", "Alias of `cctally claude monthly` (the canonical form).", None),
+    _Reg('weekly', _build_weekly_parser, "Show usage grouped by subscription week (with Used %% and $/1%%)", "Alias of `cctally claude weekly` (the canonical form).", None),
+    _Reg('codex-daily', _build_codex_daily_parser, "Show Codex usage report grouped by date (drop-in for `ccusage-codex daily`)", "Alias of `cctally codex daily` (the canonical form).", None),
+    _Reg('codex-monthly', _build_codex_monthly_parser, "Show Codex usage grouped by month (drop-in for `ccusage-codex monthly`)", "Alias of `cctally codex monthly` (the canonical form).", None),
+    _Reg('codex-weekly', _build_codex_weekly_parser, "Show Codex usage grouped by week (week-start from config.json)", "Alias of `cctally codex weekly` (the canonical form).", None),
+    _Reg('codex-session', _build_codex_session_parser, "Show Codex usage grouped by session (drop-in for `ccusage-codex session`)", "Alias of `cctally codex session` (the canonical form).", None),
+    _Reg('project', _build_project_parser, "Roll usage up by project (git-root), with per-project Used %% attribution", None, None),
+    _Reg('diff', _build_diff_parser, "Compare Claude usage between two windows.", None, None),
+    _Reg('session', _build_session_parser, "Show Claude usage grouped by sessionId (merges resumed-across-files sessions)", "Alias of `cctally claude session` (the canonical form).", None),
+    _Reg('claude', _build_claude_parser, "Claude-source reports (drop-in for `ccusage claude …`)", None, None),
+    _Reg('codex', _build_codex_parser, "Codex-source reports (drop-in for `ccusage codex …`)", None, None),
+    _Reg('config', _build_config_parser, "Get / set / unset persisted user preferences", None, None),
+    _Reg('telemetry', _build_telemetry_parser, "Show or change anonymous install-count telemetry", None, None),
+    _Reg('alerts', _build_alerts_parser, "Manage threshold alerts", None, None),
+    _Reg('setup', _build_setup_parser, "Install cctally into Claude Code (hooks + symlinks)", None, None),
+    _Reg('db', _build_db_parser, "Migration / DB management (status, skip, unskip)", None, None),
+    _Reg('doctor', _build_doctor_parser, "Diagnose data freshness and install state", None, None),
+    _Reg('pricing-check', _build_pricing_check_parser, "Detect stale or missing embedded model pricing", None, None),
+    _Reg('hook-tick', _build_hook_tick_parser, argparse.SUPPRESS, None, None),
+    _Reg('__preview', _build_preview_parser, argparse.SUPPRESS, None, lambda c: getattr(c, "cmd_preview", None) is not None),
+    _Reg('update', _build_update_parser, "Update cctally to the latest version", None, None),
+    _Reg('_update-check', _build_update_check_parser, argparse.SUPPRESS, None, None),
+    _Reg('_telemetry-beat', _build_telemetry_beat_parser, argparse.SUPPRESS, None, None),
+    _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    c = _cctally()
+    p = argparse.ArgumentParser(
+        prog="cctally",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Track Claude subscription weekly usage percent and weekly cost
+            in a local SQLite database.
+
+            Data flow:
+              1) Claude Code status line captures rate limit data after each API call.
+              2) record-usage stores usage snapshots and triggers percent milestones.
+              3) sync-week computes weekly USD cost from Claude Code session data.
+              4) report computes dollars per 1% and shows trend history.
+            """
+        ),
+        epilog=textwrap.dedent(
+            """\
+            Quick start:
+              # Add record-usage call to ~/.claude/statusline-command.sh (see record-usage --help)
+              cctally sync-week
+              cctally report
+            """
+        ),
+    )
+    p.add_argument(
+        "-v", "--version",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print cctally version (from CHANGELOG.md latest release header) and exit",
+    )
+    sub = p.add_subparsers(
+        dest="command",
+        required=False,
+        title="commands",
+        metavar="<command>",
+    )
+
+    for _reg in _REGISTRATION:
+        if _reg.predicate is not None and not _reg.predicate(c):
+            continue
+        _reg.builder(sub, _reg.name, help_text=_reg.help_text, xref=_reg.xref)
+
     sub._choices_actions = [
         a for a in getattr(sub, "_choices_actions", [])
         if getattr(a, "help", None) is not argparse.SUPPRESS
     ]
-
     return p
+
