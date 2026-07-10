@@ -267,7 +267,6 @@ import dataclasses
 import datetime as dt
 import io
 import json
-import math
 import os
 import pathlib
 import queue
@@ -340,7 +339,6 @@ from _cctally_core import (
     _get_alerts_config,
     _AlertsConfigError,
     _get_budget_config,
-    _budget_alerts_active,
     _BudgetConfigError,
 )
 from _lib_display_tz import (
