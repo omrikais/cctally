@@ -175,6 +175,15 @@ def create_stats_db(path: Path) -> None:
       * five_hour_block_models   (per-(block, model) rollup-child)
       * five_hour_block_projects (per-(block, project_path) rollup-child)
       * schema_migrations        (durable migration-completion marker)
+      * schema_migrations_skipped (poison-pill skip sibling)
+
+    Framework-untracked plain-CREATE tables (mirrored from _cctally_core.py so
+    an in-tree fixture opened by a real command doesn't silently CREATE them):
+      * project_budget_milestones (per-project equiv-$ budget crossings, #19/#121)
+      * weekly_credit_floors      (in-place weekly partial-credit floor, #209)
+
+    week_reset_events carries observed_pre_credit_pct (record-credit M2) to
+    match production head.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -250,6 +259,7 @@ def create_stats_db(path: Path) -> None:
                 old_week_end_at        TEXT NOT NULL,
                 new_week_end_at        TEXT NOT NULL,
                 effective_reset_at_utc TEXT NOT NULL,
+                observed_pre_credit_pct REAL,
                 UNIQUE(old_week_end_at, new_week_end_at)
             );
 
@@ -364,6 +374,18 @@ def create_stats_db(path: Path) -> None:
                 applied_at_utc   TEXT NOT NULL
             );
 
+            -- schema_migrations_skipped: poison-pill skip sibling. Created by
+            -- the dispatcher (_run_pending_migrations) in production alongside
+            -- schema_migrations, so a fully-opened stats.db always has both.
+            -- Mirrored here for framework-table symmetry with create_cache_db
+            -- (which already ships it) — keeps an in-tree fixture opened by a
+            -- real command from silently CREATE-ing it.
+            CREATE TABLE schema_migrations_skipped (
+                name             TEXT PRIMARY KEY,
+                skipped_at_utc   TEXT NOT NULL,
+                reason           TEXT
+            );
+
             CREATE TABLE five_hour_block_models (
                 id                          INTEGER PRIMARY KEY AUTOINCREMENT,
                 block_id                    INTEGER NOT NULL,
@@ -401,6 +423,41 @@ def create_stats_db(path: Path) -> None:
                 ON five_hour_block_projects(block_id);
             CREATE INDEX idx_five_hour_block_projects_window
                 ON five_hour_block_projects(five_hour_window_key);
+
+            -- project_budget_milestones: per-project equiv-$ budget crossings
+            -- (issue #19/#121). Framework-untracked plain-CREATE table in
+            -- production (_cctally_core.py) — no migration handler, no
+            -- user_version bump. Mirrored here so a fixture stats.db opened by
+            -- a real `cctally` command doesn't silently CREATE it and dirty an
+            -- in-tree fixture. Empty in fixtures unless a builder seeds it.
+            CREATE TABLE project_budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                project_key     TEXT    NOT NULL,
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                UNIQUE(week_start_at, project_key, threshold)
+            );
+
+            -- weekly_credit_floors: in-place weekly partial-credit floor
+            -- (issue #209, record-credit M2). Framework-untracked plain-CREATE
+            -- table in production (_cctally_core.py) — no migration handler, no
+            -- user_version bump. Mirrored here for the same in-tree byte-stability
+            -- reason as project_budget_milestones above. Consumed by
+            -- `_reset_aware_floor` (UNION with week_reset_events); empty in
+            -- fixtures unless a builder seeds it.
+            CREATE TABLE weekly_credit_floors (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date         TEXT    NOT NULL,
+                effective_at_utc        TEXT    NOT NULL,
+                observed_pre_credit_pct REAL    NOT NULL,
+                applied_at_utc          TEXT    NOT NULL,
+                UNIQUE(week_start_date, effective_at_utc)
+            );
         """)
 
 
@@ -426,12 +483,19 @@ def _self_test_create_stats_db() -> None:
             "percent_milestones", "week_reset_events",
             "five_hour_blocks", "five_hour_milestones",
             "budget_milestones", "projected_milestones",
+            "project_budget_milestones", "weekly_credit_floors",
             "five_hour_reset_events",
             "five_hour_block_models", "five_hour_block_projects",
-            "schema_migrations",
+            "schema_migrations", "schema_migrations_skipped",
         }
         missing = expected - tables
         assert not missing, f"missing tables: {missing}"
+        # Column-presence check — week_reset_events.observed_pre_credit_pct
+        # (record-credit M2) is the known drift this head-sync closes.
+        wre_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(week_reset_events)")}
+        assert "observed_pre_credit_pct" in wre_cols, \
+            "week_reset_events.observed_pre_credit_pct missing (drift vs _cctally_core)"
     print("OK: create_stats_db")
 
 
@@ -712,6 +776,43 @@ def seed_weekly_usage_snapshot(
     )
 
 
+def seed_weekly_cost_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    captured_at_utc: str,
+    week_start_date: str,
+    week_end_date: str,
+    cost_usd: float,
+    week_start_at: Optional[str] = None,
+    week_end_at: Optional[str] = None,
+    range_start_iso: Optional[str] = None,
+    range_end_iso: Optional[str] = None,
+    source: str = "cctally-range-cost",
+    mode: str = "auto",
+    project: Optional[str] = None,
+) -> None:
+    """Insert a weekly_cost_snapshots row (sibling of
+    seed_weekly_usage_snapshot).
+
+    `report` (a.k.a. `dollar-per-percent`) joins weekly_usage_snapshots +
+    weekly_cost_snapshots per week window to build its $/1% trend table, so a
+    report fixture must seed BOTH. Set `week_start_at` / `week_end_at` (the
+    default None) to exercise the ISO-match vs date-only-fallback join paths —
+    same posture as the usage seeder. `cost_usd` is the snapshotted cost (report
+    reads the snapshot value, unlike `weekly`, which recomputes from
+    session_entries)."""
+    conn.execute(
+        """INSERT INTO weekly_cost_snapshots
+           (captured_at_utc, week_start_date, week_end_date,
+            week_start_at, week_end_at, range_start_iso, range_end_iso,
+            cost_usd, source, mode, project)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (captured_at_utc, week_start_date, week_end_date,
+         week_start_at, week_end_at, range_start_iso, range_end_iso,
+         cost_usd, source, mode, project),
+    )
+
+
 def seed_week_reset_event(
     conn: sqlite3.Connection,
     *,
@@ -877,6 +978,32 @@ def _self_test_weekly_usage_seeder() -> None:
         assert rows[1] == ("2026-04-13", 42.5, "2026-04-13T15:00:00Z", 7.25, 1776628800), \
             f"row 1 mismatch: {rows[1]}"
     print("OK: weekly_usage seeder")
+
+
+def _self_test_weekly_cost_seeder() -> None:
+    """Verify seed_weekly_cost_snapshot round-trips fields + defaults."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "stats.db"
+        create_stats_db(db)
+        with sqlite3.connect(db) as conn:
+            seed_weekly_cost_snapshot(
+                conn,
+                captured_at_utc="2026-04-15T12:00:00Z",
+                week_start_date="2026-04-13",
+                week_end_date="2026-04-20",
+                week_start_at="2026-04-13T15:00:00Z",
+                week_end_at="2026-04-20T15:00:00Z",
+                cost_usd=12.34,
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT week_start_date, cost_usd, week_start_at, source, mode "
+                "FROM weekly_cost_snapshots"
+            ).fetchone()
+        assert row == ("2026-04-13", 12.34, "2026-04-13T15:00:00Z",
+                       "cctally-range-cost", "auto"), f"row mismatch: {row}"
+    print("OK: weekly_cost seeder")
 
 
 def _self_test_codex_seeders() -> None:
@@ -1116,6 +1243,7 @@ if __name__ == "__main__":
     _self_test_create_cache_db()
     _self_test_claude_seeders()
     _self_test_weekly_usage_seeder()
+    _self_test_weekly_cost_seeder()
     _self_test_codex_seeders()
     _self_test_emit_streaming_pair()
     print("all self-tests passed")

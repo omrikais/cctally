@@ -2088,6 +2088,16 @@ def _build_claude_parser(subparsers, name, *, help_text, xref=None):
 
     Move-only extraction of the former inline build_parser() block;
     call-time `c = _cctally()` binding, --help bytes unchanged.
+
+    Build-once, register-twice: reuses the same leaf builders as the flat
+    forms. The nested subparsers deliberately reuse dest="command" so
+    args.command resolves to the LEAF name (e.g. "blocks") — this
+    leaf-collapse keeps `_recompute_banner_should_emit` (_cctally_db.py,
+    raw sys.argv routing that hardcodes claude/codex as the only
+    subgroups) and `_post_command_update_hooks` (bin/cctally)
+    byte-identical between flat and nested forms. Pinned by
+    tests/test_subgroup_routing.py; adding a new subgroup means updating
+    that raw-argv routing too.
     """
     c = _cctally()
     claude_p = subparsers.add_parser(
@@ -2124,6 +2134,11 @@ def _build_codex_parser(subparsers, name, *, help_text, xref=None):
 
     Move-only extraction of the former inline build_parser() block;
     call-time `c = _cctally()` binding, --help bytes unchanged.
+
+    Same build-once/register-twice + dest="command" leaf-collapse coupling
+    as `_build_claude_parser` — see its docstring for the
+    `_recompute_banner_should_emit` / `_post_command_update_hooks`
+    cross-reference.
     """
     c = _cctally()
     codex_p = subparsers.add_parser(
