@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "daily": [
     {
       "date": "2026-05-20",

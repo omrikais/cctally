@@ -6,6 +6,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Reporting `--json` output now carries a `schemaVersion: 1` key (rendered first) so downstream consumers can version-gate against the payload shape; this session adds it to `daily`/`daily --instances`/`monthly`/`weekly`/`session` and the Codex `codex-daily`/`codex-monthly`/`codex-weekly`/`codex-session` reports, including their empty-result forms. Existing keys are unchanged and consumers should tolerate unknown keys (#279).
 - The cache sync now counts JSONL lines it can't parse (malformed) or has to drift-skip (usage/model/timestamp no longer parse), per vendor, and surfaces them on the `cache-sync` done lines, the hook-tick log line, and a new `cctally doctor` "Ingest parse health" check — so a Claude Code / Codex session-format change that would silently affect your cost numbers becomes visible instead of vanishing (#279).
 - `CCTALLY_DEBUG=1` now makes `cctally` print the full Python traceback on stderr when a command crashes (default output is unchanged), and `CCTALLY_DEBUG_LOG=<path>` additionally appends the backend log to a file — so a bug is reportable without editing source (#279).
 - The dashboard now logs server errors (HTTP 500) to the terminal running it, instead of swallowing them silently; routine client errors and the per-request access log stay quiet (#279).

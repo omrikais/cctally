@@ -1,1 +1,1 @@
-{"monthly":[],"totals":null}
+{"schemaVersion":1,"monthly":[],"totals":null}

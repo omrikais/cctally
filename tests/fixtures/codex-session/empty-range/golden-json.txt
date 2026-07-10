@@ -1,1 +1,1 @@
-{"sessions":[],"totals":null}
+{"schemaVersion":1,"sessions":[],"totals":null}

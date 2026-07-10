@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "weekly": [
     {
       "week": "2026-04-13",

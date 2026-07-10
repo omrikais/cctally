@@ -152,7 +152,8 @@ def test_bucket_by_project_to_json_shape_and_order():
     groups = [("app (work)", [_bucket("2026-05-20", 9.0)]),
               ("lib", [_bucket("2026-05-20", 0.5)])]
     out = json.loads(render._bucket_by_project_to_json(groups, date_key="date"))
-    assert list(out.keys()) == ["projects", "totals"]
+    assert list(out.keys()) == ["schemaVersion", "projects", "totals"]
+    assert out["schemaVersion"] == 1
     # Keys preserve caller (cost-desc) order.
     assert list(out["projects"].keys()) == ["app (work)", "lib"]
     assert out["projects"]["app (work)"][0]["date"] == "2026-05-20"

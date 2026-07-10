@@ -100,6 +100,11 @@ _short_model_name = _lib_pricing._short_model_name
 _lib_display_tz = _load_lib("_lib_display_tz")
 _resolve_tz = _lib_display_tz._resolve_tz
 
+# JSON wire-format kernel — the additive camelCase schemaVersion stamp
+# (#279 S6 W1; convention docs/cli-contract.md).
+_lib_json_envelope = _load_lib("_lib_json_envelope")
+stamp_schema_version = _lib_json_envelope.stamp_schema_version
+
 # fmt/color/table primitives honest-imported from _lib_fmt (#126 C11)
 _lib_fmt = _load_lib("_lib_fmt")
 _supports_color_stdout = _lib_fmt._supports_color_stdout
@@ -812,7 +817,8 @@ def _bucket_to_json(
     """
     bucket_list = [_daily_row_dict(d, date_key=date_key) for d in buckets]
     totals = _bucket_totals_dict(buckets)
-    return json.dumps({list_key: bucket_list, "totals": totals}, indent=2)
+    payload = stamp_schema_version({list_key: bucket_list, "totals": totals})
+    return json.dumps(payload, indent=2)
 
 
 def _bucket_by_project_to_json(project_groups, *, date_key: str = "date") -> str:
@@ -825,10 +831,9 @@ def _bucket_by_project_to_json(project_groups, *, date_key: str = "date") -> str
     for label, buckets in project_groups:
         projects[label] = [_daily_row_dict(b, date_key=date_key) for b in buckets]
         all_buckets.extend(buckets)
-    return json.dumps(
-        {"projects": projects, "totals": _bucket_totals_dict(all_buckets)},
-        indent=2,
-    )
+    payload = stamp_schema_version(
+        {"projects": projects, "totals": _bucket_totals_dict(all_buckets)})
+    return json.dumps(payload, indent=2)
 
 
 def _weekly_to_json(
@@ -912,7 +917,7 @@ def _weekly_to_json(
             "totalCost": tot_cost,
         },
     }
-    return json.dumps(payload, indent=2)
+    return json.dumps(stamp_schema_version(payload), indent=2)
 
 
 def _daily_compact_split(bucket: str) -> str:
@@ -976,7 +981,8 @@ def _emit_codex_no_data(args: argparse.Namespace, list_key: str) -> None:
     filter_applied = bool(getattr(args, "since", None) or getattr(args, "until", None))
     if getattr(args, "json", False):
         # Compact separators to match Node's `JSON.stringify(obj)` output exactly.
-        print(json.dumps({list_key: [], "totals": None}, separators=(",", ":")))
+        print(json.dumps(stamp_schema_version({list_key: [], "totals": None}),
+                         separators=(",", ":")))
     else:
         if filter_applied:
             print("No Codex usage data found for provided filters.")
@@ -1056,7 +1062,8 @@ def _codex_bucket_to_json(
         "totalTokens": tot_tokens,
         "costUSD": tot_cost,
     }
-    return json.dumps({list_key: bucket_list, "totals": totals}, indent=2)
+    payload = stamp_schema_version({list_key: bucket_list, "totals": totals})
+    return json.dumps(payload, indent=2)
 
 
 def _codex_root_short_labels(roots: list[str]) -> list[str]:
@@ -1161,7 +1168,8 @@ def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
         "totalTokens": tot_tokens,
         "costUSD": tot_cost,
     }
-    return json.dumps({"sessions": session_list, "totals": totals}, indent=2)
+    payload = stamp_schema_version({"sessions": session_list, "totals": totals})
+    return json.dumps(payload, indent=2)
 
 
 def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage]) -> str:
@@ -1227,7 +1235,7 @@ def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage]) -> str:
             "totalCost": tot_cost,
         },
     }
-    return json.dumps(payload, indent=2)
+    return json.dumps(stamp_schema_version(payload), indent=2)
 
 
 def _render_bucket_table(

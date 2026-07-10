@@ -1,1 +1,1 @@
-{"weekly":[],"totals":null}
+{"schemaVersion":1,"weekly":[],"totals":null}

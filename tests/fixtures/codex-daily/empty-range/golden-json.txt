@@ -1,1 +1,1 @@
-{"daily":[],"totals":null}
+{"schemaVersion":1,"daily":[],"totals":null}

@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "sessions": [
     {
       "sessionId": "proj-dedup-s/rollout-dd-s-001",

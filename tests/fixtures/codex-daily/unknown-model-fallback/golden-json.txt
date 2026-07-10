@@ -1,5 +1,6 @@
 [codex] unknown model, using gpt-5 fallback pricing (isFallback=true): gpt-hypothetical-99
 {
+  "schemaVersion": 1,
   "daily": [
     {
       "date": "Apr 15, 2026",

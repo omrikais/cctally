@@ -1,5 +1,6 @@
 Warning: 2 entries lacked session_files rows (cache may be catching up).
 {
+  "schemaVersion": 1,
   "sessions": [
     {
       "sessionId": "ssn-miss-0000-0000-deadbeefcafe",
