@@ -398,7 +398,7 @@ def test_budget_unset_project_removes_key(pjns, capsys):
     )
     assert rc == 0
     first = json.loads(capsys.readouterr().out)
-    assert first == {"status": "unset", "project_key": key}
+    assert first == {"schemaVersion": 1, "status": "unset", "project_key": key}
     assert key not in _pj_read_projects(pjns)
     # idempotent: unsetting again is a no-op success with status "noop".
     rc2 = pjns["cmd_budget"](
@@ -406,7 +406,7 @@ def test_budget_unset_project_removes_key(pjns, capsys):
     )
     assert rc2 == 0
     second = json.loads(capsys.readouterr().out)
-    assert second == {"status": "noop", "project_key": key}
+    assert second == {"schemaVersion": 1, "status": "noop", "project_key": key}
 
 
 # ── display section (terminal + project-only + --json) ──────────────────────

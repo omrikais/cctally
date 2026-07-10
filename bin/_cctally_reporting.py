@@ -701,7 +701,7 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
             ),
             "modelBreakdowns": breakdowns,
         }
-        print(json.dumps(output, indent=2))
+        print(json.dumps(c.stamp_schema_version(output), indent=2))
         return 0
 
     if args.breakdown:

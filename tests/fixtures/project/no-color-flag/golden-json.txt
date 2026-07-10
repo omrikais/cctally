@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "rangeStart": "2026-04-13",
   "rangeEnd": "2026-04-15",
   "weeksInRange": 1,

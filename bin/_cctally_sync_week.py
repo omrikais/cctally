@@ -111,7 +111,7 @@ def cmd_sync_week(args: argparse.Namespace) -> int:
         }
 
         if args.json:
-            print(json.dumps(payload, indent=2))
+            print(json.dumps(c.stamp_schema_version(payload), indent=2))
         elif not args.quiet:
             print(
                 f"Synced week {payload['weekStartDate']}..{payload['weekEndDate']} "

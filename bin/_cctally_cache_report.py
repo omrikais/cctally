@@ -1010,7 +1010,7 @@ def _emit_cache_report_json(
         for row_dict in output[top_key]:
             row_dict["totalCost"] = row_dict["cost"]
         output["totals"]["totalCost"] = output["totals"]["cost"]
-    return json.dumps(output, indent=2)
+    return json.dumps(_cctally().stamp_schema_version(output), indent=2)
 
 
 def _build_cache_report_title(args: argparse.Namespace, mode: str) -> str:
@@ -1141,8 +1141,9 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     if since == until:
         if args.json:
             print(json.dumps(
-                {top_key: [], "totals": None,
-                 "generatedAt": now_utc_iso(now_utc=now_utc)},
+                c.stamp_schema_version(
+                    {top_key: [], "totals": None,
+                     "generatedAt": now_utc_iso(now_utc=now_utc)}),
                 indent=2,
             ))
         else:
@@ -1163,8 +1164,9 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     if not rows:
         if args.json:
             print(json.dumps(
-                {top_key: [], "totals": None,
-                 "generatedAt": now_utc_iso(now_utc=now_utc)},
+                c.stamp_schema_version(
+                    {top_key: [], "totals": None,
+                     "generatedAt": now_utc_iso(now_utc=now_utc)}),
                 indent=2,
             ))
         else:

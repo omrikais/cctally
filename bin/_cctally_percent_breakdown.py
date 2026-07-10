@@ -156,7 +156,7 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
         }
 
         if args.json:
-            print(json.dumps(output, indent=2))
+            print(json.dumps(c.stamp_schema_version(output), indent=2))
             return 0
 
         # Prefer the reset-adjusted ISO timestamps in the terminal header

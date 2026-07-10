@@ -708,7 +708,8 @@ def cmd_blocks(args: argparse.Namespace) -> int:
         blocks = [b for b in blocks if b.is_active and not b.is_gap]
         if not blocks:
             if args.json:
-                print('{\n  "blocks": [],\n  "message": "No active block"\n}')
+                print(json.dumps(_c.stamp_schema_version(
+                    {"blocks": [], "message": "No active block"}), indent=2))
             else:
                 print("No active session block found.")
             return 0

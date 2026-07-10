@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "blocks": [
     {
       "id": "2026-04-23T09:00:00.000Z",

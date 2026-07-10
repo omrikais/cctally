@@ -620,7 +620,11 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
 
 
 def _emit_forecast_json(out: ForecastOutput) -> str:
-    return json.dumps(_build_forecast_json_payload(out), indent=2)
+    # Stamp at the CLI boundary ONLY — never in _build_forecast_json_payload,
+    # which also feeds the dashboard `explain` subtree (spec gate F3).
+    return json.dumps(
+        _cctally().stamp_schema_version(_build_forecast_json_payload(out)),
+        indent=2)
 
 
 def _render_forecast_status_line(out: ForecastOutput, color: bool) -> str:
@@ -989,7 +993,9 @@ def cmd_report(args: argparse.Namespace) -> int:
                 c._share_render_and_emit(snap, args)
                 return 0
             if args.json:
-                print(json.dumps({"current": None, "trend": []}, indent=2))
+                print(json.dumps(
+                    c.stamp_schema_version({"current": None, "trend": []}),
+                    indent=2))
             else:
                 print("No data yet. Add record-usage to your status line script (see record-usage --help).")
             return 0
@@ -1177,7 +1183,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             return 0
 
         if args.json:
-            print(json.dumps(output, indent=2))
+            print(json.dumps(c.stamp_schema_version(output), indent=2))
             return 0
 
         if current_row is not None:
@@ -1376,10 +1382,10 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             c._share_render_and_emit(snap, args)
             return 0
         if args.json:
-            print(json.dumps({
+            print(json.dumps(c.stamp_schema_version({
                 "error": "no_current_week_data",
                 "meta": {"generated_at": _iso_z(now_utc), "tool_version": TOOL_VERSION},
-            }, indent=2))
+            }), indent=2))
         elif args.status_line:
             pass  # silent segment
         else:
@@ -2087,6 +2093,7 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):
         print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "set",
             "project_key": root,
             "budget_usd": amount,
@@ -2146,6 +2153,7 @@ def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):
         print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "unset" if removed else "noop",
             "project_key": root,
         }))
@@ -2220,6 +2228,7 @@ def _cmd_budget_set(args: argparse.Namespace, period=None) -> int:
     c._reconcile_budget_on_config_write(validated)
     if getattr(args, "json", False):
         print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "set",
             "weekly_usd": weekly_usd,
             "period": stored_period,
@@ -2258,7 +2267,9 @@ def _cmd_budget_unset(args: argparse.Namespace) -> int:
         c.save_config(config)
 
     if getattr(args, "json", False):
-        print(json.dumps({"status": "unset", "weekly_usd": None}))
+        print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
+            "status": "unset", "weekly_usd": None}))
         return 0
     print("Weekly budget cleared")
     return 0
@@ -2328,6 +2339,7 @@ def _cmd_budget_set_codex(args: argparse.Namespace, period=None) -> int:
     thresholds = codex["alert_thresholds"]
     if getattr(args, "json", False):
         print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "set",
             "vendor": "codex",
             "amount_usd": amount_usd,
@@ -2368,6 +2380,7 @@ def _cmd_budget_unset_codex(args: argparse.Namespace) -> int:
 
     if getattr(args, "json", False):
         print(json.dumps({
+            "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
             "status": "unset" if removed else "noop", "vendor": "codex",
         }))
         return 0

@@ -352,7 +352,7 @@ def _project_json_output(
         "projects": projects_json,
         "warnings": warnings,
     }
-    return json.dumps(payload, indent=2)
+    return json.dumps(_cctally().stamp_schema_version(payload), indent=2)
 
 
 def _project_sort_key(row: dict, sort_by: str, order: str):

@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "days": [
     {
       "inputTokens": 15000,

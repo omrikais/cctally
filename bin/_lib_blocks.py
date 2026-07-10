@@ -61,6 +61,11 @@ UsageEntry = _lib_jsonl.UsageEntry
 _lib_pricing = _load_lib("_lib_pricing")
 _calculate_entry_cost = _lib_pricing._calculate_entry_cost
 
+# JSON wire-format kernel — the additive camelCase schemaVersion stamp
+# (#279 S6 W1; convention docs/cli-contract.md).
+_lib_json_envelope = _load_lib("_lib_json_envelope")
+stamp_schema_version = _lib_json_envelope.stamp_schema_version
+
 
 @dataclass
 class Block:
@@ -526,4 +531,4 @@ def _blocks_to_json(
             }
         result.append(obj)
 
-    return json.dumps({"blocks": result}, indent=2)
+    return json.dumps(stamp_schema_version({"blocks": result}), indent=2)

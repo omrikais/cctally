@@ -345,7 +345,7 @@ def cmd_telemetry(args) -> int:
         "fields": ["token", "version", "os"],
     }
     if getattr(args, "json", False):
-        print(json.dumps(info))
+        print(json.dumps(c.stamp_schema_version(info)))
         return 0
     print(f"telemetry: {'enabled' if enabled else 'disabled'} ({reason})")
     print(
