@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# Wrapper that forwards to `cctally dashboard`.
-# Keeps CLI ergonomics in line with cctally-tui / cctally-forecast.
+# Thin wrapper: `cctally-dashboard` → `cctally dashboard`.
+set -euo pipefail
 exec "$(dirname "$0")/cctally" dashboard "$@"

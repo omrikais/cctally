@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 # cctally-statusline — thin wrapper. Mirrors bin/cctally-<cmd> siblings.
+set -euo pipefail
 exec "$(dirname "$0")/cctally" statusline "$@"
