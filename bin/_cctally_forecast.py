@@ -1298,7 +1298,8 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     if args.json and args.status_line:
         print("forecast: --json and --status-line are mutually exclusive",
               file=sys.stderr)
-        return 1
+        # cctally-native usage error → exit 2 (docs/cli-contract.md; #279 S6 W2).
+        return 2
 
     # Resolve display tz via the unified --tz / config.display.tz pipeline.
     # The renderer reads it back from args._resolved_tz.
@@ -1309,7 +1310,8 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         targets = _parse_forecast_targets(args.targets)
     except ValueError as exc:
         print(f"forecast: {exc}", file=sys.stderr)
-        return 1
+        # cctally-native usage error → exit 2 (docs/cli-contract.md; #279 S6 W2).
+        return 2
 
     now_utc = _resolve_forecast_now(args.as_of)
     conn = open_db()

@@ -82,8 +82,11 @@ Terminal output is a ccusage-style ANSI table matching the shape of
 ## Exit codes
 
 - `0` — success.
-- `1` — invalid flag combination (e.g. `--weeks` together with
-  `--since`/`--until`; `--until < --since`).
+- `2` — invalid flag combination or bad input (e.g. `--weeks` together with
+  `--since`/`--until`; `--until < --since`; an unparseable `--since`/`--until`).
+  Changed from `1` in the #279 contract cleanup: `project` is a cctally-native
+  command and now exits `2` on usage/validation errors like the rest of the
+  native family (`diff`, `budget`, `forecast`, …). See `docs/cli-contract.md`.
 
 ## See also
 

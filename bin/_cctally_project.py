@@ -390,10 +390,10 @@ def cmd_project(args: argparse.Namespace) -> int:
     # Flag-combination validation (must run before any expensive work).
     if args.weeks is not None and args.weeks < 1:
         eprint("Error: --weeks must be >= 1")
-        return 1
+        return 2
     if args.weeks is not None and (args.since or args.until):
         eprint("Error: --weeks cannot be combined with --since/--until")
-        return 1
+        return 2
     if args.since and args.until:
         # Parse both as dates using the same multi-format helper shape used
         # elsewhere in the codebase so YYYY-MM-DD and YYYYMMDD both compare
@@ -415,7 +415,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         # complaint triggered by garbage input).
         if since_parsed is not None and until_parsed is not None and since_parsed > until_parsed:
             eprint("Error: --since must be <= --until")
-            return 1
+            return 2
 
     now = _command_as_of()
     conn = open_db()
@@ -424,7 +424,10 @@ def cmd_project(args: argparse.Namespace) -> int:
     if args.since or args.until:
         parsed = c._parse_cli_date_range(args, now_utc=now)
         if isinstance(parsed, int):
-            return parsed
+            # Translate the ccusage-parity helper's exit 1 into project's own
+            # native usage code 2 — project is cctally-native, not a ccusage
+            # drop-in (docs/cli-contract.md; #279 S6 W2).
+            return 2
         since_dt, until_dt = parsed
         since_dt = since_dt.astimezone(dt.timezone.utc)
         until_dt = until_dt.astimezone(dt.timezone.utc)

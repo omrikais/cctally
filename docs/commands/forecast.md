@@ -77,3 +77,8 @@ cctally forecast --targets 100,95,85
 ## Shareable output
 
 `cctally forecast` accepts `--format {md,html,svg}` and related flags for shareable artifacts. See [share.md](share.md) for the full flag reference.
+
+## Exit codes
+
+- `0` — success.
+- `2` — usage/validation error (e.g. `--json` together with `--status-line`; an unparseable `--targets` value). Changed from `1` in the #279 contract cleanup so `forecast` matches the rest of the cctally-native family. See `docs/cli-contract.md`.
