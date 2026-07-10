@@ -1,10 +1,14 @@
 """cctally CLI argument-parser construction (eager sibling).
 
-Holds the full argparse tree: build_parser() + per-command _build_*_parser
-helpers, the _add_*_args helpers, _share_validate_args, the _nonneg_int
-type validator, and CLIHelpFormatter. Loaded eagerly by bin/cctally; every
-symbol is re-exported into the cctally namespace. cmd_* handlers and other
-bin/cctally-staying globals are reached via the call-time _cctally() accessor.
+Holds the full argparse tree: build_parser() loops over the ordered
+_REGISTRATION table (`_Reg` rows) of per-command `_build_*_parser` builders
+(#279 S6 W3 — table order is registration order is --help order), the
+_add_*_args helpers incl. _add_since_until_args, _share_validate_args, the
+_nonneg_int type validator, and CLIHelpFormatter. Loaded eagerly by bin/cctally;
+every symbol is re-exported into the cctally namespace. cmd_* handlers and other
+bin/cctally-staying globals are reached via the call-time _cctally() accessor;
+the table stores builder callables + literal help_text/xref + the __preview
+predicate lambda — nothing is resolved at import time.
 
 Spec: docs/superpowers/specs/2026-05-30-parser-share-extraction-design.md
 """

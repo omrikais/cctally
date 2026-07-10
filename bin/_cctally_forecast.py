@@ -2,7 +2,7 @@
 
 Holds `cmd_report`, `cmd_forecast`, `cmd_budget`, the forecast core cluster
 (window resolvers, ForecastInputs/ForecastOutput/BudgetRow, _compute_forecast,
-the forecast render helpers, _iso_z), and the 10 budget render/snapshot helpers.
+the forecast render helpers), and the 10 budget render/snapshot helpers.
 
 Honest *name* imports are KERNEL-ONLY (_cctally_core) + stdlib. Every library
 kernel + sibling helper this module needs (build_forecast_view, build_trend_view,
@@ -18,9 +18,10 @@ cluster (get_recent_weeks, _apply_reset_events_to_weekrefs,
 _get_canonical_boundary_for_date) lives in _cctally_weekrefs.py (re-exported on
 the cctally ns); both are reached via c.
 
-_iso_z is defined HERE (intra-module) and re-exported in bin/cctally AFTER the
-dashboard _iso_z binding so cctally._iso_z stays the forecast version
-(the dt-only variant _lib_diff_kernel + _cctally_five_hour depend on).
+_iso_z is honest-imported from the canonical _lib_json_envelope (#279 S6 W4);
+the former intra-module dt-only copy collapsed onto it, and bin/cctally binds
+that single canonical (the old dashboard-then-forecast double-bind is gone).
+_lib_diff_kernel + _cctally_five_hour reach it unchanged via the cctally ns.
 
 Spec: docs/superpowers/specs/2026-05-31-extract-forecast-budget-cmd-design.md
 """
@@ -82,6 +83,13 @@ def _ensure_sibling_loaded(name: str) -> None:
 
 _ensure_sibling_loaded("_lib_forecast")
 from _lib_forecast import ForecastInputs, BudgetRow, ForecastOutput, _compute_forecast
+
+# #279 S6 W4: the canonical None-safe UTC-Z serializer. forecast's former local
+# _iso_z (dt-only, no None guard) collapses to this single definition; the union
+# behavior is exactly the canonical (forecast gains a None guard it never
+# exercises). doctor's _iso_z deliberately keeps its own divergent copy.
+_ensure_sibling_loaded("_lib_json_envelope")
+from _lib_json_envelope import _iso_z
 
 
 def _cctally():
@@ -553,10 +561,6 @@ def _parse_forecast_targets(raw: str) -> list[int]:
 
 
 TOOL_VERSION = "forecast-v1"  # Bumped on material JSON-schema changes.
-
-
-def _iso_z(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _build_forecast_json_payload(out: ForecastOutput) -> dict:

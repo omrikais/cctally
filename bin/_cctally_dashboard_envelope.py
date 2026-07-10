@@ -83,6 +83,11 @@ def _ensure_sibling_loaded(name: str) -> None:
 _ensure_sibling_loaded("_cctally_dashboard_cache_report")
 from _cctally_dashboard_cache_report import _cache_report_snapshot_to_dict
 
+# #279 S6 W4: the canonical None-safe UTC-Z serializer (its own former local
+# copy was already exactly this — collapse to the single definition).
+_ensure_sibling_loaded("_lib_json_envelope")
+from _lib_json_envelope import _iso_z
+
 
 def _model_breakdowns_to_models(model_breakdowns: list[dict[str, Any]],
                                 period_cost: float) -> list[dict[str, Any]]:
@@ -151,15 +156,6 @@ def _compute_intensity_buckets(rows: "list[DailyPanelRow]") -> list[float]:
         else:
             r.intensity_bucket = min(bisect.bisect_right(distinct, r.cost_usd), 5)
     return thresholds
-
-
-def _iso_z(d: "dt.datetime | None") -> "str | None":
-    """Serialize a UTC-aware datetime as ISO-8601 with a ``Z`` suffix.
-    Returns None for None so it can be dropped straight into the JSON
-    envelope."""
-    if d is None:
-        return None
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _select_current_block_for_envelope(

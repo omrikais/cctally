@@ -1120,7 +1120,8 @@ _dashboard_build_blocks_panel = _cctally_dashboard._dashboard_build_blocks_panel
 _dashboard_build_blocks_view = _cctally_dashboard._dashboard_build_blocks_view
 _dashboard_build_daily_panel = _cctally_dashboard._dashboard_build_daily_panel
 _empty_dashboard_snapshot = _cctally_dashboard._empty_dashboard_snapshot
-_iso_z = _cctally_dashboard._iso_z
+# _iso_z is NOT bound here anymore — the former dashboard-then-forecast
+# double-bind collapses to a single canonical bind below (#279 S6 W4).
 # Projects panel + modal (spec 2026-05-19-projects-panel-design.md).
 # Re-export so the sync-thread builder at `_cctally_tui._tui_build_snapshot`
 # can reach the dashboard sibling's aggregator via `c = _cctally()`.
@@ -1214,9 +1215,7 @@ cmd_range_cost = _cctally_reporting.cmd_range_cost   # parser: c.cmd_range_cost 
 # are the parser's set_defaults(func=c.cmd_*) targets; the forecast cluster is
 # reached by TUI/dashboard/refresh/view_models via shim/accessor, and tests
 # retrieve any of these off the cctally namespace. So EVERY moved symbol lives
-# here. _iso_z is LAST: it overrides the L943 `_iso_z = _cctally_dashboard._iso_z`
-# binding so cctally._iso_z stays the FORECAST version (the dt-only variant
-# _lib_diff_kernel + _cctally_five_hour depend on). This block MUST be after L943.
+# here.
 _cctally_forecast = _load_sibling("_cctally_forecast")
 cmd_report = _cctally_forecast.cmd_report
 cmd_forecast = _cctally_forecast.cmd_forecast
@@ -1265,8 +1264,12 @@ _budget_emit_json = _cctally_forecast._budget_emit_json
 _build_budget_snapshot = _cctally_forecast._build_budget_snapshot
 _build_budget_no_data_snapshot = _cctally_forecast._build_budget_no_data_snapshot
 _build_budget_no_budget_snapshot = _cctally_forecast._build_budget_no_budget_snapshot
-# _iso_z LAST — overrides the L943 dashboard binding (forecast version wins).
-_iso_z = _cctally_forecast._iso_z
+# #279 S6 W4: single canonical _iso_z bind (None-safe seconds-precision UTC-Z),
+# placed where the old forecast-wins override sat so the _lib_diff_kernel /
+# _cctally_five_hour shim lookups resolve to the same object. forecast and the
+# dashboard envelope now alias this same canonical; doctor keeps its divergent
+# name-shared copy.
+_iso_z = _lib_json_envelope._iso_z
 
 
 RELEASE_HEADER_RE = re.compile(

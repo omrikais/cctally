@@ -39,12 +39,17 @@ def cctally_mod(tmp_path, monkeypatch):
     return load_isolated_cctally_module(tmp_path, monkeypatch)
 
 
-def test_iso_z_is_the_forecast_version(cctally_mod):
-    """The re-export ordering keeps cctally._iso_z == the forecast (dt-only)
-    variant, not the dashboard None-accepting one (spec §3)."""
+def test_iso_z_is_the_canonical_envelope_version(cctally_mod):
+    """#279 S6 W4: cctally._iso_z collapses to the single canonical
+    _lib_json_envelope._iso_z (None-safe, seconds precision). The former
+    double-bind (dashboard then forecast-wins) is gone; forecast and the
+    dashboard envelope now both alias the canonical, so all three are the
+    same object (doctor's divergent _iso_z deliberately keeps its own name)."""
     mod = cctally_mod
+    assert mod._iso_z is mod._lib_json_envelope._iso_z
     assert mod._iso_z is mod._cctally_forecast._iso_z
     assert mod._iso_z(dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)) == "2026-01-02T03:04:05Z"
+    assert mod._iso_z(None) is None
 
 
 def test_cmd_forecast_resolves_view_and_share_through_namespace(cctally_mod, monkeypatch):

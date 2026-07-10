@@ -11,6 +11,17 @@ import pathlib
 import _lib_doctor as L
 
 
+def test_doctor_iso_z_naive_means_utc_and_keeps_microseconds():
+    # #279 S6 W4 (gate F12): doctor's _iso_z deliberately DIVERGES from the
+    # canonical _lib_json_envelope._iso_z. It treats a naive datetime as UTC
+    # (replace(tzinfo=utc), NOT astimezone — which would reinterpret it as
+    # host-local) and preserves microseconds (isoformat, not %S). The doctor
+    # goldens use aware whole-second timestamps and cannot prove this, so it is
+    # pinned directly here; the divergence is why doctor keeps its own name.
+    naive = dt.datetime(2026, 7, 10, 12, 0, 5, 123456)
+    assert L._iso_z(naive) == "2026-07-10T12:00:05.123456Z"
+
+
 def test_doctor_state_has_required_fields():
     fields = {f.name for f in dc.fields(L.DoctorState)}
     expected = {

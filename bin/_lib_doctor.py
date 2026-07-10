@@ -1456,7 +1456,20 @@ def run_checks(state: DoctorState) -> DoctorReport:
 
 
 def _iso_z(d: dt.datetime) -> str:
-    """Render a UTC datetime as ISO 8601 with trailing 'Z' (share-v2 convention)."""
+    """Render a UTC datetime as ISO 8601 with trailing 'Z' (share-v2 convention).
+
+    DELIBERATELY DIVERGES from the canonical ``_lib_json_envelope._iso_z``
+    (#279 S6 W4) on two axes and therefore KEEPS this local name (gate F11):
+    (1) a NAIVE datetime is treated as UTC via ``replace(tzinfo=utc)`` — the
+    canonical's ``astimezone(utc)`` would reinterpret it as host-local; and
+    (2) microseconds are preserved via ``isoformat()`` — the canonical floors
+    to whole seconds via ``%S``. Renaming this to the canonical would silently
+    degrade the doctor block for the cross-module consumers that resolve it by
+    name through the sibling loader (``_cctally_tui`` and
+    ``_cctally_dashboard_envelope``'s doctor-envelope builders, whose
+    try/except swallows a rename). Divergence pinned by
+    ``tests/test_lib_doctor.py::test_doctor_iso_z_naive_means_utc_and_keeps_microseconds``.
+    """
     if d.tzinfo is None:
         d = d.replace(tzinfo=dt.timezone.utc)
     s = d.astimezone(dt.timezone.utc).isoformat()
