@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import importlib.util as _ilu
 import os
 import pathlib
 import shutil
@@ -58,6 +57,7 @@ def _load_lib(name: str):
     cached = sys.modules.get(name)
     if cached is not None:
         return cached
+    import importlib.util as _ilu
     p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
     spec = _ilu.spec_from_file_location(name, p)
     mod = _ilu.module_from_spec(spec)

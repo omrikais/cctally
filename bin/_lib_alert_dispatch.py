@@ -18,7 +18,6 @@ Spec: docs/superpowers/specs/2026-06-02-alerts-dispatch-severity-seams-design.md
 """
 from __future__ import annotations
 
-import importlib.util as _ilu
 import pathlib
 import sys
 
@@ -36,6 +35,7 @@ def _load_lib(name: str):
     cached = sys.modules.get(name)
     if cached is not None:
         return cached
+    import importlib.util as _ilu
     p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
     spec = _ilu.spec_from_file_location(name, p)
     mod = _ilu.module_from_spec(spec)
