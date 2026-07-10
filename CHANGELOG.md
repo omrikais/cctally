@@ -5,6 +5,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- CI safety net (#281 S2): the full frontend vitest estate now runs in CI — on every non-docs-only push to main (self-hosted lane) and in a new hosted-ubuntu `test-pr` lane covering same-repo code PRs plus all code PRs on the public repo — and a new markdown doc-lint (`bin/cctally-doc-lint-test`, auto-run by `cctally-test-all`, plus a `doc-lint.yml` workflow that sees md-only pushes) guards the retired stale claims from reappearing.
+
 ### Fixed
 - Docs truth pass (#281 S1): the README privacy tagline now discloses the anonymous, opt-out install-count telemetry instead of denying it (and the "nothing leaves your machine" absolute is qualified — `cctally never uploads your session data`); the CONTRIBUTING license line is corrected from MIT to Apache-2.0; `docs/architecture.md` and `docs/runtime-data.md` are rewritten to describe the real multi-module layout, the migration framework, and the full 15-table `stats.db` schema (plus the conversation-viewer cache tables); stale claims are fixed for the pricing-dict location, the `doctor` module attribution, the superseded `search_aux` conversation index, and the 5-hour anchor wording; the `blocks` / `five-hour-blocks` / `five-hour-breakdown` trio now cross-reference each other; and the `telemetry` command doc's "no IP ever leaves" claim is made precise.
 

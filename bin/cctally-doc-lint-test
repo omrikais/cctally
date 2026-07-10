@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Doc-lint harness: banned stale-claim phrases must not reappear in the
+# public-facing markdown surface (#281 S2 / #280 R2). Seed list handed off
+# by the #281 S1 truth-pass spec (docs/superpowers/specs/
+# 2026-07-10-281-s1-truth-trust-design.md § "Banned-phrase list").
+#
+# Scope: README.md, CONTRIBUTING.md, and docs/**/*.md at every depth
+# (':(glob)' magic — a naive 'docs/**/*.md' pathspec does NOT match
+# top-level docs/*.md), excluding docs/superpowers/** (historical
+# specs/plans are records, not claims; also private/unmatched, absent on
+# the public mirror — the exclusion is defense-in-depth). Root
+# CHANGELOG.md is outside the scope by construction. The standalone-word
+# MIT check scopes to README.md + CONTRIBUTING.md only (a case-insensitive
+# substring would false-positive on "commit"; dashboard dep licenses are
+# out of scope).
+#
+# 'never leaves your machine' is deliberately NOT banned: two
+# legitimately-qualified true uses exist (README install-id parenthetical;
+# docs/telemetry.md) and no inline-exception mechanism is wanted.
+#
+# Self-checks (both exit 2, after the summary line):
+#   * scope anchors — git ls-files over the scope must include README.md,
+#     CONTRIBUTING.md, docs/architecture.md, docs/telemetry.md and no
+#     docs/superpowers/ path, so a silently-wrong pathspec can never
+#     produce a vacuous PASS;
+#   * pattern canaries — every pattern must match its embedded known-bad
+#     fixture string (plain grep; git grep only scans tracked files), so
+#     a silently-broken regex can never produce a vacuous PASS.
+#
+# Per-check git grep tri-state: rc 0 = matches found -> FAIL (file:line
+# printed); rc 1 = clean -> ok; rc > 1 = git error -> self-check failure.
+#
+# Runs on the public mirror too (the linux matrix glob-runs
+# cctally-test-all there): private docs are simply absent, and all four
+# anchors are public-mirrored (docs/*.md positive allowlist rule).
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# Universal harness preamble (dev-autodetect suppressor; enforced by
+# tests/test_harness_dev_autodetect_coverage.py).
+source "$REPO_ROOT/bin/_lib-harness-env.sh"
+# git grep pathspecs below are repo-relative — root the process here so
+# the harness behaves identically from any invocation cwd.
+cd "$REPO_ROOT"
+
+pass_count=0
+fail_count=0
+
+emit_summary() {
+    echo "----"
+    echo "passed: $pass_count   failed: $fail_count"
+}
+
+self_check_fail() {
+    echo "SELF-CHECK FAIL: $1" >&2
+    emit_summary
+    exit 2
+}
+
+# --- banned patterns (index-aligned with their canary fixtures) ---------
+PATTERNS=(
+    'no telemetry'
+    'zero telemetry'
+    'nothing leaves'
+    'single-file.*python'
+    'no migration framework'
+    'no ip.*leaves'
+)
+CANARIES=(
+    'ships with no telemetry at all'
+    'we collect zero telemetry'
+    'nothing leaves your machine'
+    'a single-file, **stdlib-only Python 3** program'
+    'there is no migration framework'
+    'No IP address ever leaves the machine'
+)
+MIT_PATTERN='MIT'
+MIT_CANARY='under the MIT license'
+
+SCOPE=(README.md CONTRIBUTING.md ':(glob)docs/**/*.md' ':(exclude)docs/superpowers/**')
+MIT_SCOPE=(README.md CONTRIBUTING.md)
+ANCHORS=(README.md CONTRIBUTING.md docs/architecture.md docs/telemetry.md)
+
+# --- self-check 1: scope anchors ----------------------------------------
+scope_files=$(git ls-files -- "${SCOPE[@]}") \
+    || self_check_fail "git ls-files failed over the scope pathspec"
+for a in "${ANCHORS[@]}"; do
+    printf '%s\n' "$scope_files" | grep -qx "$a" \
+        || self_check_fail "scope anchor missing from pathspec: $a"
+done
+if printf '%s\n' "$scope_files" | grep -q '^docs/superpowers/'; then
+    self_check_fail "scope pathspec leaked docs/superpowers/"
+fi
+echo "ok: scope anchors ($(printf '%s\n' "$scope_files" | wc -l | tr -d ' ') files in scope)"
+pass_count=$((pass_count + 1))
+
+# --- self-check 2: pattern canaries --------------------------------------
+i=0
+while [ "$i" -lt "${#PATTERNS[@]}" ]; do
+    printf '%s\n' "${CANARIES[$i]}" | grep -qiE "${PATTERNS[$i]}" \
+        || self_check_fail "canary not matched by pattern: ${PATTERNS[$i]}"
+    i=$((i + 1))
+done
+printf '%s\n' "$MIT_CANARY" | grep -qiw "$MIT_PATTERN" \
+    || self_check_fail "canary not matched by word pattern: $MIT_PATTERN"
+echo "ok: pattern canaries (${#PATTERNS[@]} + MIT)"
+pass_count=$((pass_count + 1))
+
+# --- the scans ------------------------------------------------------------
+scan() {
+    # $1 = label, $2 = pattern, $3 = mode (regex|word), rest = pathspecs
+    local label=$1 pattern=$2 mode=$3
+    shift 3
+    local hits rc
+    if [ "$mode" = word ]; then
+        hits=$(git grep -inw "$pattern" -- "$@")
+    else
+        hits=$(git grep -inE "$pattern" -- "$@")
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: banned phrase reintroduced — $label"
+        printf '%s\n' "$hits"
+        fail_count=$((fail_count + 1))
+    elif [ "$rc" -eq 1 ]; then
+        echo "ok: $label"
+        pass_count=$((pass_count + 1))
+    else
+        self_check_fail "git grep rc=$rc for pattern: $pattern"
+    fi
+}
+
+scan "'no telemetry'"          'no telemetry'           regex "${SCOPE[@]}"
+scan "'zero telemetry'"        'zero telemetry'         regex "${SCOPE[@]}"
+scan "'nothing leaves'"        'nothing leaves'         regex "${SCOPE[@]}"
+scan "'single-file.*python'"   'single-file.*python'    regex "${SCOPE[@]}"
+scan "'no migration framework'" 'no migration framework' regex "${SCOPE[@]}"
+scan "'no ip.*leaves'"         'no ip.*leaves'          regex "${SCOPE[@]}"
+scan "MIT (standalone word, README+CONTRIBUTING)" "$MIT_PATTERN" word "${MIT_SCOPE[@]}"
+
+emit_summary
+[ "$fail_count" -eq 0 ]

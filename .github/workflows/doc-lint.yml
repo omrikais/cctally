@@ -1,0 +1,39 @@
+name: Doc lint
+
+# Banned stale-claim phrases must not reappear in public-facing markdown
+# (#281 S2 / #280 R2 finding 27): ci.yml skips md-only pushes via
+# paths-ignore, so this workflow is the surface that DOES see them. The
+# lint logic lives in bin/cctally-doc-lint-test (also glob-run by
+# cctally-test-all in every existing lane); this workflow just runs it on
+# md-touching events. Mixed code+md pushes run both workflows — a few
+# redundant seconds, accepted for trigger simplicity.
+on:
+  push:
+    branches: [main]
+    paths: ['**/*.md']
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ['**/*.md']
+
+jobs:
+  doc-lint:
+    # Same PR-source posture as ci.yml's test-pr (#281 S2): push events
+    # always run; PR events run for same-repo PRs everywhere + all PRs on
+    # the public mirror. Private-repo forks are collaborator-only, so this
+    # is uniformity/defense-in-depth, not a live exposure.
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      github.repository == 'omrikais/cctally'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: doc-lint-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: bin/cctally-doc-lint-test
