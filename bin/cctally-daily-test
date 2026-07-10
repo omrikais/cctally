@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `cctally daily` (#279 S7 W6 — the base
+# per-day table path; `daily --instances` stays cctally-daily-instances-test).
+#
+# Rebuilds fixtures into a scratch dir, then walks each fixture under
+# tests/fixtures/daily/ and runs each output mode through the shared run_mode
+# helper (bin/_lib-fixture-harness.sh). Modes:
+#   * terminal       — default
+#   * json           — --json (schemaVersion-stamped post-S6)
+#   * mode-calculate  — -m calculate (== auto for cost-less entries → reuses
+#                      golden-terminal byte-for-byte; proves the flag threads)
+#   * mode-display    — -m display (drops cost-less entries to $0 → distinct golden)
+# The since-window scenario adds --since/--until via input.env FLAGS.
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="daily"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/daily"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-daily-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+"$REPO_ROOT/bin/build-daily-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+    echo "FAIL: build-daily-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal"       ""              "terminal"
+    run_mode "$name" "json"           "--json"        "json"
+    run_mode "$name" "mode-calculate" "-m calculate"  "terminal"
+    run_mode "$name" "mode-display"   "-m display"    "mode-display"
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

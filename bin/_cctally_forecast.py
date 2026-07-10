@@ -1121,7 +1121,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             "current": current_row,
             "trend": trend,
             "weekStartRule": week_start_name,
-            "generatedAt": now_utc_iso(),
+            # Honor the CCTALLY_AS_OF testing hook (matches cache-report's
+            # generatedAt, #279 S7 W6) — real behavior is unchanged since
+            # _command_as_of() returns wall-clock when the hook is unset, but the
+            # field becomes deterministic under the hook so report --json is
+            # golden-testable.
+            "generatedAt": now_utc_iso(now_utc=_command_as_of()),
             "currentWeek": {
                 "weekStartDate": current_ref.week_start.isoformat(),
                 "weekEndDate": current_ref.week_end.isoformat() if current_ref.week_end else None,

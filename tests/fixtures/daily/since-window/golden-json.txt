@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "daily": [
+    {
+      "date": "2026-04-14",
+      "inputTokens": 100,
+      "outputTokens": 2000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalTokens": 2100,
+      "totalCost": 0.0505,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 100,
+          "outputTokens": 2000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.0505
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 100,
+    "outputTokens": 2000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "totalCost": 0.0505,
+    "totalTokens": 2100
+  }
+}

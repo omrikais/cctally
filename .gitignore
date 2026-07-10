@@ -43,6 +43,9 @@ tests/fixtures/*/*/.local/share/cctally/logs/
 tests/fixtures/alerts/*/.local/share/cctally/*.db
 tests/fixtures/blocks/*/.local/share/cctally/*.db
 tests/fixtures/cache-report/*/.local/share/cctally/*.db
+tests/fixtures/daily/*/.local/share/cctally/*.db
+tests/fixtures/monthly/*/.local/share/cctally/*.db
+tests/fixtures/report/*/.local/share/cctally/*.db
 tests/fixtures/codex-daily/*/.local/share/cctally/*.db
 tests/fixtures/codex-monthly/*/.local/share/cctally/*.db
 tests/fixtures/codex-session/*/.local/share/cctally/*.db

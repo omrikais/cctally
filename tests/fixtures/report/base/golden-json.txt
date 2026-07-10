@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "current": {
+    "weekStartDate": "2026-04-13",
+    "weekEndDate": "2026-04-20",
+    "weekStartAt": "2026-04-13T00:00:00+00:00",
+    "weekEndAt": "2026-04-20T00:00:00+00:00",
+    "weeklyPercent": 50.0,
+    "weeklyCostUSD": 130.0,
+    "dollarsPerPercent": 2.6,
+    "usageCapturedAt": "2026-04-13T12:00:00Z",
+    "costCapturedAt": "2026-04-13T12:00:00Z",
+    "asOf": "2026-04-13T12:00:00+00:00",
+    "rangeStartIso": null,
+    "rangeEndIso": null
+  },
+  "trend": [
+    {
+      "weekStartDate": "2026-04-13",
+      "weekEndDate": "2026-04-20",
+      "weekStartAt": "2026-04-13T00:00:00+00:00",
+      "weekEndAt": "2026-04-20T00:00:00+00:00",
+      "weeklyPercent": 50.0,
+      "weeklyCostUSD": 130.0,
+      "dollarsPerPercent": 2.6,
+      "usageCapturedAt": "2026-04-13T12:00:00Z",
+      "costCapturedAt": "2026-04-13T12:00:00Z",
+      "asOf": "2026-04-13T12:00:00+00:00",
+      "rangeStartIso": null,
+      "rangeEndIso": null
+    },
+    {
+      "weekStartDate": "2026-04-06",
+      "weekEndDate": "2026-04-13",
+      "weekStartAt": "2026-04-06T00:00:00+00:00",
+      "weekEndAt": "2026-04-13T00:00:00+00:00",
+      "weeklyPercent": 20.0,
+      "weeklyCostUSD": 40.0,
+      "dollarsPerPercent": 2.0,
+      "usageCapturedAt": "2026-04-06T12:00:00Z",
+      "costCapturedAt": "2026-04-06T12:00:00Z",
+      "asOf": "2026-04-06T12:00:00+00:00",
+      "rangeStartIso": null,
+      "rangeEndIso": null
+    }
+  ],
+  "weekStartRule": "monday",
+  "generatedAt": "2026-04-20T18:00:00Z",
+  "currentWeek": {
+    "weekStartDate": "2026-04-13",
+    "weekEndDate": "2026-04-20",
+    "weekStartAt": "2026-04-13T00:00:00+00:00",
+    "weekEndAt": "2026-04-20T00:00:00+00:00"
+  }
+}

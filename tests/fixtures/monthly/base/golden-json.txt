@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "monthly": [
+    {
+      "month": "2026-02",
+      "inputTokens": 100,
+      "outputTokens": 1000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalTokens": 1100,
+      "totalCost": 0.025500000000000002,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 100,
+          "outputTokens": 1000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.025500000000000002
+        }
+      ]
+    },
+    {
+      "month": "2026-03",
+      "inputTokens": 100,
+      "outputTokens": 2000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalTokens": 2100,
+      "totalCost": 0.0505,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 100,
+          "outputTokens": 2000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.0505
+        }
+      ]
+    },
+    {
+      "month": "2026-04",
+      "inputTokens": 100,
+      "outputTokens": 3000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalTokens": 3100,
+      "totalCost": 0.0755,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 100,
+          "outputTokens": 3000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.0755
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 300,
+    "outputTokens": 6000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "totalCost": 0.1515,
+    "totalTokens": 6300
+  }
+}
