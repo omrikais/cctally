@@ -36,6 +36,20 @@ Per-migration goldens (lazy-adopted; one pair per migration that ships them):
   - per-migration/008_recompute_weekly_cost_snapshots_dedup_fix/{pre,pre-cache,post}.sqlite
     — paired stats+cache fixture for the ccusage-parity historical recompute.
     Loaded by tests/test_migration_008_per_migration_goldens.py.
+  - per-migration/{001_five_hour_block_models_backfill_v1,
+    002_five_hour_block_projects_backfill_v1, 003_merge_5h_block_duplicates_v1,
+    004_heal_forked_week_start_date_buckets, 007_observed_pre_credit_pct}/{pre,post}.sqlite
+    — the STATS-five backfill goldens (#279 S7 W3). Pre reuses create_stats_db
+    except 007 (hardcoded pre-007 week_reset_events sans observed_pre_credit_pct);
+    001/002 isolate the backfill cache read to a throwaway work cache.
+  - per-migration/{005_conversation_reingest_meta,
+    006_conversation_reingest_source_tool_use_id}/{pre,post}.sqlite — the two
+    flag-only CACHE re-ingest goldens (#279 S7 W3), same shape as 003/004.
+
+Builder-less goldens: only STATS 005/006 (percent/five-hour reset_event_id) are
+hand-built frozen artifacts with NO build_per_migration_* function — they are
+intentionally outside the #197 byte-idempotency guard (see
+tests/test_build_migrations_fixtures_stamps_markers.py).
 """
 
 from __future__ import annotations
@@ -49,10 +63,45 @@ from pathlib import Path
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _fixture_builders import register_fixture_db  # noqa: E402
+from _fixture_builders import register_fixture_db, create_stats_db  # noqa: E402
 
 
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "migrations"
+
+# Pinned instant for the stats-five per-migration goldens (W3 backfill, #279 S7).
+# Deterministic — never wall-clock — so a builder regen is byte-idempotent under
+# the #197 guard (tests/test_build_migrations_fixtures_stamps_markers.py).
+TS_STATS_FIVE_APPLIED = "2026-04-30T12:00:00Z"
+
+
+def _load_db_module():
+    """Load the FULL ``bin/cctally`` module so the production stats/cache
+    migration handlers can be called directly, then return its
+    ``_cctally_db`` sibling.
+
+    Loading ``cctally`` (not just ``_cctally_db``) is required because the
+    handlers reach back into the main module via the ``_cctally()`` accessor
+    (e.g. ``_compute_block_totals`` / ``_FIVE_HOUR_JITTER_FLOOR_SECONDS``),
+    which resolves ``sys.modules["cctally"]`` — unset when the #197 guard
+    invokes a builder in isolation. Returns the ``_cctally_db`` module;
+    ``mod._cctally_core`` / ``mod.now_utc_iso`` / ``mod._apply_cache_schema``
+    / ``mod._STATS_MIGRATIONS`` are the handles the builders patch/read."""
+    import importlib.util as ilu
+    from importlib.machinery import SourceFileLoader
+    bin_dir = Path(__file__).resolve().parent
+    loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+    spec = ilu.spec_from_loader("cctally", loader)
+    mod = ilu.module_from_spec(spec)
+    sys.modules["cctally"] = mod
+    loader.exec_module(mod)
+    return sys.modules["_cctally_db"]
+
+
+def _stats_handler(mod, name: str):
+    for m in mod._STATS_MIGRATIONS:
+        if m.name == name:
+            return m.handler
+    raise SystemExit(f"stats migration {name} not registered")
 
 # Stable timestamps — never use "now"; use these.
 TS_001_APPLIED = "2026-04-30T12:00:00Z"
@@ -3407,6 +3456,595 @@ def build_per_migration_020_session_entries_physical_unique(scenario_dir: Path) 
     _build_post(pre, post)
 
 
+# ───────────────────────── W3 backfill: the 7 missing per-migration goldens ──
+# STATS 001–004, 007 + CACHE 005–006 (#279 S7). The stats-five pre-fixtures
+# reuse ``create_stats_db`` (the shared current-schema source, consistent with
+# how the cache goldens reuse ``_apply_cache_schema``) EXCEPT 007, whose golden
+# must show a week_reset_events WITHOUT ``observed_pre_credit_pct`` — so 007
+# hardcodes the pre-007 historical shape. All builders pin every timestamp
+# (``TS_STATS_FIVE_APPLIED``) so a regen stays byte-idempotent under the #197
+# guard; 001/002/003 discard a throwaway work cache and synthetic projects dir.
+
+
+def _isolate_backfill_cache(mod, scenario_dir: Path):
+    """Fully isolate a backfill handler's ``_compute_block_totals(skip_sync=
+    False)`` cache read so it returns NOTHING (no child rows written) instead
+    of ingesting the developer's real ``~/.claude/projects`` (~GB) into a work
+    cache. Returns ``(restore_fn, work_cache)``; the caller runs the handler in
+    a try/finally and calls ``restore_fn()``.
+
+    Two levers, both required (mirrors the "isolate needs BOTH env vars"
+    gotcha):
+      * ``_cctally_core.{APP_DIR,CACHE_DB_PATH,CACHE_LOCK_PATH}`` → a fresh
+        empty work cache under the scenario dir. The work cache is built via
+        ``_apply_cache_schema`` ONLY (no ``schema_migrations``), so
+        ``open_cache_db`` sees a fresh install and stamps every cache migration
+        WITHOUT running a handler — no migration-errors.log writes.
+      * ``CLAUDE_CONFIG_DIR`` env → a scratch dir with an EMPTY ``projects/``
+        subtree, because ``sync_cache`` enumerates JSONL via
+        ``_get_claude_data_dirs()`` (which reads that env var), NOT
+        ``CLAUDE_PROJECTS_DIR``. Without this the walk hits real data.
+    Everything (work cache, lock, scratch config dir) is discarded by
+    ``restore_fn``."""
+    core = mod._cctally_core
+    orig_app_dir = core.APP_DIR
+    orig_cache = core.CACHE_DB_PATH
+    orig_lock = core.CACHE_LOCK_PATH
+    orig_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    work_cache = scenario_dir / "_work_cache.db"
+
+    def _clean() -> None:
+        for p in sorted(scenario_dir.glob("_work_cache.db*")):
+            p.unlink()
+        import shutil as _sh
+        _sh.rmtree(scenario_dir / "_fake_claude", ignore_errors=True)
+
+    _clean()
+    wc = sqlite3.connect(work_cache)
+    try:
+        wc.execute("PRAGMA journal_mode=WAL")
+        mod._apply_cache_schema(wc)
+        wc.commit()
+    finally:
+        wc.close()
+    fake_claude = scenario_dir / "_fake_claude"
+    (fake_claude / "projects").mkdir(parents=True, exist_ok=True)
+
+    core.APP_DIR = scenario_dir
+    core.CACHE_DB_PATH = work_cache
+    core.CACHE_LOCK_PATH = scenario_dir / "_work_cache.db.lock"
+    os.environ["CLAUDE_CONFIG_DIR"] = str(fake_claude)
+
+    def _restore() -> None:
+        core.APP_DIR = orig_app_dir
+        core.CACHE_DB_PATH = orig_cache
+        core.CACHE_LOCK_PATH = orig_lock
+        if orig_env is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = orig_env
+        _clean()
+
+    return _restore, work_cache
+
+
+def build_per_migration_001_five_hour_block_models_backfill_v1(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``001_five_hour_block_models_backfill_v1`` (#279 S7 W3).
+
+    pre.sqlite: full current stats schema (``create_stats_db``) with ONE
+    ``five_hour_blocks`` parent (id=1) and ONE ORPHAN ``five_hour_block_models``
+    row (block_id=999 → no such parent). post.sqlite: the handler's defensive
+    orphan cleanup DELETEs the orphan, its per-block backfill loop writes zero
+    child rows (the cache read is isolated to a fresh empty work cache, so
+    ``_compute_block_totals`` returns no by_model buckets), and the 001 marker
+    is stamped. The orphan DELETE is the non-vacuous, deterministic effect; the
+    faithful child-row backfill is covered end-to-end by the ancient→head test
+    (W2) and the migrations-test scenario 11.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        create_stats_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(id, five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, created_at_utc, last_updated_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (1, 1776600000, "2026-04-19T20:00:00Z", "2026-04-19T15:00:00Z",
+                 "2026-04-19T15:05:00Z", "2026-04-19T19:55:00Z", 42.0,
+                 "2026-04-19T15:05:00Z", "2026-04-19T19:55:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO five_hour_block_models "
+                "(block_id, five_hour_window_key, model, input_tokens, "
+                " output_tokens, cache_create_tokens, cache_read_tokens, "
+                " cost_usd, entry_count) VALUES (?,?,?,?,?,?,?,?,?)",
+                (999, 1776500000, "claude-opus-4-7", 10, 20, 0, 0, 0.001, 1),
+            )
+            conn.commit()
+            # create_stats_db leaves an idle connection open (its `with` commits
+            # but never closes), so the schema frames sit in the WAL and a plain
+            # shutil.copy of the main file would miss them. FULL-checkpoint the
+            # committed frames into the main file before the copy in _build_post.
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        restore, _work_cache = _isolate_backfill_cache(mod, scenario_dir)
+        handler = _stats_handler(mod, "001_five_hour_block_models_backfill_v1")
+        try:
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.row_factory = sqlite3.Row  # handler reads rows by column name
+                handler(conn)
+                mod._stamp_applied(
+                    conn, "001_five_hour_block_models_backfill_v1",
+                    TS_STATS_FIVE_APPLIED,
+                )
+            finally:
+                conn.close()
+        finally:
+            restore()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_002_five_hour_block_projects_backfill_v1(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``002_five_hour_block_projects_backfill_v1`` (#279 S7 W3).
+
+    Mirror of the 001 builder but for the by-project rollup child: pre.sqlite
+    seeds a ``five_hour_blocks`` parent + an ORPHAN ``five_hour_block_projects``
+    row; post.sqlite has the orphan DELETEd, no child rows written (isolated
+    empty cache), and the 002 marker stamped.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        create_stats_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(id, five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, created_at_utc, last_updated_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (1, 1776600000, "2026-04-19T20:00:00Z", "2026-04-19T15:00:00Z",
+                 "2026-04-19T15:05:00Z", "2026-04-19T19:55:00Z", 42.0,
+                 "2026-04-19T15:05:00Z", "2026-04-19T19:55:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO five_hour_block_projects "
+                "(block_id, five_hour_window_key, project_path, input_tokens, "
+                " output_tokens, cache_create_tokens, cache_read_tokens, "
+                " cost_usd, entry_count) VALUES (?,?,?,?,?,?,?,?,?)",
+                (999, 1776500000, "/fake/proj", 10, 20, 0, 0, 0.001, 1),
+            )
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(FULL)")  # see 001 builder note
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        restore, _work_cache = _isolate_backfill_cache(mod, scenario_dir)
+        handler = _stats_handler(mod, "002_five_hour_block_projects_backfill_v1")
+        try:
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.row_factory = sqlite3.Row
+                handler(conn)
+                mod._stamp_applied(
+                    conn, "002_five_hour_block_projects_backfill_v1",
+                    TS_STATS_FIVE_APPLIED,
+                )
+            finally:
+                conn.close()
+        finally:
+            restore()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_003_merge_5h_block_duplicates_v1(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``003_merge_5h_block_duplicates_v1`` (#279 S7 W3).
+
+    pre.sqlite: full current stats schema with TWO ``five_hour_blocks`` rows
+    that represent the same physical 5h window under jitter-forked
+    ``five_hour_window_key`` values (their ``five_hour_resets_at`` fall within
+    the 1800 s = 3×600 s grouping band), plus a ``weekly_usage_snapshots`` row
+    keyed on the DROPPED block's window key. post.sqlite: the handler merges
+    the pair into the canonical (earliest ``first_observed_at_utc``) block —
+    group-wide MAX aggregates, the dropped parent DELETEd, and the snapshot's
+    ``five_hour_window_key`` rewritten to canonical — with the 003 marker
+    stamped. The handler writes ``now_utc_iso()`` into ``last_updated_at_utc``;
+    the builder pins that clock so the golden is rebuild-deterministic (#197).
+    Pure stats handler — no cache open.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        create_stats_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Canonical block (id=1): earliest first_observed; smaller totals.
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(id, five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, seven_day_pct_at_block_end, "
+                " crossed_seven_day_reset, is_closed, "
+                " total_input_tokens, total_output_tokens, "
+                " total_cache_create_tokens, total_cache_read_tokens, "
+                " total_cost_usd, created_at_utc, last_updated_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (1, 1776600000, "2026-04-19T20:00:00Z", "2026-04-19T15:00:00Z",
+                 "2026-04-19T15:05:00Z", "2026-04-19T17:00:00Z", 30.0, 40.0,
+                 0, 0, 100, 200, 0, 0, 1.0,
+                 "2026-04-19T15:05:00Z", "2026-04-19T17:00:00Z"),
+            )
+            # Dropped duplicate (id=2): later first_observed; jittered key
+            # (+600 s), resets_at within 1800 s; larger totals + later
+            # last_observed so the MERGE (group MAX / latest-observation) is
+            # observable in canonical.
+            conn.execute(
+                "INSERT INTO five_hour_blocks "
+                "(id, five_hour_window_key, five_hour_resets_at, block_start_at, "
+                " first_observed_at_utc, last_observed_at_utc, "
+                " final_five_hour_percent, seven_day_pct_at_block_end, "
+                " crossed_seven_day_reset, is_closed, "
+                " total_input_tokens, total_output_tokens, "
+                " total_cache_create_tokens, total_cache_read_tokens, "
+                " total_cost_usd, created_at_utc, last_updated_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (2, 1776600600, "2026-04-19T20:05:00Z", "2026-04-19T15:00:00Z",
+                 "2026-04-19T15:06:00Z", "2026-04-19T19:55:00Z", 55.0, 60.0,
+                 1, 1, 150, 300, 0, 0, 2.5,
+                 "2026-04-19T15:06:00Z", "2026-04-19T19:55:00Z"),
+            )
+            # Snapshot keyed on the DROPPED block's window key — must be
+            # rewritten to canonical (1776600000).
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " weekly_percent, source, payload_json, five_hour_window_key) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("2026-04-19T19:55:00Z", "2026-04-13", "2026-04-20", 22.0,
+                 "userscript", "{}", 1776600600),
+            )
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(FULL)")  # see 001 builder note
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        orig_now = mod.now_utc_iso
+        mod.now_utc_iso = lambda *a, **k: TS_STATS_FIVE_APPLIED  # pin the clock
+        handler = _stats_handler(mod, "003_merge_5h_block_duplicates_v1")
+        try:
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.row_factory = sqlite3.Row
+                handler(conn)
+                mod._stamp_applied(
+                    conn, "003_merge_5h_block_duplicates_v1",
+                    TS_STATS_FIVE_APPLIED,
+                )
+            finally:
+                conn.close()
+        finally:
+            mod.now_utc_iso = orig_now
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_004_heal_forked_week_start_date_buckets(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration
+    ``004_heal_forked_week_start_date_buckets`` (#279 S7 W3).
+
+    pre.sqlite: full current stats schema with a FORKED
+    ``weekly_usage_snapshots`` row whose ``week_start_date`` disagrees with
+    ``substr(week_start_at, 1, 10)`` (host-TZ contamination) plus a canonical
+    row for the same physical week. post.sqlite: the fork is healed
+    (``week_start_date`` / ``week_end_date`` rewritten from the ISO boundary)
+    and the 004 marker stamped. Pure stats handler — no cache open, no clock.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        create_stats_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Forked ghost row: date bucket says 2026-04-12 but the ISO
+            # boundary's UTC calendar day is 2026-04-13.
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, weekly_percent, source, "
+                " payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                ("2026-04-14T12:00:00Z", "2026-04-12", "2026-04-19",
+                 "2026-04-13T15:00:00Z", "2026-04-20T15:00:00Z", 20.0,
+                 "userscript", "{}"),
+            )
+            # Canonical row for the same physical week (already correct).
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, weekly_percent, source, "
+                " payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                ("2026-04-15T12:00:00Z", "2026-04-13", "2026-04-20",
+                 "2026-04-13T15:00:00Z", "2026-04-20T15:00:00Z", 31.0,
+                 "userscript", "{}"),
+            )
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(FULL)")  # see 001 builder note
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = _stats_handler(mod, "004_heal_forked_week_start_date_buckets")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            mod._stamp_applied(
+                conn, "004_heal_forked_week_start_date_buckets",
+                TS_STATS_FIVE_APPLIED,
+            )
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_007_observed_pre_credit_pct(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for stats migration ``007_observed_pre_credit_pct``
+    (#279 S7 W3).
+
+    pre.sqlite: HARDCODED pre-007 historical shape — a ``week_reset_events``
+    table WITHOUT the ``observed_pre_credit_pct`` column (create_stats_db now
+    carries it, so the pre must be hand-built to show the ADD COLUMN), plus one
+    seeded reset event and an empty ``schema_migrations``. post.sqlite: the
+    column is added (NULL on the existing row) and the 007 marker stamped. Pure
+    stats handler — a simple ADD COLUMN, no cache, no clock.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    name           TEXT PRIMARY KEY,
+                    applied_at_utc TEXT NOT NULL
+                );
+                -- Pre-007 shape: NO observed_pre_credit_pct column.
+                CREATE TABLE week_reset_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    detected_at_utc        TEXT NOT NULL,
+                    old_week_end_at        TEXT NOT NULL,
+                    new_week_end_at        TEXT NOT NULL,
+                    effective_reset_at_utc TEXT NOT NULL,
+                    UNIQUE(old_week_end_at, new_week_end_at)
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO week_reset_events "
+                "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                " effective_reset_at_utc) VALUES (?,?,?,?)",
+                ("2026-04-19T18:00:00Z", "2026-04-20T15:00:00Z",
+                 "2026-04-19T18:00:00Z", "2026-04-19T18:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = _stats_handler(mod, "007_observed_pre_credit_pct")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            mod._stamp_applied(
+                conn, "007_observed_pre_credit_pct", TS_STATS_FIVE_APPLIED,
+            )
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def _build_flag_only_cache_golden(
+    scenario_dir: Path,
+    *,
+    migration_name: str,
+    predecessor_marker: str,
+    flag_key: str,
+) -> None:
+    """Shared builder for the flag-only conversation re-ingest cache goldens
+    (cache 005 / 006, #279 S7 W3). Mirrors the 003/004 cache builders: pre =
+    full cache schema (``_apply_cache_schema``) + the predecessor marker + one
+    ``conversation_messages`` row; post = the row UNCHANGED plus ``flag_key``
+    set in ``cache_meta`` and the migration marker stamped (the flag-only
+    handler defers the clear + offset-0 re-ingest to sync_cache under the
+    ``cache.db.lock`` flock)."""
+    import json as _json
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    _BLOCKS = _json.dumps(
+        [{"kind": "tool_use", "name": "Read", "input_summary": "{}",
+          "id": "toolu_x", "preview": "/a/b.py"}],
+        separators=(",", ":"),
+    )
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        mod = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            mod._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) VALUES (?, ?)",
+                (predecessor_marker, TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute(
+                "INSERT INTO conversation_messages "
+                "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                " entry_type,text,blocks_json,model,msg_id,req_id,is_sidechain) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("s1", "a1", "/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 0, "2026-04-15T15:00:00Z", "assistant", "",
+                 _BLOCKS, "claude-opus-4-7", "m1", "r1", 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = None
+        for m in mod._CACHE_MIGRATIONS:
+            if m.name == migration_name:
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(f"cache migration {migration_name} not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration_name, TS_STATS_FIVE_APPLIED),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_005_conversation_reingest_meta(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration ``005_conversation_reingest_meta``
+    (#279 S7 W3). Flag-only handler — sets the shared
+    ``conversation_reingest_pending`` flag (reused from 003/004) so sync_cache
+    later reclassifies injected ``isMeta`` user lines. Loaded by
+    ``tests/test_cache_migration_005_per_migration_goldens.py``."""
+    _build_flag_only_cache_golden(
+        scenario_dir,
+        migration_name="005_conversation_reingest_meta",
+        predecessor_marker="004_conversation_reingest_subagent_kind",
+        flag_key="conversation_reingest_pending",
+    )
+
+
+def build_per_migration_006_conversation_reingest_source_tool_use_id(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``006_conversation_reingest_source_tool_use_id`` (#279 S7 W3). Flag-only
+    handler — sets the DISTINCT ``conversation_source_tool_use_reingest_pending``
+    flag (NOT the shared one) so sync_cache backfills ``source_tool_use_id``.
+    Loaded by ``tests/test_cache_migration_006_per_migration_goldens.py``."""
+    _build_flag_only_cache_golden(
+        scenario_dir,
+        migration_name="006_conversation_reingest_source_tool_use_id",
+        predecessor_marker="005_conversation_reingest_meta",
+        flag_key="conversation_source_tool_use_reingest_pending",
+    )
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -3489,6 +4127,34 @@ def main() -> int:
     )
     build_per_migration_012_unify_budget_milestones_vendor(
         FIXTURES_ROOT / "per-migration" / "012_unify_budget_milestones_vendor"
+    )
+    # W3 backfill (#279 S7): the 7 previously-missing per-migration goldens —
+    # stats 001-004/007 + cache 005/006 (stats 005/006 remain the only
+    # hand-built, builder-less goldens).
+    build_per_migration_001_five_hour_block_models_backfill_v1(
+        FIXTURES_ROOT / "per-migration"
+        / "001_five_hour_block_models_backfill_v1"
+    )
+    build_per_migration_002_five_hour_block_projects_backfill_v1(
+        FIXTURES_ROOT / "per-migration"
+        / "002_five_hour_block_projects_backfill_v1"
+    )
+    build_per_migration_003_merge_5h_block_duplicates_v1(
+        FIXTURES_ROOT / "per-migration" / "003_merge_5h_block_duplicates_v1"
+    )
+    build_per_migration_004_heal_forked_week_start_date_buckets(
+        FIXTURES_ROOT / "per-migration"
+        / "004_heal_forked_week_start_date_buckets"
+    )
+    build_per_migration_007_observed_pre_credit_pct(
+        FIXTURES_ROOT / "per-migration" / "007_observed_pre_credit_pct"
+    )
+    build_per_migration_005_conversation_reingest_meta(
+        FIXTURES_ROOT / "per-migration" / "005_conversation_reingest_meta"
+    )
+    build_per_migration_006_conversation_reingest_source_tool_use_id(
+        FIXTURES_ROOT / "per-migration"
+        / "006_conversation_reingest_source_tool_use_id"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

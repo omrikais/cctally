@@ -14,10 +14,12 @@ clears BOTH atomically.
 
 Mirrors ``test_migration_003_reingest.py``'s harness (``load_script() +
 redirect_paths()``, per the "HOME-only test loader reads prod DB" gotcha). The
-per-migration golden is intentionally skipped (matching cache 005's precedent: a
-flag-only re-ingest's pre/post diff is just the flag bit) — and the
-``test_migration_006_*`` filename here covers the CACHE migration, distinct from
-the stats-006 golden test ``test_migration_006_per_migration_goldens.py``.
+per-migration pre/post golden now lives in
+``test_cache_migration_006_per_migration_goldens.py`` (#279 S7 W3 backfill — the
+lazy-adoption gap was closed and the registry-completeness guard now enforces a
+golden for EVERY migration); the ``test_migration_006_*`` filename here covers
+the CACHE migration's sync_cache consume site, distinct from the stats-006
+golden test ``test_migration_006_per_migration_goldens.py``.
 """
 import json
 import sqlite3
