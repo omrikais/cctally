@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.66.0] - 2026-07-10
+
 ### Added
 - Reporting `--json` output now carries a `schemaVersion: 1` key (rendered first) so downstream consumers can version-gate against the payload shape. It is added to every reporting surface that lacked it — `daily`/`daily --instances`/`monthly`/`weekly`/`session`, the Codex `codex-daily`/`codex-monthly`/`codex-weekly`/`codex-session` reports, `blocks`, `forecast`, `report` (`dollar-per-percent`), `project`, `range-cost`, `cache-report`, `percent-breakdown`, `sync-week`, `telemetry`, and the `budget set`/`unset` actions — including their empty and error forms. The already-versioned surfaces (`five-hour-blocks`, `five-hour-breakdown`, `budget` status, `record-credit`, `pricing-check`) are unchanged, and the shipped snake-case `schema_version` surfaces (`diff`, `doctor`, `db status`, `refresh-usage`, `setup`) keep their existing key. Existing keys are unchanged and consumers should tolerate unknown keys (#279).
 - The cache sync now counts JSONL lines it can't parse (malformed) or has to drift-skip (usage/model/timestamp no longer parse), per vendor, and surfaces them on the `cache-sync` done lines, the hook-tick log line, and a new `cctally doctor` "Ingest parse health" check — so a Claude Code / Codex session-format change that would silently affect your cost numbers becomes visible instead of vanishing (#279).
