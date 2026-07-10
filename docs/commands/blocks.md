@@ -4,13 +4,18 @@ Claude usage grouped by 5-hour session block.
 
 > Canonical form: [`cctally claude blocks`](claude.md) (this flat form remains as an alias).
 
+> **Which 5h command?** `blocks` (this page) is the ccusage-compatible per-window view (includes `~`-prefixed heuristic rows when no recorded reset covers a window); [`five-hour-blocks`](five-hour-blocks.md) is the API-anchored analytics view with model/project rollups and 7d drift; [`five-hour-breakdown`](five-hour-breakdown.md) drills into per-percent milestones inside one block.
+
 `cctally blocks` aims for parity with `ccusage blocks`'s output shape but
 implements two intentional improvements over upstream:
 
 1. **5h block boundaries follow Anthropic's `rate_limits.5h.resets_at`**
-   (10-minute granularity), not the legacy hour-floor algorithm. A first
-   message at 7:10 PM anchors the block at 7:10, not 7:00. ccusage still
-   uses `floor_to_hour` (`rust/crates/ccusage/src/blocks.rs:51-54`).
+   (10-minute granularity) wherever a recorded snapshot covers the window,
+   not the legacy hour-floor algorithm. A first message at 7:10 PM anchors
+   the block at 7:10, not 7:00. ccusage still uses `floor_to_hour`
+   (`rust/crates/ccusage/src/blocks.rs:51-54`). Windows with no recorded
+   reset fall back to a heuristic start and render as `~`-prefixed rows that
+   can drift from the real boundary (see [Notes](#notes)).
 2. **Duplicate-pair dedup matches ccusage's `should_replace_deduped_entry`**
    (`rust/crates/ccusage/src/claude_loader.rs:531`) — higher-token-total
    wins, `speed`-set breaks ties. Fixed in v1.12.0; pre-fix versions kept

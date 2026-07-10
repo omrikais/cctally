@@ -3,6 +3,8 @@
 Per-percent cumulative + marginal cost milestones inside a single
 API-anchored 5-hour block. Mirror of `percent-breakdown` for the 5h axis.
 
+> **Which 5h command?** [`blocks`](blocks.md) is the ccusage-compatible per-window view (includes `~`-prefixed heuristic rows when no recorded reset covers a window); [`five-hour-blocks`](five-hour-blocks.md) is the API-anchored analytics view with model/project rollups and 7d drift; `five-hour-breakdown` (this page) drills into per-percent milestones inside one block.
+
 ## Synopsis
 
 ```

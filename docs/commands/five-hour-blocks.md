@@ -2,6 +2,8 @@
 
 List API-anchored 5-hour blocks with rollup totals plus 7d-drift columns.
 
+> **Which 5h command?** [`blocks`](blocks.md) is the ccusage-compatible per-window view (includes `~`-prefixed heuristic rows when no recorded reset covers a window); `five-hour-blocks` (this page) is the API-anchored analytics view with model/project rollups and 7d drift; [`five-hour-breakdown`](five-hour-breakdown.md) drills into per-percent milestones inside one block.
+
 ## Synopsis
 
 ```

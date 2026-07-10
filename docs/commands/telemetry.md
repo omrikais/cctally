@@ -1,6 +1,6 @@
 # `telemetry`
 
-Inspect and control cctally's anonymous, opt-out **install-count telemetry**. cctally sends, at most once a day, a minimal beat — a one-way month-rotating token (never your install id), the client version, and a coarse OS family (`macos`/`linux`/`windows`/`other`). No IP, username, path, or session content ever leaves the machine.
+Inspect and control cctally's anonymous, opt-out **install-count telemetry**. cctally sends, at most once a day, a minimal beat — a one-way month-rotating token (never your install id), the client version, and a coarse OS family (`macos`/`linux`/`windows`/`other`). No username, path, or session content is ever sent; no IP is included in the payload or retained by the server (Cloudflare necessarily sees the source IP to route the request — see [`../telemetry.md`](../telemetry.md) for the honest threat model).
 
 This page is the command reference. For the full privacy story — what is sent, what is never collected, how the token's cross-month unlinkability works, retention, and the honest threat model — see [`../telemetry.md`](../telemetry.md).
 

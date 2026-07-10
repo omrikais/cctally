@@ -1,16 +1,13 @@
 # Architecture
 
-Single-file Python CLI (~4350 lines, stdlib only) at
-`bin/cctally`. Two bash wrappers in the same directory.
-This page maps out the major data flows so you can find the right
-subcommand for the right question.
+`bin/cctally` is the executable and re-export surface of a **stdlib-only** Python 3 CLI; it eagerly loads sibling command/glue modules (`bin/_cctally_*.py`) and reusable `_lib_*.py` modules from the same directory. Optional dependencies such as `rich` stay command-lazy. Thin bash wrappers exist for selected commands. The `dashboard/web/` Vite/React island is the one build-time surface; its built output is committed to `dashboard/static/` so the runtime stays zero-dep. This page maps out the major data flows so you can find the right subcommand for the right question.
 
 ## Data sources
 
 | Source | Used by |
 | --- | --- |
 | Claude Code status-line JSON (`rate_limits`) | `record-usage` |
-| Claude Code session JSONLs (`~/.claude/projects/**/*.jsonl`) | every Claude usage/cost command via `cache.db` |
+| Claude Code session JSONLs (`~/.claude/projects/**/*.jsonl`) | Claude usage/cost commands that read session data via `cache.db` (`report` without `--sync-current` is stats-only) |
 | Codex CLI session JSONLs (`~/.codex/sessions/**/*.jsonl`) | every `codex-*` command via `cache.db` |
 
 ## Storage layers
@@ -34,11 +31,9 @@ See [runtime-data.md](runtime-data.md) for the full schema of both DBs.
 
 Every JSONL-reading command goes through a delta cache:
 
-1. On invocation, `sync_cache()` walks `~/.claude/projects/` (or
-   `~/.codex/sessions/` for Codex commands).
-2. For each file, it reads `(size_bytes, mtime_ns)` and compares to
-   `session_files.last_byte_offset`.
-3. New bytes are tail-ingested into `session_entries`. Old bytes are not
+1. On invocation, `sync_cache()` walks `~/.claude/projects/` (Codex commands use the parallel `sync_codex_cache()` over `~/.codex/sessions/`, with its own `codex_session_files`/`codex_session_entries` tables and `cache.db.codex.lock`).
+2. For each file, it reads `(size_bytes, mtime_ns)` and compares to the Claude-side `session_files.last_byte_offset`.
+3. New bytes are tail-ingested into the Claude-side `session_entries`. Old bytes are not
    re-read.
 4. Queries (`iter_entries()`) then run against `session_entries` instead of
    re-parsing JSONL.
@@ -96,7 +91,7 @@ rows that predate the hour-accurate column.
 ## Pricing
 
 `CLAUDE_MODEL_PRICING` and `CODEX_MODEL_PRICING` are **hardcoded** dicts
-near the top of the script. When Anthropic / OpenAI ship a new model:
+in `bin/_lib_pricing.py`. When Anthropic / OpenAI ship a new model:
 
 - Add an entry to the appropriate dict.
 - Sessions using unrecognized Claude models log a warning and contribute
@@ -144,19 +139,18 @@ this back to upstream parity.**
 
 ## Schema migrations
 
-No migration framework. New columns are added inline in `open_db()` via:
+Two patterns, one rule each:
 
-```python
-cols = {r["name"] for r in conn.execute("PRAGMA table_info(<table>)").fetchall()}
-if "<new_col>" not in cols:
-    conn.execute("ALTER TABLE <table> ADD COLUMN <new_col> <type>")
-```
+- **Column additions** use `add_column_if_missing(...)` — an idempotent guard that adds the column when absent. No marker row, no version bump.
+- **Data-shape changes** (backfills, dedups, renames, table rewrites) go through the migration framework: handlers registered with `@stats_migration` / `@cache_migration` and dispatched by `_run_pending_migrations` on DB open, tracked in the `schema_migrations` table alongside `PRAGMA user_version`.
 
-Follow this pattern when extending the schema.
+Do **not** write inline `if "<col>" not in cols: ALTER TABLE …` blocks in `open_db()` — that is the anti-pattern the framework replaces.
+
+The operator surface is `cctally db status` (list applied/pending/failed/skipped across both DBs), `db skip` / `db unskip` (park a migration that cannot succeed on this machine), and `db recover` (revert a version-ahead DB to the known head). A dev-checkout binary refuses to forward-migrate the production data dir, so an in-progress migration on a git checkout can never brick the installed release's databases.
 
 ## Diagnostics
 
-`cctally doctor` is a pure-function kernel (`bin/_lib_doctor.py`) wrapping read-only inspections of every diagnostic source — install symlinks, hook activity, OAuth state, migration markers, snapshot freshness, dashboard bind safety, update-state files. The kernel takes a `DoctorState` dataclass assembled by `doctor_gather_state` in `bin/cctally` (the I/O layer reusing existing helpers like `_db_status_for`, `_setup_count_hook_entries`, `_load_update_state`). The same kernel powers the CLI report (text + JSON), the dashboard SSE envelope's aggregate `doctor` block, and the `GET /api/doctor` full-payload endpoint.
+`cctally doctor` is a pure-function kernel (`bin/_lib_doctor.py`) wrapping read-only inspections of every diagnostic source — install symlinks, hook activity, OAuth state, migration markers, snapshot freshness, dashboard bind safety, update-state files. The kernel takes a `DoctorState` dataclass assembled by `doctor_gather_state` in `bin/_cctally_doctor.py` (the I/O layer reusing existing helpers like `_db_status_for`, `_setup_count_hook_entries`, `_load_update_state`). The same kernel powers the CLI report (text + JSON), the dashboard SSE envelope's aggregate `doctor` block, and the `GET /api/doctor` full-payload endpoint.
 
 ## Where to read next
 

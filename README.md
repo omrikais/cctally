@@ -16,7 +16,7 @@
   <a href="https://github.com/omrikais/cctally/stargazers"><img src="https://img.shields.io/github/stars/omrikais/cctally.svg" alt="GitHub stars"></a>
 </p>
 
-Claude Code's Pro/Max plans meter you on a weekly quota, but the only signal you get is a percentage that creeps up until you cap. `cctally` turns that percentage into something you can act on: it reads your local session logs, computes cost in-process, and shows you **how much each percent of quota is actually costing you, whether you're on track to cap this week, and exactly where the spend is going** - across a live web dashboard, a read-only conversation viewer, and a full set of CLI reports. Everything runs locally against your own `~/.claude` data. No account, no API key, no telemetry, nothing leaves your machine.
+Claude Code's Pro/Max plans meter you on a weekly quota, but the only signal you get is a percentage that creeps up until you cap. `cctally` turns that percentage into something you can act on: it reads your local session logs, computes cost in-process, and shows you **how much each percent of quota is actually costing you, whether you're on track to cap this week, and exactly where the spend is going** - across a live web dashboard, a read-only conversation viewer, and a full set of CLI reports. Everything runs locally against your own `~/.claude` data. No account, no API key, no cloud processing — cctally never uploads your session data, and its only telemetry is an anonymous, opt-out [install count](#privacy--telemetry).
 
 <p align="center">
   <img src="docs/img/dashboard-desktop.png" alt="cctally dashboard, desktop view" width="900">
@@ -120,7 +120,7 @@ Get a native desktop notification the moment you cross a percent milestone, so a
 
 ## 5-hour analytics
 
-Claude Code's quota also runs on rolling 5-hour windows. `cctally blocks` and `cctally five-hour-blocks` break usage down per window - anchored to the real API resets, not a re-sizable guess - with model and project rollups and cross-reset flags, and `cctally five-hour-breakdown` drills into the per-percent milestones inside a single block.
+Claude Code's quota also runs on rolling 5-hour windows. `cctally blocks` and `cctally five-hour-blocks` break usage down per window - anchored to the real API resets where a recorded reset covers the window (`blocks` marks its heuristic fallback rows with `~`), not a re-sizable guess - with model and project rollups and cross-reset flags, and `cctally five-hour-breakdown` drills into the per-percent milestones inside a single block.
 
 <p align="center">
   <img src="docs/img/cli-five-hour-blocks.svg" alt="cctally five-hour-blocks: 5h analytics with model breakdown">
@@ -156,7 +156,7 @@ If you also use OpenAI's Codex CLI, `cctally codex daily / monthly / session` ar
 
 ## Privacy & telemetry
 
-cctally sends an anonymous, opt-out **install-count beat** — at most once a day — so the project can gauge how many people actually use it (npm and GitHub numbers are drowned in bots and mirrors). The entire payload is a one-way token that rotates every month (derived from a random local id that never leaves your machine and can't be recovered from the token), the cctally version, and a coarse OS family (`macos`/`linux`/`windows`/`other`). No identity, file paths, prompts, usage data, or stored IP — ever. Nothing leaves your machine for at least 24 hours after first run, so you always have a window to opt out first.
+cctally sends an anonymous, opt-out **install-count beat** — at most once a day — so the project can gauge how many people actually use it (npm and GitHub numbers are drowned in bots and mirrors). The entire payload is a one-way token that rotates every month (derived from a random local id that never leaves your machine and can't be recovered from the token), the cctally version, and a coarse OS family (`macos`/`linux`/`windows`/`other`). No identity, file paths, prompts, usage data, or stored IP — ever. The first beat is held for at least 24 hours after first run, so you always have a window to opt out first.
 
 Turn it off any time with `cctally telemetry off` (or `cctally config set telemetry.enabled false`, `CCTALLY_DISABLE_TELEMETRY=1`, or the community-standard `DO_NOT_TRACK=1`); it's also off automatically in dev checkouts. Run `cctally telemetry` to see the current state and exactly what would be sent. The full transparency page — token construction, retention, and an honest threat model — is [docs/telemetry.md](docs/telemetry.md).
 

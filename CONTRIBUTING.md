@@ -43,8 +43,7 @@ approach before you write code.
 
 ## Local development
 
-cctally is a single-file, **stdlib-only Python 3** program — there is no
-install step and no build step for the CLI.
+cctally is a **stdlib-only Python 3** program — `bin/cctally` plus a family of sibling modules in `bin/` — with no install step and no build step for the CLI.
 
 - Sanity-check a change: `python3 -m py_compile bin/cctally`
 - Run the test suite: `bin/cctally-test-all`
@@ -65,4 +64,4 @@ install step and no build step for the CLI.
 ## License
 
 By contributing, you agree that your contributions are licensed under the
-project's [MIT License](LICENSE).
+project's [Apache License 2.0](LICENSE).
