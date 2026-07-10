@@ -440,6 +440,13 @@ STATUSLINE_BURN_RATE_BANDS = _lib_statusline.STATUSLINE_BURN_RATE_BANDS
 # top-level catch-all; adopted by the dashboard log_error surface).
 _lib_log = _load_sibling("_lib_log")
 
+# #279 S6 W1: pure JSON wire-format kernel — the schemaVersion stamp helper
+# (single chokepoint for the additive camelCase envelope across reporting
+# --json surfaces) + the canonical _iso_z (bound in W4/Task 9, not here).
+# Convention: docs/cli-contract.md.
+_lib_json_envelope = _load_sibling("_lib_json_envelope")
+stamp_schema_version = _lib_json_envelope.stamp_schema_version
+
 _lib_changelog = _load_sibling("_lib_changelog")
 # Backward-compat re-export: callers and tests reach the helper through
 # ``cctally._release_read_latest_release_version`` (incl. monkeypatch
