@@ -22,6 +22,10 @@ from pathlib import Path
 
 import pytest
 
+# W1 registry-completeness guard (#279 S7): declares this module exercises
+# the handler's second-invocation idempotency (test names vary across modules).
+IDEMPOTENCY_COVERED = True
+
 
 FIXTURE_DIR = (
     Path(__file__).resolve().parent

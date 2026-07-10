@@ -25,6 +25,10 @@ from pathlib import Path
 
 import pytest
 
+# W1 registry-completeness guard (#279 S7): declares this module exercises
+# the handler's second-invocation idempotency (test names vary across modules).
+IDEMPOTENCY_COVERED = True
+
 
 FIXTURE_DIR = (
     Path(__file__).resolve().parent
@@ -118,6 +122,44 @@ def test_handler_is_clean_noop_on_post_217_schema(cctally_module, tmp_path):
         cctally_module._stamp_applied(conn, _MIGRATION)
 
         assert _cols(conn) == before, "handler must not change the schema"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name=?",
+            (_MIGRATION,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_handler_drops_then_is_idempotent_on_rerun(cctally_module, tmp_path):
+    """Run-twice coverage on a COLUMN-CARRYING DB (the golden pre lacks
+    ``search_aux``, so this is the only place the DROP path meets the rerun
+    guard). Add the dead column back onto a copy of pre.sqlite (which has the
+    current FTS shape — no ``conversation_fts_aux`` / no split-pending flag —
+    so guard 3 passes), then invoke the handler TWICE: the first run DROPs the
+    column, the second finds it gone and is a clean no-op (guard 1). This is the
+    #279 S7 W1 run-twice closure — cache 016 was the one golden of 25 without a
+    second-invocation test."""
+    work = tmp_path / "cache.db"
+    shutil.copy(PRE_DB, work)
+    conn = sqlite3.connect(work)
+    try:
+        conn.execute(
+            "ALTER TABLE conversation_messages ADD COLUMN search_aux TEXT DEFAULT ''"
+        )
+        conn.commit()
+        assert "search_aux" in _cols(conn)
+        handler = _migration_handler(cctally_module)
+
+        # First invocation: drops the column.
+        handler(conn)
+        cctally_module._stamp_applied(conn, _MIGRATION)
+        assert "search_aux" not in _cols(conn), "first run must DROP search_aux"
+
+        # Second invocation: column already gone → guard 1 no-op, no raise.
+        after_first = _cols(conn)
+        handler(conn)
+        cctally_module._stamp_applied(conn, _MIGRATION)
+        assert _cols(conn) == after_first, "rerun must be a clean no-op"
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE name=?",
             (_MIGRATION,),

@@ -401,12 +401,44 @@ def _make_migration_decorator(registry: list[Migration], db_label: str, name: st
 
 
 def stats_migration(name: str):
-    """Register a stats.db migration. Use as @stats_migration("NNN_descriptive_name")."""
+    """Register a stats.db migration. Use as @stats_migration("NNN_descriptive_name").
+
+    HANDLER CONTRACT — idempotency is MANDATORY, not best-effort. The
+    dispatcher applies a handler and stamps its ``schema_migrations`` marker in
+    a TWO-TRANSACTION window (``m.handler(conn)`` commits the data change, THEN
+    ``_stamp_applied`` writes the marker in a separate transaction — see
+    ``_run_pending_migrations``). A crash BETWEEN those two commits leaves the
+    data change applied but unmarked, so the NEXT ``open_db()`` re-invokes the
+    handler. A handler that is not idempotent (re-derives from already-migrated
+    state, double-applies, or raises on a second run) corrupts or bricks the DB
+    on that retry. Every handler MUST therefore be safe to run again on its own
+    output: probe-then-return on the already-applied shape (a fast-path guard
+    like ``if 'col' in cols(...): return``), or use ``INSERT OR IGNORE`` /
+    ``UPDATE … WHERE not-yet-migrated`` / upsert idioms. The same contract
+    covers a ``MigrationGateNotMet`` deferral: the dispatcher leaves the
+    migration pending and re-runs it on a later open, which is just another
+    handler retry. Carve-out: cache ``001_dedup_highest_wins`` stamps its marker
+    ATOMICALLY inside its own ``BEGIN IMMEDIATE`` (the destructive wipe and the
+    stamp must commit together), so it has no two-transaction window — but it is
+    still idempotent (its in-txn ``already_applied`` re-check). Per-migration
+    goldens (``tests/test_*_per_migration_goldens.py``) pin the second-invocation
+    no-op; the registry-completeness guard enforces one per migration.
+    """
     return _make_migration_decorator(_STATS_MIGRATIONS, "stats.db", name)
 
 
 def cache_migration(name: str):
-    """Register a cache.db migration. Use as @cache_migration("NNN_descriptive_name")."""
+    """Register a cache.db migration. Use as @cache_migration("NNN_descriptive_name").
+
+    HANDLER CONTRACT — idempotency is MANDATORY. See ``stats_migration`` above
+    for the full statement: the dispatcher's handler-commit → marker-stamp
+    two-transaction window means a crash (or a ``MigrationGateNotMet`` deferral)
+    re-invokes the handler on its own output, so every handler must be safe to
+    re-run (probe-then-return / ``INSERT OR IGNORE`` / not-yet-migrated guards).
+    The flag-only re-ingest cache migrations (003-007, 009, 014, 017) satisfy it
+    by ``_set_cache_meta`` upsert; ``001_dedup_highest_wins`` is the lone
+    atomic-stamp carve-out.
+    """
     return _make_migration_decorator(_CACHE_MIGRATIONS, "cache.db", name)
 
 

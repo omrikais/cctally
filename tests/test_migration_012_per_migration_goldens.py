@@ -5,6 +5,10 @@ from pathlib import Path
 import pytest
 from conftest import load_script
 
+# W1 registry-completeness guard (#279 S7): declares this module exercises
+# the handler's second-invocation idempotency (test names vary across modules).
+IDEMPOTENCY_COVERED = True
+
 FIXTURE = (Path(__file__).resolve().parent / "fixtures" / "migrations"
            / "per-migration" / "012_unify_budget_milestones_vendor")
 PRE_DB = FIXTURE / "pre.sqlite"
