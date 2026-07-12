@@ -8,12 +8,16 @@ import { useEffect } from 'react';
 // setup -> cleanup -> setup double-invoke is balanced (+1, -1, +1) and re-saves
 // the same values, so it's inert.
 //
-// We lock BOTH <html> (documentElement) and <body>. In standards mode <html>
-// is the viewport scroller (cctally's `html, body` set no overflow/height), so
-// `overflow:hidden` on <body> alone is inert — the page keeps scrolling behind
-// the overlay. Locking documentElement is the load-bearing part; body is kept
-// for setups where <body> is the scroller. (Verified in Chromium at 390px —
-// #214 M1 QA caught the body-only version scrolling behind every modal.)
+// We lock BOTH <html> (documentElement) and <body>. On the current stylesheet
+// `html, body` set no `overflow` (both resolve to the initial `visible`), and CSS
+// overflow PROPAGATION governs: when the root <html>'s overflow is `visible`, the
+// UA applies the FIRST <body>'s overflow to the viewport instead. So on this
+// stylesheet `overflow: hidden` on <body> ALONE already locks the page — the
+// propagated value is what stops the viewport scrolling. Locking documentElement
+// too is belt-and-suspenders, NOT load-bearing here; it's kept for a future
+// stylesheet that gives <html> its own non-`visible` overflow (which would cancel
+// the propagation and make <html> the scroller). (#281 S5 B4 — corrects the prior
+// inverted claim; body-only overflow:hidden is sufficient on this stylesheet.)
 let lockCount = 0;
 let savedHtmlOverflow = '';
 let savedBodyOverflow = '';

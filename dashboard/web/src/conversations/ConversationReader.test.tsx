@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader, deriveReaderTitle } from './ConversationReader';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
@@ -3095,5 +3096,135 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     await waitFor(() => expect(getState().convPinnedUuid).toBe('a-saved'));
     expect(container.querySelector('[data-uuid="a-saved"]')!.classList.contains('conv-item--jumped')).toBe(true);
     clearReadingPositions();
+  });
+
+  // #281 S5 §2 — the machine's StrictMode lifecycle contract, exercised at the
+  // REACT level (spec §2 discharged the pure-machine half in readerScrollMachine
+  // .test.ts; these pin the adapter under <StrictMode>, whose mount double-invoke
+  // (setup → cleanup → setup) is exactly what the generation-keyed one-shot
+  // latches must survive without duplicating OR losing work). Review a-P2.
+  //
+  // A URL-routing fetch mock (NOT mockFetchOnce): StrictMode's mount fires the
+  // hook's open-fetch effect twice (setup → abort → setup), so the ?tail=1 page
+  // is requested twice — a once-queued response would starve the replay. Routing
+  // by URL serves each request idempotently, which is the whole point of the
+  // contract (a repeated fetch for the same window is harmless).
+  describe('#281 S5 §2 — StrictMode lifecycle contract', () => {
+    function routeFetch(routes: Array<{ match: (u: string) => boolean; body: unknown; status?: number }>): void {
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+        const u = String(url);
+        const route = routes.find((r) => r.match(u));
+        if (!route) throw new HttpErrorLike(u);
+        const status = route.status ?? 200;
+        return { ok: status < 400, status, json: async () => route.body } as Response;
+      });
+    }
+    class HttpErrorLike extends Error {
+      constructor(u: string) { super(`routeFetch: no route for ${u}`); }
+    }
+
+    it('(1) initial open lands the open-scroll intent EXACTLY ONCE under StrictMode', async () => {
+      // A single-page open resolves openScrollIntent 'top' → the one-shot lander
+      // issues scrollToIndex({index:0, align:'start'}) once. Under StrictMode the
+      // firstWindowReady latch (keyed on the open generation) must fire once — a
+      // non-idempotent latch would land twice (or the generation would double-bump).
+      routeFetch([{ match: (u) => u.includes('/conversation/s') && u.includes('tail=1'),
+        body: edged([makeItem({ uuid: 't1' }), makeItem({ uuid: 't2' })], { prev_before: null, has_prev: false }) }]);
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+      const { container } = render(<StrictMode><ConversationReader sessionId="s" /></StrictMode>);
+      await waitFor(() => expect(container.querySelector('[data-uuid="t2"]')).not.toBeNull());
+      // Let every passive effect (incl. the StrictMode replay) flush.
+      await act(async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); });
+      // The single-page open lands at the TOP exactly once (the only scrollToIndex
+      // for an open with no jump / no walk).
+      expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledTimes(1);
+      expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledWith({ index: 0, align: 'start' });
+    });
+
+    it('(2) A→B→A restore re-arms under StrictMode (restore fires again on return to A)', async () => {
+      const sItem = (sid: string, uuid: string) => makeItem({
+        uuid, member_uuids: [uuid], anchor: { session_id: sid, uuid, id: _idFor(uuid) },
+      } as never);
+      const sDetail = (sid: string, items: ConversationItem[]) => ({
+        ...edged(items, { prev_before: 3, has_prev: true }),
+        session_id: sid,
+      });
+      clearReadingPositions();
+      recordReadingPos('a', 'a-saved', 1000);
+      vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+      const outlineA = outlineFor([oTurn({ uuid: 'a-saved', kind: 'human' }), oTurn({ uuid: 'a-last', kind: 'human' })]);
+      const outlineB = outlineFor([oTurn({ uuid: 'b-1', kind: 'human' }), oTurn({ uuid: 'b-2', kind: 'human' })]);
+      routeFetch([
+        { match: (u) => u.includes('/conversation/a'), body: sDetail('a', [sItem('a', 'a-saved'), sItem('a', 'a-last')]) },
+        { match: (u) => u.includes('/conversation/b'), body: sDetail('b', [sItem('b', 'b-1'), sItem('b', 'b-2')]) },
+      ]);
+
+      // Open A → restore fires (pin lands on a-saved).
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+      const { container, rerender } = render(<StrictMode><ConversationReader sessionId="a" outline={outlineA} /></StrictMode>);
+      await waitFor(() => expect(getState().convPinnedUuid).toBe('a-saved'));
+
+      // Switch to B (a genuine, NON-restore tail open — never touches A's latch).
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'b' });
+      rerender(<StrictMode><ConversationReader sessionId="b" outline={outlineB} /></StrictMode>);
+      await waitFor(() => expect(container.querySelector('[data-uuid="b-1"]')).not.toBeNull());
+      await waitFor(() => expect(getState().convPinnedUuid).toBeNull());
+
+      // Return to A → the generation-keyed restore latch re-arms and fires again,
+      // even though a value-keyed latch (never reset by B) would wrongly skip it.
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'a' });
+      rerender(<StrictMode><ConversationReader sessionId="a" outline={outlineA} /></StrictMode>);
+      await waitFor(() => expect(getState().convPinnedUuid).toBe('a-saved'));
+      clearReadingPositions();
+    });
+
+    it('(3) a pending jump runs loadToTarget ONCE under the StrictMode double-invoke', async () => {
+      // Page 1 (tail) has h1 with more below; the forward drain fetches page 2
+      // (the target). Count the DRAIN request (?after=): the pending jump's
+      // loadToTarget must run exactly once — the drain's single-in-flight guard +
+      // the jump effect's cancel guard together survive the StrictMode replay (a
+      // double-run would fire a second ?after= drain).
+      let drainCount = 0;
+      routeFetch([
+        { match: (u) => { if (u.includes('after=2')) { drainCount += 1; } return u.includes('after=2'); },
+          body: detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null) },
+        { match: (u) => u.includes('/conversation/s'), body: detail([makeItem({ uuid: 'h1' })], 2) },
+      ]);
+      spyScrollTo();
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'targetFrag' } });
+      const { container } = render(<StrictMode><ConversationReader sessionId="s" /></StrictMode>);
+      await waitFor(() => expect(container.querySelector('[data-uuid="target"]')).not.toBeNull());
+      await waitFor(() => expect(getState().convPinnedUuid).toBe('targetFrag'));
+      await act(async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); });
+      // Exactly one forward drain — the jump did not double-run.
+      expect(drainCount).toBe(1);
+    });
+
+    it('(4) unmount with a pending jump leaks nothing (#256 abort discipline)', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      routeFetch([
+        { match: (u) => u.includes('after=2'),
+          body: detail([makeItem({ uuid: 'target', member_uuids: ['target', 'targetFrag'] } as never)], null) },
+        { match: (u) => u.includes('/conversation/s'), body: detail([makeItem({ uuid: 'h1' })], 2) },
+      ]);
+      spyScrollTo();
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'targetFrag' } });
+      const { container, unmount } = render(<StrictMode><ConversationReader sessionId="s" /></StrictMode>);
+      // The pipeline is in flight once the body mounts (detail resolved → the
+      // drain + the rAF quiesce loops are scheduled). Tear the reader down
+      // underneath them.
+      await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+      unmount();
+      const pinAtUnmount = getState().convPinnedUuid;
+      // Flush every pending macrotask / rAF (the shim is setTimeout(0)-backed). A
+      // self-rescheduling rAF that ignored aborted() would keep firing here and
+      // push a post-unmount store update or throw; a compliant loop bails on its
+      // first aborted() check, so nothing changes after unmount.
+      await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+      expect(getState().convPinnedUuid).toBe(pinAtUnmount);
+      const badErr = errSpy.mock.calls.find((c) => /not defined|unmounted|inside a test was not wrapped in act/.test(String(c[0])));
+      expect(badErr ? String(badErr[0]) : null).toBeNull();
+      errSpy.mockRestore();
+    });
   });
 });

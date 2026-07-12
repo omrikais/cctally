@@ -1329,8 +1329,14 @@ def build_blocks_view(
                         per_model.items(), key=lambda kv: -kv[1],
                     )
                 ]
+                # Round the DISPLAYED start to the nearest 10-min boundary
+                # (reset-jitter normalization); ``start_at`` / ``end_at``
+                # below stay exact — they key the React row and the
+                # ``/api/block/:start_at`` lookup, which matches by exact
+                # equality (issue #76).
                 local_label = c.format_display_dt(
-                    b.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
+                    c._round_to_ten_minutes(b.start_time),
+                    display_tz, fmt="%H:%M %b %d", suffix=True,
                 )
                 rows.append(BlocksPanelRow(
                     start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),

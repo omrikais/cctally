@@ -34,8 +34,9 @@ import type { ConversationDetail, ConversationItem, OpenIntent, OutlineTurn } fr
 // can keep the count/firstId flat). `rev` is monotonic and bumps on EVERY
 // mutation (even a length-flat one), so a reader effect keyed on `rev` fires
 // reliably; `op` names the direction; the four `added*`/`dropped*` counts let
-// the reader's anchor-restore, live-append/stick, and `newCount` paths read
-// exactly what changed at each edge.
+// the reader's live-append/stick and `newCount` pill paths read exactly what
+// changed at each edge (since #232 the viewport pin across a prepend is Virtuoso's
+// `firstItemIndex`, not a reader-side scroll-anchor effect).
 export interface WindowOp {
   rev: number;                  // monotonic, bumped on every window mutation
   op: 'prepend' | 'append' | 'reset';
@@ -48,6 +49,31 @@ export interface WindowOp {
   // append/stick path treats it as a no-op (addedBottom is 0). A non-trim paging
   // op leaves this undefined.
   trim?: true;
+}
+
+// #286 B3 (spec §7 carve-out) — the additive `loadToTarget` return shape. The
+// reader's jump runner acks the exhaustion clear against the COMMITTED WINDOW
+// EPOCH: a stale pre-commit captured render list can never fire a premature
+// clear, because the runner defers until `committedRev >= terminalOpRev` with the
+// target genuinely absent from the LIVE window (`!found`) and the DRAINED edge
+// truly exhausted (`exhausted`, directional). NO other hook surface moves.
+export interface LoadToTargetResult {
+  // The target ended up in the live window (`detailRef`), even if React hasn't
+  // committed the bringing-prepend to the reader's render list yet.
+  found: boolean;
+  // Which edge the drain paged: 'backward' (top, `?before=`), 'forward' (bottom,
+  // `?after=`), or 'none' (no drivable direction — already loaded / not an outline
+  // turn / session gone). Informational; the reader reads `exhausted`.
+  direction: 'backward' | 'forward' | 'none';
+  // The DRAINED edge is genuinely exhausted (directional: `prevBefore == null` for
+  // a backward drain, `next_after == null` for forward; `none` → treated exhausted
+  // so a truly-unreachable target still clears). A non-exhaustion exit (session
+  // change mid-drain) leaves this false so the jump stays pending for a re-fire.
+  exhausted: boolean;
+  // The rev of the drain's TERMINAL WindowOp (`opRevRef` after the drain). The
+  // reader clears only once its captured `lastOp.rev` has caught up to this, so a
+  // still-in-flight bringing-prepend defers the clear to its own commit re-fire.
+  terminalOpRev: number;
 }
 
 export interface UseConversation {
@@ -67,16 +93,16 @@ export interface UseConversation {
   // anchor (the jump pipeline drives the scroll then).
   openScrollIntent: 'top' | 'bottom' | null;
   // #228 S3 B3 — the latest window-mutation metadata (null before the first
-  // mutation). The reader keys its scroll-anchor restore, live-append/stick, and
-  // `newCount` pill on this, NOT on items.length / firstId / count deltas.
+  // mutation). The reader keys its live-append/stick and `newCount` pill on this,
+  // NOT on items.length / firstId / count deltas (since #232 the prepend viewport
+  // pin is Virtuoso's `firstItemIndex`, not a reader scroll-anchor restore).
   lastOp: WindowOp | null;
   loadMore: () => Promise<WindowOp | null>;
   // #228 S3 B3 — resolves to the prepend's WindowOp (or null for a genuine no-op:
-  // null cursor, stale cursor → empty page, or a fetch error). The reader checks
-  // `addedTop > 0` for success (NOT a count compare, which a far-trim defeats) and
-  // uses it to clear its scroll-anchor snapshot only on a genuine no-op.
+  // null cursor, stale cursor → empty page, or a fetch error). `addedTop > 0`
+  // signals a real prepend (NOT a count compare, which a far-trim defeats).
   loadPrev: () => Promise<WindowOp | null>;
-  loadToTarget: (uuid: string) => Promise<void>;
+  loadToTarget: (uuid: string) => Promise<LoadToTargetResult>;
   jumpToLatest: () => Promise<void>;
   // #217 S4 / I-1.6 — a monotonic counter bumped on each successful pollTail
   // merge (live-tail growth). The open find bar keys its auto-refetch on this
@@ -192,6 +218,14 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const runDrainToTargetRef = useRef<(uuid: string, sid: string) => Promise<void>>(
     () => Promise.resolve(),
   );
+  // #286 B3 — the drain's direction (set once per drain by `runDrainImpl` when it
+  // picks a loop) and its committed-epoch result, so the guarded `loadToTarget`
+  // wrapper (and a re-entrant awaiter) can return the actual `{found, direction,
+  // exhausted, terminalOpRev}` without restructuring the freeze-sensitive drain.
+  const lastDrainDirectionRef = useRef<'backward' | 'forward' | 'none'>('none');
+  const drainResultRef = useRef<LoadToTargetResult>({
+    found: false, direction: 'none', exhausted: true, terminalOpRev: 0,
+  });
   const sessionRef = useRef<string | null>(null);
   // #175 F4 live-tail bookkeeping.
   const hasMoreRef = useRef(false);
@@ -389,9 +423,11 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // strictly advances toward a known-position target and stops on in-window or a
   // genuine edge exhaustion. A uuid resolving to no outline turn is a graceful
   // no-op (current behavior).
-  const loadToTarget = useCallback(async (uuid: string) => {
+  const loadToTarget = useCallback(async (uuid: string): Promise<LoadToTargetResult> => {
     const sid = sessionRef.current;
-    if (sid == null) return;
+    // Session gone — no drain, no absence claim (defer, never clear): exhausted
+    // false so the reader stays pending for the re-open re-fire (#286 B3).
+    if (sid == null) return { found: false, direction: 'none', exhausted: false, terminalOpRev: opRevRef.current };
     // #232 — RE-ENTRANCY GUARD (the cold-deep-link freeze fix). The jump effect
     // re-fires on every prepend THIS drain itself causes (its deps include
     // `nodes` / `virtualFirstItemIndex` / `detail.items.length`), and each re-fire
@@ -409,16 +445,34 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // toward the same target) instead of starting a rival. Awaiting (not dropping)
     // also lets a genuine NEW target — a second jump dispatched mid-drain — run its
     // own drain right after the first settles.
+    // A re-entrant call awaits the in-flight drain and returns ITS committed-epoch
+    // result (`drainResultRef`, set when that drain finished) — so a re-fire that
+    // rode an existing drain acks against the same terminal op (#286 B3).
     const inFlight = drainingRef.current;
-    if (inFlight) { await inFlight; return; }
+    if (inFlight) { await inFlight; return drainResultRef.current; }
     let release: () => void = () => {};
     drainingRef.current = new Promise<void>((res) => { release = res; });
     try {
+      // runDrainImpl resets `lastDrainDirectionRef` to 'none' at its top and sets
+      // 'backward'/'forward' once it picks a loop (via the ref indirection).
       await runDrainToTarget(uuid, sid);
     } finally {
       drainingRef.current = null;
       release();
     }
+    // #286 B3 — compute the committed-epoch result from the terminal drain state:
+    // `found` = the target reached the live window; `exhausted` = the DRAINED
+    // edge's cursor is null (directional; 'none' → treated exhausted so a
+    // truly-unreachable uuid still clears); `terminalOpRev` = the last emitted op.
+    const direction = lastDrainDirectionRef.current;
+    const found = detailRef.current?.items.some((it) => it.member_uuids.includes(uuid)) ?? false;
+    const exhausted = direction === 'backward'
+      ? prevBeforeRef.current == null
+      : direction === 'forward'
+        ? nextAfterRef.current == null
+        : true;
+    drainResultRef.current = { found, direction, exhausted, terminalOpRev: opRevRef.current };
+    return drainResultRef.current;
     // runDrainToTargetRef is a stable ref, so this callback's identity never churns.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -435,6 +489,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // above (so only ONE drain is ever in flight per hook instance — see the freeze
   // note there). `sid` is captured by the wrapper at entry.
   const runDrainImpl = useCallback(async (uuid: string, sid: string) => {
+    lastDrainDirectionRef.current = 'none';  // #286 B3 — reset; set once a loop is picked
     // Already loaded? (read the synchronous mirror, not React state.)
     const has = () => {
       const s = detailRef.current;
@@ -459,12 +514,13 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // commit/paint timing.
     //
     // Safe to trim in the SAME commit as the prepend here (the Codex P0 hazard a
-    // same-commit prepend+far-trim poses for scroll-anchor restore does NOT apply):
-    // the reader's anchor-restore (ConversationReader useLayoutEffect) is gated on
-    // its `prependPendingRef` snapshot, which only the top-sentinel scroll-up path
-    // sets — a jump-driven hook prepend has no snapshot, so it no-ops. The in-flight
-    // jump target is in `protectedUuids`, so the trim never drops it even if a
-    // stale `has()` over-drains past it. The opposite-edge cursor is re-armed so
+    // same-commit prepend+far-trim once posed for a reader-side scroll-anchor
+    // restore no longer applies): since #232 the reader has NO scroll-anchor
+    // snapshot / useLayoutEffect — Virtuoso's `firstItemIndex` (owned here,
+    // decremented atomically by the prepended count in this SAME commit) keeps the
+    // viewport pinned across the prepend with no scrollTop math. The in-flight jump
+    // target is in `protectedUuids`, so the trim never drops it even if a stale
+    // `has()` over-drains past it. The opposite-edge cursor is re-armed so
     // the dropped far edge stays re-fetchable: a bottom drop (backward drain)
     // re-arms the bottom cursor — `hasMore` is DERIVED from `page.next_after`, no
     // state to sync; a top drop (forward drain) re-arms the top cursor and syncs
@@ -529,6 +585,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // overlap-race disambiguation is preserved. This keeps a deep-link arriving
     // before the outline skeleton from no-op'ing.
     if (turns.length === 0) {
+      lastDrainDirectionRef.current = 'forward';  // #286 B3 — no-outline legacy forward drain
       const sidF = sid;
       for (;;) {
         if (has()) return;
@@ -573,6 +630,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // backward iff the target is strictly above the window's first loaded turn;
     // otherwise forward (covers below-window AND the cold-window fallback).
     const backward = firstIdx !== undefined && targetIdx < firstIdx;
+    lastDrainDirectionRef.current = backward ? 'backward' : 'forward';  // #286 B3 — drained edge
 
     if (backward) {
       // Page head-ward via the top edge until the target loads or the head is
@@ -752,12 +810,12 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
 
   // ── #228 S3 B3 — the decoupled windowed-DOM-cap trim ───────────────────────
   // Applied on a FOLLOW-UP passive effect keyed on `lastOp.rev`, NEVER in the
-  // same commit as the paging mutation (the Codex P0 hazard: a same-commit
-  // prepend+far-trim nets the scrollHeight delta and breaks the anchor restore).
-  // A passive effect runs after the commit's layout effects (the prepend's
-  // anchor-restore / the append's stick) AND after the browser paints, so the
-  // far-edge drop — already off-screen — is invisible and never coincides with a
-  // measurement. The brief DOM peak of cap+1 page before this fires is accepted.
+  // same commit as the paging mutation. A passive effect runs after the commit's
+  // layout work AND after the browser paints, so the far-edge drop — already
+  // off-screen — is invisible and never coincides with a measurement. Since #232
+  // the viewport is pinned across a prepend by Virtuoso's `firstItemIndex` (owned
+  // here, compensated in the prepend's own commit), not a reader-side scroll-anchor
+  // useLayoutEffect. The brief DOM peak of cap+1 page before this fires is accepted.
   useEffect(() => {
     const op = lastOp;
     if (!op || op.trim) return;  // the trim's own op must never re-trigger a trim (no recursion)

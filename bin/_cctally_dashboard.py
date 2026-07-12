@@ -349,7 +349,7 @@ from _lib_display_tz import (
 from _lib_aggregators import _aggregate_daily, _aggregate_monthly, _aggregate_weekly
 from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost, _chip_for_model, _short_model_name
-from _lib_five_hour import _canonical_5h_window_key
+from _lib_five_hour import _canonical_5h_window_key, _round_to_ten_minutes
 from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
 # #279 S2 F3: stdlib-logging chokepoint — server errors reach stderr via
@@ -528,6 +528,7 @@ from _cctally_dashboard_conversation import (
     _handle_get_conversation_outline_impl,
     _handle_get_conversation_prompts_impl,
     _handle_get_conversation_export_impl,
+    _handle_get_conversation_anon_map_impl,
     _handle_get_conversation_find_impl,
     _handle_get_conversation_media_impl,
 )
@@ -1787,8 +1788,13 @@ def _build_block_detail(block: "Block",
                           if block.actual_end_time else None),
         "anchor":   block.anchor,
         "is_active": bool(block.is_active and block.entries_count > 0),
+        # ``label`` rounds the shown start to the nearest 10-min boundary
+        # (reset-jitter normalization); ``start_at`` / ``end_at`` above stay
+        # exact — they echo the canonical interval and the lookup matches
+        # ``start_at`` by exact equality (issue #76).
         "label":    format_display_dt(
-            block.start_time, display_tz, fmt="%H:%M %b %d", suffix=True,
+            _round_to_ten_minutes(block.start_time),
+            display_tz, fmt="%H:%M %b %d", suffix=True,
         ),
 
         "entries_count": block.entries_count,
@@ -3615,6 +3621,9 @@ _GET_ROUTES = (
     ("prefix+suffix", ("/api/conversation/", "/export"),
      "_handle_get_conversation_export",
      ("scope", "endpoint.conversation_export"), True),
+    ("prefix+suffix", ("/api/conversation/", "/anon-map"),
+     "_handle_get_conversation_anon_map",
+     ("scope", "endpoint.conversation_anon_map"), True),
     ("prefix+suffix", ("/api/conversation/", "/prompts"),
      "_handle_get_conversation_prompts",
      ("scope", "endpoint.conversation_prompts"), True),
@@ -5160,6 +5169,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_get_conversation_export(self, path: str) -> None:
         return _handle_get_conversation_export_impl(self, path)
+
+    def _handle_get_conversation_anon_map(self, path: str) -> None:
+        return _handle_get_conversation_anon_map_impl(self, path)
 
     def _handle_get_conversation_find(self, path: str) -> None:
         return _handle_get_conversation_find_impl(self, path)

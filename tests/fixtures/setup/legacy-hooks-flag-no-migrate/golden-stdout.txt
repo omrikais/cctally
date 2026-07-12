@@ -1,5 +1,5 @@
 ✓ Detected Claude Code at /FAKE/.claude
-✓ Symlinks at /FAKE/.local/bin/: 14/14 (N newly created)
+✓ Symlinks at /FAKE/.local/bin/: 15/15 (N newly created)
 ✓ Wrote 3 hook entries to /FAKE/.claude/settings.json
 ⚠ Legacy bespoke hooks detected (predate `cctally setup`; failing silently on this system). Skipped at your request. Re-run `cctally setup --migrate-legacy-hooks` later, or remove them yourself. The four `.py` files are at ~/.claude/hooks/{record-usage-stop,usage-poller{,-start,-stop}}.py.
 ⚠ No Claude OAuth token detected.
@@ -9,10 +9,6 @@
 ✓ Synced session cache (N new entries)
 
 cctally is ready (with 2 warning(s) above).
-
-⚠ Restart Claude Code for the new hooks to take effect in any currently
-  open sessions. New sessions launched after this point pick them up
-  automatically. (settings.json is cached at session start.)
 
   Try:
     cctally daily              # last 30 days
@@ -25,3 +21,7 @@ What's sent: a rotating, un-linkable token + version + OS family.
 No identity, no paths, no usage data, no IP stored. Auto-expires monthly.
 Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)
 How it works:     https://github.com/omrikais/cctally/blob/main/docs/telemetry.md
+
+▶ Next step: restart Claude Code to activate the new hooks.
+  Open sessions won't record until you restart (settings.json is cached at
+  session start). New sessions started after this pick them up automatically.

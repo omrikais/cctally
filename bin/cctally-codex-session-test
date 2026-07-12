@@ -28,7 +28,8 @@ SCRATCH_DIR=$(mktemp -d -t cctally-codex-session-fixtures-XXXXXX)
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR/codex-session"
 
-"$REPO_ROOT/bin/build-codex-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-codex-fixtures.py" "$SCRATCH_DIR" || {
     echo "FAIL: build-codex-fixtures.py crashed (exit $?)" >&2
     exit 1
 }

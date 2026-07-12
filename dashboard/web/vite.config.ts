@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { configDefaults } from 'vitest/config';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
@@ -118,6 +119,12 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./__tests__/setup.ts'],
+    // #281 S3 — the Playwright e2e suite lives in `e2e/*.spec.ts`. Vitest's
+    // default `include` (`**/*.{test,spec}.?(c|m)[jt]s?(x)`) would otherwise
+    // COLLECT those Playwright specs and fail (no vitest globals there). Preserve
+    // the defaults and add `e2e/**` on top — a bare `['e2e/**']` would drop
+    // node_modules/dist from the ignore set and slow every run.
+    exclude: [...configDefaults.exclude, 'e2e/**'],
     // Auto-undo `vi.stubGlobal(...)` between tests. Without this, a stub like
     // `stubMobileMedia`'s `matchMedia` (vi.stubGlobal, which restoreAllMocks
     // does NOT undo) leaks into every later test in the file, so `useIsMobile()`

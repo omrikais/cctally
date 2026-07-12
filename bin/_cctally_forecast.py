@@ -359,40 +359,54 @@ def _select_dollars_per_percent(
     if p_now >= 10.0 and p_now > 0:
         return spent_usd / p_now, "this_week"
 
-    # Path 2: trailing 4-week median.
-    # Fetch all eligible prior weeks then Python-filter (legacy rows may carry
-    # non-UTC offsets that break lexical compare against an ISO-UTC bound).
-    rows = conn.execute(
-        "SELECT week_start_at, week_end_at, MAX(weekly_percent) AS final_pct, "
-        "       MAX(captured_at_utc) AS latest_cap "
+    # Path 2: trailing 4-week median, reset-aware floored (#290).
+    import statistics
+    # Bounded candidate selection: the <=12 most-recent prior weeks. The median
+    # needs 4 eligible; 12 leaves margin so flooring a credited week below 1%
+    # can't starve it, while keeping this hot path (live forecast view +
+    # dashboard refresh) from materializing all history.
+    cand = conn.execute(
+        "SELECT DISTINCT week_start_at, week_end_at, week_start_date "
         "FROM weekly_usage_snapshots "
         "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
-        "GROUP BY week_start_at "
-        "HAVING MAX(weekly_percent) >= 1"
+        "  AND datetime(week_start_at) < datetime(?) "
+        "ORDER BY datetime(week_start_at) DESC LIMIT 12",
+        (current_week_start.isoformat(),),
     ).fetchall()
-    by_instant: dict[dt.datetime, dict] = {}
-    for r in rows:
-        try:
-            ws = parse_iso_datetime(r[0], "week_start_at")
-            we = parse_iso_datetime(r[1], "week_end_at")
-        except ValueError:
-            continue
-        slot = by_instant.get(ws)
-        final_pct = float(r[2])
-        if slot is None:
-            by_instant[ws] = {"we": we, "final_pct": final_pct}
-        else:
-            slot["final_pct"] = max(slot["final_pct"], final_pct)
-
+    we_by_ws: dict[dt.datetime, dt.datetime] = {}
+    rows_in: list = []
+    ws_iso_list = [row[0] for row in cand]
+    if ws_iso_list:
+        placeholders = ",".join("?" * len(ws_iso_list))
+        snap = conn.execute(
+            "SELECT week_start_date, week_start_at, week_end_at, "
+            "       captured_at_utc, weekly_percent "
+            "FROM weekly_usage_snapshots "
+            "WHERE week_start_at IN (" + placeholders + ")",
+            ws_iso_list,
+        ).fetchall()
+        for wsd, ws_iso, we_iso, cap_iso, pct in snap:
+            if pct is None:
+                continue
+            try:
+                ws = parse_iso_datetime(ws_iso, "week_start_at")
+                we = parse_iso_datetime(we_iso, "week_end_at")
+            except ValueError:
+                continue
+            we_by_ws.setdefault(ws, we)  # first-wins; all rows share one instant
+            rows_in.append((ws, wsd, ws_iso, we_iso, cap_iso, pct))
+    floored = c._floored_week_max(conn, rows_in)  # {ws_instant -> floored max}
     eligible: list[tuple[dt.datetime, dt.datetime, float]] = [
-        (ws, v["we"], v["final_pct"])
-        for ws, v in by_instant.items()
-        if ws < current_week_start and v["we"] < now_utc and v["final_pct"] >= 1.0
+        (ws, we_by_ws[ws], floored[ws])
+        for ws in floored
+        if ws in we_by_ws
+        and ws < current_week_start
+        and we_by_ws[ws] < now_utc
+        and floored[ws] >= 1.0
     ]
     eligible.sort(key=lambda x: x[0], reverse=True)
     prior = eligible[:4]
     if len(prior) >= 4:
-        import statistics
         values: list[float] = []
         for ws, we, final_pct in prior:
             if use_weekref_cost_cache:

@@ -847,9 +847,17 @@ def _format_block_start(iso: str, tz: "ZoneInfo | None") -> str:
     Renders as ``YYYY-MM-DD HH:MM <SUFFIX>`` where the suffix is the
     zone label per ``display_tz_label``. Naive inputs are treated as
     UTC; ``tz=None`` means "host-local via bare astimezone()".
+
+    The displayed time is rounded to the nearest 10-minute boundary to
+    normalize Anthropic reset-capture jitter (e.g. a :39 recorded reset
+    renders as :40). The stored ``block_start_at`` is unchanged.
     """
     _c = _cctally()
-    return _c.format_display_dt(iso, tz, fmt="%Y-%m-%d %H:%M", suffix=True)
+    parsed = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return _c.format_display_dt(
+        _c._round_to_ten_minutes(parsed), tz,
+        fmt="%Y-%m-%d %H:%M", suffix=True,
+    )
 
 
 def _format_hhmm_in_tz(iso: str, tz: "ZoneInfo | None") -> str:
@@ -858,9 +866,16 @@ def _format_hhmm_in_tz(iso: str, tz: "ZoneInfo | None") -> str:
     Mirrors ``_format_block_start``'s tz resolution so paired start/end
     cells in the same row stay in the same zone. Naive inputs are
     treated as UTC; ``tz=None`` means host-local. No suffix.
+
+    Rounded to the nearest 10-minute boundary for the same reset-jitter
+    normalization as ``_format_block_start`` (the paired start/end cells
+    must round together or a 5h window renders as 4h59m/5h01m).
     """
     _c = _cctally()
-    return _c.format_display_dt(iso, tz, fmt="%H:%M", suffix=False)
+    parsed = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return _c.format_display_dt(
+        _c._round_to_ten_minutes(parsed), tz, fmt="%H:%M", suffix=False,
+    )
 
 
 def _block_is_active(

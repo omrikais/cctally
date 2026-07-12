@@ -121,6 +121,61 @@ jobs:
       - name: Verify dashboard/static/ is byte-stable
         run: git diff --exit-code dashboard/static/
 
+  e2e-reader:
+    # The conversation-reader real-browser smoke net (#281 S3): a small,
+    # deterministic Playwright suite over the scroll / pager / anchor / focus /
+    # live-tail seams that JSDOM unit tests are structurally blind to. Same
+    # self-hosted-on-public-PR exposure rule as test-macos / dashboard-build-
+    # stability above — push-only + this-repo gating keeps fork-PR code off the
+    # maintainer's machine. This lane serves the COMMITTED dashboard/static
+    # bundle; its byte-stability against source is dashboard-build-stability's
+    # job on the same push, so this lane deliberately does NOT rebuild (the PR
+    # lane, which has no build-stability check, builds first instead).
+    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    runs-on: [self-hosted, macOS, cctally]
+    timeout-minutes: 30  # generous headroom over the ~2-5 min suite so a hung test can't wedge the job
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node (per .nvmrc)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: dashboard/web/.nvmrc
+          cache: npm
+          cache-dependency-path: dashboard/web/package-lock.json
+
+      - name: Install dashboard deps
+        working-directory: dashboard/web
+        run: npm ci
+
+      - name: Install Playwright chromium (cached no-op after the first run)
+        working-directory: dashboard/web
+        run: npx playwright install chromium
+
+      - name: Run reader e2e suite
+        working-directory: dashboard/web
+        # The launcher (e2e/serve.sh) shells `python3` for the stdlib-only fixture
+        # builder and the `cctally dashboard` server, so brew's Python 3.13 must
+        # win over any pyenv shim — the same pin test-macos uses. PREPEND it to
+        # PATH rather than replacing PATH the way test-macos does for its
+        # pure-Python step: a full override would drop setup-node's node from PATH
+        # and break `npx playwright`. No venv is needed — the builder and the
+        # dashboard server are stdlib-only.
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
+          python3 --version
+          npx playwright test
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-reader-artifacts
+          path: |
+            dashboard/web/playwright-report/
+            dashboard/web/test-results/
+          retention-days: 7
+
   test-pr:
     # PR signal lane (#281 S2 / #280 R2): same-repo PRs get checks
     # everywhere; fork PRs additionally run on the public mirror
@@ -190,3 +245,41 @@ jobs:
       - name: Run frontend unit tests (full vitest estate)
         working-directory: dashboard/web
         run: npx vitest run
+
+      # Reader real-browser smoke net (#281 S3) on the PR lane. The self-hosted
+      # e2e-reader job above is push-only for fork-PR safety, so external PRs pick
+      # up this e2e signal on the public mirror (omrikais/cctally), where hosted
+      # sandboxing makes fork code safe and minutes are free.
+      - name: Resolve Playwright version (for the browser cache key)
+        id: playwright
+        working-directory: dashboard/web
+        # Read the resolved version straight from package-lock so the cache key
+        # tracks exactly the pinned Playwright (and thus its bundled browser).
+        run: echo "version=$(node -p "require('./package-lock.json').packages['node_modules/@playwright/test'].version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright.outputs.version }}
+      - name: Install Playwright chromium + OS deps
+        working-directory: dashboard/web
+        run: npx playwright install --with-deps chromium
+      # Build a fresh bundle before the e2e run: test-pr never builds otherwise, so
+      # a PR changing React source without regenerating dashboard/static/ would
+      # e2e-test the stale committed bundle (spec R12). The push lane skips this —
+      # dashboard-build-stability already guards the committed bytes there.
+      - name: Build dashboard bundle (fresh — closes the stale-bundle-on-PR hole)
+        working-directory: dashboard/web
+        run: npm run build
+      - name: Run reader e2e suite
+        working-directory: dashboard/web
+        run: npx playwright test
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-reader-pr-artifacts
+          path: |
+            dashboard/web/playwright-report/
+            dashboard/web/test-results/
+          retention-days: 7

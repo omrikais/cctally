@@ -21,6 +21,7 @@ import { CumulativeCostChip } from './CumulativeCostChip';
 import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
+import { loadAnonMode, saveAnonMode } from '../store/anonPrefs';
 import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
@@ -31,6 +32,16 @@ import { reassertCenter } from './reassertCenter';
 import { resolveJumpOwner } from './resolveJumpOwner';
 import { isLayoutStable, type LayoutSnapshot } from './layoutStable';
 import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
+import {
+  classifyWindowGrowth,
+  applyOpenChange,
+  resetPillTrackers,
+  INITIAL_PILL_TRACKERS,
+  runJumpPipeline,
+  type PillTrackers,
+  type JumpRunnerDeps,
+} from './readerScrollMachine';
+import { useReaderMachine } from './useReaderMachine';
 import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -215,6 +226,14 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // explicit pin. Memoized on the member uuids so identity is stable between
   // unrelated renders.
   const jumpUuidForSession = jump && jump.session_id === sessionId ? jump.uuid : null;
+  // #291 — a same-session jump is in flight (find / outline / restore / Latest /
+  // landmark nav / deep-link — all flow through `conversationJump`). Suspend
+  // react-virtuoso's raw-truthy resize-autoscroll-to-LAST watcher for the jump's
+  // whole lifetime by passing literal `followOutput={false}` (below). Derived from
+  // the store (not the follow controller), so it is in effect in the SAME render
+  // the jump is dispatched — before a force-open SIZE_INCREASED can arm the
+  // watcher — and releases automatically when the jump clears.
+  const activeJumpForSession = jumpUuidForSession != null;
   const protectedUuids = useMemo(() => {
     const s = new Set<string>();
     if (jumpUuidForSession) s.add(jumpUuidForSession);
@@ -231,13 +250,17 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const firstItemIndexRef = useRef(virtualFirstItemIndex);
   firstItemIndexRef.current = virtualFirstItemIndex;
-  // #234 — walk-token guard (spec §2.2-1 / Codex P0-3). A cold far jump runs a
-  // longer async walk-to-mount than the old single scrollIntoView, and the
-  // effect re-fires on node/window/forcedOpenKeys changes WHILE that walk is in
-  // flight. A monotonic token (NOT the boolean jumpDrainingRef) lets each walk
-  // own its run: a new jump bumps it; an older superseded walk detects the
-  // mismatch after every await and bails WITHOUT clearing a newer walk's guard.
-  const walkTokenRef = useRef(0);
+  // #281 S5 — the reader's scroll-orchestration machine (A2: paging gates + the
+  // programmatic-run token; A3/A4 grow it). `gates` owns the arming / suppression
+  // cluster + the walk-token that used to be `reversePagingArmedRef`/
+  // `forwardPagingArmedRef`/`jumpDrainingRef`/`armPagingTimerRef`/`walkTokenRef`.
+  // The walk-token guard (spec §2.2-1 / Codex P0-3): a cold far jump runs a longer
+  // async walk-to-mount than the old single scrollIntoView, and the effect re-fires
+  // on node/window/forcedOpenKeys changes WHILE that walk is in flight; a monotonic
+  // token lets each run own itself (a new jump bumps it via `beginProgrammaticRun`;
+  // an older superseded run detects the mismatch via `isCurrentRun` after every
+  // await and bails WITHOUT clearing a newer run's suppression).
+  const { gates, lifecycle, generation, followMode, follow } = useReaderMachine(sessionId);
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
@@ -297,6 +320,17 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     selectMarkersEnabled(getState()),
   );
   const [findTerms, setFindTerms] = useState<HighlightTerms | null>(null);
+  // #281 S4 — the "Anonymize" mode (default ON, persisted). Single source for
+  // the header toggle chip, the Export menu, and every per-card CopyButton (via
+  // TranscriptContext). Seeded from localStorage; a flip persists immediately.
+  const [anonMode, setAnonMode] = useState<boolean>(loadAnonMode);
+  const toggleAnonMode = useCallback(() => {
+    setAnonMode((v) => {
+      const next = !v;
+      saveAnonMode(next);
+      return next;
+    });
+  }, []);
   // Live closure to the find bar's cursor stepper (n/N drive it while the bar
   // is open + the input is blurred). FindBar assigns its `step` here each render.
   const findStepRef = useRef<((delta: number) => void) | null>(null);
@@ -460,53 +494,44 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   markersEnabledRef.current = markersEnabled;
 
   // #175 F4 — live-tail scroll behavior. `atBottomRef` tracks whether the user
-  // is parked at the bottom (updated on every scroll). `prevLenRef`/`prevHasMoreRef`
-  // drive the live-append discriminator: a growth is a LIVE append (not the final
-  // pagination page) only when the conversation was ALREADY fully paged before it
-  // — i.e. prevHasMoreRef.current === false. The final pagination page grows
-  // `items` AND flips hasMore false in the same update, so a naive `!hasMore`
+  // is parked at the bottom (updated on every scroll). `pillTrackersRef` holds the
+  // immutable per-open pill state (#281 S5 A1 — `prevLen`/`prevHasMore`/known-set
+  // now live in `readerScrollMachine.classifyWindowGrowth`): a growth is a LIVE
+  // append (not the final pagination page) only when the conversation was ALREADY
+  // fully paged before it — i.e. `prevHasMore === false`. The final pagination page
+  // grows `items` AND flips hasMore false in the same update, so a naive `!hasMore`
   // check would false-positive once on the last page (Codex P0). `newCount` feeds
   // the floating "↓ N new" pill.
   const atBottomRef = useRef(true);
-  const prevLenRef = useRef(0);
-  const prevHasMoreRef = useRef(false);
-  // #232 — paging-arming gate (the cold-load freeze fix's defense-in-depth layer).
-  // FALSE on every session open; flipped TRUE only once the initial open
-  // positioning has SETTLED, so Virtuoso's transient startReached/endReached
-  // during cold mount + the programmatic jump drain can't trigger paging (which
-  // would re-enter the drain that's positioning the window). A real user
-  // scroll-to-edge only happens after settle, so genuine reverse/forward paging
-  // still works. `jumpDrainingRef` additionally suppresses both edges WHILE a
-  // loadToTarget drain is in flight (set around the reader's await of it).
-  const reversePagingArmedRef = useRef(false);
-  const forwardPagingArmedRef = useRef(false);
-  const jumpDrainingRef = useRef(false);
-  const armPagingTimerRef = useRef<number | null>(null);
-  // Arm both edges (idempotent). Called when the open settles: the first
-  // atBottomStateChange (tail open lands at the bottom), the jump pipeline's
+  const pillTrackersRef = useRef<PillTrackers>(INITIAL_PILL_TRACKERS);
+  // #232 / #281 S5 A2 — the paging-arming gate (the cold-load freeze fix's
+  // defense-in-depth layer) now lives in `gates` (readerScrollMachine). Both edges
+  // are DISARMED on every session open (`gates.sessionOpened()`) and armed only
+  // once the initial open positioning has SETTLED — so Virtuoso's transient
+  // startReached/endReached during cold mount + the programmatic jump drain can't
+  // trigger paging (which would re-enter the drain that's positioning the window).
+  // A real user scroll-to-edge only happens after settle, so genuine reverse/forward
+  // paging still works. A programmatic run additionally suppresses both edges WHILE
+  // a loadToTarget drain is in flight (the `beginProgrammaticRun`/`endProgrammaticRun`
+  // pair). `gates.arm()` arms both edges (idempotent) when the open settles: the
+  // first atBottomStateChange (tail open lands at the bottom), the jump pipeline's
   // scrollToIndex landing (deep-link lands on the target), or the 750ms fallback
   // armed on each session open — whichever fires first.
-  const armPaging = useCallback(() => {
-    reversePagingArmedRef.current = true;
-    forwardPagingArmedRef.current = true;
-    if (armPagingTimerRef.current != null) { window.clearTimeout(armPagingTimerRef.current); armPagingTimerRef.current = null; }
-  }, []);
   const [newCount, setNewCount] = useState(0);
 
   // #188 S4/C2 — count only VISIBLE live appends in the "↓ N new" pill (Bug 5).
   // `openKeysRef` tracks which subagent threads are currently expanded (lifted
-  // from SidechainGroup via handleSubagentOpenChange); `knownSubagentKeysRef`
-  // records every subagent_key seen on a prior commit. A live-appended item is
-  // visible — and so counts — iff it's top-level, OR the first item of a
-  // brand-new subagent group (its card appears), OR an append into an
-  // already-EXPANDED known thread. An append into an existing COLLAPSED thread is
-  // below the fold → +0. Both refs reset on session switch and seed (without
-  // counting) during non-live pagination growth.
-  const openKeysRef = useRef<Set<string>>(new Set());
-  const knownSubagentKeysRef = useRef<Set<string>>(new Set());
+  // from SidechainGroup via handleSubagentOpenChange); the known-subagent set now
+  // lives inside `pillTrackersRef` (#281 S5 A1). A live-appended item is visible —
+  // and so counts — iff it's top-level, OR the first item of a brand-new subagent
+  // group (its card appears), OR an append into an already-EXPANDED known thread.
+  // An append into an existing COLLAPSED thread is below the fold → +0. Both reset
+  // on session switch and seed (without counting) during non-live pagination growth.
+  // The open-set is an IMMUTABLE value (#281 S5 A1 / spec F5) — a change replaces
+  // the ref with a fresh set via `applyOpenChange`, never mutating in place.
+  const openKeysRef = useRef<ReadonlySet<string>>(new Set());
   const handleSubagentOpenChange = useCallback((key: string, open: boolean) => {
-    if (open) openKeysRef.current.add(key);
-    else openKeysRef.current.delete(key);
+    openKeysRef.current = applyOpenChange(openKeysRef.current, key, open);
   }, []);
 
   // #176 — floating "↑ Top of turn" button. Replaces the #175 sticky turn
@@ -573,85 +598,32 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // #232 — the "↓ N new" pill COUNT. The actual stick-to-bottom moved onto
   // Virtuoso's `followOutput` (Task 3); this effect now only feeds `setNewCount`
   // with the PRESERVED `visibleAdded` classifier (Codex P1-2 — do NOT replace it
-  // with a raw append count). Keyed on `lastOp.rev` (+ hasMore so prevHasMoreRef
-  // tracks each commit), NOT items.length: a prepend+far-trim (the windowed DOM
-  // cap) can keep items.length flat while still mutating the window, and a length
-  // key would miss it. A plain useEffect (no longer pre-paint — Virtuoso owns the
-  // scroll, so there is no manual scrollTo to land before paint).
+  // with a raw append count). Keyed on `lastOp.rev` (+ hasMore so the trackers'
+  // prevHasMore tracks each commit), NOT items.length: a prepend+far-trim (the
+  // windowed DOM cap) can keep items.length flat while still mutating the window,
+  // and a length key would miss it. A plain useEffect (no longer pre-paint —
+  // Virtuoso owns the scroll, so there is no manual scrollTo to land before paint).
+  //
+  // #281 S5 A1 — the whole discriminator (reset re-seed, prepend/trim bail,
+  // addedBottom tail slice, known/open visibility classification) now lives in the
+  // pure `classifyWindowGrowth`; this effect just feeds it the current inputs +
+  // the immutable trackers, applies the count, and stores the fresh trackers.
+  // #232 — stick is `followOutput`'s job now (it sticks when already at bottom);
+  // `atBottom` gates the count so an at-bottom growth (which followOutput sticks +
+  // atBottomStateChange zeroes) never double-bumps the pill.
   useEffect(() => {
-    const items = detail?.items ?? [];
-    const len = items.length;
-    // #228 S3 B3 — direction comes straight from the hook op, not a top-edge id
-    // advance. A reverse-page PREPEND (top-sentinel doLoadPrev OR a jump's
-    // backward branch inside the hook) must NOT be mistaken for a live append:
-    // it grows items.length too and on a tail open (hasMore === false) would
-    // satisfy the live discriminator, bumping "↓ N new" by the prior window size.
-    // A reset replaces the whole window and is likewise neither a stick nor a
-    // count. Bail (advancing the prev-trackers) so this effect never miscounts a
-    // prepend as a live append; #232 Virtuoso's `firstItemIndex` keeps the
-    // viewport pinned across the prepend, so there is no scroll-anchor snapshot to
-    // preserve here.
-    if (lastOp != null && lastOp.op !== 'append') {
-      // A RESET replaces the whole window, so it must SEED the known-subagent set
-      // from the ENTIRE new window (mirrors the old code, where the null-detail
-      // transient zeroed prevLen and the next page seeded the full slice). Without
-      // this the new session's first live append into a thread present on page-1
-      // would mis-read as a brand-new group and over-count "↓ N new".
-      if (lastOp.op === 'reset') {
-        for (const it of items) {
-          if (it.subagent_key != null) knownSubagentKeysRef.current.add(it.subagent_key);
-        }
-      }
-      prevLenRef.current = len;
-      prevHasMoreRef.current = hasMore;
-      return;
-    }
-    // The count of genuinely-new TAIL items comes from the op (addedBottom), not
-    // `len - prevLen` (which a top-trim in the same commit would corrupt). The
-    // newly-appended items are the LAST `added` items of the window — trim-safe
-    // because any top-drop shifts indices but never the bottom slice's content.
-    const added = lastOp?.op === 'append' ? lastOp.addedBottom : 0;
-    // Live append (not the final pagination page): already fully paged before
-    // this growth, and not the very first page load (prevLen > 0).
-    const live = added > 0 && prevHasMoreRef.current === false && prevLenRef.current > 0;
-    // #188 S4/C2 — classify each newly-appended item by VISIBILITY against the
-    // OLD known-set + open-set (Bug 5): top-level (+1); first item of a
-    // brand-new subagent group (+1, deduped per key per tick); append into an
-    // already-EXPANDED known thread (+1); append into an existing COLLAPSED
-    // known thread (+0, below the fold). Computed only on a live append; during
-    // non-live growth (first page / pagination) the tail just SEEDS the
-    // known-set below WITHOUT counting.
-    const tail = added > 0 ? items.slice(len - added) : [];
-    let visibleAdded = 0;
-    if (live) {
-      const newThisTick = new Set<string>();
-      for (const it of tail) {
-        const k = it.subagent_key;
-        if (k == null) {
-          visibleAdded++;                              // top-level → always visible
-        } else if (!knownSubagentKeysRef.current.has(k)) {
-          // First item of a brand-new subagent group → its card appears once.
-          if (!newThisTick.has(k)) { visibleAdded++; newThisTick.add(k); }
-        } else if (openKeysRef.current.has(k)) {
-          visibleAdded++;                              // append into an expanded thread
-        }
-        // else: append into an existing collapsed thread → +0 (below the fold).
-      }
-    }
-    // Update the known-set from the tail (AFTER the visibility classification
-    // read the OLD set) — covers both live and non-live (seed) growth.
-    for (const it of tail) {
-      if (it.subagent_key != null) knownSubagentKeysRef.current.add(it.subagent_key);
-    }
-    // #232 — stick is `followOutput`'s job now (it sticks when already at bottom).
-    // When the user is scrolled UP (atBottomRef false), surface the pill with the
-    // SAME `visibleAdded` count as before. When at bottom, followOutput sticks and
-    // atBottomStateChange resets the count, so no pill bump here.
-    if (live && visibleAdded > 0 && !atBottomRef.current) {
-      setNewCount((n) => n + visibleAdded);
-    }
-    prevLenRef.current = len;
-    prevHasMoreRef.current = hasMore;
+    const result = classifyWindowGrowth(
+      {
+        op: lastOp,
+        items: detail?.items ?? [],
+        hasMore,
+        atBottom: atBottomRef.current,
+        openKeys: openKeysRef.current,
+      },
+      pillTrackersRef.current,
+    );
+    if (result.countsTowardPill) setNewCount((n) => n + result.visibleAdded);
+    pillTrackersRef.current = result.nextTrackers;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastOp?.rev, hasMore]);
 
@@ -860,8 +832,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // size itself from context (no per-item store subscription); the provider
   // identity flips when the session's heaviest loaded turn cost changes.
   const transcriptCtx = useMemo(
-    () => ({ sessionId, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost }),
-    [sessionId, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost],
+    () => ({ sessionId, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost, anonMode }),
+    [sessionId, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode],
   );
 
   // #232 — the bottom sentinel observer, the top sentinel observer, and the
@@ -877,40 +849,45 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // restore open leaves openScrollIntent null — the jump pipeline drives that
   // scroll instead. Reduced-motion-safe (instant).
   //
-  // P0 fix — fire EXACTLY ONCE per open. The effect is keyed on items.length so
-  // it lands the moment the first non-empty page renders, but `openScrollIntent`
-  // is set ONCE (the hook resets it only on session change), so without a guard
-  // every reverse-page prepend / live append would re-run it and yank the reader
-  // back to the bottom (re-clamping scrollTop + re-arming atBottomRef), defeating
-  // reverse pagination, the scroll-anchor, and the "stick only when at bottom"
-  // contract. `appliedIntentRef` is a one-shot latch: apply on the first commit
-  // where the intent is resolved AND content exists, then bail on every later
-  // commit. It is reset to false on session switch (the effect below), so the
-  // NEXT open re-applies its own intent.
+  // P0 requirement — fire EXACTLY ONCE per open. The effect is keyed on
+  // items.length so it lands the moment the first non-empty page renders, but
+  // `openScrollIntent` is set ONCE (the hook resets it only on session change), so
+  // without a one-shot every reverse-page prepend / live append would re-run it and
+  // yank the reader back to the bottom (re-clamping scrollTop + re-arming
+  // atBottomRef), defeating reverse pagination, the scroll-anchor, and the "stick
+  // only when at bottom" contract.
   // #232 — land through Virtuoso's `scrollToIndex` (not a raw `scrollTop` write,
   // which fights the library's scroll management). A 'bottom' open jumps to the
-  // last node aligned to the bottom edge; a 'top' open jumps to the first. The
-  // one-shot latch + atBottomRef arming are unchanged.
-  const appliedIntentRef = useRef(false);
+  // last node aligned to the bottom edge; a 'top' open jumps to the first.
+  // #281 S5 A3 — the one-shot latch now lives in the machine's `firstWindowReady`,
+  // keyed on the OPEN GENERATION (so the NEXT open re-applies its own intent); the
+  // effect just consumes the landing command. `firstWindowReady` returns null
+  // until the intent resolves AND items AND rendered nodes are non-empty, then
+  // exactly once per generation.
   useEffect(() => {
-    if (openScrollIntent == null) return;
-    if (appliedIntentRef.current) return;          // already applied this open
-    const len = detail?.items.length ?? 0;
-    if (!len) return;                               // wait for the first content page
     const nodeCount = nodes.length;
-    if (!nodeCount) return;                         // wait for the render list too
-    appliedIntentRef.current = true;
+    const cmd = lifecycle.firstWindowReady(
+      generation, openScrollIntent, detail?.items.length ?? 0, nodeCount,
+    );
+    if (!cmd) return;
     // #232 fix — scrollToIndex takes the 0-based DATA (array) index, NOT the
     // firstItemIndex-offset virtual index (which the library clamps + ignores —
     // see the jump-landing fix note). A 'bottom' open lands on the last node
     // (array index nodeCount − 1); a 'top' open lands on the first (array index 0).
-    if (openScrollIntent === 'bottom') {
+    // #281 S5 B1 (#285 FIX) — a 'top' landing suspends follow (the reader passes
+    // literal `followOutput={false}`) so react-virtuoso's raw-truthy
+    // resize-autoscroll-to-LAST watcher is DISABLED and the scrollToIndex(0)
+    // actually sticks (a single-page conversation opens at the TOP again); a
+    // 'bottom' landing keeps follow live so a multi-page tail open stays stuck to
+    // the bottom with live-tail engaged. The suspension holds until settle (first
+    // atBottomStateChange after the landing / a jump landing / the fallback).
+    if (cmd.target === 'bottom') {
       virtuosoRef.current?.scrollToIndex({ index: nodeCount - 1, align: 'end' });
-      atBottomRef.current = true;
     } else {
       virtuosoRef.current?.scrollToIndex({ index: 0, align: 'start' });
-      atBottomRef.current = false;
     }
+    atBottomRef.current = cmd.setAtBottom;
+    follow.landed(cmd.target);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openScrollIntent, detail?.items.length, nodes.length]);
 
@@ -924,30 +901,26 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   //
   // P2 fix — A→B→A re-open must re-restore. The reader is mounted PERSISTENTLY
   // (ConversationsView reuses one instance, no key={sessionId}), so a per-open
-  // one-shot latch keyed on `sessionId` VALUE breaks: open A (latch := 'a'),
-  // switch to B as a non-restore (tail) open — the early `return` above leaves
-  // the latch at 'a' — then return to A, and `latch === 'a'` wrongly skips the
-  // restore. The latch must therefore be keyed on the OPEN INSTANCE, not the id:
-  // `lastOpenSessionRef` records the session this effect last SAW (set on EVERY
-  // run, restore or not), and a mismatch means a genuinely new open → clear the
-  // restored latch so the new open can fire its own restore. This re-arms on
-  // return to A even though B never restored.
-  const restoredRef = useRef(false);
-  const lastOpenSessionRef = useRef<string | null>(null);
+  // one-shot latch keyed on `sessionId` VALUE breaks: open A, switch to B as a
+  // non-restore (tail) open, then return to A — a value-keyed latch wrongly skips
+  // the restore. #281 S5 A3 — the latch is keyed on the OPEN GENERATION instead
+  // (the machine's `restoreReady`): a genuinely new open (incl. the A→B→A return)
+  // is a fresh generation, so it re-fires its own restore even though B never did.
+  // `restoreReady` also folds in the cross-session-transient guard (detail's
+  // session_id must match) so a stale prior-session detail never restores.
   useEffect(() => {
-    // New open (the session changed since the last run) → re-arm the latch.
-    if (lastOpenSessionRef.current !== sessionId) {
-      lastOpenSessionRef.current = sessionId;
-      restoredRef.current = false;
-    }
-    if (openIntent?.kind !== 'restore') return;
-    if (!detail || detail.session_id !== sessionId) return;
-    if (restoredRef.current) return;  // already restored this open (paged-growth re-fire guard)
-    restoredRef.current = true;
+    const cmd = lifecycle.restoreReady(
+      generation,
+      openIntent?.kind ?? null,
+      openIntent?.kind === 'restore' ? openIntent.uuid : null,
+      detail?.session_id ?? null,
+      sessionId,
+    );
+    if (!cmd) return;
     dispatch({
       type: 'OPEN_CONVERSATION',
       sessionId,
-      jump: { session_id: sessionId, uuid: openIntent.uuid },
+      jump: { session_id: sessionId, uuid: cmd.uuid },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openIntent, sessionId, detail?.session_id]);
@@ -1026,11 +999,14 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     }
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     let cancelled = false;
-    // #234 — this jump owns a fresh walk token. The walk and the final landing run
-    // inside the async block below; `aborted()` after every await covers BOTH a
-    // session/jump-clear cancel AND a newer jump that bumped the token (Codex P0-3).
-    const myToken = ++walkTokenRef.current;
-    const aborted = () => cancelled || walkTokenRef.current !== myToken;
+    // #234 / #281 S5 A2 — this jump owns a fresh programmatic-run token. The walk
+    // and the final landing run inside the async block below; `aborted()` after
+    // every await covers BOTH a session/jump-clear cancel AND a newer jump that
+    // superseded this run's token (Codex P0-3). `myToken` is assigned by
+    // `gates.beginProgrammaticRun()` inside the async body (where the drain
+    // suppression used to be set), so `aborted()` is never consulted before then.
+    let myToken = 0;
+    const aborted = () => cancelled || !gates.isCurrentRun(myToken);
     const targetUuid = jump.uuid;
     // #234 §2.2-3 / Codex P0-2 — resolve once the layout tuple (mounted
     // array-range, scrollHeight, scrollTop, target-anchor rect) is stable across 2
@@ -1080,294 +1056,252 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
       };
       requestAnimationFrame(tick);
     });
-    void (async () => {
-     // #232/#234 — suppress startReached/endReached for the WHOLE programmatic jump
-     // operation: the loadToTarget drain, the R1 walk-to-mount, AND the final
-     // landing. Even with the arming gate, a drain/walk that runs AFTER paging is
-     // armed (an in-session jump, not just the cold open) must not let Virtuoso's
-     // settle-time edge hits re-enter paging mid-operation. The boolean is cleared
-     // in the finally below; the walk-token guard (above) is the per-jump owner.
-     jumpDrainingRef.current = true;
-     try {
-      await loadToTarget(jump.uuid);
-      if (aborted()) return;
-      // #232 — the mode-hidden check runs FIRST, before resolving the node index.
-      // A non-`all` focus mode coalesces the target's turn into a `hidden_run`
-      // marker, and `nodeIndexForUuid` matches a hidden_run by its `firstUuid`, so
-      // a target that IS the run's first uuid would otherwise resolve onto the
-      // marker and we'd scroll/flash the run instead of unhiding the turn. Reset to
-      // `all` so the turn re-renders, then the focusMode re-fire lands the jump via
-      // the index path below. (Carry-forward: this ordering is exactly why
-      // nodeIndexForUuid's hidden_run case can stay firstUuid-only.)
-      const mode = focusModeRef.current;
-      if (mode !== 'all') {
-        // §5 — the target's TOP-LEVEL RenderNode (recursing into nested subagents)
-        // decides visibility under the mode. A node missing from `groups` (paged in
-        // but its node not built yet) is treated as not-yet-paged → leave it to the
-        // detail-growth re-fire; do NOT reset (diverges from jumpNext's snapshot).
-        const node = findTopLevelNodeFor(groupsRef.current, jump.uuid, detail);
-        if (node != null && !nodeVisible(node, mode)) {
-          dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
-          return; // re-run under `all`: the node renders + its index resolves
-        }
-      }
-      // Resolve the target to its TOP-LEVEL node POSITION (Codex P0-2), not a
-      // mounted DOM element: an off-screen-but-loaded target has no element under
-      // virtualization. `nodeIndexForUuid` matches an anchor / folded member /
-      // subagent-subtree uuid and returns both index spaces; the virtual index
-      // feeds Virtuoso's scrollToIndex. The jump is data-presence-driven, not
-      // DOM-presence-driven.
-      const hit = nodeIndexForUuid(nodes, jump.uuid, virtualFirstItemIndex);
-      if (hit) {
-        // #234 §2.3-1 (Codex P1-4) — resolve the owning subagent from the RENDER
-        // TREE, not the flat detail.items list. A find hit on a card's nested
-        // member used to leave the card un-force-opened (the flat find-by-member
-        // path never fired conv-sidechain--force), so the member sat in
-        // un-accounted overflow OUTSIDE the scrollable range — unreachable by any
-        // scroll. resolveJumpOwner returns the deepest owning subagent key, the
-        // top-level card-root uuid, and whether the uuid IS that card root.
-        const owner = resolveJumpOwner(nodesRef.current, jump.uuid);
-        // A subagent CARD-ROOT jump (the bucket-root uuid — an outline subagent
-        // entry / collapsed-card flash) aligns the card to the top; a normal turn
-        // / a deep inner-member find-jump centers (#204).
-        const isCardRoot = owner?.isCardRoot ?? false;
-        // §5/§2.3-1 — a find-jump into a NESTED subagent MEMBER (not the bucket
-        // root) must force-open the owning ancestor chain FIRST, so the card's
-        // Virtuoso row re-measures from its 81px collapsed-summary height to full
-        // height (otherwise the member is in overflow the library never accounts
-        // for) and the member renders + takes the flash. Set the force keys and
-        // return; the forcedOpenKeys re-fire then walks + centers.
-        if (!isCardRoot && owner && owner.ownerSubagentKey != null) {
-          const chain = ancestorKeys(owner.ownerSubagentKey, detail.subagent_meta);
-          if (chain.some((k) => !forcedOpenKeys.has(k))) {
-            setForcedOpenKeys((prev) => {
-              const next = new Set(prev);
-              for (const k of chain) next.add(k);
-              return next;
-            });
-            return; // wait for the chain to open + re-measure, then re-fire to walk + center
+    // #281 S5 A4 — the jump PIPELINE runs in the pure `runJumpPipeline`; the
+    // adapter supplies every side effect. `captured.*` closures read the effect-fire
+    // captures (jump/detail/nodes/virtualFirstItemIndex/hasMore/focusMode); `live.*`
+    // closures read the refs LIVE during the run. The snapshot-vs-live split is
+    // PRESERVED VERBATIM (spec §3-A4) — this is exactly how the #285 inert top-open
+    // and the #286 exhaustion-clear race stay bug-for-bug until Phase B.
+    const runnerDeps: JumpRunnerDeps = {
+      aborted,
+      loadToTarget: () => loadToTarget(targetUuid),
+      // #286 B3 — the captured committed-window epoch (lastOp.rev at effect-fire).
+      // The no-hit exhaustion clear acks the drain's terminalOpRev against this, so
+      // a stale pre-commit captured render list can never fire a premature clear.
+      committedRev: lastOp?.rev ?? 0,
+      captured: {
+        // #232 — mode-hidden: a non-`all` focus mode coalesces the target's turn
+        // into a hidden_run marker; reset to `all` so the turn re-renders + its
+        // index resolves. findTopLevelNodeFor reads groupsRef/detail, focusMode via
+        // focusModeRef; a node missing from `groups` is left to the re-fire.
+        modeHidden: () => {
+          const mode = focusModeRef.current;
+          if (mode !== 'all') {
+            const node = findTopLevelNodeFor(groupsRef.current, targetUuid, detail);
+            if (node != null && !nodeVisible(node, mode)) return 'reset-needed';
           }
-        }
-        // #234 §2.2 (R1) — a single estimate-based scrollIntoView hop over hundreds
-        // of unmeasured high-variance rows cannot land deterministically: the
-        // library briefly reaches the target, then asynchronously re-measures the
-        // just-paged-in giant rows (scrollHeight 15705→~74266), moving the target's
-        // true offset out from under the in-flight scroll, and the ~1200ms
-        // convergence budget expires mid-correction — stranding the viewport in the
-        // target's region with the target UNMOUNTED (the #233-deferred residual).
-        // Instead, WALK Virtuoso toward the target in mounted-window steps so the
-        // path rows MEASURE, then write the scroller's scrollTop directly to the
-        // now-stable measured offset. scrollToIndex takes the ARRAY index ONLY
-        // (#232 P1-A); the walk re-resolves it each step through the live refs.
-        // #234 — if the target element is ALREADY mounted in the DOM (a warm jump,
-        // or the chain we just force-opened has attached its ref), its row is
-        // measured: skip the walk and go straight to the direct-center. Only a
-        // cold/far jump whose target is unmounted needs the walk-to-mount. The DOM
-        // presence check (not just renderedRangeRef) is robust to a lagging range.
-        const alreadyMounted = (): boolean => {
+          return 'proceed';
+        },
+        // Resolve the target to its TOP-LEVEL node POSITION over the CAPTURED nodes
+        // + virtualFirstItemIndex (Codex P0-2) — data-presence-driven, not DOM.
+        resolveHit: () => nodeIndexForUuid(nodes, targetUuid, virtualFirstItemIndex),
+        // #234 §2.3-1 — the owning subagent from the RENDER TREE (nodesRef live). A
+        // find-jump into a NESTED member returns its ancestor chain (minus already-
+        // forced keys) so the card re-measures; a card-root / top-level hit -> null.
+        ownerChainToOpen: () => {
+          const owner = resolveJumpOwner(nodesRef.current, targetUuid);
+          const isCardRoot = owner?.isCardRoot ?? false;
+          if (!isCardRoot && owner && owner.ownerSubagentKey != null) {
+            const chain = ancestorKeys(owner.ownerSubagentKey, detail.subagent_meta);
+            if (chain.some((k) => !forcedOpenKeys.has(k))) return chain;
+          }
+          return null;
+        },
+        // The no-hit fallback: a COLLAPSED subagent thread whose card didn't resolve
+        // a hit — force the owning ancestor chain open so the node enters `nodes`.
+        fallbackChainToOpen: () => {
+          const targetItem = detail.items.find((it) => it.member_uuids.includes(targetUuid));
+          if (targetItem && targetItem.subagent_key != null) {
+            const chain = ancestorKeys(targetItem.subagent_key, detail.subagent_meta);
+            if (chain.some((k) => !forcedOpenKeys.has(k))) return chain;
+          }
+          return null;
+        },
+      },
+      live: {
+        // #234 — already mounted (a warm jump, or the force-open attached its ref)?
+        // Then skip the walk. The DOM presence check is robust to a lagging range.
+        isTargetMounted: () => {
           if (itemRefs.current.has(targetUuid) || cardRefs.current.has(targetUuid)) return true;
           const b = bodyRef.current;
           return !!b?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
-        };
-        const result = alreadyMounted() ? 'mounted' : await walkToTarget({
-          getTargetArrayIndex: () => {
-            const h = nodeIndexForUuid(nodesRef.current, targetUuid, firstItemIndexRef.current);
-            return h ? h.arrayIndex : null;
-          },
-          getMountedArrayRange: () => ({
-            first: renderedRangeRef.current.first - firstItemIndexRef.current,
-            last: renderedRangeRef.current.last - firstItemIndexRef.current,
-          }),
-          scrollToIndex: (index, alignEdge) =>
-            virtuosoRef.current?.scrollToIndex({ index, align: alignEdge, behavior: 'auto' }),
-          quiesce: () => waitForQuiesce(targetUuid),
-          isAborted: aborted,
-          maxSteps: 60,
-          initialWindow: Math.max(1, renderedRangeRef.current.last - renderedRangeRef.current.first + 1),
-        });
-        if (aborted()) return;
-        const body = bodyRef.current;
-        const el = (itemRefs.current.get(targetUuid)
-          ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-        if (result === 'mounted' && body && el) {
-          // #234 §2.3-2/§2.3-3 (R2) — for a tool/thinking find hit, open the matched
-          // member's collapsed inner disclosures so the <mark> actually renders, and
-          // suppress their ~240ms ::details-content open transition (Codex P1-2 — an
-          // animating open would grow the row AFTER we center, drifting the landing).
-          if (jump.expand_details) {
-            el.querySelectorAll('details:not([open])').forEach((d) => {
-              d.classList.add('conv-details--jumpopen');
-              (d as HTMLDetailsElement).open = true;
-            });
-          }
-          // Wait for the force-open re-measure + disclosure-open to QUIESCE (the row
-          // is full height) before computing the offset, then land precisely with a
-          // DIRECT scrollTop write — native el.scrollIntoView is inert inside the
-          // giant library-managed row (measured 0px).
-          //
-          // #204/#234 — a jump whose uuid IS a subagent bucket-root resolves a
-          // cardRefs entry: align that <details> CARD element to the top (NOT the
-          // sticky <summary>, whose rect reports the viewport top — §2.1/P2-1), so a
-          // tall card shows its head rather than centering it far below the fold.
-          // This covers BOTH the top-level card root (owner.isCardRoot) and a NESTED
-          // subagent's card root (whose owner.rootUuid is its top-level ancestor, so
-          // owner.isCardRoot is false — cardRefs presence is the truth). Any other
-          // hit (a member turn) centers.
+        },
+        // #234 §2.2 (R1) — WALK Virtuoso toward the target in mounted-window steps so
+        // the path rows MEASURE (a single estimate hop strands the target). The walk
+        // re-resolves the array index each step through the live refs.
+        walk: async () => {
+          const r = await walkToTarget({
+            getTargetArrayIndex: () => {
+              const h = nodeIndexForUuid(nodesRef.current, targetUuid, firstItemIndexRef.current);
+              return h ? h.arrayIndex : null;
+            },
+            getMountedArrayRange: () => ({
+              first: renderedRangeRef.current.first - firstItemIndexRef.current,
+              last: renderedRangeRef.current.last - firstItemIndexRef.current,
+            }),
+            scrollToIndex: (index, alignEdge) =>
+              virtuosoRef.current?.scrollToIndex({ index, align: alignEdge, behavior: 'auto' }),
+            quiesce: () => waitForQuiesce(targetUuid),
+            isAborted: aborted,
+            // #286 B3 — the step budget must span a FULL drained window in ONE
+            // walk call. Removing the scenario-4 pre-page workaround means a cold
+            // TAIL jump now walks the whole distance from the bottom to an early
+            // turn without a prior scroll shrinking it; each mounted-window step
+            // advances only a handful of items over the giant (multi-KB) rows, so
+            // the pre-B3 budget of 60 exhausted mid-traversal and the flash-only
+            // fallback prematurely cleared the jump. Bound it to the current window
+            // size (each step advances >= 1 item, so nodeCount steps guarantee the
+            // crossing) with a 60 floor; the walk still early-exits the instant the
+            // target mounts, so the ceiling is only ever hit by a genuinely stuck
+            // (no-progress) walk, which the halving step-shrink already terminates.
+            maxSteps: Math.max(60, nodesRef.current.length),
+            initialWindow: Math.max(1, renderedRangeRef.current.last - renderedRangeRef.current.first + 1),
+          });
+          return r === 'mounted' ? 'mounted' : 'exhausted';
+        },
+        quiesce: () => waitForQuiesce(targetUuid),
+        // body && el resolvable — the current `result === 'mounted' && body && el`
+        // guard for whether the landing block runs at all.
+        hasLandableElement: () => {
+          const body = bodyRef.current;
+          const el = itemRefs.current.get(targetUuid)
+            ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
+          return !!body && !!el;
+        },
+        hasCardRef: () => cardRefs.current.has(targetUuid),
+        findOpen: () => convFindOpenRef.current,
+        // #234 §2.3-2/§2.3-3 (R2) — open the matched member's collapsed inner
+        // disclosures so the <mark> renders, suppressing their open transition.
+        openDisclosures: () => {
+          const body = bodyRef.current;
+          const el = (itemRefs.current.get(targetUuid)
+            ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+          el?.querySelectorAll('details:not([open])').forEach((d) => {
+            d.classList.add('conv-details--jumpopen');
+            (d as HTMLDetailsElement).open = true;
+          });
+        },
+        // #204/#234 — a card-root jump aligns the <details> CARD to the top (NOT the
+        // sticky summary), so a tall card shows its head. A DIRECT scrollTop write
+        // (native scrollIntoView is inert inside the giant library-managed row).
+        landCard: async () => {
+          const body = bodyRef.current;
           const card = cardRefs.current.get(targetUuid);
+          if (!body || !card) return;
+          scrollNodeIntoView(body, card, 'start', 'auto');
           await waitForQuiesce(targetUuid);
           if (aborted()) return;
-          if (card) {
-            scrollNodeIntoView(body, card, 'start', 'auto');
-            await waitForQuiesce(targetUuid);
-            if (aborted()) return;
-            scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
-            // #238 R5 — a card-root landing has no single "the" match, but it must
-            // still clear the prior step's stale highlight (else it lingers
-            // off-screen) and, best-effort, mark the first landable match shown in
-            // the aligned card. Feed an actual <mark> only, never the card root.
-            markCurrent(convFindOpenRef.current ? firstLandableMark(card) : null);
-          } else if (jump.expand_details && convFindOpenRef.current) {
-            // #237 — an auto-expanded disclosure settles to a SHORTER height over
-            // ~150ms AFTER the open (content-visibility / lazy layout). With
-            // scrollTop pinned by a single center+re-assert, the content above the
-            // matched <mark> collapsing pulls the word UP (measured up to ~640px
-            // above center on a tall turn); the turn-anchored quiesce can't catch
-            // it (the turn top never moves, only the mark rides up) and
-            // false-settles on a 2-frame lull. Re-center the matched mark every
-            // frame until the computed center offset stops changing, so the word
-            // stays pinned at center through the collapse and lands dead-center.
-            // The target is re-resolved EACH frame (Codex P2-2/P2-3): the live turn
-            // from itemRefs/DOM (robust to Virtuoso recycling) → its first landable
-            // mark, returned so apply() re-centers that exact element; a target
-            // swap restarts the stable count and a disconnect aborts the loop.
-            const probeTarget = (): HTMLElement | null => {
-              const turn = (itemRefs.current.get(targetUuid)
-                ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-              if (!turn || !turn.isConnected) return null;
-              return (convFindOpenRef.current ? firstLandableMark(turn) : null) ?? turn;
-            };
-            await reassertCenter({
-              measure: () => {
-                const t = probeTarget();
-                return t ? { desired: alignScrollTop(body, t, 'center'), target: t } : null;
-              },
-              apply: (f) => scrollNodeIntoView(body, f.target as HTMLElement, 'center', 'auto'),
-              nextFrame: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
-              now: () => performance.now(),
-              isAborted: aborted,
-              tol: 1,
-              stableNeeded: REASSERT_STABLE_FRAMES,
-              budgetMs: REASSERT_BUDGET_MS,
-            });
-            if (aborted()) return;
-            // #238 R5 — mark the landed match distinct. Re-resolve the live turn
-            // (robust to a Virtuoso recycle) → its first landable <mark>, never
-            // the turn root: a no-mark landing clears the highlight.
-            const ct = (itemRefs.current.get(targetUuid)
+          scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
+          // #238 R5 — mark the first landable match in the aligned card (never the
+          // card root); a no-mark landing clears the highlight.
+          markCurrent(convFindOpenRef.current ? firstLandableMark(card) : null);
+        },
+        // #237/#291 — the convergent find landing, used for EVERY find jump (not just
+        // auto-expanded disclosures): re-center the matched mark EVERY frame until the
+        // center offset stops changing, so the landing survives BOTH a disclosure
+        // settling shorter over ~150ms AND virtuoso's deferred ResizeObserver
+        // re-measure (the top-reset). The target re-resolves each frame.
+        landFindReassert: async () => {
+          const body = bodyRef.current;
+          if (!body) return;
+          const probeTarget = (): HTMLElement | null => {
+            const turn = (itemRefs.current.get(targetUuid)
               ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-            markCurrent(ct && ct.isConnected && convFindOpenRef.current ? firstLandableMark(ct) : null);
-          } else {
-            // #236 — land on the matched WORD: center the turn's first LANDABLE
-            // <mark> when find is open, re-querying before each scroll (robust to
-            // a re-measure). No landable mark / find closed → center the turn root
-            // (unchanged #204 behavior).
-            const centerTarget = (): HTMLElement =>
-              (convFindOpenRef.current ? firstLandableMark(el) : null) ?? el;
-            scrollNodeIntoView(body, centerTarget(), 'center', 'auto');
-            await waitForQuiesce(targetUuid);
-            if (aborted()) return;
-            scrollNodeIntoView(body, centerTarget(), 'center', 'auto'); // §2.1 single re-assert
-            // #238 R5 — mark the landed match distinct. Feed the ACTUAL <mark>
-            // only (never the turn-root fallback): a no-mark landing clears it.
-            markCurrent(convFindOpenRef.current ? firstLandableMark(el) : null);
-          }
-        }
-        // result === 'exhausted' → fall through: the jumpedUuid flash still
-        // identifies the target (spec §2.2-6 — never spin or throw).
-        if (aborted()) return;
-        // #234 §2.2-7 (Codex P1-3) — post-landing bookkeeping runs ONLY after the
-        // verified final center, and only on the non-aborted path. Doing it early
-        // (as the old code did, right after the single scrollIntoView) released the
-        // paging/pin guards before the viewport was stable.
-        //
-        // #232 — the jump has LANDED on the target: arm paging. From here a user
-        // scroll to either edge legitimately pages.
-        armPaging();
-        // Render-driven flash (#232): the row may mount AFTER the scroll settles,
-        // and the class still lands because renderNode reads `jumpedUuid` on every
-        // (re)mount — unmount-safe, unlike the old imperative classList.add.
-        setJumpedUuid(targetUuid);
-        // #188 B2 — pin the landing so the outline selects EXACTLY this target and
-        // a repeat forward jump-to-next steps strictly past it (closes #187).
-        dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: targetUuid });
-        // #177 S6 — sync the keyboard cursor to the jumped node so j/k (and find's
-        // n/N) resume from the match (sets both the index + the stable ring uuid).
-        setCursor(hit.arrayIndex);
-        if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
-        highlightTimerRef.current = window.setTimeout(() => {
-          setJumpedUuid(null);
-          // #234 — drop the transient no-transition class once the flash clears, so a
-          // later user toggle of the same disclosure animates normally again.
-          if (bodyRef.current) bodyRef.current.querySelectorAll('.conv-details--jumpopen')
-            .forEach((d) => d.classList.remove('conv-details--jumpopen'));
-          highlightTimerRef.current = null;
-        }, 2000);
-        dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
-        setForcedOpenKeys(new Set()); // reset for the next jump (threads stay open via their latches)
-        return;
-      }
-      // #232 — no node hit. Two remaining reasons the target's node is absent from
-      // `nodes` (the mode-hidden reset already ran ABOVE, before resolving the
-      // index):
-      //
-      //   (1) It just paged in but its node isn't built/rendered yet (the
-      //       detail-growth / forcedOpenKeys re-fire handles that).
-      //   (2) It lives inside a COLLAPSED subagent thread whose top-level card
-      //       didn't yet resolve a hit (e.g. the chain isn't open) — force the
-      //       owning ancestor chain open so the target's node enters `nodes`.
-      const targetItem = detail.items.find((it) => it.member_uuids.includes(jump.uuid));
-      if (targetItem && targetItem.subagent_key != null) {
-        // §5 (Codex P1-D) — force-open the WHOLE ancestor chain (the target
-        // subagent + every parent up to the root) so a nested target's element
-        // renders. A jump into a grandchild opens the grandchild AND its parent.
-        const chain = ancestorKeys(targetItem.subagent_key, detail.subagent_meta);
-        const missing = chain.some((k) => !forcedOpenKeys.has(k));
-        if (missing) {
+            if (!turn || !turn.isConnected) return null;
+            return (convFindOpenRef.current ? firstLandableMark(turn) : null) ?? turn;
+          };
+          await reassertCenter({
+            measure: () => {
+              const t = probeTarget();
+              return t ? { desired: alignScrollTop(body, t, 'center'), target: t } : null;
+            },
+            apply: (f) => scrollNodeIntoView(body, f.target as HTMLElement, 'center', 'auto'),
+            nextFrame: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
+            now: () => performance.now(),
+            isAborted: aborted,
+            tol: 1,
+            stableNeeded: REASSERT_STABLE_FRAMES,
+            budgetMs: REASSERT_BUDGET_MS,
+            // #291 Disruption C — virtuoso's deferred re-measure transiently recycles
+            // the target row (~57ms) on a force-open; tolerate that transient 'gone'
+            // (per-outage, ¼ of the budget) so the loop resumes centering on re-mount
+            // instead of bailing. SidechainGroup's reveal reassert opts out (default 0).
+            transientGoneGraceMs: 200,
+          });
+          if (aborted()) return;
+          const ct = (itemRefs.current.get(targetUuid)
+            ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+          markCurrent(ct && ct.isConnected && convFindOpenRef.current ? firstLandableMark(ct) : null);
+        },
+        // #236 — center the turn's first LANDABLE <mark> when find is open (re-query
+        // before each scroll), else center the turn root (#204). Single re-assert.
+        landCenter: async () => {
+          const body = bodyRef.current;
+          const el = (itemRefs.current.get(targetUuid)
+            ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+          if (!body || !el) return;
+          const centerTarget = (): HTMLElement =>
+            (convFindOpenRef.current ? firstLandableMark(el) : null) ?? el;
+          scrollNodeIntoView(body, centerTarget(), 'center', 'auto');
+          await waitForQuiesce(targetUuid);
+          if (aborted()) return;
+          scrollNodeIntoView(body, centerTarget(), 'center', 'auto'); // §2.1 single re-assert
+          markCurrent(convFindOpenRef.current ? firstLandableMark(el) : null);
+        },
+        // §5 (Codex P1-D) — force-open the WHOLE ancestor chain (the target subagent
+        // + every parent up to the root). Setting it re-fires the effect.
+        requestForceOpen: (chain) => {
           setForcedOpenKeys((prev) => {
             const next = new Set(prev);
             for (const k of chain) next.add(k);
             return next;
           });
-          return; // wait for the groups to open + attach the ref, then re-fire
-        }
-        // Already forced open: the ref attaches in the forcedOpenKeys commit
-        // (before this re-fire), so reaching here means it's genuinely absent —
-        // fall through to the exhaustion clear rather than spinning.
+        },
+        dispatchModeReset: () => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' }),
+        // #234 §2.2-7 — post-landing bookkeeping runs ONLY after the verified final
+        // center, on the non-aborted path: arm paging, render-driven flash, pin,
+        // cursor sync, the 2s flash-clear timer, clear the jump, reset the force set.
+        landedBookkeeping: (arrayIndex) => {
+          gates.arm();
+          // #281 S5 B1 — a jump landing settles the open: release any follow
+          // suspension (an anchor/restore open was suspended jump-driven) so
+          // live-tail stick resumes once the target is centered.
+          follow.settle();
+          setJumpedUuid(targetUuid);
+          dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: targetUuid });
+          setCursor(arrayIndex);
+          if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
+          highlightTimerRef.current = window.setTimeout(() => {
+            setJumpedUuid(null);
+            if (bodyRef.current) bodyRef.current.querySelectorAll('.conv-details--jumpopen')
+              .forEach((d) => d.classList.remove('conv-details--jumpopen'));
+            highlightTimerRef.current = null;
+          }, 2000);
+          dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
+          setForcedOpenKeys(new Set()); // reset for the next jump (threads stay open via their latches)
+        },
+        clearJump: () => dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }),
+      },
+      expandDetails: !!jump.expand_details,
+    };
+    void (async () => {
+      // #232/#234/#281 S5 A2 — begin THIS programmatic run: bump the walk token +
+      // suppress startReached/endReached for the WHOLE jump operation (drain + walk
+      // + landing). Released in the finally via `endProgrammaticRun`, which no-ops if
+      // a newer run has taken ownership.
+      myToken = gates.beginProgrammaticRun();
+      try {
+        await runJumpPipeline(runnerDeps);
+      } finally {
+        // Re-enable edge paging once the whole jump operation has run or bailed, but
+        // ONLY if THIS run is still the current owner (a newer run that superseded
+        // the token owns the gate now). `endProgrammaticRun` bakes the ownership
+        // check in (spec §2.2-1 / F4).
+        gates.endProgrammaticRun(myToken);
       }
-      if (!hasMore) {
-        dispatch({ type: 'CLEAR_CONVERSATION_JUMP' });
-      }
-     } finally {
-      // #232/#234 — re-enable edge paging once the whole jump operation (drain +
-      // walk + landing) has run or bailed, but ONLY if THIS run is still the
-      // current owner. If the effect re-fired mid-walk (a page load / focus
-      // change / live-tail append landing during the walk), the newer run bumped
-      // walkTokenRef and now owns the edge-suppression gate; this older run must
-      // NOT clear the boolean out from under it (a window where the newer walk's
-      // settle-time startReached/endReached leak into paging — the class of bug
-      // #232 fought). The gate stays asserted "while any walk token is active"
-      // (spec §2.2-1); the newest run clears it on its own exit. (Codex P2.)
-      if (walkTokenRef.current === myToken) jumpDrainingRef.current = false;
-     }
     })();
     return () => { cancelled = true; };
-    // hasMore stays in deps so the give-up clear fires on the edge where the final
+    // hasMore stays in deps so a re-fire still fires on the edge where the final
     // page appends 0 items (items.length unchanged) but flips the cursor.
+    // #286 B3 — `lastOp?.rev` is a dep too: the committed-window-epoch exhaustion
+    // re-evaluation must re-fire on the drain's TERMINAL op commit (a 0-item
+    // append or a trimmed prepend can leave items.length / nodes unchanged while
+    // the rev — and thus `committedRev` — advances past the pending terminalOpRev).
     // forcedOpenKeys re-fires the effect once a force-opened thread has attached the
     // target's ref. focusMode re-fires it once the mode-hidden fallback resets to
     // `all` — the hidden target's node renders + its ref attaches in that commit,
     // and this re-fire scrolls via the branch above. No infinite loop:
-    // loadToTarget/fetchNext serialize via loadingMoreRef, hasMore transitions a
+    // loadToTarget/fetchNext serialize via loadingMoreRef, hasMore/rev transition a
     // bounded number of times, the forcedOpenKeys path either resolves (clears) or
     // settles to a stable set (every chain key present), and the focusMode reset
     // is one-way (non-`all` → `all`) so the mode-hidden branch can fire at most
@@ -1375,7 +1309,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     // post-load scrollToIndex re-fires once the target is paged into the render
     // list (a prepend can shift the virtual index without growing items.length).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore, forcedOpenKeys, focusMode, nodes, virtualFirstItemIndex]);
+  }, [jump, sessionId, detail?.items.length, hasMore, lastOp?.rev, forcedOpenKeys, focusMode, nodes, virtualFirstItemIndex]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful
@@ -1440,18 +1374,20 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // next conversation starts with the button hidden.
   useEffect(() => {
     setNewCount(0);
-    // #217 S3 E2 — the open-precedence fold: an anchor/restore open lands the
-    // user on a SPECIFIC turn (not the tail), so it must NOT force atBottom (else
-    // a live append would yank the viewport to the bottom). A tail / legacy open
-    // keeps the prior default (true → live appends stick). The openScrollIntent
-    // layout effect re-confirms this once the first page resolves.
-    atBottomRef.current = openIntent?.kind === 'anchor' || openIntent?.kind === 'restore' ? false : true;
-    // P0 fix — re-arm the open-scroll-intent one-shot for the NEW open so its own
-    // 'top'/'bottom' verdict applies once when the first page resolves. Safe to
-    // reset here (a regular effect): the new session's first page hasn't fetched
-    // yet, so the layout effect that consumes the latch only runs in a LATER
-    // commit, after this reset.
-    appliedIntentRef.current = false;
+    // #217 S3 E2 / #281 S5 A3 — the open-precedence fold: an anchor/restore open
+    // lands the user on a SPECIFIC turn (not the tail), so it must NOT force
+    // atBottom (else a live append would yank the viewport to the bottom). A tail
+    // / legacy open keeps the prior default (true → live appends stick). The
+    // machine's `sessionChanged` returns this default (idempotent per generation);
+    // the `firstWindowReady` landing re-confirms it once the first page resolves.
+    // Re-arming the one-shot lander for the NEW open is now automatic — the
+    // generation bump makes `firstWindowReady` fire once for this open.
+    const reset = lifecycle.sessionChanged(generation, openIntent?.kind ?? null);
+    if (reset) atBottomRef.current = reset.atBottom;
+    // #281 S5 B1 — reset the follow-suspension for the new open. anchor/restore
+    // → suspend (jump-driven, until the landing settle); tail/legacy → live (a
+    // subsequent single-page 'top' landing re-suspends via follow.landed).
+    follow.openChanged(openIntent?.kind ?? null);
     setJumpTopVisible(false);
     jumpTopTargetRef.current = null;
     // #188 S4/C2 — the reused reader must not carry a prior conversation's
@@ -1459,31 +1395,21 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     // agent-file hash and can collide). Clearing both keeps the next session's
     // first live append counted correctly: an append into a thread that was
     // expanded in the OLD conversation but is collapsed in the new one must NOT
-    // count (Bug 5 + #188 B6's per-session reset rationale).
-    openKeysRef.current.clear();
-    knownSubagentKeysRef.current.clear();
-    // #232 — DISARM paging for the new open and arm the fallback timer. Both edges
-    // stay no-op until the open settles (atBottomStateChange / jump-landing /
-    // this 750ms fallback). Clearing any prior timer first keeps it one-shot per
-    // open. The fallback guarantees paging is eventually usable even if neither
-    // settle signal fires (e.g. a single-page conversation that never reaches the
-    // bottom-state edge nor runs a jump).
-    reversePagingArmedRef.current = false;
-    forwardPagingArmedRef.current = false;
-    jumpDrainingRef.current = false;
-    if (armPagingTimerRef.current != null) window.clearTimeout(armPagingTimerRef.current);
-    armPagingTimerRef.current = window.setTimeout(() => {
-      reversePagingArmedRef.current = true;
-      forwardPagingArmedRef.current = true;
-      armPagingTimerRef.current = null;
-    }, 750);
-  }, [sessionId, openIntent]);
-
-  // #232 — clear the arming fallback timer on unmount so it never fires into a
-  // torn-down reader.
-  useEffect(() => () => {
-    if (armPagingTimerRef.current != null) { window.clearTimeout(armPagingTimerRef.current); armPagingTimerRef.current = null; }
-  }, []);
+    // count (Bug 5 + #188 B6's per-session reset rationale). #281 S5 A1 — the
+    // known-set lives in the immutable pill trackers now; `resetPillTrackers()`
+    // mints a fresh empty value, and the open-set is replaced with a fresh set.
+    openKeysRef.current = new Set();
+    pillTrackersRef.current = resetPillTrackers();
+    // #232 / #281 S5 A2 — DISARM paging for the new open and arm the fallback
+    // timer via the machine. Both edges stay no-op until the open settles
+    // (atBottomStateChange / jump-landing / the 750ms fallback). `sessionOpened()`
+    // clears any prior fallback first (one-shot per open) + drops in-flight
+    // suppression; the fallback guarantees paging is eventually usable even if
+    // neither settle signal fires (e.g. a single-page conversation that never
+    // reaches the bottom-state edge nor runs a jump). The unmount cleanup that
+    // cancelled this timer now lives in `useReaderMachine` (`gates.dispose()`).
+    gates.sessionOpened();
+  }, [sessionId, openIntent, gates, lifecycle, generation, follow]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
@@ -2357,6 +2283,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
             <ReaderOverflowMenu
               sessionId={sessionId}
               exportTitle={detail.title}
+              anonMode={anonMode}
+              onToggleAnon={toggleAnonMode}
               onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
               onLatest={detail.last_anchor ? () => { void jumpToLatest(); } : null}
               latestBusy={jumpingLatest}
@@ -2494,9 +2422,25 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
             subagents={subagentOptions}
             onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
           />
+          {/* #281 S4 — the "Anonymize" mode toggle chip, next to Export ▾.
+              Default ON, persisted; single source for the menu + per-card copy. */}
+          <button
+            type="button"
+            className="conv-anon-toggle"
+            aria-pressed={anonMode}
+            aria-label="Anonymize shared transcripts"
+            title={
+              anonMode
+                ? 'Anonymize ON — exports & copies redact project paths, home, username & known secrets (best-effort; review before sharing)'
+                : 'Anonymize OFF — exports & copies are raw'
+            }
+            onClick={toggleAnonMode}
+          >
+            {anonMode ? '🎭 Anon' : 'Anon off'}
+          </button>
           {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
               its own Esc/outside-click close; fetches the new /export route. */}
-          <ExportMenu sessionId={sessionId} title={detail.title} />
+          <ExportMenu sessionId={sessionId} title={detail.title} anonMode={anonMode} />
           {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
               last_anchor is null (a genuinely empty conversation). Disabled with
               a spinner glyph while jumpToLatest() resets to the tail. Bound to `End`. */}
@@ -2584,25 +2528,36 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
         itemContent={(index, node) => renderNode(node, index - firstItemIndexRef.current)}
         components={virtuosoComponents}
         startReached={() => {
-          // #232 — ARMING GATE (defense-in-depth on top of loadToTarget's
-          // re-entrancy guard). On a cold open Virtuoso fires startReached/endReached
-          // as it settles the initial position (the deep-link target's scrollToIndex,
-          // or the tail), BEFORE any user scroll. Paging on those transient edge hits
-          // re-enters the very drain that's positioning the window. Gate both edges:
-          // they no-op until the open has SETTLED (first atBottomStateChange OR the
-          // jump landed OR a 750ms fallback — see the arming effect) AND while a
-          // programmatic jump drain is in flight. A genuine user scroll-to-edge
-          // happens only after settle, so real reverse/forward paging is preserved.
-          if (!reversePagingArmedRef.current || jumpDrainingRef.current) return;
+          // #232 / #281 S5 A2 — ARMING GATE (defense-in-depth on top of
+          // loadToTarget's re-entrancy guard). On a cold open Virtuoso fires
+          // startReached/endReached as it settles the initial position (the
+          // deep-link target's scrollToIndex, or the tail), BEFORE any user scroll.
+          // Paging on those transient edge hits re-enters the very drain that's
+          // positioning the window. `gates.shouldPage(edge)` folds both conditions:
+          // the edge is armed (the open SETTLED — first atBottomStateChange OR the
+          // jump landed OR the 750ms fallback) AND no programmatic run is in flight.
+          // A genuine user scroll-to-edge happens only after settle, so real
+          // reverse/forward paging is preserved.
+          if (!gates.shouldPage('start')) return;
           doLoadPrevRef.current();
         }}
         endReached={() => {
-          if (!forwardPagingArmedRef.current || jumpDrainingRef.current) return;
+          if (!gates.shouldPage('end')) return;
           void loadMore();
         }}
-        followOutput={(atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
+        // #281 S5 B1 (#285 FIX) — a truthy RAW `followOutput` prop (even this
+        // callback) installs react-virtuoso's resize-autoscroll-to-LAST watcher
+        // regardless of the callback's return, so `() => false` does NOT disable
+        // it (that watcher is what pulled single-page opens to the bottom). While
+        // the machine reports `followMode === 'suspended'` (a 'top' landing or an
+        // anchor/restore open) we pass the LITERAL `false` prop to uninstall the
+        // watcher; otherwise the live stick callback runs. …and while a same-session
+        // jump is active (`activeJumpForSession`, #291) — the jump-dispatch render
+        // must already be `false` so a jump-driven force-open's `SIZE_INCREASED`
+        // finds no armed watcher.
+        followOutput={(followMode === 'suspended' || activeJumpForSession) ? false : (atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
         atBottomThreshold={80}
-        atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; armPaging(); if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
+        atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; gates.arm(); follow.settle(); if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
         itemsRendered={onItemsRendered}
         increaseViewportBy={600}
         onScroll={onBodyScroll}

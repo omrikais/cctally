@@ -4,11 +4,11 @@ Turns the former "per-migration goldens are lazy-adopted; not retroactively
 backfilled" policy into an ENFORCED invariant, now that W3 has backfilled the
 last 7 gaps:
 
-  1. Registry counts are pinned (12 stats / 20 cache) with the test-injection
+  1. Registry counts are pinned (12 stats / 21 cache) with the test-injection
      env var (``CCTALLY_MIGRATION_TEST_MODE``) asserted ABSENT — when it is
      armed, ``bin/_cctally_db`` registers a REAL extra entry in each registry
-     (``013_test_failure_injection`` / ``021_test_cache_migration``) that has no
-     golden, so the guard must run against the clean 12/20 shape.
+     (``013_test_failure_injection`` / ``022_test_cache_migration``) that has no
+     golden, so the guard must run against the clean 12/21 shape.
   2. Bijection: the set of migration names in BOTH registries equals the set of
      ``per-migration/<name>/`` golden dirs — no migration missing a golden, and
      no orphan golden dir. Each dir carries both ``pre.sqlite`` + ``post.sqlite``.
@@ -44,7 +44,7 @@ PER_MIGRATION_ROOT = (
 
 # Pinned registry sizes. Bump BOTH when a migration ships (see module docstring).
 EXPECTED_STATS_COUNT = 12
-EXPECTED_CACHE_COUNT = 20
+EXPECTED_CACHE_COUNT = 21
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -87,6 +87,7 @@ MANIFEST = {
     "018_create_conversation_title_fts": "test_cache_migration_018_per_migration_goldens",
     "019_create_conversation_file_touches": "test_cache_migration_019_per_migration_goldens",
     "020_session_entries_physical_unique": "test_cache_migration_020_per_migration_goldens",
+    "021_index_conversation_messages_cwd": "test_cache_migration_021_index_conversation_messages_cwd",
 }
 
 

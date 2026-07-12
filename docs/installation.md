@@ -81,6 +81,20 @@ cd cctally
 If `~/.local/bin` isn't on your PATH yet, `setup` will print the line to add to
 your shell rc.
 
+## Using cctally before (or without) `setup`
+
+You don't have to run `cctally setup` to get value from cctally. The reporting commands read your `~/.claude` session logs (and the local cache) directly, so they work immediately after an npm/npx or source install:
+
+```bash
+npx cctally daily          # cost-by-day, no setup required
+npx cctally dashboard      # live web dashboard
+npx cctally tui            # terminal dashboard
+```
+
+(After a global npm install — or a source checkout whose `bin/` is on your `PATH` — drop the `npx` and just run `cctally daily`.)
+
+What `setup` adds is *auto-recording*: the live status-line quota percentage and the three hooks that keep data flowing as you work, plus the first-run cache bootstrap. Run it once you want continuous tracking rather than on-demand reports. On a large session history that first-run cache sync now streams live progress to the terminal, so a multi-second cold sync no longer looks hung.
+
 ## Verify
 
 ```bash

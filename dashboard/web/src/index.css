@@ -2916,6 +2916,7 @@ mark.current {
 .blocks-row .gauge-fill .seg-opus   { background: var(--accent-purple); }
 .blocks-row .gauge-fill .seg-sonnet { background: var(--accent-blue); }
 .blocks-row .gauge-fill .seg-haiku  { background: var(--accent-green); }
+.blocks-row .gauge-fill .seg-fable  { background: var(--chip-fable); }
 .blocks-row .gauge-fill .seg-other  { background: var(--text-dim); }
 
 .blocks-row .pill-active {
@@ -6780,6 +6781,40 @@ mark.current {
 }
 .conv-export-action:disabled { opacity: 0.6; cursor: progress; }
 
+/* ---- Anonymize toggle + export note (#281 S4) ------------------- */
+/* The header "Anon" toggle chip, next to Export ▾. Chrome mirrors
+   .conv-outline-toggle / .conv-find-toggle so the reader controls read as one
+   set; the pressed (ON) state uses the accent tint like the other toggles. */
+.conv-anon-toggle {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.conv-anon-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-anon-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.conv-anon-toggle[aria-pressed="true"] {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+/* The in-menu "Anonymized …" note above the scope rows (mode ON only). */
+.conv-export-anon-note {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  padding: 2px var(--space-2) var(--space-1);
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: var(--space-1);
+  white-space: normal;
+  max-width: 22ch;
+}
+
 /* ---- Task-completion chip (#217 S5 F7) --------------------------- */
 /* Always-visible (regardless of scroll) reader-header chip shown when the main
    thread's final task snapshot is fully done; clicking jumps to that turn.
@@ -8929,6 +8964,10 @@ mark.current {
 /* Tool I/O bodies anchor a copy button top-right of each block. */
 .conv-tool-io { position: relative; }
 .conv-tool-io > .conv-copy-btn { position: absolute; top: 2px; right: 2px; z-index: 1; }
+/* #281 S4 — per-card copy in anon mode carries a subtle accent tint (the "anon"
+   hint); a fail-closed error flashes the error color instead of writing raw. */
+.conv-copy-btn-anon { color: var(--accent-blue); }
+.conv-copy-btn-error { color: var(--accent-red, #e5534b); }
 /* Per-turn message-text copy: hover/focus/keyboard-cursor revealed. */
 .conv-item-actions {
   display: flex;
@@ -9555,6 +9594,18 @@ mark.current {
   #root .conv-overflow-item:hover { background: var(--panel-bg); }
   #root .conv-overflow-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
   #root .conv-overflow-item:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* #281 S4 — the Anonymize toggle row: label left, an On/Off state chip right. */
+  #root .conv-overflow-item--toggle { justify-content: space-between; gap: var(--space-3); }
+  #root .conv-overflow-item-state {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  #root .conv-overflow-item--toggle[aria-pressed='true'] .conv-overflow-item-state {
+    color: var(--accent-blue);
+  }
   /* Row 2: the compact Focus dropdown grows; Find + Outline sit beside it. */
   /* Same definite-width clamp as row1 — keeps Focus · Find · Outline on-screen. */
   #root .conv-reader-row2 {

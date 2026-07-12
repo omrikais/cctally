@@ -1,7 +1,7 @@
 cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
-  ⚠ Symlinks                 14/14 available; 2 stale link(s) to clean
+  ⚠ Symlinks                 15/15 available; 2 stale link(s) to clean
       → Run `cctally setup` to clean stale links
 Hooks
   ⚠ Recent activity (24h)    0 fires
@@ -11,7 +11,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       32 pending
+  ⚠ Pending migrations       33 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing

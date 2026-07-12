@@ -22,7 +22,9 @@ export interface ReassertFrame {
 
 export interface ReassertDeps {
   /** Resolve the current target + its desired center scrollTop. null → target
-   *  gone (row recycled / disconnected) → returns 'gone'. */
+   *  gone (row recycled / disconnected). By default a null returns 'gone'
+   *  immediately; an opt-in `transientGoneGraceMs` tolerates a transient null
+   *  (see below) and resumes centering when the row re-mounts. */
   measure: () => ReassertFrame | null;
   /** Re-center to the frame `measure` just returned (its `target`). */
   apply: (frame: ReassertFrame) => void;
@@ -39,6 +41,17 @@ export interface ReassertDeps {
   stableNeeded: number;
   /** wall-clock fallback ceiling in ms. */
   budgetMs: number;
+  /** #291 — opt-in tolerance (ms) for a TRANSIENT null `measure()`. Virtuoso's
+   *  deferred ResizeObserver re-measure transiently recycles the target row
+   *  (~57ms) on a force-open (Disruption C), which would otherwise trip the
+   *  genuine-`'gone'` exit before the row re-mounts. When set (>0), a null frame
+   *  keeps awaiting `nextFrame()` and re-measuring — resuming centering the
+   *  instant the row re-mounts — until either it re-mounts or this grace elapses
+   *  with the target still gone (then `'gone'`). Grace is measured PER-OUTAGE
+   *  (reset on every successful measure), because virtuoso can recycle the row
+   *  more than once per operation; the outer `budgetMs` still bounds total time.
+   *  Default `0`/unset = today's immediate-`'gone'` behavior (SidechainGroup). */
+  transientGoneGraceMs?: number;
 }
 
 export type ReassertResult = 'settled' | 'aborted' | 'exhausted' | 'gone';
@@ -46,12 +59,27 @@ export type ReassertResult = 'settled' | 'aborted' | 'exhausted' | 'gone';
 /** Re-center every frame until the center offset stabilizes (spec §2). */
 export async function reassertCenter(d: ReassertDeps): Promise<ReassertResult> {
   const start = d.now();
+  const goneGraceMs = Math.max(0, d.transientGoneGraceMs ?? 0);
+  let goneSince: number | null = null;   // #291 — per-outage null clock (reset on every successful measure)
   let last: ReassertFrame | null = null;
   let stable = 0;
   while (d.now() - start <= d.budgetMs) {
     if (d.isAborted()) return 'aborted';
     const cur = d.measure();
-    if (cur == null) return 'gone';
+    if (cur == null) {
+      // #291 — tolerate a TRANSIENT recycle when opted in: keep polling for the
+      // row's re-mount until a PER-OUTAGE grace elapses; the outer budget still
+      // bounds the total. Never `apply` on a null frame; reset `last`/`stable` so
+      // stability can never bridge an unmounted interval.
+      if (goneGraceMs === 0) return 'gone';                 // default — unchanged (SidechainGroup)
+      const now = d.now();
+      if (goneSince == null) goneSince = now;
+      if (now - goneSince >= goneGraceMs) return 'gone';
+      last = null; stable = 0;
+      await d.nextFrame();
+      continue;
+    }
+    goneSince = null;                                        // a successful measure resets the per-outage clock
     // #237 — re-center EVERY frame, not just when `desired` moves > tol. A
     // jump-opened disclosure collapses to its settled height via a sub-pixel tail
     // (each frame's shift is ≤ tol), so an apply-on-change-only loop stops

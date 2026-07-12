@@ -150,7 +150,7 @@ const items = () => [
 ];
 
 describe('#236 find-jump lands on the matched word', () => {
-  it('centers the first landable <mark> when find is open', async () => {
+  it('#291 — a find-open jump (even without expand_details) routes through the convergent loop and centers the <mark>', async () => {
     mockFetchOnce(detail(items()));
     // Open the conversation, THEN open find on the SAME session (a new
     // OPEN_CONVERSATION for the same id preserves convFindOpen), then jump.
@@ -171,10 +171,15 @@ describe('#236 find-jump lands on the matched word', () => {
 
     // Every center call targeted the sentinel mark, not the turn root.
     expect(scrollCalls.every((el) => el === sentinelMark)).toBe(true);
-    // A non-expand_details find-jump takes the #236 fallback center path, NOT the
-    // #237 convergent loop — so alignScrollTop is never consulted here. (Locks the
-    // routing distinction from the other side so the #237 assertion isn't vacuous.)
-    expect(alignCalls.length).toBe(0);
+    // #291 — EVERY find landing (find open) now routes through the #237 convergent
+    // reassert: the runner branch was relaxed from `expandDetails && findOpen` to
+    // just `findOpen` (so the plain-prose find hit no longer falls to the single-shot
+    // #236 center that virtuoso's deferred re-measure could clobber). Only the loop's
+    // measure() reads alignScrollTop, so a non-zero call count is the signature that
+    // this non-expand find-jump ROUTED THROUGH the convergent loop — and it measured
+    // the mark, not the turn root.
+    expect(alignCalls.length).toBeGreaterThan(0);
+    expect(alignCalls.every((el) => el === sentinelMark)).toBe(true);
   });
 
   it('centers the turn root when find is CLOSED (firstLandableMark not consulted)', async () => {
@@ -246,7 +251,8 @@ describe('#236 find-jump lands on the matched word', () => {
     expect(scrollCalls.every((el) => el === sentinelMark)).toBe(true);
     // Proof the jump ROUTED THROUGH the convergent loop (not the #236 fallback):
     // only the loop's measure() reads alignScrollTop, so a non-zero call count is
-    // the signature of the new expand_details branch — and it measured the mark.
+    // the signature of the find-landing branch (post-#291, shared by every find
+    // landing) — this expand_details case additionally opens the inner disclosures.
     expect(alignCalls.length).toBeGreaterThan(0);
     expect(alignCalls.every((el) => el === sentinelMark)).toBe(true);
   });

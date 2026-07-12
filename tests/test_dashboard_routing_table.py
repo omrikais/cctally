@@ -33,6 +33,7 @@ def test_conversation_routes_precede_catch_all():
         "_handle_get_conversation_find",
         "_handle_get_conversation_events",
         "_handle_get_conversation_export",
+        "_handle_get_conversation_anon_map",
         "_handle_get_conversation_prompts",
     ):
         assert names.index(earlier) < catch, earlier
@@ -54,8 +55,9 @@ def test_post_routes_have_no_settings_405_guard_entry():
 
 
 def test_conversation_perf_wraps_present():
-    # gate P2-1: the 11 per-route perf wraps survive as table entries
+    # gate P2-1: the per-route perf wraps survive as table entries (12 after
+    # #281 S4 adds /anon-map with a scope wrap).
     dash = _dash()
     wrapped = [e for e in dash._GET_ROUTES if e[3] is not None]
-    assert len(wrapped) == 11
+    assert len(wrapped) == 12
     assert {e[3][0] for e in wrapped} == {"scope", "phase"}

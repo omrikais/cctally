@@ -245,7 +245,14 @@ def _render_title_banner(title: str, *, unicode_ok: bool, color: bool) -> str:
 
 
 def _fmt_block_time_local(ts: dt.datetime, tz: "ZoneInfo | None") -> str:
-    """Block-start timestamp in display tz, ccusage `toLocaleString`-style."""
+    """Block-start timestamp in display tz, ccusage `toLocaleString`-style.
+
+    ``ts`` is always a 5h-block boundary (start_time / end_time — every
+    caller passes one), so it is rounded to the nearest 10-minute boundary
+    to normalize Anthropic's reset-capture jitter (e.g. 4:39:59 → 4:40:00)
+    before rendering.
+    """
+    ts = _cctally()._round_to_ten_minutes(ts)
     local = ts.astimezone(tz)
     hour_12 = local.hour % 12 or 12
     ampm = "a.m." if local.hour < 12 else "p.m."

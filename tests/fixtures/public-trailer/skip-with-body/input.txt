@@ -1,5 +1,0 @@
-fix: thing
-
-Detail.
-
-Public-Skip: true

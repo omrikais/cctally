@@ -4872,3 +4872,63 @@ def test_facets_models_fold_then_count(seeded_conn):
     assert [m["family"] for m in fac["models"]] == ["opus", "sonnet", "haiku"]
     # projects key unchanged / still present.
     assert "projects" in fac
+
+
+# ---- #281 S4: anon-plan identity source + existence probe -------------------
+
+def _sf(c, *, path, session_id=None, project_path=None):
+    """Insert a session_files row (project_path is the legacy fallback source)."""
+    c.execute(
+        "INSERT OR REPLACE INTO session_files "
+        "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+        " session_id,project_path) VALUES(?,?,?,?,?,?,?)",
+        (path, 1, 1, 1, "t", session_id, project_path))
+
+
+def test_build_anon_plan_for_db_scrubs_observed_cwds_labels_home_user():
+    from _lib_conversation_anon import scrub_text
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi",
+         cwd="/Users/alice/repos/cctally-dev")
+    _msg(c, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-02T00:00:00Z", entry_type="human", text="yo",
+         cwd="/Volumes/EXT/repos/project")
+    # legacy fallback: a session_files.project_path with no matching cwd row.
+    _sf(c, path="c.jsonl", session_id="s3", project_path="/home/bob/work/api")
+    plan = cq.build_anon_plan_for_db(c, home_dir="/Users/alice")
+    out = scrub_text(
+        "cwd /Users/alice/repos/cctally-dev and /home/bob/work/api by alice, bob "
+        "home /Users/alice repo cctally-dev", plan)
+    assert "/Users/alice/repos/cctally-dev" not in out    # primary cwd root
+    assert "/home/bob/work/api" not in out                # session_files fallback root
+    assert "/Users/alice" not in out                       # bare home dir → ~
+    assert "alice" not in out and "bob" not in out         # usernames (home basenames)
+    assert "cctally-dev" not in out                        # label (bounded)
+    assert "~" in out and "user" in out                    # home + username replacements
+
+
+def test_build_anon_plan_for_db_deterministic_across_calls():
+    from _lib_conversation_anon import plan_to_wire
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text="hi",
+         cwd="/Volumes/EXT/repos/zeta")
+    _msg(c, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text="yo",
+         cwd="/Users/alice/repos/alpha")
+    p1 = plan_to_wire(cq.build_anon_plan_for_db(c, home_dir="/Users/alice"))
+    p2 = plan_to_wire(cq.build_anon_plan_for_db(c, home_dir="/Users/alice"))
+    assert p1 == p2
+    # lexical numbering by root path: /Users/... < /Volumes/...
+    reps = {t["text"]: t["replacement"] for t in p1["tokens"]}
+    assert reps["/Users/alice/repos/alpha"] == "project-1"
+    assert reps["/Volumes/EXT/repos/zeta"] == "project-2"
+
+
+def test_conversation_exists_true_false():
+    c = _conn()
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="t", entry_type="human", text="hi")
+    assert cq.conversation_exists(c, "s1") is True
+    assert cq.conversation_exists(c, "nope") is False

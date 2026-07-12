@@ -2400,6 +2400,16 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON conversation_messages(source_path);
         CREATE INDEX IF NOT EXISTS idx_conv_turnkey
             ON conversation_messages(msg_id, req_id);
+        -- #289: partial covering index on cwd. build_anon_plan_for_db sources
+        -- anonymization tokens with `SELECT DISTINCT cwd FROM conversation_messages
+        -- WHERE cwd IS NOT NULL AND cwd != ''`; without this index that DISTINCT is
+        -- a full scan of the whole (prose-heavy) table (~20s cold on a 5.5 GB
+        -- cache). The partial `(cwd)` index matches the WHERE exactly so the
+        -- DISTINCT is answered by an ordered index-only walk. MIRRORS migration 021
+        -- (base schema here for fresh/rebuilt caches, migration for existing ones).
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_cwd
+            ON conversation_messages(cwd)
+            WHERE cwd IS NOT NULL AND cwd != '';
 
         -- #193: per-session AI-generated title, isolated from the six places
         -- that iterate conversation_messages. The explicit NOT NULL on the
@@ -3985,6 +3995,27 @@ def _020_session_entries_physical_unique(conn: sqlite3.Connection) -> None:
             except OSError:
                 pass
             lock_fh.close()
+
+
+@cache_migration("021_index_conversation_messages_cwd")
+def _021_index_conversation_messages_cwd(conn: sqlite3.Connection) -> None:
+    """#289: partial covering index on conversation_messages(cwd) to collapse the
+    full-table `SELECT DISTINCT cwd` scan in build_anon_plan_for_db (~20s cold on
+    a 5.5 GB cache) into an index-only search.
+
+    Fresh installs never run this handler: the dispatcher stamps it WITHOUT
+    running (the fresh-install branch), and `_apply_cache_schema` already created
+    the index on the fresh DB. NO self-stamp — the dispatcher central-stamps on a
+    clean return (#140). Run-twice safe: CREATE INDEX is IF NOT EXISTS. cache.db
+    is re-derivable — `cache-sync --rebuild` is the escape hatch.
+
+    No flock/BEGIN IMMEDIATE (unlike 020): a single CREATE INDEX IF NOT EXISTS is
+    atomic and touches no rows, so it needs no mutual-exclusion scaffolding.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_messages_cwd "
+        "ON conversation_messages(cwd) WHERE cwd IS NOT NULL AND cwd != ''"
+    )
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===

@@ -1717,3 +1717,85 @@ def test_conversations_model_filter_and_facets(tmp_path, monkeypatch):
         assert counts == {"opus": 3}, counts
     finally:
         srv.shutdown()
+
+
+# ---- #281 S4: anonymized export param + anon-map route ---------------------
+
+def _seed_anon_session(ns):
+    """Insert a session whose rendered prose carries an OBSERVED identity token
+    (the seeded cwd) so the anonymized export visibly differs from raw."""
+    cache = ns["open_cache_db"]()
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES('sanon','ah1',NULL,'anon.jsonl',0,"
+        "'2026-06-03T00:00:00Z','human','edited /home/u/proj/secret.py here',"
+        "'[]',NULL,NULL,NULL,'/home/u/proj','main',0)")
+    cache.commit()
+    cache.close()
+
+
+def test_conversation_export_anonymize_param(tmp_path, monkeypatch):
+    """``?anonymize=1`` scrubs the body; absent/``0`` are byte-identical raw;
+    blank/duplicate/non-0-1 are strict-parse 400s BEFORE the kernel (spec §5)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        _seed_anon_session(ns)
+        port = srv.server_address[1]
+        base = "/api/conversation/sanon/export?scope=all"
+
+        # Raw (no param) and anonymize=0 are byte-identical (R4 raw-unchanged).
+        st, ct, raw = _get_ct(port, base)
+        assert st == 200 and ct.startswith("text/markdown"), (st, ct)
+        st0, _, raw0 = _get_ct(port, base + "&anonymize=0")
+        assert st0 == 200 and raw0 == raw
+        assert b"/home/u/proj" in raw               # identity token present in raw
+
+        # anonymize=1 → scrubbed; the identity token is gone; body differs.
+        st1, ct1, anon = _get_ct(port, base + "&anonymize=1")
+        assert st1 == 200 and ct1.startswith("text/markdown"), (st1, ct1)
+        assert b"/home/u/proj" not in anon
+        assert anon != raw
+
+        # Strict parse (before the kernel): blank / duplicate / non-0-1 → 400.
+        for bad in ("&anonymize=", "&anonymize=1&anonymize=0",
+                    "&anonymize=true", "&anonymize=2"):
+            st, _, _ = _get_ct(port, base + bad)
+            assert st == 400, bad
+    finally:
+        srv.shutdown()
+
+
+def test_conversation_anon_map_route(tmp_path, monkeypatch):
+    """``/api/conversation/<sid>/anon-map`` returns the plan_to_wire shape;
+    404 unknown sid; 403 under the LAN-hostname gate; and route-ordering proof
+    that the suffix does NOT fall through to the detail catch-all (spec §5)."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+
+        st, body = _get(port, "/api/conversation/s1/anon-map")
+        assert st == 200, (st, body)
+        wire = json.loads(body)
+        assert set(wire) == {"tokens", "patterns"}
+        assert all(set(t) == {"text", "replacement", "bounded"}
+                   for t in wire["tokens"])
+        assert all(set(p) == {"name", "source", "ignoreCase", "keepGroup1"}
+                   for p in wire["patterns"])
+        assert wire["patterns"], "production secret patterns must be present"
+        # Precedence: NOT the detail catch-all (items/page) nor the export md.
+        assert "items" not in wire and "page" not in wire
+
+        # Unknown sid → 404 (sibling envelope discipline).
+        st, _ = _get(port, "/api/conversation/does-not-exist/anon-map")
+        assert st == 404
+
+        # Privacy gate reused: LAN hostname + expose=False → 403.
+        st, _ = _get(port, "/api/conversation/s1/anon-map",
+                     host="machine.local:8789")
+        assert st == 403
+    finally:
+        srv.shutdown()

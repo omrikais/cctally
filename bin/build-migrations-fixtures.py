@@ -3456,6 +3456,144 @@ def build_per_migration_020_session_entries_physical_unique(scenario_dir: Path) 
     _build_post(pre, post)
 
 
+def build_per_migration_021_index_conversation_messages_cwd(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``021_index_conversation_messages_cwd``
+    (#289 — the partial covering index on ``conversation_messages(cwd)``).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``)
+        with the ``idx_conversation_messages_cwd`` index DROPPED (a genuine pre-021
+        DB lacks it; the base schema now creates it, so we drop it exactly like 020
+        drops ``idx_entries_physical``), ``schema_migrations`` carrying cache
+        migrations 001-020 (an existing install at the 020 head), and a handful of
+        seeded ``conversation_messages`` rows: two sharing ``cwd='/proj/a'``
+        (a duplicate the DISTINCT collapses) + one ``cwd='/proj/b'`` + a NULL-cwd
+        row + an empty-string-cwd row (both excluded by the partial WHERE).
+      * ``post.sqlite`` — same DB after running the production 021 handler
+        (``CREATE INDEX IF NOT EXISTS``) and stamping the dispatcher's 021 marker
+        (reproduced here with a PINNED applied_at_utc so the committed golden is
+        rebuild-deterministic, #197).
+
+    Loaded by ``tests/test_cache_migration_021_index_conversation_messages_cwd.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    # The 020-head prior chain stamped into pre.sqlite (an existing install that
+    # has every prior cache migration but not yet the cwd index).
+    _PRIOR_CHAIN = (
+        "001_dedup_highest_wins",
+        "002_conversation_messages_backfill",
+        "003_conversation_reingest_tool_ids",
+        "004_conversation_reingest_subagent_kind",
+        "005_conversation_reingest_meta",
+        "006_conversation_reingest_source_tool_use_id",
+        "007_conversation_reingest_enrichment",
+        "008_session_entries_speed_backfill",
+        "009_conversation_media_reingest",
+        "010_conversation_search_split",
+        "011_conversation_promote_command_args",
+        "012_create_conversation_ai_titles",
+        "013_create_conversation_sessions",
+        "014_conversation_queued_prompt_reingest",
+        "015_conversation_sessions_filter_columns",
+        "016_drop_search_aux",
+        "017_arm_nested_agent_reingest",
+        "018_create_conversation_title_fts",
+        "019_create_conversation_file_touches",
+        "020_session_entries_physical_unique",
+    )
+
+    _SEED_INSERT = (
+        "INSERT INTO conversation_messages "
+        "(session_id, uuid, source_path, byte_offset, entry_type, cwd) "
+        "VALUES (?,?,?,?,?,?)"
+    )
+    # (session_id, uuid, source_path, byte_offset, entry_type, cwd). Distinct +
+    # duplicate cwds so the DISTINCT is meaningful, plus NULL/empty rows the
+    # partial WHERE excludes. Each (source_path, byte_offset) is unique.
+    _SEED_ROWS = [
+        ("s1", "u1", "/fake/.claude/projects/p1/a.jsonl", 0, "user", "/proj/a"),
+        ("s1", "u2", "/fake/.claude/projects/p1/a.jsonl", 100, "assistant", "/proj/a"),
+        ("s2", "u3", "/fake/.claude/projects/p1/b.jsonl", 0, "user", "/proj/b"),
+        ("s3", "u4", "/fake/.claude/projects/p1/c.jsonl", 0, "user", None),
+        ("s4", "u5", "/fake/.claude/projects/p1/d.jsonl", 0, "user", ""),
+    ]
+
+    TS_021_APPLIED_PIN = "2026-07-11T12:00:00Z"
+
+    def _load_db():
+        spec = ilu.spec_from_file_location("_cctally_db", bin_dir / "_cctally_db.py")
+        mod = ilu.module_from_spec(spec)
+        sys.modules["_cctally_db"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_db()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            # A genuine pre-021 DB lacks the cwd index — drop it so pre's DISTINCT
+            # plan is a full SCAN (the handler then creates it).
+            conn.execute("DROP INDEX IF EXISTS idx_conversation_messages_cwd")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-11T11:00:00Z"),
+                )
+            conn.executemany(_SEED_INSERT, _SEED_ROWS)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_db()
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "021_index_conversation_messages_cwd":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("021_index_conversation_messages_cwd not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Production handler: CREATE INDEX IF NOT EXISTS on cwd.
+            handler(conn)
+            # Reproduce the dispatcher's central stamp (#140) with a PINNED
+            # timestamp so the committed golden is rebuild-deterministic.
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("021_index_conversation_messages_cwd", TS_021_APPLIED_PIN),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 # ───────────────────────── W3 backfill: the 7 missing per-migration goldens ──
 # STATS 001–004, 007 + CACHE 005–006 (#279 S7). The stats-five pre-fixtures
 # reuse ``create_stats_db`` (the shared current-schema source, consistent with
@@ -4117,6 +4255,9 @@ def main() -> int:
     )
     build_per_migration_020_session_entries_physical_unique(
         FIXTURES_ROOT / "per-migration" / "020_session_entries_physical_unique"
+    )
+    build_per_migration_021_index_conversation_messages_cwd(
+        FIXTURES_ROOT / "per-migration" / "021_index_conversation_messages_cwd"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

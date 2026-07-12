@@ -37,7 +37,9 @@ npm install -g cctally && cctally setup
 git clone https://github.com/omrikais/cctally && cd cctally && ./bin/cctally setup
 ```
 
-`cctally setup` symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (it never overwrites existing entries), and bootstraps the local SQLite cache. If `~/.local/bin/` isn't on your `PATH`, the script prints the line to add. The npm install needs Python 3 on `PATH` - if setup reports "python3 not found", install it (`brew install python` on macOS) and re-run.
+The reporting commands work right away — you don't need `cctally setup` first. Straight after an install, `npx cctally daily` (or, once it's global, `cctally daily`) reads your existing `~/.claude` session logs directly and prints a cost table; `cctally dashboard` and `cctally tui` work the same way. `cctally setup` is what adds *auto-recording* — the live status-line quota percentage and the hooks that keep data flowing as you work — so run it once you want continuous tracking rather than on-demand reports.
+
+`cctally setup` symlinks the binaries into `~/.local/bin/`, adds three additive hooks to `~/.claude/settings.json` (it never overwrites existing entries), and bootstraps the local SQLite cache — on a large session history that first-run sync now shows live progress instead of sitting silent. If `~/.local/bin/` isn't on your `PATH`, the script prints the line to add. The npm install needs Python 3 on `PATH` - if setup reports "python3 not found", install it (`brew install python` on macOS) and re-run.
 
 ```bash
 cctally setup --status     # verify hooks + symlinks

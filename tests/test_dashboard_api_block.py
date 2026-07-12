@@ -517,6 +517,14 @@ def test_block_detail_floor_band_trap_returns_exact_window(
         assert r.status == 200, r.status
         body = json.loads(r.read())
         assert body["start_at"] == prior_start
+        # start_at echoes the EXACT canonical bs (04:39:59) — the lookup
+        # key — while the display `label` rounds the reset jitter to the
+        # nearest 10-min boundary (:39:59 → :40). The two must not be
+        # conflated: rounding start_at would 404 the exact-bs lookup.
+        # tz-robust: label is "%H:%M %b %d <tz>"; the host zone shifts the
+        # hour but the rounded minute field stays :40 (was :39 pre-fix).
+        assert body["label"][3:5] == "40", body["label"]
+        assert ":39" not in body["label"], body["label"]
         # 4 prior + 8 floor-band entries == 12 inside [04:39:59, 09:39:59).
         assert body["entries_count"] == 12, body["entries_count"]
         assert body["anchor"] == "recorded"

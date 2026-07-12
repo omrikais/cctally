@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { fmt, type FmtCtx } from '../lib/fmt';
+import { fmt, roundIsoToTenMinutes, type FmtCtx } from '../lib/fmt';
 import type { BlockDetail } from '../types/envelope';
 
 // SVG geometry — matches the spec's coordinate system. Rendered into a
@@ -48,9 +48,12 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
   };
 
   // Hour boundaries: start, +1h, +2h, +3h, +4h, end (5h block by definition).
+  // Each label/gridline rounds to the nearest 10-min boundary so the axis
+  // reads :40 (not the jittered :39); position + label round together, and
+  // the cost polyline below still plots exact entry timestamps.
   const hours: string[] = [];
   for (let i = 0; i <= 5; i++) {
-    hours.push(new Date(startMs + i * 3600_000).toISOString());
+    hours.push(roundIsoToTenMinutes(new Date(startMs + i * 3600_000).toISOString()));
   }
 
   // Sample → polyline. Prepend (start, 0); append (now, last_cum) on

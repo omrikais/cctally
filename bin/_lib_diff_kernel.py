@@ -130,6 +130,7 @@ from _cctally_core import (
     open_db,
     _command_as_of,
     _canonicalize_optional_iso,
+    _floored_week_max,
     parse_iso_datetime,
 )
 
@@ -659,8 +660,9 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
 
     "avg" fires for windows spanning >= 2 full weeks (e.g., last-30d
     over 4-5 weeks): we average max(weekly_percent) across the weeks
-    that have snapshot rows. If any subscription week in [start, end)
-    lacks a snapshot, mode is downgraded to `n/a`.
+    that have snapshot rows — reset-aware floored per week (#290), so a
+    credited week contributes its post-credit value. If any subscription
+    week in [start, end) lacks a snapshot, mode is downgraded to `n/a`.
 
     The "exact" lookup is constrained to the target week's
     `week_start_date` so a window with no recorded snapshots correctly
@@ -693,14 +695,24 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
         except Exception:
             return None, "n/a"
         try:
-            rows = conn.execute(
-                "SELECT week_start_date, MAX(weekly_percent) "
+            # #290: reset-aware-floor each week's peak so a credited week
+            # contributes its post-credit value (not the stale pre-credit peak),
+            # consistent with the exact branch + every other used-% surface.
+            # Raw rows (NO NULL-bounds filter: legacy NULL rows still count via
+            # the helper's NULL tolerance); helper reduces to floored per-week
+            # max keyed on week_start_date.
+            raw = conn.execute(
+                "SELECT week_start_date, week_start_at, week_end_at, "
+                "       captured_at_utc, weekly_percent "
                 "FROM weekly_usage_snapshots "
-                "WHERE captured_at_utc >= ? AND captured_at_utc < ? "
-                "GROUP BY week_start_date",
+                "WHERE captured_at_utc >= ? AND captured_at_utc < ?",
                 (_iso_z(window.start_utc), _iso_z(window.end_utc)),
             ).fetchall()
-            vals = [r[1] for r in rows if r[1] is not None]
+            floored = _floored_week_max(
+                conn,
+                [(r[0], r[0], r[1], r[2], r[3], r[4]) for r in raw],
+            )
+            vals = list(floored.values())
             if len(vals) < window.full_weeks_count:
                 # Spec §9.3: missing-coverage weeks would skew the avg —
                 # downgrade to n/a instead of reporting a misleading number.

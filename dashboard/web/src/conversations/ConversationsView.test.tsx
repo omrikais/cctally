@@ -19,6 +19,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from '../App';
+import { CONVERSATIONS_BINDINGS } from './ConversationsView';
 import {
   _resetForTests,
   dispatch,
@@ -952,5 +953,66 @@ describe('Conversations outline sheet generalized to the tablet band (#228 S3 F1
     act(() => { ctl.set(bandResolver('wide')); });
     expect(getState().convOutlineMobileOpen).toBe(false);
     await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
+  });
+});
+
+// #289 — Escape peels one layer at a time (compare → outline sheet →
+// reader-deselect → rail-search-clear → dashboard). These cases drive the
+// exported binding's `action` directly against the real store, pinning the peel
+// order without rendering the whole App. The load-bearing non-vacuous case is
+// "reader open AND rail search set": an implementor who reversed the
+// reader-deselect and search-clear branches fails exactly there.
+describe('#289 Escape peel — CONVERSATIONS_BINDINGS action matrix', () => {
+  const escapeAction = () =>
+    CONVERSATIONS_BINDINGS.find((b) => b.key === 'Escape')!.action();
+
+  beforeEach(() => { _resetForTests(); dispatch({ type: 'SET_VIEW', view: 'conversations' }); });
+  afterEach(() => { _resetForTests(); });
+
+  it('compare open → CLOSE_COMPARE (regression guard), not deselect', () => {
+    dispatch({ type: 'OPEN_COMPARE', a: 'abc', b: 'def' });
+    escapeAction();
+    expect(getState().compare).toBeNull();
+    // The anchor selection survives (close-to-reader), and the focus-return flag
+    // is armed — proves CLOSE_COMPARE fired, not an eject/deselect.
+    expect(getState().selectedConversationId).toBe('abc');
+    expect(getState().compareCloseFocusPending).toBe(true);
+  });
+
+  it('outline sheet open (reader open) → closes only the sheet, reader stays', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); // opens convOutlineMobileOpen
+    expect(getState().convOutlineMobileOpen).toBe(true);
+    escapeAction();
+    expect(getState().convOutlineMobileOpen).toBe(false);
+    expect(getState().selectedConversationId).toBe('abc'); // reader NOT deselected
+  });
+
+  it('reader open + nothing else → deselects to the list, not the dashboard', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    escapeAction();
+    expect(getState().selectedConversationId).toBeNull();
+    expect(getState().view).toBe('conversations'); // NOT 'dashboard'
+  });
+
+  it('reader open AND rail search set → deselects but PRESERVES the needle (pins reader-before-search order)', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'abc' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'needle' });
+    escapeAction();
+    expect(getState().selectedConversationId).toBeNull();
+    expect(getState().conversationSearch).toBe('needle'); // search survives the deselect
+    expect(getState().view).toBe('conversations');
+  });
+
+  it('no selection + rail search set → clears the search (still conversations)', () => {
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'x' });
+    escapeAction();
+    expect(getState().conversationSearch).toBe('');
+    expect(getState().view).toBe('conversations');
+  });
+
+  it('no selection, no search, no compare → leaves to the dashboard', () => {
+    escapeAction();
+    expect(getState().view).toBe('dashboard');
   });
 });

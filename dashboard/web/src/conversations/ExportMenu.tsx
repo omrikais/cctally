@@ -43,14 +43,23 @@ export function slugifyTitle(title: string | undefined, sessionId: string): stri
   return s || sessionId.slice(0, 12);
 }
 
-function exportUrl(sessionId: string, scope: Scope): string {
-  return `/api/conversation/${encodeURIComponent(sessionId)}/export?scope=${scope}`;
+// #281 S4 — when anon mode is ON the 8 copy/download items fetch the
+// server-scrubbed body (`&anonymize=1`); OFF is byte-identical to today's URL.
+function exportUrl(sessionId: string, scope: Scope, anon: boolean): string {
+  const base = `/api/conversation/${encodeURIComponent(sessionId)}/export?scope=${scope}`;
+  return anon ? `${base}&anonymize=1` : base;
 }
 
-async function fetchExport(sessionId: string, scope: Scope): Promise<string> {
-  const res = await fetch(exportUrl(sessionId, scope));
+async function fetchExport(sessionId: string, scope: Scope, anon: boolean): Promise<string> {
+  const res = await fetch(exportUrl(sessionId, scope, anon));
   if (!res.ok) throw new Error(`export failed: ${res.status}`);
   return res.text();
+}
+
+// Download filename gains an `-anon` suffix in anon mode; OFF is unchanged.
+function exportFilename(title: string | undefined, sessionId: string, scope: Scope, anon: boolean): string {
+  const slug = slugifyTitle(title, sessionId);
+  return anon ? `${slug}-${scope}-anon.md` : `${slug}-${scope}.md`;
 }
 
 function triggerDownload(filename: string, text: string): void {
@@ -66,7 +75,17 @@ function triggerDownload(filename: string, text: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-export function ExportMenu({ sessionId, title }: { sessionId: string; title?: string }) {
+export function ExportMenu({
+  sessionId,
+  title,
+  anonMode = false,
+}: {
+  sessionId: string;
+  title?: string;
+  // #281 S4 — when true, exports fetch `&anonymize=1` and filenames gain `-anon`.
+  // Defaults false so provider-less tests keep asserting today's OFF-path bytes.
+  anonMode?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   // The action currently fetching, encoded `${scope}:${kind}`, so its row shows
   // a disabled/loading state without freezing the others.
@@ -174,7 +193,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
       const key = `${scope}:copy`;
       setBusy(key);
       try {
-        const text = await fetchExport(sessionId, scope);
+        const text = await fetchExport(sessionId, scope, anonMode);
         copy(text);
       } catch {
         /* swallow — a failed export leaves the clipboard untouched */
@@ -182,7 +201,7 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [sessionId, copy],
+    [sessionId, copy, anonMode],
   );
 
   const doDownload = useCallback(
@@ -190,15 +209,15 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
       const key = `${scope}:download`;
       setBusy(key);
       try {
-        const text = await fetchExport(sessionId, scope);
-        triggerDownload(`${slugifyTitle(title, sessionId)}-${scope}.md`, text);
+        const text = await fetchExport(sessionId, scope, anonMode);
+        triggerDownload(exportFilename(title, sessionId, scope, anonMode), text);
       } catch {
         /* swallow */
       } finally {
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [sessionId, title],
+    [sessionId, title, anonMode],
   );
 
   return (
@@ -230,6 +249,11 @@ export function ExportMenu({ sessionId, title }: { sessionId: string; title?: st
           tabIndex={-1}
           onKeyDown={onMenuKeyDown}
         >
+          {anonMode && (
+            <div className="conv-export-anon-note" role="none">
+              Anonymized — project paths, home, username &amp; known secrets redacted
+            </div>
+          )}
           {SCOPES.map(({ scope, label }, rowIdx) => {
             const copyIdx = rowIdx * 2;
             const downloadIdx = copyIdx + 1;

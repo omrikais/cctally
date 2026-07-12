@@ -36,16 +36,17 @@ FIXTURES="$SCRATCH_DIR"
 # Rebuild every fixture tree this harness reads into the scratch dir.
 # ~3s total; makes standalone invocation self-contained on a fresh clone
 # without dirtying the in-tree fixtures.
-"$REPO_ROOT/bin/build-weekly-fixtures.py"       --out "$SCRATCH_DIR/weekly"       >/dev/null
-"$REPO_ROOT/bin/build-session-fixtures.py"      --out "$SCRATCH_DIR/session"      >/dev/null
-"$REPO_ROOT/bin/build-cache-report-fixtures.py" --out "$SCRATCH_DIR/cache-report" >/dev/null
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-weekly-fixtures.py" "$SCRATCH_DIR/weekly"
+build_fixtures_cached "$REPO_ROOT/bin/build-session-fixtures.py" "$SCRATCH_DIR/session"
+build_fixtures_cached "$REPO_ROOT/bin/build-cache-report-fixtures.py" "$SCRATCH_DIR/cache-report"
 "$REPO_ROOT/bin/build-codex-fixtures.py"        --out "$SCRATCH_DIR"              >/dev/null
-"$REPO_ROOT/bin/build-diff-fixtures.py"         --out "$SCRATCH_DIR/diff"         >/dev/null
-"$REPO_ROOT/bin/build-mode-fixtures.py"         --out "$SCRATCH_DIR/mode"         >/dev/null
-"$REPO_ROOT/bin/build-speed-fixtures.py"        --out "$SCRATCH_DIR/speed"        >/dev/null
+build_fixtures_cached "$REPO_ROOT/bin/build-diff-fixtures.py" "$SCRATCH_DIR/diff"
+build_fixtures_cached "$REPO_ROOT/bin/build-mode-fixtures.py" "$SCRATCH_DIR/mode"
+build_fixtures_cached "$REPO_ROOT/bin/build-speed-fixtures.py" "$SCRATCH_DIR/speed"
 "$REPO_ROOT/bin/build-daily-instances-fixtures.py" --out "$SCRATCH_DIR/daily-instances" >/dev/null
-"$REPO_ROOT/bin/build-budget-fixtures.py"          --out "$SCRATCH_DIR/budget"          >/dev/null
-"$REPO_ROOT/bin/build-forecast-fixtures.py"        --out "$SCRATCH_DIR/forecast"        >/dev/null
+build_fixtures_cached "$REPO_ROOT/bin/build-budget-fixtures.py" "$SCRATCH_DIR/budget"
+build_fixtures_cached "$REPO_ROOT/bin/build-forecast-fixtures.py" "$SCRATCH_DIR/forecast"
 
 pass_count=0
 fail_count=0
@@ -4311,6 +4312,343 @@ else
     echo "RECONCILE FAIL budget_vendors_coexist budget/both-vendors: fixture missing"
     fail_count=$((fail_count + 1))
 fi
+
+# ============================================================================
+# U-PCT: usage-% cross-surface invariants (#281 S6 / #280 R5, spec §2)
+# ----------------------------------------------------------------------------
+# The usage-% chain (statusline 7d <-> weekly Used % <-> report/forecast p_now
+# <-> dashboard envelope <-> project) has per-surface pytest coverage but no
+# CROSS-surface reconcile invariant. This group pins that every surface reads
+# the SAME reset-aware value in three scenarios.
+#
+# THREE per-scenario HOMEs (not one shared DB): `report`'s current-week pick,
+# the statusline DB fallback, and record-usage's reset detection all compare
+# against the GLOBALLY-latest snapshot, so a shared three-week DB cannot be
+# scenario-selected by CCTALLY_AS_OF alone (spec §2.1 / Codex finding 3).
+# CCTALLY_AS_OF is pinned inside each scenario's week.
+#
+# Fixture week: [2026-06-25T10:00:00Z, 2026-07-02T10:00:00Z), wsd 2026-06-25.
+#   W-CTRL   ramp 10 -> 20 -> 30                                    expect 30
+#   W-RESET  pre-peak 41; reset eff 06-27T10:00Z; post 3,5,7        expect 7
+#   W-CREDIT pre-peak 46; credit-floor eff 06-27T10:00Z; 33,37      expect 37
+#
+# Six read-only surfaces, two families:
+#   latest-row  : forecast.current.weekly_percent, weekly.usedPct,
+#                 report.weeklyPercent, envelope.current_week.used_pct
+#   floored-MAX : project.totals.usedPercent, statusline 7d
+# Both families read the SAME expected value under correct (floored) behavior:
+# the post-reset/post-credit ramp is the latest AND the floored MAX. Surface 7
+# (record-credit --dry-run) pins the reset/credit --from resolution. An
+# un-floored clamp site snaps its floored-MAX surface to the stale peak
+# (41 / 46) while the latest-row surfaces stay put — the disjoint
+# belt-and-suspenders design (spec §3 wired-verification pass, §5 evidence).
+# ============================================================================
+UPCT_WSD="2026-06-25"
+UPCT_WS_AT="2026-06-25T10:00:00Z"
+UPCT_WE_AT="2026-07-02T10:00:00Z"
+UPCT_WE_DATE="2026-07-02"
+UPCT_AS_OF="2026-06-29T12:00:00Z"
+
+# Seed one scenario HOME's stats.db + cache.db. Inline heredoc (self-contained,
+# deterministic) using the _fixture_builders seed helpers; the
+# weekly_credit_floors row is raw SQL naming all four required columns
+# (week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc —
+# no shared helper exists, YAGNI for one consumer; spec §2.1 / Codex finding 13).
+upct_seed_reader () {
+    local scenario="$1" datadir="$2"
+    mkdir -p "$datadir"
+    UPCT_SCENARIO="$scenario" UPCT_DATADIR="$datadir" \
+    UPCT_WSD="$UPCT_WSD" UPCT_WS_AT="$UPCT_WS_AT" \
+    UPCT_WE_AT="$UPCT_WE_AT" UPCT_WE_DATE="$UPCT_WE_DATE" \
+    PYTHONPATH="$REPO_ROOT/bin" TZ=Etc/UTC python3 - <<'PYSEED'
+import datetime as dt, os, pathlib, sqlite3
+import _fixture_builders as fb
+
+scenario = os.environ["UPCT_SCENARIO"]
+datadir = pathlib.Path(os.environ["UPCT_DATADIR"])
+wsd = os.environ["UPCT_WSD"]
+ws_at = os.environ["UPCT_WS_AT"]
+we_at = os.environ["UPCT_WE_AT"]
+we_date = os.environ["UPCT_WE_DATE"]
+
+stats = datadir / "stats.db"
+cache = datadir / "cache.db"
+fb.create_stats_db(stats)
+fb.create_cache_db(cache)
+
+fhr = "2026-06-29T15:00:00Z"
+fhr_epoch = int(dt.datetime.fromisoformat(fhr.replace("Z", "+00:00")).timestamp())
+fhk = fhr_epoch // 600 * 600
+common = dict(
+    week_start_date=wsd, week_end_date=we_date,
+    week_start_at=ws_at, week_end_at=we_at,
+    five_hour_percent=8.0, five_hour_resets_at=fhr, five_hour_window_key=fhk,
+    source="upct-fixture",
+)
+
+if scenario == "ctrl":
+    ramp = [("2026-06-26T09:00:00Z", 10.0),
+            ("2026-06-27T09:00:00Z", 20.0),
+            ("2026-06-28T09:00:00Z", 30.0)]
+elif scenario == "reset":
+    # Pre-reset peak 41 is captured BEFORE the 10:00Z reset effective; the
+    # post-reset ramp 3->5->7 is captured after. Un-floored MAX snaps to 41.
+    ramp = [("2026-06-26T08:00:00Z", 15.0),
+            ("2026-06-27T09:00:00Z", 41.0),
+            ("2026-06-27T11:00:00Z", 3.0),
+            ("2026-06-28T09:00:00Z", 5.0),
+            ("2026-06-28T15:00:00Z", 7.0)]
+elif scenario == "credit":
+    # Pre-credit peak 46 before the 10:00Z floor; post-credit 33->37 after.
+    ramp = [("2026-06-26T08:00:00Z", 20.0),
+            ("2026-06-27T09:00:00Z", 46.0),
+            ("2026-06-27T11:00:00Z", 33.0),
+            ("2026-06-28T09:00:00Z", 37.0)]
+else:
+    raise SystemExit(f"unknown scenario {scenario}")
+
+with sqlite3.connect(stats) as c:
+    for cap, pct in ramp:
+        fb.seed_weekly_usage_snapshot(c, captured_at_utc=cap, weekly_percent=pct, **common)
+    # One cost snapshot so `report`'s usage-cost join emits a current-week row.
+    fb.seed_weekly_cost_snapshot(
+        c, captured_at_utc="2026-06-28T12:00:00Z",
+        week_start_date=wsd, week_end_date=we_date,
+        week_start_at=ws_at, week_end_at=we_at, cost_usd=5.0)
+    if scenario == "reset":
+        # Mixed +00:00 (event) vs Z (snapshots) offset spellings; new_week_end_at
+        # matches week_end_at's instant so forecast's midweek-reset override + the
+        # subscription-week re-anchor both fire. effective inside [ws_at, we_at).
+        fb.seed_week_reset_event(
+            c, detected_at_utc="2026-06-27T10:05:00Z",
+            old_week_end_at="2026-06-30T10:00:00+00:00",
+            new_week_end_at="2026-07-02T10:00:00+00:00",
+            effective_reset_at_utc="2026-06-27T10:00:00+00:00")
+    if scenario == "credit":
+        c.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " applied_at_utc) VALUES (?,?,?,?)",
+            (wsd, "2026-06-27T10:00:00+00:00", 46.0, "2026-06-27T10:05:00Z"))
+    c.commit()
+
+# One in-window cache session entry (after the reset/credit effective) so
+# `weekly`'s _aggregate_weekly emits a current-week bucket (spec §2.1 finding 4).
+with sqlite3.connect(cache) as c:
+    fb.seed_session_file(
+        c, path="/upct/session.jsonl", session_id="upct-sid",
+        project_path="/upct/proj")
+    fb.seed_session_entry(
+        c, source_path="/upct/session.jsonl", line_offset=0,
+        timestamp_utc="2026-06-28T12:00:00Z", model="claude-sonnet-4-5",
+        input_tokens=100000, output_tokens=10000,
+        msg_id="upct-msg", req_id="upct-req")
+    c.commit()
+PYSEED
+}
+
+# Run all six read-only surfaces (+ optional record-credit surface 7) against a
+# seeded HOME and assert every one reports `expected` within 1e-9.
+#   $1 name  $2 expected  $3 home  $4 rc_mode(none|hwm|prior_credit)  $5 rc_from
+upct_reader_run () {
+    local name="$1" expected="$2" h="$3" rc_mode="$4" rc_from="$5"
+    local as_of="$UPCT_AS_OF" wsd="$UPCT_WSD" datadir="$h/.local/share/cctally"
+    local FC WK RP PJ SL ENVPCT RC=""
+    FC=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" forecast --json 2>/dev/null)
+    WK=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" weekly --json 2>/dev/null)
+    RP=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" report --json 2>/dev/null)
+    PJ=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" project --json 2>/dev/null)
+    # Feed `{}` on stdin so statusline exercises the DB-fallback + HWM-clamp
+    # path (spec §2.2 surface 6 / Codex finding 10), not the stdin rate_limits.
+    SL=$(printf '{}' | HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" statusline 2>/dev/null)
+    # Dashboard envelope via the pure-Python in-process path (spec §2.2 surface
+    # 4): _tui_build_snapshot(now_utc=..., skip_sync=True) -> snapshot_to_envelope.
+    ENVPCT=$(CCTALLY_DATA_DIR="$datadir" REPO_ROOT_RESOLVED="$REPO_ROOT" \
+             UPCT_NOW="$as_of" CCTALLY_AS_OF="$as_of" TZ=Etc/UTC python3 - <<'PYENV' 2>/dev/null)
+import datetime as dt, os, pathlib, sys, types
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+script_path = repo_root / "bin" / "cctally"
+mod = types.ModuleType("cctally"); mod.__file__ = str(script_path)
+sys.modules["cctally"] = mod
+exec(compile(script_path.read_text(), str(script_path), "exec"), mod.__dict__)
+sys.path.insert(0, str(repo_root / "bin"))
+import _cctally_tui as T
+import _cctally_dashboard_envelope as E
+NOW = dt.datetime.fromisoformat(os.environ["UPCT_NOW"].replace("Z", "+00:00"))
+snap = T._tui_build_snapshot(now_utc=NOW, skip_sync=True)
+env = E.snapshot_to_envelope(snap, now_utc=NOW)
+cw = env.get("current_week")
+print(cw["used_pct"] if cw and cw.get("used_pct") is not None else "None")
+PYENV
+    if [ "$rc_mode" != "none" ]; then
+        RC=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" \
+             record-credit --to 1 --dry-run --json 2>/dev/null)
+    fi
+    local result rc_py
+    result=$(UPCT_NAME="$name" UPCT_EXPECTED="$expected" UPCT_WSD="$wsd" \
+             UPCT_RC_MODE="$rc_mode" UPCT_RC_FROM="$rc_from" \
+             UPCT_FC="$FC" UPCT_WK="$WK" UPCT_RP="$RP" UPCT_PJ="$PJ" \
+             UPCT_SL="$SL" UPCT_ENV="$ENVPCT" UPCT_RC="$RC" \
+             python3 - <<'PYCHK' 2>&1); rc_py=$?
+import json, os, re, sys
+name = os.environ["UPCT_NAME"]
+exp = float(os.environ["UPCT_EXPECTED"])
+wsd = os.environ["UPCT_WSD"]
+TOL = 1e-9
+errs = []
+def near(v, label):
+    if v is None:
+        errs.append(f"{label}=None"); return
+    if abs(float(v) - exp) >= TOL:
+        errs.append(f"{label}={v} (want {exp})")
+fc = json.loads(os.environ["UPCT_FC"])
+near(fc["current"]["weekly_percent"], "forecast.current.weekly_percent")
+wk = json.loads(os.environ["UPCT_WK"])
+wrow = next((w for w in wk.get("weekly", []) if w.get("week") == wsd), None)
+near(wrow["usedPct"] if wrow else None, "weekly.usedPct")
+rp = json.loads(os.environ["UPCT_RP"])
+rrow = next((r for r in rp.get("trend", []) if r.get("weekStartDate") == wsd), None)
+near(rrow["weeklyPercent"] if rrow else None, "report.weeklyPercent")
+pj = json.loads(os.environ["UPCT_PJ"])
+near(pj["totals"]["usedPercent"], "project.totals.usedPercent")
+m = re.search(r"7d (\d+(?:\.\d+)?)%", os.environ["UPCT_SL"])
+near(float(m.group(1)) if m else None, "statusline.7d")
+env = os.environ["UPCT_ENV"].strip()
+near(float(env) if env not in ("", "None") else None, "envelope.current_week.used_pct")
+rc_mode = os.environ["UPCT_RC_MODE"]
+if rc_mode != "none":
+    rc = json.loads(os.environ["UPCT_RC"])
+    fs = rc["credit"]["fromSource"]
+    fp = rc["credit"]["fromPct"]
+    rc_from = float(os.environ["UPCT_RC_FROM"])
+    if fs != rc_mode:
+        errs.append(f"record-credit.fromSource={fs!r} (want {rc_mode!r})")
+    if abs(float(fp) - rc_from) >= TOL:
+        errs.append(f"record-credit.fromPct={fp} (want {rc_from})")
+if errs:
+    print("; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+PYCHK
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name upct/$(basename "$h"): $result"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS $name upct/$(basename "$h")"
+        pass_count=$((pass_count + 1))
+    fi
+}
+
+UPCT_CTRL="$SCRATCH_DIR/upct-ctrl"
+UPCT_RESET="$SCRATCH_DIR/upct-reset"
+UPCT_CREDIT="$SCRATCH_DIR/upct-credit"
+upct_seed_reader ctrl   "$UPCT_CTRL/.local/share/cctally"
+upct_seed_reader reset  "$UPCT_RESET/.local/share/cctally"
+upct_seed_reader credit "$UPCT_CREDIT/.local/share/cctally"
+# U-PCT1 (W-CTRL): surfaces 1-6 agree at 30 (no reset/credit — surface 7 skipped).
+upct_reader_run U-PCT1 30 "$UPCT_CTRL"   none         0
+# U-PCT2 (W-RESET): surfaces 1-6 = post-reset 7, not the pre-reset peak 41;
+# record-credit resolves --from via the reset-aware HWM (fromSource=hwm, 7).
+upct_reader_run U-PCT2 7  "$UPCT_RESET"  hwm          7
+# U-PCT3 (W-CREDIT): surfaces 1-6 = post-credit 37, not the pre-credit peak 46;
+# record-credit pins the documented prior_credit precedence (fromSource, 46).
+upct_reader_run U-PCT3 37 "$UPCT_CREDIT" prior_credit 46
+
+# ----------------------------------------------------------------------------
+# U-PCT4: write-site clamp accepts a real post-credit tick (the M2 linchpin).
+# record-usage has NO --json (Codex finding 1), so the check queries the
+# just-inserted weekly_usage_snapshots row directly. A fed post-credit tick 38
+# is BELOW the stale peak (41 reset / 46 credit) but ABOVE the floored MAX
+# (7 / 37). The reset-aware write clamp must ACCEPT it -> the newest row (MAX
+# id) reads 38. An un-floored clamp would MAX to 41/46 and suppress the tick
+# (should_insert=False) -> the newest row would stay at the prior post value
+# (7 / 37), never storing 38 (spec §4a; the "real post-credit 37<46 tick not
+# suppressed" linchpin).
+#
+# Wall-clock-anchored HOMEs, isolated from the pinned reader HOMEs above:
+# record-usage ignores CCTALLY_AS_OF for the plausibility band AND stamps the
+# inserted row with real now_utc_iso() (Codex finding 9), so the fixture week
+# is built relative to real now. The fed tick 38 is a RISE from 7/37, so it
+# never trips the >=25pp / reset-to-zero auto-credit detector (which fires on
+# DROPS). alerts.notifier=none suppresses the milestone-crossing dispatch.
+upct_seed_writeclamp () {
+    # Seed one wall-clock W4 HOME; echo the derived week_reset epoch on stdout.
+    local scenario="$1" datadir="$2"
+    mkdir -p "$datadir"
+    UPCT4_SCENARIO="$scenario" UPCT4_DATADIR="$datadir" \
+    PYTHONPATH="$REPO_ROOT/bin" TZ=Etc/UTC python3 - <<'PYSEED4'
+import datetime as dt, json, os, pathlib, sqlite3
+import _fixture_builders as fb
+scenario = os.environ["UPCT4_SCENARIO"]
+datadir = pathlib.Path(os.environ["UPCT4_DATADIR"])
+# Current subscription week contains real now: week_end 3d ahead (within the
+# [now-30d, now+8d] plausibility band), week_start 4d behind. record-usage
+# derives week_start_date from --resets-at as (fromtimestamp(resets) - 7d).date,
+# so the seeded rows must carry that exact wsd.
+now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+week_end = now + dt.timedelta(days=3)
+week_start = week_end - dt.timedelta(days=7)
+resets_epoch = int(week_end.timestamp())
+wsd = week_start.date().isoformat()
+we_date = week_end.date().isoformat()
+ws_at = week_start.isoformat(timespec="seconds").replace("+00:00", "Z")
+we_at = week_end.isoformat(timespec="seconds").replace("+00:00", "Z")
+# Floor effective ~26h ago (mixed +00:00 spelling vs the Z captures). The
+# pre-reset/pre-credit peak is captured 48h ago (before the floor); the post
+# ramp is captured after, so the floored MAX drops the stale peak.
+floor_eff = (now - dt.timedelta(hours=26)).isoformat(timespec="seconds")
+def cap(hours_ago):
+    return (now - dt.timedelta(hours=hours_ago)).isoformat(timespec="seconds").replace("+00:00", "Z")
+stats = datadir / "stats.db"
+cache = datadir / "cache.db"
+fb.create_stats_db(stats)
+fb.create_cache_db(cache)
+(datadir / "config.json").write_text(json.dumps({"alerts": {"notifier": "none"}}))
+common = dict(week_start_date=wsd, week_end_date=we_date,
+              week_start_at=ws_at, week_end_at=we_at, source="upct4-fixture")
+if scenario == "reset":
+    ramp = [(48, 41.0), (20, 3.0), (10, 5.0), (1, 7.0)]  # (hours_ago, pct)
+else:
+    ramp = [(48, 46.0), (20, 33.0), (1, 37.0)]
+with sqlite3.connect(stats) as c:
+    for hrs, pct in ramp:
+        fb.seed_weekly_usage_snapshot(c, captured_at_utc=cap(hrs), weekly_percent=pct, **common)
+    if scenario == "reset":
+        fb.seed_week_reset_event(
+            c, detected_at_utc=cap(26),
+            old_week_end_at=(week_end - dt.timedelta(days=2)).isoformat(timespec="seconds"),
+            new_week_end_at=we_at, effective_reset_at_utc=floor_eff)
+    else:
+        c.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " applied_at_utc) VALUES (?,?,?,?)",
+            (wsd, floor_eff, 46.0, cap(25)))
+    c.commit()
+print(resets_epoch)
+PYSEED4
+}
+
+# Feed the tick into a freshly-seeded W4 HOME and assert the newest row is 38.
+upct_writeclamp_run_scn () {
+    # $1 name  $2 scenario(reset|credit)  $3 home  $4 stale_peak
+    local name="$1" scenario="$2" h="$3" stale="$4"
+    local datadir="$h/.local/share/cctally" resets latest diff
+    resets=$(upct_seed_writeclamp "$scenario" "$datadir")
+    HOME="$h" TZ=Etc/UTC "$BIN" record-usage --percent 38 --resets-at "$resets" >/dev/null 2>&1
+    latest=$(sqlite3 "$datadir/stats.db" \
+        "SELECT weekly_percent FROM weekly_usage_snapshots ORDER BY id DESC LIMIT 1" 2>/dev/null)
+    diff=$(awk -v a="$latest" -v b=38 'BEGIN{d=a-b; if(d<0)d=-d; print d}')
+    if awk -v d="$diff" 'BEGIN{exit !(d < 1e-9)}'; then
+        echo "PASS $name upct/$(basename "$h")"
+        pass_count=$((pass_count + 1))
+    else
+        echo "RECONCILE FAIL $name upct/$(basename "$h"): newest weekly_percent=$latest (want 38; un-floored clamp would suppress it to the stale peak $stale)"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+upct_writeclamp_run_scn U-PCT4a reset  "$SCRATCH_DIR/upct-w4-reset"  41
+upct_writeclamp_run_scn U-PCT4b credit "$SCRATCH_DIR/upct-w4-credit" 46
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"

@@ -233,13 +233,13 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # scenario.
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
-              CCTALLY_DISABLE_UPDATE_CHECK=1 \
+              CCTALLY_DISABLE_UPDATE_CHECK=1 CCTALLY_SETUP_PROGRESS=0 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd < "$dir/stdin.txt" 2>&1; echo "EXIT=$?")
     else
         # shellcheck disable=SC2086
         raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
-              CCTALLY_DISABLE_UPDATE_CHECK=1 \
+              CCTALLY_DISABLE_UPDATE_CHECK=1 CCTALLY_SETUP_PROGRESS=0 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd 2>&1; echo "EXIT=$?")
     fi

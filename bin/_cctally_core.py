@@ -1671,6 +1671,82 @@ def _reset_aware_floor(
     return row[0] if row and row[0] else None
 
 
+def _floored_week_max(conn, rows):
+    """Return {week_key -> per-week reset-aware-floored maximum weekly_percent}.
+
+    ``rows`` is an iterable of
+      (week_key, week_start_date, week_start_at, week_end_at,
+       captured_at_utc, weekly_percent).
+
+    Two-pass so floor resolution is independent of row order (#290): pass 1
+    buckets rows per ``week_key`` and canonicalizes each week's first non-NULL
+    (week_start_at, week_end_at) + its week_start_date; pass 2 resolves
+    ``_reset_aware_floor`` once per week (keyed on week_start_date) and drops
+    captures earlier than that floor before taking the week's maximum
+    ``weekly_percent``. ``week_key`` is the caller's aggregation key (1:1 with a
+    week); floor identity is week_start_date, so a NULL-bound legacy row cannot
+    suppress the reset-event leg for a later anchored row of the same week.
+
+    A NULL ``weekly_percent`` row is skipped. An unparseable ``captured_at_utc``
+    under an active floor is RETAINED (epoch unknown), matching
+    ``_cctally_project._load_week_snapshots``. All-NULL bounds resolve
+    credit-floor-leg-only (the reset leg is inert: unixepoch(NULL) is NULL).
+    A week whose every in-scope row is pre-floor is absent from the result.
+    """
+    # Pass 1: bucket + canonicalize bounds.
+    buckets: dict = {}
+    for wk, wsd, ws_at, we_at, cap, pct in rows:
+        if pct is None:
+            continue
+        b = buckets.get(wk)
+        if b is None:
+            buckets[wk] = {
+                "wsd": wsd, "ws_at": ws_at, "we_at": we_at,
+                "rows": [(cap, float(pct))],
+            }
+            continue
+        if b["wsd"] is None and wsd is not None:
+            b["wsd"] = wsd
+        if b["ws_at"] is None and ws_at is not None:
+            b["ws_at"] = ws_at
+        if b["we_at"] is None and we_at is not None:
+            b["we_at"] = we_at
+        b["rows"].append((cap, float(pct)))
+
+    # Pass 2: resolve floor once per week, drop pre-floor captures, take max.
+    result: dict = {}
+    for wk, b in buckets.items():
+        floor_iso = _reset_aware_floor(conn, b["wsd"], b["ws_at"], b["we_at"])
+        floor_epoch = None
+        if floor_iso:
+            try:
+                floor_epoch = int(
+                    parse_iso_datetime(
+                        floor_iso, "floored_week_max.floor"
+                    ).timestamp()
+                )
+            except ValueError:
+                floor_epoch = None
+        best = None
+        for cap, pct in b["rows"]:
+            if floor_epoch is not None and cap is not None:
+                try:
+                    cap_epoch = int(
+                        parse_iso_datetime(
+                            str(cap), "floored_week_max.cap"
+                        ).timestamp()
+                    )
+                except ValueError:
+                    cap_epoch = None
+                if cap_epoch is not None and cap_epoch < floor_epoch:
+                    continue
+            if best is None or pct > best:
+                best = pct
+        if best is not None:
+            result[wk] = best
+    return result
+
+
 def get_latest_usage_for_week(
     conn: sqlite3.Connection,
     week_ref: WeekRef,

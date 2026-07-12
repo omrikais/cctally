@@ -604,20 +604,41 @@ def _handle_get_conversation_export_impl(handler, path: str) -> None:
     Blob/filename, so no ``Content-Disposition`` is needed)."""
     if not handler._require_transcripts_allowed():
         return
+    import os as _os
     import urllib.parse as _u
+    qs = handler.path.partition("?")[2]
     session_id = _u.unquote(path[len("/api/conversation/"):-len("/export")])
-    q = _u.parse_qs(handler.path.partition("?")[2])
+    q = _u.parse_qs(qs)
     scope = _qs_str(q, "scope", "all")
     if scope not in _CONV_EXPORT_SCOPES:
         handler._respond_json(400, {"error": f"unknown scope: {scope}"})
         return
+    # #281 S4: `anonymize` gets its OWN strict parse (the default parse_qs /
+    # _qs_str path silently drops blanks + first-picks duplicates). It must
+    # appear at most once and be literal `0` or `1`; blank / duplicate / any
+    # other spelling is a clean 400 HERE, BEFORE the kernel (the
+    # _run_conversation_query-collapses-kernel-exceptions-to-500 gotcha). Absent
+    # → raw (the R4 "raw export byte-unchanged" acceptance is structural).
+    avals = _u.parse_qs(qs, keep_blank_values=True).get("anonymize")
+    if avals is not None and (len(avals) != 1 or avals[0] not in ("0", "1")):
+        handler._respond_json(400, {"error": f"invalid anonymize: {avals}"})
+        return
+    anonymize = avals is not None and avals[0] == "1"
     if not session_id:
         handler.send_error(404, "conversation not found")
         return
+
+    def _kernel(conn):
+        cq = handler._conversation_query()
+        md = cq.get_conversation_export(conn, session_id, scope)
+        if md is None or not anonymize:
+            return md
+        anon = sys.modules["cctally"]._load_sibling("_lib_conversation_anon")
+        plan = cq.build_anon_plan_for_db(conn, home_dir=_os.path.expanduser("~"))
+        return anon.scrub_text(md, plan)
+
     ok, body = handler._run_conversation_query(
-        lambda conn: handler._conversation_query().get_conversation_export(
-            conn, session_id, scope),
-        "/api/conversation/export")
+        _kernel, "/api/conversation/export")
     if not ok:
         return
     if body is None:
@@ -629,6 +650,44 @@ def _handle_get_conversation_export_impl(handler, path: str) -> None:
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+def _handle_get_conversation_anon_map_impl(handler, path: str) -> None:
+    """``GET /api/conversation/<sid>/anon-map`` — the ``plan_to_wire`` JSON the
+    client-side scrubber executes for per-card copy (#281 S4, spec §5).
+
+    Same fail-closed transcript privacy gate as the sibling reader routes —
+    ``_require_transcripts_allowed()`` ONLY (no ``_check_origin_csrf``). Although
+    the plan is GLOBAL, the route probes existence (``conversation_exists``) and
+    404s on an unknown ``<sid>``, matching sibling envelope discipline — never a
+    token dump for a non-session. Contains only tokens the same gated client
+    already sees raw, so no new information exposure. Matched BEFORE the bare
+    ``<id>`` detail catch-all in ``do_GET`` (route-ordering test asserts the
+    suffix does not fall through)."""
+    if not handler._require_transcripts_allowed():
+        return
+    import os as _os
+    import urllib.parse as _u
+    session_id = _u.unquote(path[len("/api/conversation/"):-len("/anon-map")])
+    if not session_id:
+        handler.send_error(404, "conversation not found")
+        return
+    anon = sys.modules["cctally"]._load_sibling("_lib_conversation_anon")
+
+    def _kernel(conn):
+        cq = handler._conversation_query()
+        if not cq.conversation_exists(conn, session_id):
+            return None
+        plan = cq.build_anon_plan_for_db(conn, home_dir=_os.path.expanduser("~"))
+        return anon.plan_to_wire(plan)
+
+    ok, body = handler._run_conversation_query(
+        _kernel, "/api/conversation/anon-map")
+    if not ok:
+        return
+    if body is None:
+        handler.send_error(404, "conversation not found")
+        return
+    handler._respond_json(200, body)
 
 def _handle_get_conversation_find_impl(handler, path: str) -> None:
     """``GET /api/conversation/<sid>/find?q=...&kind=...`` — in-conversation

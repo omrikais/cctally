@@ -2385,6 +2385,72 @@ def get_conversation_export(conn, session_id, scope):
                                    title=title, session_id=session_id)
 
 
+def conversation_exists(conn, session_id) -> bool:
+    """Cheap existence probe (#281 S4) — True iff any ``conversation_messages``
+    row carries ``session_id``. Mirrors ``_assemble_session``'s own existence
+    check; the ``/anon-map`` route uses it for the sibling-parity 404 on an
+    unknown id. An ``OperationalError`` (no table) reads as absent."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+            (session_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
+
+
+def build_anon_plan_for_db(conn, *, home_dir):
+    """Assemble an :class:`_lib_conversation_anon.AnonPlan` from the DB's OBSERVED
+    identity (#281 S4, spec §4). Thin I/O glue: SELECTs + ``_project_label`` +
+    one ``build_anon_plan`` call — the ONE helper both the HTTP handlers and the
+    CLI route through, so CLI↔HTTP byte-parity is structural.
+
+    Sources: distinct non-empty ``conversation_messages.cwd`` (the conversation
+    layer's source of truth) UNION ``session_files.project_path`` (legacy/lossy
+    fallback only). Labels derive per root via ``_project_label`` (observed CWDs
+    — no git-root resolution in v1). Home-dir prefixes = the caller-supplied
+    ``home_dir`` (``os.path.expanduser('~')`` at the call site — the pure kernel
+    never reads env) plus ``/Users/<x>`` / ``/home/<x>`` prefixes derived from
+    observed CWDs; usernames are the basenames of those home dirs.
+    """
+    from _lib_conversation_anon import build_anon_plan
+    cwds: set = set()
+    try:
+        for (cwd,) in conn.execute(
+                "SELECT DISTINCT cwd FROM conversation_messages "
+                "WHERE cwd IS NOT NULL AND cwd != ''"):
+            if cwd:
+                cwds.add(cwd)
+    except sqlite3.OperationalError:
+        pass
+    try:
+        for (pp,) in conn.execute(
+                "SELECT DISTINCT project_path FROM session_files "
+                "WHERE project_path IS NOT NULL AND project_path != ''"):
+            if pp:
+                cwds.add(pp)
+    except sqlite3.OperationalError:
+        pass
+    project_roots = {c: _project_label(c) for c in cwds}
+    home_dirs: set = set()
+    usernames: set = set()
+    if home_dir:
+        home_dirs.add(home_dir)
+        u = os.path.basename(home_dir.rstrip("/"))
+        if u:
+            usernames.add(u)
+    for c in cwds:
+        for prefix in ("/Users/", "/home/"):
+            if c.startswith(prefix):
+                user = c[len(prefix):].split("/", 1)[0]
+                if user:
+                    home_dirs.add(prefix + user)
+                    usernames.add(user)
+    return build_anon_plan(
+        project_roots=project_roots,
+        home_dirs=sorted(home_dirs), usernames=sorted(usernames))
+
+
 _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")
 
 

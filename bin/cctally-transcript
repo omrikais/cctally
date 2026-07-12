@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-transcript` → `cctally transcript`.
+# Mirrors the `cctally-forecast` / `cctally-project` pattern.
+set -euo pipefail
+exec "$(dirname "$0")/cctally" transcript "$@"

@@ -9,10 +9,6 @@
 
 cctally is ready (with 1 warning(s) above).
 
-⚠ Restart Claude Code for the new hooks to take effect in any currently
-  open sessions. New sessions launched after this point pick them up
-  automatically. (settings.json is cached at session start.)
-
   Try:
     cctally daily              # last 30 days
     cctally dashboard          # live web dashboard
@@ -24,3 +20,7 @@ What's sent: a rotating, un-linkable token + version + OS family.
 No identity, no paths, no usage data, no IP stored. Auto-expires monthly.
 Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)
 How it works:     https://github.com/omrikais/cctally/blob/main/docs/telemetry.md
+
+▶ Next step: restart Claude Code to activate the new hooks.
+  Open sessions won't record until you restart (settings.json is cached at
+  session start). New sessions started after this pick them up automatically.

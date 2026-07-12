@@ -3,6 +3,10 @@ dist/
 .vitest-cache/
 coverage/
 *.log
+# #281 S3 Playwright reader smoke net
+e2e/.runtime/
+playwright-report/
+test-results/
 .env
 .env.local
 .env.*.local

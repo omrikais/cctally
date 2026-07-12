@@ -38,7 +38,8 @@ fi
 # Regenerate fixtures into scratch (in-tree fixtures stay byte-stable —
 # matches the forecast / project / diff / dashboard scratch-dir pattern
 # called out in CLAUDE.md "Harness scratch-dir pattern").
-"$REPO_ROOT/bin/build-alerts-fixtures.py" --out "$SCRATCH_BASE" >/dev/null || {
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-alerts-fixtures.py" "$SCRATCH_BASE" || {
     echo "FAIL: build-alerts-fixtures.py crashed (exit $?)" >&2
     exit 1
 }

@@ -189,7 +189,9 @@ export function ConversationsView() {
 // fire while the popover (and its inputs) are focused, consistent with the
 // reader's named-key guard (convFiltersOpen, Codex P2 #7).
 const inView = () => !getState().openModal && getState().inputMode === null && !getState().convFiltersOpen;
-const CONVERSATIONS_BINDINGS = [
+// Exported for the #289 Escape-peel unit matrix (ConversationsView.test.tsx),
+// which drives the Escape binding's `action` directly against the real store.
+export const CONVERSATIONS_BINDINGS = [
   {
     // #177 S6 (F8) — '/' is reader-aware. With an open reader it opens the
     // floating in-conversation find bar; with no conversation selected it keeps
@@ -233,6 +235,11 @@ const CONVERSATIONS_BINDINGS = [
     key: 'Escape', scope: 'global' as const, view: 'conversations' as const,
     when: inView,
     action: () => {
+      // #289 — Escape peels ONE layer at a time instead of ejecting the whole
+      // workspace: compare → outline sheet → reader-deselect → rail-search-clear
+      // → dashboard. QA hit the old single-step eject twice as a surprise (an
+      // open reader was torn down straight to the dashboard on one keystroke).
+      //
       // #238 S3 (C2) — a comparison is the dominant foreground overlay, so Escape
       // dismisses it FIRST, back to the reader (NOT the dashboard). Mirror ✕ Close
       // exactly: CLOSE_COMPARE clears `compare` AND arms compareCloseFocusPending
@@ -242,6 +249,16 @@ const CONVERSATIONS_BINDINGS = [
       // needle would look like a no-op and leave the comparison open. OPEN_COMPARE
       // clears convFiltersOpen, so inView is true here and this branch can fire.
       if (getState().compare) { dispatch({ type: 'CLOSE_COMPARE' }); return; }
+      // #289 (Codex P2-C) — the mobile/tablet outline SHEET is a foreground
+      // overlay within the reader; peel it before the reader itself. The desktop
+      // persistent outline COLUMN (convOutlineOpen, >1100px) is a panel, not an
+      // overlay, and Escape deliberately does NOT touch it.
+      if (getState().convOutlineMobileOpen) { dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' }); return; }
+      // #289 — with a reader open, Escape deselects back to the conversations
+      // LIST (SELECT_CONVERSATION null keeps view:'conversations' and preserves
+      // any rail needle — the list you return to stays filtered until the next
+      // Escape clears it). This is the same destination as the mobileBack button.
+      if (getState().selectedConversationId) { dispatch({ type: 'SELECT_CONVERSATION', sessionId: null }); return; }
       if (getState().conversationSearch) { dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' }); return; }
       dispatch({ type: 'SET_VIEW', view: 'dashboard' });
     },

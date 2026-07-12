@@ -151,6 +151,7 @@ SETUP_SYMLINK_NAMES = (
     "cctally-refresh-usage",
     "cctally-statusline",
     "cctally-sync-week",
+    "cctally-transcript",
     "cctally-tui",
     "cctally-update",
 )
@@ -214,6 +215,7 @@ _canonicalize_optional_iso = _cctally_core._canonicalize_optional_iso
 make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
 _reset_aware_floor = _cctally_core._reset_aware_floor
+_floored_week_max = _cctally_core._floored_week_max
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
 # Re-exported so the telemetry kernel's ``c._is_dev_checkout()`` accessor
 # call resolves on the ``cctally`` module (and tests can monkeypatch it
@@ -404,6 +406,7 @@ severity_to_urgency = _lib_alert_dispatch.severity_to_urgency
 _lib_five_hour = _load_sibling("_lib_five_hour")
 _FIVE_HOUR_JITTER_FLOOR_SECONDS = _lib_five_hour._FIVE_HOUR_JITTER_FLOOR_SECONDS
 _floor_to_ten_minutes = _lib_five_hour._floor_to_ten_minutes
+_round_to_ten_minutes = _lib_five_hour._round_to_ten_minutes
 _canonical_5h_window_key = _lib_five_hour._canonical_5h_window_key
 
 _lib_subscription_weeks = _load_sibling("_lib_subscription_weeks")
@@ -2564,6 +2567,11 @@ _diff_resolve_anchor = _lib_diff_kernel._diff_resolve_anchor
 _cctally_diff = _load_sibling("_cctally_diff")
 cmd_diff                 = _cctally_diff.cmd_diff                  # parser: c.cmd_diff (_cctally_parser.py:2032)
 _emit_diff_debug_samples = _cctally_diff._emit_diff_debug_samples  # test_debug_sample_emission mod._emit_diff_debug_samples
+
+# #281 S4: the `transcript export|search` command module. Eager re-export so the
+# parser's set_defaults(func=c.cmd_transcript) resolves at build_parser time.
+_cctally_transcript = _load_sibling("_cctally_transcript")
+cmd_transcript = _cctally_transcript.cmd_transcript               # parser: c.cmd_transcript
 
 
 _cctally_weekrefs = _load_sibling("_cctally_weekrefs")

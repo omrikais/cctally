@@ -10,5 +10,6 @@ cctally-project -> /REPO/node_modules/cctally/bin/cctally-project
 cctally-refresh-usage -> /REPO/node_modules/cctally/bin/cctally-refresh-usage
 cctally-statusline -> /REPO/node_modules/cctally/bin/cctally-statusline
 cctally-sync-week -> /REPO/node_modules/cctally/bin/cctally-sync-week
+cctally-transcript -> /REPO/node_modules/cctally/bin/cctally-transcript
 cctally-tui -> /REPO/node_modules/cctally/bin/cctally-tui
 cctally-update -> /REPO/node_modules/cctally/bin/cctally-update

@@ -1083,3 +1083,35 @@ def test_load_recorded_five_hour_windows_collapses_straddle_via_stored_key(
     bs_w2, rs_w2 = canonical_intervals[R_w2]
     assert bs_w2 == dt.datetime(2026, 6, 14, 20, 39, 59, tzinfo=dt.timezone.utc)
     assert rs_w2 == dt.datetime(2026, 6, 15, 1, 39, 59, tzinfo=dt.timezone.utc)
+
+
+def test_five_hour_formatters_round_jitter(ns):
+    """`_format_block_start` / `_format_hhmm_in_tz` (five-hour-blocks +
+    breakdown Block-Start / window cells) round Anthropic reset jitter to
+    the nearest 10-min boundary for display. The five-hour-blocks golden
+    fixtures all sit on-boundary, so this is the non-vacuous proof of that
+    wiring. tz=None → host-local; assert on the rounded minute (tz-robust).
+    """
+    start = ns["_format_block_start"]("2026-04-15T04:39:59+00:00", None)
+    assert ":40" in start and ":39" not in start, start
+    # Paired window end (five_hour_resets_at) rounds together with it.
+    ended = ns["_format_hhmm_in_tz"]("2026-04-15T09:42:00+00:00", None)
+    assert ":40" in ended and ":42" not in ended, ended
+
+
+def test_build_blocks_view_panel_label_rounds_jitter(ns):
+    """The dashboard / TUI Blocks-panel row ``label`` rounds a jittered
+    recorded reset (bs 04:39:59 → :40) while ``start_at`` stays EXACT —
+    start_at keys the React row and the ``/api/block/:start_at`` lookup,
+    which matches by exact equality (issue #76). Rounding start_at would
+    404 the click.
+    """
+    build = ns["build_blocks_view"]
+    utc = dt.timezone.utc
+    R = dt.datetime(2026, 4, 15, 9, 39, 59, tzinfo=utc)   # jittered reset
+    entries = [_entry(ns, dt.datetime(2026, 4, 15, 6, 0, tzinfo=utc))]
+    view = build(entries, now_utc=R, recorded_windows=[R])
+    rows = list(view.rows)
+    assert len(rows) == 1, rows
+    assert rows[0].start_at.startswith("2026-04-15T04:39:59"), rows[0].start_at
+    assert ":40" in rows[0].label and ":39" not in rows[0].label, rows[0].label

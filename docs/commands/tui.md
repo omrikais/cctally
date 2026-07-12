@@ -4,6 +4,12 @@ Live refreshing dashboard for subscription usage, spend, and recent-session
 activity. Renders with `rich`; background daemon thread keeps the data
 fresh while the main thread handles keys and redraws.
 
+> **Maintenance status:** the TUI is in **bugfix-only maintenance mode** as of
+> the 2026-07-12 disposition decision. Both layout variants below keep working
+> and remain fully supported, but the TUI no longer tracks new dashboard
+> features. For the actively-developed rich UI, use
+> [`cctally dashboard`](dashboard.md).
+
 Two layout variants:
 
 - **Conventional** (default): a 2×2 grid — Current Week / Forecast on top,

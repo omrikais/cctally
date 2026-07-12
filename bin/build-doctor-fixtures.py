@@ -129,7 +129,7 @@ def _scenario_body(slug: str) -> str:
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-tui cctally-update; do
+                       cctally-transcript cctally-tui cctally-update; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
             done
             # CC settings.json — canonical hook shape that _is_cctally_hook_command
@@ -317,7 +317,7 @@ def _scenario_body(slug: str) -> str:
         # `stale` symlink state. <prefix>/bin (all 14 cmds) on PATH makes
         # every command reachable elsewhere, so the leftover keg links are
         # cleanable cruft (`stale`), not broken (`wrong`). Expect:
-        # "14/14 available; 2 stale link(s) to clean" (cctally + cctally-tui).
+        # "15/15 available; 2 stale link(s) to clean" (cctally + cctally-tui).
         return textwrap.dedent("""\
             # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
             # Reachability source for the empty ~/.local/bin slots → `ok`.
@@ -326,7 +326,7 @@ def _scenario_body(slug: str) -> str:
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-tui cctally-update; do
+                       cctally-transcript cctally-tui cctally-update; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
             done
             # A LIVE old-keg file + a ~/.local/bin link pointing at it (the
@@ -349,8 +349,8 @@ def _scenario_body(slug: str) -> str:
         # ~/.local/bin is OFF PATH (DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1 +
         # DOCTOR_INCLUDE_PREFIX_BIN=1). cctally lives on <prefix>/bin only;
         # path_includes_local_bin is False yet cctally_reachable_on_path is
-        # True → install.path passes ("cctally reachable on $PATH"). All 14
-        # cmds on <prefix>/bin so install.symlinks is a clean "14/14 available"
+        # True → install.path passes ("cctally reachable on $PATH"). All 15
+        # cmds on <prefix>/bin so install.symlinks is a clean "15/15 available"
         # (empty ~/.local/bin slots reachable-elsewhere → ok).
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
@@ -358,7 +358,7 @@ def _scenario_body(slug: str) -> str:
                        cctally-dollar-per-percent cctally-five-hour-blocks \\
                        cctally-five-hour-breakdown cctally-forecast cctally-project \\
                        cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-tui cctally-update; do
+                       cctally-transcript cctally-tui cctally-update; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
             done
             write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"

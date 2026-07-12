@@ -42,6 +42,10 @@ export interface TranscriptCtxValue {
   // cost bar can size itself without each memoized MessageItem subscribing to
   // the store. Optional + default 0 (→ no bar) for the many provider-less tests.
   maxTurnCost?: number;
+  // #281 S4 — the "Anonymize" mode, provided ONCE by the reader (single source
+  // for the Export menu + every per-card CopyButton). Optional + default FALSE
+  // for provider-less card tests (which assert today's raw-copy behavior).
+  anonMode?: boolean;
 }
 
 export const TranscriptContext = createContext<TranscriptCtxValue>({
@@ -62,3 +66,7 @@ export const useMarkersEnabled = (): boolean =>
 // Default 0 (no provider value) → costIntensity returns 0 → no bar.
 export const useMaxTurnCost = (): number =>
   useContext(TranscriptContext).maxTurnCost ?? 0;
+// #281 S4 — the per-card copy anon mode. Default FALSE (no provider value) so
+// isolated card tests copy raw exactly as before.
+export const useAnonMode = (): boolean =>
+  useContext(TranscriptContext).anonMode ?? false;

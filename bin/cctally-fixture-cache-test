@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Canary/regression harness for the fixture cache (#281 S11 / R9).
+#
+# Auto-discovered by cctally-test-all's Phase-1 glob. Drives the REAL
+# build-weekly-fixtures.py (a relocatable SQLite builder) through the cache
+# and asserts the FIXTURE-CACHE stderr markers + byte-identity + poison
+# detection (normal + audit) + transitive-import key sensitivity + bypass.
+# Uses an ISOLATED cache dir inside its own mktemp scratch — never the shared
+# user cache. Ends with the standard `passed: N   failed: M` line so
+# cctally-test-all parses it. Non-vacuity for the pure fingerprint legs
+# (scenario 6) is covered by tests/test_fixture_cache.py.
+set -uo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Dev-instance isolation preamble (exports CCTALLY_DISABLE_DEV_AUTODETECT=1);
+# coverage enforced by tests/test_harness_dev_autodetect_coverage.py.
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+SCRATCH="$(mktemp -d -t cctally-fixture-cache-XXXXXX)"; trap 'rm -rf "$SCRATCH"' EXIT
+# This harness TESTS the cache mechanism, so it must be immune to an ambient
+# opt-out/audit leaking in from the caller (e.g. `CCTALLY_FIXTURE_CACHE=0
+# bin/cctally-test-all` exports the bypass suite-wide, which would turn every
+# scenario below into a BYPASS and defeat the MISS/HIT/POISONED assertions).
+# Force a known-clean control state; scenarios set the bypass/audit knobs
+# inline per-command where a scenario needs them.
+unset CCTALLY_FIXTURE_CACHE CCTALLY_FIXTURE_CACHE_VERIFY
+export CCTALLY_FIXTURE_CACHE_DIR="$SCRATCH/cache"
+
+FC="$REPO_ROOT/bin/_fixture_cache.py"
+B="$REPO_ROOT/bin/build-weekly-fixtures.py"
+pass=0; fail=0
+ok () { echo "PASS $1"; pass=$((pass+1)); }
+no () { echo "FAIL $1: $2"; fail=$((fail+1)); }
+
+# Run the cache CLI: $1 = out dir, $2 = stderr capture file.
+run_cache () { python3 "$FC" run --builder "$B" --out "$1" >/dev/null 2> "$2"; }
+
+# 1 cold MISS
+run_cache "$SCRATCH/o1" "$SCRATCH/e1"
+if grep -q "MISS weekly" "$SCRATCH/e1"; then ok cold-miss; else no cold-miss "no MISS marker"; fi
+
+# 2 warm HIT + byte-identical vs a cache-off (BYPASS) build of the same builder
+run_cache "$SCRATCH/o2" "$SCRATCH/e2"
+if grep -q "HIT weekly" "$SCRATCH/e2"; then ok warm-hit; else no warm-hit "no HIT marker"; fi
+CCTALLY_FIXTURE_CACHE=0 python3 "$FC" run --builder "$B" --out "$SCRATCH/oref" >/dev/null 2>/dev/null
+# Exclude transient SQLite sidecars: the cache restore drops them (they're not
+# in the manifest) but a cache-off direct build could leave them, so a future
+# sidecar-leaving driver builder must not cause a false FAIL here.
+if diff -r -x '*.db-wal' -x '*.db-shm' -x '*.db-journal' \
+        -x '*.sqlite-wal' -x '*.sqlite-shm' -x '*.sqlite-journal' \
+        "$SCRATCH/o2" "$SCRATCH/oref" >/dev/null 2>&1; then ok warm-identical; else no warm-identical "restored tree != fresh build"; fi
+
+# 3 poison (normal) -> POISONED marker + fail-safe rebuild with correct output
+victim="$(find "$SCRATCH/cache" -name '*.db' | head -1)"; echo CORRUPT > "$victim"
+run_cache "$SCRATCH/o3" "$SCRATCH/e3"
+if grep -q "POISONED weekly" "$SCRATCH/e3" && diff -r "$SCRATCH/o3" "$SCRATCH/oref" >/dev/null 2>&1; then
+    ok poison-normal
+else
+    no poison-normal "no POISONED marker or rebuilt output diverged"
+fi
+
+# 4 poison (audit) -> hard RED (nonzero exit + AUDIT FAILURE). The entry was
+# rebuilt+republished in #3, so re-poison it here.
+victim="$(find "$SCRATCH/cache" -name '*.db' | head -1)"; echo CORRUPT > "$victim"
+CCTALLY_FIXTURE_CACHE_VERIFY=1 python3 "$FC" run --builder "$B" --out "$SCRATCH/o4" >/dev/null 2> "$SCRATCH/e4"
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q "AUDIT FAILURE" "$SCRATCH/e4"; then ok poison-verify; else no poison-verify "verify not RED (rc=$rc)"; fi
+
+# 5 mutate a TRANSITIVE import in a staged copy -> MISS under a new key
+stage="$SCRATCH/stage"; mkdir -p "$stage"
+python3 - "$B" "$stage" <<'PY'
+import sys, shutil, importlib.util
+from pathlib import Path
+BIN = Path(sys.argv[1]).resolve().parent
+spec = importlib.util.spec_from_file_location("_fc", BIN / "_fixture_cache.py")
+fc = importlib.util.module_from_spec(spec); spec.loader.exec_module(fc)
+for p in fc.transitive_bin_sources(Path(sys.argv[1])):
+    shutil.copy2(p, Path(sys.argv[2]) / p.name)
+shutil.copy2(BIN / "_fixture_cache.py", Path(sys.argv[2]) / "_fixture_cache.py")
+PY
+SB="$stage/build-weekly-fixtures.py"
+python3 "$stage/_fixture_cache.py" run --builder "$SB" --out "$SCRATCH/os1" >/dev/null 2> "$SCRATCH/es1"
+printf '\n# mutate\n' >> "$stage/_fixture_builders.py"
+python3 "$stage/_fixture_cache.py" run --builder "$SB" --out "$SCRATCH/os2" >/dev/null 2> "$SCRATCH/es2"
+if grep -q "MISS weekly" "$SCRATCH/es2"; then ok transitive-miss; else no transitive-miss "stale HIT after transitive-import change"; fi
+
+# 7 bypass -> builder runs, isolated cache dir stays empty, BYPASS marker
+rm -rf "$SCRATCH/cache2"
+CCTALLY_FIXTURE_CACHE=0 CCTALLY_FIXTURE_CACHE_DIR="$SCRATCH/cache2" \
+    python3 "$FC" run --builder "$B" --out "$SCRATCH/ob" >/dev/null 2> "$SCRATCH/eb"
+if grep -q "BYPASS weekly" "$SCRATCH/eb" && { [ ! -d "$SCRATCH/cache2" ] || [ -z "$(ls -A "$SCRATCH/cache2" 2>/dev/null)" ]; }; then
+    ok bypass
+else
+    no bypass "cache written under bypass or no BYPASS marker"
+fi
+
+echo "----"
+echo "passed: $pass   failed: $fail"
+[ "$fail" -eq 0 ]

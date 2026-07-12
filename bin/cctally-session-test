@@ -30,7 +30,8 @@ export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
 
 # Regenerate seeded fixture DBs into the scratch dir so goldens always
 # check against reproducible state without dirtying the tree.
-"$REPO_ROOT/bin/build-session-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-session-fixtures.py" "$SCRATCH_DIR" || {
     echo "FAIL: build-session-fixtures.py crashed (exit $?)" >&2
     exit 1
 }

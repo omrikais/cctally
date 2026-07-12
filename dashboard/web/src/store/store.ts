@@ -1019,6 +1019,10 @@ export function dispatch(action: Action): void {
         // lingers behind the next view.
         compare: null,
         comparePick: null,
+        // #289 (Codex P2-D, belt-and-suspenders) — also drop the pending
+        // compare-close focus so leaving the workspace (the second Escape → the
+        // dashboard) never strands the flag for the next reader.
+        compareCloseFocusPending: false,
         ...(action.view === 'dashboard'
           ? { selectedConversationId: null, conversationJump: null, conversationSearch: '', conversationSearchKind: 'all' as const }
           : {}),
@@ -1097,6 +1101,13 @@ export function dispatch(action: Action): void {
         // leaves any in-flight comparison + pick-mode.
         compare: null,
         comparePick: null,
+        // #289 (Codex P2-D) — clear the pending compare-close focus too. The new
+        // Escape peel can run CLOSE_COMPARE (arms it) → SELECT_CONVERSATION null
+        // (unmounts the reader that would consume it), which would otherwise
+        // strand the flag so the NEXT reader steals focus to #conv-compare-with.
+        // A deselect-to-null OR select-to-other both make a pending compare-focus
+        // moot; the intended in-reader compare-close return does no SELECT.
+        compareCloseFocusPending: false,
         selectedConversationId: action.sessionId,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen

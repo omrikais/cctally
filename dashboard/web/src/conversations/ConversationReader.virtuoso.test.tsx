@@ -28,6 +28,24 @@ import type { ConversationItem } from '../types/conversation';
 // genuinely unmounted at a top-anchored mount.
 const MOCK_VIEWPORT = { viewportHeight: 800, itemHeight: 100 } as const;
 
+// #283 — the two off-screen-jump tests below ((b), (d)) assert the jump
+// self-clears (`conversationJump === null`). That clear is gated behind the
+// reader's WALK-then-clear pipeline: `walkToTarget` steps Virtuoso toward the
+// target, quiescing each step across requestAnimationFrame. Under
+// VirtuosoMockContext the stubbed scroll never actually advances the window, so
+// the walk can never mount the target through its own scrolling and burns its
+// FULL bounded budget (maxSteps = max(60, nodeCount) = 60 here) — ~60 steps,
+// each awaiting rAF — before `landedBookkeeping` dispatches
+// CLEAR_CONVERSATION_JUMP. Because that latency is dominated by rAF scheduling,
+// it is LOAD-PROPORTIONAL: ~85ms on an idle machine but climbing past the 1000ms
+// testing-library default under a loaded parallel suite (the original #283 firing
+// was a 67.6s full-suite run; measured ~750ms under 3× CPU overcommit locally).
+// These generous ceilings give the bounded walk headroom so the (UNCHANGED)
+// assertions stay robust under CI load — strengthening the wait, never loosening
+// the assertion — while a genuine never-clears hang still fails within 10s.
+const JUMP_CLEAR_TIMEOUT_MS = 10_000; // waitFor ceiling for `conversationJump === null`
+const JUMP_TEST_TIMEOUT_MS = 15_000;  // per-test ceiling (wraps the 10s waitFor + the manual landing drive)
+
 const _idByUuid = new Map<string, number>();
 let _nextItemId = 1;
 function _idFor(uuid: string): number {
@@ -194,7 +212,9 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     // scrollIntoView({ index: arrayIndex, done }), sets `jumpedUuid`, and self-clears
     // the jump.
     await waitFor(() => expect(container.querySelector('[data-uuid="t0"]')).not.toBeNull());
-    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    // #283 — generous ceiling for the bounded walk-then-clear pipeline (see the
+    // JUMP_CLEAR_TIMEOUT_MS note); the condition is unchanged.
+    await waitFor(() => expect(getState().conversationJump).toBeNull(), { timeout: JUMP_CLEAR_TIMEOUT_MS });
 
     // NON-VACUITY: the target is genuinely UNMOUNTED at a head-anchored mount —
     // off-screen rows are absent from the DOM (this is the whole point of
@@ -222,7 +242,7 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     // — the unmount-safe behavior the old imperative `classList.add` against a
     // then-absent element could never deliver (Codex P0-1).
     expect(target!.classList.contains('conv-item--jumped')).toBe(true);
-  });
+  }, JUMP_TEST_TIMEOUT_MS); // #283 — raise the per-test ceiling above the 10s jump-clear waitFor
 
   it('(d) a far jump WALKS to the target then direct-centers — the target is the resting node, mounted + flashed, and HOLDS across a re-measure (#234)', async () => {
     // #234 — the far-jump landing no longer hops through react-virtuoso's library
@@ -255,7 +275,9 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     // The jump effect resolves the target (already in the one loaded page), walks
     // Virtuoso toward it via scrollToIndex then direct-writes scrollTop, and
     // self-clears the jump.
-    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    // #283 — generous ceiling for the bounded walk-then-clear pipeline (see the
+    // JUMP_CLEAR_TIMEOUT_MS note); the condition is unchanged.
+    await waitFor(() => expect(getState().conversationJump).toBeNull(), { timeout: JUMP_CLEAR_TIMEOUT_MS });
 
     // NON-VACUITY: the target is genuinely UNMOUNTED at a head-anchored mount.
     expect(container.querySelector(`[data-uuid="${targetUuid}"]`)).toBeNull();
@@ -288,7 +310,7 @@ describe('ConversationReader — real Virtuoso (VirtuosoMockContext) (#232)', ()
     const targetAfter = container.querySelector(`[data-uuid="${targetUuid}"]`);
     expect(targetAfter).not.toBeNull();
     expect(targetAfter!.classList.contains('conv-item--jumped')).toBe(true);
-  });
+  }, JUMP_TEST_TIMEOUT_MS); // #283 — raise the per-test ceiling above the 10s jump-clear waitFor
 
   it('(e) #234 R2 — a find/jump hit on a subagent card SECOND member force-opens the card', async () => {
     // The exact #234 R2 topology (Codex P1-4): a top-level subagent card whose

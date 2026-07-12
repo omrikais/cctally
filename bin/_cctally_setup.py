@@ -64,6 +64,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -1769,6 +1770,84 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+_SETUP_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+_SETUP_PROGRESS_HEARTBEAT_POLL_SECONDS = 0.5
+
+
+def _setup_progress_enabled(*, json_mode: bool) -> bool:
+    """Whether to emit setup cold-sync progress to stderr (issue #281 S7 / R6).
+
+    ``CCTALLY_SETUP_PROGRESS='1'`` forces on, ``'0'`` forces off (both
+    directions: the golden harness force-suppresses, the timed
+    fixture-ladder run force-observes). Otherwise: on iff stderr is a TTY
+    and not ``--json`` (json is machine-readable — auto-suppress the
+    friendly notices there). Gating on ``sys.stderr`` (not stdout) is
+    correct because progress goes to stderr, so a user who pipes stdout
+    still sees it while the harness (command-substitution pipe) reads
+    non-TTY.
+    """
+    env = os.environ.get("CCTALLY_SETUP_PROGRESS")
+    if env == "1":
+        return True
+    if env == "0":
+        return False
+    return (not json_mode) and sys.stderr.isatty()
+
+
+class _SetupProgressReporter:
+    """Best-effort stderr progress for setup's cold-sync bootstrap.
+
+    Coordinates the per-file ``sync_cache(progress=)`` callback with a
+    background heartbeat so neither a single giant JSONL nor a slow OAuth
+    fetch leaves a silent gap > ~2s. All emissions throttle off one shared
+    monotonic ``last_emit`` under a lock; ``force=True`` bypasses the
+    throttle (used for the pre-sync and pre-OAuth notices). A no-op (and no
+    thread) when disabled — so it is inert in the golden harness / non-TTY
+    / ``--json``.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._last_emit = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+
+    def emit(self, msg: str, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if not force and (now - self._last_emit) < _SETUP_PROGRESS_MIN_INTERVAL_SECONDS:
+                return
+            self._last_emit = now
+            eprint(msg)
+
+    def sync_callback(self, stats) -> None:
+        # `stats` is a duck-typed cache.IngestStats (reads files_processed /
+        # files_total). sync_cache invokes this per file; emit() throttles.
+        self.emit(f"  … synced {stats.files_processed}/{stats.files_total} session files")
+
+    def _heartbeat_loop(self) -> None:
+        # Fires only when no per-file line / notice emitted in the last
+        # interval, bounding intra-file and intra-fetch silence.
+        while not self._stop.wait(_SETUP_PROGRESS_HEARTBEAT_POLL_SECONDS):
+            self.emit("  … still working…")
+
+    def __enter__(self) -> "_SetupProgressReporter":
+        if self.enabled:
+            self._thread = threading.Thread(
+                target=self._heartbeat_loop, name="cctally-setup-progress", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
 def _setup_emit_text(lines: list[str]) -> None:
     for ln in lines:
         print(ln)
@@ -2075,62 +2154,78 @@ def _setup_install(args: argparse.Namespace) -> int:
         out.append("  leave (data is funneled correctly either way), but you can remove")
         out.append("  it whenever you want. We won't touch the file.")
 
-    # Bootstrap (non-fatal). sync_cache requires a connection arg — mirror
-    # the pattern from cmd_hook_tick (Task 2 fix).
+    # Bootstrap (non-fatal). Progress is stderr-only + TTY-gated so the
+    # buffered stdout transcript and --json envelope are unchanged (issue
+    # #281 S7 / R6). The reporter wraps BOTH the cold-sync ingest and the
+    # OAuth fetch under one daemon heartbeat, so neither a single giant
+    # JSONL nor a slow OAuth network call leaves a silent gap > ~2s.
+    # sync_cache is untouched — we only pass its existing progress= seam.
     bootstrap_rows: int | None = None
     bootstrap_oauth_status: str | None = None
-    try:
-        cache_conn = c.open_cache_db()
+    progress = _SetupProgressReporter(
+        _setup_progress_enabled(json_mode=getattr(args, "json", False))
+    )
+    with progress:
+        progress.emit(
+            "⏳ Syncing session history (first run can take a moment on a large history)…",
+            force=True,
+        )
         try:
-            stats = c.sync_cache(cache_conn)
-            rows = int(stats.rows_changed)
-        finally:
+            cache_conn = c.open_cache_db()
             try:
-                cache_conn.close()
-            except Exception:
-                pass
-        bootstrap_rows = rows
-        # `rows` counts both genuine INSERTs and ccusage-parity DO UPDATE
-        # replacements (see IngestStats.rows_changed). On first install
-        # this is always 0-vs-N pure inserts (cache is empty), so "N new
-        # entries" is exactly accurate. On a re-install / upgrade path
-        # with active sessions, `rows` also counts UPSERT replacements
-        # (streaming-vs-final tiebreaker swaps), so the count is more
-        # accurately "ingest activity" than "rows newly added" — but
-        # we keep "new entries" because (a) it's still a useful signal
-        # to the operator that the cache is alive, and (b) the dominant
-        # case (first install) reads literally.
-        out.append(f"✓ Synced session cache ({rows} new entries)")
-    except Exception as exc:
-        out.append(f"⚠ sync_cache during bootstrap failed: {exc}")
-        warnings += 1
-    if oauth:
-        try:
-            status, _ = c._hook_tick_oauth_refresh()
-            bootstrap_oauth_status = status
-            if status.startswith("ok"):
-                c._hook_tick_throttle_touch()
-                out.append(f"✓ Bootstrapped weekly usage ({status})")
-            else:
-                out.append(f"⚠ Bootstrap OAuth fetch: {status}")
+                stats = c.sync_cache(cache_conn, progress=progress.sync_callback)
+            finally:
+                try:
+                    cache_conn.close()
+                except Exception:
+                    pass
+            if stats.lock_contended:
+                # Another process holds the cache flock — nothing was
+                # ingested (sync_cache short-circuits with rows_changed=0).
+                # Report honestly rather than a false "Synced (0 new
+                # entries)"; leave bootstrap_rows None for the envelope.
+                out.append("⚠ Another cache sync is in progress; using existing cache.")
                 warnings += 1
+                bootstrap_rows = None
+            else:
+                rows = int(stats.rows_changed)
+                bootstrap_rows = rows
+                # `rows` counts both genuine INSERTs and ccusage-parity DO
+                # UPDATE replacements (see IngestStats.rows_changed). On
+                # first install this is always 0-vs-N pure inserts (cache is
+                # empty), so "N new entries" is exactly accurate. On a
+                # re-install / upgrade path with active sessions, `rows` also
+                # counts UPSERT replacements (streaming-vs-final tiebreaker
+                # swaps), so the count is more accurately "ingest activity"
+                # than "rows newly added" — but we keep "new entries" because
+                # (a) it's still a useful signal to the operator that the
+                # cache is alive, and (b) the dominant case (first install)
+                # reads literally.
+                out.append(f"✓ Synced session cache ({rows} new entries)")
         except Exception as exc:
-            bootstrap_oauth_status = f"err({type(exc).__name__})"
-            out.append(f"⚠ Bootstrap OAuth failed: {exc}")
+            out.append(f"⚠ sync_cache during bootstrap failed: {exc}")
             warnings += 1
+        if oauth:
+            progress.emit("⏳ Fetching current usage…", force=True)
+            try:
+                status, _ = c._hook_tick_oauth_refresh()
+                bootstrap_oauth_status = status
+                if status.startswith("ok"):
+                    c._hook_tick_throttle_touch()
+                    out.append(f"✓ Bootstrapped weekly usage ({status})")
+                else:
+                    out.append(f"⚠ Bootstrap OAuth fetch: {status}")
+                    warnings += 1
+            except Exception as exc:
+                bootstrap_oauth_status = f"err({type(exc).__name__})"
+                out.append(f"⚠ Bootstrap OAuth failed: {exc}")
+                warnings += 1
 
     out.append("")
     if warnings:
         out.append(f"cctally is ready (with {warnings} warning(s) above).")
     else:
         out.append("cctally is ready.")
-    out.append("")
-    # Settings.json was modified — CC caches it at session start. The
-    # warning fires unconditionally because `_setup_install` always
-    # rewrites settings.json (legacy migration, fresh install, repair).
-    out.append("⚠ Restart Claude Code for the new hooks to take effect in any currently")
-    out.append("  open sessions. New sessions launched after this point pick them up")
-    out.append("  automatically. (settings.json is cached at session start.)")
     out.append("")
     out.append("  Try:")
     out.append("    cctally daily              # last 30 days")
@@ -2150,6 +2245,18 @@ def _setup_install(args: argparse.Namespace) -> int:
     out.append("No identity, no paths, no usage data, no IP stored. Auto-expires monthly.")
     out.append("Opt out anytime:  cctally telemetry off   (or CCTALLY_DISABLE_TELEMETRY=1)")
     out.append("How it works:     https://github.com/omrikais/cctally/blob/main/docs/telemetry.md")
+
+    # ▶ Next step LAST: the sole required action, set off from the wall of
+    # text (issue #281 S7 / R6 — it was previously buried mid-dump, right
+    # after the readiness line and followed by ~12 more lines). It's an
+    # action, not a warning, so it drops the `⚠` and never touched the
+    # `warnings` count. settings.json is cached at session start, so open
+    # sessions need a restart; `_setup_install` always rewrites settings.json
+    # (legacy migration, fresh install, repair), so this always applies.
+    out.append("")
+    out.append("▶ Next step: restart Claude Code to activate the new hooks.")
+    out.append("  Open sessions won't record until you restart (settings.json is cached at")
+    out.append("  session start). New sessions started after this pick them up automatically.")
 
     if getattr(args, "json", False):
         # JSON-safe telemetry disclosure (spec 2026-07-07 §4): a structured

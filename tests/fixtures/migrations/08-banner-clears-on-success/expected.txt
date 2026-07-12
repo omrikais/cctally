@@ -14,7 +14,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
   ✓ 013_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 21 / 21 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 22 / 22 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -35,7 +35,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 21 / 21 known
   ✓ 018_create_conversation_title_fts              applied <REDACTED>
   ✓ 019_create_conversation_file_touches           applied <REDACTED>
   ✓ 020_session_entries_physical_unique            applied <REDACTED>
-  ✓ 021_test_cache_migration                       applied <REDACTED>
+  ✓ 021_index_conversation_messages_cwd            applied <REDACTED>
+  ✓ 022_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit

@@ -25,8 +25,9 @@ git config tag.gpgsign false
 mkdir -p .githooks bin
 cp "$REPO_ROOT/.mirror-allowlist" .
 cp "$REPO_ROOT/.githooks/_match.py" .githooks/
-cp "$REPO_ROOT/.githooks/_public_trailer.py" .githooks/
-cp "$REPO_ROOT/.githooks/_skip_chain_metrics.py" .githooks/
+# #281 S9 retired the trailer machinery — these fixtures exercise only
+# cmd_bootstrap + cmd_reconcile, neither of which needs _public_trailer.py
+# or _skip_chain_metrics.py (the mirror tool's skip-chain import is gone).
 # The mirror tool resolves _REPO_ROOT via __file__.parent.parent at
 # import time. Copy it INTO the scratch private's bin/ and run from
 # there so it walks the scratch private repo (not cctally-dev itself).
@@ -36,18 +37,10 @@ chmod +x bin/cctally-mirror-public
 # the tag-propagated/tag-held-back scenarios match the live config.
 cp "$REPO_ROOT/.public-tag-patterns" .
 
-# Infra-bootstrap commit. Contents are public-classified, but we tag
-# mirror-cursor here so the mirror walks ONLY scenario-specific commits
-# that follow this point. The infra commit message itself carries a
-# `--- public ---` block so it would be a valid publish if walked, but
-# the mirror-cursor tag below ensures the mirror starts AFTER it.
+# Infra-bootstrap commit + mirror-cursor at HEAD (the cursor establishes
+# the pre-publish baseline the reconcile scenarios drift away from).
 git add -A
-git commit --no-verify -q -F - <<'CCTALLY_INFRA_MSG_EOF'
-chore: infra bootstrap
-
---- public ---
-chore: infra bootstrap
-CCTALLY_INFRA_MSG_EOF
+git commit --no-verify -q -m "chore: infra bootstrap"
 git -c tag.gpgsign=false tag mirror-cursor HEAD
 
 # cwd remains $work/private/ for scenario-specific bash that follows.
@@ -59,9 +52,6 @@ git -c tag.gpgsign=false tag mirror-cursor HEAD
 echo "# Public README" > README.md
 git add README.md
 git commit --no-verify -q -F - <<'CCTALLY_MSG_EOF'
-fix: seed
-
---- public ---
 docs: initial seed
 CCTALLY_MSG_EOF
 mkdir -p ../msg

@@ -2,7 +2,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
   ✓ Mode                     installed
-  ⚠ Symlinks                 0/14 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update
+  ⚠ Symlinks                 0/15 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update
       → cctally is reachable only through a legacy ~/.local/bin link to a Homebrew keg. Put <prefix>/bin on your PATH (e.g. `eval "$(brew shellenv)"`), then run `cctally setup` to remove the legacy link.
   ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected
@@ -20,8 +20,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/32 applied
-  ⚠ Pending migrations       32 pending
+  ✓ Migrations               0/33 applied
+  ⚠ Pending migrations       33 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
 Data

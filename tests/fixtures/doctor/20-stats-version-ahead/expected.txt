@@ -2,7 +2,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
   ✓ Mode                     installed
-  ✓ Symlinks                 14/14 available
+  ✓ Symlinks                 15/15 available
   ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected
   ✓ Legacy bespoke hooks     not detected
@@ -20,8 +20,8 @@ Database
   ✓ Integrity                quick_check ok
   ✗ Version ahead            stats.db ahead (v99 > known v12)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ✓ Migrations               0/32 applied
-  ⚠ Pending migrations       32 pending
+  ✓ Migrations               0/33 applied
+  ⚠ Pending migrations       33 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
 Data

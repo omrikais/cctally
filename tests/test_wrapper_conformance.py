@@ -29,6 +29,7 @@ WRAPPER_ARGV = {
     "cctally-refresh-usage": "refresh-usage",
     "cctally-statusline": "statusline",
     "cctally-sync-week": "sync-week",
+    "cctally-transcript": "transcript",
     "cctally-tui": "tui",
     "cctally-update": "update",
 }

@@ -5,7 +5,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
 import { BlockTimeline } from './BlockTimeline';
 import { ShareIcon } from '../components/ShareIcon';
-import { fmt, type FmtCtx } from '../lib/fmt';
+import { fmt, roundIsoToTenMinutes, type FmtCtx } from '../lib/fmt';
 import { ModelCostBars } from './ModelCostBars';
 import type { BlockDetail } from '../types/envelope';
 
@@ -40,7 +40,10 @@ function fmtWindow(start: string, end: string, ctx: FmtCtx): string {
   // tz-aware `fmt.timeHHmm`, which appends the suffix from
   // ctx.offsetLabel. Both ends carry the suffix so the rendered text
   // remains readable when copied without surrounding context.
-  return `${fmt.timeHHmm(start, ctx)} → ${fmt.timeHHmm(end, ctx)}`;
+  // Both ends round to the nearest 10-min boundary (reset-jitter
+  // normalization) so the window matches the panel/title; the raw
+  // `start_at` still drives the block lookup elsewhere (issue #76).
+  return `${fmt.timeHHmm(roundIsoToTenMinutes(start), ctx)} → ${fmt.timeHHmm(roundIsoToTenMinutes(end), ctx)}`;
 }
 
 export function BlockModal() {

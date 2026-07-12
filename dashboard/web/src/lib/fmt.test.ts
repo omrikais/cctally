@@ -1,5 +1,33 @@
 import { describe, it, expect } from 'vitest';
-import { fmt } from './fmt';
+import { fmt, roundIsoToTenMinutes } from './fmt';
+
+describe('roundIsoToTenMinutes (5h-block reset-jitter display normalization)', () => {
+  it('rounds a jittered :39 boundary up to :40 (mirrors the server helper)', () => {
+    expect(roundIsoToTenMinutes('2026-04-15T04:39:59Z'))
+      .toBe('2026-04-15T04:40:00.000Z');
+    expect(roundIsoToTenMinutes('2026-07-11T10:39:00Z'))
+      .toBe('2026-07-11T10:40:00.000Z');
+  });
+  it('rounds down when nearer the lower boundary', () => {
+    expect(roundIsoToTenMinutes('2026-04-15T04:34:00Z'))
+      .toBe('2026-04-15T04:30:00.000Z');
+  });
+  it('rounds the exact half up', () => {
+    expect(roundIsoToTenMinutes('2026-04-15T04:35:00Z'))
+      .toBe('2026-04-15T04:40:00.000Z');
+  });
+  it('is idempotent on a boundary', () => {
+    expect(roundIsoToTenMinutes('2026-04-15T04:40:00Z'))
+      .toBe('2026-04-15T04:40:00.000Z');
+  });
+  it('rolls over the hour', () => {
+    expect(roundIsoToTenMinutes('2026-04-15T04:56:00Z'))
+      .toBe('2026-04-15T05:00:00.000Z');
+  });
+  it('passes unparseable input through unchanged', () => {
+    expect(roundIsoToTenMinutes('not-a-date')).toBe('not-a-date');
+  });
+});
 
 describe('fmt.usd0 (#264 S1 — whole-dollar hero)', () => {
   it('rounds to whole dollars with a leading $', () => {

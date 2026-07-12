@@ -28,6 +28,12 @@ export interface ReaderOverflowMenuProps {
   // Export rides as the embedded ExportMenu (its own nested popover).
   sessionId: string;
   exportTitle?: string;
+  // #281 S4 — the Anonymize toggle. The SAME store state as the desktop header
+  // chip (the reader owns `anonMode` + `toggleAnonMode`), so a flip here updates
+  // the chip and vice versa, and the embedded ExportMenu below honors it — a
+  // desktop OFF no longer silently produces raw exports through the mobile menu.
+  anonMode: boolean;
+  onToggleAnon: () => void;
   // Compare with… — enters rail pick-mode anchored on this session.
   onCompare: () => void;
   // Latest ↓ — reset to the tail + jump/flash the final turn. Hidden when null
@@ -48,6 +54,8 @@ export interface ReaderOverflowMenuProps {
 export function ReaderOverflowMenu({
   sessionId,
   exportTitle,
+  anonMode,
+  onToggleAnon,
   onCompare,
   onLatest,
   latestBusy = false,
@@ -66,17 +74,22 @@ export function ReaderOverflowMenu({
   const rootRef = useRef<HTMLDivElement>(null);
   useOutsideDismiss(rootRef, open, useCallback(() => setOpen(false), []));
 
-  // The flat action menuitems, in render order (Export rides separately as its
-  // own popover row and is NOT in this roving set). `null` entries are filtered
-  // out (e.g. Latest when the conversation is empty), so the roving index always
-  // spans only the live items.
-  const actions = [
-    { key: 'compare', label: '⟷ Compare with…', run: onCompare },
-    onLatest ? { key: 'latest', label: `${latestBusy ? '… ' : ''}Latest ↓`, run: onLatest, busy: latestBusy } : null,
-    { key: 'expand', label: '⤢ Expand all', run: onExpandAll },
-    { key: 'collapse', label: '⤡ Collapse all', run: onCollapseAll },
-  ].filter(Boolean) as { key: string; label: string; run: () => void; busy?: boolean }[];
-  const itemCount = actions.length;
+  // The roving menuitems, in render order (Export rides separately as its own
+  // popover row and is NOT in this roving set). The Anonymize toggle is the first
+  // item — it sits directly under Export because it governs what Export/copy
+  // produce. `null` entries are filtered out (e.g. Latest when the conversation
+  // is empty), so the roving index always spans only the live items.
+  const items = [
+    { key: 'anon', kind: 'toggle', label: 'Anonymize', pressed: anonMode },
+    { key: 'compare', kind: 'action', label: '⟷ Compare with…', run: onCompare },
+    onLatest ? { key: 'latest', kind: 'action', label: `${latestBusy ? '… ' : ''}Latest ↓`, run: onLatest, busy: latestBusy } : null,
+    { key: 'expand', kind: 'action', label: '⤢ Expand all', run: onExpandAll },
+    { key: 'collapse', kind: 'action', label: '⤡ Collapse all', run: onCollapseAll },
+  ].filter(Boolean) as (
+    | { key: 'anon'; kind: 'toggle'; label: string; pressed: boolean }
+    | { key: string; kind: 'action'; label: string; run: () => void; busy?: boolean }
+  )[];
+  const itemCount = items.length;
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const activeIndexRef = useRef(0);
@@ -208,24 +221,42 @@ export function ReaderOverflowMenu({
               )}
             </div>
           )}
-          {/* Export is its own nested popover — rides as a row, not a menuitem. */}
+          {/* Export is its own nested popover — rides as a row, not a menuitem.
+              It honors the SAME anonMode as the toggle below (a desktop OFF now
+              flows through to mobile exports). */}
           <div className="conv-overflow-export" role="none">
-            <ExportMenu sessionId={sessionId} title={exportTitle} />
+            <ExportMenu sessionId={sessionId} title={exportTitle} anonMode={anonMode} />
           </div>
-          {actions.map((a, i) => (
+          {items.map((it, i) => (
             <button
-              key={a.key}
+              key={it.key}
               type="button"
               role="menuitem"
               tabIndex={i === activeIndex ? 0 : -1}
               ref={(el) => {
                 itemRefs.current[i] = el;
               }}
-              className="conv-overflow-item"
-              disabled={a.busy}
-              onClick={() => pick(a.run)}
+              className={
+                it.kind === 'toggle'
+                  ? 'conv-overflow-item conv-overflow-item--toggle'
+                  : 'conv-overflow-item'
+              }
+              aria-pressed={it.kind === 'toggle' ? it.pressed : undefined}
+              disabled={it.kind === 'action' ? it.busy : undefined}
+              // The toggle flips in place (menu stays open — mirrors the desktop
+              // chip); actions run then close the menu (focus-return).
+              onClick={() => (it.kind === 'toggle' ? onToggleAnon() : pick(it.run))}
             >
-              {a.label}
+              {it.kind === 'toggle' ? (
+                <>
+                  <span className="conv-overflow-item-label">🎭 {it.label}</span>
+                  <span className="conv-overflow-item-state" aria-hidden="true">
+                    {it.pressed ? 'On' : 'Off'}
+                  </span>
+                </>
+              ) : (
+                it.label
+              )}
             </button>
           ))}
         </div>

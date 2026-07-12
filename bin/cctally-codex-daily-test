@@ -31,7 +31,8 @@ export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR/codex-daily"
 
 # Shared Codex builder regenerates fixtures for all four command trees,
 # writing into the scratch dir so the in-tree fixtures stay clean.
-"$REPO_ROOT/bin/build-codex-fixtures.py" --out "$SCRATCH_DIR" >/dev/null || {
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-codex-fixtures.py" "$SCRATCH_DIR" || {
     echo "FAIL: build-codex-fixtures.py crashed (exit $?)" >&2
     exit 1
 }

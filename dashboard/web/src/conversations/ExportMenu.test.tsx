@@ -139,6 +139,69 @@ describe('ExportMenu', () => {
     });
   });
 
+  // #281 S4 — Anonymize mode.
+  it('anon mode ON: copy fetches &anonymize=1 and the menu shows the anon note', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, text: async () => '# T' });
+    vi.stubGlobal('fetch', fetchMock);
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    render(<ExportMenu sessionId="s1" title="My Sess" anonMode />);
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    expect(screen.getByText(/anonymized/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('menuitem', { name: /whole transcript.*copy/i }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/api/conversation/s1/export?scope=all&anonymize=1'),
+      ),
+    );
+  });
+
+  it('anon mode ON: download filename gains an -anon suffix', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, text: async () => '# T' });
+    vi.stubGlobal('fetch', fetchMock);
+    let downloadName = '';
+    const realCreate = document.createElement.bind(document);
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement;
+      if (tag === 'a') {
+        (el as HTMLAnchorElement).click = () => {
+          downloadName = (el as HTMLAnchorElement).download;
+        };
+      }
+      return el;
+    });
+    vi.stubGlobal('URL', { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
+    render(<ExportMenu sessionId="s1" title="My Sess" anonMode />);
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /replay recipe.*download/i }));
+    await waitFor(() => expect(downloadName).toBe('My-Sess-recipe-anon.md'));
+    createSpy.mockRestore();
+  });
+
+  it('anon mode OFF: URL has no anonymize param, filename has no -anon (byte-identical)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, text: async () => '# T' });
+    vi.stubGlobal('fetch', fetchMock);
+    let downloadName = '';
+    const realCreate = document.createElement.bind(document);
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement;
+      if (tag === 'a') {
+        (el as HTMLAnchorElement).click = () => {
+          downloadName = (el as HTMLAnchorElement).download;
+        };
+      }
+      return el;
+    });
+    vi.stubGlobal('URL', { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
+    render(<ExportMenu sessionId="s1" title="My Sess" />);
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+    expect(screen.queryByText(/anonymized/i)).toBeNull();
+    fireEvent.click(screen.getByRole('menuitem', { name: /replay recipe.*download/i }));
+    await waitFor(() => expect(downloadName).toBe('My-Sess-recipe.md'));
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).not.toContain('anonymize');
+    createSpy.mockRestore();
+  });
+
   it('slugifyTitle strips non-ascii/control and caps, falling back to session id', () => {
     expect(slugifyTitle('Hello World! 你好', 'abc123def456')).toBe('Hello-World');
     expect(slugifyTitle('', 'abc123def456789')).toBe('abc123def456');

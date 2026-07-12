@@ -29,17 +29,18 @@
                             "cctally-refresh-usage",
                             "cctally-statusline",
                             "cctally-sync-week",
+                            "cctally-transcript",
                             "cctally-tui",
                             "cctally-update"
                         ],
                         "present": 0,
                         "stale": [],
-                        "total": 14
+                        "total": 15
                     },
                     "id": "install.symlinks",
                     "remediation": "Run `cctally setup`",
                     "severity": "warn",
-                    "summary": "0/14 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-tui, cctally-update",
+                    "summary": "0/15 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update",
                     "title": "Symlinks"
                 },
                 {
@@ -162,7 +163,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 20,
+                            "registry_size": 21,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -202,7 +203,8 @@
                                     "017_arm_nested_agent_reingest",
                                     "018_create_conversation_title_fts",
                                     "019_create_conversation_file_touches",
-                                    "020_session_entries_physical_unique"
+                                    "020_session_entries_physical_unique",
+                                    "021_index_conversation_messages_cwd"
                                 ],
                                 "skipped": []
                             },
@@ -366,13 +368,17 @@
                             [
                                 "cache.db",
                                 "020_session_entries_physical_unique"
+                            ],
+                            [
+                                "cache.db",
+                                "021_index_conversation_messages_cwd"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "31 pending",
+                    "summary": "32 pending",
                     "title": "Pending migrations"
                 },
                 {

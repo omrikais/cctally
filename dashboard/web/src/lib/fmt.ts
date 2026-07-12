@@ -205,6 +205,21 @@ function fmtTimeHHmm(
   return opts.noSuffix ? body : `${body} ${tzSuffixForInstant(d, ctx.tz)}`;
 }
 
+// 5h-block reset times carry sub-10-minute capture jitter (a true :40
+// boundary can arrive as :39). For DISPLAY only, round the instant to the
+// nearest 10-minute boundary so the shown clock time matches the real
+// reset — the mirror of the server's `_lib_five_hour._round_to_ten_minutes`
+// (round half-up on the absolute epoch; JS `Math.round` is half-up for the
+// positive epochs we handle). Block `start_at`/`end_at` stay exact on the
+// wire (they key the `/api/block/:start_at` lookup by exact equality, issue
+// #76); only the rendered string rounds. Unparseable input passes through.
+export function roundIsoToTenMinutes(iso: string): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return iso;
+  const BUCKET = 600_000; // 10 min in ms
+  return new Date(Math.round(ms / BUCKET) * BUCKET).toISOString();
+}
+
 export const fmt = {
   pct0(v: number | null | undefined): string {
     return v == null ? '—' : `${Math.round(v)}%`;

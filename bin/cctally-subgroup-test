@@ -29,8 +29,9 @@ export GOLDEN_DIFF_TMPDIR="$SCRATCH"
 pass=0; fail=0
 
 # --- seed Claude + Codex fixture data into pinned data dirs ---
-"$REPO_ROOT/bin/build-blocks-fixtures.py" --out "$SCRATCH/claude" >/dev/null || { echo "FAIL: blocks builder"; exit 1; }
-"$REPO_ROOT/bin/build-codex-fixtures.py"  --out "$SCRATCH/codex"  >/dev/null || { echo "FAIL: codex builder"; exit 1; }
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-blocks-fixtures.py" "$SCRATCH/claude" || { echo "FAIL: blocks builder"; exit 1; }
+build_fixtures_cached "$REPO_ROOT/bin/build-codex-fixtures.py" "$SCRATCH/codex" || { echo "FAIL: codex builder"; exit 1; }
 
 # Both builders write one fixture HOME per scenario, laid out as
 #   <out>/[<cmd>/]<scenario>/{.local/share/cctally/cache.db, .claude|.codex/...}

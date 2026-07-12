@@ -81,6 +81,33 @@ def _floor_to_ten_minutes(d: dt.datetime) -> dt.datetime:
     )
 
 
+def _round_to_ten_minutes(d: dt.datetime) -> dt.datetime:
+    """Round a datetime to the NEAREST 10-minute boundary (half up).
+
+    The *display*-side companion to ``_floor_to_ten_minutes``. Anthropic
+    ``rate_limits.5h.resets_at`` (and the derived ``block_start_at``,
+    ``block_start = reset - 5h``) carries sub-10-minute capture jitter, so
+    a reset that truly lands on ``:40`` can be recorded as ``:39``.
+    Flooring that for display shows ``:30`` — off by a full bucket — so
+    every user-facing 5h-block clock time rounds to the nearest boundary
+    instead.
+
+    Rounds the ABSOLUTE instant (epoch, tz-independent) rather than the
+    local minute, so it is correct regardless of the display zone's offset
+    (the reset is a fixed UTC instant). Returns a UTC-aware datetime;
+    callers hand it to ``format_display_dt`` for zone conversion.
+
+    NEVER use this for keys / partitioning / lookups — those require the
+    exact stored timestamp (issue #76). This is a render-only normalizer.
+    """
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    bucket = _FIVE_HOUR_JITTER_FLOOR_SECONDS  # 600s = 10 min
+    # floor(x + 0.5) is predictable half-UP (Python's round() is banker's).
+    rounded = math.floor(d.timestamp() / bucket + 0.5) * bucket
+    return dt.datetime.fromtimestamp(rounded, dt.timezone.utc)
+
+
 def _canonical_5h_window_key(
     resets_at_epoch: int,
     prior_epoch: int | None = None,

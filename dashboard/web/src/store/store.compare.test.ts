@@ -54,6 +54,30 @@ describe('compare slice', () => {
     dispatch({ type: 'CANCEL_COMPARE_PICK' });
     expect(getState().comparePick).toBeNull();
   });
+
+  // #289 (Codex P2-D) — the new Escape peel adds a reader-deselect step, so the
+  // sequence Escape(close compare) → Escape(deselect reader) unmounts the reader
+  // (the only consumer of compareCloseFocusPending) with the flag still armed.
+  // Left uncleared, the NEXT reader opened would steal focus to #conv-compare-with.
+  // SELECT_CONVERSATION's reverse-clear must drop it (deselect-to-null AND
+  // select-to-other both make a pending compare-focus moot).
+  it('SELECT_CONVERSATION reverse-clear clears a pending compare-close focus', () => {
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    dispatch({ type: 'CLOSE_COMPARE' });
+    expect(getState().compareCloseFocusPending).toBe(true); // armed by CLOSE_COMPARE
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: null });
+    expect(getState().compareCloseFocusPending).toBe(false); // must be cleared
+  });
+
+  // Belt-and-suspenders: the pre-existing SET_VIEW → dashboard reverse-clear must
+  // also drop the flag so the second-Escape-to-dashboard path leaves it clean.
+  it('SET_VIEW dashboard reverse-clear also clears a pending compare-close focus', () => {
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    dispatch({ type: 'CLOSE_COMPARE' });
+    expect(getState().compareCloseFocusPending).toBe(true);
+    dispatch({ type: 'SET_VIEW', view: 'dashboard' });
+    expect(getState().compareCloseFocusPending).toBe(false);
+  });
 });
 
 // #227 — the shared session_id → title cache the rail feeds and the comparison

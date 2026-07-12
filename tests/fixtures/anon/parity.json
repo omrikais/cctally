@@ -1,0 +1,166 @@
+{
+  "plan": {
+    "tokens": [
+      {
+        "text": "-Users-alice-repos-cctally-dev",
+        "replacement": "-project-1",
+        "bounded": false
+      },
+      {
+        "text": "/Users/alice/repos/cctally-dev",
+        "replacement": "project-1",
+        "bounded": false
+      },
+      {
+        "text": "-Volumes-EXT-repos-project",
+        "replacement": "-project-2",
+        "bounded": false
+      },
+      {
+        "text": "/Volumes/EXT/repos/project",
+        "replacement": "project-2",
+        "bounded": false
+      },
+      {
+        "text": "/Users/alice",
+        "replacement": "~",
+        "bounded": false
+      },
+      {
+        "text": "cctally-dev",
+        "replacement": "project-1",
+        "bounded": true
+      },
+      {
+        "text": "project",
+        "replacement": "project-2",
+        "bounded": true
+      },
+      {
+        "text": "alice",
+        "replacement": "user",
+        "bounded": true
+      }
+    ],
+    "patterns": [
+      {
+        "name": "authorization-header",
+        "source": "(\\bAuthorization:[ \\t]*)\\S[^\\r\\n]*",
+        "ignoreCase": true,
+        "keepGroup1": true
+      },
+      {
+        "name": "bearer-token",
+        "source": "(\\bBearer[ \\t]+)[A-Za-z0-9._~+/=-]{16,}",
+        "ignoreCase": true,
+        "keepGroup1": true
+      },
+      {
+        "name": "anthropic-key",
+        "source": "sk-ant-[A-Za-z0-9_-]{8,}",
+        "ignoreCase": false,
+        "keepGroup1": false
+      },
+      {
+        "name": "generic-sk-key",
+        "source": "sk-[A-Za-z0-9_-]{20,}",
+        "ignoreCase": false,
+        "keepGroup1": false
+      },
+      {
+        "name": "github-token",
+        "source": "(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}",
+        "ignoreCase": false,
+        "keepGroup1": false
+      },
+      {
+        "name": "aws-access-key",
+        "source": "AKIA[0-9A-Z]{16}",
+        "ignoreCase": false,
+        "keepGroup1": false
+      },
+      {
+        "name": "slack-token",
+        "source": "xox[baprs]-[A-Za-z0-9-]{10,}",
+        "ignoreCase": false,
+        "keepGroup1": false
+      },
+      {
+        "name": "secret-assignment",
+        "source": "(\\b(?:api[_-]?key|secret|token|passwd|password)\\b[ \\t]*[=:][ \\t]*)(?:\\\"[^\\\"\\r\\n]{6,}\\\"|'[^'\\r\\n]{6,}'|[^\\s\\\"']{6,})",
+        "ignoreCase": true,
+        "keepGroup1": true
+      }
+    ]
+  },
+  "cases": [
+    {
+      "input": "edited /Users/alice/repos/cctally-dev/bin/x here",
+      "expected": "edited project-1/bin/x here"
+    },
+    {
+      "input": "cache ~/.claude/projects/-Users-alice-repos-cctally-dev/x.jsonl",
+      "expected": "cache ~/.claude/projects/-project-1/x.jsonl"
+    },
+    {
+      "input": "the cctally-dev repo",
+      "expected": "the project-1 repo"
+    },
+    {
+      "input": "home /Users/alice done",
+      "expected": "home ~ done"
+    },
+    {
+      "input": "hi alice bye",
+      "expected": "hi user bye"
+    },
+    {
+      "input": "Authorization: Bearer sometoken1234567890",
+      "expected": "Authorization: [REDACTED:authorization-header]"
+    },
+    {
+      "input": "Bearer abcdefghijklmnop1234",
+      "expected": "Bearer [REDACTED:bearer-token]"
+    },
+    {
+      "input": "key sk-ant-api03-abcdefgh1234 end",
+      "expected": "key [REDACTED:anthropic-key] end"
+    },
+    {
+      "input": "key sk-aaaaaaaaaaaaaaaaaaaaaaaa end",
+      "expected": "key [REDACTED:generic-sk-key] end"
+    },
+    {
+      "input": "tok ghp_AAAAAAAAAAAAAAAAAAAA",
+      "expected": "tok [REDACTED:github-token]"
+    },
+    {
+      "input": "tok github_pat_BBBBBBBBBBBBBBBBBBBB",
+      "expected": "tok [REDACTED:github-token]"
+    },
+    {
+      "input": "aws AKIACCCCCCCCCCCCCCCC end",
+      "expected": "aws [REDACTED:aws-access-key] end"
+    },
+    {
+      "input": "slack xoxb-1234567890-abc end",
+      "expected": "slack [REDACTED:slack-token] end"
+    },
+    {
+      "input": "password = \"hunter2secret\"",
+      "expected": "password = [REDACTED:secret-assignment]"
+    },
+    {
+      "input": "project /Volumes/EXT/repos/project again",
+      "expected": "project-2 project-2 again"
+    },
+    {
+      "input": "project-9 and project here",
+      "expected": "project-9 and project-2 here"
+    },
+    {
+      "input": "in /Users/alice/repos/cctally-dev the key sk-ant-abcdefgh1234",
+      "expected": "in project-1 the key [REDACTED:anthropic-key]"
+    }
+  ]
+}

@@ -2400,6 +2400,96 @@ def _build_setup_parser(subparsers, name, *, help_text, xref=None):
     )
     sp.set_defaults(func=c.cmd_setup)
 
+def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `transcript` parser (#281 S4) — nested export|search subgroup,
+    following the `db` subgroup precedent (call-time `c = _cctally()` binding,
+    both sub-actions dispatch to `c.cmd_transcript` on `transcript_action`)."""
+    c = _cctally()
+    t_parser = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Export or search conversation transcripts from the local cache.
+
+            Subcommands:
+              export   Whole-session Markdown. ANONYMIZED BY DEFAULT (observed
+                       project paths/labels, home dir, and username → project-N/
+                       ~/user, plus documented secret patterns redacted). --raw
+                       disables the whole scrub, byte-identical to the dashboard's
+                       raw export. Best-effort over KNOWN tokens — review before
+                       sharing (see docs/commands/transcript.md).
+              search   Cross-session FTS/LIKE search. Output is RAW (a navigation
+                       surface, not a sharing artifact).
+
+            Examples:
+              cctally transcript export <session-id>
+              cctally transcript export <session-id> --scope chat --raw
+              cctally transcript export <session-id> -o session.md
+              cctally transcript search "reset window"
+              cctally transcript search needle --kind prompts --json
+            """
+        ),
+        epilog="See docs/commands/transcript.md for exit codes + the exact "
+               "is/isn't-covered redaction list.",
+    )
+    t_sub = t_parser.add_subparsers(dest="transcript_action", required=True)
+
+    t_export = t_sub.add_parser(
+        "export", help="Export a whole session as Markdown (anonymized by default)",
+        formatter_class=CLIHelpFormatter)
+    t_export.add_argument("session_id", metavar="SESSION_ID",
+                          help="Claude sessionId to export")
+    t_export.add_argument(
+        "--scope", choices=("all", "prompts", "chat", "recipe"), default="all",
+        help="Which slice to export (default: all)")
+    t_export.add_argument(
+        "--raw", action="store_true",
+        help="Disable the whole scrub (identity + secrets); byte-identical to "
+             "the dashboard raw export")
+    t_export.add_argument(
+        "-o", "--output", metavar="PATH", default=None,
+        help="Write to PATH instead of stdout (same exact bytes)")
+    t_export.set_defaults(func=c.cmd_transcript)
+
+    t_search = t_sub.add_parser(
+        "search", help="Search transcripts across sessions (raw output)",
+        formatter_class=CLIHelpFormatter)
+    t_search.add_argument("query", metavar="QUERY", help="Search text")
+    t_search.add_argument(
+        "--kind",
+        choices=("all", "prompts", "assistant", "tools", "thinking",
+                 "title", "files"),
+        default="all", help="Search facet (default: all)")
+    t_search.add_argument("--limit", type=int, default=50,
+                          help="Max results (default: 50)")
+    t_search.add_argument("--offset", type=int, default=0,
+                          help="Result offset for pagination (default: 0)")
+    t_search.add_argument("--project", action="append", default=None,
+                          metavar="LABEL",
+                          help="Filter by project label (repeatable)")
+    t_search.add_argument("--model", action="append", default=None,
+                          metavar="FAMILY",
+                          help="Filter by model family (repeatable)")
+    t_search.add_argument("--date-from", dest="date_from", default=None,
+                          metavar="YYYY-MM-DD",
+                          help="Only sessions on/after this date (display tz)")
+    t_search.add_argument("--date-to", dest="date_to", default=None,
+                          metavar="YYYY-MM-DD",
+                          help="Only sessions on/before this date (display tz)")
+    t_search.add_argument("--cost-min", dest="cost_min", type=float, default=None,
+                          metavar="USD", help="Min session cost")
+    t_search.add_argument("--cost-max", dest="cost_max", type=float, default=None,
+                          metavar="USD", help="Max session cost")
+    t_search.add_argument("--rebuild-min", dest="rebuild_min", type=int,
+                          default=None, metavar="N",
+                          help="Min cache-rebuild count")
+    t_search.add_argument("--json", action="store_true", dest="json",
+                          help="Emit JSON (schemaVersion: 1)")
+    t_search.set_defaults(func=c.cmd_transcript)
+
+
 def _build_db_parser(subparsers, name, *, help_text, xref=None):
     """Build the `db` parser (registered via _REGISTRATION; #279 S6 W3).
 
@@ -2808,6 +2898,7 @@ _REGISTRATION = (
     _Reg('project', _build_project_parser, "Roll usage up by project (git-root), with per-project Used %% attribution", None, None),
     _Reg('diff', _build_diff_parser, "Compare Claude usage between two windows.", None, None),
     _Reg('session', _build_session_parser, "Show Claude usage grouped by sessionId (merges resumed-across-files sessions)", "Alias of `cctally claude session` (the canonical form).", None),
+    _Reg('transcript', _build_transcript_parser, "Export or search conversation transcripts (anonymized export by default)", None, None),
     _Reg('claude', _build_claude_parser, "Claude-source reports (drop-in for `ccusage claude …`)", None, None),
     _Reg('codex', _build_codex_parser, "Codex-source reports (drop-in for `ccusage codex …`)", None, None),
     _Reg('config', _build_config_parser, "Get / set / unset persisted user preferences", None, None),
