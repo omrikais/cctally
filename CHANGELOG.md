@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.67.1] - 2026-07-12
+
+### Fixed
+- Internal (maintainer-only): ship the golden-harness fixture-cache engine (`bin/_fixture_cache.py`, #281 S11) to the public repo. It is sourced by the mirrored `bin/_lib-fixture-cache.sh` wrapper (used by 18 public golden harnesses) and read by `tests/test_fixture_cache.py`, but was omitted from the mirror allowlist, so the public repo's CI failed at test collection with `FileNotFoundError`. A new structural guard now asserts no public test/harness references a mirror-private `bin/` sibling, so this stranded-dependency class is caught before it ships. No user-facing behavior change.
+
 ## [1.67.0] - 2026-07-12
 
 ### Added
