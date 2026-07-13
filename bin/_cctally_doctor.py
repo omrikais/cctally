@@ -473,6 +473,17 @@ def doctor_gather_state(
     except Exception:
         locks_held = None
 
+    # ── cache.db WAL size (#297) — read-only backstop ────────────────
+    # Gathered OUTSIDE the deep/quick_check branch (above) so the WAL-size
+    # check runs in both shallow and deep gather modes. Best-effort getsize;
+    # None on OSError/race (doctor never blocks or raises), 0 when absent.
+    cache_db_wal_bytes: "int | None"
+    try:
+        _wal = pathlib.Path(f"{_cctally_core.CACHE_DB_PATH}-wal")
+        cache_db_wal_bytes = _wal.stat().st_size if _wal.exists() else 0
+    except OSError:
+        cache_db_wal_bytes = None
+
     # ── Safety ───────────────────────────────────────────────────────
     # `dashboard.bind` is read via the same chokepoint that powers
     # `cctally config get dashboard.bind` — `_config_known_value`
@@ -646,6 +657,8 @@ def doctor_gather_state(
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         locks_held=locks_held,
+        # #297: cache.db WAL size backstop (gathered outside the deep branch).
+        cache_db_wal_bytes=cache_db_wal_bytes,
     )
 
 

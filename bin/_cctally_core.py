@@ -213,6 +213,14 @@ def _real_prod_data_dir() -> pathlib.Path:
 _init_paths_from_env()
 
 
+# stats.db WAL cap (#297). Bounds the persistent WAL file so a resetting
+# checkpoint truncates it back down instead of leaving it at its high-water
+# size. stats.db writes are small (its -wal was observed at 0 bytes even under
+# the contention that bloated cache.db to multi-GB), so a tighter 16 MB cap is
+# ample. See docs/superpowers/specs/2026-07-13-cache-db-wal-hardening-design.md.
+STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
+
+
 # === Telemetry constants (non-path; see spec 2026-07-07) =============
 #
 # These are static (not APP_DIR-derived) so they live outside
@@ -939,16 +947,17 @@ def open_db() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         # Explicit for intent + symmetry with open_cache_db (bin/_cctally_cache.py).
-        # sqlite3.connect()'s default timeout=5.0 ALREADY maps to busy_timeout=5000,
-        # so this is not a behavior change — it makes the multi-writer retry window
-        # an explicit contract beside the WAL pragmas instead of an inherited
-        # default a reader has to know about. NOTE: busy_timeout does NOT absorb
-        # SQLITE_BUSY_SNAPSHOT (a WAL read-then-write transaction whose snapshot is
-        # invalidated by a competing commit raises "database is locked" instantly,
-        # bypassing the busy handler). The write paths defend against that by taking
-        # the write lock up front — BEGIN IMMEDIATE, or a write as the transaction's
-        # first DML. See cctally-dev#87.
-        conn.execute("PRAGMA busy_timeout=5000")
+        # #297: raised 5000 -> 15000 so a writer waits out a slow-but-normal
+        # sync (>5 s) instead of instantly erroring with "database is locked".
+        # NOTE: busy_timeout does NOT absorb SQLITE_BUSY_SNAPSHOT (a WAL
+        # read-then-write transaction whose snapshot is invalidated by a
+        # competing commit raises "database is locked" instantly, bypassing the
+        # busy handler). The write paths defend against that by taking the write
+        # lock up front — BEGIN IMMEDIATE, or a write as the transaction's first
+        # DML. See cctally-dev#87.
+        conn.execute("PRAGMA busy_timeout=15000")
+        # #297: bound the persistent WAL file (symmetry with open_cache_db).
+        conn.execute(f"PRAGMA journal_size_limit={STATS_WAL_SIZE_LIMIT_BYTES}")
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
         try:

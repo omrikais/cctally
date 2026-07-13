@@ -107,7 +107,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 
 def _cctally():
@@ -314,6 +314,96 @@ clear_conversation_messages = _cctally_db_sib.clear_conversation_messages
 # cache_meta key/value upsert helper — reused by the resumable reingest cursor
 # writes (#179) so the ON CONFLICT idiom lives in one place. Caller commits.
 _set_cache_meta = _cctally_db_sib._set_cache_meta
+
+
+# cache.db WAL hardening (#297). See
+# docs/superpowers/specs/2026-07-13-cache-db-wal-hardening-design.md.
+# `journal_size_limit` bounds the *persistent* WAL file so a checkpoint that
+# actually resets the WAL truncates the file back down to this cap — it is
+# containment/recovery under transient reader contention, NOT a reader-proof
+# hard cap (a pinned long-lived reader still defeats it until it releases).
+CACHE_WAL_SIZE_LIMIT_BYTES = 128 * 1024 * 1024  # 134217728
+# End-of-sync physical-size shrink trigger: only force a TRUNCATE checkpoint
+# once the -wal file has grown past this, so normal small syncs stay cheap.
+CACHE_WAL_CHECKPOINT_TRIGGER_BYTES = 64 * 1024 * 1024  # 67108864
+# Near-nonblocking busy_timeout for the auto end-of-sync checkpoint. It runs
+# BEFORE the ingest flock is released, so a long wait here would stall every
+# above-threshold sync's flock under the heavy-reader contention that motivates
+# the fix — fail fast and rely on journal_size_limit + the next checkpoint.
+CHECKPOINT_AUTO_BUSY_TIMEOUT_MS = 100
+# The explicit `cctally db checkpoint` command may wait this long.
+CHECKPOINT_CMD_BUSY_TIMEOUT_MS = 15000
+
+
+class CheckpointResult(NamedTuple):
+    """Outcome of a single ``PRAGMA wal_checkpoint(TRUNCATE)`` (#297).
+
+    ``busy`` is the checkpoint's own busy flag (a reader/writer held it off);
+    ``truncated`` means the WAL was actually reset AND the -wal file is now
+    zero-length/absent — a checkpoint can copy some frames yet still report
+    ``busy`` (partial), which is NOT ``truncated``.
+    """
+
+    db: str
+    wal_bytes_before: int
+    wal_bytes_after: int
+    frames_checkpointed: int
+    busy: bool
+    truncated: bool
+
+
+def _wal_file_size(db_path) -> int:
+    """Best-effort size of the -wal sidecar in bytes; 0 if absent/unreadable."""
+    try:
+        return os.path.getsize(f"{db_path}-wal")
+    except OSError:
+        return 0
+
+
+def _run_wal_truncate(conn, db_path, *, db_label: str) -> "CheckpointResult":
+    """Run a best-effort TRUNCATE checkpoint on an already-open connection.
+
+    PRECONDITION: ``conn`` has NO active transaction (autocommit). The
+    ``db checkpoint`` command passes a fresh raw connection; the end-of-sync
+    caller has committed all ingest work first. ``PRAGMA
+    wal_checkpoint(TRUNCATE)`` returns ``(busy, log, checkpointed)``: ``busy=0``
+    means the WAL was reset. Measures the -wal size before and after so callers
+    can report the shrink without re-deriving it.
+    """
+    before = _wal_file_size(db_path)
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    busy = bool(row[0]) if row else True
+    frames = int(row[2]) if (row and row[2] is not None) else 0
+    after = _wal_file_size(db_path)
+    truncated = (not busy) and after == 0
+    return CheckpointResult(db_label, before, after, frames, busy, truncated)
+
+
+def _maybe_truncate_wal(conn, db_path) -> None:
+    """End-of-sync best-effort WAL drain (#297).
+
+    Threshold-gated (only once the -wal file has grown past
+    ``CACHE_WAL_CHECKPOINT_TRIGGER_BYTES``) and run under a near-nonblocking
+    short busy_timeout so it NEVER stalls the held sync flock — the checkpoint
+    runs BEFORE the flock is released, so a long busy wait here would stall
+    every above-threshold sync under exactly the heavy-reader contention that
+    motivates the fix. Restores the prior busy_timeout. Fail-soft: a checkpoint
+    error must never fail the sync (observability/hygiene, not correctness).
+
+    PRECONDITION: ``conn`` has no active transaction — the caller has committed
+    all ingest work by this point.
+    """
+    try:
+        if _wal_file_size(db_path) <= CACHE_WAL_CHECKPOINT_TRIGGER_BYTES:
+            return
+        prior = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            conn.execute(f"PRAGMA busy_timeout={CHECKPOINT_AUTO_BUSY_TIMEOUT_MS}")
+            _run_wal_truncate(conn, db_path, db_label="cache.db")
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={prior}")
+    except sqlite3.DatabaseError:
+        pass  # best-effort; observability/hygiene must never fail a sync
 
 
 _PARSE_HEALTH_SCHEMA = 1
@@ -1875,6 +1965,11 @@ def sync_cache(
         # write has materialized the -wal/-shm sidecars. open_cache_db hardens
         # cache.db + the data dir; this finishes the job for the sidecars.
         _harden_cache_sidecars()
+        # #297: forced end-of-sync WAL drain. Threshold-gated + short-timeout +
+        # best-effort. Runs here — all ingest work is committed (no active txn)
+        # and the flock is still held, so the short busy_timeout keeps it from
+        # stalling the lock under heavy-reader contention.
+        _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
         return stats
     finally:
         try:
@@ -3262,6 +3357,12 @@ def sync_codex_cache(
             skip_reasons=stats.skip_reasons,
             rebuild=rebuild,
         )
+        # #297: forced end-of-sync WAL drain (Codex half). Claude and Codex
+        # ingests use SEPARATE flocks but commit into the SAME cache.db WAL, so
+        # the fail-fast short timeout naturally dedupes concurrent attempts —
+        # whoever wins truncates; the other gets `busy` immediately and moves
+        # on. All Codex ingest work is committed here (no active txn).
+        _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
         return stats
     finally:
         try:
@@ -3513,7 +3614,14 @@ def open_cache_db() -> sqlite3.Connection:
         eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    # #297: 15 s (was 5 s) lets a writer wait out a slow-but-normal sync (>5 s)
+    # instead of instantly erroring with "database is locked". Covers plain
+    # writer-vs-writer SQLITE_BUSY, not SQLITE_BUSY_SNAPSHOT (defended by
+    # write-lock-up-front at the write sites, #87).
+    conn.execute("PRAGMA busy_timeout=15000")
+    # #297: bound the persistent WAL file so a resetting checkpoint truncates it
+    # back to this cap instead of leaving it at its multi-GB high-water size.
+    conn.execute(f"PRAGMA journal_size_limit={CACHE_WAL_SIZE_LIMIT_BYTES}")
     # Re-derivable DB under WAL: NORMAL risks at most the tail transaction on
     # power loss, and cache.db can always be rebuilt (cache-sync --rebuild).
     # Fewer ingest fsyncs than the default FULL. Matches stats.db

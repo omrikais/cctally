@@ -63,6 +63,9 @@ Database
   ✓ Locks                    free
       details:
         locks: {'cache.db.lock': False, 'cache.db.codex.lock': False}
+  ✓ cache.db WAL size        within limit
+      details:
+        cache_db_wal_bytes: 0
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -119,4 +122,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 22 OK · 7 WARN · 1 FAIL
+Summary: 23 OK · 7 WARN · 1 FAIL

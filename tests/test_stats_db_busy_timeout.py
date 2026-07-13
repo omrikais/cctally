@@ -9,8 +9,9 @@ concurrently, and worktrees magnify the writer count without changing the
 data store. Before #87, ``open_db()`` set ``journal_mode=WAL`` +
 ``synchronous=NORMAL`` but NOT ``busy_timeout`` (default 0), so the first
 time SQLite returned BUSY the call raised ``OperationalError: database is
-locked`` immediately. The cache.db open path already sets
-``busy_timeout=5000`` (``bin/_cctally_cache.py``); stats.db now matches.
+locked`` immediately. Both open paths now set ``busy_timeout=15000``
+(``bin/_cctally_cache.py`` + ``open_db``; raised from 5000 by #297 so a
+writer waits out a slow-but-normal sync rather than erroring instantly).
 
 The user-visible cost of the missing timeout was not just a UX papercut:
 ``record-usage`` ticks that died on BUSY silently dropped write-once,
@@ -37,8 +38,10 @@ from conftest import load_script, redirect_paths
 
 # Matches the cache.db precedent at bin/_cctally_cache.py and the value
 # the fix installs in open_db(). The longest stats.db writer transaction is
-# _run_pending_migrations, which is bounded well under 5s.
-EXPECTED_BUSY_TIMEOUT_MS = 5000
+# _run_pending_migrations, which is bounded well under this timeout.
+# #297 raised both opens from 5000 -> 15000 so a writer waits out a
+# slow-but-normal sync (>5 s) instead of instantly erroring.
+EXPECTED_BUSY_TIMEOUT_MS = 15000
 
 
 @pytest.fixture
@@ -53,11 +56,11 @@ def _busy_timeout(conn: sqlite3.Connection) -> int:
 
 
 def test_open_db_sets_busy_timeout(ns):
-    """The connection returned by open_db() carries busy_timeout=5000.
+    """The connection returned by open_db() carries busy_timeout=15000.
 
-    This is the direct check on issue #87 acceptance criterion 1 — the
-    PRAGMA is connection-scoped, so once set it governs every statement
-    on that connection.
+    This is the direct check on issue #87 acceptance criterion 1 (value
+    raised 5000 -> 15000 by #297) — the PRAGMA is connection-scoped, so
+    once set it governs every statement on that connection.
     """
     conn = ns["open_db"]()
     try:
@@ -281,7 +284,7 @@ def test_busy_timeout_does_not_absorb_busy_snapshot(ns):
     """Characterizes WHY the live write paths take the write lock up front
     (BEGIN IMMEDIATE) rather than relying on busy_timeout alone (#87).
 
-    busy_timeout=5000 IS in effect (see test_open_db_sets_busy_timeout), but
+    busy_timeout=15000 IS in effect (see test_open_db_sets_busy_timeout), but
     it does NOT cover ``SQLITE_BUSY_SNAPSHOT``: a deferred transaction that
     READS (taking a WAL read snapshot), then sees a competing connection
     COMMIT, then tries to WRITE, fails the snapshot-to-write upgrade and
@@ -322,7 +325,7 @@ def test_busy_timeout_does_not_absorb_busy_snapshot(ns):
             reader.execute(
                 "UPDATE weekly_usage_snapshots SET weekly_percent = 99"
             )
-        # Instant raise: busy_timeout (5s) did NOT delay it.
+        # Instant raise: busy_timeout (15s) did NOT delay it.
         assert time.monotonic() - start < 1.0
     finally:
         try:

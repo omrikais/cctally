@@ -27,7 +27,7 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13']
     env:
-      CCTALLY_TEST_JOBS: "2"                            # dashboard fixture servers need port-print headroom
+      CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2, release auto-capped via the runner (#292)
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:

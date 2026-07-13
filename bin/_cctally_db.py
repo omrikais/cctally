@@ -5453,3 +5453,66 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         return 0
     finally:
         conn.close()
+
+
+def cmd_db_checkpoint(args: argparse.Namespace) -> int:
+    """Fast, non-destructive WAL drain (TRUNCATE checkpoint) for cache.db /
+    stats.db (#297).
+
+    Opens a RAW existing-file-only connection — NOT open_cache_db()/open_db(),
+    which apply schema, run the migration dispatcher, can DELETE Codex rows on a
+    column-add, and CREATE a missing DB; a checkpoint may do none of those.
+    Precedent: cmd_db_recover's raw connect above. It flushes WAL frames into
+    the main DB and truncates the -wal file — it changes no data, no schema, no
+    user_version — so there is no prod guard and no --yes.
+
+    Exit 0 when drained / already-small / the DB is absent; 3 (staged) if the
+    target stayed busy or was not fully truncated through the timeout — an
+    actionable "something is still holding it" signal.
+    """
+    import _cctally_cache
+    from _lib_json_envelope import stamp_schema_version
+
+    which = args.db  # "cache" | "stats"
+    if which == "cache":
+        path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
+    else:
+        path, label = _cctally_core.DB_PATH, "stats.db"
+    timeout = int(getattr(args, "busy_timeout_ms", None)
+                  or _cctally_cache.CHECKPOINT_CMD_BUSY_TIMEOUT_MS)
+    as_json = bool(getattr(args, "json", False))
+
+    # Absent file → nothing to drain; a missing re-derivable cache is not an
+    # error (mirrors cmd_db_recover / cmd_db_unskip). Do NOT connect — mode=rw
+    # would refuse to create it, but skip it entirely for a clean message.
+    if not path.exists():
+        if as_json:
+            payload = {"db": label, "walBytesBefore": 0, "walBytesAfter": 0,
+                       "framesCheckpointed": 0, "busy": False, "truncated": True,
+                       "present": False}
+            print(json.dumps(stamp_schema_version(payload, version=1)))
+        else:
+            print(f"cctally: no {label} database file present; nothing to drain.")
+        return 0
+
+    conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={timeout}")
+        result = _cctally_cache._run_wal_truncate(conn, path, db_label=label)
+    finally:
+        conn.close()
+
+    if as_json:
+        payload = {"db": result.db, "walBytesBefore": result.wal_bytes_before,
+                   "walBytesAfter": result.wal_bytes_after,
+                   "framesCheckpointed": result.frames_checkpointed,
+                   "busy": result.busy, "truncated": result.truncated,
+                   "present": True}
+        print(json.dumps(stamp_schema_version(payload, version=1)))
+    else:
+        mb_b = result.wal_bytes_before / (1024 * 1024)
+        mb_a = result.wal_bytes_after / (1024 * 1024)
+        state = "drained" if result.truncated else ("still busy" if result.busy else "partial")
+        print(f"cctally: {result.db} WAL {mb_b:.1f} MB -> {mb_a:.1f} MB "
+              f"({result.frames_checkpointed} frames; {state}).")
+    return 0 if result.truncated else 3

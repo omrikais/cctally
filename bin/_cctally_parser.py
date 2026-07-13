@@ -2576,6 +2576,29 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Required for --db stats (non-re-derivable; may need a re-record)",
     )
     db_recover.set_defaults(func=c.cmd_db_recover)
+    db_checkpoint = db_sub.add_parser(
+        "checkpoint",
+        help="Drain the WAL (TRUNCATE checkpoint) — fast, non-destructive",
+    )
+    db_checkpoint.add_argument(
+        "--db",
+        choices=("cache", "stats"),
+        default="cache",
+        help="Which DB to checkpoint (default: cache)",
+    )
+    db_checkpoint.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON to stdout",
+    )
+    db_checkpoint.add_argument(
+        "--busy-timeout-ms",
+        dest="busy_timeout_ms",
+        type=int,
+        default=15000,
+        help=argparse.SUPPRESS,
+    )
+    db_checkpoint.set_defaults(func=c.cmd_db_checkpoint)
 
 def _build_doctor_parser(subparsers, name, *, help_text, xref=None):
     """Build the `doctor` parser (registered via _REGISTRATION; #279 S6 W3).

@@ -1,7 +1,7 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Four actions: `status`, `skip`,
-`unskip`, `recover`.
+Migration / DB-management subcommand. Five actions: `status`, `skip`,
+`unskip`, `recover`, `checkpoint`.
 
 ## Synopsis
 
@@ -10,6 +10,7 @@ cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
 cctally db recover --db {cache,stats} [--yes]
+cctally db checkpoint [--db {cache,stats}] [--json]
 ```
 
 ## Description
@@ -137,6 +138,58 @@ no-op when the DB is not ahead.
 without `--yes` while the DB is ahead, **or** the #146 prod guard
 refused a dev-checkout recovery of the real prod stats.db.
 
+## `cctally db checkpoint [--db {cache,stats}] [--json]`
+
+Fast, non-destructive WAL drain (issue #297). Runs a single `PRAGMA
+wal_checkpoint(TRUNCATE)` to flush the write-ahead-log frames into the
+main DB and shrink the `-wal` file back to zero. It does **not** do a
+full ingest walk (the distinction from `cache-sync`, and why it still
+works when the syncs themselves are what's wedged), changes no data, no
+schema, and no `user_version`.
+
+The recurring symptom this fixes: during a heavy multi-agent session the
+`cache.db-wal` file ratchets up to multi-GB and never shrinks, making
+every write crawl past the busy timeout so `cctally` commands fail with
+`Error: database is locked`. In normal operation the WAL cap
+(`PRAGMA journal_size_limit`) plus a forced end-of-sync checkpoint keep
+the WAL contained; this command is the manual escape hatch and the
+`doctor` `cache.db WAL size` remediation for a pathological case.
+
+It opens the target via a **raw existing-file-only** connection
+(`sqlite3.connect("file:<path>?mode=rw", uri=True)`, guarded by an
+`exists()` check) — explicitly **not** `open_cache_db()` / `open_db()`,
+which apply schema, run the migration dispatcher, can delete Codex rows,
+and would create a missing DB. It relies on SQLite's own file locking
+plus a 15 s `busy_timeout`; it is **best-effort** — if a reader/writer
+holds the target off past the timeout it reports `busy` rather than
+hanging. There is **no prod guard and no `--yes`** — a checkpoint is safe
+from any instance (a dev checkout drains the dev data dir; the installed
+binary drains prod).
+
+| Flag | Description |
+| --- | --- |
+| `--db {cache,stats}` | Which DB to drain. Default **`cache`** (the DB that bloats, and the re-derivable one). No `--db all`. |
+| `--json` | Emit a `schemaVersion: 1` envelope instead of text. |
+
+- **`truncated`** = the checkpoint reset the WAL (`busy=0`) **and** the
+  `-wal` file is now zero-length/absent. A checkpoint can copy some
+  frames yet still report `busy=1` (partial) — that is **not**
+  `truncated`.
+- **Missing target DB** → exit `0` with `no <db> database file present;
+  nothing to drain` (a missing re-derivable cache is not an error). The
+  raw connect never creates the file.
+
+### `--json` fields
+
+`schemaVersion` (always first), `db`, `walBytesBefore`, `walBytesAfter`,
+`framesCheckpointed`, `busy`, `truncated`, `present`.
+
+### Exit codes
+
+`0` drained, already-small, or DB absent; `3` (staged) the target stayed
+`busy` / the WAL was not fully truncated through the timeout — an
+actionable "something is still holding it" signal.
+
 ## Notes
 
 - **Failure recovery.** A failed migration writes a block to
@@ -149,10 +202,10 @@ refused a dev-checkout recovery of the real prod stats.db.
   migrations. Per-migration transactional safety inside `BEGIN`/`COMMIT`
   handles partial-failure rollback; full reversibility is not a goal.
 - **Banner suppression.** `db status` / `db skip` / `db unskip` /
-  `db recover` self-suppress the migration-error banner (the `db`
-  namespace shows failure state in its own output or is mid-fix). Other
-  interactive commands continue to render the banner when failures are
-  pending.
+  `db recover` / `db checkpoint` self-suppress the migration-error banner
+  (the whole `db` namespace shows failure state in its own output or is
+  mid-fix). Other interactive commands continue to render the banner when
+  failures are pending.
 - **`db status` is read-only and uses raw `sqlite3.connect()`.** It
   does NOT go through `open_db()` / `open_cache_db()`, and therefore
   does NOT trigger the migration dispatcher on this invocation.

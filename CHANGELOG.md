@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.68.0] - 2026-07-13
+
+### Added
+- `cctally db checkpoint [--db {cache,stats}] [--json]` — fast, non-destructive WAL drain (TRUNCATE checkpoint) for cache.db/stats.db; the manual escape hatch and the `doctor` remediation for a bloated write-ahead log. (#297)
+
+### Changed
+- `cctally-test-all`: faster full-suite runs — `reconcile` now runs inside the parallel pool instead of as a serial barrier, and a three-role worker model (`CCTALLY_TEST_JOBS` outer budget + derived/overridable `CCTALLY_INNER_JOBS` / `CCTALLY_PYTEST_JOBS`) caps the nested per-harness fan-out that made individual harnesses 2–8× slower under load. Adds a slowest-harness timing report. (#292)
+- `doctor` gains a read-only `cache.db WAL size` check that warns when the WAL exceeds 256 MB and points to `cctally db checkpoint`. (#297)
+
+### Fixed
+- Prevent the cache.db write-ahead log from bloating to multi-GB under heavy concurrent multi-agent syncs, which surfaced as `Error: database is locked` on every `cctally` command — cap the WAL file (`PRAGMA journal_size_limit`), force a best-effort TRUNCATE checkpoint at end-of-sync, and raise `busy_timeout` from 5s to 15s. Existing bloated caches self-heal on the next sync (or run `cctally db checkpoint`). (#297)
+
 ## [1.67.1] - 2026-07-12
 
 ### Fixed

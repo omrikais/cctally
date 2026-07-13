@@ -1,85 +1,148 @@
 #!/usr/bin/env bash
 # Aggregate golden-file harness runner.
 #
-# Phase 1 — parallel: per-command harnesses run concurrently. Each one
-# uses its own mktemp -d scratch dir (the harness scratch-dir pattern
-# documented in CLAUDE.md), so they're concurrent-safe.
-# Phase 2 — serial: reconcile-test runs last, after all other harnesses
-# have finished, so any cross-harness fixture state is settled.
-# Continues on per-harness failure to give maximum coverage in the
-# summary. Exits non-zero iff any harness had any failure.
+# Concurrency model (issue #292): three roles resolved from CCTALLY_TEST_JOBS
+# (the outer harness-pool budget — backward-compatible meaning):
+#   OUTER  — xargs -P width of the shell-harness pool.
+#   INNER  — per-harness inner fan-out cap, passed into each harness's env
+#            (config/dashboard/update read CCTALLY_TEST_JOBS; release reads
+#            CCTALLY_RELEASE_TEST_JOBS). Prevents the B^2 nesting where B
+#            outer harnesses each spawn B (or, for release, nproc) inner
+#            workers.
+#   PYTEST — pytest-xdist worker count for the solo, post-pool pytest phase.
+# Unset, OUTER auto-tunes below the core count (round(NCPU*0.45)) to stop the
+# pool oversubscribing; PYTEST keeps the full core count because pytest runs
+# alone after the pool. Explicit CCTALLY_TEST_JOBS=B preserves today's
+# behavior (OUTER=PYTEST=B). Each role has an explicit override:
+# CCTALLY_OUTER_JOBS / CCTALLY_INNER_JOBS / CCTALLY_PYTEST_JOBS.
+# CCTALLY_TEST_JOBS=1 forces fully serial (1/1/1).
 #
-# Concurrency cap: CCTALLY_TEST_JOBS env var, defaulting to the host's
-# CPU count. Use CCTALLY_TEST_JOBS=1 to force serial behavior (e.g. for
-# debugging a flaky harness or constrained CI).
+# reconcile runs INSIDE the pool (its build fixtures are scratch-built; it
+# opens tests/fixtures/projects read-only and no suite harness rewrites that
+# dir). pytest runs AFTER the pool completes, solo — NO overlap (a pytest/
+# pool overlap races in-place fixture rebuilds; deferred, see the #292 spec).
+# Continues on per-harness failure for maximum coverage; exits non-zero iff
+# any harness or pytest had any failure.
+#
+# CCTALLY_TEST_ALL_PLAN=1 prints the resolved plan and exits 0 without running
+# anything (test seam). CCTALLY_TEST_ALL_FAKE_NCPU pins the core count for
+# deterministic plan tests.
 
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-default_jobs() {
+# ---- worker-budget resolution ------------------------------------------
+
+# A non-empty worker var must be a positive integer, else exit 2 (a bad value
+# like 0 would make xargs -P 0 spawn unbounded workers). Empty = unset.
+_require_pos_int_or_empty() {
+    local name=$1 val=$2
+    [ -z "$val" ] && return 0
+    case "$val" in
+        *[!0-9]*|'')
+            echo "cctally-test-all: $name must be a positive integer (got: '$val')" >&2
+            exit 2 ;;
+    esac
+    if [ "$val" -lt 1 ]; then
+        echo "cctally-test-all: $name must be >= 1 (got: '$val')" >&2
+        exit 2
+    fi
+}
+_require_pos_int_or_empty CCTALLY_TEST_JOBS         "${CCTALLY_TEST_JOBS:-}"
+_require_pos_int_or_empty CCTALLY_OUTER_JOBS        "${CCTALLY_OUTER_JOBS:-}"
+_require_pos_int_or_empty CCTALLY_INNER_JOBS        "${CCTALLY_INNER_JOBS:-}"
+_require_pos_int_or_empty CCTALLY_PYTEST_JOBS       "${CCTALLY_PYTEST_JOBS:-}"
+_require_pos_int_or_empty CCTALLY_TEST_ALL_FAKE_NCPU "${CCTALLY_TEST_ALL_FAKE_NCPU:-}"
+
+_detect_ncpu() {
     local n
     n=$(sysctl -n hw.ncpu 2>/dev/null) || n=$(nproc 2>/dev/null) || n=4
     echo "$n"
 }
-JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
+NCPU=${CCTALLY_TEST_ALL_FAKE_NCPU:-$(_detect_ncpu)}
 
-# Backstop: also export for the whole suite run so any harness that somehow
-# lacks the preamble still behaves. NOT a substitute for per-harness
-# sourcing — tests/test_harness_dev_autodetect_coverage.py enforces that,
-# because this backstop would otherwise mask a missing source on direct runs.
+_clamp() {  # _clamp value lo hi
+    local v=$1 lo=$2 hi=$3
+    [ "$v" -lt "$lo" ] && v=$lo
+    [ "$v" -gt "$hi" ] && v=$hi
+    echo "$v"
+}
+
+if [ -n "${CCTALLY_TEST_JOBS:-}" ]; then
+    # Explicit budget: today's meaning — outer and pytest both = budget.
+    BUDGET=$CCTALLY_TEST_JOBS
+    OUTER_default=$BUDGET
+    PYTEST_default=$BUDGET
+else
+    # Unset: auto-tune OUTER below the core count; pytest (solo) gets the lot.
+    BUDGET=$NCPU
+    lo=2; [ "$NCPU" -lt 2 ] && lo=$NCPU
+    OUTER_default=$(_clamp "$(( (9 * NCPU + 10) / 20 ))" "$lo" "$NCPU")  # round(NCPU*0.45)
+    PYTEST_default=$NCPU
+fi
+OUTER=${CCTALLY_OUTER_JOBS:-$OUTER_default}
+# INNER derived AFTER OUTER is final: min(4, OUTER) (the measured knee; <= OUTER
+# so budget=1 stays fully serial). Explicit CCTALLY_INNER_JOBS overrides.
+inner_cap=4; [ "$OUTER" -lt 4 ] && inner_cap=$OUTER
+INNER=${CCTALLY_INNER_JOBS:-$inner_cap}
+PYTEST=${CCTALLY_PYTEST_JOBS:-$PYTEST_default}
+
+# Backstop dev-autodetect suppressor for the whole suite run (see the
+# tests/test_harness_dev_autodetect_coverage.py note: NOT a substitute for
+# per-harness sourcing).
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
 
-# Phase 2: must run after parallel_harnesses (reads cross-harness state).
+# ---- harness discovery (read-only; safe in plan mode) ------------------
+# reconcile is kept in final_harnesses ONLY as a summary-ordering device so it
+# stays the last row; it now runs inside the pool, not as a serial phase.
 final_harnesses=(reconcile)
-
-# Phase 1: parallel-safe harnesses, glob-discovered.
-# Glob over bin/cctally-*-test and strip the `cctally-` prefix and `-test`
-# suffix. Any harness present on disk (other than this aggregator and the
-# Phase 2 finals) is run in Phase 1. Default shell glob ordering is
-# alphabetical, so output stays deterministic.
-#
-# Why glob instead of a hardcoded list: the same file content needs to
-# work in both the private repo (which has cctally-mirror-public-test)
-# and the public mirror (which doesn't, since the mirror-public tooling
-# is private-only). A glob picks up exactly what's present in each clone.
-# New harnesses (e.g. cctally-subgroup-test, issue #86;
-# cctally-conversation-test, Plan 2 conversation endpoints) are
-# auto-discovered here once `chmod +x`'d — no edit to this list is needed.
 parallel_harnesses=()
 final_set=" ${final_harnesses[*]} "
 for path in "$REPO_ROOT"/bin/cctally-*-test; do
     [ -x "$path" ] || continue
     base=$(basename "$path")
     [ "$base" = "cctally-test-all" ] && continue
-    # Strip leading `cctally-` and trailing `-test`.
     name=${base#cctally-}
     name=${name%-test}
-    # Skip Phase 2 entries — they're added at the tail.
     case "$final_set" in *" $name "*) continue ;; esac
     parallel_harnesses+=("$name")
 done
 all_harnesses=("${parallel_harnesses[@]}" "${final_harnesses[@]}")
 
+# ---- plan mode: emit the resolved plan and exit before ANY side effect --
+if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
+    printf 'ncpu=%s\n'   "$NCPU"
+    printf 'budget=%s\n' "$BUDGET"
+    printf 'outer=%s\n'  "$OUTER"
+    printf 'inner=%s\n'  "$INNER"
+    printf 'pytest=%s\n' "$PYTEST"
+    printf 'reconcile_in_pool=1\n'
+    printf 'harnesses=%s\n' "${all_harnesses[*]}"
+    exit 0
+fi
+
 LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
 trap 'rm -rf "$LOGDIR"' EXIT
 
 run_one() {
-    local h=$1
-    "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1 || true
+    local h=$1 start=$SECONDS
+    # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update
+    # read CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS. INNER
+    # is exported below so it is non-empty in this xargs-spawned subshell.
+    env CCTALLY_TEST_JOBS="$INNER" CCTALLY_RELEASE_TEST_JOBS="$INNER" \
+        "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1 || true
+    echo "$((SECONDS - start))" > "$LOGDIR/${h}.time"  # one file per harness
 }
 export -f run_one
-export REPO_ROOT LOGDIR
+export REPO_ROOT LOGDIR INNER
 
-# Phase 1: parallel via xargs -P. Each invocation forks one bash to run a
-# single harness; -I {} substitutes the harness name as the argv.
-printf '%s\n' "${parallel_harnesses[@]}" \
-    | xargs -P "$JOBS" -I {} bash -c 'run_one "$@"' _ {}
-
-# Phase 2: serial.
-for h in "${final_harnesses[@]}"; do
-    run_one "$h"
-done
+# Shell-harness pool (reconcile included; no serial phase). xargs -I {} runs
+# one bash per harness; -P "$OUTER" bounds concurrency.
+pool_start=$SECONDS
+printf '%s\n' "${all_harnesses[@]}" \
+    | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {}
+pool_wall=$((SECONDS - pool_start))
 
 # Aggregate in original harness order so output stays deterministic
 # regardless of which harness finished first under parallelism.
@@ -119,41 +182,30 @@ for h in "${all_harnesses[@]}"; do
     fi
 done
 
-# Phase 3: pytest tests/ (skipped if pytest unavailable). Runs after the
-# golden-file harnesses so any cross-harness state is settled before the
-# Python suite executes. When pytest-xdist is importable (declared in
-# tests/requirements-dev.txt as an optional dev dep), pass `-n "$JOBS"`
-# so the suite fans out across workers honoring the same concurrency
-# cap as the harness phase. Falls back to serial silently if xdist is
-# not installed — the suite still runs, just slower (~30s vs ~6s on
-# this machine).
+# pytest tests/ (solo, after the pool; skipped if pytest unavailable). When
+# pytest-xdist is importable, pass -n "$PYTEST" (its own decoupled worker
+# count — pytest has the whole machine to itself here). Falls back to serial
+# silently if xdist is absent.
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
+pytest_wall=0
 if python3 -m pytest --version >/dev/null 2>&1; then
     pytest_log="$LOGDIR/pytest.log"
-    # -rfE forces pytest's "short test summary info" section to emit the
-    # `FAILED path::test` / `ERROR path::test` node IDs on every run,
-    # independent of any future repo-level pytest `-r` config. Issue #141:
-    # a Phase-3 flake under `-n "$JOBS"` xdist parallelism is otherwise
-    # undiagnosable — the node ID lived only in the stderr dump below, which
-    # is interleaved with the 40+ harness streams and gets rm -rf'd on EXIT.
-    # We both keep the full stderr dump AND hoist the node IDs into the
-    # deterministic summary block (which survives `| tail`).
+    # -rfE forces the "short test summary info" section to emit FAILED/ERROR
+    # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
+    # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
     pytest_args=(tests/ -q -rfE)
     if python3 -c 'import xdist' >/dev/null 2>&1; then
-        pytest_args+=(-n "$JOBS")
+        pytest_args+=(-n "$PYTEST")
     fi
-    # pytest-timeout, optional-by-detection (mirrors the xdist pattern above):
-    # a hung test wedges the whole suite (and, in CI, a job for GitHub's default
-    # 6h) with no signal. When the plugin is importable, cap every test at
-    # CCTALLY_PYTEST_TIMEOUT seconds (default 120 — generous headroom for the
-    # self-hosted runner) with the thread method so a wedged C call / uncatchable
-    # loop still trips it. Absence falls back to today's behavior exactly (no
-    # flag, byte-compatible for direct pytest users) — the runtime CLI stays
-    # stdlib-only and the plugin is a test-time optional dep.
+    # pytest-timeout, optional-by-detection: a hung test otherwise wedges the
+    # whole suite (and, in CI, a job for GitHub's default 6h). Thread method so
+    # a wedged C call / uncatchable loop still trips it. Absent => today's
+    # behavior exactly (no flag).
     if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
         pytest_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
     fi
+    pytest_start=$SECONDS
     if (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1; then
         pytest_status="PASS"
     else
@@ -161,19 +213,15 @@ if python3 -m pytest --version >/dev/null 2>&1; then
         total_fail=$((total_fail + 1))
         echo "---- pytest FAIL details ----" >&2
         cat "$pytest_log" >&2
-        # Hoist the failing node IDs out of the (truncatable, interleaved)
-        # stderr dump so the deterministic summary block below names the
-        # exact test(s) that failed — the next flake is then filable.
         pytest_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_log" || true)
     fi
+    pytest_wall=$((SECONDS - pytest_start))
 fi
 
 echo "----"
 for row in "${rows[@]}"; do echo "$row"; done
 printf '%5s   %s\n' "$pytest_status" "pytest"
 if [ "$pytest_status" = "FAIL" ]; then
-    # Name the failing test(s) right here in the always-printed summary so a
-    # flake is filable from the summary alone (issue #141).
     if [ -n "$pytest_failed_nodes" ]; then
         echo "pytest failing node ids:"
         while IFS= read -r node; do echo "  $node"; done <<< "$pytest_failed_nodes"
@@ -181,5 +229,19 @@ if [ "$pytest_status" = "FAIL" ]; then
         echo "pytest failing node ids: (none parsed — likely a pytest INTERNALERROR or a truncated/missing log; see '---- pytest FAIL details ----' on stderr)"
     fi
 fi
-echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (jobs=$JOBS)"
+echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (outer=$OUTER inner=$INNER pytest=$PYTEST)"
+
+# ---- timing section (does not perturb the deterministic rows above) ----
+echo "----"
+echo "Timing: total=${SECONDS}s  shell-pool=${pool_wall}s  pytest=${pytest_wall}s  (outer=$OUTER inner=$INNER pytest=$PYTEST)"
+echo "Slowest harnesses:"
+{
+    for h in "${all_harnesses[@]}"; do
+        t=$(cat "$LOGDIR/${h}.time" 2>/dev/null || echo 0)
+        printf '%s %s\n' "$t" "$h"
+    done
+} | sort -rn | head -10 | while read -r t h; do
+    printf '  %4ss  %s\n' "$t" "$h"
+done
+
 [ "$total_fail" -eq 0 ]

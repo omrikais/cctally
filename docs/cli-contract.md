@@ -22,6 +22,7 @@ cctally exit codes fall into three groups.
 | `alerts test` | `1` notifier binary missing · `2` `--threshold` out of range · `3` other spawn error |
 | `db skip` / `db unskip` | `1` unknown name / already-applied · `2` ambiguous bare name |
 | `db recover` | `2` `--db stats` without `--yes`, or prod-guard refusal |
+| `db checkpoint` | `3` the target DB stayed busy / the WAL was not fully truncated through the timeout (`0` = drained, already-small, or DB absent) |
 | `tui` | `1` fatal (missing `rich`, narrow terminal, renderer crash) · `2` argument error |
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |
 | share surface | `2` flag-combo error · `3` output-filename collision exhaustion |

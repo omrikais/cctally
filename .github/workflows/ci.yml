@@ -64,13 +64,13 @@ jobs:
           # doesn't shadow it. Also drop the runner's tool-cache entries
           # that some Actions toolchains inject ahead of brew.
           PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-          # Cap the parallel-harness fan-out below the Mac Studio's core
-          # count. cctally-test-all defaults to nproc (10 cores here), and
-          # at jobs=10 several harnesses spawn enough child cctally
-          # processes that `dashboard` fixture servers can't print their
-          # port within the harness's wait window. Four leaves headroom
-          # for the maintainer's other workloads on the same machine.
+          # Cap the OUTER parallel-harness fan-out below the Mac Studio's core
+          # count. cctally-test-all keeps CCTALLY_TEST_JOBS as the outer pool
+          # budget; the derived inner cap (min(4,outer)=4 here) is pinned lower
+          # so dashboard fixture servers keep port-print headroom and `release`
+          # no longer fans out to full nproc (#292). pytest still runs solo.
           CCTALLY_TEST_JOBS: "4"
+          CCTALLY_INNER_JOBS: "2"
         run: |
           set -e
           python3 --version
@@ -198,7 +198,7 @@ jobs:
       group: test-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
-      CCTALLY_TEST_JOBS: "2"                            # dashboard fixture servers need port-print headroom
+      CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2 (release auto-capped via the runner) — no explicit CCTALLY_INNER_JOBS needed (#292)
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:

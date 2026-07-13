@@ -194,6 +194,11 @@ class DoctorState:
     # (name -> True held / False free / None unreadable). Probe never
     # creates files (doctor read-only contract). None = probe errored.
     locks_held: Optional[dict] = None
+    # #297: size in bytes of cache.db-wal, gathered read-only in
+    # doctor_gather_state (getsize, OSError/absent -> None). Warns above
+    # DOCTOR_WAL_WARN_BYTES (2x the WAL cap) — only when the journal_size_limit
+    # + forced-checkpoint machinery has genuinely failed to contain the WAL.
+    cache_db_wal_bytes: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1340,6 +1345,36 @@ def _check_db_lock_state(s: DoctorState) -> CheckResult:
     )
 
 
+# #297: WARN when cache.db-wal exceeds 2x the Section 1 cap (128 MiB), so this
+# only fires when the journal_size_limit + forced-checkpoint machinery has
+# genuinely failed to contain the WAL — never in normal operation.
+DOCTOR_WAL_WARN_BYTES = 256 * 1024 * 1024  # 268435456
+
+
+def _check_db_wal_size(s: DoctorState) -> CheckResult:
+    """Read-only backstop that makes a genuine cache.db WAL wedge visible and
+    points at `cctally db checkpoint` (#297).
+
+    The exact byte count lives ONLY in the (fingerprint-excluded) details block;
+    the summary stays a stable string so a below-threshold byte count that
+    drifts tick-to-tick does not flip the doctor fingerprint — only an OK<->WARN
+    crossing does.
+    """
+    wal = s.cache_db_wal_bytes
+    details = {"cache_db_wal_bytes": wal}
+    if isinstance(wal, int) and wal > DOCTOR_WAL_WARN_BYTES:
+        return CheckResult(
+            id="db.wal_size", title="cache.db WAL size", severity="warn",
+            summary="oversized — cache.db WAL far above its cap",
+            remediation="Run `cctally db checkpoint` to drain the WAL.",
+            details=details,
+        )
+    return CheckResult(
+        id="db.wal_size", title="cache.db WAL size", severity="ok",
+        summary="within limit", remediation=None, details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1370,6 +1405,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.migrations.applied", "_check_db_migrations_applied"),
         ("db.migrations.pending", "_check_db_migrations_pending"),
         ("db.lock_state", "_check_db_lock_state"),
+        ("db.wal_size", "_check_db_wal_size"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),

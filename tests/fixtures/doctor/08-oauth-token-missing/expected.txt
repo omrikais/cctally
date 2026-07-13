@@ -26,6 +26,7 @@ Database
   ⚠ Pending migrations       33 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
+  ✓ cache.db WAL size        within limit
 Data
   ✓ Latest snapshot          2s ago
   ✓ Claude cache             0 entries (no JSONL corpus)
@@ -46,4 +47,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 22 OK · 7 WARN · 1 FAIL
+Summary: 23 OK · 7 WARN · 1 FAIL

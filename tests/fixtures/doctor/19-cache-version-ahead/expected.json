@@ -373,6 +373,15 @@
                     "severity": "ok",
                     "summary": "free",
                     "title": "Locks"
+                },
+                {
+                    "details": {
+                        "cache_db_wal_bytes": 0
+                    },
+                    "id": "db.wal_size",
+                    "severity": "ok",
+                    "summary": "within limit",
+                    "title": "cache.db WAL size"
                 }
             ],
             "id": "db",
@@ -548,7 +557,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 25,
+            "ok": 26,
             "warn": 5
         },
         "severity": "warn"

@@ -61,6 +61,8 @@ def test_doctor_state_has_required_fields():
         "parse_health_claude", "parse_health_codex",
         "stats_db_quick_check", "cache_db_quick_check",
         "locks_held",
+        # #297: read-only cache.db WAL-size backstop.
+        "cache_db_wal_bytes",
     }
     assert fields == expected, fields ^ expected
 
