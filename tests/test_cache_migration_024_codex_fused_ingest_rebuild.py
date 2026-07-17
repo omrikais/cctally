@@ -208,14 +208,14 @@ def _assert_pre_migration_scope_unchanged(conn: sqlite3.Connection) -> None:
 
 def test_cache_registry_024_is_contiguous_after_023(tmp_path, monkeypatch):
     _ns, db, _core = _seed_existing_cache(tmp_path, monkeypatch)
-    assert [migration.name for migration in db._CACHE_MIGRATIONS][-3:] == [
-        BEFORE_PREDECESSOR,
-        PREDECESSOR,
-        MIGRATION,
-    ]
-    assert db._CACHE_MIGRATIONS[-3].seq == 22
-    assert db._CACHE_MIGRATIONS[-2].seq == 23
-    assert db._CACHE_MIGRATIONS[-1].seq == 24
+    # 024 is no longer last (S6 appended 025); locate it and assert its
+    # immediate predecessors + seq.
+    names = [migration.name for migration in db._CACHE_MIGRATIONS]
+    idx = names.index(MIGRATION)
+    assert names[idx - 2:idx + 1] == [BEFORE_PREDECESSOR, PREDECESSOR, MIGRATION]
+    assert db._CACHE_MIGRATIONS[idx - 2].seq == 22
+    assert db._CACHE_MIGRATIONS[idx - 1].seq == 23
+    assert db._CACHE_MIGRATIONS[idx].seq == 24
 
 
 def test_024_handler_clears_only_codex_and_is_idempotent_before_central_stamp(
@@ -255,7 +255,8 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 24
+        # S6 appended migration 025, so the registry head is now 25.
+        assert _version(conn) == 25
     finally:
         conn.close()
 
@@ -284,7 +285,8 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 24
+        # S6 appended migration 025, so the registry head is now 25.
+        assert _version(conn) == 25
     finally:
         conn.close()
 
@@ -314,7 +316,8 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 24
+        # S6 appended migration 025, so the registry head is now 25.
+        assert _version(conn) == 25
     finally:
         conn.close()
 

@@ -876,7 +876,16 @@ def _run_pending_migrations(
             # absent must still be treated as non-fresh so a flag-only
             # conversation migration's consumer actually runs (e.g. 011's
             # command-args promotion) instead of being stamped without it.
-            "cache.db": ("session_entries", "conversation_messages"),
+            # codex_conversation_events joins them (#294 S6): a Codex-bearing
+            # cache written by S1's fused ingest but missing schema_migrations
+            # would otherwise be classified fresh and stamp 025 WITHOUT replaying
+            # normalization, leaving the read kernels authoritative over an empty
+            # normalized corpus. Probing it forces 025's handler to run and derive
+            # the normalized rows from the retained events.
+            "cache.db": (
+                "session_entries", "conversation_messages",
+                "codex_conversation_events",
+            ),
         }.get(db_label, ())
         for probe_table in probe_tables:
             # _probe_table_nonempty centralizes the "is there data here?"
@@ -2621,6 +2630,81 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_codex_events_timestamp
             ON codex_conversation_events(timestamp_utc);
 
+        -- #294 S6: normalized Codex conversation storage. Like the S1 tables
+        -- above, these live in the UNCONDITIONAL base-schema script — before the
+        -- legacy-FTS topology checks below — so an existing cache gains them on
+        -- every open. The independent Codex FTS layer
+        -- (_apply_codex_conversation_fts) stands up codex_conversation_fts + its
+        -- own triggers separately, BEFORE the Claude legacy-FTS early-return, so
+        -- a legacy-shape Claude cache still gets the Codex search index.
+        --
+        -- codex_conversation_messages: one normalized row per NORMALIZED physical
+        -- event (§3.1). ``id`` is a PLAIN rowid alias (deliberately NOT
+        -- AUTOINCREMENT): migration 025 replays inserts in deterministic
+        -- (source_path ASC, line_offset ASC) order, so a repeated run is
+        -- byte-idempotent (no sqlite_sequence drift), while fresh ingest inserts
+        -- in discovery order — fresh-vs-migrated equality is asserted
+        -- SEMANTICALLY (row content modulo id).
+        CREATE TABLE IF NOT EXISTS codex_conversation_messages (
+            id               INTEGER PRIMARY KEY,
+            conversation_key TEXT NOT NULL,
+            source_root_key  TEXT NOT NULL,
+            source_path      TEXT NOT NULL,
+            line_offset      INTEGER NOT NULL,
+            timestamp_utc    TEXT,
+            turn_id          TEXT,
+            call_id          TEXT,
+            kind             TEXT NOT NULL,
+            event_type       TEXT,
+            record_family    TEXT NOT NULL,
+            model            TEXT,
+            text             TEXT,
+            content_digest   TEXT NOT NULL,
+            content_len      INTEGER NOT NULL CHECK(content_len >= 0),
+            detail_json      TEXT,
+            search_tool      TEXT,
+            search_thinking  TEXT,
+            UNIQUE(source_path, line_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_conv_msgs_conversation
+            ON codex_conversation_messages(conversation_key, timestamp_utc, id);
+        CREATE INDEX IF NOT EXISTS idx_codex_conv_msgs_source
+            ON codex_conversation_messages(source_path);
+
+        -- codex_conversation_rollups: browse-rail materialization (§3.2). A pure
+        -- function of surviving codex_conversation_messages (+ thread metadata),
+        -- recomputed-affected-or-deleted after every write/delete path. item_count
+        -- counts rendered LOGICAL items (mirror-paired), not physical rows.
+        CREATE TABLE IF NOT EXISTS codex_conversation_rollups (
+            conversation_key  TEXT NOT NULL PRIMARY KEY,
+            source_root_key   TEXT NOT NULL,
+            parent_thread_id  TEXT,
+            item_count        INTEGER NOT NULL DEFAULT 0,
+            started_utc       TEXT,
+            last_activity_utc TEXT,
+            project_key       TEXT,
+            project_label     TEXT,
+            models_json       TEXT,
+            title             TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_conv_rollups_recent
+            ON codex_conversation_rollups(last_activity_utc DESC, conversation_key DESC);
+
+        -- codex_conversation_file_touches: write-class axis for the `files`
+        -- search kind + outline file stats (§3.3). source_path gives explicit
+        -- lineage so the per-file delete/truncate/prune paths scope deletions
+        -- exactly as they do for the other Codex families.
+        CREATE TABLE IF NOT EXISTS codex_conversation_file_touches (
+            message_id       INTEGER NOT NULL,
+            conversation_key TEXT NOT NULL,
+            source_path      TEXT NOT NULL,
+            file_path        TEXT NOT NULL,
+            tool             TEXT NOT NULL,
+            UNIQUE(message_id, file_path, tool)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_conv_touches_source
+            ON codex_conversation_file_touches(source_path);
+
         CREATE TABLE IF NOT EXISTS cache_meta (
             key   TEXT PRIMARY KEY,
             value TEXT
@@ -2662,6 +2746,10 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "codex_session_files", "last_root_thread_id", "TEXT")
     add_column_if_missing(conn, "codex_session_files", "last_parent_thread_id", "TEXT")
     add_column_if_missing(conn, "codex_session_files", "last_conversation_key", "TEXT")
+    # #294 S6: the terminal sticky-turn seed for delta resumes, alongside the
+    # existing last_model/thread facts. A batch that ends after a turn_context
+    # and resumes with a response_item stamps the correct effective turn.
+    add_column_if_missing(conn, "codex_session_files", "last_turn_id", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_codex_files_source_root "
         "ON codex_session_files(source_root_key)"
@@ -2761,6 +2849,12 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
     )
+    # #294 S6: the independent Codex conversation FTS lifecycle. Run BEFORE (and
+    # independent of) the Claude FTS branch below — the Claude branch early-returns
+    # on a legacy conversation_fts(text) shape, so the Codex index must be stood up
+    # here or a legacy-shape cache would never gain Codex search. Never touches any
+    # Claude FTS object (conv_fts_* / conv_title_fts_*).
+    _apply_codex_conversation_fts(conn)
     # FTS5 is optional in the sqlite build. Create the external-content index +
     # sync triggers as separate executes wrapped in one try; on failure create
     # NEITHER the table NOR the triggers (a trigger referencing a missing table
@@ -3186,6 +3280,142 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('delete-all')")
     _create_conversation_fts_triggers(conn)
+
+
+# ── #294 S6: independent Codex conversation FTS lifecycle (§3.4) ──────────────
+# The Codex normalized search index owns its OWN external-content FTS5 table +
+# AI/AD/AU trigger trio, entirely separate from the Claude conversation_fts /
+# conversation_title_fts objects. _apply_codex_conversation_fts runs from
+# _apply_cache_schema BEFORE the Claude legacy-FTS early-return, so a legacy-shape
+# Claude cache still gains it. The Codex-scoped `codex_fts_unavailable` cache_meta
+# marker is INDEPENDENT of the Claude `fts5_unavailable` marker. Column names
+# match codex_conversation_messages BY NAME (external-content FTS5 rule).
+_CODEX_CONV_FTS_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS codex_conversation_fts USING fts5("
+    "text, search_tool, search_thinking, "
+    "content='codex_conversation_messages', content_rowid='id')"
+)
+# Trigger DDL lives in ONE place so the initial create and the storm-free
+# full-clear (which drops + recreates the trigger set) can never drift. AD/AU use
+# the external-content `'delete'` idiom; AU fires AFTER UPDATE OF the three
+# indexed columns.
+_CODEX_CONV_FTS_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS codex_conv_fts_ai AFTER INSERT ON codex_conversation_messages "
+    "BEGIN INSERT INTO codex_conversation_fts(rowid, text, search_tool, search_thinking) "
+    "VALUES (new.id, new.text, new.search_tool, new.search_thinking); END",
+    "CREATE TRIGGER IF NOT EXISTS codex_conv_fts_ad AFTER DELETE ON codex_conversation_messages "
+    "BEGIN INSERT INTO codex_conversation_fts(codex_conversation_fts, rowid, text, search_tool, search_thinking) "
+    "VALUES('delete', old.id, old.text, old.search_tool, old.search_thinking); END",
+    "CREATE TRIGGER IF NOT EXISTS codex_conv_fts_au "
+    "AFTER UPDATE OF text, search_tool, search_thinking ON codex_conversation_messages "
+    "BEGIN INSERT INTO codex_conversation_fts(codex_conversation_fts, rowid, text, search_tool, search_thinking) "
+    "VALUES('delete', old.id, old.text, old.search_tool, old.search_thinking); "
+    "INSERT INTO codex_conversation_fts(rowid, text, search_tool, search_thinking) "
+    "VALUES (new.id, new.text, new.search_tool, new.search_thinking); END",
+)
+_CODEX_CONV_FTS_TRIGGER_NAMES = ("codex_conv_fts_au", "codex_conv_fts_ad", "codex_conv_fts_ai")
+
+
+def _create_codex_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Create the Codex FTS sync trigger set — idempotent (each ``IF NOT EXISTS``).
+    Single source of truth, shared by ``_apply_codex_conversation_fts`` and the
+    storm-free full-clear. The caller must have already created the vtable."""
+    for stmt in _CODEX_CONV_FTS_TRIGGER_DDL:
+        conn.execute(stmt)
+
+
+def _drop_codex_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Drop the Codex FTS sync trigger set — idempotent (``IF EXISTS``). Swallows
+    ``OperationalError`` per statement so an absent set (FTS5-unavailable build) is
+    tolerated. Dropping these on a no-FTS5 build is what keeps a normalized INSERT
+    from firing a trigger against the missing vtable and rolling back the shared
+    per-file ingest transaction. NEVER touches any Claude FTS trigger."""
+    for name in _CODEX_CONV_FTS_TRIGGER_NAMES:
+        try:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        except sqlite3.OperationalError:
+            pass
+
+
+def _apply_codex_conversation_fts(conn: sqlite3.Connection) -> None:
+    """Stand up / recover / degrade the independent Codex conversation FTS (§3.4).
+
+    Four states: create (FTS5 available, no marker) → codex_conversation_fts +
+    triggers; unavailable-at-creation → set ``codex_fts_unavailable`` + skip DDL;
+    capable→unavailable reopen → drop ONLY the Codex triggers + set the marker;
+    recovery (FTS5 available again, marker set) → drop/recreate the vtable + its
+    triggers, ``rebuild`` from the base rows, clear the marker. Never touches any
+    Claude FTS object."""
+    if _fts5_available(conn):
+        recovering = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='codex_fts_unavailable'"
+        ).fetchone() is not None
+        try:
+            if recovering:
+                # A prior FTS5-unavailable run ingested normalized rows without a
+                # live trigger (or a capable→unavailable→capable cycle left a stale
+                # vtable). Drop + recreate the index and its triggers, then rebuild
+                # from the base rows.
+                _drop_codex_conversation_fts_triggers(conn)
+                conn.execute("DROP TABLE IF EXISTS codex_conversation_fts")
+            conn.execute(_CODEX_CONV_FTS_DDL)
+            _create_codex_conversation_fts_triggers(conn)
+            if recovering:
+                conn.execute(
+                    "INSERT INTO codex_conversation_fts(codex_conversation_fts) VALUES('rebuild')")
+            conn.execute("DELETE FROM cache_meta WHERE key='codex_fts_unavailable'")
+        except sqlite3.OperationalError:
+            # Partial create cleanup, then mark unavailable so search uses LIKE.
+            _drop_codex_conversation_fts_triggers(conn)
+            try:
+                conn.execute("DROP TABLE IF EXISTS codex_conversation_fts")
+            except sqlite3.OperationalError:
+                pass
+            _set_cache_meta(conn, "codex_fts_unavailable", "1")
+    else:
+        # FTS5 unavailable on THIS build. If a prior capable run left the Codex
+        # triggers, they now reference an unusable vtable and every normalized
+        # INSERT would fail and roll back the shared per-file transaction — so
+        # drop ONLY the Codex triggers (the vtable can't be dropped without fts5,
+        # but with no triggers nothing writes to it) and mark unavailable.
+        _drop_codex_conversation_fts_triggers(conn)
+        _set_cache_meta(conn, "codex_fts_unavailable", "1")
+
+
+def _codex_conversation_fts_full_clear(conn: sqlite3.Connection) -> None:
+    """Storm-free FULL clear of every Codex normalized derived table (§3.4).
+
+    Drops the Codex FTS triggers, truncates codex_conversation_messages (the
+    no-trigger fast path), resets the external-content index via ``'delete-all'``,
+    recreates the triggers, then clears file-touches + rollups. ``'delete-all'`` is
+    valid here precisely because the WHOLE normalized corpus empties; the sequence
+    makes repeated runs byte-idempotent at the FTS shadow-table level (migration
+    025 re-run, cache-rebuild). Partial deletes (per-file truncation, root-set
+    orphan prune) MUST NOT use this — they ride the per-row delete triggers so
+    surviving conversations keep their postings. Falls back to a plain base DELETE
+    when FTS5 is unavailable (no triggers, no usable vtable)."""
+    try:
+        fts_unavailable = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='codex_fts_unavailable'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        fts_unavailable = True
+    if fts_unavailable:
+        conn.execute("DELETE FROM codex_conversation_messages")
+    else:
+        _drop_codex_conversation_fts_triggers(conn)
+        conn.execute("DELETE FROM codex_conversation_messages")
+        conn.execute(
+            "INSERT INTO codex_conversation_fts(codex_conversation_fts) VALUES('delete-all')")
+        _create_codex_conversation_fts_triggers(conn)
+    for stmt in (
+        "DELETE FROM codex_conversation_file_touches",
+        "DELETE FROM codex_conversation_rollups",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # table not yet created (pre-schema conn); nothing to clear
 
 
 def _eagerly_apply_cache_migrations() -> None:
@@ -4285,6 +4515,61 @@ def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
             )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+@cache_migration("025_codex_conversation_normalization")
+def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
+    """Derive S6 normalized conversation state for caches whose Codex events were
+    ingested before S6 (#294 S6, §3.5).
+
+    Clears the three derived tables (codex_conversation_messages,
+    codex_conversation_file_touches, codex_conversation_rollups) via the §3.4
+    storm-free full-clear helper, then replays the pure normalization kernel over
+    the stored ``codex_conversation_events`` per file in
+    ``(source_path ASC, line_offset ASC)`` order — rebuilding session_meta /
+    turn_context sticky state as it goes. The physical event log and Codex
+    accounting/thread/quota rows are the replay SOURCE and are never touched.
+
+    Takes ``cache.db.codex.lock`` with the same fcntl-then-``BEGIN IMMEDIATE``
+    order as ``sync_codex_cache``, raising ``MigrationGateNotMet`` on contention
+    (defer, never partially normalize) from both the ordinary and eager cache
+    dispatch paths. Deterministic replay order + the non-AUTOINCREMENT ``id``
+    rowid alias + the storm-free full-clear make a re-run (handler success, crash
+    before the central stamp) byte-idempotent INCLUDING the FTS shadow tables.
+    Never self-stamps; the dispatcher owns ``schema_migrations`` and
+    ``user_version``.
+    """
+    lock_path = _cache_db_codex_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
+                "deferring cache 025 conversation normalization (#294 S6)"
+            )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Full clear of only the DERIVED normalized tables (the event log
+            # remains as the replay source), then re-derive from it.
+            _codex_conversation_fts_full_clear(conn)
+            import _cctally_cache
+            _cctally_cache._replay_codex_normalization(conn)
             conn.commit()
         except Exception:
             conn.rollback()

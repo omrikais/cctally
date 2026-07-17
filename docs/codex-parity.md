@@ -5,8 +5,11 @@ semantics. It does not mean relabeling one provider's data as the other's, or
 inventing a zero value for an unavailable capability. S0 fixed the contract;
 S1 supplies the physical ingest foundation, S2 ships native quota
 interpretation and lifecycle, S4 ships the dashboard's source-aware backend read
-model, and S5 now ships the visible React source selector and source-labelled
-sharing controls over that backend. Native Codex conversations and later
+model, S5 ships the visible React source selector and source-labelled sharing
+controls over that backend, and S6 now ships the Codex conversation
+normalization and assembly kernel layer (title, dedup, item/thread grouping,
+cost attribution, outline, browse/facets, search) behind a provider-neutral
+dispatch. The native Codex conversation routes and UI (S7–S8) and later
 certification remain deferred.
 
 ## S3 provider-aware CLI analytics
@@ -45,9 +48,10 @@ The S3 acceptance rows `source-derived-project-attribution`,
 `source-aware-cli-share-identity`, `report-per-source-never-blended`, and
 `codex-token-reuse-forensics` are supported. `codex-cache-hit-rate-not-applicable`
 remains deliberately not applicable. S4's dashboard backend contract and S5's
-`source-aware-dashboard-share-identity` acceptance row are supported; native
-Codex conversations (S6–S8) and later certification remain deferred, so issue
-#294 is still open.
+`source-aware-dashboard-share-identity` acceptance row are supported; S6 ships
+the Codex conversation normalization/assembly kernel layer, while the native
+conversation routes and UI (S7–S8) and later certification remain deferred, so
+issue #294 is still open.
 
 ## Capability states
 
@@ -83,12 +87,34 @@ physical event, source-derived thread facts, and native quota observations in
 the local protected cache. This is a storage foundation, not a dashboard panel
 or native conversation reader. S2 interprets the retained observations through
 the native `cctally codex quota` commands and setup-managed lifecycle hooks;
-S4 still owns dashboard reconciliation, and S6–S8 still own normalization,
-routes, search, export, sharing, and browser storage.
+S4 still owns dashboard reconciliation, S6 now owns normalization and assembly,
+and S7–S8 still own routes, search, export, sharing, and browser storage.
 
 The cache migration `024_codex_fused_ingest_rebuild` deliberately clears old
 Codex-derived rows so the next local rollout sync can rederive provider-root
 and thread facts without fabricating them from an older accounting-only cache.
+
+## S6 conversation normalization
+
+S6 makes S1's write-only physical corpus readable. Inside the same per-file
+`sync_codex_cache` transaction, a pure normalization kernel maps each buffered
+`codex_conversation_events` batch to normalized message rows, file touches, and
+browse rollups, replayable from the stored events by cache migration
+`025_codex_conversation_normalization`; the normalized corpus gets its own
+external-content FTS index with an independent lifecycle, and an explicit
+`normalization_pending` capability state covers caches whose events predate the
+migration. Provider-neutral assembly kernels then derive the
+first-meaningful-prompt title, digest-exact mirror pairing, canonical rendered
+items with a qualified stable `item_key`, per-turn cost attribution
+reconciling to a priced conversation total under an explicit
+`effective_speed`, thread nesting from
+`thread_source`/parent metadata, outline, browse/facets, and FTS5/LIKE search.
+A thin provider-neutral dispatch routes a bare Claude session id to the
+untouched Claude kernels and an opaque `IdentityV1` conversation key by source,
+mapping both into one neutral envelope family with a source-tagged token union.
+This is a kernel layer with zero user-visible surface: S7 wires the routes,
+transcript CLI, export/anonymization, and live-tail, and S8 ships the React UI
+and reading position. The Claude conversation kernels stay byte-untouched.
 
 ## Capability matrix
 
@@ -173,9 +199,9 @@ boundary for current-week output, and derive drift digests from Codex state.
 | Outcome | Claude | Codex | Owner | Truthful contract |
 | --- | --- | --- | --- | --- |
 | browse, search/facets, reader | supported | deferred | S6–S8 | New routes use opaque qualified conversation keys. |
-| title and outline | supported | deferred | S6 | First meaningful user prompt is the initial Codex title fallback. |
-| tools, reasoning, events | supported | deferred | S6 | Preserve observed provider record distinctions. |
-| thread nesting | supported | deferred | S6 | Use `thread_source`/parent metadata, never an `agent-` filename convention. |
+| title and outline | supported | supported | S6 | First meaningful user prompt is the initial Codex title fallback; the normalization/assembly kernels derive the title and outline. |
+| tools, reasoning, events | supported | supported | S6 | Preserve observed provider record distinctions in the normalized message rows and neutral detail blocks. |
+| thread nesting | supported | supported | S6 | Use `thread_source`/parent metadata, never an `agent-` filename convention. |
 | find, comparison, navigation | supported | deferred | S7–S8 | Session IDs alone are insufficient identities. |
 | reading position | supported | deferred | S8 | `readingPosition.ts` must store an opaque qualified key. |
 | transcript CLI and anonymized/raw export | supported | deferred | S7 | `build_anon_plan_for_db` must include Codex roots and labels. |

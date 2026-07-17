@@ -25,8 +25,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/37 applied
-  ⚠ Pending migrations       37 pending
+  ✓ Migrations               0/38 applied
+  ⚠ Pending migrations       38 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit

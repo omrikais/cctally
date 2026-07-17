@@ -186,7 +186,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 24,
+                            "registry_size": 25,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -230,7 +230,8 @@
                                     "021_index_conversation_messages_cwd",
                                     "022_index_conversation_messages_model",
                                     "023_conversation_sessions_enrichment_columns",
-                                    "024_codex_fused_ingest_rebuild"
+                                    "024_codex_fused_ingest_rebuild",
+                                    "025_codex_conversation_normalization"
                                 ],
                                 "skipped": []
                             },
@@ -258,7 +259,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/37 applied",
+                    "summary": "0/38 applied",
                     "title": "Migrations"
                 },
                 {
@@ -411,13 +412,17 @@
                             [
                                 "cache.db",
                                 "024_codex_fused_ingest_rebuild"
+                            ],
+                            [
+                                "cache.db",
+                                "025_codex_conversation_normalization"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "37 pending",
+                    "summary": "38 pending",
                     "title": "Pending migrations"
                 },
                 {

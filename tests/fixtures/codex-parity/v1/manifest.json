@@ -1531,6 +1531,11 @@
       "change": "Initial synthetic snapshot from issue 294 audit",
       "date": "2026-07-14",
       "version": 1
+    },
+    {
+      "change": "#294 S6 conversation normalization: content-bearing collision roots and nested parent/child, new mirror-pairing / unturned-event-prose / title-wrapper-window scenarios, and a genuine Claude-format seed sharing SHARED_ID.",
+      "date": "2026-07-17",
+      "version": 2
     }
   ],
   "identityFields": [
@@ -1579,6 +1584,7 @@
     "legacy-envelope": "rollouts/legacy-envelope.jsonl",
     "malformed-tail": "rollouts/malformed-tail.jsonl",
     "metadata-only-tail": "rollouts/metadata-only-tail.jsonl",
+    "mirror-pairing": "rollouts/mirror-pairing.jsonl",
     "mixed-source": "rollouts/mixed-source.jsonl",
     "modern-dual-location-conflict": "rollouts/modern-dual-location-conflict.jsonl",
     "modern-full": "rollouts/modern-full.jsonl",
@@ -1592,7 +1598,9 @@
     "root-b-collision": "rollouts/root-b-collision.jsonl",
     "secret-canary": "rollouts/secret-canary.jsonl",
     "stale-cache": "rollouts/stale-cache.jsonl",
-    "unknown-records": "rollouts/unknown-records.jsonl"
+    "title-wrapper-window": "rollouts/title-wrapper-window.jsonl",
+    "unknown-records": "rollouts/unknown-records.jsonl",
+    "unturned-event-prose": "rollouts/unturned-event-prose.jsonl"
   },
   "schemaPosture": {
     "missingRateLimits": "degrade-quota-only",

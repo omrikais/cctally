@@ -618,7 +618,7 @@
     },
     {
       "capability": "conversation-title",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "modern-full"
       ],
@@ -634,7 +634,7 @@
     },
     {
       "capability": "conversation-threading",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "nested-parent",
         "nested-child"

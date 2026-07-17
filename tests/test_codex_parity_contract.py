@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -338,6 +339,12 @@ def test_capability_truth_and_owner_decisions_are_independent_of_builder_constan
         "five-hour-breakdown-per-source": ("S2", "deferred"),
         "codex-refresh-is-local-rollout-reread": ("S2", "unavailable"),
         "codex-local-rollout-quota-freshness": ("S2", "supported"),
+        # #294 S6 conversation normalization kernel layer shipped: the title and
+        # threading rows flip to supported (owner S6); the whole-phase deferral
+        # row stays deferred (S6–S8 may defer independently).
+        "codex-title-first-prompt-fallback": ("S6", "supported"),
+        "codex-threading-uses-thread-metadata": ("S6", "supported"),
+        "conversation-phase-independently-deferrable": ("S6", "deferred"),
     }
     assert {key: (rows[key]["ownerSession"], rows[key]["contractState"]) for key in expected} == expected
 
@@ -521,3 +528,92 @@ def test_field_inventory_requiredness_guard_is_non_vacuous(tmp_path):
     token_entry["recordSelector"].pop("payload.type")
     with pytest.raises(AssertionError):
         _assert_field_inventory(broadened, out)
+
+
+# ── #294 S6 corpus extensions (conversation normalization) ────────────────────
+
+# The pinned ``legacy-envelope`` scenario is the S0 stable contract; S6 extends
+# the corpus around it but MUST leave its bytes byte-identical (spec §8). Pinned
+# by content sha so an accidental builder edit that touches it fails loudly.
+LEGACY_ENVELOPE_SHA256 = (
+    "9e9d0568c9b3d5fe9c5399a52500d686d1edb60df2a3b6647aa6e52689e13a1a"
+)
+
+
+def test_legacy_envelope_scenario_bytes_are_pinned_unchanged():
+    data = (CORPUS / "rollouts" / "legacy-envelope.jsonl").read_bytes()
+    assert hashlib.sha256(data).hexdigest() == LEGACY_ENVELOPE_SHA256
+
+
+def test_s6_new_conversation_scenarios_present():
+    mod = _load_builder()
+    manifest = _json(CORPUS / "manifest.json")
+    for name in ("mirror-pairing", "unturned-event-prose", "title-wrapper-window"):
+        assert name in mod.REQUIRED_SCENARIOS, name
+        assert name in manifest["scenarios"], name
+        assert (CORPUS / manifest["scenarios"][name]).is_file(), name
+
+
+def test_s6_extended_scenarios_carry_prose_content():
+    """The collision roots and nested parent/child now carry normalizable prose
+    (distinct per root/thread), not just metadata + accounting (spec §8)."""
+    manifest = _json(CORPUS / "manifest.json")
+    for name in ("root-a-collision", "root-b-collision", "nested-parent", "nested-child"):
+        records = _records(CORPUS, manifest, name)
+        # session_meta stays the first record (identity evidence tests read [0]).
+        assert records[0].get("type") == "session_meta", name
+        prose = [r for r in records if r.get("type") == "response_item"
+                 and r.get("payload", {}).get("type") == "message"]
+        assert prose, name
+    a_prose = [r["payload"]["content"][0]["text"] for r in _records(CORPUS, manifest, "root-a-collision")
+               if r.get("type") == "response_item" and r.get("payload", {}).get("type") == "message"]
+    b_prose = [r["payload"]["content"][0]["text"] for r in _records(CORPUS, manifest, "root-b-collision")
+               if r.get("type") == "response_item" and r.get("payload", {}).get("type") == "message"]
+    assert set(a_prose) and set(b_prose) and not (set(a_prose) & set(b_prose)), (
+        "collision roots must carry DISTINCT prose so content-level isolation is provable"
+    )
+
+
+def test_s6_manifest_history_records_the_corpus_extension():
+    manifest = _json(CORPUS / "manifest.json")
+    assert len(manifest["history"]) >= 2, "S6 must append a manifest-history entry"
+    latest = manifest["history"][-1]
+    assert latest["version"] >= 2
+    assert "S6" in latest["change"] or "conversation" in latest["change"].lower()
+
+
+def test_s6_claude_seed_shares_shared_id_and_is_genuine_claude_shape():
+    mod = _load_builder()
+    seed = CORPUS / "claude-seed" / f"{mod.SHARED_ID}.jsonl"
+    assert seed.is_file(), "genuine Claude-format seed sharing SHARED_ID must exist"
+    records = [json.loads(line) for line in seed.read_text(encoding="utf-8").splitlines()]
+    assert records, "seed must carry records"
+    assert all(rec.get("sessionId") == mod.SHARED_ID for rec in records)
+    types = {rec.get("type") for rec in records}
+    assert {"user", "assistant"} <= types, "seed must carry genuine Claude user+assistant turns"
+    assert all(isinstance(rec.get("message"), dict) for rec in records)
+
+
+def test_s6_mirror_pairing_scenario_shapes_are_present():
+    """The mirror-pairing scenario carries the exact shapes the assembly pairing
+    kernel is proven against (spec §5.3)."""
+    manifest = _json(CORPUS / "manifest.json")
+    records = _records(CORPUS, manifest, "mirror-pairing")
+    families = {(r.get("type"), r.get("payload", {}).get("type")) for r in records}
+    assert ("response_item", "message") in families
+    assert ("event_msg", "agent_message") in families
+    assert any(r.get("type") == "turn_context" for r in records)
+
+
+def test_s6_title_wrapper_window_pushes_meaningful_prompt_past_physical_row_12():
+    """Mirror-paired wrapper prompts keep the first meaningful prompt inside the
+    first 12 LOGICAL prompts while pushing it past physical row 12 (spec §4.3)."""
+    manifest = _json(CORPUS / "manifest.json")
+    records = _records(CORPUS, manifest, "title-wrapper-window")
+    user_prose = [r for r in records if r.get("type") in ("response_item", "event_msg")
+                  and (
+                      (r.get("payload", {}).get("type") == "message"
+                       and r.get("payload", {}).get("role") == "user")
+                      or r.get("payload", {}).get("type") == "user_message")]
+    # More than 12 physical user prose rows (mirror pairs are 2 physical each).
+    assert len(user_prose) > 12

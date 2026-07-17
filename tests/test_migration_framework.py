@@ -320,6 +320,44 @@ def test_dispatcher_fresh_install_stamps_only(cctally_module):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
+def test_cache_db_with_codex_events_is_not_fresh_install(cctally_module):
+    """A Codex-bearing cache (S1 fused ingest wrote codex_conversation_events)
+    that is missing schema_migrations must NOT be classified fresh (#294 S6).
+
+    Otherwise migration 025 would be stamped WITHOUT replaying normalization,
+    leaving the read kernels authoritative over an empty normalized corpus.
+    codex_conversation_events joins session_entries/conversation_messages as a
+    cache.db fresh-install probe table: a non-empty one forces the handler to
+    run instead of stamp-only."""
+    conn = _fresh_conn_cache()
+    conn.execute(
+        "CREATE TABLE codex_conversation_events (id INTEGER PRIMARY KEY, x TEXT)")
+    conn.execute("INSERT INTO codex_conversation_events (x) VALUES ('event')")
+    conn.commit()
+    invoked = []
+    fake_registry = [
+        cctally_module.Migration(seq=1, name="001_a",
+                                 handler=lambda c: invoked.append("a")),
+    ]
+    cctally_module._run_pending_migrations(
+        conn, registry=fake_registry, db_label="cache.db")
+    assert invoked == ["a"], "codex-events cache must be non-fresh -> handler runs"
+
+    # Control (non-vacuity): the SAME dispatch over a cache WITHOUT the codex
+    # events table (no probe table present) IS a genuine fresh install -> the
+    # handler is stamped without running. This proves the probe table is what
+    # flips the classification, not some unrelated non-fresh signal.
+    conn2 = _fresh_conn_cache()
+    invoked2 = []
+    fake_registry2 = [
+        cctally_module.Migration(seq=1, name="001_a",
+                                 handler=lambda c: invoked2.append("a")),
+    ]
+    cctally_module._run_pending_migrations(
+        conn2, registry=fake_registry2, db_label="cache.db")
+    assert invoked2 == [], "empty cache with no probe tables is a fresh install"
+
+
 def test_dispatcher_upgrade_runs_pending(cctally_module):
     """One marker present → run only the missing one."""
     conn = _fresh_conn()

@@ -173,6 +173,11 @@ jobs:
         run: |
           export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           python3 --version
+          # Reap any dashboard server a prior HARD-FAILED run leaked on the
+          # dedicated e2e port before Playwright's reuseExistingServer:false probe
+          # (which runs BEFORE e2e/serve.sh) turns the occupied port into a red
+          # build unrelated to the code under test. See e2e/free-port.sh.
+          bash e2e/free-port.sh
           npx playwright test
 
       - name: Upload Playwright artifacts

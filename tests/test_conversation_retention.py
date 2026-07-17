@@ -17,7 +17,12 @@ if str(_BIN) not in sys.path:
 
 from conftest import load_script, redirect_paths  # noqa: E402
 
+import _cctally_db as _db  # noqa: E402
+import _lib_codex_conversation_query as _cxq  # noqa: E402
+
 UTC = dt.timezone.utc
+
+_CORPUS = Path(__file__).resolve().parent / "fixtures" / "codex-parity" / "v1" / "rollouts"
 
 
 def _env(tmp_path, monkeypatch):
@@ -415,3 +420,270 @@ def test_cutoff_far_in_past_prunes_nothing(tmp_path, monkeypatch):
     assert stats.claude_sessions == 0
     assert stats.claude_messages == 0
     assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 2
+
+
+# ── #294 S6: pruning also removes the Codex normalized derived rows ────────────
+#
+# S6 added three derived tables (codex_conversation_messages / _rollups /
+# _file_touches) + an external-content FTS index over the messages, all derived
+# from codex_conversation_events. #313's retention prune predates S6 and only
+# deleted the physical events — leaving the derived rows orphaned (stale browse
+# rows, stale search hits). The Codex prune leg must now delete the derived rows
+# in the SAME transaction as the events, at whole-conversation granularity
+# (§3.2 "or-delete"; §3.4 partial-delete rides the per-row FTS triggers, never
+# the full-clear 'delete-all').
+
+
+def _seed_codex_event(conn, ck, ts, *, source_path, line_offset, root_key="root-a"):
+    conn.execute(
+        "INSERT INTO codex_conversation_events "
+        "(source_path, line_offset, source_root_key, conversation_key, timestamp_utc, "
+        " payload_json) VALUES (?,?,?,?,?,'{}')",
+        (source_path, line_offset, root_key, ck, ts),
+    )
+
+
+def _seed_codex_msg(conn, ck, ts, *, source_path, line_offset, text,
+                    kind="assistant", record_family="response_item", root_key="root-a"):
+    conn.execute(
+        "INSERT INTO codex_conversation_messages "
+        "(conversation_key, source_root_key, source_path, line_offset, timestamp_utc, "
+        " turn_id, call_id, kind, event_type, record_family, model, text, "
+        " content_digest, content_len, detail_json, search_tool, search_thinking) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ck, root_key, source_path, line_offset, ts, "turn-a", None, kind, None,
+         record_family, "gpt-x", text, "d" * 32, len(text.encode("utf-8")), None, "", ""),
+    )
+    return conn.execute(
+        "SELECT id FROM codex_conversation_messages "
+        "WHERE source_path=? AND line_offset=?", (source_path, line_offset)).fetchone()[0]
+
+
+def _seed_codex_rollup(conn, ck, ts, *, title, item_count=1, root_key="root-a"):
+    conn.execute(
+        "INSERT INTO codex_conversation_rollups "
+        "(conversation_key, source_root_key, parent_thread_id, item_count, started_utc, "
+        " last_activity_utc, project_key, project_label, models_json, title) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ck, root_key, None, item_count, ts, ts, "project:x", "Proj", '["gpt-x"]', title),
+    )
+
+
+def _seed_codex_touch(conn, ck, message_id, *, source_path, file_path="/f.py",
+                      tool="apply_patch"):
+    conn.execute(
+        "INSERT INTO codex_conversation_file_touches "
+        "(message_id, conversation_key, source_path, file_path, tool) VALUES (?,?,?,?,?)",
+        (message_id, ck, source_path, file_path, tool),
+    )
+
+
+def test_codex_prune_removes_all_normalized_derived_rows(tmp_path, monkeypatch):
+    """A pruned Codex conversation leaves ZERO rows in all three derived tables
+    (messages, file_touches, rollups) plus the FTS index — not just the events."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_codex_event(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1)
+    mid = _seed_codex_msg(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1,
+                          text="MirrorAlpha aged content")
+    _seed_codex_rollup(conn, "conv-a", OLD, title="Aged A")
+    _seed_codex_touch(conn, "conv-a", mid, source_path="/a.jsonl")
+    conn.commit()
+
+    stats = retention.prune_conversation_transcripts(conn, cutoff_utc=_cutoff())
+    conn.commit()
+
+    # Reported counts stay physical-conversation/physical-event — no double-count.
+    assert stats.codex_conversations == 1
+    assert stats.codex_events == 1
+    for table in ("codex_conversation_events", "codex_conversation_messages",
+                  "codex_conversation_file_touches", "codex_conversation_rollups"):
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE conversation_key='conv-a'"
+        ).fetchone()[0] == 0, table
+    # FTS postings for the pruned conversation are gone (per-row AD trigger).
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_fts "
+        "WHERE codex_conversation_fts MATCH 'MirrorAlpha'").fetchone()[0] == 0
+
+
+def test_codex_prune_leaves_survivor_searchable_fts_and_like(tmp_path, monkeypatch):
+    """Partial-delete policy (§3.4): pruning neighbor A must NOT disturb survivor
+    B's postings — B stays searchable in both FTS and LIKE modes."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_codex_event(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1)
+    _seed_codex_msg(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1,
+                    text="MirrorAlpha aged content", kind="assistant")
+    _seed_codex_rollup(conn, "conv-a", OLD, title="Aged A")
+    _seed_codex_event(conn, "conv-b", FRESH, source_path="/b.jsonl", line_offset=1)
+    _seed_codex_msg(conn, "conv-b", FRESH, source_path="/b.jsonl", line_offset=1,
+                    text="SurvivorBravo fresh content", kind="user")
+    _seed_codex_rollup(conn, "conv-b", FRESH, title="Fresh B")
+    conn.commit()
+
+    retention.prune_conversation_transcripts(conn, cutoff_utc=_cutoff())
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_messages WHERE conversation_key='conv-b'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_messages WHERE conversation_key='conv-a'"
+    ).fetchone()[0] == 0
+    # Raw FTS index: survivor matches, pruned leaves no residue.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_fts "
+        "WHERE codex_conversation_fts MATCH 'SurvivorBravo'").fetchone()[0] > 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_fts "
+        "WHERE codex_conversation_fts MATCH 'MirrorAlpha'").fetchone()[0] == 0
+    # Raw LIKE over the base table: survivor matches, pruned absent.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_messages WHERE text LIKE '%SurvivorBravo%'"
+    ).fetchone()[0] > 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_messages WHERE text LIKE '%MirrorAlpha%'"
+    ).fetchone()[0] == 0
+    # Search kernel, FTS mode: only the survivor.
+    res_fts = _cxq.search_codex_conversations(conn, "SurvivorBravo", effective_speed="standard")
+    assert res_fts["mode"] == "fts"
+    assert {h["conversation_key"] for h in res_fts["hits"]} == {"conv-b"}
+    assert _cxq.search_codex_conversations(
+        conn, "MirrorAlpha", effective_speed="standard")["hits"] == []
+    # Search kernel, LIKE mode (marker forces the LIKE path): only the survivor.
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES('codex_fts_unavailable','1') "
+        "ON CONFLICT(key) DO UPDATE SET value='1'")
+    res_like = _cxq.search_codex_conversations(conn, "SurvivorBravo", effective_speed="standard")
+    assert res_like["mode"] == "like"
+    assert {h["conversation_key"] for h in res_like["hits"]} == {"conv-b"}
+    assert _cxq.search_codex_conversations(
+        conn, "MirrorAlpha", effective_speed="standard")["hits"] == []
+
+
+def test_codex_prune_removes_from_browse_list_fast_path_and_live_fallback(tmp_path, monkeypatch):
+    """The pruned conversation's rollup is gone and list_codex_conversations no
+    longer returns it via the stored-rollup fast path OR the live recompute
+    fallback (the fallback must not resurrect it from surviving-but-empty state)."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_codex_event(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1)
+    _seed_codex_msg(conn, "conv-a", OLD, source_path="/a.jsonl", line_offset=1,
+                    text="AgedAlpha", kind="user")
+    _seed_codex_rollup(conn, "conv-a", OLD, title="Aged A")
+    _seed_codex_event(conn, "conv-b", FRESH, source_path="/b.jsonl", line_offset=1)
+    _seed_codex_msg(conn, "conv-b", FRESH, source_path="/b.jsonl", line_offset=1,
+                    text="FreshBravo", kind="user")
+    _seed_codex_rollup(conn, "conv-b", FRESH, title="Fresh B")
+    conn.commit()
+    pre = _cxq.list_codex_conversations(conn, effective_speed="standard")
+    assert {r["conversation_key"] for r in pre["rows"]} == {"conv-a", "conv-b"}
+
+    retention.prune_conversation_transcripts(conn, cutoff_utc=_cutoff())
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_rollups WHERE conversation_key='conv-a'"
+    ).fetchone()[0] == 0
+    # Fast path (B keeps its stored rollup): only the survivor lists.
+    post = _cxq.list_codex_conversations(conn, effective_speed="standard")
+    assert {r["conversation_key"] for r in post["rows"]} == {"conv-b"}
+    # Live fallback: drop B's rollup so it must live-recompute; the pruned A must
+    # NOT resurrect (its messages are gone, so the browse driver never sees it).
+    conn.execute("DELETE FROM codex_conversation_rollups WHERE conversation_key='conv-b'")
+    conn.commit()
+    live = _cxq.list_codex_conversations(conn, effective_speed="standard")
+    assert {r["conversation_key"] for r in live["rows"]} == {"conv-b"}
+
+
+def test_codex_forced_replay_prune_removes_rederived_derived_rows(tmp_path, monkeypatch):
+    """F9 end-to-end for the S6 derived tables: a rebuild re-ingests aged events
+    AND re-derives their normalized rows; the forced UNTHROTTLED prune must then
+    remove the events AND every re-derived derived row, even with a fresh throttle
+    stamp (a throttled prune would skip)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache_mod = importlib.import_module("_cctally_cache")
+    provider_root = tmp_path / "provider"
+    rollout = provider_root / "sessions" / "2024" / "01" / "10" / "rollout-aged.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    # Age every timestamp in the corpus scenario to well before the 180-day cutoff.
+    aged = (_CORPUS / "modern-full.jsonl").read_text().replace("2026-07-14", "2024-01-10")
+    rollout.write_text(aged)
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+    conn = ns["open_cache_db"]()
+    try:
+        cache_mod.sync_codex_cache(conn)
+        # Precondition: aged rows ingested + normalized; an ordinary sync did not prune.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] > 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_rollups").fetchone()[0] == 1
+
+        # A FRESH throttle stamp: only the UNTHROTTLED force-prune may still trim.
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('conversation_retention_last_prune_at', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (dt.datetime.now(UTC).isoformat(),))
+        conn.commit()
+
+        # Rebuild = from-zero replay: clears + re-ingests + re-derives, then the
+        # forced prune (F9) fires after the flock releases.
+        cache_mod.sync_codex_cache(conn, rebuild=True)
+
+        for table in ("codex_conversation_events", "codex_conversation_messages",
+                      "codex_conversation_file_touches", "codex_conversation_rollups"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+    finally:
+        conn.close()
+
+
+def test_migration_025_replay_after_prune_does_not_resurrect(tmp_path, monkeypatch):
+    """Migration 025 replay (full-clear + re-derive from events) after a prune
+    cannot resurrect a pruned conversation: its physical events are gone, so
+    replay has nothing to re-derive for it. Non-vacuity is proven first — a
+    pre-prune replay DOES reconstruct the conversation from its events."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache_mod = importlib.import_module("_cctally_cache")
+    provider_root = tmp_path / "provider"
+    rollout = provider_root / "sessions" / "2024" / "01" / "10" / "rollout-aged.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    aged = (_CORPUS / "modern-full.jsonl").read_text().replace("2026-07-14", "2024-01-10")
+    rollout.write_text(aged)
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+    retention = importlib.import_module("_lib_conversation_retention")
+
+    conn = ns["open_cache_db"]()
+    try:
+        cache_mod.sync_codex_cache(conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
+
+        # Non-vacuity: 025's clear+replay reconstructs the conversation from its
+        # still-present events (proves replay actually re-derives from events).
+        _db._codex_conversation_fts_full_clear(conn)
+        cache_mod._replay_codex_normalization(conn)
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_rollups").fetchone()[0] == 1
+
+        # Prune the aged conversation (events + derived rows gone).
+        retention.prune_conversation_transcripts(conn, cutoff_utc=_cutoff())
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == 0
+
+        # A subsequent 025 replay must NOT resurrect it — no events to re-derive.
+        _db._codex_conversation_fts_full_clear(conn)
+        cache_mod._replay_codex_normalization(conn)
+        conn.commit()
+        for table in ("codex_conversation_messages", "codex_conversation_rollups",
+                      "codex_conversation_file_touches"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+    finally:
+        conn.close()

@@ -178,6 +178,11 @@ _should_replace = _lib_jsonl._should_replace
 _lib_conversation = _load_lib("_lib_conversation")
 _iter_message_rows = _lib_conversation.iter_message_rows
 
+# #294 S6: the pure Codex conversation normalization kernel. Pure stdlib leaf
+# (imports only the _lib_conversation / _lib_conversation_query display helpers),
+# so it loads at module-load time alongside _lib_conversation.
+_lib_codex_conversation = _load_lib("_lib_codex_conversation")
+
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
 # shared no-op singleton), so the sync_cache seam wraps below cost nothing on
@@ -320,6 +325,10 @@ _CACHE_MIGRATIONS = _cctally_db_sib._CACHE_MIGRATIONS
 # drop/recreate dance so the per-row delete trigger never fires O(rows) under
 # the held lock on a rebuild / truncation escalation.
 clear_conversation_messages = _cctally_db_sib.clear_conversation_messages
+# #294 S6: storm-free FULL clear of the Codex normalized derived tables (drop
+# triggers -> truncate -> 'delete-all' -> recreate triggers). Used only by the
+# cache-rebuild path + migration 025; partial deletes ride the per-row triggers.
+_codex_conversation_fts_full_clear = _cctally_db_sib._codex_conversation_fts_full_clear
 # cache_meta key/value upsert helper — reused by the resumable reingest cursor
 # writes (#179) so the ON CONFLICT idiom lives in one place. Caller commits.
 _set_cache_meta = _cctally_db_sib._set_cache_meta
@@ -711,6 +720,21 @@ def _delete_codex_file_derived_rows(
         "DELETE FROM codex_conversation_threads WHERE source_path = ?" + root_clause,
         params,
     )
+    # #294 S6: normalized rows + file touches for this file. This is a PARTIAL
+    # delete (one file), so it rides the per-row FTS delete trigger — surviving
+    # conversations keep their postings (§3.4 two-path policy). File touches have
+    # no source_root_key column; a source_path maps to exactly one file/root, so
+    # scoping them by source_path alone is exact. Rollups are repaired by the
+    # caller's _recompute_codex_rollups (§3.2), which needs the affected keys
+    # captured BEFORE this delete.
+    conn.execute(
+        "DELETE FROM codex_conversation_file_touches WHERE source_path = ?",
+        (path_str,),
+    )
+    conn.execute(
+        "DELETE FROM codex_conversation_messages WHERE source_path = ?" + root_clause,
+        params,
+    )
     conn.execute(
         "DELETE FROM codex_session_files WHERE path = ?" + root_clause,
         params,
@@ -725,6 +749,10 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM codex_conversation_events")
     conn.execute("DELETE FROM codex_session_files")
     conn.execute("DELETE FROM codex_source_roots")
+    # #294 S6: FULL clear of the normalized derived tables (messages + touches +
+    # rollups) via the storm-free helper — this is a whole-corpus rebuild, so
+    # 'delete-all' resets the FTS shadow tables cleanly (§3.4 full-clear path).
+    _codex_conversation_fts_full_clear(conn)
     # F3: this clears the Codex physical quota state, so any stored
     # quota-projection certificate would become stale-valid (its cache
     # sequence unchanged) and let the reconcile short-circuit skip over
@@ -741,6 +769,181 @@ def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
         "('codex_physical_mutation_seq', '1') "
         "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
     )
+
+
+# ── #294 S6: normalized-conversation write helpers (kernel-backed) ────────────
+
+_CODEX_NORM_COLS = (
+    "conversation_key, source_root_key, source_path, line_offset, timestamp_utc, "
+    "turn_id, call_id, kind, event_type, record_family, model, text, "
+    "content_digest, content_len, detail_json, search_tool, search_thinking"
+)
+_CODEX_MSG_INSERT_SQL = (
+    "INSERT OR IGNORE INTO codex_conversation_messages (" + _CODEX_NORM_COLS + ") "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def _codex_conversation_project_attribution(
+    source_root_key: str | None, cwd: object, git_json: object,
+) -> tuple[str | None, str | None]:
+    """(project_key, project_label) for one conversation's thread facts (§3.2).
+
+    Mirrors the S3 read-time attribution (cwd git-root resolution → basename
+    label, else git identity, else unassigned) so the browse live-recompute
+    fallback matches the stored rollup. Degrades to (None, None) when the S3
+    kernel or a valid source root is unavailable — never guesses.
+    """
+    if not source_root_key:
+        return None, None
+    try:
+        from _cctally_source_analytics import _project_label, _git_resolved_key
+        from _lib_source_analytics import opaque_project_key
+    except Exception:
+        return None, None
+    if isinstance(cwd, str) and cwd:
+        project = _resolve_project_key(cwd, "git-root", {})
+        resolved_key = project.bucket_path
+        cwd_label = _project_label(cwd)
+        project_label = (
+            cwd_label if cwd_label in {"(home)", "(root)"}
+            else _project_label(project.display_key)
+        )
+    elif isinstance(git_json, str) and git_json:
+        git_key = _git_resolved_key(git_json)
+        if git_key is None:
+            resolved_key, project_label = "(unassigned)", "(unassigned)"
+        else:
+            resolved_key, project_label = git_key, "Git project"
+    else:
+        resolved_key, project_label = "(unassigned)", "(unassigned)"
+    try:
+        return opaque_project_key("codex", source_root_key, resolved_key), project_label
+    except ValueError:
+        return None, None
+
+
+def _load_codex_normalized_rows(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> list:
+    """Load a conversation's normalized rows (all files) in physical order as
+    kernel CodexNormalizedRow objects."""
+    return [
+        _lib_codex_conversation.CodexNormalizedRow(*row)
+        for row in conn.execute(
+            "SELECT " + _CODEX_NORM_COLS + " FROM codex_conversation_messages "
+            "WHERE conversation_key = ? "
+            "ORDER BY timestamp_utc, source_path, line_offset",
+            (conversation_key,),
+        )
+    ]
+
+
+def _insert_codex_normalized_rows(conn: sqlite3.Connection, rows: list, touches: list) -> None:
+    """Insert normalized rows (INSERT OR IGNORE on the physical key) + their file
+    touches (message linkage resolved via (source_path, line_offset))."""
+    if rows:
+        conn.executemany(_CODEX_MSG_INSERT_SQL, [
+            (r.conversation_key, r.source_root_key, r.source_path, r.line_offset,
+             r.timestamp_utc, r.turn_id, r.call_id, r.kind, r.event_type,
+             r.record_family, r.model, r.text, r.content_digest, r.content_len,
+             r.detail_json, r.search_tool, r.search_thinking)
+            for r in rows
+        ])
+    for touch in touches:
+        conn.execute(
+            "INSERT OR IGNORE INTO codex_conversation_file_touches "
+            "(message_id, conversation_key, source_path, file_path, tool) "
+            "SELECT m.id, ?, ?, ?, ? FROM codex_conversation_messages m "
+            "WHERE m.source_path = ? AND m.line_offset = ?",
+            (touch.conversation_key, touch.source_path, touch.file_path, touch.tool,
+             touch.source_path, touch.line_offset),
+        )
+
+
+def _recompute_codex_rollups(conn: sqlite3.Connection, conversation_keys) -> None:
+    """Recompute-affected-or-delete the rollup for each conversation (§3.2).
+
+    A rollup is a pure function of surviving codex_conversation_messages (+ thread
+    metadata): aggregate across ALL files of the conversation, delete emptied
+    rollups, stamp item_count (rendered LOGICAL items), title, project attribution,
+    times, and models. Called by every write/delete path so no stale rollup
+    survives.
+    """
+    kern = _lib_codex_conversation
+    for conversation_key in {key for key in conversation_keys if key}:
+        rows = _load_codex_normalized_rows(conn, conversation_key)
+        if not rows:
+            conn.execute(
+                "DELETE FROM codex_conversation_rollups WHERE conversation_key = ?",
+                (conversation_key,),
+            )
+            continue
+        item_count = kern.rollup_item_count(rows)
+        title = kern.derive_title(rows)
+        timestamps = [r.timestamp_utc for r in rows if r.timestamp_utc]
+        started = min(timestamps) if timestamps else None
+        last_activity = max(timestamps) if timestamps else None
+        models = sorted({r.model for r in rows if r.model})
+        models_json = json.dumps(models) if models else None
+        source_root_key = rows[0].source_root_key
+        thread = conn.execute(
+            "SELECT cwd, git_json, parent_thread_id, source_root_key "
+            "FROM codex_conversation_threads WHERE conversation_key = ?",
+            (conversation_key,),
+        ).fetchone()
+        cwd = git_json = parent_thread_id = None
+        if thread is not None:
+            cwd, git_json, parent_thread_id, thread_root = thread
+            if thread_root:
+                source_root_key = thread_root
+        project_key, project_label = _codex_conversation_project_attribution(
+            source_root_key, cwd, git_json)
+        conn.execute(
+            "INSERT INTO codex_conversation_rollups "
+            "(conversation_key, source_root_key, parent_thread_id, item_count, "
+            " started_utc, last_activity_utc, project_key, project_label, "
+            " models_json, title) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(conversation_key) DO UPDATE SET "
+            " source_root_key=excluded.source_root_key, "
+            " parent_thread_id=excluded.parent_thread_id, "
+            " item_count=excluded.item_count, started_utc=excluded.started_utc, "
+            " last_activity_utc=excluded.last_activity_utc, "
+            " project_key=excluded.project_key, project_label=excluded.project_label, "
+            " models_json=excluded.models_json, title=excluded.title",
+            (conversation_key, source_root_key, parent_thread_id, item_count,
+             started, last_activity, project_key, project_label, models_json, title),
+        )
+
+
+def _replay_codex_normalization(conn: sqlite3.Connection) -> None:
+    """Re-derive ALL normalized rows/touches/rollups from stored
+    codex_conversation_events, per file in (source_path ASC, line_offset ASC)
+    order (migration 025). Runs inside the caller's transaction — the caller
+    full-clears first (§3.4 helper) and owns the commit. Deterministic order +
+    the plain rowid alias make a re-run byte-idempotent."""
+    kern = _lib_codex_conversation
+    events_by_file: dict[str, list] = {}
+    order: list[str] = []
+    for row in conn.execute(
+        "SELECT source_path, line_offset, source_root_key, conversation_key, "
+        "native_thread_id, root_thread_id, parent_thread_id, timestamp_utc, "
+        "record_type, event_type, turn_id, call_id, payload_json "
+        "FROM codex_conversation_events "
+        "ORDER BY source_path ASC, line_offset ASC"
+    ):
+        event = _lib_jsonl.CodexPhysicalEvent(*row)
+        if event.source_path not in events_by_file:
+            events_by_file[event.source_path] = []
+            order.append(event.source_path)
+        events_by_file[event.source_path].append(event)
+    affected: set = set()
+    for source_path in order:
+        result = kern.normalize_codex_events(
+            events_by_file[source_path], initial=kern.CodexStickyState())
+        _insert_codex_normalized_rows(conn, result.rows, result.touches)
+        affected.update(r.conversation_key for r in result.rows)
+    _recompute_codex_rollups(conn, affected)
 
 
 def _collect_inactive_codex_paths_and_roots(
@@ -863,16 +1066,27 @@ def _write_codex_file_batch(
     last_root_thread_id: str | None,
     last_parent_thread_id: str | None,
     last_conversation_key: str | None,
+    last_turn_id: str | None,
     reset_file: bool,
     accounting_rows: list[tuple[Any, ...]],
     quota_rows: list[tuple[Any, ...]],
     thread_rows: list[tuple[Any, ...]],
     event_rows: list[tuple[Any, ...]],
+    normalized_rows: list,
+    normalized_touches: list,
     active_root_keys: set[str],
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    # #294 S6: rollups are recomputed-affected-or-deleted (§3.2), so capture the
+    # conversation keys this file's normalized rows touch BEFORE a reset delete
+    # removes them.
+    affected_keys: set = set()
     if reset_file:
+        affected_keys.update(
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
+                "WHERE source_path = ?", (path_str,)) if row[0])
         _delete_codex_file_derived_rows(conn, path_str)
     conn.execute(
         """INSERT INTO codex_source_roots
@@ -937,18 +1151,27 @@ def _write_codex_file_batch(
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             event_rows,
         )
+    # #294 S6: normalized rows + file touches ride the same per-file transaction
+    # as the events themselves. INSERT OR IGNORE on the physical key keeps a delta
+    # re-read idempotent; the per-row FTS triggers index them. Then recompute the
+    # rollup for every affected conversation (aggregating across all its files),
+    # deleting emptied rollups. Threads were inserted above, so project
+    # attribution can read them.
+    _insert_codex_normalized_rows(conn, normalized_rows, normalized_touches)
+    affected_keys.update(r.conversation_key for r in normalized_rows)
+    _recompute_codex_rollups(conn, affected_keys)
     conn.execute(
         """INSERT OR REPLACE INTO codex_session_files
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
             last_session_id, last_model, last_total_tokens, source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            last_conversation_key, last_turn_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
             last_model, last_total_tokens, discovered.source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key,
+            last_conversation_key, last_turn_id,
         ),
     )
     _prune_inactive_codex_source_roots(conn, active_root_keys)
@@ -3615,7 +3838,14 @@ def sync_codex_cache(
             )
             if orphan_sources or orphan_root_keys:
                 before_prune = conn.total_changes
+                # #294 S6: capture the conversation keys the orphan rows belong to
+                # BEFORE deleting, so the rollups can be repaired/deleted after.
+                orphan_keys: set = set()
                 for orphan_path, orphan_root_key in orphan_sources:
+                    orphan_keys.update(
+                        row[0] for row in conn.execute(
+                            "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
+                            "WHERE source_path = ?", (orphan_path,)) if row[0])
                     _delete_codex_file_derived_rows(
                         conn,
                         orphan_path,
@@ -3626,6 +3856,10 @@ def sync_codex_cache(
                     conn, active_root_keys,
                     candidate_root_keys=orphan_root_keys,
                 )
+                # Recompute-affected-or-delete the rollups the prune touched (§3.2):
+                # a conversation with no surviving rows loses its rollup, one that
+                # survives in another file is recomputed from the survivors.
+                _recompute_codex_rollups(conn, orphan_keys)
                 if conn.total_changes != before_prune:
                     _bump_codex_physical_mutation_seq(conn)
                 conn.commit()
@@ -3644,13 +3878,13 @@ def sync_codex_cache(
         existing = {
             row[0]: (
                 row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                row[8], row[9], row[10], row[11],
+                row[8], row[9], row[10], row[11], row[12],
             )
             for row in conn.execute(
                 "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
                 "last_session_id, last_model, last_total_tokens, source_root_key, "
                 "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-                "last_conversation_key "
+                "last_conversation_key, last_turn_id "
                 "FROM codex_session_files"
             )
         }
@@ -3677,6 +3911,8 @@ def sync_codex_cache(
             initial_session_id: str | None = None
             initial_model: str | None = None
             initial_total_tokens = 0
+            # #294 S6: the sticky-turn resume seed (parallel to initial_model).
+            initial_turn_id: str | None = None
             prev_total_tokens: int | None = None
             prev_native_thread_id: str | None = None
             prev_root_thread_id: str | None = None
@@ -3687,7 +3923,7 @@ def sync_codex_cache(
                 (
                     prev_size, _, prev_offset, prev_sid, prev_model, prev_ttot,
                     prev_root_key, prev_native_thread_id, prev_root_thread_id,
-                    prev_parent_thread_id, prev_conversation_key,
+                    prev_parent_thread_id, prev_conversation_key, prev_turn_id,
                 ) = prev
                 prev_total_tokens = (
                     int(prev_ttot) if prev_ttot is not None else None
@@ -3701,18 +3937,23 @@ def sync_codex_cache(
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
+                    initial_turn_id = prev_turn_id
                 else:
                     truncated = True
                     start_offset = 0
                     initial_session_id = None
                     initial_model = None
                     initial_total_tokens = 0
+                    initial_turn_id = None
                     prev_total_tokens = None
 
             accounting_rows: list[tuple[Any, ...]] = []
             quota_rows: list[tuple[Any, ...]] = []
             thread_rows: list[tuple[Any, ...]] = []
             event_rows: list[tuple[Any, ...]] = []
+            # #294 S6: the physical event objects for this file window, fed to the
+            # normalization kernel after the drain (in offset order).
+            events_list: list = []
             final_offset = start_offset
             # Mutable tracker that the iterator updates on every
             # session_meta / turn_context record, regardless of whether a
@@ -3766,6 +4007,7 @@ def sync_codex_cache(
                         state=iter_state,
                     ):
                         event = emission.event
+                        events_list.append(event)
                         event_rows.append((
                             event.source_path, event.line_offset,
                             event.source_root_key, event.conversation_key,
@@ -3872,6 +4114,18 @@ def sync_codex_cache(
                 if terminal_thread is not None else prev_conversation_key
             )
 
+            # #294 S6: normalize this file window's physical events into
+            # normalized rows + file touches, replaying sticky turn/model state
+            # seeded from the persisted resume seed. Buffered before the first DML
+            # (like every other family), so the single retry re-runs the same
+            # in-memory batch. The terminal sticky turn persists as last_turn_id.
+            norm_result = _lib_codex_conversation.normalize_codex_events(
+                events_list,
+                initial=_lib_codex_conversation.CodexStickyState(
+                    turn_id=initial_turn_id, model=initial_model),
+            )
+            new_last_turn_id = norm_result.terminal.turn_id
+
             # Every derived row above was buffered before the first DML. A
             # late database failure therefore rolls the whole file back and
             # retries that same in-memory batch exactly once.
@@ -3892,11 +4146,14 @@ def sync_codex_cache(
                         last_root_thread_id=new_last_root_thread_id,
                         last_parent_thread_id=new_last_parent_thread_id,
                         last_conversation_key=new_last_conversation_key,
+                        last_turn_id=new_last_turn_id,
                         reset_file=truncated or requalified,
                         accounting_rows=accounting_rows,
                         quota_rows=quota_rows,
                         thread_rows=thread_rows,
                         event_rows=event_rows,
+                        normalized_rows=norm_result.rows,
+                        normalized_touches=norm_result.touches,
                         active_root_keys={item.source_root_key for item in files},
                     )
                 except sqlite3.DatabaseError as exc:

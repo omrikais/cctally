@@ -4,11 +4,11 @@ Turns the former "per-migration goldens are lazy-adopted; not retroactively
 backfilled" policy into an ENFORCED invariant, now that W3 has backfilled the
 last 7 gaps:
 
-  1. Registry counts are pinned (13 stats / 24 cache) with the test-injection
+  1. Registry counts are pinned (13 stats / 25 cache) with the test-injection
      env var (``CCTALLY_MIGRATION_TEST_MODE``) asserted ABSENT — when it is
      armed, ``bin/_cctally_db`` registers a REAL extra entry in each registry
-     (``014_test_failure_injection`` / ``025_test_cache_migration``) that has no
-    golden, so the guard must run against the clean 13/24 shape.
+     (``014_test_failure_injection`` / ``026_test_cache_migration``) that has no
+    golden, so the guard must run against the clean 13/25 shape.
   2. Bijection: the set of migration names in BOTH registries equals the set of
      ``per-migration/<name>/`` golden dirs — no migration missing a golden, and
      no orphan golden dir. Each dir carries both ``pre.sqlite`` + ``post.sqlite``.
@@ -44,7 +44,7 @@ PER_MIGRATION_ROOT = (
 
 # Pinned registry sizes. Bump BOTH when a migration ships (see module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 24
+EXPECTED_CACHE_COUNT = 25
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -92,13 +92,14 @@ MANIFEST = {
     "022_index_conversation_messages_model": "test_cache_migration_022_index_conversation_messages_model",
     "023_conversation_sessions_enrichment_columns": "test_cache_migration_023_per_migration_goldens",
     "024_codex_fused_ingest_rebuild": "test_cache_migration_024_codex_fused_ingest_rebuild",
+    "025_codex_conversation_normalization": "test_cache_migration_025_codex_conversation_normalization",
 }
 
 
 def _registry_names():
-    # The test-injection block registers a REAL 14th stats / 25th cache entry
+    # The test-injection block registers a REAL 14th stats / 26th cache entry
     # when armed (bin/_cctally_db.py). Assert it is OFF so the registries hold
-    # exactly the shippable 13/24 — else the guard would demand a golden for an
+    # exactly the shippable 13/25 — else the guard would demand a golden for an
     # injected migration.
     assert os.environ.get("CCTALLY_MIGRATION_TEST_MODE") != "1", (
         "CCTALLY_MIGRATION_TEST_MODE must be unset for this guard — it injects "

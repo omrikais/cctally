@@ -5,6 +5,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.72.0] - 2026-07-17
+
+### Added
+- Codex conversations (#294 S6): the write-only Codex physical corpus is now readable through a new normalization and assembly kernel layer. Ingest derives normalized message rows, browse rollups, and an independent FTS index inside the existing per-file sync transaction (replayable by cache migration `025_codex_conversation_normalization`, with an explicit `normalization_pending` state for caches whose events predate it), and provider-neutral kernels assemble first-meaningful-prompt titles, digest-exact mirror pairing, canonical items with stable keys, per-turn cost attribution, thread nesting from thread metadata, outline, browse/facets, and FTS5/LIKE search. Transcript retention (#313) now prunes these derived rows — normalized messages, rollups, file touches, and their FTS postings — in the same transaction as the Codex physical events it removes, so a prune leaves no orphaned browse or search state. A thin provider-neutral dispatch maps both Claude and Codex conversations into one envelope family with a source-tagged token union. This is an internal kernel layer with no user-visible surface yet — S7 wires the routes, transcript CLI, export, and live-tail; the Claude conversation kernels are unchanged. (#294)
+
+### Fixed
+- Packaging: `bin/_lib_conversation_retention.py` (the transcript-retention prune engine shipped in 1.71.0) was missing from the npm `files` list and the public mirror allowlist, so an installed `cctally cache-sync --prune-conversations` and the dashboard's background prune would crash at import (and the public test suite could not import it); it now ships in both. (#313)
+- Internal (maintainer-only): the self-hosted reader e2e (`e2e-reader`) CI lane no longer red-builds when a prior hard-failed run leaks its `cctally dashboard` server on the dedicated Playwright port 8797. A pre-flight `dashboard/web/e2e/free-port.sh` now reaps any stale listener before `npx playwright test` — Playwright's `reuseExistingServer: false` probe aborts on an occupied port *before* it launches `e2e/serve.sh`, so the port has to be cleared ahead of the run rather than inside the launcher. No user-facing behavior change.
+
 ## [1.71.0] - 2026-07-17
 
 ### Added

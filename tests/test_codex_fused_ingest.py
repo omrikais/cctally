@@ -187,12 +187,14 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("source_root_key", "TEXT", 0),
             ("conversation_key", "TEXT", 0),
         ]
-        assert _columns(conn, "codex_session_files")[-5:] == [
+        assert _columns(conn, "codex_session_files")[-6:] == [
             ("source_root_key", "TEXT", 0),
             ("last_native_thread_id", "TEXT", 0),
             ("last_root_thread_id", "TEXT", 0),
             ("last_parent_thread_id", "TEXT", 0),
             ("last_conversation_key", "TEXT", 0),
+            # #294 S6: terminal sticky-turn seed for delta resumes.
+            ("last_turn_id", "TEXT", 0),
         ]
 
         quota_sql = _schema_sql(conn, "quota_window_snapshots")

@@ -28,12 +28,32 @@ REQUIRED_SCENARIOS = (
     "metadata-only-tail", "root-a-collision", "root-b-collision", "nested-parent",
     "nested-child", "claude-collision", "secret-canary", "empty-source", "stale-cache",
     "claude-only", "codex-only", "mixed-source",
+    # #294 S6 conversation-normalization corpus extensions.
+    "mirror-pairing", "unturned-event-prose", "title-wrapper-window",
 )
 
 SHARED_ID = "11111111-1111-4111-8111-111111111111"
 ROOT_A = "/synthetic/root-a/project-red"
 ROOT_B = "/synthetic/root-b/project-blue"
 MODEL = "gpt-synthetic-codex"
+
+# #294 S6: distinct native thread/session ids for the conversation-normalization
+# scenarios so each ingests as its own conversation (no accidental collision with
+# the SHARED_ID identity scenarios). Kept UUID-shaped for realism.
+MIRROR_SESSION = "22222222-2222-4222-8222-222222222222"
+UNTURNED_SESSION = "33333333-3333-4333-8333-333333333333"
+TITLE_SESSION = "44444444-4444-4444-8444-444444444444"
+# The Claude-side seed reuses SHARED_ID as its sessionId so the collision proof
+# can show Codex/Claude assemblies share ZERO rows on content, not just key
+# inequality. A known-priced model keeps the sync-time cost pass warning-free.
+CLAUDE_SEED_MODEL = "claude-opus-4-8"
+# Length of the shared prefix for the "distinct over-cap texts sharing a capped
+# prefix" pairing case (spec §5.3). MUST be >= the kernel's display text cap
+# (bin/_lib_codex_conversation.CODEX_TEXT_CAP) so the two rows' capped ``text``
+# columns collide byte-for-byte while their full-text digests differ — proving
+# pairing keys on the pre-cap digest, never on capped text. Equality of this
+# bound with the kernel cap is pinned in tests/test_codex_conversation_normalization.py.
+_OVERCAP_PREFIX_LEN = 16000
 
 
 def _canonical_json(value) -> str:
@@ -143,6 +163,161 @@ def _lifecycle_events() -> list[dict]:
             for index, payload in enumerate(payloads)]
 
 
+# ── #294 S6 conversation-normalization prose helpers ─────────────────────────
+# Deterministic content-bearing records used by the collision/nested extensions
+# and the three new conversation scenarios. Every text is synthetic and carries
+# no maintainer data (enforced by test_fixture_corpus_contains_no_maintainer_data).
+
+
+def _turn_context(timestamp: str, turn_id: str, model: str = MODEL) -> dict:
+    return {"timestamp": timestamp, "type": "turn_context",
+            "payload": {"turn_id": turn_id, "model": model, "model_context_window": 272000}}
+
+
+def _response_message(timestamp: str, role: str, text: str) -> dict:
+    """A ``response_item``/``message`` record (user or assistant prose)."""
+    content_key = "input_text" if role == "user" else "output_text"
+    return {"timestamp": timestamp, "type": "response_item",
+            "payload": {"type": "message", "role": role,
+                        "phase": "input" if role == "user" else "output",
+                        "content": [{"type": content_key, "text": text}]}}
+
+
+def _event_prose(timestamp: str, ptype: str, text: str) -> dict:
+    """An ``event_msg``-family prose record (the mirror-pairing input family)."""
+    if ptype == "agent_message":
+        payload = {"type": "agent_message", "message": text, "phase": "final", "memory_citation": None}
+    elif ptype == "agent_reasoning":
+        payload = {"type": "agent_reasoning", "text": text}
+    elif ptype == "user_message":
+        payload = {"type": "user_message", "images": [], "local_images": [], "message": text,
+                   "text_elements": [{"text": text}]}
+    else:
+        raise ValueError(f"unsupported event prose type: {ptype}")
+    return {"timestamp": timestamp, "type": "event_msg", "payload": payload}
+
+
+def _mirror_pairing_records() -> list[dict]:
+    """Modern turned conversation exercising every §5.3 pairing shape."""
+    over_prefix = ("codex-mirror-overcap-prefix " * 640)[:_OVERCAP_PREFIX_LEN]
+    long_a = over_prefix + "-distinct-tail-alpha"
+    long_b = over_prefix + "-distinct-tail-beta"
+
+    def ts(index: int) -> str:
+        return f"2026-07-14T13:{index:02d}:00Z"
+
+    return [
+        _session_meta(session_id=MIRROR_SESSION, record_id="mirror-thread",
+                      thread_source="mirror-thread", forked_from_id="mirror-thread"),
+        _turn_context(ts(1), "turn-m"),
+        # exact mirror pair (assistant): response_item canonical, event_msg suppressed.
+        _response_message(ts(2), "assistant", "Mirror assistant reply"),
+        _event_prose(ts(3), "agent_message", "Mirror assistant reply"),
+        # non-mirror event prose survives (genuine unique event_msg content).
+        _event_prose(ts(4), "agent_message", "Unique event-only note"),
+        # distinct over-cap texts sharing a capped prefix must NOT pair.
+        _response_message(ts(5), "assistant", long_a),
+        _event_prose(ts(6), "agent_message", long_b),
+        # whitespace-sensitive variants (two spaces vs one) must NOT pair.
+        _response_message(ts(7), "assistant", "code x  y"),
+        _event_prose(ts(8), "agent_message", "code x y"),
+        # multiset one-to-one: one response, three identical events -> one pairs,
+        # two survive (three copies never collapse into one response row).
+        _response_message(ts(9), "assistant", "Triple echo"),
+        _event_prose(ts(10), "agent_message", "Triple echo"),
+        _event_prose(ts(11), "agent_message", "Triple echo"),
+        _event_prose(ts(12), "agent_message", "Triple echo"),
+        # distant identical cross-family rows in DIFFERENT turns must NOT pair.
+        _event_prose(ts(13), "agent_message", "Distant cross echo"),
+        # repeated identical prompts -> two distinct logical items (offsets differ).
+        _response_message(ts(14), "user", "Repeat prompt"),
+        _response_message(ts(15), "user", "Repeat prompt"),
+        _turn_context(ts(16), "turn-n"),
+        _response_message(ts(17), "assistant", "Distant cross echo"),
+        _token_event(timestamp=ts(18)),
+    ]
+
+
+def _unturned_event_prose_records() -> list[dict]:
+    """Identity established, event-family prose, NEVER any turn_context.
+
+    Carries one adjacent mirror pair (retain canonical, drop event) and one
+    uncorrelated duplicate separated by an intervening same-kind prose row
+    (retain both) — the §5.3 unturned adjacency rule.
+    """
+    def ts(index: int) -> str:
+        return f"2026-07-14T14:{index:02d}:00Z"
+
+    return [
+        _session_meta(session_id=UNTURNED_SESSION, record_id="unturned-thread",
+                      thread_source="unturned-thread", forked_from_id="unturned-thread"),
+        _response_message(ts(1), "assistant", "Unturned reply"),
+        _event_prose(ts(2), "agent_message", "Unturned reply"),      # adjacent -> pairs
+        _event_prose(ts(3), "agent_message", "Solo unturned note"),  # unique -> survives
+        _response_message(ts(4), "assistant", "Coincidence"),
+        _event_prose(ts(5), "agent_message", "Intervening other"),   # intervening same-kind
+        _event_prose(ts(6), "agent_message", "Coincidence"),         # not adjacent -> retain both
+        _token_event(timestamp=ts(7)),
+    ]
+
+
+def _title_wrapper_window_records() -> list[dict]:
+    """Mirror-paired structural wrapper prompts push the first meaningful prompt
+    past physical row 12 while keeping it inside logical prompt 12 (spec §4.3)."""
+    def ts(index: int) -> str:
+        return f"2026-07-14T15:{index:02d}:00Z"
+
+    records: list[dict] = [
+        _session_meta(session_id=TITLE_SESSION, record_id="title-thread",
+                      thread_source="title-thread", forked_from_id="title-thread"),
+    ]
+    index = 1
+    for wrapper in range(1, 8):  # 7 mirror-paired wrappers = 14 physical user rows
+        if wrapper % 2:
+            text = f"<environment_context>wrapper context {wrapper}</environment_context>"
+        else:
+            text = f"<user_instructions>wrapper instructions {wrapper}</user_instructions>"
+        records.append(_response_message(ts(index), "user", text))
+        index += 1
+        records.append(_event_prose(ts(index), "user_message", text))
+        index += 1
+    records.append(_response_message(ts(index), "user", "First meaningful title prompt"))
+    index += 1
+    records.append(_token_event(timestamp=ts(index)))
+    return records
+
+
+def _content_bearing_root(root: str, record_id: str, subject: str) -> list[dict]:
+    """A minimal turned conversation with prose distinct per collision root."""
+    def ts(index: int) -> str:
+        return f"2026-07-14T16:{index:02d}:00Z"
+
+    return [
+        _session_meta(root=root, record_id=record_id),
+        _turn_context(ts(1), "turn-a"),
+        _response_message(ts(2), "user", f"{subject} prompt"),
+        _response_message(ts(3), "assistant", f"{subject} response"),
+        _token_event(timestamp=ts(4)),
+    ]
+
+
+def _claude_seed_records() -> list[dict]:
+    """A genuine Claude-format conversation sharing SHARED_ID as its sessionId."""
+    return [
+        {"type": "user", "uuid": "claude-seed-uuid-1", "sessionId": SHARED_ID,
+         "timestamp": "2026-07-14T12:00:00.000Z", "cwd": ROOT_A,
+         "message": {"role": "user",
+                     "content": [{"type": "text", "text": "Claude seed user prompt distinct from codex"}]}},
+        {"type": "assistant", "uuid": "claude-seed-uuid-2", "parentUuid": "claude-seed-uuid-1",
+         "sessionId": SHARED_ID, "timestamp": "2026-07-14T12:00:05.000Z", "cwd": ROOT_A,
+         "requestId": "claude-seed-req-1",
+         "message": {"id": "claude-seed-msg-1", "model": CLAUDE_SEED_MODEL, "role": "assistant",
+                     "content": [{"type": "text", "text": "Claude seed assistant reply distinct from codex"}],
+                     "usage": {"input_tokens": 10, "output_tokens": 20,
+                               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+    ]
+
+
 def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
     full = [_session_meta(), {"timestamp": "2026-07-14T12:01:00Z", "type": "turn_context", "payload": {"turn_id": "turn-a", "model": MODEL, "model_context_window": 272000}}, _token_event(), *_response_items(), *_lifecycle_events()]
     duplicate = [_session_meta()]
@@ -187,9 +362,23 @@ def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
         "malformed-tail": ([_session_meta(), _token_event()], '{"timestamp":"2026-07-14T12:09:00Z"'),
         "duplicate-token-count": (duplicate, None),
         "metadata-only-tail": ([_token_event(), _session_meta()], None),
-        "root-a-collision": ([_session_meta(root=ROOT_A, record_id="codex-root-a"), _token_event()], None),
-        "root-b-collision": ([_session_meta(root=ROOT_B, record_id="codex-root-b"), _token_event()], None),
-        "nested-parent": ([parent, _token_event()], None), "nested-child": ([child, _token_event()], None),
+        "root-a-collision": (_content_bearing_root(ROOT_A, "codex-root-a", "Root A red"), None),
+        "root-b-collision": (_content_bearing_root(ROOT_B, "codex-root-b", "Root B blue"), None),
+        "nested-parent": ([
+            parent, _turn_context("2026-07-14T17:01:00Z", "turn-p"),
+            _response_message("2026-07-14T17:02:00Z", "user", "Parent thread question"),
+            _response_message("2026-07-14T17:03:00Z", "assistant", "Parent thread answer"),
+            _token_event(timestamp="2026-07-14T17:04:00Z"),
+        ], None),
+        "nested-child": ([
+            child, _turn_context("2026-07-14T17:11:00Z", "turn-c"),
+            _response_message("2026-07-14T17:12:00Z", "user", "Child thread question"),
+            _response_message("2026-07-14T17:13:00Z", "assistant", "Child thread answer"),
+            _token_event(timestamp="2026-07-14T17:14:00Z"),
+        ], None),
+        "mirror-pairing": (_mirror_pairing_records(), None),
+        "unturned-event-prose": (_unturned_event_prose_records(), None),
+        "title-wrapper-window": (_title_wrapper_window_records(), None),
         "claude-collision": ([_session_meta(source="claude", record_id="claude-root", thread_source="claude-root", forked_from_id="claude-root"), {"timestamp": "2026-07-14T12:02:00Z", "type": "assistant", "payload": {"session_id": SHARED_ID}}], None),
         "secret-canary": ([{"timestamp": "2026-07-14T12:11:00Z", "type": "message", "payload": {"api_key_shape": "sk-fixture-not-a-secret", "authorization_shape": "Authorization: Bearer fixture-token", "home_shape": "/home/fixture-user/project-green", "root_shape": ROOT_A}}], None),
         "empty-source": ([], None),
@@ -243,8 +432,8 @@ def _acceptance_matrix() -> dict:
         _row("codex-token-reuse-forensics", "S3", ["codex"], "token-reuse", "supported", ["modern-full"], ["tests/test_source_aware_analytics.py", "tests/test_source_aware_cli.py", "bin/cctally-source-aware-test"], "Cached input is a truthful Codex token-reuse outcome."),
         _row("codex-pricing-coverage-supported", "S1", ["codex"], "pricing-coverage", "supported", ["modern-full"], "tests/test_codex_fused_ingest.py", "Existing Codex pricing coverage and drift semantics remain supported."),
         _row("codex-budget-existing-semantics", "S1", ["codex"], "budget", "supported", ["modern-full"], "tests/test_codex_fused_ingest.py", "Existing Codex budget calculation and actual/projected semantics remain supported."),
-        _row("codex-title-first-prompt-fallback", "S6", ["codex"], "conversation-title", "deferred", ["modern-full"], "tests/test_codex_conversation_normalization.py", "Initial title uses the first meaningful user prompt."),
-        _row("codex-threading-uses-thread-metadata", "S6", ["codex"], "conversation-threading", "deferred", ["nested-parent", "nested-child"], "tests/test_codex_conversation_normalization.py", "Nesting uses thread metadata, not filenames."),
+        _row("codex-title-first-prompt-fallback", "S6", ["codex"], "conversation-title", "supported", ["modern-full"], ["tests/test_codex_conversation_normalization.py"], "Initial title uses the first meaningful user prompt."),
+        _row("codex-threading-uses-thread-metadata", "S6", ["codex"], "conversation-threading", "supported", ["nested-parent", "nested-child"], ["tests/test_codex_conversation_normalization.py"], "Nesting uses thread metadata, not filenames."),
         _row("codex-anon-plan-includes-roots", "S7", ["codex"], "anon-plan", "deferred", ["secret-canary"], "tests/test_codex_conversation_api.py", "The anonymization plan includes provider roots and labels."),
         _row("debug-backend-source-counts", "S4", ["all"], "debug-diagnostics", "supported", ["mixed-source", "stale-cache", "root-a-collision"], ["tests/test_dashboard_debug_backend.py", "tests/test_dashboard_source_invalidation.py"], "Loopback-only backend diagnostics expose source-aware aggregate counts and opaque versions without private identities."),
         _row("reading-position-qualified-key", "S8", ["all"], "reading-position", "deferred", ["root-a-collision", "root-b-collision"], "dashboard/web/src/store/readingPosition.test.ts", "Reading positions use opaque qualified conversation keys."),
@@ -315,7 +504,10 @@ def _manifest() -> dict:
             "combinedArithmetic": {"additive": list(ADDITIVE_MEASURES), "nonAdditive": list(NON_ADDITIVE_MEASURES)},
             "requiredCapabilityFamilies": ["accounting", "quota", "analytics-share", "dashboard", "conversations", "lifecycle-governance"],
             "scenarios": {name: f"rollouts/{name}.jsonl" for name in REQUIRED_SCENARIOS}, "fieldInventory": _field_inventory(),
-            "history": [{"version": 1, "date": "2026-07-14", "change": "Initial synthetic snapshot from issue 294 audit"}]}
+            "history": [
+                {"version": 1, "date": "2026-07-14", "change": "Initial synthetic snapshot from issue 294 audit"},
+                {"version": 2, "date": "2026-07-17", "change": "#294 S6 conversation normalization: content-bearing collision roots and nested parent/child, new mirror-pairing / unturned-event-prose / title-wrapper-window scenarios, and a genuine Claude-format seed sharing SHARED_ID."},
+            ]}
 
 
 def _safe_output(out_dir: Path) -> Path:
@@ -340,6 +532,10 @@ def build(out_dir: Path = DEFAULT_OUT) -> None:
     out_dir.mkdir(parents=True)
     for name, (records, malformed) in _scenarios().items():
         _write_jsonl(out_dir / "rollouts" / f"{name}.jsonl", records, malformed)
+    # #294 S6: a genuine Claude-format seed (NOT a Codex rollout) sharing
+    # SHARED_ID, placed under claude-seed/ so tests can ingest it through the
+    # Claude sync_cache path and prove cross-provider assembly isolation.
+    _write_jsonl(out_dir / "claude-seed" / f"{SHARED_ID}.jsonl", _claude_seed_records())
     _write_json(out_dir / "manifest.json", _manifest())
     _write_json(out_dir / "acceptance-matrix.json", _acceptance_matrix())
 

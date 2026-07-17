@@ -19,12 +19,12 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 99 / 24 known
+  ✓ cache.db                 version 99 / 25 known
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            cache.db ahead (v99 > known v24) — auto-heals
+  ⚠ Version ahead            cache.db ahead (v99 > known v25) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
-  ✓ Migrations               0/37 applied
-  ⚠ Pending migrations       37 pending
+  ✓ Migrations               0/38 applied
+  ⚠ Pending migrations       38 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit

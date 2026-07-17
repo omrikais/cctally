@@ -3958,6 +3958,163 @@ def build_per_migration_024_codex_fused_ingest_rebuild(scenario_dir: Path) -> No
     _build_post(pre, post)
 
 
+def build_per_migration_025_codex_conversation_normalization(scenario_dir: Path) -> None:
+    """Build deterministic existing-cache goldens for cache migration 025.
+
+    ``pre.sqlite`` is an existing post-S1 cache at the 024 head with a small
+    stored Codex conversation (``codex_conversation_events`` + a thread row) but
+    NO normalized rows. ``post.sqlite`` runs the production handler — which
+    full-clears the derived tables and replays the pure normalization kernel over
+    the stored events — and reproduces only the dispatcher's central marker stamp.
+    A Claude sentinel proves the replay never touches Claude-derived state. The
+    thread carries git metadata (not a cwd) so project attribution is a pure
+    deterministic hash with no filesystem probing — byte-stable across the build
+    machine and every CI platform.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    prior_chain = tuple(
+        f"{seq:03d}_{name}" for seq, name in (
+            (1, "dedup_highest_wins"),
+            (2, "conversation_messages_backfill"),
+            (3, "conversation_reingest_tool_ids"),
+            (4, "conversation_reingest_subagent_kind"),
+            (5, "conversation_reingest_meta"),
+            (6, "conversation_reingest_source_tool_use_id"),
+            (7, "conversation_reingest_enrichment"),
+            (8, "session_entries_speed_backfill"),
+            (9, "conversation_media_reingest"),
+            (10, "conversation_search_split"),
+            (11, "conversation_promote_command_args"),
+            (12, "create_conversation_ai_titles"),
+            (13, "create_conversation_sessions"),
+            (14, "conversation_queued_prompt_reingest"),
+            (15, "conversation_sessions_filter_columns"),
+            (16, "drop_search_aux"),
+            (17, "arm_nested_agent_reingest"),
+            (18, "create_conversation_title_fts"),
+            (19, "create_conversation_file_touches"),
+            (20, "session_entries_physical_unique"),
+            (21, "index_conversation_messages_cwd"),
+            (22, "index_conversation_messages_model"),
+            (23, "conversation_sessions_enrichment_columns"),
+            (24, "codex_fused_ingest_rebuild"),
+        )
+    )
+    applied_at = "2026-07-15T12:00:00Z"
+    src = "/codex/golden.jsonl"
+    root_key = "root-golden"
+    ck = "conv-golden"
+    git_json = '{"branch":"main","repository":"golden-repo"}'
+
+    def rec(payload: dict, rtype: str, timestamp: str) -> str:
+        return json.dumps(
+            {"payload": payload, "type": rtype, "timestamp": timestamp},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    # (line_offset, record_type, event_type, turn_id, call_id, timestamp, payload_json)
+    events = [
+        (1, "session_meta", None, None, None, "2026-07-14T12:00:00Z",
+         rec({"id": "native-golden", "session_id": "native-golden"},
+             "session_meta", "2026-07-14T12:00:00Z")),
+        (2, "turn_context", None, "turn-g", None, "2026-07-14T12:01:00Z",
+         rec({"turn_id": "turn-g", "model": "gpt-golden"},
+             "turn_context", "2026-07-14T12:01:00Z")),
+        (3, "response_item", "message", None, None, "2026-07-14T12:02:00Z",
+         rec({"type": "message", "role": "user",
+              "content": [{"type": "input_text", "text": "golden prompt"}]},
+             "response_item", "2026-07-14T12:02:00Z")),
+        (4, "response_item", "message", None, None, "2026-07-14T12:03:00Z",
+         rec({"type": "message", "role": "assistant",
+              "content": [{"type": "output_text", "text": "golden reply"}]},
+             "response_item", "2026-07-14T12:03:00Z")),
+        (5, "event_msg", "patch_apply_end", "turn-g", "patch-1", "2026-07-14T12:04:00Z",
+         rec({"type": "patch_apply_end", "changes": [{"path": "golden.txt"}]},
+             "event_msg", "2026-07-14T12:04:00Z")),
+    ]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            db.add_column_if_missing(
+                conn, "codex_session_files", "last_total_tokens", "INTEGER")
+            conn.execute(
+                "CREATE TABLE schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)")
+            for name in prior_chain:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) VALUES (?, ?)",
+                    (name, "2026-07-15T11:00:00Z"))
+            conn.execute("PRAGMA user_version = 24")
+            # Claude sentinel — the replay must leave it untouched.
+            conn.execute(
+                "INSERT INTO conversation_messages "
+                "(session_id, source_path, byte_offset, entry_type, text) "
+                "VALUES ('claude-session', '/claude/source.jsonl', 1, 'assistant', 'keep me')")
+            # The stored Codex conversation (replay source) + its thread facts.
+            conn.execute(
+                "INSERT INTO codex_source_roots "
+                "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+                "VALUES (?, '/codex', '2026-07-14T12:00:00Z', '2026-07-14T12:00:00Z')",
+                (root_key,))
+            conn.execute(
+                "INSERT INTO codex_conversation_threads "
+                "(conversation_key, source_root_key, native_thread_id, root_thread_id, "
+                " parent_thread_id, source_path, cwd, git_json) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (ck, root_key, "native-golden", "native-golden", None, src, None, git_json))
+            for offset, rtype, etype, turn_id, call_id, ts, payload_json in events:
+                conn.execute(
+                    "INSERT INTO codex_conversation_events "
+                    "(source_path, line_offset, source_root_key, conversation_key, "
+                    " native_thread_id, root_thread_id, parent_thread_id, timestamp_utc, "
+                    " record_type, event_type, turn_id, call_id, payload_json) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (src, offset, root_key, ck, "native-golden", "native-golden", None,
+                     ts, rtype, etype, turn_id, call_id, payload_json))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(source: Path, dest: Path) -> None:
+        if dest.exists():
+            dest.unlink()
+        import shutil
+        shutil.copy(source, dest)
+        register_fixture_db(dest)
+        db = _load_db_module()
+        handler = None
+        for migration in db._CACHE_MIGRATIONS:
+            if migration.name == "025_codex_conversation_normalization":
+                handler = migration.handler
+                break
+        if handler is None:
+            raise SystemExit("025_codex_conversation_normalization not registered")
+        conn = sqlite3.connect(dest)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            db._stamp_applied(conn, "025_codex_conversation_normalization", applied_at)
+            conn.commit()
+        finally:
+            conn.close()
+        # The handler opens a <db>.codex.lock sibling; drop it so the golden dir
+        # holds only pre/post.sqlite.
+        lock = Path(str(dest) + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_023_conversation_sessions_enrichment_columns(
     scenario_dir: Path,
 ) -> None:
@@ -4755,6 +4912,9 @@ def main() -> int:
     )
     build_per_migration_024_codex_fused_ingest_rebuild(
         FIXTURES_ROOT / "per-migration" / "024_codex_fused_ingest_rebuild"
+    )
+    build_per_migration_025_codex_conversation_normalization(
+        FIXTURES_ROOT / "per-migration" / "025_codex_conversation_normalization"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"
