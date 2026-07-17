@@ -242,6 +242,30 @@ def test_prior_state_degradation_retains_whole_prior_data_and_version():
     assert degraded.warnings == (warning,)
 
 
+def test_degrading_an_unavailable_prior_stays_unavailable_not_invalid_partial():
+    """An unavailable prior (no coherent generation, empty data_version) cannot
+    be retained as a ``partial`` state — copying its empty ``data_version`` into
+    a partial state trips the non-empty-data_version validator and raises.
+
+    Regression for the dashboard ``source-bundle: data_version must be a
+    non-empty string`` sync error, which fired on the 2nd (and every later)
+    consecutive failing sync of a degraded provider: the 1st failure produces an
+    unavailable prior, and the next failure degrades THAT prior.
+    """
+    warning = SourceDashboardWarning("source_ingest_failed", "Source ingest failed.")
+    prior_unavailable = source_kernel.unavailable_source_state("codex", warning)
+    assert prior_unavailable.availability == "unavailable"
+    assert prior_unavailable.data_version == ""
+
+    degraded = source_kernel.degrade_source_state(prior_unavailable, warning)
+
+    assert degraded.source == "codex"
+    assert degraded.availability == "unavailable"
+    assert degraded.data_version == ""
+    assert degraded.data is None
+    assert degraded.warnings == (warning,)
+
+
 def test_unavailable_source_has_no_data_or_success_version():
     warning = SourceDashboardWarning("source_ingest_failed", "Source ingest failed.")
 

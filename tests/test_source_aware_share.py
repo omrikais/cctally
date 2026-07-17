@@ -657,3 +657,42 @@ def test_source_aware_harness_is_a_required_bundle_gate():
     bundle = (root / "bin" / "cctally-test-all").read_text(encoding="utf-8")
 
     assert "required_harnesses=(codex-quota source-aware)" in bundle
+
+
+def _live_release_version(root: Path) -> str:
+    """First stamped ``## [x.y.z]`` header in the repo CHANGELOG."""
+    for line in (root / "CHANGELOG.md").read_text(encoding="utf-8").splitlines():
+        if line.startswith("## [") and "Unreleased" not in line:
+            return line.split("[", 1)[1].split("]", 1)[0]
+    raise AssertionError("no stamped CHANGELOG version found")
+
+
+def test_source_aware_branded_goldens_are_version_pinned_not_release_coupled():
+    """The branded md/html/svg goldens must embed a fixed stub version, never
+    the live CHANGELOG version.
+
+    Regression guard for the v1.69.0 break: the builder read
+    ``_release_version()`` (latest CHANGELOG entry) unpinned, so the committed
+    goldens froze whatever version was current at generation time and every
+    subsequent release re-staled all 74 branded goldens — reddening dev + public
+    CI on the release commit itself. The builder now pins a ``9.9.9`` stub
+    (bin/build-source-aware-fixtures.py), mirroring the share-v2 harness.
+
+    Non-vacuous: the assertion below fails the instant the pin is removed, since
+    the live repo version (1.69.x+) is never ``9.9.9``.
+    """
+    root = Path(__file__).resolve().parents[1]
+    live = _live_release_version(root)
+    assert live != "9.9.9", "repo happens to be at the stub version; pick another stub"
+
+    branded = (
+        root / "tests" / "fixtures" / "source-aware"
+        / "codex-report-codex-daily-populated" / "output.md.golden"
+    ).read_text(encoding="utf-8")
+    assert "cctally_version: 9.9.9" in branded
+    assert f"cctally_version: {live}" not in branded
+
+    # The builder itself must carry the pin so any regeneration self-pins.
+    builder_source = (root / "bin" / "build-source-aware-fixtures.py").read_text(encoding="utf-8")
+    assert "CCTALLY_TEST_CHANGELOG_PATH" in builder_source
+    assert "os.get_terminal_size" in builder_source

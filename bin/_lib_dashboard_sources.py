@@ -230,6 +230,13 @@ def degrade_source_state(
         raise ValueError("prior must be a SourceDashboardState")
     if not isinstance(warning, SourceDashboardWarning):
         raise ValueError("warning must be a SourceDashboardWarning")
+    # There must be a coherent prior generation to retain. An unavailable prior
+    # carries no data and an empty ``data_version``; degrading it to ``partial``
+    # would build an invalid state (the non-empty-data_version invariant only
+    # exempts ``unavailable``) and raise. Stay unavailable, carrying the new
+    # warning — this is the 2nd+ consecutive failing sync of a degraded provider.
+    if prior.availability == "unavailable" or not prior.data_version:
+        return unavailable_source_state(prior.source, warning)
     return SourceDashboardState(
         source=prior.source,
         availability="partial",

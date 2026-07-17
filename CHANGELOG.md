@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.69.3] - 2026-07-17
+
+### Fixed
+- Dashboard: cleared the persistent `⚠ sync error` chip (`source-bundle: data_version must be a non-empty string`) that appeared once a provider — typically Codex — stayed degraded or unavailable across two or more consecutive sync ticks. The first failure records an unavailable provider generation; the next tick then tried to retain that already-unavailable generation as a `partial` state with an empty data version, which fails the source-state validator. `degrade_source_state` now stays `unavailable` (carrying the new warning) when there is no coherent prior generation to retain.
+
 ## [1.69.2] - 2026-07-17
 
 ### Fixed
