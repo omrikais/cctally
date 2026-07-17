@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.69.1] - 2026-07-17
+
+### Fixed
+- The 1.69.0 npm/brew package was missing four runtime modules (`_cctally_dashboard_sources`, `_cctally_source_analytics`, `_lib_dashboard_sources`, `_lib_source_analytics`) that the source-aware dashboard/CLI analytics load at startup, so every installed command crashed at import; they are now in the public mirror allowlist and ship in the package.
+
 ## [1.69.0] - 2026-07-17
 
 ### Added
