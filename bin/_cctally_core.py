@@ -243,13 +243,37 @@ def _real_prod_data_dir() -> pathlib.Path:
 #
 # STATUSLINE_PERSIST_THROTTLE_SECONDS: min seconds between statusline
 #   persist attempts (keyed off STATUSLINE_OBSERVE_MARKER_PATH liveness).
+#   Retuned 60.0 -> 25.0 for #311: the setup-managed statusLine.refreshInterval
+#   timer fires the statusline on a 30s cadence, and the throttle MUST be
+#   strictly LESS than that interval. When interval <= throttle, phase jitter
+#   produces beat-frequency skips (a tick at 59.9s of marker age is throttled;
+#   the next persist waits ~120s), so a 60/60 pairing oscillates 60<->120s.
+#   With interval 30 > throttle 25, every tick whose predecessor's record
+#   completed promptly (within interval - throttle = 5s) passes the gate.
+#   CADENCE QUALIFIER: the marker is touched at persist COMPLETION, so a tick
+#   observes marker age = 30 - d where d is the previous record's duration;
+#   if d > 5s (the record kernel can run cmd_sync_week JSONL scans) that tick
+#   throttles and the cycle degrades to skip-one-tick (~60s), self-correcting
+#   on the next tick. Exact-30s is NOT an invariant (no attempt-start marker
+#   exists — one would let a hung/failed record claim liveness and suppress
+#   the OAuth backfill). Still strictly better than the 60/60 beat's 60-120s.
 # OAUTH_BACKFILL_STALE_SECONDS: the OAuth poll only backfills once the
 #   observation marker is at least this stale (i.e. the statusline has
 #   NOT fed recently). Strictly greater than the persist throttle so the
-#   statusline is the primary writer and OAuth only covers its absence.
+#   statusline is the primary writer and OAuth only covers its absence
+#   (300 > 25 still holds).
 # OAUTH_BACKOFF_BASE_SECONDS / OAUTH_BACKOFF_CAP_SECONDS: the headerless
 #   exponential 429 backoff (base * 2**consecutive_429, capped).
-STATUSLINE_PERSIST_THROTTLE_SECONDS = 60.0
+STATUSLINE_PERSIST_THROTTLE_SECONDS = 25.0
+# STATUSLINE_REFRESH_INTERVAL_DEFAULT (#311): the value `cctally setup`
+# writes into Claude Code's settings.json `statusLine.refreshInterval` when a
+# recognized cctally statusLine block lacks one. Claude Code re-runs the
+# statusline command on this fixed timer "in addition to the event-driven
+# updates", which keeps the usage-persistence feeder ticking while a parent
+# session waits on a long subagent (event-driven updates go quiet then). MUST
+# exceed STATUSLINE_PERSIST_THROTTLE_SECONDS (30 > 25) — see the pairing rule
+# above. Add-when-absent only; a user-set value is never mutated.
+STATUSLINE_REFRESH_INTERVAL_DEFAULT = 30
 OAUTH_BACKFILL_STALE_SECONDS = 300.0
 OAUTH_BACKOFF_BASE_SECONDS = 60.0
 OAUTH_BACKOFF_CAP_SECONDS = 3600.0

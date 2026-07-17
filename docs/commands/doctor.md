@@ -37,7 +37,7 @@ usable as a healthcheck without false-positive noise:
 
 ## Check inventory
 
-Seven categories. Each check has a stable `id` (used as the
+Eight categories. Each check has a stable `id` (used as the
 JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
@@ -49,6 +49,7 @@ severity != `OK`.
 
 ### Hooks
 - `hooks.installed` — WARN when any of `PostToolBatch`/`Stop`/`SubagentStop` entries are missing.
+- `hooks.statusline_refresh_interval` — WARN only when a recognized cctally `statusLine` command is present but has no `refreshInterval` (state `missing`); the remediation is `Run cctally setup to add statusLine.refreshInterval, or set it manually`. Without it, statusline-fed usage persistence goes quiet while a coordinator waits on a long subagent (see [setup.md](setup.md#statuslinerefreshinterval) and [statusline.md](statusline.md#keeping-usage-fresh-during-subagent-waits-statuslinerefreshinterval)). Every other state is OK with its own summary — `present` (set), `absent` (no statusLine configured), `foreign` (a custom, non-cctally statusLine), and `unavailable` (settings.json unreadable — the `hooks.installed` / settings warnings already surface that, so this check does not double-WARN).
 - `hooks.recent_activity_24h` — WARN when no hook has fired in 24h, or error/fire ratio ≥ 0.5.
 - `hooks.last_fire_age` — WARN when the last fire was >1h ago or never.
 - `hooks.codex_installed` — root-qualified Codex hook state. With no detected

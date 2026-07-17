@@ -191,6 +191,32 @@ def parse_statusline_stdin(raw: "bytes | str") -> "StatuslineInput | ParseError"
     )
 
 
+# ---- Pool-identity guard (persist-only; spec 2026-07-17 #311 D1) ----------
+
+
+_ALTERNATE_POOL_MODEL_ID_RE = re.compile(r"\[[^\]]+\]$")
+
+
+def is_alternate_pool_model_id(model_id) -> bool:
+    """True iff ``model_id`` is a bracketed variant id (e.g.
+    ``claude-opus-4-8[1m]``) that reports a SEPARATE rate-limit pool.
+
+    Such a session's stdin ``rate_limits`` describes a DIFFERENT usage pool
+    on the same account; persisting it poisons the default-pool DB (the 7d
+    HWM clamp latches the foreign high value and dedup then freezes tracking
+    — see the #311 spec). The persist feeder skips it.
+
+    Matches ANY trailing bracket suffix, not just the literal ``[1m]``: a
+    future variant that turns out to share the default pool would merely lose
+    one redundant writer (fail-safe toward data purity), whereas matching
+    only ``[1m]`` would let the next variant poison the DB again. Missing /
+    ``None`` / non-string / no-suffix ids return ``False`` (persist proceeds —
+    only a positive variant match skips). Never raises."""
+    if not isinstance(model_id, str) or not model_id:
+        return False
+    return _ALTERNATE_POOL_MODEL_ID_RE.search(model_id) is not None
+
+
 # ---- Segment 1: model -----------------------------------------------------
 
 

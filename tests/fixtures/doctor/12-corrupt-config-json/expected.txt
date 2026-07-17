@@ -10,6 +10,7 @@ Install
   ✓ Legacy bespoke hooks     not detected
 Hooks
   ✓ Hook entries installed   PostToolBatch, Stop, SubagentStop
+  ✓ statusLine refreshInterval no statusLine configured
   ⚠ Recent activity (24h)    0 fires
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
   ⚠ Last hook fire           never
@@ -50,4 +51,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 26 OK · 7 WARN · 1 FAIL
+Summary: 27 OK · 7 WARN · 1 FAIL

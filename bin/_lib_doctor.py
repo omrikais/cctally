@@ -204,6 +204,15 @@ class DoctorState:
     codex_quota_windows: Optional[list[dict]] = None
     codex_hook_roots: Optional[list[dict]] = None
     codex_lifecycle_activity_24h: Optional[dict] = None
+    # #311: precomputed five-state classification of settings.json's
+    # statusLine.refreshInterval (unavailable/absent/foreign/present/missing),
+    # computed by doctor_gather_state via the setup I/O-layer classifier so the
+    # kernel stays I/O-free (it never imports bin/_cctally_setup). Defaulted
+    # (placed last after the other defaulted tail fields) so existing
+    # constructors stay valid; the default "unavailable" is the always-OK,
+    # never-WARN posture (the hooks.installed / settings warnings already
+    # surface a genuinely-unreadable settings.json — no double-WARN here).
+    statusline_refresh_state: str = "unavailable"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -438,6 +447,44 @@ def _check_hooks_installed(s: DoctorState) -> CheckResult:
             "counts": {ev: counts.get(ev, 0) for ev in _REQUIRED_HOOK_EVENTS},
             "missing": missing,
         },
+    )
+
+
+_STATUSLINE_REFRESH_SUMMARIES = {
+    "present": "set",
+    "missing": "not set on a cctally statusLine",
+    "absent": "no statusLine configured",
+    "foreign": "n/a (custom statusLine command)",
+    "unavailable": "settings.json unreadable",
+}
+
+
+def _check_statusline_refresh_interval(s: DoctorState) -> CheckResult:
+    """WARN only when a recognized cctally ``statusLine`` command lacks a
+    ``refreshInterval`` (#311): without it, statusline-fed usage persistence
+    goes quiet while a parent session waits on a long subagent. Every other
+    state is OK with its own STABLE summary — the not-applicable states
+    (absent/foreign) say so, and `unavailable` says settings were unreadable
+    (the hooks.installed / settings warnings already surface that failure, so
+    no double-WARN). The kernel reads only the precomputed scalar; the setup
+    classifier's I/O happens in doctor_gather_state."""
+    state = s.statusline_refresh_state
+    summary = _STATUSLINE_REFRESH_SUMMARIES.get(state, _STATUSLINE_REFRESH_SUMMARIES["unavailable"])
+    if state == "missing":
+        return CheckResult(
+            id="hooks.statusline_refresh_interval",
+            title="statusLine refreshInterval", severity="warn",
+            summary=summary,
+            remediation=(
+                "Run `cctally setup` to add statusLine.refreshInterval, or set "
+                "it manually — see docs/commands/statusline.md"
+            ),
+            details={"state": state},
+        )
+    return CheckResult(
+        id="hooks.statusline_refresh_interval",
+        title="statusLine refreshInterval", severity="ok",
+        summary=summary, remediation=None, details={"state": state},
     )
 
 
@@ -1590,6 +1637,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     )),
     ("hooks", "Hooks", (
         ("hooks.installed", "_check_hooks_installed"),
+        ("hooks.statusline_refresh_interval", "_check_statusline_refresh_interval"),
         ("hooks.recent_activity_24h", "_check_hooks_recent_activity_24h"),
         ("hooks.last_fire_age", "_check_hooks_last_fire_age"),
         ("hooks.codex_installed", "_check_hooks_codex_installed"),

@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.70.0] - 2026-07-17
+
+### Added
+- `cctally setup` now adds `statusLine.refreshInterval: 30` to a cctally-pointing Claude Code `statusLine` block that lacks one, so status-line-fed usage keeps recording on a 30-second timer while a coordinator session waits on a long-running subagent (Claude Code's event-driven status-line updates go quiet then). Ownership is add-when-absent / never-mutate / never-remove: setup never creates a `statusLine` block, never changes a `refreshInterval` you set yourself, and `--uninstall` leaves it. Surfaced in install / `--status` / `--dry-run` (text plus the `--json` `statusline_refresh {state, value, action}` object). (#311)
+- `cctally doctor` gains a `hooks.statusline_refresh_interval` check that WARNs when a recognized cctally `statusLine` command is missing its `refreshInterval`, and is OK (with a per-state summary) otherwise. (#311)
+
+### Changed
+- Retuned the status-line usage-persist throttle from 60s to 25s so it sits below the new 30s `statusLine.refreshInterval` timer; a 60/60 pairing beat-frequency-throttled every other tick and oscillated the effective cadence between 60 and 120 seconds. (#311)
+
+### Fixed
+- Status-line usage persistence now skips sessions running a bracketed model variant such as `claude-opus-4-8[1m]` (the 1M-context variant), whose `rate_limits` describe a separate account usage pool. Persisting those poisoned the default-pool snapshots — the reset-aware high-water-mark clamp latched the foreign value and froze all subsequent genuine writes. The guard is persist-only, so a `[1m]` session still renders its own true pool numbers on the status line. (#311)
+
 ## [1.69.3] - 2026-07-17
 
 ### Fixed

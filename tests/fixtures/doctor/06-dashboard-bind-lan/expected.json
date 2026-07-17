@@ -87,6 +87,15 @@
                 },
                 {
                     "details": {
+                        "state": "absent"
+                    },
+                    "id": "hooks.statusline_refresh_interval",
+                    "severity": "ok",
+                    "summary": "no statusLine configured",
+                    "title": "statusLine refreshInterval"
+                },
+                {
+                    "details": {
                         "by_event": {},
                         "errors": 0,
                         "fires": 0,
@@ -637,7 +646,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 26,
+            "ok": 27,
             "warn": 8
         },
         "severity": "warn"

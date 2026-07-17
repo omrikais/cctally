@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "mode": "dry-run",
+  "symlinks": {
+    "would_create": 15,
+    "already": 0,
+    "blocked": [],
+    "destination": "/FAKE/.local/bin",
+    "total": 15
+  },
+  "hooks": {
+    "would_add": [
+      {
+        "event": "PostToolBatch",
+        "matcher": "*",
+        "command": "/REPO/bin/cctally hook-tick"
+      },
+      {
+        "event": "Stop",
+        "matcher": "",
+        "command": "/REPO/bin/cctally hook-tick"
+      },
+      {
+        "event": "SubagentStop",
+        "matcher": "",
+        "command": "/REPO/bin/cctally hook-tick"
+      }
+    ],
+    "settings_path": "/FAKE/.claude/settings.json"
+  },
+  "statusline_refresh": {
+    "state": "missing",
+    "value": null,
+    "action": "would_add"
+  },
+  "codex_hooks": {
+    "roots": [],
+    "installed_count": 0,
+    "error_count": 0
+  },
+  "legacy": {
+    "statusline_snippet": null,
+    "bespoke_hooks": {
+      "detected": false,
+      "settings_entries": [],
+      "files": []
+    }
+  },
+  "migration_preview": {
+    "detected": false,
+    "decision": "not_detected",
+    "would_remove_entries": [],
+    "would_move_files": []
+  },
+  "exit_code": 0
+}

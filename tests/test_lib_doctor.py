@@ -66,6 +66,8 @@ def test_doctor_state_has_required_fields():
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
+        # #311: precomputed statusLine.refreshInterval classification.
+        "statusline_refresh_state",
     }
     assert fields == expected, fields ^ expected
 

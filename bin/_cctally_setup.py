@@ -62,6 +62,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -402,6 +403,246 @@ def _settings_merge_unwire_legacy(settings: dict) -> tuple[dict, int]:
         else:
             del hooks_root[ev]
     return settings, removed
+
+
+# ── statusLine.refreshInterval recognizer + classifier + merge (#311 D3) ─
+# The setup-managed statusLine.refreshInterval keeps the usage-persistence
+# feeder ticking while a parent session waits on a long subagent (Claude
+# Code's event-driven statusline updates go quiet then). Ownership is
+# add-when-absent / never-mutate / never-remove: we only augment a statusLine
+# block that already points at cctally, never create one, never change a
+# user's value, and never delete it. These are I/O-LAYER helpers (wrapper
+# recognition does path expansion, existence checks, and file-content
+# scanning, so purity is impossible — Codex R2 F4); they live here and MUST
+# NOT be imported by bin/_lib_doctor.py (the doctor kernel stays I/O-free —
+# doctor_gather_state calls these and passes only the resulting state string
+# into DoctorState).
+
+_STATUSLINE_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_STATUSLINE_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_STATUSLINE_VAR_REF_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+_STATUSLINE_SHELLS = ("sh", "bash", "zsh")
+
+
+def _statusline_executable_kind(token: str) -> "str | None":
+    """Classify a bare executable token.
+
+    ``"sub"`` when the basename is ``cctally`` or the npm shim (a
+    ``statusline`` subcommand must follow), ``"self"`` when it is
+    ``cctally-statusline`` (self-contained — ``bin/cctally-statusline`` itself
+    dispatches to ``cctally statusline``, so no following subcommand is
+    required, Codex R3 F1), else ``None``."""
+    if not isinstance(token, str):
+        return None
+    name = pathlib.PurePosixPath(token).name
+    if name in ("cctally", _CCTALLY_NPM_SHIM_BASENAME):
+        return "sub"
+    if name == "cctally-statusline":
+        return "self"
+    return None
+
+
+def _statusline_tokens_have_direct_invocation(tokens: list) -> bool:
+    """True iff ``tokens`` (one script line) carry a CORRELATED cctally
+    statusline invocation: a cctally/shim token IMMEDIATELY followed by
+    ``statusline`` (or ``claude statusline``), or a self-contained
+    ``cctally-statusline`` token. Adjacency (not independent needles) defeats
+    the `cctally forecast` + foreign `ccusage statusline` false positive
+    (Codex R2 F1); scanning every position (not just the head) catches the
+    common piped/`exec`-prefixed real-wrapper shapes. Known accepted
+    residual: a literal token pair anywhere on the line (e.g. an unquoted
+    `echo cctally statusline`) matches too — bounded by the
+    LEGACY_STATUSLINE_PATHS anchor and a benign add-when-absent blast
+    radius; head-anchoring would false-negative the real piped wrapper."""
+    for i, tok in enumerate(tokens):
+        kind = _statusline_executable_kind(tok)
+        if kind == "self":
+            return True
+        if kind == "sub":
+            if tokens[i + 1:i + 2] == ["statusline"] or \
+               tokens[i + 1:i + 3] == ["claude", "statusline"]:
+                return True
+    return False
+
+
+def _statusline_deref_var(token: str) -> "str | None":
+    """Variable name from ``$VAR`` / ``${VAR}`` (shlex already stripped any
+    surrounding quotes), else ``None``."""
+    m = _STATUSLINE_VAR_REF_RE.match(token)
+    return m.group(1) if m else None
+
+
+def _statusline_script_content_correlated(text: str) -> bool:
+    """Two-pass static analysis of a legacy wrapper script's (comment-stripped)
+    content. True iff a line directly invokes ``cctally statusline`` (or a
+    self-contained ``cctally-statusline``), OR a variable is bound to a
+    recognized cctally executable and later invoked with ``statusline`` (bare
+    for the self-contained kind). Per-line full grammar is deliberately NOT
+    parsed (the indirection makes it impossible); the assignment-then-
+    invocation correlation is static-analyzable and bounded by the legacy-path
+    anchor (Codex R2 F1 / R3 F1)."""
+    import shlex
+    lines: list = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            toks = shlex.split(raw)
+        except ValueError:
+            continue
+        if toks:
+            lines.append(toks)
+
+    var_kind: dict = {}  # var name -> "sub" | "self"
+    for toks in lines:
+        # Pass 1a: a directly-correlated invocation on this line ends it.
+        if _statusline_tokens_have_direct_invocation(toks):
+            return True
+        # Pass 1b: record `VAR=<recognized executable>` assignments.
+        for tok in toks:
+            m = _STATUSLINE_ASSIGN_RE.match(tok)
+            if not m:
+                continue
+            kind = _statusline_executable_kind(m.group(2).strip())
+            if kind:
+                var_kind[m.group(1)] = kind
+
+    if not var_kind:
+        return False
+    # Pass 2: a later line invoking a bound variable, correlated the same way.
+    for toks in lines:
+        for i, tok in enumerate(toks):
+            var = _statusline_deref_var(tok)
+            if var is None or var not in var_kind:
+                continue
+            kind = var_kind[var]
+            if kind == "self":
+                return True
+            if kind == "sub" and (
+                toks[i + 1:i + 2] == ["statusline"]
+                or toks[i + 1:i + 3] == ["claude", "statusline"]
+            ):
+                return True
+    return False
+
+
+def _statusline_wrapper_script_matches(script_token: str) -> bool:
+    """True iff ``script_token`` — after ``$HOME``/``${HOME}``/``~`` expansion
+    (Codex: os.path.expanduser alone does NOT expand $HOME; expandvars first) —
+    resolves to an existing file at one of ``LEGACY_STATUSLINE_PATHS`` whose
+    comment-stripped content carries a correlated cctally-statusline
+    invocation."""
+    c = _cctally()
+    expanded = os.path.expanduser(os.path.expandvars(script_token))
+    norm = os.path.normpath(expanded)
+    legacy = c.LEGACY_STATUSLINE_PATHS
+    if not any(os.path.normpath(str(lp)) == norm for lp in legacy):
+        return False
+    p = pathlib.Path(expanded)
+    if not p.is_file():
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return _statusline_script_content_correlated(text)
+
+
+def _is_cctally_statusline_command(cmd) -> bool:
+    """True iff ``cmd`` runs ``cctally statusline`` (the #311 anchored grammar).
+
+    Anchored EXECUTION grammar (Codex R1 F3 — free token scanning would
+    false-positive on ``echo cctally statusline`` / ``cat <legacy path>``):
+    ``shlex.split`` the command (malformed → False), strip leading
+    ``VAR=value`` env-assignment tokens, then classify on the FIRST command
+    token.
+
+    Direct form: first token is ``cctally``/npm-shim followed immediately by
+    ``statusline`` (or ``claude statusline`` — the documented subgroup form),
+    or first token is ``cctally-statusline``. Trailing flags tolerated.
+
+    Wrapper form (the real-world default): first token is a shell
+    (``sh``/``bash``/``zsh``) whose first non-flag argument resolves to a
+    legacy-path script with correlated content; a bare legacy-path token with
+    no shell prefix is matched the same way."""
+    import shlex
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    try:
+        tokens = shlex.split(cmd.strip())
+    except ValueError:
+        return False
+    idx = 0
+    while idx < len(tokens) and _STATUSLINE_ENV_ASSIGN_RE.match(tokens[idx]):
+        idx += 1
+    tokens = tokens[idx:]
+    if not tokens:
+        return False
+    first = tokens[0]
+    kind = _statusline_executable_kind(first)
+    if kind == "self":
+        return True
+    if kind == "sub":
+        rest = tokens[1:]
+        return rest[:1] == ["statusline"] or rest[:2] == ["claude", "statusline"]
+    # Not a direct cctally executable. Wrapper form.
+    if pathlib.PurePosixPath(first).name in _STATUSLINE_SHELLS:
+        script = next((t for t in tokens[1:] if not t.startswith("-")), None)
+        if script is None:
+            return False
+        return _statusline_wrapper_script_matches(script)
+    # A bare legacy-path script token (no shell prefix).
+    return _statusline_wrapper_script_matches(first)
+
+
+def _classify_statusline_refresh(settings) -> "tuple[str, object]":
+    """Five-state classification of ``settings``'s
+    ``statusLine.refreshInterval``, shared by setup + doctor.
+
+    States (Codex R1 F4):
+      - ``unavailable``: settings could not be loaded (None/SetupError
+        sentinel). MUST be preserved as None — coercing to ``{}`` would
+        falsely report ``absent`` ("no statusline configuration").
+      - ``absent``: no ``statusLine`` key (setup never creates one).
+      - ``foreign``: block is not a dict, ``type != "command"``, or the
+        command is not a recognized cctally statusline.
+      - ``missing``: recognized cctally statusLine with no ``refreshInterval``.
+      - ``present``: recognized + ``refreshInterval`` set.
+
+    Returns ``(state, value)`` where ``value`` is the existing
+    ``refreshInterval`` echoed VERBATIM (any JSON type) for ``present``, else
+    ``None`` (the settings loader validates only the root, so a user value may
+    be a string/bool/list/object — the never-mutate rule preserves all)."""
+    c = _cctally()
+    if settings is None:
+        return ("unavailable", None)
+    if not isinstance(settings, dict) or "statusLine" not in settings:
+        return ("absent", None)
+    block = settings["statusLine"]
+    if not isinstance(block, dict) or block.get("type") != "command":
+        return ("foreign", None)
+    if not c._is_cctally_statusline_command(block.get("command", "")):
+        return ("foreign", None)
+    if "refreshInterval" not in block:
+        return ("missing", None)
+    return ("present", block["refreshInterval"])
+
+
+def _settings_merge_statusline_refresh_interval(settings: dict) -> bool:
+    """Add ``statusLine.refreshInterval`` when — and ONLY when — a recognized
+    cctally statusLine block lacks it (add-when-absent / never-mutate /
+    never-remove). Returns True iff it changed anything. Called from
+    ``_setup_install`` so the change rides the SAME existing atomic
+    backup+write (no second write, no new ownership state)."""
+    c = _cctally()
+    state, _ = c._classify_statusline_refresh(settings)
+    if state != "missing":
+        return False
+    settings["statusLine"]["refreshInterval"] = (
+        _cctally_core.STATUSLINE_REFRESH_INTERVAL_DEFAULT
+    )
+    return True
 
 
 # ── symlink + path helpers ─────────────────────────────────────────────
@@ -1488,11 +1729,19 @@ def _setup_status(args: argparse.Namespace) -> int:
     stale_syms = list(dict.fromkeys(active_stale + retired_stale))    # union, order-stable
     is_brew = _setup_is_brew_install(repo_root)
     on_path = _setup_path_includes_local_bin()
+    settings_load_failed = False
     try:
         settings = c._load_claude_settings()
     except c.SetupError as exc:
         eprint(f"setup: warning: {exc}")
         settings = {}
+        settings_load_failed = True
+    # #311: classify statusLine.refreshInterval read-only. Preserve the
+    # SetupError sentinel (classify from None, NOT the coerced {}) so a
+    # malformed settings.json reports `unavailable`, never a false `absent`.
+    sl_state, sl_value = c._classify_statusline_refresh(
+        None if settings_load_failed else settings
+    )
     hook_counts = _setup_count_hook_entries(settings)
     oauth = _setup_oauth_token_present()
     throttle_age = c._hook_tick_throttle_age_seconds()
@@ -1514,6 +1763,11 @@ def _setup_status(args: argparse.Namespace) -> int:
                 "path_includes": on_path,
             },
             "hooks": {ev: hook_counts[ev] for ev in c.SETUP_HOOK_EVENTS},
+            # #311: read-only statusLine.refreshInterval classification (status
+            # never mutates → action always "none").
+            "statusline_refresh": {
+                "state": sl_state, "value": sl_value, "action": "none",
+            },
             "auth": {
                 "oauth_token_present": oauth,
                 "last_fetch_age_s": (
@@ -1555,6 +1809,15 @@ def _setup_status(args: argparse.Namespace) -> int:
         marker = "✓" if hook_counts[ev] >= 1 else "✗"
         word = "installed" if hook_counts[ev] >= 1 else "missing"
         out.append(f"  {ev:14s} {word:24s} {marker}")
+    # #311: report statusLine.refreshInterval read-only — only when a
+    # statusLine block exists (present/missing/foreign); silent for the
+    # common `absent`/`unavailable` cases (hooks/settings warnings cover those).
+    if sl_state == "present":
+        out.append(f"  {'refreshInterval':14s} {'set (' + str(sl_value) + ')':24s} ✓")
+    elif sl_state == "missing":
+        out.append(f"  {'refreshInterval':14s} {'not set':24s} ⚠")
+    elif sl_state == "foreign":
+        out.append(f"  {'refreshInterval':14s} {'n/a (custom statusLine)':24s} ✓")
     if codex_hooks["roots"]:
         out.append("Codex hooks")
         for row in codex_hooks["roots"]:
@@ -1795,6 +2058,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     dst_dir = _setup_local_bin_dir()
     claude_available = _setup_claude_available()
     settings: dict = {}
+    settings_load_failed = False
     if claude_available:
         try:
             settings = c._load_claude_settings()
@@ -1803,6 +2067,13 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             # against an empty dict simply yields detected=False for entries.
             # Mirror _setup_status's non-mutating warning behavior.
             eprint(f"setup: warning: {exc}")
+            settings_load_failed = True
+    # #311: classify statusLine.refreshInterval. Preserve the SetupError
+    # sentinel (classify from None, NOT the coerced {}) so a malformed
+    # settings.json previews `unavailable`, never a false `absent`.
+    sl_state, sl_value = c._classify_statusline_refresh(
+        None if settings_load_failed else settings
+    )
     detection = _setup_detect_legacy_bespoke_hooks(settings)
     sym_results = []
     for name in c.SETUP_SYMLINK_NAMES:
@@ -1846,6 +2117,13 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             )
     else:
         out.append("Claude Code home not present — would skip Claude hooks")
+    # #311: preview the statusLine.refreshInterval add — ONLY in the `missing`
+    # state (a recognized cctally statusLine block lacking the key).
+    if sl_state == "missing":
+        out.append(
+            f"Would add statusLine.refreshInterval: "
+            f"{_cctally_core.STATUSLINE_REFRESH_INTERVAL_DEFAULT}"
+        )
     for row in codex_hooks["roots"]:
         if row["state"] == "malformed":
             out.append(f"Codex hooks malformed at {row['hooks_path']}: {row['error']}")
@@ -1937,6 +2215,12 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
                     for ev in (c.SETUP_HOOK_EVENTS if claude_available else ())
                 ],
                 "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
+            },
+            # #311: additive statusLine.refreshInterval preview object. `action`
+            # is `would_add` only in the `missing` state, else `none`.
+            "statusline_refresh": {
+                "state": sl_state, "value": sl_value,
+                "action": "would_add" if sl_state == "missing" else "none",
             },
             "codex_hooks": codex_hooks,
             # Sibling parity with `_setup_status` and `_setup_install`
@@ -2204,6 +2488,18 @@ def _setup_install(args: argparse.Namespace) -> int:
             eprint(f"setup: {exc}")
             return 1
 
+    # #311: statusLine.refreshInterval — add-when-absent. Classify BEFORE the
+    # merge (for the text/JSON report) then mutate; the mutation rides the same
+    # atomic backup+write below (no second write). Only mutates in the `missing`
+    # state. When Claude isn't available there's no settings to consult →
+    # `unavailable`, action none.
+    sl_state_pre, sl_value_pre = (
+        c._classify_statusline_refresh(settings) if claude_available
+        else ("unavailable", None)
+    )
+    sl_added = bool(claude_available) and \
+        c._settings_merge_statusline_refresh_interval(settings)
+
     # Clean up symlinks left behind by prior cctally versions whose
     # subcommand surface has changed (e.g. v1.9.0 retired
     # `cctally-release` when release tooling went private). Only unlinks
@@ -2363,6 +2659,20 @@ def _setup_install(args: argparse.Namespace) -> int:
     # — matches the spec's success-path sample (Section 2).
     if claude_available:
         out.append(f"✓ Wrote {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}")
+        # #311: report the statusLine.refreshInterval outcome — only when a
+        # statusLine block exists (present/foreign/missing); silent for the
+        # common `absent` case so a fresh install with no statusLine is quiet.
+        if sl_added:
+            out.append(
+                f"✓ Added statusLine.refreshInterval: "
+                f"{_cctally_core.STATUSLINE_REFRESH_INTERVAL_DEFAULT} to settings.json"
+            )
+        elif sl_state_pre == "present":
+            out.append(
+                f"  statusLine.refreshInterval unchanged (user value: {sl_value_pre})"
+            )
+        elif sl_state_pre == "foreign":
+            out.append("  statusLine.refreshInterval skipped (custom statusLine command)")
 
     if decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
         files_str = "{record-usage-stop,usage-poller{,-start,-stop}}.py"
@@ -2511,6 +2821,16 @@ def _setup_install(args: argparse.Namespace) -> int:
                 "events_added": list(c.SETUP_HOOK_EVENTS) if claude_available else [],
                 "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
             },
+            # #311: additive statusLine.refreshInterval object. `state`/`value`
+            # reflect the RESULT (post-merge) so an add reports present/30;
+            # `action` is `added` only when this install inserted the key.
+            "statusline_refresh": (
+                {"state": "present",
+                 "value": _cctally_core.STATUSLINE_REFRESH_INTERVAL_DEFAULT,
+                 "action": "added"}
+                if sl_added else
+                {"state": sl_state_pre, "value": sl_value_pre, "action": "none"}
+            ),
             "codex_hooks": codex_hooks,
             "auth": {
                 "oauth_token_present": oauth,

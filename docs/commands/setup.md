@@ -121,6 +121,18 @@ run in the background child.
 `command` field: a path whose basename is `cctally` followed by `hook-tick`.
 Both bare and absolute paths match; quoted paths (with spaces) match too.
 
+## `statusLine.refreshInterval`
+
+When your `~/.claude/settings.json` already has a `statusLine` block that points at cctally (a `type: "command"` block whose command runs `cctally statusline` — directly, via `cctally claude statusline`, via the self-contained `cctally-statusline`, or through a legacy `~/.claude/statusline-command.sh`-style wrapper that invokes it), setup adds `"refreshInterval": 30` when the block lacks one. This makes Claude Code re-run the status line on a 30-second timer so usage keeps recording while a coordinator session waits on a long subagent (see [statusline.md](statusline.md#keeping-usage-fresh-during-subagent-waits-statuslinerefreshinterval)).
+
+Ownership is **add-when-absent / never-mutate / never-remove**:
+
+- **Add when absent.** The key is inserted only when a recognized cctally `statusLine` block has no `refreshInterval`. Setup never *creates* a `statusLine` block where none exists — your status-line choice is yours; setup only augments a cctally-pointing one.
+- **Never mutate.** A `refreshInterval` you already set is left exactly as-is, whatever its value or JSON type (a number, or even a string). Setting your own value is the durable way to change or disable the cadence.
+- **Never remove.** `cctally setup --uninstall` removes cctally's hook entries but leaves the `statusLine` block and any `refreshInterval` untouched.
+
+The change rides the same atomic backup + write as the hook install. Install reports what it did (`Added …`, `unchanged (user value: N)`, or `skipped` for a non-cctally statusLine command); `--dry-run` previews `Would add statusLine.refreshInterval: 30` only when it would actually add it; `--status` reports the current state read-only. All three modes carry a `statusline_refresh` object in their `--json` envelope with `{ state, value, action }` — `state ∈ {unavailable, absent, foreign, present, missing}`, `value` the existing `refreshInterval` echoed verbatim (or `null`), and `action ∈ {added, would_add, none}`. `cctally doctor` WARNs when a recognized cctally statusLine command is missing the key (see [doctor.md](doctor.md)).
+
 ## Codex quota lifecycle hooks
 
 When Codex homes are available, setup also manages native Codex quota hooks.

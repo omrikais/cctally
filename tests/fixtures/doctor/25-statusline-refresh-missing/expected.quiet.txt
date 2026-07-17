@@ -1,0 +1,23 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ statusLine refreshInterval not set on a cctally statusLine
+      → Run `cctally setup` to add statusLine.refreshInterval, or set it manually — see docs/commands/statusline.md
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ cache.db                 absent (fresh install)
+  ⚠ Pending migrations       37 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+Data
+Pricing
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+Telemetry
+
+Summary: 29 OK · 6 WARN · 0 FAIL

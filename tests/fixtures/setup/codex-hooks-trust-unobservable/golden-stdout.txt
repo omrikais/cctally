@@ -11,6 +11,11 @@
     "Stop": 0,
     "SubagentStop": 0
   },
+  "statusline_refresh": {
+    "state": "absent",
+    "value": null,
+    "action": "none"
+  },
   "auth": {
     "oauth_token_present": false,
     "last_fetch_age_s": null

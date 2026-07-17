@@ -704,6 +704,15 @@ _cctally_setup = _load_sibling("_cctally_setup")
 _settings_merge_install = _cctally_setup._settings_merge_install
 _settings_merge_uninstall = _cctally_setup._settings_merge_uninstall
 _settings_merge_unwire_legacy = _cctally_setup._settings_merge_unwire_legacy
+# #311: statusLine.refreshInterval recognizer / classifier / merge. Re-exported
+# so doctor's gather site (c._classify_statusline_refresh) and the setup tests
+# reach the one implementation; the classifier is reached from _cctally_doctor,
+# never imported into the I/O-free _lib_doctor kernel.
+_is_cctally_statusline_command = _cctally_setup._is_cctally_statusline_command
+_classify_statusline_refresh = _cctally_setup._classify_statusline_refresh
+_settings_merge_statusline_refresh_interval = (
+    _cctally_setup._settings_merge_statusline_refresh_interval
+)
 _setup_resolve_repo_root = _cctally_setup._setup_resolve_repo_root
 _setup_local_bin_dir = _cctally_setup._setup_local_bin_dir
 _SetupSymlinkResult = _cctally_setup._SetupSymlinkResult

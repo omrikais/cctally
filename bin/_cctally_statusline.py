@@ -449,6 +449,17 @@ def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
     INLINE (no fork) so persistence tests are deterministic and no detached
     child outlives fixture cleanup."""
     c = _cctally()
+    # 0. Pool-identity guard (spec 2026-07-17 #311 D1). A bracket-variant
+    #    model id (e.g. `claude-opus-4-8[1m]`) reports a SEPARATE rate-limit
+    #    pool; persisting it poisons the default-pool DB (HWM latch + dedup
+    #    freeze). Skip BEFORE the lock/fork AND before touching the
+    #    observation marker — a foreign-pool session is not evidence the
+    #    regular-pool pipeline is alive, so the OAuth backfill must keep
+    #    aging. Render is unchanged (this is persist-only). `.model_id` is a
+    #    dataclass attr, not a dict key, so this never AttributeErrors into
+    #    cmd_statusline's silent `except`.
+    if _lib_statusline.is_alternate_pool_model_id(parsed.model_id):
+        return
     # 1. Require a usable 7d reading. Absence is a clean no-op (older CC / CC
     #    not supplying rate_limits — the OAuth backfill covers that case).
     if parsed.rate_limits_7d_pct is None or parsed.rate_limits_7d_resets_at is None:

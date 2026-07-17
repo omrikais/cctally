@@ -53,6 +53,9 @@ SCENARIOS = {
     "22-codex-quota-fresh-future": "codex_quota_fresh_future",
     "23-codex-lifecycle-recent-never": "codex_lifecycle_recent_never",
     "24-codex-lifecycle-recent-stale": "codex_lifecycle_recent_stale",
+    # #311: a recognized cctally statusLine command with NO refreshInterval →
+    # the only WARN is hooks.statusline_refresh_interval (all_ok otherwise).
+    "25-statusline-refresh-missing": "statusline_refresh_missing",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -435,6 +438,34 @@ def _scenario_body(slug: str) -> str:
             PY
             """)
         return _scenario_body("all_ok") + bump
+    if slug == "statusline_refresh_missing":
+        # #311: reuse the clean all_ok baseline (install/hooks/oauth/snapshot
+        # all OK), then overwrite settings.json with the canonical hooks PLUS a
+        # recognized cctally statusLine command that lacks `refreshInterval`.
+        # The direct-form recognizer parses the command string (no PATH lookup),
+        # so `hooks.statusline_refresh_interval` is the one NEW warn this
+        # scenario adds over the all_ok baseline (which itself carries the
+        # usual fresh-install WARNs: recent-activity, last-fire, cache.db
+        # absent, pending migrations, update-state).
+        statusline = textwrap.dedent("""\
+            cat > "$HARNESS_FAKE_HOME/.claude/settings.json" <<'JSON'
+            {
+              "hooks": {
+                "PostToolBatch": [
+                  {"matcher": "*", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
+                ],
+                "Stop": [
+                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
+                ],
+                "SubagentStop": [
+                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
+                ]
+              },
+              "statusLine": {"type": "command", "command": "cctally statusline"}
+            }
+            JSON
+            """)
+        return _scenario_body("all_ok") + statusline
     if slug == "stats_version_ahead":
         # Issue #145: reuse the all_ok baseline, then push stats.db's
         # user_version past the stats registry head. doctor's raw status read

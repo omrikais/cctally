@@ -187,6 +187,14 @@ def doctor_gather_state(
         settings = c._load_claude_settings()
     except c.SetupError:
         settings = None
+    # #311: precompute the statusLine.refreshInterval state via the setup
+    # I/O-layer classifier (wrapper recognition does file scans), so the pure
+    # doctor kernel stays I/O-free. `settings is None` (SetupError) → the
+    # classifier's `unavailable`, matching the check's always-OK posture.
+    try:
+        statusline_refresh_state = c._classify_statusline_refresh(settings)[0]
+    except Exception:
+        statusline_refresh_state = "unavailable"
     # Below: fail-soft posture for the diagnostic — any unexpected error
     # in a sub-probe degrades that field to None rather than aborting the
     # whole report.
@@ -777,6 +785,8 @@ def doctor_gather_state(
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,
+        # #311: precomputed statusLine.refreshInterval classification.
+        statusline_refresh_state=statusline_refresh_state,
     )
 
 

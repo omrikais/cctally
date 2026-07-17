@@ -278,6 +278,18 @@ Properties of the persist (all side effects — the rendered line never changes)
 Snapshots written this way are labeled `source=statusline`; OAuth-fed rows are
 labeled `source=api`.
 
+### Keeping usage fresh during subagent waits (`statusLine.refreshInterval`)
+
+Claude Code's status-line updates are **event-driven**, so while a coordinator session waits on a long-running subagent those events go quiet: `cctally statusline` isn't invoked, and the usage snapshots stop advancing for the whole subagent run. Claude Code's documented `statusLine.refreshInterval` setting re-runs the status-line command on a fixed timer *in addition to* the event-driven updates, which is the only idle-time trigger for the persist. `cctally setup` therefore adds `"refreshInterval": 30` to a cctally-pointing `statusLine` block that doesn't already have one (see [setup.md](setup.md) for the add-when-absent / never-mutate / never-remove ownership rules), so usage keeps ticking on a 30-second cadence even during an otherwise-idle wait. The interval is deliberately larger than the internal persist throttle so a steady tick isn't beat-frequency-throttled.
+
+This is a **Claude Code `settings.json` key**, not the `cctally statusline --refresh-interval N` flag — those are unrelated. The CLI `--refresh-interval` flag is a **no-op** accepted only for `ccusage` drop-in compatibility (see the flag reference above); the timer is entirely Claude Code's, driven by `statusLine.refreshInterval` in `~/.claude/settings.json`.
+
+Removal semantics: **deleting** the `refreshInterval` key is not durable — the next `cctally setup` re-adds `30` under the add-when-absent rule. The durable way to change or disable the cadence is to **set your own value** (e.g. a larger number, or the Claude Code minimum of `1`); setup never mutates a `refreshInterval` you set yourself.
+
+### Pool-identity guard (`[1m]`-variant sessions)
+
+A session running a bracketed model variant such as `claude-opus-4-8[1m]` (the 1M-context variant) reports its `rate_limits` for a **separate usage pool** on the same account. Persisting that reading would poison the default-pool snapshots (the reset-aware high-water-mark clamp would latch the foreign value and freeze subsequent genuine writes), so the persist is **skipped** for any bracket-variant model id. Such a session still **renders** its own true pool numbers on the status line — only the write is suppressed, and the OAuth backfill's liveness clock keeps aging (a foreign-pool tick is not evidence the default-pool pipeline is alive).
+
 ## Examples
 
 ```bash

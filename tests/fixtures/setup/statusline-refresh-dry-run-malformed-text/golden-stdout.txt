@@ -1,0 +1,10 @@
+setup: warning: settings.json at /FAKE/.claude/settings.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1). Fix it and re-run.
+Would symlink 15 files to /FAKE/.local/bin/ (0 already correct, 15 new)
+Would add 3 hook entries to /FAKE/.claude/settings.json:
+  hooks.PostToolBatch[*] += { matcher: "*", command: "/REPO/bin/cctally hook-tick" }
+  hooks.Stop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+  hooks.SubagentStop[*] += { matcher: "", command: "/REPO/bin/cctally hook-tick" }
+Would not modify ~/.claude/statusline-command.sh
+Would not delete any data
+
+Re-run without --dry-run to apply.

@@ -22,6 +22,9 @@ Hooks
   ✓ Hook entries installed   PostToolBatch, Stop, SubagentStop
       details:
         counts: {'PostToolBatch': 1, 'Stop': 1, 'SubagentStop': 1}
+  ✓ statusLine refreshInterval no statusLine configured
+      details:
+        state: absent
   ⚠ Recent activity (24h)    0 fires
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
       details:
@@ -149,4 +152,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 26 OK · 7 WARN · 1 FAIL
+Summary: 27 OK · 7 WARN · 1 FAIL

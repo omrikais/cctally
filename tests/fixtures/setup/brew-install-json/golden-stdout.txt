@@ -20,6 +20,11 @@
     ],
     "settings_path": "/FAKE/.claude/settings.json"
   },
+  "statusline_refresh": {
+    "state": "absent",
+    "value": null,
+    "action": "none"
+  },
   "codex_hooks": {
     "roots": [],
     "installed_count": 0,
