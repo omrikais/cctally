@@ -1,4 +1,6 @@
-import type { AlertEntry, Envelope, SessionRow } from '../types/envelope';
+import type { AlertEntry, DashboardSelection, Envelope, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
+import type { SourceResource } from '../hooks/useSourceDetail';
+import { seedFormsForRow, toastAlertId } from '../lib/alertIdentity';
 import type { ConversationFilters, ConversationJump, RailSortKey, SearchKind } from '../types/conversation';
 import type { FocusMode } from '../conversations/applyFocusMode';
 import { EMPTY_FILTERS } from '../types/conversation';
@@ -35,6 +37,19 @@ import {
   type BasketAction,
   type BasketSlice,
 } from './basketSlice';
+import { loadActiveSource, saveActiveSource } from './sourcePrefs';
+import { resolveSourceView } from './sourceView';
+import { deriveVisiblePanelOrder, mapVisibleReorderToFull } from '../lib/visiblePanelOrder';
+import {
+  applySourceSessionFilter,
+  collectSourceSessionRows,
+  computeSourceSessionMatches,
+  type SessionDisplayRow,
+} from '../lib/sourceRows';
+import {
+  sourceRecencyDescCompare,
+  sourceSessionsColumns,
+} from '../lib/sourceSessionsColumns';
 
 export type { ShareModalState, ComposerModalState } from './shareSlice';
 
@@ -244,7 +259,13 @@ export interface Prefs {
 // without a second store read.
 export type ToastState =
   | { kind: 'status'; text: string }
-  | { kind: 'alert'; payload: AlertEntry }
+  // #294 S5 §6.7 — the alert toast payload is EITHER a legacy AlertEntry (from
+  // SHOW_ALERT_TOAST / the legacy INGEST_SNAPSHOT_ALERTS path) OR a
+  // source-qualified row (from the new INGEST_SOURCE_ALERTS pipeline). The Toast
+  // normalizes both to a source row at render time and shows a source chip; the
+  // legacy reducers keep RAW AlertEntry payloads so their existing store tests
+  // stay byte-stable.
+  | { kind: 'alert'; payload: AlertEntry | SourceAlertRow }
   | null;
 
 // Mirrors the Python envelope's alerts_settings block; lets
@@ -298,6 +319,12 @@ export interface DashboardPrefs {
 
 export interface UIState {
   snapshot: Envelope | null;
+  // #294 S5 — the global Claude / Codex / All source selection. Seeded from
+  // localStorage (`cctally:dashboard:source`) in loadInitial and persisted on
+  // every SET_ACTIVE_SOURCE that changes it. Purely a client re-selection over
+  // the already-delivered `sources` bundle: the store NEVER waits for or
+  // reconciles this against an envelope (§5.1).
+  activeSource: DashboardSelection;
   // Conversation viewer (spec §4). Top-level view mode + the small
   // cross-cutting reader/search state. Fetched list/reader DATA lives in
   // hook state, not here (mirrors useProjectDetail). None of these persist
@@ -449,7 +476,10 @@ export interface UIState {
   // reducer relied on a "next tick will surface the next unseen" loop
   // that never came. Cleared on cold-start (re-seed via INGEST first
   // tick) so a reconnect can't replay alerts that fired pre-drop.
-  alertToastQueue: AlertEntry[];
+  // #294 S5 §6.7 — carries either legacy AlertEntry rows (legacy path) or
+  // source-qualified rows (new pipeline) so a Codex toast can queue beside a
+  // Claude one; the Toast normalizes both at render.
+  alertToastQueue: Array<AlertEntry | SourceAlertRow>;
   // UI-only preview of panelOrder during an in-flight drag. While set,
   // App.tsx renders this order (FLIP animates) but prefs.panelOrder
   // remains untouched. Committed to prefs on drop (COMMIT_DRAG_PREVIEW)
@@ -502,6 +532,19 @@ export interface UIState {
    *  Lets the global/sessions key guards suppress hotkeys under those
    *  overlays, which are NOT in `openModal`/`doctorModalOpen` (#207 D2). */
   chromeOverlayOpen: number;
+  // #294 S5 §5.6 — the open qualified source-detail request (Codex/All source
+  // rows). Carries {source, resource, key}; the SourceDetailModal fetches the
+  // qualified route via useSourceDetail. Null when closed. Separate from the
+  // legacy `openSessionId`/`openBlockStartAt` fields (which stay the Claude
+  // legacy-route path).
+  openSourceDetail: { source: SourceName; resource: SourceResource; key: string } | null;
+  // #294 S5 §6.3 — the header-click sort override for the source-aware Sessions
+  // grid (Codex + All), over the SOURCE_SESSIONS_COLUMNS set (recency / label /
+  // total / cost). TRANSIENT (not persisted — no new config key): defaults to
+  // null, which renders the native default sort (last_activity desc). Distinct
+  // from the Claude `prefs.sessionsSortOverride` so a switch never cross-binds
+  // the two grids' sort state.
+  sourceSessionsSort: SortOverride | null;
 }
 
 export function defaultPrefs(): Prefs {
@@ -625,6 +668,8 @@ function loadInitial(): UIState {
   const railPrefs = loadRailPrefs();
   return {
     snapshot: null,
+    // #294 S5 — seed the persisted source selection (invalid/missing → claude).
+    activeSource: loadActiveSource(),
     view: 'dashboard',
     selectedConversationId: null,
     conversationSearch: '',
@@ -682,6 +727,9 @@ function loadInitial(): UIState {
     // #248 §6 — transient; starts with the hero in view (not scrolled).
     heroScrolled: false,
     chromeOverlayOpen: 0,
+    openSourceDetail: null,
+    // #294 S5 — transient; the source-grid sort defaults to native recency desc.
+    sourceSessionsSort: null,
   };
 }
 
@@ -758,17 +806,41 @@ export function getRenderedRows(s: UIState = state): SessionRow[] {
   return sorted.slice(0, s.prefs.sessionsPerPage);
 }
 
+// #294 S5 §6.3 — the source-aware parallel of getRenderedRows: the currently-
+// visible Sessions display-row list for Codex / All. Codex → the source-native
+// rows; All → the two providers' rows CONCATENATED and interleaved by the shared
+// recency comparator (each row keeps its own `source` — no merge). filter →
+// sort → slice-to-perPage, exactly matching how the source Sessions grid paints,
+// so search-match indices align with rendered positions (n/N). Claude mode uses
+// the legacy `getRenderedRows` path instead and this returns []. Byte-identical
+// Claude output is preserved because `_recomputeSearch` routes Claude away from
+// this path entirely.
+export function getRenderedSourceRows(s: UIState = state): SessionDisplayRow[] {
+  if (s.activeSource === 'claude') return [];
+  const view = resolveSourceView(s.snapshot, s.activeSource);
+  const rows = collectSourceSessionRows(view);
+  const filtered = applySourceSessionFilter(rows, s.filterText);
+  const override = s.sourceSessionsSort;
+  const sorted = override
+    ? applyTableSort(filtered, sourceSessionsColumns({ includeSource: s.activeSource === 'all' }), override)
+    : filtered.slice().sort(sourceRecencyDescCompare);
+  return sorted.slice(0, s.prefs.sessionsPerPage);
+}
+
 // Recompute searchMatches + searchIndex from the currently-visible row
 // list. Every reducer branch that changes what's visible (snapshot,
 // filter, sort, perPage) — or the needle itself — calls this so the
 // match set never goes stale.
 function _recomputeSearch(s: UIState): Pick<UIState, 'searchMatches' | 'searchIndex'> {
   if (!s.searchText) return { searchMatches: [], searchIndex: -1 };
-  const matches = computeSearchMatches(
-    getRenderedRows(s),
-    s.searchText,
-    ctxFromEnvelope(s.snapshot),
-  );
+  // #294 S5 — route the search haystack + rendered-row list by active source so
+  // n/N and the in-cell highlight align with what the visible grid paints.
+  // Claude keeps the legacy row+haystack path verbatim (byte-identical); Codex /
+  // All match over the source display rows (haystack = label + models).
+  const matches =
+    s.activeSource === 'claude'
+      ? computeSearchMatches(getRenderedRows(s), s.searchText, ctxFromEnvelope(s.snapshot))
+      : computeSourceSessionMatches(getRenderedSourceRows(s), s.searchText);
   if (matches.length === 0) return { searchMatches: [], searchIndex: -1 };
   const idx =
     s.searchIndex < 0 || s.searchIndex >= matches.length ? 0 : s.searchIndex;
@@ -797,6 +869,17 @@ export function resetSnapshotOrdering(): void { lastGeneratedAt = ''; }
 export type Action =
   | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string; projectKey?: string }
   | { type: 'CLOSE_MODAL' }
+  // #294 S5 — the global source selection. Persists to localStorage only when
+  // it actually changes (identity-gated, like the basket / outline-width
+  // persistence); a same-value dispatch is a no-op (no emit, no write).
+  | { type: 'SET_ACTIVE_SOURCE'; source: DashboardSelection }
+  // #294 S5 §5.6 — open / close the qualified source-detail modal (Codex/All
+  // source rows). The modal fetches `/api/source/<source>/<resource>/<key>`.
+  | { type: 'OPEN_SOURCE_DETAIL'; source: SourceName; resource: SourceResource; key: string }
+  | { type: 'CLOSE_SOURCE_DETAIL' }
+  // #294 S5 §6.3 — header-click sort override for the source Sessions grid
+  // (Codex / All). Transient; null restores the native recency-desc default.
+  | { type: 'SET_SOURCE_SESSIONS_SORT'; override: SortOverride | null }
   // Conversation viewer (spec §4). View-mode + reader/search cross-cutting
   // state. None persist to localStorage (a reload lands on the dashboard).
   | { type: 'SET_VIEW'; view: 'dashboard' | 'conversations' }
@@ -905,6 +988,18 @@ export type Action =
       alertsSettings: AlertsConfig;
       isFirstTick: boolean;
     }
+  // #294 S5 §6.7 — the source-aware toast pipeline. `rows` is the union of the
+  // two provider projections (`sources.claude` + `sources.codex` data.alerts),
+  // NOT the legacy top-level array, so a codex_budget row can't double-toast.
+  // Seen-state keys off the normalized `toastAlertId` (§6.7), seeding both the
+  // normalized and bare legacy forms for continuity. Toasts fire for rows of
+  // every source regardless of `activeSource` (an alert is a notification).
+  | {
+      type: 'INGEST_SOURCE_ALERTS';
+      rows: SourceAlertRow[];
+      alertsSettings: AlertsConfig;
+      isFirstTick: boolean;
+    }
   // cache-failure-markers spec §5 — mirror the snapshot's `dashboard_prefs`
   // block into the named slice each tick (the SSE handler dispatches this
   // from ingestDashboardPrefs). Replaced wholesale: the server is the source
@@ -981,6 +1076,8 @@ const DISMISSED_ON_VIEW_SWITCH = {
   openProjectKey: null,
   shareModal: null,
   composerModal: null,
+  // #294 S5 — the qualified source-detail modal is a transient overlay too.
+  openSourceDetail: null,
 } satisfies Partial<UIState>;
 
 export function dispatch(action: Action): void {
@@ -1005,6 +1102,37 @@ export function dispatch(action: Action): void {
         openProjectKey: null,
       };
       break;
+    case 'SET_ACTIVE_SOURCE':
+      // No-op same-value dispatch FIRST (skip both the persist AND the state
+      // reassignment) so a re-click of the active segment never churns the
+      // store or hits synchronous localStorage. Persist only on a real change.
+      if (state.activeSource === action.source) break;
+      saveActiveSource(action.source);
+      {
+        // A source switch closes any open qualified detail (its key belongs to
+        // the prior source's rows). Recompute search matches over the new
+        // source's rendered rows so an active `/` needle + n/N stay coherent.
+        const next = { ...state, activeSource: action.source, openSourceDetail: null };
+        state = { ...next, ..._recomputeSearch(next) };
+      }
+      break;
+    case 'OPEN_SOURCE_DETAIL':
+      state = {
+        ...state,
+        openSourceDetail: { source: action.source, resource: action.resource, key: action.key },
+      };
+      break;
+    case 'CLOSE_SOURCE_DETAIL':
+      if (state.openSourceDetail == null) break;
+      state = { ...state, openSourceDetail: null };
+      break;
+    case 'SET_SOURCE_SESSIONS_SORT': {
+      // Header-click sort reorders the source grid's rendered rows; search
+      // indices must follow. Transient — no localStorage write.
+      const next = { ...state, sourceSessionsSort: action.override };
+      state = { ...next, ..._recomputeSearch(next) };
+      break;
+    }
     case 'SET_VIEW':
       // Leaving the view clears the active selection AND the rail search so
       // re-entry starts clean; entering preserves any selection set by
@@ -1414,14 +1542,23 @@ export function dispatch(action: Action): void {
       break;
     }
     case 'REORDER_PANELS': {
+      // #294 S5 §6.11 — from/to index the VISIBLE (source-filtered) list; the
+      // reorder maps back into the full order via mapVisibleReorderToFull so
+      // hidden panels keep their absolute positions. When every panel is visible
+      // (visible === full) this is byte-identical to the prior splice-move.
       const { from, to } = action;
-      const order = state.prefs.panelOrder;
+      const full = state.prefs.panelOrder;
+      const visible = deriveVisiblePanelOrder(
+        full,
+        resolveSourceView(state.snapshot, state.activeSource),
+      );
       if (from === to) break;
-      if (from < 0 || from >= order.length) break;
-      if (to < 0 || to >= order.length) break;
-      const next = order.slice();
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
+      if (from < 0 || from >= visible.length) break;
+      if (to < 0 || to >= visible.length) break;
+      const after = visible.slice();
+      const [moved] = after.splice(from, 1);
+      after.splice(to, 0, moved);
+      const next = mapVisibleReorderToFull(full, visible, after);
       const prefs = { ...state.prefs, panelOrder: next };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       state = { ...state, prefs };
@@ -1455,17 +1592,26 @@ export function dispatch(action: Action): void {
       // never cross height classes (matching the pointer path, where each row
       // is its own dnd context). Empty/one-item rows and the class boundaries
       // are no-ops.
+      // #294 S5 §6.11 — `index` is the position in the VISIBLE (source-filtered)
+      // list; the row-aware swap walks the VISIBLE list and writes back into the
+      // full order (hidden panels hold their positions). visible === full →
+      // byte-identical to the prior full-order swap.
       const { index, direction } = action;
-      const order = state.prefs.panelOrder;
-      if (index < 0 || index >= order.length) break;
-      const row = CARD_LAYOUT[order[index]].row;
+      const full = state.prefs.panelOrder;
+      const visible = deriveVisiblePanelOrder(
+        full,
+        resolveSourceView(state.snapshot, state.activeSource),
+      );
+      if (index < 0 || index >= visible.length) break;
+      const row = CARD_LAYOUT[visible[index]].row;
       let target = index + direction;
-      while (target >= 0 && target < order.length && CARD_LAYOUT[order[target]].row !== row) {
+      while (target >= 0 && target < visible.length && CARD_LAYOUT[visible[target]].row !== row) {
         target += direction;
       }
-      if (target < 0 || target >= order.length) break;
-      const next = order.slice();
-      [next[index], next[target]] = [next[target], next[index]];
+      if (target < 0 || target >= visible.length) break;
+      const after = visible.slice();
+      [after[index], after[target]] = [after[target], after[index]];
+      const next = mapVisibleReorderToFull(full, visible, after);
       const prefs = { ...state.prefs, panelOrder: next };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       state = { ...state, prefs };
@@ -1498,6 +1644,9 @@ export function dispatch(action: Action): void {
       state = { ...state, toast: { kind: 'status', text: action.text } };
       break;
     case 'SHOW_ALERT_TOAST':
+      // The alerts-test button dispatches a Claude AlertEntry; the Toast
+      // normalizes it to a Claude source row at render (raw here so the store
+      // test's exact-payload assertion stays byte-stable).
       state = { ...state, toast: { kind: 'alert', payload: action.alert } };
       break;
     case 'HIDE_TOAST': {
@@ -1577,6 +1726,48 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         alerts: action.alerts,
+        seenAlertIds: seen,
+        alertsConfig: action.alertsSettings,
+        alertToastQueue: queue,
+        toast,
+      };
+      break;
+    }
+    case 'INGEST_SOURCE_ALERTS': {
+      // #294 S5 §6.7 — the source-aware toast pipeline. Mirrors the legacy
+      // INGEST_SNAPSHOT_ALERTS forward-only rule, but keyed on the normalized
+      // `toastAlertId` and fed ONLY the provider projections (no legacy
+      // top-level array → no codex_budget double-toast). Toasts fire for rows
+      // of every source; the panel (not the store) filters by active source.
+      const seen = new Set(state.seenAlertIds);
+      if (action.isFirstTick) {
+        // Cold-start / reconnect: seed every row as seen (both the normalized
+        // and bare legacy forms, for one release of continuity) without
+        // surfacing a toast, and clear the queue so a reconnect can't replay.
+        for (const r of action.rows) for (const f of seedFormsForRow(r)) seen.add(f);
+        state = {
+          ...state,
+          seenAlertIds: seen,
+          alertsConfig: action.alertsSettings,
+          alertToastQueue: [],
+        };
+        break;
+      }
+      const fresh = action.rows.filter((r) => !seen.has(toastAlertId(r)));
+      for (const r of fresh) for (const f of seedFormsForRow(r)) seen.add(f);
+
+      let toast = state.toast;
+      let queue = state.alertToastQueue;
+      if (fresh.length > 0) {
+        if (!toast || toast.kind !== 'alert') {
+          toast = { kind: 'alert', payload: fresh[0] };
+          queue = [...queue, ...fresh.slice(1)];
+        } else {
+          queue = [...queue, ...fresh];
+        }
+      }
+      state = {
+        ...state,
         seenAlertIds: seen,
         alertsConfig: action.alertsSettings,
         alertToastQueue: queue,
@@ -1697,9 +1888,17 @@ export function dispatch(action: Action): void {
     case 'CLOSE_SHARE':
     case 'OPEN_COMPOSER':
     case 'CLOSE_COMPOSER': {
+      // #294 S5 §7 — stamp the share flow's source from the CURRENT
+      // activeSource at OPEN_SHARE. A later SET_ACTIVE_SOURCE mutates only
+      // state.activeSource (not shareModal), so the captured source is frozen
+      // for the flow's lifetime — no restamp mid-flow.
+      const enriched: ShareAction =
+        action.type === 'OPEN_SHARE'
+          ? { ...action, source: action.source ?? state.activeSource }
+          : action;
       const slice = shareReducer(
         { shareModal: state.shareModal, composerModal: state.composerModal },
-        action,
+        enriched,
       );
       state = { ...state, ...slice };
       break;

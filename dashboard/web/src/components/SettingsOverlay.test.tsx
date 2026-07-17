@@ -1041,19 +1041,22 @@ describe('<SettingsOverlay /> dirty-state feedback (SET-1)', () => {
   });
 });
 
-// SET-5 (#252): the flat Alerts fieldset is split into two REAL domains —
-// Threshold (governed by the `alerts.enabled` master) and Budget (gated by a
-// configured budget, INDEPENDENT of the master). Guards against the issue's
-// literal-but-wrong "one master over all" nesting.
-describe('<SettingsOverlay /> alerts two-domain grouping (SET-5)', () => {
-  it('renders distinct Threshold / Budget / Test groups', () => {
+// #294 S5 Task 8 (supersedes SET-5 #252): the alerts fieldsets are regrouped
+// into three SOURCE-scoped groups — Notifications (global notifier), Claude
+// alerts (threshold master + projected weekly + a labeled Claude-budget
+// subgroup), and Codex alerts (the mirrored budget.codex.* toggles). The
+// two-domain "Threshold/Budget" split is retired; the underlying enablement
+// semantics (the budget/Codex toggles are gated by a configured budget, NOT the
+// threshold master) are unchanged and re-asserted below.
+describe('<SettingsOverlay /> alerts source-scoped grouping (Task 8)', () => {
+  it('renders distinct Notifications / Claude / Codex groups', () => {
     render(<SettingsOverlay />);
     seedAlertsConfig({ codex_budget_configured: true });
     openSettings();
-    // Scope to <legend> — the regexes also substring-match control labels
-    // ("Enable threshold alerts", "Codex budget alerts", …).
-    expect(screen.getByText(/Threshold alerts/i, { selector: 'legend' })).toBeInTheDocument();
-    expect(screen.getByText(/Budget alerts/i, { selector: 'legend' })).toBeInTheDocument();
+    // Scope to <legend> — the regexes also substring-match control labels.
+    expect(screen.getByText(/^Notifications/i, { selector: 'legend' })).toBeInTheDocument();
+    expect(screen.getByText(/^Claude alerts/i, { selector: 'legend' })).toBeInTheDocument();
+    expect(screen.getByText(/^Codex alerts/i, { selector: 'legend' })).toBeInTheDocument();
   });
 
   it('flipping the threshold master does not disable the budget/Codex toggles', () => {
@@ -1178,15 +1181,17 @@ describe('<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2
 // `.is-changed` marker (the decorative half of the dirty feedback; the Save
 // badge is the authoritative machine-readable signal).
 describe('<SettingsOverlay /> per-fieldset changed markers (SET-1)', () => {
-  it('marks the Threshold-alerts fieldset changed after a notifier edit, not Sort default', () => {
+  it('marks the Notifications fieldset changed after a notifier edit, not Sort default', () => {
+    // #294 S5 Task 8 — the notifier now lives in its own global "Notifications"
+    // group, so a notifier edit marks THAT fieldset (not the Claude group).
     render(<SettingsOverlay />);
     seedAlertsConfig({ notifier: 'auto' });
     openSettings();
     fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
     // Scope to <legend> so the regex doesn't also match control labels.
-    const thresh = screen.getByText(/Threshold alerts/i, { selector: 'legend' }).closest('fieldset')!;
+    const notif = screen.getByText(/^Notifications/i, { selector: 'legend' }).closest('fieldset')!;
     const sortFs = screen.getByText(/Sort default/i, { selector: 'legend' }).closest('fieldset')!;
-    expect(thresh.className).toMatch(/is-changed/);
+    expect(notif.className).toMatch(/is-changed/);
     expect(sortFs.className).not.toMatch(/is-changed/);
   });
 });

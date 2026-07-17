@@ -74,7 +74,7 @@ describe('D6: share modals use the × close glyph', () => {
     const items: BasketItem[] = [{
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:abc',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }];
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
     act(() => {

@@ -2,6 +2,12 @@ import { render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { TrendPanel } from './TrendPanel';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import {
+  makeAllSourceEntry,
+  makeClaudeSourceEntry,
+  makeCodexSourceEntry,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 import type { Envelope, TrendRow } from '../types/envelope';
 
 beforeEach(() => {
@@ -122,6 +128,56 @@ describe('TrendPanel sparkline track count (#207 C6)', () => {
     render(<TrendPanel />);
     const spark = document.getElementById('trend-spark')!;
     expect(spark.style.gridTemplateColumns).toBe('repeat(1, 1fr)');
+  });
+});
+
+// #294 S5 — the source seam: TrendPanel must not leak the legacy top-level
+// `env.trend` (Claude $/1% data) under a Codex selection. The panel is wrapped
+// in SourcePanelShell — Claude renders unchanged, Codex renders nothing, All
+// renders the Claude-labeled provider section.
+function trendLeakEnv(): Envelope {
+  const claude = makeClaudeSourceEntry();
+  const codex = makeCodexSourceEntry();
+  const slice = makeSourceEnvelope({
+    sources: { claude, codex, all: makeAllSourceEntry(claude, codex) },
+  });
+  // A populated legacy top-level trend (the exact leak surface from the QA).
+  const weeks = Array.from({ length: 3 }, (_, i) => trendRow(3 - i));
+  return {
+    ...baseEnvelope(),
+    ...slice,
+    trend: { weeks, spark_heights: weeks.map((_, i) => i + 1), history: weeks },
+  } as unknown as Envelope;
+}
+
+describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () => {
+  it('Codex mode renders NO trend rows and no Claude trend panel', () => {
+    updateSnapshot(trendLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<TrendPanel />);
+    expect(container.querySelector('#panel-trend')).toBeNull();
+    expect(container.querySelectorAll('.trend-table tbody tr').length).toBe(0);
+  });
+
+  it('All mode wraps the Claude trend in a Claude-labeled provider section (no Codex section)', () => {
+    updateSnapshot(trendLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+    const section = container.querySelector('.source-provider-section[data-source="claude"]');
+    expect(section).not.toBeNull();
+    expect(section!.querySelector('.source-chip')?.textContent).toBe('Claude');
+    // The real trend table renders inside the Claude section.
+    expect(section!.querySelector('#panel-trend')).not.toBeNull();
+    expect(section!.querySelectorAll('.trend-table tbody tr').length).toBe(3);
+    // Codex has no trend path → no Codex section.
+    expect(container.querySelector('.source-provider-section[data-source="codex"]')).toBeNull();
+  });
+
+  it('Claude mode still renders the trend table through the wrap (transparent)', () => {
+    updateSnapshot(trendLeakEnv());
+    render(<TrendPanel />);
+    expect(document.querySelector('#panel-trend')).not.toBeNull();
+    expect(document.querySelectorAll('.trend-table tbody tr').length).toBe(3);
   });
 });
 

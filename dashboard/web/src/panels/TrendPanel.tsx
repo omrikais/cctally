@@ -13,6 +13,7 @@ import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendSparkData, type TrendChartDatum } from '../store/selectors';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { SourcePanelShell } from './sourcePanel';
 
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
@@ -48,7 +49,25 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
   return `$/1% trend over ${data.length} weeks; latest ${latest}${dir}`;
 }
 
+// #294 S5 — source-aware wrapper. The $/1% trend is a Claude-only surface (Codex
+// hero publishes no trend, §5.5): Claude renders the existing sparkline+table
+// unchanged; Codex renders nothing (gate-hidden — the grid unmounts it, and the
+// shell returns null defensively); All renders the Claude-labeled provider
+// section (no Codex trend section). Wrapping stops the legacy top-level
+// `env.trend` from leaking Claude $/1% data under a Codex label.
 export function TrendPanel() {
+  return (
+    <SourcePanelShell
+      panel="trend"
+      panelKind="trend"
+      claude={<ClaudeTrendPanel />}
+      codex={() => null}
+      emptyLabel="No Codex trend."
+    />
+  );
+}
+
+function ClaudeTrendPanel() {
   const env = useSnapshot();
   const data = buildTrendSparkData(env);
   // #278 Theme A (ui-qa P3): header sub-label predicate — while hydrating with

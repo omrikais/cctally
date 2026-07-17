@@ -266,6 +266,50 @@ def test_post_sync_503_when_lock_held_beyond_timeout(monkeypatch, tmp_path):
         srv.shutdown(); t.join(timeout=2)
 
 
+def test_post_sync_immediate_during_long_automatic_cooldown(monkeypatch, tmp_path):
+    """F10 (#313 P2): the automatic sync thread's work-proportional cooldown
+    holds no lock, so a manual POST /api/sync runs immediately even while the
+    automatic thread is parked in a long cooldown."""
+    import importlib
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = importlib.import_module("_cctally_dashboard")
+    sync_lock = threading.Lock()
+    rebuild_calls = _wire(ns, sync_lock=sync_lock)
+    monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
+
+    first_iteration_done = threading.Event()
+    stop = threading.Event()
+
+    def run_iteration():
+        # Mirror the real automatic tick: hold the shared sync_lock only for the
+        # "rebuild", then release it before entering the cooldown.
+        with sync_lock:
+            pass
+        first_iteration_done.set()
+
+    loop_thread = threading.Thread(
+        target=lambda: dash._dashboard_sync_loop(
+            stop=stop, interval=100.0, run_iteration=run_iteration,
+            take_sync_request=lambda: False,
+        ),
+        daemon=True,
+    )
+    loop_thread.start()
+    srv, t, port = _serve(ns)
+    try:
+        # The automatic thread has finished one iteration and is now parked in
+        # its 100s cooldown, holding no lock.
+        assert first_iteration_done.wait(timeout=2)
+        status, _ = _post_sync(port)
+        assert status == 204
+        assert rebuild_calls["n"] == 1  # ran immediately — not gated by the cooldown
+    finally:
+        stop.set()
+        loop_thread.join(timeout=2)
+        srv.shutdown(); t.join(timeout=2)
+
+
 def test_post_sync_lock_released_between_calls(monkeypatch, tmp_path):
     """After a successful POST, the lock must be released so the next POST can run."""
     ns = load_script()

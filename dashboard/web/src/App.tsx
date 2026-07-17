@@ -10,6 +10,7 @@ import { PanelGridDnd } from './components/PanelGridDnd';
 import { DoctorModal } from './components/DoctorModal';
 import { UpdateModal } from './components/UpdateModal';
 import { ModalRoot } from './modals/ModalRoot';
+import { SourceDetailModal } from './modals/SourceDetailModal';
 import { ShareModalRoot } from './share/ShareModalRoot';
 import { ConversationsView } from './conversations/ConversationsView';
 import { getState, subscribeStore } from './store/store';
@@ -19,6 +20,8 @@ import { deriveAppState } from './lib/appState';
 import { ConnectionBanner } from './components/ConnectionBanner';
 import { SkeletonGrid } from './components/SkeletonGrid';
 import { CARD_LAYOUT } from './lib/panelIds';
+import { resolveSourceView } from './store/sourceView';
+import { deriveVisiblePanelOrder } from './lib/visiblePanelOrder';
 import { useBoardMode } from './hooks/useBoardMode';
 import { BoardModeContext } from './lib/boardModeContext';
 
@@ -32,6 +35,11 @@ export function App() {
     subscribeStore,
     () => getState().prefs.panelOrder,
   );
+  // #294 S5 §6.11 — the grid renders the DERIVED visible-panel order for the
+  // active source (source-hidden panels are not mounted). The persisted full
+  // order (`panelOrder`) is never rewritten by a switch; DnD/keyboard reorders
+  // map back into it (see the store's REORDER/SWAP handlers).
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   // Conversation viewer (spec §4). Swap the app BODY on the top-level
   // view mode; Header/Footer/overlays/modals stay mounted outside the
   // conditional so the always-on chrome (switcher, sync chip, settings,
@@ -61,15 +69,20 @@ export function App() {
   // ⇒ a pointer drag can't cross height classes; each PanelHost is handed its
   // GLOBAL panelOrder index so REORDER/SWAP stay correct.
   const { tall, medium, short, globalIndex } = useMemo(() => {
+    // Filter the persisted full order down to the source-visible panels, then
+    // partition into the three height-class rows. The per-panel `index` handed
+    // to PanelHost is its position in the VISIBLE list — SWAP_PANELS indexes the
+    // visible list and writes back into the full order.
+    const visibleOrder = deriveVisiblePanelOrder(panelOrder, resolveSourceView(env, activeSource));
     const byRow = (r: 'tall' | 'medium' | 'short') =>
-      panelOrder.filter((id) => CARD_LAYOUT[id].row === r);
+      visibleOrder.filter((id) => CARD_LAYOUT[id].row === r);
     return {
       tall: byRow('tall'),
       medium: byRow('medium'),
       short: byRow('short'),
-      globalIndex: new Map(panelOrder.map((id, i) => [id, i])),
+      globalIndex: new Map(visibleOrder.map((id, i) => [id, i])),
     };
-  }, [panelOrder]);
+  }, [panelOrder, env, activeSource]);
   return (
     <>
       {/* Keyboard bypass (A7) — first tab stop; reveals on :focus and
@@ -127,6 +140,9 @@ export function App() {
       <HelpOverlay />
       <SettingsOverlay />
       <ModalRoot />
+      {/* #294 S5 §5.6 — the qualified source-detail modal (Codex/All source
+          rows). Renders nothing when state.openSourceDetail === null. */}
+      <SourceDetailModal />
       {/* Share modal layer (spec §6.1) — separate from <ModalRoot> so
           the share modal layers ABOVE any open panel modal. Renders
           nothing when state.shareModal === null. */}

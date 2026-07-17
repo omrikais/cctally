@@ -19,9 +19,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { renderShare, ShareApiError } from './api';
 import type { ShareOptions, SharePanelId } from './types';
+import { SELECTION_LABEL } from './types';
+import type { DashboardSelection } from '../types/envelope';
 
 interface Props {
   panel: SharePanelId;
+  // #294 S5 §7 — the flow's captured source, stamped on the render body and
+  // surfaced as label chrome so the preview matches what the artifact says.
+  // Optional with a 'claude' default (compatibility path).
+  source?: DashboardSelection;
   templateId: string | null;
   options: ShareOptions;
 }
@@ -44,7 +50,7 @@ const initialPreviewState: PreviewState = {
   errorField: null,
 };
 
-export function PreviewPane({ panel, templateId, options }: Props) {
+export function PreviewPane({ panel, source = 'claude', templateId, options }: Props) {
   const [preview, setPreview] = useState<PreviewState>(initialPreviewState);
   // Per-fetch AbortController, set when a fetch starts and aborted when
   // the next fetch starts (or the component unmounts).
@@ -74,7 +80,7 @@ export function PreviewPane({ panel, templateId, options }: Props) {
       const previewOptions: ShareOptions = { ...options, reveal_projects: true };
 
       renderShare(
-        { panel, template_id: templateId, options: previewOptions },
+        { panel, template_id: templateId, options: previewOptions, source },
         { signal: ctl.signal },
       )
         .then((resp) => {
@@ -123,7 +129,7 @@ export function PreviewPane({ panel, templateId, options }: Props) {
       // effect's `setTimeout` aborts old in-flight requests at start.
       // On unmount we abort below in a separate effect.
     };
-  }, [panel, templateId, options]);
+  }, [panel, source, templateId, options]);
 
   // Unmount cleanup: abort any pending request so React doesn't warn
   // about a setState on an unmounted component if a slow fetch resolves
@@ -166,24 +172,36 @@ export function PreviewPane({ panel, templateId, options }: Props) {
     );
   }
 
-  // ready
+  // ready — surface the source label chrome so the preview matches what the
+  // artifact says (§7 Artifact chrome).
+  const sourceChrome = (
+    <div className="share-preview-source" aria-label={`Report source: ${SELECTION_LABEL[source]}`}>
+      <span className={`source-chip source-chip--${source}`}>{SELECTION_LABEL[source]}</span>
+    </div>
+  );
   if (options.format === 'md') {
     return (
-      <pre className="share-preview share-preview-md" aria-label="Markdown preview">
-        {preview.body}
-      </pre>
+      <div className="share-preview-wrap">
+        {sourceChrome}
+        <pre className="share-preview share-preview-md" aria-label="Markdown preview">
+          {preview.body}
+        </pre>
+      </div>
     );
   }
 
   // html / svg
   return (
-    <iframe
-      className="share-preview share-preview-iframe"
-      title="Report preview (decorative)"
-      tabIndex={-1}
-      // Static kernel output — no scripts needed.
-      sandbox="allow-same-origin"
-      srcDoc={preview.body}
-    />
+    <div className="share-preview-wrap">
+      {sourceChrome}
+      <iframe
+        className="share-preview share-preview-iframe"
+        title="Report preview (decorative)"
+        tabIndex={-1}
+        // Static kernel output — no scripts needed.
+        sandbox="allow-same-origin"
+        srcDoc={preview.body}
+      />
+    </div>
   );
 }

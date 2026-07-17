@@ -13,6 +13,7 @@ import { useReducedMotion } from '../hooks/useReducedMotion';
 import { BoardModeContext } from '../lib/boardModeContext';
 import { summarize } from '../lib/summaryWindow';
 import { cardRegionClick } from '../lib/cardRegion';
+import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
 import type { PeriodRow } from '../types/envelope';
 
 // #264 S2 / #265 — the Weekly summary TILE (restored from the S8 collapse).
@@ -57,7 +58,22 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
   );
 }
 
+// #294 S5 — source-aware wrapper. Claude = subscription-week summary tile
+// (unchanged); Codex = native calendar-week period table; All = provider
+// sections (Claude subscription weeks + Codex calendar weeks, never merged).
 export function WeeklyPanel() {
+  return (
+    <SourcePanelShell
+      panel="weekly"
+      panelKind="weekly"
+      claude={<ClaudeWeeklyPanel />}
+      codex={(d) => <CodexPeriodTable data={d} label="Weekly" />}
+      emptyLabel="No Codex weekly activity yet."
+    />
+  );
+}
+
+function ClaudeWeeklyPanel() {
   const env = useSnapshot();
   const allRows = env?.weekly?.rows ?? [];
   const mode = useContext(BoardModeContext);

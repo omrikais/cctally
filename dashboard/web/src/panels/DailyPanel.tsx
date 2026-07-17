@@ -9,6 +9,7 @@ import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
 import type { DailyPanelRow } from '../types/envelope';
 
 const MONTH_ABBR = [
@@ -89,7 +90,22 @@ function Cell({
   );
 }
 
+// #294 S5 — source-aware wrapper. Claude renders the existing heatmap panel
+// unchanged; Codex renders the native calendar-day period table; All renders
+// provider-labeled sections.
 export function DailyPanel() {
+  return (
+    <SourcePanelShell
+      panel="daily"
+      panelKind="daily"
+      claude={<ClaudeDailyPanel />}
+      codex={(d) => <CodexPeriodTable data={d} label="Daily" />}
+      emptyLabel="No Codex daily activity yet."
+    />
+  );
+}
+
+function ClaudeDailyPanel() {
   const env = useSnapshot();
   const isMobile = useIsMobile();
   const isDesktopBento = useIsDesktopBento();

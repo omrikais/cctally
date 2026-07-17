@@ -162,8 +162,29 @@ function alert(id: string) {
   };
 }
 
+// #294 S5 Task 7 — the SSE toast pipeline now reads the SOURCE projections
+// (`sources.claude/codex.data.alerts.rows`), NOT the legacy top-level `alerts`
+// array. Embed the alerts as Claude source rows so `collectToastAlertRows`
+// picks them up; the seed-both-forms rule (§6.7) means the bare legacy `id`
+// still lands in `seenAlertIds`.
+function withSources<T extends object>(env: T, alerts: ReturnType<typeof alert>[]): T {
+  return {
+    ...env,
+    // Real wire shape (#294 S5 QA): the source fields spread at the envelope
+    // TOP level; `sources` is the FLAT per-source map. `collectToastAlertRows`
+    // reads `env.sources.claude.data.alerts.rows`.
+    source_schema_version: 1,
+    default_source: 'claude',
+    source_order: ['claude', 'codex', 'all'],
+    sources: {
+      claude: { data: { alerts: { rows: alerts.map((a) => ({ ...a, source: 'claude', key: a.id })) } } },
+      codex: { data: { alerts: { rows: [] } } },
+    },
+  } as T;
+}
+
 function snapWithAlerts(generated_at: string, alerts: ReturnType<typeof alert>[]) {
-  return { ...snap(generated_at), alerts };
+  return withSources({ ...snap(generated_at), alerts }, alerts);
 }
 
 describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
@@ -276,12 +297,13 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     // out-of-order. The newer envelope carries an empty alerts list
     // and the same alertsConfig.
     const newerAlert = alert('weekly:2026-04-27:95');
-    MockEventSource.instances[0].emit('update', {
+    MockEventSource.instances[0].emit('update', withSources({
       ...snap('2026-04-24T10:01:00Z'),
       alerts: [newerAlert],
       alerts_settings: freshSettings,
-    });
-    expect(getState().alerts).toEqual([newerAlert]);
+    }, [newerAlert]));
+    // #294 S5 — sse now feeds the source pipeline; the observable invariants are
+    // alertsConfig + seenAlertIds (state.alerts is no longer sse-populated).
     expect(getState().alertsConfig).toEqual(freshSettings);
     const seenBefore = new Set(getState().seenAlertIds);
     expect(seenBefore.has(newerAlert.id)).toBe(true);
@@ -298,15 +320,14 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       budget_enabled: false,
     };
     const staleAlert = alert('weekly:2026-04-20:60');
-    MockEventSource.instances[0].emit('update', {
+    MockEventSource.instances[0].emit('update', withSources({
       ...snap('2026-04-24T09:50:00Z'),  // OLDER than 10:01
       alerts: [staleAlert],
       alerts_settings: staleSettings,
-    });
-    // updateSnapshot rejected the older envelope; ingestAlerts MUST
-    // NOT have run, so alerts / alertsConfig / seenAlertIds are
-    // exactly as they were after the post-bootstrap update.
-    expect(getState().alerts).toEqual([newerAlert]);
+    }, [staleAlert]));
+    // updateSnapshot rejected the older envelope; ingestAlerts MUST NOT have
+    // run, so alertsConfig / seenAlertIds are exactly as they were after the
+    // post-bootstrap update (the stale alert never got seeded).
     expect(getState().alertsConfig).toEqual(freshSettings);
     expect(getState().seenAlertIds.has(staleAlert.id)).toBe(false);
   });

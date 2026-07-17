@@ -327,10 +327,75 @@ ALLOWED_CONFIG_KEYS = (
     "budget.codex.alert_thresholds",
     "budget.codex.projected_enabled",
     "telemetry.enabled",
+    "conversation.retention_days",
 )
 
 
 _CODEX_BUDGET_LEAF_PREFIX = "budget.codex."
+
+_DEFAULT_CONVERSATION_RETENTION_DAYS = 180
+
+
+def _validate_retention_days_value(raw: object) -> int:
+    """Validate a ``config set`` value for ``conversation.retention_days`` (F8).
+
+    Accept a non-negative integer; ``off`` / ``0`` canonicalize to integer 0
+    (disabled — keep transcripts forever). Reject booleans, negatives, and
+    non-numeric input by raising ``ValueError`` (the caller maps that to exit 2).
+    """
+    if isinstance(raw, bool):
+        raise ValueError(
+            "conversation.retention_days must be a non-negative integer or 'off'"
+        )
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text == "off":
+            return 0
+        try:
+            value = int(text, 10)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "conversation.retention_days must be a non-negative integer "
+                f"or 'off', got {raw!r}"
+            )
+    elif isinstance(raw, int):
+        value = raw
+    else:
+        raise ValueError(
+            "conversation.retention_days must be a non-negative integer or 'off'"
+        )
+    if value < 0:
+        raise ValueError(
+            "conversation.retention_days must be >= 0 (use 'off' or 0 to disable)"
+        )
+    return value
+
+
+def resolve_retention_days(config: dict) -> int:
+    """Effective conversation transcript retention in days (F8).
+
+    Default is ``180``; ``0`` disables retention (keep forever). Any malformed
+    persisted value (non-int, boolean, negative, un-parseable string) degrades
+    to the safe 180 default rather than raising.
+    """
+    default = _DEFAULT_CONVERSATION_RETENTION_DAYS
+    block = config.get("conversation") if isinstance(config, dict) else None
+    if not isinstance(block, dict):
+        return default
+    stored = block.get("retention_days")
+    if stored is None:
+        return default
+    if isinstance(stored, bool):
+        return default
+    if isinstance(stored, int):
+        return stored if stored >= 0 else default
+    if isinstance(stored, str):
+        try:
+            value = int(stored.strip(), 10)
+        except (TypeError, ValueError):
+            return default
+        return value if value >= 0 else default
+    return default
 
 
 def _config_codex_leaf_value(config: dict, key: str) -> object:
@@ -794,6 +859,10 @@ def _config_known_value(config: dict, key: str) -> "object":
             except ValueError:
                 return True
         return True
+    if key == "conversation.retention_days":
+        # Effective transcript-retention window in days (default 180; 0 = keep
+        # forever). Malformed persisted data surfaces the safe default (F8).
+        return resolve_retention_days(config)
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Defaults mirror `_is_update_check_due` (True / 24 hours).
         # Hand-edited junk surfaces as the default — matches dashboard.bind.
@@ -1422,6 +1491,32 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 rendered = str(normalized)
             print(f"{key}={rendered}")
         return 0
+    if key == "conversation.retention_days":
+        # Validate first; rejection short-circuits before lock acquisition (F8).
+        try:
+            normalized = _validate_retention_days_value(raw)
+        except ValueError as exc:
+            print(f"cctally: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("conversation")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: conversation config error: conversation must be "
+                    "an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["retention_days"] = normalized
+            config["conversation"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"conversation": {"retention_days": normalized}}, indent=2))
+        else:
+            print(f"{key}={normalized}")
+        return 0
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Validate first; rejection short-circuits before lock acquisition.
         if key == "update.check.enabled":
@@ -1859,6 +1954,19 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block[inner_key]
                 if not block:
                     config.pop("statusline", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "conversation.retention_days":
+        # Mirror the display.tz branch: drop the leaf; if the `conversation`
+        # block ends up empty, drop it too. Next get resolves the 180 default.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("conversation")
+            if isinstance(block, dict) and "retention_days" in block:
+                del block["retention_days"]
+                if not block:
+                    config.pop("conversation", None)
                 save_config(config)
             # idempotent: silent on missing key
         return 0

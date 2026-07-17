@@ -23,6 +23,8 @@
 // Esc as a backstop even if the user has tabbed past it.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SharePanelId, ShareOptions, ShareTemplate } from './types';
+import { SELECTION_LABEL } from './types';
+import type { DashboardSelection } from '../types/envelope';
 import { fetchTemplates, ShareApiError } from './api';
 import { TemplateGallery } from './TemplateGallery';
 import { Knobs } from './Knobs';
@@ -40,6 +42,10 @@ import { ModalCloseButton } from '../modals/ModalCloseButton';
 
 interface Props {
   panel: SharePanelId;
+  // #294 S5 §7 — the source the flow was captured under (from shareModal.source).
+  // Optional with a 'claude' default: production always supplies it via
+  // ShareModalRoot; the default keeps the compatibility path for older callers.
+  source?: DashboardSelection;
   onClose: () => void;
   // Opaque per-panel params forwarded from the store's `shareModal.params`
   // slot (set by the opener via `dispatch(openShareModal(..., params))`).
@@ -79,7 +85,7 @@ function mergeOptions(base: ShareOptions, override: Partial<ShareOptions> | unde
   return next;
 }
 
-export function ShareModal({ panel, onClose, initialParams }: Props) {
+export function ShareModal({ panel, source = 'claude', onClose, initialParams }: Props) {
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -225,12 +231,19 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
         titleId={titleId}
         className="share-modal-header"
       />
+      {/* #294 S5 §7 — the flow's captured source, so the modal reads apart under
+          Codex/All. The artifact itself carries the label chrome; this echoes it
+          in-modal (the picker + every request are stamped with this source). */}
+      <div className="share-modal-source" aria-label={`Source: ${SELECTION_LABEL[source]}`}>
+        <span className={`source-chip source-chip--${source}`}>{SELECTION_LABEL[source]}</span>
+      </div>
 
       <div className="share-modal-body">
         {isMobile && (
           <div className="share-preview-col share-preview-col--lead" aria-label="Live preview">
             <PreviewPane
               panel={panel}
+              source={source}
               templateId={selectedTemplateId}
               options={options}
             />
@@ -278,6 +291,7 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
       <footer className="share-modal-footer">
         <ActionBar
           panel={panel}
+          source={source}
           templateId={selectedTemplateId}
           options={options}
           onOptionsChange={handleOptionsChange}

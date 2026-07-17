@@ -14,9 +14,14 @@ import { useState } from 'react';
 import { savePreset, ShareApiError } from './presetsApi';
 import { dispatch } from '../store/store';
 import type { SharePanelId, ShareOptions } from './types';
+import type { DashboardSelection } from '../types/envelope';
 
 interface Props {
   panel: SharePanelId;
+  // #294 S5 §7 — the flow's captured source; stamped on the saved preset
+  // (overwrites the (panel, name) record and updates its stored source).
+  // Optional with a 'claude' default (compatibility path).
+  source?: DashboardSelection;
   templateId: string;
   options: ShareOptions;
   onSaved: () => void;
@@ -24,7 +29,7 @@ interface Props {
 }
 
 export function SavePresetPopover({
-  panel, templateId, options, onSaved, onCancel,
+  panel, source = 'claude', templateId, options, onSaved, onCancel,
 }: Props) {
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
@@ -52,6 +57,7 @@ export function SavePresetPopover({
         name: trimmed,
         template_id: templateId,
         options,
+        source,
       });
       dispatch({ type: 'SHOW_STATUS_TOAST', text: `Saved preset "${trimmed}"` });
       onSaved();

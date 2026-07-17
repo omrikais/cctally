@@ -349,6 +349,7 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "CACHE_DB_PATH": share / "cache.db",
         "CACHE_LOCK_PATH": share / "cache.db.lock",
         "CACHE_LOCK_CODEX_PATH": share / "cache.db.codex.lock",
+        "CACHE_LOCK_MAINTENANCE_PATH": share / "cache.db.maintenance.lock",
         "CONFIG_LOCK_PATH": share / "config.json.lock",
         "CONFIG_PATH": share / "config.json",
         "MIGRATION_ERROR_LOG_PATH": share / "logs" / "migration-errors.log",

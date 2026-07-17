@@ -24,6 +24,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { renderShare, ShareApiError } from './api';
 import type { ShareFormat, ShareOptions, SharePanelId } from './types';
+import type { DashboardSelection } from '../types/envelope';
 import { sharePanelLabel, shareFormatExt } from './panelLabels';
 import { dispatch, getState } from '../store/store';
 import { makeBasketItem } from '../store/basketSlice';
@@ -44,6 +45,9 @@ function recordHistory(args: {
   template_id: string;
   options: ShareOptions;
   destination: 'copy' | 'download' | 'open' | 'png' | 'print';
+  // #294 S5 §7 — the flow's captured source; stamped into the history record so
+  // "same panel, different source" rows stay distinct server-side.
+  source: DashboardSelection;
 }): void {
   void appendHistory({
     panel: args.panel,
@@ -56,6 +60,7 @@ function recordHistory(args: {
     // export action, not just the source format.
     format: args.options.format,
     destination: args.destination,
+    source: args.source,
   }).catch(() => { /* non-fatal — see comment above */ });
 }
 
@@ -68,6 +73,10 @@ function paletteBg(theme: 'light' | 'dark'): string {
 
 interface Props {
   panel: SharePanelId;
+  // #294 S5 §7 — the flow's captured source, stamped on every render/basket/
+  // history request this ActionBar issues. Optional with a 'claude' default
+  // (the compatibility path; ShareModal always supplies it).
+  source?: DashboardSelection;
   templateId: string | null;
   options: ShareOptions;
   onOptionsChange: (next: ShareOptions) => void;
@@ -109,7 +118,7 @@ function triggerDownload(filename: string, blob: Blob): void {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-export function ActionBar({ panel, templateId, options, onOptionsChange }: Props) {
+export function ActionBar({ panel, source = 'claude', templateId, options, onOptionsChange }: Props) {
   const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket' | 'png' | 'print'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // M3.5 — short-lived "✓ Added" feedback flash on the + Basket button
@@ -175,6 +184,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       // checkbox already flipped reveal_projects in the parent's
       // options state via Knobs.
       options,
+      source,
     });
     return { body: resp.body, format: options.format };
   };
@@ -190,7 +200,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       }
       await navigator.clipboard.writeText(body);
       showToast('Copied');
-      recordHistory({ panel, template_id: templateId, options, destination: 'copy' });
+      recordHistory({ panel, template_id: templateId, options, destination: 'copy', source });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -211,7 +221,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       const blob = new Blob([body], { type: mimeFor(format) });
       triggerDownload(shareFilename(panel, format), blob);
       showToast('Downloaded');
-      recordHistory({ panel, template_id: templateId, options, destination: 'download' });
+      recordHistory({ panel, template_id: templateId, options, destination: 'download', source });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -246,6 +256,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         panel,
         template_id: templateId,
         options,
+        source,
       });
       const item = makeBasketItem({
         panel,
@@ -255,6 +266,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         data_digest_at_add: resp.snapshot.data_digest,
         kernel_version: resp.snapshot.kernel_version,
         label_hint: sharePanelLabel(panel),
+        source,
       });
       dispatch({ type: 'BASKET_ADD', item });
       // BASKET_ADD can be rejected when the basket is already at the
@@ -294,7 +306,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       // revoke it (the user may want to keep the tab open). Browsers
       // GC blob URLs when the window unloads.
       window.open(url, '_blank', 'noopener,noreferrer');
-      recordHistory({ panel, template_id: templateId, options, destination: 'open' });
+      recordHistory({ panel, template_id: templateId, options, destination: 'open', source });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -323,7 +335,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
       // keep the `cctally-<panel>-<utcdate>.png` shape from spec §6.5.
       triggerDownload(shareFilename(panel, 'svg').replace(/\.svg$/, '.png'), png);
       showToast('PNG downloaded');
-      recordHistory({ panel, template_id: templateId, options, destination: 'png' });
+      recordHistory({ panel, template_id: templateId, options, destination: 'png', source });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -347,7 +359,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
     try {
       const { body } = await fetchForExport();
       printPdf(body);
-      recordHistory({ panel, template_id: templateId, options, destination: 'print' });
+      recordHistory({ panel, template_id: templateId, options, destination: 'print', source });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -494,6 +506,7 @@ export function ActionBar({ panel, templateId, options, onOptionsChange }: Props
         {savingOpen && templateId ? (
           <SavePresetPopover
             panel={panel}
+            source={source}
             templateId={templateId}
             options={options}
             onSaved={() => setSavingOpen(false)}

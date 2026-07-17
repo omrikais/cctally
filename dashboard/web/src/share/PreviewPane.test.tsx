@@ -101,6 +101,40 @@ describe('<PreviewPane>', () => {
     expect(iframe!.getAttribute('srcdoc')).toContain('hello');
   });
 
+  // #294 S5 §7 (Fix 2) — the source-label chip carries a source-specific
+  // `source-chip--<source>` class so CSS can accent it. `all` was reachable in
+  // share chrome but had no `.source-chip--all` accent (added in index.css);
+  // this guards that the `all` chip keeps its source-specific class hook (a
+  // regression that hardcoded `claude` would drop the accent).
+  it('renders the source-chip--all class + All label for source=all', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        body: '# weekly recap',
+        content_type: 'text/markdown',
+        snapshot: {},
+      }),
+    }));
+    const { container } = render(
+      <PreviewPane
+        panel="weekly"
+        source="all"
+        templateId="weekly-recap"
+        options={defaults()}
+      />,
+    );
+    await act(async () => {
+      vi.advanceTimersByTime(250);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const chip = container.querySelector('.source-chip--all');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveTextContent('All');
+  });
+
   it('shows a red banner with field hint on 400 error', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,

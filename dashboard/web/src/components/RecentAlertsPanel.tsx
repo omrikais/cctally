@@ -3,7 +3,12 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { fmt } from '../lib/fmt';
-import { alertSeverity, AXIS_CHIP_LABEL } from '../lib/alertAxis';
+import {
+  alertDisplay,
+  selectSourceAlertRows,
+} from '../lib/alertIdentity';
+import type { SourceAlertRow } from '../types/envelope';
+import { resolveSourceView } from '../store/sourceView';
 import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
@@ -16,23 +21,42 @@ import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 // toggles `prefs.alertsCollapsed`; that click stops propagation so
 // the open-modal handler doesn't fire on the same gesture.
 //
-// Per spec §7 / v2 mockup: there is intentionally NO "Open modal"
-// CTA inside the panel body — clicking the panel itself is the
-// established open path across sessions/blocks/daily/weekly etc.
+// #294 S5 §6.7 — the panel is source-aware. It reads the ACTIVE source's alert
+// projection through the seam (`selectSourceAlertRows`), never the legacy
+// top-level array. On a pre-S4 envelope (no `sources` bundle) it falls back to
+// the legacy `state.alerts` (wrapped as Claude rows) so older servers and unit
+// tests keep working; Claude-mode rendering is value-identical either way.
 export function RecentAlertsPanel(): JSX.Element {
-  const allAlerts = useSyncExternalStore(
-    subscribeStore,
-    () => getState().alerts,
-  );
+  const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const legacyAlerts = useSyncExternalStore(subscribeStore, () => getState().alerts);
   const collapsed = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.alertsCollapsed,
   );
-  // #248 §5 / #264 S1 / #265 A — the empty state reads the current Used %
+  const hasBundle = env?.sources != null;
+  const view = resolveSourceView(env ?? null, activeSource);
+  const claudeLegacyRows: SourceAlertRow[] = legacyAlerts.map((a) => ({
+    ...a,
+    source: 'claude' as const,
+    key: a.id,
+  }));
+  // #294 S5 §6.7 / §5.2 — Codex + All read the source projection. Claude reads
+  // the legacy top-level projection when populated (the §5.2 Claude legacy-
+  // compatible view — value-identical to the source projection in production,
+  // which mirrors both), else the source projection. A pre-S4 envelope (no
+  // bundle) always uses the legacy rows.
+  const allRows: SourceAlertRow[] =
+    !hasBundle
+      ? claudeLegacyRows
+      : activeSource === 'claude' && claudeLegacyRows.length > 0
+        ? claudeLegacyRows
+        : selectSourceAlertRows(view);
+
+  // #248 §5 / #264 S1 / #265 A — the Claude empty state reads the current Used %
   // (header) + the configured weekly fire thresholds (default [90, 95]) and
   // renders the shared <AlertsEmptyGauge> (compact) so the panel + modal empty
-  // states can't drift; never hardcode 90/95.
-  const env = useSnapshot();
+  // states can't drift; never hardcode 90/95. The gauge routes per active source.
   const usedPct = env?.header?.used_pct ?? null;
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
   const gaugeThresholds =
@@ -41,10 +65,9 @@ export function RecentAlertsPanel(): JSX.Element {
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Slice newest-first to last 10 for the panel; the modal renders the
   // full list (up to 100). Panel slice is a UI policy, not a data
-  // truncation — `getState().alerts.length` continues to reflect the
-  // store's full count for the "N of M shown" footer.
-  const alerts = allAlerts.slice(0, 10);
-  const total = allAlerts.length;
+  // truncation — the footer's `total` continues to reflect the full count.
+  const alerts = allRows.slice(0, 10);
+  const total = allRows.length;
 
   // Open-modal handler routes through panelRegistry.alerts.openAction
   // so the keyboard ('9' in T13) and click paths share one source of
@@ -104,23 +127,33 @@ export function RecentAlertsPanel(): JSX.Element {
       </div>
       <div className="panel-body" id="panel-alerts-body">
         {alerts.length === 0 ? (
-          <AlertsEmptyGauge usedPct={usedPct} thresholds={gaugeThresholds} compact />
+          <AlertsEmptyGauge
+            source={activeSource}
+            usedPct={usedPct}
+            thresholds={gaugeThresholds}
+            compact
+          />
         ) : (
           <ul className="alerts-list">
-            {alerts.map((a) => {
-              const severity = alertSeverity(a);
+            {alerts.map((row) => {
+              const d = alertDisplay(row);
               return (
-                <li key={a.id} className="alert-row">
+                <li key={`${d.source}:${(row as { key: string }).key}`} className="alert-row">
                   <span
-                    className={`alert-threshold severity-${severity} ${severity}`}
+                    className={`alert-threshold severity-${d.severity} ${d.severity}`}
                   >
-                    {a.threshold}%
+                    {d.threshold}%
                   </span>
-                  <span className={`chip chip--${a.axis}`}>
-                    {AXIS_CHIP_LABEL[a.axis]}
+                  <span className={`chip ${d.chipClass}`}>
+                    {d.chipLabel}
                   </span>
+                  {activeSource === 'all' && (
+                    <span className={`source-chip source-chip--${d.source}`}>
+                      {d.sourceLabel}
+                    </span>
+                  )}
                   <span className="alert-when">
-                    {fmt.relativeOrAbsolute(a.alerted_at, ctx)}
+                    {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
                   </span>
                 </li>
               );

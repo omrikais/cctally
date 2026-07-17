@@ -1,6 +1,7 @@
 import type { Envelope } from '../types/envelope';
 import { dispatch, updateSnapshot, resetSnapshotOrdering, getState } from './store';
 import { coerceUpdateState, coerceUpdateSuppress } from './update';
+import { collectToastAlertRows } from '../lib/alertIdentity';
 
 let es: EventSource | null = null;
 let disconnected = false;
@@ -165,9 +166,16 @@ const FALLBACK_ALERTS_SETTINGS = {
 };
 
 function ingestAlerts(snap: Envelope): void {
+  // #294 S5 §6.7 — feed the source-aware toast pipeline from the two provider
+  // projections (`sources.claude` + `sources.codex` data.alerts) ONLY. The
+  // legacy top-level `alerts` array is deliberately NOT consumed here, so a
+  // codex_budget row present in both feeds can't double-toast. The panel/modal
+  // read the active source's projection directly through the seam. On a pre-S4
+  // envelope (no `sources` bundle) the union is empty and no toast fires —
+  // matching the seam's pre-S4 Claude legacy-compatible view.
   dispatch({
-    type: 'INGEST_SNAPSHOT_ALERTS',
-    alerts: snap.alerts ?? [],
+    type: 'INGEST_SOURCE_ALERTS',
+    rows: collectToastAlertRows(snap),
     alertsSettings: snap.alerts_settings ?? FALLBACK_ALERTS_SETTINGS,
     isFirstTick,
   });

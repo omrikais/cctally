@@ -4278,6 +4278,13 @@ def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM codex_conversation_threads")
             conn.execute("DELETE FROM codex_conversation_events")
             conn.execute("DELETE FROM codex_source_roots")
+            # F3 (#313): clearing Codex quota state without invalidating the
+            # quota-projection certificate would leave a stale-valid cert
+            # (cache sequence unchanged) that lets the reconcile short-circuit
+            # skip over now-deleted data. Delete it in the same transaction.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -5802,3 +5809,155 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
         print(f"cctally: {result.db} WAL {mb_b:.1f} MB -> {mb_a:.1f} MB "
               f"({result.frames_checkpointed} frames; {state}).")
     return 0 if result.truncated else 3
+
+
+# VACUUM writes a full fresh copy of the database into a temporary file and then
+# swaps it in, so it transiently needs roughly the DB's own size on top of the
+# existing file, plus room for the drained WAL. A short busy_timeout keeps a
+# contended VACUUM from hanging (F13).
+_VACUUM_BUSY_TIMEOUT_MS = 250
+
+
+def _free_disk_bytes(directory) -> int:
+    """Free bytes on the filesystem holding ``directory`` (mockable in tests)."""
+    import shutil
+    return shutil.disk_usage(str(directory)).free
+
+
+def _vacuum_required_free_bytes(path) -> int:
+    """Conservative free-space floor to VACUUM ``path``: ~2x the DB file plus its
+    current WAL sidecar (F13 — the VACUUM temp copy + a WAL/temp margin)."""
+    try:
+        db_bytes = path.stat().st_size
+    except OSError:
+        db_bytes = 0
+    wal = path.parent / (path.name + "-wal")
+    try:
+        wal_bytes = wal.stat().st_size
+    except OSError:
+        wal_bytes = 0
+    return 2 * db_bytes + wal_bytes
+
+
+def _run_vacuum_exclusive(path, label: str) -> int:
+    """Checkpoint + VACUUM ``path`` under a real SQLite EXCLUSIVE lock (F13).
+
+    ``locking_mode=EXCLUSIVE`` + a short ``busy_timeout`` make a concurrent
+    reader/writer FAIL PROMPTLY (no TOCTOU gap — the exclusion is the DB's own
+    lock, which the advisory flocks do not provide against dashboard readers).
+    Exit 0 on success, 3 when the DB is in use."""
+    conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_VACUUM_BUSY_TIMEOUT_MS}")
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        before = conn.execute("PRAGMA page_count").fetchone()[0]
+        try:
+            conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+                eprint(
+                    f"cctally: {label} is in use — VACUUM needs exclusive access. "
+                    f"Stop the dashboard and any other cctally process holding "
+                    f"{label}, then retry."
+                )
+                return 3
+            raise
+        after = conn.execute("PRAGMA page_count").fetchone()[0]
+        freed_mb = max(0, (before - after)) * page_size / (1024 * 1024)
+        print(
+            f"cctally: {label} reclaimed {freed_mb:.1f} MB "
+            f"({before} -> {after} pages)."
+        )
+        return 0
+    finally:
+        conn.close()
+
+
+def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
+    if not path.exists():
+        print(f"cctally: no {label} database file present; nothing to reclaim.")
+        return 0
+    needed = _vacuum_required_free_bytes(path)
+    free = _free_disk_bytes(path.parent)
+    if free < needed:
+        eprint(
+            f"cctally: not enough free disk to VACUUM {label}: need ~"
+            f"{needed // (1024 * 1024)} MB free, have {free // (1024 * 1024)} MB. "
+            f"Free up space and retry."
+        )
+        return 3
+    core = _cctally_core
+    try:
+        core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    # Serialize against the retention prune and concurrent vacuums via the
+    # dedicated maintenance flock (F13/F7), then the provider flocks for
+    # cache.db. All non-blocking: fail promptly rather than hang.
+    maint_fh = open(core.CACHE_LOCK_MAINTENANCE_PATH, "w")
+    try:
+        try:
+            fcntl.flock(maint_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            eprint(
+                f"cctally: {label} VACUUM skipped: another maintenance operation "
+                f"is running. Retry shortly."
+            )
+            return 3
+        held = []
+        try:
+            if provider_locked:
+                for lock_path, lname in (
+                    (core.CACHE_LOCK_PATH, "claude"),
+                    (core.CACHE_LOCK_CODEX_PATH, "codex"),
+                ):
+                    fh = open(lock_path, "w")
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except (BlockingIOError, OSError):
+                        fh.close()
+                        eprint(
+                            f"cctally: {label} VACUUM skipped: a {lname} sync is in "
+                            f"progress. Stop the dashboard / other cctally "
+                            f"processes and retry."
+                        )
+                        return 3
+                    held.append(fh)
+            return _run_vacuum_exclusive(path, label)
+        finally:
+            for fh in held:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                fh.close()
+    finally:
+        try:
+            fcntl.flock(maint_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        maint_fh.close()
+
+
+def cmd_db_vacuum(args: argparse.Namespace) -> int:
+    """Reclaim disk space via VACUUM after a transcript prune (#313 P3, F13).
+
+    NEVER automatic. Holds the maintenance flock + (for cache.db) the provider
+    flocks, then runs a checkpoint + VACUUM under a real SQLite EXCLUSIVE lock so
+    a concurrent dashboard reader fails promptly instead of racing. Refuses when
+    free disk is below ~2x the file + WAL. Exit 0 on success, 3 when a target is
+    in use or disk is short."""
+    which = getattr(args, "db", "cache")
+    targets = []
+    if which in ("cache", "all"):
+        targets.append((_cctally_core.CACHE_DB_PATH, "cache.db", True))
+    if which in ("stats", "all"):
+        targets.append((_cctally_core.DB_PATH, "stats.db", False))
+    overall = 0
+    for path, label, provider_locked in targets:
+        rc = _vacuum_one_db(path, label, provider_locked)
+        if rc != 0:
+            overall = rc
+    return overall

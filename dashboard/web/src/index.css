@@ -1336,6 +1336,22 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .sess-table tbody td.cost-xs   { color: var(--accent-green); }
 .sess-table tbody td.cost-none { color: var(--text-dim); } /* unknown cost — neutral, not cheap (#207 B4) */
 
+/* #294 S5 §6.3 — the source-aware Sessions grid (Codex / All). Reuses the
+   .sess-table skeleton; these add the provider-native columns: the recency
+   timestamp, the models chip cell, the five token cells (right-aligned via the
+   shared .num), the leading Source chip cell (All-mode interleave), and the
+   static (non-sortable) display headers. */
+.source-sess-table tbody td.recency { color: var(--accent-cyan); }
+.source-sess-table tbody td.models { white-space: normal; }
+.source-sess-table tbody td.models .model-chip { margin: 1px 4px 1px 0; }
+.source-sess-table tbody td.src { padding-right: 8px; }
+.source-sess-table .src-model-empty { color: var(--text-faint); }
+.source-sess-table thead th.th-static {
+  padding: 6px 10px 6px 0; text-align: left; color: var(--text-dim);
+  font-weight: 600; white-space: nowrap;
+}
+.source-sess-table thead th.th-static.num { text-align: right; }
+
 /* #249 C3 — single-model caption: the "● all · <model>" signpost that
    replaces the per-row Model column when the whole set is one model (SESS-1).
    The Model <th>/<td> are dropped entirely (no ditto middot column). */
@@ -1521,6 +1537,24 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   padding: 24px 28px;
   min-width: 320px;
   color: var(--text);
+}
+/* #294 S5 §6.9 — Help's per-source hidden-capability notes. */
+#help-overlay .help-hidden-capabilities {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+#help-overlay .help-hidden-heading {
+  margin: 0 0 4px;
+  font-size: var(--fs-meta);
+  font-weight: 700;
+  color: var(--text-dim);
+}
+#help-overlay .help-hidden-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 #help-overlay .help-header {
   display: flex; justify-content: space-between; align-items: center;
@@ -2710,6 +2744,13 @@ mark.current {
   margin-left: 10px;
   padding-left: 12px;
   border-left: 1px solid var(--border-soft);
+}
+/* #294 S5 Task 8 — label for the Claude/Codex budget subgroups. */
+.settings-subgroup-label {
+  margin: 4px 0 2px;
+  font-size: var(--fs-meta);
+  font-weight: 700;
+  color: var(--text-dim);
 }
 /* SET-1 (#252) — per-fieldset changed marker glyph (● in the legend). */
 .settings-fs > legend .fs-changed { color: var(--accent-orange); }
@@ -4029,6 +4070,19 @@ mark.current {
 }
 
 /* Preview pane ------------------------------------------------------------ */
+/* #294 S5 §7 — share source chrome: the flow's captured source shown in the
+   modal header + above the live preview, and per-item/per-row chips in the
+   composer + preset dropdown. All reuse the .source-chip vocabulary. */
+.share-preview-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 6px; }
+.share-preview-wrap .share-preview { flex: 1; }
+.share-preview-source,
+.share-modal-source { display: flex; align-items: center; gap: 6px; }
+.share-modal-source { padding: 0 18px 4px; }
+.share-presets-row,
+.share-presets-history-row { display: flex; align-items: center; gap: 6px; }
+.share-presets-row .share-presets-item,
+.share-presets-history-row .share-presets-history-item { flex: 1; }
+
 .share-preview {
   flex: 1; min-height: 280px;
   background: var(--panel-bg-2);
@@ -4496,8 +4550,14 @@ mark.current {
   /* #293 S4 BASKET-1 — keep the basket-chip OUT of the scrolled hide list so a
      non-empty basket stays reachable in the condensed mobile header (the chip
      self-removes when the basket is empty, so it shows exactly when non-empty).
-     view-switcher + doctor-chip stay hidden to keep the bar ≤64px. */
+     view-switcher + doctor-chip stay hidden to keep the bar ≤64px. #294 S5 —
+     the source-switcher + source-status chip join that hide list: the collapsed
+     nowrap row has no room for the 3-segment selector, and the provider-native
+     condensed readout already reflects the active source, so switching source
+     is not a scrolled-header action (parity with the view-switcher). */
   .topbar.is-scrolled .view-switcher,
+  .topbar.is-scrolled .source-switcher,
+  .topbar.is-scrolled .source-status-chip,
   .topbar.is-scrolled .doctor-chip { display: none; }
   /* Row 2 = the action band: doctor pill at the start, basket chip +
      icon trio clustered at the end. Width:100% claims the full row;
@@ -5506,6 +5566,20 @@ mark.current {
    block so it wins by source order at ≤360. */
 @media (max-width: 360px) {
   .doctor-chip-label { display: none; }
+  /* #294 S5 — the active-source status chip lives inside the flex-shrink:0
+     .topbar-actions cluster (nowrap children). At ≤360 that cluster (doctor +
+     basket + the three action icons + the sync-chip text) already fills the
+     row, so keeping the source-status chip pushes the non-shrinkable cluster
+     past the 320px viewport and reintroduces the #293 S4 no-x-overflow trap the
+     S5 spec called out (§ "without triggering the known nowrap-overflow trap").
+     Freshness is still conveyed by the global SyncChip, and a degraded source
+     stays surfaced via the selector's accessible name + the per-panel state.
+     The `#root` prefix is the id-selector specificity floor: unlike
+     `.doctor-chip-label` (whose base rule precedes this block), the base
+     `.source-status-chip { display: inline-flex }` is defined LATER in the file,
+     so a bare-class hide here would lose the same-specificity source-order race.
+     `#root .source-status-chip` (1,1,0) outranks the base (0,1,0) regardless. */
+  #root .source-status-chip { display: none; }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------
@@ -6565,6 +6639,192 @@ mark.current {
   outline: none;
   box-shadow: var(--focus-ring);
 }
+
+/* ---- #294 S5: global source selector (Claude / Codex / All) --------- */
+/* Reuses the .view-switcher/.view-seg vocabulary under its own class names so
+   the segmented control reads as a sibling of the workspace switcher. */
+.source-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+}
+.source-seg {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: var(--space-1) var(--space-3);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.source-seg:hover { color: var(--text); }
+.source-seg.is-active {
+  background: var(--panel-bg);
+  color: var(--accent-blue);
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
+.source-seg:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Active-source status chip (§6.8) — distinct from the global SyncChip. Reuses
+   the existing chip severity vocabulary rather than inventing new primitives. */
+.source-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.source-status-chip.is-stale { color: var(--text); border-color: var(--border); }
+.source-status-chip.is-degraded {
+  color: var(--sev-warn-fg, var(--accent-amber, #d08700));
+  border-color: var(--sev-warn-fg, var(--accent-amber, #d08700));
+  background: var(--sev-warn-bg, transparent);
+}
+
+/* ---- #294 S5: per-source source badge (panels, All sections, alert lists,
+   toasts, share chrome). ONE .source-chip family — a §6.10 duplicate base
+   earlier in the file used to shadow-merge with this one (its text/shape lost
+   the cascade while its background tints leaked through); the tints are now
+   explicit here and the duplicate is gone, so this block is the single truth
+   for the rendered look. ---- */
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  color: var(--text-dim);
+}
+.source-chip--claude { color: var(--accent-blue, #4c8dff); border-color: currentColor; background: rgba(224, 207, 255, 0.10); }
+.source-chip--codex { color: var(--accent-green, #10b981); border-color: currentColor; background: rgba(148, 163, 184, 0.14); }
+/* #294 S5 §7 — the `all` selection chip in share chrome (ShareModal /
+   PreviewPane). "All" is both providers, so it takes a neutral accent rather
+   than a third loud color — dim text with a matching border, mirroring the
+   claude/codex `border-color: currentColor` treatment without inventing a new
+   primitive. Keeps the chip accented (not the bare unaccented base). */
+.source-chip--all { color: var(--text-dim); border-color: currentColor; }
+.panel-degraded-chip {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--sev-warn-fg, var(--accent-amber, #d08700));
+  border: 1px solid currentColor;
+}
+.panel-source-skeleton {
+  min-height: 96px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--panel-bg-2) 25%, var(--panel-bg) 50%, var(--panel-bg-2) 75%);
+}
+.panel-source-empty {
+  padding: var(--space-3);
+  color: var(--text-dim);
+  font-size: var(--fs-data);
+}
+.source-all-sections { display: flex; flex-direction: column; gap: var(--space-3); }
+.source-provider-section { display: flex; flex-direction: column; gap: var(--space-1); }
+.source-provider-head { display: flex; align-items: center; gap: var(--space-2); }
+.codex-period-table,
+.codex-projects-table,
+.codex-sessions-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-data);
+}
+.codex-period-table th,
+.codex-projects-table th,
+.codex-sessions-table th {
+  text-align: left;
+  color: var(--text-faint);
+  font-weight: 600;
+  padding: 2px 6px;
+}
+.codex-period-table td,
+.codex-projects-table td,
+.codex-sessions-table td {
+  padding: 2px 6px;
+  color: var(--text);
+}
+.codex-token-list { list-style: none; margin: 0; padding: 0; }
+.codex-token-list li { display: flex; justify-content: space-between; gap: var(--space-2); font-size: var(--fs-data); }
+.codex-token-list .ctl-k { color: var(--text-faint); }
+.codex-blocks-list { list-style: none; margin: 0; padding: 0; }
+.codex-blocks-list li { display: flex; justify-content: space-between; gap: var(--space-2); font-size: var(--fs-data); }
+.combined-unavailable { color: var(--text-dim); }
+.codex-detail-open {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--accent-blue, #4c8dff);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.codex-detail-open:hover { text-decoration: underline; }
+
+/* #294 S5 §5.6 — qualified source-detail modal (Codex/All rows). */
+.source-detail-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 900;
+}
+.source-detail-card {
+  position: relative;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 10px);
+  padding: var(--space-4, 20px);
+  min-width: 280px;
+  max-width: min(560px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+}
+.source-detail-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.sd-tokens { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; margin: var(--space-2) 0; }
+.sd-tokens > div { display: flex; justify-content: space-between; }
+.sd-tokens dt { color: var(--text-faint); }
+.sd-tokens dd { margin: 0; }
 
 /* ---- Sessions panel: per-row "open conversation" affordance -------- */
 .sess-open-conv {

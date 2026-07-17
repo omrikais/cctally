@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.71.0] - 2026-07-17
+
+### Added
+- Transcript retention: the dashboard's background sync thread now runs a throttled (at most once every 24 hours) prune of conversation transcripts older than the new `conversation.retention_days` config key (default 180; set to `off`/`0` to keep transcripts forever), bounding `cache.db`'s otherwise-unbounded growth. Only transcript rows are pruned — cost/usage history and Codex analytics metadata are untouched and everything pruned is re-derivable from the JSONL. Eligibility is decided per conversation from the authoritative message rows (a conversation with any recent activity is kept whole), never a rollup. (#313)
+- `cctally cache-sync --prune-conversations` prunes >retention-day transcripts on demand and reports the rows removed per provider. (#313)
+- `cctally db vacuum [--db {cache,stats,all}]` reclaims the disk space a prune freed (SQLite `VACUUM`); it is never automatic, runs under an exclusive lock so a running dashboard makes it fail promptly rather than race, and refuses when free disk is below ~2x the file size. (#313)
+
+### Fixed
+- Dashboard CPU peg: `cctally dashboard` no longer pegs a CPU core under sustained active use on large caches. The Codex quota-projection reconcile — which ran unconditionally on every dashboard tick and every `codex-*` command, re-loading the entire quota history (~2.9s) — now short-circuits to an O(1) no-op when the Codex physical state is unchanged and the stored projection is intact; `codex-daily` with no fresh Codex data drops from ~3.2s to well under a second. The dashboard sync thread also caps its CPU duty at 50% of one core via a work-proportional cooldown, so a slow rebuild can no longer keep the thread busy back-to-back. (#313)
+- Dashboard: the #294 S5 source selector no longer causes the mobile topbar to scroll sideways on the narrowest phones. The active-source status chip sits in the non-shrinkable action cluster, and adding it pushed that cluster past a 320px-wide viewport; it now hides at ≤360px (freshness is still on the global sync chip and a degraded source stays flagged in the selector and panels), and both the source selector and its status chip drop out of the condensed one-row header once you scroll, matching how the workspace switcher and doctor chip already collapse there. (#294)
+
 ## [1.70.0] - 2026-07-17
 
 ### Added
@@ -35,6 +46,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [1.69.0] - 2026-07-17
 
 ### Added
+- Dashboard source selector and source-aware UX (#294 S5): a Header Claude/Codex/All radiogroup (cycle with `v`) drives every panel, modal, alert filter, and share default at once, rendering each provider's native vocabulary (Codex token counters and quota windows, no `$ / 1%` or subscription-week copy) and hiding — never zero-filling — panels a source doesn't publish, with a Help-overlay note pointing at where the equivalent lives (Codex forecast/trend → the quota panel, cache-report → the hero counters). Alerts and toasts read the per-source projections (a Codex budget alert can't double-toast), the alert settings regroup into global-notifier / Claude / Codex controls with a CLI pointer for Codex quota rules, a per-source status chip surfaces freshness and degraded warnings, and every share render, composer section, preset, and history row carries and displays the source it was captured under — a mid-flow selector switch never restamps an open share flow, and `all` composes provider-labelled sections rather than a blended snapshot. The Claude-only user's data and flows are unchanged except that new share artifacts and history now say "Claude".
 - Dashboard source-aware backend read model (#294 S4): `/api/data` now appends
   immutable Claude, Codex, and labelled all-source states; provider-owned
   session/project/quota details use opaque qualified routes backed by bounded

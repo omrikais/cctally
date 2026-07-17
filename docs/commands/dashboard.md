@@ -104,8 +104,9 @@ the UI with either input.
 | `s` | Open settings overlay |
 | `q` | Close the tab (best-effort) |
 | `?` | Toggle help overlay |
+| `v` (dashboard) | Cycle the source selector Claude → Codex → All. View-scoped — in the Conversations reader `v` cycles the focus mode instead (below) |
 | `o` | Toggle the conversation outline sidebar (reader) |
-| `v` | Cycle the reader focus mode through the four primary modes (All → Chat → Prompts → Errors); from a "▾ More" mode (Edits/Bash/Subagent) it returns to All |
+| `v` (reader) | Cycle the reader focus mode through the four primary modes (All → Chat → Prompts → Errors); from a "▾ More" mode (Edits/Bash/Subagent) it returns to All |
 | `e` / `E` | Reader: jump to next / previous error turn |
 | `u` / `U` | Reader: jump to next / previous prompt |
 | `b` / `B` | Reader: jump to next / previous subagent thread |
@@ -175,6 +176,10 @@ ticks. Only chip clicks / `r` presses trigger OAuth fetches.
 
 The dashboard binds its HTTP port immediately and serves the current cached snapshot; the first full sync (and any pending one-time conversation-enrichment reingest) runs in the background and is pushed to the page over SSE when it completes. On a large transcript history the background reingest is resumable — interrupting the dashboard mid-sync and relaunching resumes where it left off rather than restarting. To start without any sync, use `--no-sync`; to consume a pending reingest in one foreground pass, run `cctally cache-sync` (or `cache-sync --rebuild`).
 
+## Transcript retention
+
+The dashboard's background sync thread also runs an automatic, throttled transcript-retention prune — at most once every 24 hours — that removes conversation transcripts older than `conversation.retention_days` (default 180) from `cache.db`. This bounds the cache's otherwise-unbounded growth; only transcript rows are pruned (cost/usage history and Codex analytics metadata are untouched, and everything pruned is re-derivable from the JSONL). Set `cctally config set conversation.retention_days off` to keep transcripts forever, or a positive integer to change the window. The prune is gated off under `--no-sync`. Deleting rows frees pages inside the file but does not shrink it on disk — run [`cctally db vacuum`](db.md#db-vacuum) to reclaim that space (stop the dashboard first; VACUUM needs exclusive access). You can also prune on demand with [`cctally cache-sync --prune-conversations`](cache-sync.md#--prune-conversations).
+
 ## Manual verification (post-v2)
 
 Before merging or releasing v2 changes, run through:
@@ -236,9 +241,20 @@ the default sort + remembered filter term in the same `localStorage` slot.
 
 S4 makes the dashboard server publish Claude, Codex, and presentation-only
 `all` states atomically. It does not add a visible source selector: S5 owns the
-React control and browser interaction. Until then, the source-aware endpoints
-above are a backend contract for the dashboard client and integrations; the
-existing dashboard UI remains the established Claude-first surface.
+React control and browser interaction. The source-aware endpoints above are the
+backend contract the S5 client reads.
+
+### Source selector and source-aware UX (S5)
+
+The Header hosts a three-state `Claude | Codex | All` selector (a radiogroup — Arrow keys move focus and selection, Home/End jump to the ends; the `v` shortcut cycles Claude → Codex → All). The choice persists in `localStorage` under `cctally:dashboard:source` (default `claude`) and is a pure client re-selection over the already-delivered `sources` bundle — the store never waits for or reconciles it against an envelope, and panel subtrees re-key on switch so no mixed-source frame is ever shown. The selector governs the dashboard workspace only; the Conversations workspace is unaffected.
+
+Each source renders its own vocabulary. Codex shows its native token counters (input, cached-input, output, reasoning-output, total) plus its quota windows and configured calendar-period budget — never a `$ / 1%` or subscription-week reading. `All` shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered as side-by-side provider-native chips (never a blended gauge).
+
+Capability gating (per the S4 manifest) hides — rather than zero-fills — any panel a source does not publish: under Codex the forecast, trend, and cache-report panels are absent, and the Help overlay (`?`) lists what the active source intentionally does not show with a one-line pointer to where the equivalent lives (Codex forecast/trend → the Blocks/quota panel's native forecasts; cache-report → the hero token-reuse counters). A runtime-degraded or stale source renders an explicit warning chip in place (never hidden), and a source with no successful snapshot yet renders "no successful snapshot yet". A source-status chip beside the sync chip surfaces the active source's freshness and warnings.
+
+The visible-panel order (digit shortcuts, drag-reorder, Help's panel list) is derived from the persisted full order filtered through the active source's gating; the persisted order is never rewritten by a source switch, and a reorder in a filtered view maps back into the full order preserving hidden panels' positions.
+
+Alerts are source-aware. The Recent-alerts panel and modal show the active source's own rows (Claude axes; Codex `codex_budget` / projected / quota rows with native labels; `All` a source-labelled union — never merged). Toasts fire for alerts of every source regardless of the active selection (an alert is a notification), each carrying a source chip; they are read only from the per-source projections, so a Codex budget alert can never double-toast. The Settings overlay (`s`) groups the persistable toggles into a global Notifications group (the notifier backend, shared across vendors), a Claude group (threshold + projected-weekly + a labelled Claude-budget subgroup), and a Codex group (the mirrored `budget.codex.*` toggles) — with a CLI pointer noting Codex quota-threshold rules are not configurable here. Regrouping is presentation-only; the `POST /api/settings` body is unchanged.
 
 ## Conversation viewer endpoints (Plan 2)
 

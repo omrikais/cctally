@@ -222,3 +222,55 @@ test.describe('#293 S4 — 320px topbar: compact doctor chip, no x-overflow (@ 3
     expect(probes.basPastLeft, 'no basket ::before overhang onto its left neighbor').toBe(false);
   });
 });
+
+test.describe('#294 S5 — mobile topbar: source chrome compacts, no x-overflow (@ 320)', () => {
+  test.use({ hasTouch: true, viewport: { width: 320, height: 720 } });
+
+  // The S5 source selector + source-status chip were added to the sticky topbar.
+  // The spec required them to compact on mobile "without triggering the known
+  // nowrap-overflow trap" — this proves both halves in a real browser (JSDOM
+  // cannot see @media / real scroll):
+  //   • un-scrolled: the source-status chip (which lives in the flex-shrink:0
+  //     .topbar-actions cluster) hides at ≤360 so the non-shrinkable cluster
+  //     does not push the document past 320px. The selector itself stays visible
+  //     (it wraps to its own row) and fits.
+  //   • scrolled (.is-scrolled): the collapsed ≤64px nowrap row has no room for
+  //     the 3-segment selector, so .source-switcher + .source-status-chip drop
+  //     out of the row (parity with .view-switcher / .doctor-chip). Without the
+  //     hide the selector stays in the nowrap row and re-introduces x-overflow.
+  const display = (page: import('@playwright/test').Page, sel: string) =>
+    page.locator(sel).evaluate((el) => getComputedStyle(el).display);
+  const docXOverflow = (page: import('@playwright/test').Page) =>
+    page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
+
+  test('un-scrolled: selector stays visible, status chip hidden, no x-overflow', async ({ page }) => {
+    await seedBasket(page);
+    await page.goto('/');
+    await expect(page.locator('.source-switcher')).toBeVisible();
+    // The status chip renders once the SSE snapshot lands (same tick as the
+    // doctor aggregate). Wait for it to ATTACH — it is display:none via the ≤360
+    // rule, so toBeVisible() would never resolve; toHaveCount proves it is in the
+    // DOM and merely hidden, so it does not bloat the flex-shrink:0 action cluster.
+    await expect(page.locator('.doctor-chip')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.source-status-chip')).toHaveCount(1);
+    expect(await display(page, '.source-status-chip')).toBe('none');
+    expect(await docXOverflow(page), 'no x-overflow at 320px un-scrolled').toBe(false);
+  });
+
+  test('scrolled: source-switcher + status chip drop out and no x-overflow', async ({ page }) => {
+    await seedBasket(page);
+    await page.goto('/');
+    await expect(page.locator('.source-switcher')).toBeVisible();
+    // Scroll the hero out of view so the header condenses (heroScrolled →
+    // .topbar.is-scrolled) — a trusted wheel over the main content drives the IO.
+    await page.locator('#main-content').hover();
+    await expect(async () => {
+      await page.mouse.wheel(0, 900);
+      await expect(page.locator('.topbar.is-scrolled')).toBeVisible({ timeout: 500 });
+    }).toPass({ timeout: 8000 });
+    // Both source-chrome items leave the collapsed nowrap row.
+    expect(await display(page, '.source-switcher')).toBe('none');
+    expect(await display(page, '.source-status-chip')).toBe('none');
+    expect(await docXOverflow(page), 'no x-overflow at 320px scrolled').toBe(false);
+  });
+});

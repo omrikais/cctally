@@ -11,6 +11,8 @@ import {
   rectSortingStrategy,
 } from '@dnd-kit/sortable';
 import { dispatch, getState } from '../store/store';
+import { resolveSourceView } from '../store/sourceView';
+import { deriveVisiblePanelOrder } from '../lib/visiblePanelOrder';
 import { armClickSuppression } from '../lib/clickSuppression';
 import type { GridPanelId } from '../lib/panelRegistry';
 
@@ -37,9 +39,17 @@ export function handleDragEndAction(
     // Released outside any droppable, or same panel → nothing to commit.
     return;
   }
-  const order = getState().prefs.panelOrder;
-  const from = order.indexOf(activeId);
-  const to = order.indexOf(overId);
+  // #294 S5 §6.11 — REORDER indexes the VISIBLE (source-filtered) list. Both the
+  // dragged and the drop-target panel are rendered (hence visible), so their
+  // indices resolve in the visible order; the reducer maps the reorder back into
+  // the full order, preserving hidden panels' positions.
+  const s = getState();
+  const visible = deriveVisiblePanelOrder(
+    s.prefs.panelOrder,
+    resolveSourceView(s.snapshot, s.activeSource),
+  );
+  const from = visible.indexOf(activeId);
+  const to = visible.indexOf(overId);
   if (from < 0 || to < 0 || from === to) return;
   dispatch({ type: 'REORDER_PANELS', from, to });
 }

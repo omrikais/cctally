@@ -11,6 +11,7 @@ cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
 cctally db recover --db {cache,stats} [--yes]
 cctally db checkpoint [--db {cache,stats}] [--json]
+cctally db vacuum [--db {cache,stats,all}]
 ```
 
 ## Description
@@ -189,6 +190,29 @@ binary drains prod).
 `0` drained, already-small, or DB absent; `3` (staged) the target stayed
 `busy` / the WAL was not fully truncated through the timeout — an
 actionable "something is still holding it" signal.
+
+## `cctally db vacuum [--db {cache,stats,all}]`
+
+Reclaim disk space by rewriting the database file compactly (SQLite `VACUUM`).
+Deleting rows — for example the transcript retention prune (`cache-sync
+--prune-conversations`, or the dashboard's automatic once-a-day pass) — frees
+pages *inside* the file but never shrinks it on disk; `db vacuum` is what
+actually returns that space to the filesystem. `--db` selects `cache` (default),
+`stats`, or `all`.
+
+This is **never automatic** and always explicit. VACUUM needs exclusive access:
+the command drains the WAL and rewrites the file under a real SQLite
+`PRAGMA locking_mode=EXCLUSIVE`, so a running dashboard (or any other cctally
+process reading the DB) makes it **fail promptly** rather than hang or race —
+stop the dashboard and retry. Because VACUUM writes a full temporary copy of the
+database, the command also refuses up front when free disk is below roughly twice
+the file size plus its WAL. On success it reports the space reclaimed.
+
+### Exit codes
+
+`0` reclaimed (or the DB is absent — nothing to do); `3` (staged) the target is
+in use (stop the dashboard / other cctally processes and retry), a maintenance
+operation is already running, or free disk is below the required margin.
 
 ## Notes
 

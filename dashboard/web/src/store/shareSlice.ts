@@ -15,9 +15,15 @@
 // `CLOSE_SHARE` / `OPEN_COMPOSER` / `CLOSE_COMPOSER` cases through
 // this reducer and then re-emits via the subscriber set.
 import type { SharePanelId } from '../share/types';
+import type { DashboardSelection } from '../types/envelope';
 
 export interface ShareModalState {
   panel: SharePanelId;
+  // #294 S5 §7 — the source the share flow was captured under, stamped from
+  // `activeSource` at OPEN_SHARE. A mid-flow SET_ACTIVE_SOURCE must NOT restamp
+  // this, so every render/compose/history/preset request this flow issues
+  // carries the captured source, not the live selection. Defaults to 'claude'.
+  source: DashboardSelection;
   // Element id captured when the share modal opens; <ShareModalRoot>
   // uses it to re-acquire the trigger element for focus restoration on
   // close (a11y: matches the existing panel-modal focus-restore pattern).
@@ -48,7 +54,16 @@ export const initialShareState: ShareSlice = {
 };
 
 export type ShareAction =
-  | { type: 'OPEN_SHARE'; panel: SharePanelId; triggerId: string | null; params?: { windowWeeks?: 1 | 4 | 8 | 12 } }
+  | {
+      type: 'OPEN_SHARE';
+      panel: SharePanelId;
+      triggerId: string | null;
+      params?: { windowWeeks?: 1 | 4 | 8 | 12 };
+      // #294 S5 §7 — the master store stamps this from `getState().activeSource`
+      // when it forwards OPEN_SHARE (the pure action creator omits it). Defaults
+      // to 'claude' in the reducer so direct unit dispatches stay valid.
+      source?: DashboardSelection;
+    }
   | { type: 'CLOSE_SHARE' }
   | { type: 'OPEN_COMPOSER' }
   | { type: 'CLOSE_COMPOSER' };
@@ -60,9 +75,10 @@ export function shareReducer(state: ShareSlice, action: ShareAction): ShareSlice
       // actually supplies one. Spread-assigning `params: undefined`
       // would leave the key in the object and break narrowed
       // discriminated-union checks downstream.
+      const source: DashboardSelection = action.source ?? 'claude';
       const modal: ShareModalState = action.params !== undefined
-        ? { panel: action.panel, triggerId: action.triggerId, params: action.params }
-        : { panel: action.panel, triggerId: action.triggerId };
+        ? { panel: action.panel, triggerId: action.triggerId, source, params: action.params }
+        : { panel: action.panel, triggerId: action.triggerId, source };
       return { ...state, shareModal: modal };
     }
     case 'CLOSE_SHARE':

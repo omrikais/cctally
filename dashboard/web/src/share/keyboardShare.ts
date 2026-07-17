@@ -45,7 +45,7 @@ import { dispatch, getState } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { SHARE_CAPABLE_PANELS } from '../lib/panelIds';
 import { MOBILE_MEDIA_QUERY } from '../lib/breakpoints';
-import type { SharePanelId } from './types';
+import { isSharePanelAllowed, type SharePanelId } from './types';
 
 // #293 S4 — card regions are no longer focusable (describe-only); the real Tab
 // target is a panel action (Expand / Share icon). Copy reflects that.
@@ -104,6 +104,12 @@ export function buildShareKeyBinding(): Binding {
       // Not a share-capable kind (e.g. 'alerts'): silent ignore. The
       // user clicked a panel, just not a shareable one — no toast.
       if (!SHARE_CAPABLE_PANELS.has(kind)) return;
+      // #294 S5 §7 — the active source's share matrix gates this too:
+      // forecast/trend are share-capable but absent from the Codex/All matrix,
+      // so `S` on such a panel is a silent no-op under those sources. (Under
+      // Codex/All those panels are also hidden by §5.5, so this is belt-and-
+      // suspenders — but it keeps the invariant even if a panel leaks in.)
+      if (!isSharePanelAllowed(getState().activeSource, kind as SharePanelId)) return;
       // The membership check above proves `kind` is a SharePanelId (S2 #264 —
       // daily/weekly/monthly are grid ids AND SharePanelIds, no shim needed).
       // The triggerId keeps the focused kind so ShareModalRoot restores focus

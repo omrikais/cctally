@@ -30,8 +30,15 @@ home directory, source path/fingerprint, conversation key, or logical-limit
 key. `--reveal-projects` opts out only of the project-basename anonymization;
 it does not authorize exposing those internal identities.
 
-Review every rendered MD/HTML/SVG artifact before sharing. S3 covers CLI
-artifacts only: dashboard composer/history/source selection remains deferred.
+Review every rendered MD/HTML/SVG artifact before sharing.
+
+### Dashboard share source identity (#294 S5)
+
+The dashboard share GUI stamps and displays source identity end-to-end. Opening a share flow (a panel's Share affordance, or `S` on a focused panel) captures the active source at that moment; switching the global selector while the modal, preview, or export is open never restamps the in-flight flow. Every render and composer request the client issues carries an explicit `source` (including `claude`) — so newly produced artifacts and history entries visibly say "Claude", "Codex", or "All" (an intended, documented change; a never-switching Claude user's data and flows are otherwise unchanged). The modal's live preview surfaces the flow's source label chrome so the pre-copy preview matches what the artifact says.
+
+The share picker and the `S` shortcut gate through the per-source panel matrix: Claude offers its full nine-panel set (including forecast and trend); Codex and `All` offer the same seven-panel intersection (`current-week`, `daily`, `monthly`, `weekly`, `blocks`, `sessions`, `projects`) — forecast and trend are absent, since the server unconditionally builds both provider snapshots for `all`.
+
+Each basket item permanently carries the source it was captured under, shown as an always-visible chip; a mixed-source basket is allowed and the composer renders every section with its source label, composing as provider-labelled sections (no blended snapshot exists client-side). Legacy stored basket items without a `source` load as Claude on read, without any destructive rewrite of stored bytes. Preset rows and "Recent shares" history rows display their stored-source label; presets keep the server's `(panel, name)` identity, so saving a preset under another source overwrites that record and updates its stored source, while history rows are per-source distinct (source participates in server-side history/digest identity — "same panel, different source" entries never collapse).
 
 ## Flags
 

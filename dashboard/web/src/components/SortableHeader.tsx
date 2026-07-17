@@ -45,6 +45,28 @@ export function SortableHeader<T>({ columns, override, onChange, accentVar, grid
     <thead role={grid ? 'rowgroup' : undefined}>
       <tr role={grid ? 'row' : undefined}>
         {columns.map((col) => {
+          // #294 S5 — a display-only column (`sortable: false`) renders a plain,
+          // non-interactive header cell: no sort button, caret, aria-sort, or
+          // tab stop. Used by the source-sessions grid for the models / token
+          // cells / source chip columns (only recency/label/total/cost sort).
+          if (col.sortable === false) {
+            const staticCls = [
+              'th-static',
+              col.className ?? '',
+              col.numeric ? 'num' : '',
+            ].filter(Boolean).join(' ');
+            return (
+              <th
+                key={col.id}
+                className={staticCls}
+                role={grid ? 'columnheader' : undefined}
+                data-col={col.id}
+                title={col.title}
+              >
+                {col.label}
+              </th>
+            );
+          }
           const active = override?.column === col.id;
           const dir = active ? override!.direction : null;
           const cls = [

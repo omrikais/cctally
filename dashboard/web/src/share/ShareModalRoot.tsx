@@ -101,6 +101,7 @@ export function ShareModalRoot() {
         >
           <ShareModal
             panel={slot.panel}
+            source={slot.source}
             initialParams={slot.params}
             onClose={close}
           />

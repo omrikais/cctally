@@ -87,7 +87,7 @@ describe('<ComposerModal>', () => {
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: '2026-05-11T09:00:00Z',
       data_digest_at_add: 'sha256:abc', kernel_version: 1,
-      label_hint: 'Weekly recap',
+      label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -111,7 +111,7 @@ describe('<ComposerModal>', () => {
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: '2026-05-11T09:00:00Z',
       data_digest_at_add: 'sha256:abc', kernel_version: 1,
-      label_hint: 'Weekly recap',
+      label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -139,7 +139,7 @@ describe('<ComposerModal>', () => {
     seedBasket([{
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:old',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -164,7 +164,7 @@ describe('<ComposerModal>', () => {
       // Note: reveal_projects=false → "anonymous at add-time."
       options: { ...defaultOpts(), reveal_projects: false },
       added_at: 't', data_digest_at_add: 'sha256:abc',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -187,7 +187,7 @@ describe('<ComposerModal>', () => {
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: { ...defaultOpts(), reveal_projects: true },
       added_at: 't', data_digest_at_add: 'sha256:abc',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -216,7 +216,7 @@ describe('<ComposerModal>', () => {
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't',
       data_digest_at_add: 'sha256:abc', kernel_version: 1,
-      label_hint: 'W',
+      label_hint: 'W', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     const { container } = render(<ComposerModal />);
@@ -228,7 +228,7 @@ describe('<ComposerModal>', () => {
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't',
       data_digest_at_add: 'sha256:abc', kernel_version: 1,
-      label_hint: 'W',
+      label_hint: 'W', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     const { container } = render(<ComposerModal />);
@@ -241,7 +241,7 @@ describe('<ComposerModal>', () => {
     seedBasket([{
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:abc',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -257,7 +257,7 @@ describe('<ComposerModal>', () => {
     seedBasket([{
       id: 'a', panel: 'weekly', template_id: 'weekly-recap',
       options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:abc',
-      kernel_version: 1, label_hint: 'Weekly recap',
+      kernel_version: 1, label_hint: 'Weekly recap', source: 'claude' as const,
     }]);
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -332,7 +332,7 @@ function seedOneItemBasket(): void {
     id: 'a', panel: 'weekly', template_id: 'weekly-recap',
     options: defaultOpts(), added_at: '2026-05-11T09:00:00Z',
     data_digest_at_add: 'sha256:abc', kernel_version: 1,
-    label_hint: 'Weekly recap',
+    label_hint: 'Weekly recap', source: 'claude' as const,
   }]);
 }
 

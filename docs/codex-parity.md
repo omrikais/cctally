@@ -4,9 +4,10 @@ Issue #294 defines parity as equivalent user outcomes with truthful provider
 semantics. It does not mean relabeling one provider's data as the other's, or
 inventing a zero value for an unavailable capability. S0 fixed the contract;
 S1 supplies the physical ingest foundation, S2 ships native quota
-interpretation and lifecycle, and S4 now ships the dashboard's source-aware
-backend read model. S5 still owns the visible React source selector and its
-end-to-end interaction design.
+interpretation and lifecycle, S4 ships the dashboard's source-aware backend read
+model, and S5 now ships the visible React source selector and source-labelled
+sharing controls over that backend. Native Codex conversations and later
+certification remain deferred.
 
 ## S3 provider-aware CLI analytics
 
@@ -43,9 +44,10 @@ logical-limit series can overlap the same physical accounting rows.
 The S3 acceptance rows `source-derived-project-attribution`,
 `source-aware-cli-share-identity`, `report-per-source-never-blended`, and
 `codex-token-reuse-forensics` are supported. `codex-cache-hit-rate-not-applicable`
-remains deliberately not applicable. S4's dashboard backend contract is
-supported; S5 source-selection controls, native conversations, and later
-certification remain deferred, so issue #294 is still open.
+remains deliberately not applicable. S4's dashboard backend contract and S5's
+`source-aware-dashboard-share-identity` acceptance row are supported; native
+Codex conversations (S6–S8) and later certification remain deferred, so issue
+#294 is still open.
 
 ## Capability states
 
@@ -136,7 +138,9 @@ and thread facts without fabricating them from an older accounting-only cache.
 | periods, sessions, projects, qualified details | supported | supported | S4 | Source-qualified routes own their opaque keys; same labels or native IDs never fall back across providers. |
 | quota blocks and alerts | supported | supported | S4 | Native quota windows and provider-specific alerts stay side by side, never merged. |
 | share backend | supported | supported | S4 | Render, compose, presets, and history carry `source`; `all` renders labelled provider sections rather than a blended quota. |
-| visible source selector and sharing controls | deferred | deferred | S5 | S5 owns the React controls and browser UX; S4 deliberately ships no frontend selector. |
+| visible source selector and sharing controls | supported | supported | S5 | The Header radiogroup selector (`v` to cycle) drives every panel, modal, alert filter, and share default; capability gating hides ghost panels, and the source picker/matrix stamps every render, compose, preset, and history request with an explicit source. |
+| source-aware dashboard share identity | supported | supported | S5 | Basket items, composer sections, presets, and history rows carry and display their captured source; a mid-flow selector switch never restamps an open share flow; `all` composes provider-labelled sections and never a blended snapshot. |
+| dashboard cache-report / token-reuse forensics panel | supported | deferred | S5 | Claude's cache-report panel ships its cache hit/miss/create/read forensics, so dashboard forensics stay Claude-only; Codex publishes no forensics data domain, so the hero renders the token-reuse counters and a dedicated Codex forensics panel would need an S4-side contract addition first. |
 | debug diagnostics | supported | supported | S4 | Loopback-only `/api/debug/backend` reports source-aware aggregate counts and opaque versions. |
 
 ## S4 dashboard backend contract

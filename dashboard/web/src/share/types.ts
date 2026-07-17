@@ -7,12 +7,45 @@
 // deliberately spell it as a literal union here (not
 // `Exclude<PanelId, 'alerts'>`) so a future PanelId addition that
 // happens to be non-share-capable doesn't silently widen this type.
+import type { DashboardSelection } from '../types/envelope';
+
 export type ShareFormat = 'md' | 'html' | 'svg';
 export type ShareTheme = 'light' | 'dark';
 export type SharePanelId =
   | 'current-week' | 'trend' | 'weekly' | 'daily'
   | 'monthly' | 'blocks' | 'forecast' | 'sessions'
   | 'projects';
+
+// #294 S5 §7 — the per-source share panel matrix. Claude offers its full
+// nine-panel set (including forecast/trend); Codex offers seven (no
+// forecast/trend — those live in the Codex quota panel's native forecasts);
+// All offers the Claude/Codex INTERSECTION (the same seven), because the server
+// unconditionally builds both provider snapshots for source=all. This gates the
+// share picker AND the keyboard `S` binding.
+export const SHARE_PANEL_MATRIX: Record<DashboardSelection, ReadonlySet<SharePanelId>> = {
+  claude: new Set<SharePanelId>([
+    'current-week', 'trend', 'weekly', 'daily', 'monthly', 'blocks', 'forecast', 'sessions', 'projects',
+  ]),
+  codex: new Set<SharePanelId>([
+    'current-week', 'daily', 'monthly', 'weekly', 'blocks', 'sessions', 'projects',
+  ]),
+  all: new Set<SharePanelId>([
+    'current-week', 'daily', 'monthly', 'weekly', 'blocks', 'sessions', 'projects',
+  ]),
+};
+
+// True when `panel` is shareable under the given source selection.
+export function isSharePanelAllowed(source: DashboardSelection, panel: SharePanelId): boolean {
+  return SHARE_PANEL_MATRIX[source].has(panel);
+}
+
+// #294 S5 §7 — human label for a source selection (share chrome, chips, preset/
+// history rows). Covers 'all' too, unlike the alert SOURCE_LABEL.
+export const SELECTION_LABEL: Record<DashboardSelection, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  all: 'All',
+};
 
 export interface SharePeriod {
   kind: 'current' | 'previous' | 'custom';

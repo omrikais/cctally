@@ -40,12 +40,34 @@ import { CacheNetBars } from '../modals/CacheNetBars';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
+import { SourcePanelShell } from './sourcePanel';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
 const GREEN = 'var(--accent-green)';
 
+// #294 S5 §5.5 (layer 2) / §6.6 — the cache-report (forensics) panel stays
+// Claude-only, rendered from the documented legacy `cache_report` fallback.
+// Claude mode renders the panel verbatim (bare — SourcePanelShell short-circuits
+// the claude branch with no extra chrome). In All mode the shell wraps it as a
+// Claude-labeled provider section (source chip), matching every other panel; the
+// Codex section is hidden by the gating table (no forensics domain), so the
+// `codex` renderer is never invoked. Codex-only mode hides the panel entirely
+// (App never mounts a source-hidden panel).
 export function CacheReportPanel() {
+  return (
+    <SourcePanelShell
+      panel="cache-report"
+      panelKind="cache-report"
+      claude={<ClaudeCacheReportPanel />}
+      // Codex publishes no forensics domain — the gating table hides the Codex
+      // section, so this is never rendered. Returning null is the safe floor.
+      codex={() => null}
+    />
+  );
+}
+
+function ClaudeCacheReportPanel() {
   const env = useSnapshot();
   const cr = env?.cache_report;
   // Mobile-driven collapse (< 720 px). The `.cache-report-collapsed`

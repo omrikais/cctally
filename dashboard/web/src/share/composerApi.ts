@@ -13,6 +13,7 @@
 // shape contract in one place so a future schema bump only edits one
 // builder, not a half-dozen call sites.
 import type { BasketItem } from '../store/basketSlice';
+import type { DashboardSelection } from '../types/envelope';
 import { ShareApiError } from './api';
 
 export interface ComposeRequest {
@@ -28,6 +29,10 @@ export interface ComposeRequest {
       options: BasketItem['options'];
       data_digest_at_add: string;
       kernel_version: number;
+      // #294 S5 §7 — each section carries the source its basket item was
+      // captured under, so a mixed-source basket composes as provider-labeled
+      // sections (no blended snapshot exists client-side).
+      source: DashboardSelection;
     };
   }>;
 }
@@ -72,6 +77,7 @@ export function buildComposeRequest(
         options: it.options,
         data_digest_at_add: it.data_digest_at_add,
         kernel_version: it.kernel_version,
+        source: it.source,
       },
     })),
   };

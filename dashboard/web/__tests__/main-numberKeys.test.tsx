@@ -6,9 +6,14 @@ import type { Envelope } from '../src/types/envelope';
 // A snapshot with empty sessions — enough to clear the #207 B2/B3 no-data
 // guard (openPanelByPosition is a no-op until a snapshot lands) while keeping
 // the Sessions opener a safe no-op (no session id to resolve).
+// #294 S5 §6.11 — digits address the VISIBLE panel order; the Claude cache-report
+// panel is visible only when the legacy `cache_report` object exists, so include
+// a (non-null) one here to keep all 10 grid panels visible and the default
+// full-order digit mapping intact.
 const SNAP = {
   header: {},
   sessions: { total: 0, rows: [], sort_key: 'started_desc' },
+  cache_report: { is_empty: false },
 } as unknown as Envelope;
 
 beforeEach(() => {

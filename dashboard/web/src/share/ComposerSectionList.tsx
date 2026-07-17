@@ -31,6 +31,7 @@ import { dispatch } from '../store/store';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import type { BasketItem } from '../store/basketSlice';
 import type { ComposeSectionResult } from './composerApi';
+import { SELECTION_LABEL } from './types';
 
 interface Props {
   items: BasketItem[];
@@ -129,6 +130,11 @@ function Row({
         ≡
       </button>
       <span className="composer-section-label">{item.label_hint}</span>
+      {/* #294 S5 §7 — always-visible per-item source chip, so a mixed-source
+          basket reads apart at a glance. */}
+      <span className={`source-chip source-chip--${item.source}`}>
+        {SELECTION_LABEL[item.source]}
+      </span>
       {outdated ? (
         <span
           className="composer-outdated-badge"

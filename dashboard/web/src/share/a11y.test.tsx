@@ -114,7 +114,7 @@ describe('share-v2 a11y attributes', () => {
         id: '1', panel: 'weekly', template_id: 'weekly-recap',
         options: defaultOpts(), added_at: '2026-05-12T09:00:00Z',
         data_digest_at_add: 'sha256:abc', kernel_version: 1,
-        label_hint: 'Weekly recap',
+        label_hint: 'Weekly recap', source: 'claude' as const,
       } satisfies BasketItem],
     });
     dispatch(openComposer());

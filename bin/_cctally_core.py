@@ -61,7 +61,8 @@ def _init_paths_from_env() -> None:
     """
     global APP_DIR, LEGACY_APP_DIR, LOG_DIR, DEV_MODE
     global DB_PATH, CACHE_DB_PATH
-    global CACHE_LOCK_PATH, CACHE_LOCK_CODEX_PATH, CONFIG_LOCK_PATH
+    global CACHE_LOCK_PATH, CACHE_LOCK_CODEX_PATH, CACHE_LOCK_MAINTENANCE_PATH
+    global CONFIG_LOCK_PATH
     global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
     global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
     global HOOK_TICK_THROTTLE_PATH, HOOK_TICK_THROTTLE_LOCK_PATH
@@ -100,6 +101,10 @@ def _init_paths_from_env() -> None:
 
     CACHE_LOCK_PATH = APP_DIR / "cache.db.lock"
     CACHE_LOCK_CODEX_PATH = APP_DIR / "cache.db.codex.lock"
+    # #313 P3 (F7): dedicated maintenance flock serializing the transcript
+    # retention prune across processes, held ABOVE the two provider flocks so a
+    # rebuild/reingest cannot land between candidate selection and deletion.
+    CACHE_LOCK_MAINTENANCE_PATH = APP_DIR / "cache.db.maintenance.lock"
     CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
 
     CONFIG_PATH = APP_DIR / "config.json"

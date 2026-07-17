@@ -1,13 +1,24 @@
-import { useSyncExternalStore } from 'react';
+import { useSyncExternalStore, type ReactNode } from 'react';
 import { BasketChip } from './BasketChip';
 import { DoctorChip } from './DoctorChip';
 import { SyncChip } from './SyncChip';
+import { SourceSwitcher } from './SourceSwitcher';
+import { SourceStatusChip } from './SourceStatusChip';
 import { UpdateBadge } from './UpdateBadge';
 import { ViewSwitcher } from '../conversations/ViewSwitcher';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { fmt } from '../lib/fmt';
+import { joinCodexQuotaLabels } from '../lib/sourceRows';
+import { resolveSourceView } from '../store/sourceView';
 import { triggerSync } from '../store/sync';
 import { getState, subscribeStore } from '../store/store';
+import type {
+  CodexSourceData,
+  CurrentWeekEnvelope,
+  DashboardSelection,
+  Envelope,
+  HeaderEnvelope,
+} from '../types/envelope';
 
 // Chrome bar (#248 §1) — slimmed to GLOBAL chrome only. The five dashboard
 // `.stat` blocks (Week / Used / $/1% / Forecast) and the "vs last week" delta
@@ -21,6 +32,41 @@ import { getState, subscribeStore } from '../store/store';
 // state path.
 function dispatchKey(key: string): void {
   document.dispatchEvent(new KeyboardEvent('keydown', { key }));
+}
+
+// #294 S5 §5.4 — build the provider-native condensed readout body. Returns null
+// when there is nothing to show (All mode, or Codex with no active quota
+// window), which also suppresses the condensed row entirely.
+function buildCondensedReadout(
+  activeSource: DashboardSelection,
+  env: Envelope | null,
+  header: HeaderEnvelope | null | undefined,
+  cw: CurrentWeekEnvelope | null,
+): ReactNode {
+  if (activeSource === 'all') return null; // hidden under All
+  if (activeSource === 'codex') {
+    const view = resolveSourceView(env, 'codex');
+    const data = view.entry?.data as CodexSourceData | undefined;
+    if (data?.hero == null || data?.quota == null) return null;
+    const windows = joinCodexQuotaLabels(data.hero, data.quota);
+    if (windows.length === 0) return null;
+    const top = windows[0];
+    return (
+      <>
+        <span className="topbar-condensed-pct">{fmt.pct1(top.current.current_percent)}</span>
+        <span className="topbar-condensed-sep" aria-hidden="true"> · </span>
+        <span className="topbar-condensed-reset">{top.label}</span>
+      </>
+    );
+  }
+  // Claude (default) — the legacy Used% / resets-in line, unchanged.
+  return (
+    <>
+      <span className="topbar-condensed-pct">{fmt.pct1(header?.used_pct)}</span>
+      <span className="topbar-condensed-sep" aria-hidden="true"> · </span>
+      <span className="topbar-condensed-reset">resets {fmt.ddhh(cw?.reset_in_sec)}</span>
+    </>
+  );
 }
 
 export function Header() {
@@ -38,10 +84,16 @@ export function Header() {
   // H2 full-stat duplication.
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
   const heroScrolled = useSyncExternalStore(subscribeStore, () => getState().heroScrolled);
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const env = useSnapshot();
   const header = env?.header;
   const cw = env?.current_week ?? null;
-  const showCondensed = view === 'dashboard' && heroScrolled;
+  // #294 S5 §5.4 — the mobile condensed readout is provider-native. Under Codex
+  // it shows the native quota summary via the §6.1 label join; under All it is
+  // hidden; under Claude it keeps the legacy Used% / resets-in line. It never
+  // shows Claude copy while another source is active.
+  const condensedBody = buildCondensedReadout(activeSource, env, header, cw);
+  const showCondensed = view === 'dashboard' && heroScrolled && condensedBody != null;
   return (
     <header className={`topbar${showCondensed ? ' is-scrolled' : ''}`} data-view={view}>
       {/* Heading outline root (A3) — visually hidden so the topbar design
@@ -73,18 +125,22 @@ export function Header() {
           transcripts are enabled for this request, so the dashboard
           chrome is identical for users without the feature. */}
       <ViewSwitcher />
+      {/* #294 S5 — the global Claude / Codex / All source selector. Self-hides
+          outside the dashboard workspace. Sits beside the workspace switcher. */}
+      <SourceSwitcher />
       {/* condensed readout: Task 7 — a mobile-only, dashboard-only condensed
-          Used% / resets-in line, gated on view==='dashboard' && heroScrolled.
-          CSS keeps it desktop-hidden; on mobile it keeps the sticky bar one row
-          ≤64px and the hero number glanceable while scrolling. */}
+          line, gated on view==='dashboard' && heroScrolled. Provider-native
+          under Codex (native quota summary); hidden under All; Claude keeps the
+          legacy Used% / resets-in line. CSS keeps it desktop-hidden. */}
       {showCondensed && (
-        <div className="topbar-condensed" data-testid="topbar-condensed">
-          <span className="topbar-condensed-pct">{fmt.pct1(header?.used_pct)}</span>
-          <span className="topbar-condensed-sep" aria-hidden="true"> · </span>
-          <span className="topbar-condensed-reset">resets {fmt.ddhh(cw?.reset_in_sec)}</span>
+        <div className="topbar-condensed" data-testid="topbar-condensed" data-source={activeSource}>
+          {condensedBody}
         </div>
       )}
       <div className="topbar-actions">
+        {/* #294 S5 — the active-source freshness / warning chip (§6.8). Distinct
+            from the global SyncChip; self-hides while hydrating / pre-S4. */}
+        <SourceStatusChip />
         {/* Doctor aggregate chip (spec §6.1). Renders nothing until
             the first SSE tick carrying snap.doctor lands. Click +
             `d` keymap both open the DoctorModal. Placed before the

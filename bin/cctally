@@ -952,6 +952,7 @@ cmd_db_skip = _cctally_db.cmd_db_skip
 cmd_db_unskip = _cctally_db.cmd_db_unskip
 cmd_db_recover = _cctally_db.cmd_db_recover
 cmd_db_checkpoint = _cctally_db.cmd_db_checkpoint
+cmd_db_vacuum = _cctally_db.cmd_db_vacuum
 
 
 # Session-entry cache subsystem (Claude + Codex) — read-through delta

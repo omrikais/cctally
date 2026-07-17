@@ -26,6 +26,15 @@ export function SessionsControls() {
     () => getState().prefs.sessionsSortOverride,
   );
 
+  // #294 S5 — the filter/search inputs + `f`/`/` bindings are source-agnostic
+  // (they drive the shared filterText/searchText/inputMode, which the active
+  // source's rendered rows consume). The Claude sort PILL cycles legacy
+  // SessionSortKeys and is meaningless for the source grids, whose sort is owned
+  // by the SortableHeader column clicks — so it is hidden under Codex / All.
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const isClaudeSource = activeSource === 'claude';
+  const filterPlaceholder = isClaudeSource ? 'filter project|model…' : 'filter session|model…';
+
   const isMobile = useIsMobile();
   const [filterExpanded, setFilterExpanded] = useState(false);
   const [searchExpanded, setSearchExpanded] = useState(false);
@@ -159,7 +168,7 @@ export function SessionsControls() {
           type="search"
           className="ctrl-input"
           id="filter-input"
-          placeholder="filter project|model…"
+          placeholder={filterPlaceholder}
           ref={filterInputRef}
           value={filterText}
           onChange={(e) => dispatch({ type: 'SET_FILTER', text: e.target.value })}
@@ -244,21 +253,23 @@ export function SessionsControls() {
         </div>
       )}
 
-      {/* Sort pill */}
-      <button
-        className="ctrl-btn"
-        id="sort-pill"
-        type="button"
-        title="Cycle sort"
-        onClick={onSortClick}
-      >
-        <svg className="icon" aria-hidden="true">
-          <use href="/static/icons.svg#sort-updown" />
-        </svg>
-        <span className="label">
-          sort: {override ? `${override.column} ${override.direction}` : sort}
-        </span>
-      </button>
+      {/* Sort pill — Claude only (the source grids sort via the SortableHeader). */}
+      {isClaudeSource && (
+        <button
+          className="ctrl-btn"
+          id="sort-pill"
+          type="button"
+          title="Cycle sort"
+          onClick={onSortClick}
+        >
+          <svg className="icon" aria-hidden="true">
+            <use href="/static/icons.svg#sort-updown" />
+          </svg>
+          <span className="label">
+            sort: {override ? `${override.column} ${override.direction}` : sort}
+          </span>
+        </button>
+      )}
     </div>
   );
 }

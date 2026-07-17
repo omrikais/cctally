@@ -7,6 +7,7 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { SourcePanelShell } from './sourcePanel';
 
 // ForecastPanel (#248 §4) — a calm-when-healthy uniform TILE. The projected %
 // at reset is the dominant number; the verdict chip's glyph comes straight from
@@ -17,7 +18,25 @@ import { openShareModal } from '../store/shareSlice';
 // amber number tint; `capped` (OVER) is red. The recent-24h projection + the
 // two per-day budgets render muted at the foot; the full breakdown lives in the
 // (out-of-scope) Forecast modal the tile opens.
+// #294 S5 — source-aware wrapper. The Forecast tile is a Claude-only surface
+// (Codex hero publishes no forecast, §5.5): Claude renders the existing tile
+// unchanged; Codex renders nothing (gate-hidden — the grid unmounts it, and the
+// shell returns null defensively); All renders the Claude-labeled provider
+// section (no Codex forecast section). Wrapping stops the legacy top-level
+// `env.forecast` from leaking Claude forecast numbers under a Codex label.
 export function ForecastPanel() {
+  return (
+    <SourcePanelShell
+      panel="forecast"
+      panelKind="forecast"
+      claude={<ClaudeForecastPanel />}
+      codex={() => null}
+      emptyLabel="No Codex forecast."
+    />
+  );
+}
+
+function ClaudeForecastPanel() {
   const env = useSnapshot();
   const fc = env?.forecast ?? null;
   const v = resolveVerdict(fc?.verdict ?? null);

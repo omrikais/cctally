@@ -8,6 +8,7 @@
 import type {
   SharePanelId, ShareOptions, ShareRenderResponse, ShareTemplatesResponse,
 } from './types';
+import type { DashboardSelection } from '../types/envelope';
 
 export class ShareApiError extends Error {
   // `code` is a forward-looking slot for the typed-error envelope: the
@@ -52,6 +53,11 @@ export async function renderShare(
     panel: SharePanelId;
     template_id: string;
     options: ShareOptions;
+    // #294 S5 §7 — every render the client issues stamps an explicit source
+    // (including 'claude'). Optional in the type only so a legacy caller keeps
+    // compiling; the share flow always supplies it. The server adds source_label
+    // chrome for explicit-source requests.
+    source?: DashboardSelection;
   },
   init?: { signal?: AbortSignal },
 ): Promise<ShareRenderResponse> {

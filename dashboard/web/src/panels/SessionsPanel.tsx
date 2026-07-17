@@ -24,6 +24,8 @@ import { transcriptsEnabled } from '../lib/transcripts';
 import { openShareModal } from '../store/shareSlice';
 import { HighlightText } from '../lib/highlightText';
 import { rovingAction } from '../lib/sessionsRovingKeyboard';
+import { useActiveSource } from './sourcePanel';
+import { SourceSessionsGrid } from './SourceSessionsGrid';
 import type { SessionRow } from '../types/envelope';
 
 // #299 — the row's focusable per-row controls, in DOM (= visual L→R) order.
@@ -33,7 +35,21 @@ const CONTROL_SELECTOR =
 // #299 — stable per-row identity for roving-focus tracking; matches the React key.
 const rowKey = (r: SessionRow) => r.session_id || `${r.started_utc}-${r.model}`;
 
+// #294 S5 §6.3 — source-aware wrapper. Claude keeps the full sortable/filterable
+// grid (byte-identical, via getRenderedRows + legacy SessionRow columns). Codex
+// and All render through the source-native SourceSessionsGrid (provider display
+// rows: label / last_activity / models / the five token cells / cost, sortable
+// by recency·label·total·cost, filter+search over label+models, roving grid);
+// in All the two providers' rows interleave by recency with a per-row source
+// chip (no merging of labels or native keys). The Sessions surface is NOT the
+// generic provider-labeled-sections shell — All is a single interleaved grid.
 export function SessionsPanel() {
+  const activeSource = useActiveSource();
+  if (activeSource === 'claude') return <ClaudeSessionsPanel />;
+  return <SourceSessionsGrid />;
+}
+
+function ClaudeSessionsPanel() {
   const env = useSnapshot();
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };

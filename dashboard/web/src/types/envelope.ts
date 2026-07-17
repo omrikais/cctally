@@ -95,6 +95,19 @@ export interface Envelope {
   // partial data as-is. False/absent on every complete snapshot. Additive-
   // optional — a Python without the field leaves it absent → treat as false.
   hydrating?: boolean;
+  // #294 S5 — the S4 source-aware read model. The server's
+  // `_source_bundle_to_envelope` (bin/_cctally_dashboard_envelope.py) SPREADS
+  // its four fields at the envelope TOP LEVEL via `envelope.update(...)`, so
+  // `source_schema_version` / `default_source` / `source_order` are top-level
+  // siblings and `sources` is the FLAT per-source map `{claude, codex, all}` —
+  // there is NO `env.sources.sources` nesting. All four are additive-optional:
+  // a Python that predates S4 (or a fixture built before the fields landed)
+  // omits them, and the source-view seam (store/sourceView.ts) degrades Claude
+  // to the legacy top-level envelope and Codex/All to a hydrating-like absence.
+  source_schema_version?: number;
+  default_source?: string;
+  source_order?: string[];
+  sources?: SourcesMap;
 }
 
 // Cache Report envelope (spec 2026-05-21).
@@ -709,4 +722,618 @@ export interface DailyEnvelope {
   // DailyPanel.tsx swap its `rows.reduce(...)` for a single read.
   total_cost_usd?:     number;
   total_tokens?:       number;
+}
+
+// ======================================================================
+// #294 S5 — source-aware dashboard read model (the S4 `sources` bundle)
+// ======================================================================
+//
+// These types mirror the S4 snake_case wire contract, transcribed field-by-
+// field from the Python builders (source of truth — NOT guessed):
+//   - bin/_lib_dashboard_sources.py   — SourceDashboardState / bundle / all-compose
+//   - bin/_cctally_dashboard_sources.py — build_codex_source_state + wire helpers
+//   - bin/_cctally_tui.py::_tui_project_claude_source_data — Claude projection
+//   - bin/_cctally_dashboard_envelope.py::_source_state_to_wire — the serializer
+//
+// Consumers tolerate unknown keys per the additive-evolution rule: unknown
+// capability keys, unknown capability statuses, and unknown warning codes must
+// degrade gracefully (generic labels), never crash. Do NOT treat these as
+// exhaustive where the wire is additive.
+
+export type SourceName = 'claude' | 'codex';
+export type DashboardSelection = SourceName | 'all';
+export type SourceAvailability = 'ok' | 'empty' | 'partial' | 'unavailable';
+export type SourceFreshness = 'fresh' | 'stale';
+export type CapabilityStatus =
+  | 'supported'
+  | 'derived'
+  | 'unavailable'
+  | 'deferred'
+  | 'not_applicable';
+
+// Per-capability support record. `status` is one of the five literals above,
+// but an unknown status arriving on the wire must degrade generically, not
+// throw — consumers read `status` as a plain string when gating.
+export interface CapabilityRecord {
+  status: CapabilityStatus;
+  semantics?: string;
+}
+
+export interface SourceWarning {
+  code: string;
+  message: string;
+  domain?: string;
+}
+
+// One atomically-published provider read model. `TData` is the provider's own
+// `data` payload (ClaudeSourceData | CodexSourceData | AllSourceData); it is
+// null before the first coherent generation (unavailable / hydrating).
+export interface SourceEntry<TData> {
+  availability: SourceAvailability;
+  freshness: SourceFreshness;
+  warnings: SourceWarning[];
+  data_version: string;
+  last_success_at: string | null;
+  capabilities: Record<string, CapabilityRecord>;
+  data: TData | null;
+}
+
+// ---- Codex provider vocabulary (build_codex_source_state) -------------
+
+// Freshness inside a quota history/active row carries the physical-evidence
+// state, which has MORE states than the top-level SourceFreshness (it can be
+// 'future'/'unavailable' too). Kept as its own union so those extra states
+// don't leak into SourceFreshness.
+export type QuotaEvidenceFreshness = 'fresh' | 'stale' | 'future' | 'unavailable';
+export type QuotaForecastStatus =
+  | 'ok'
+  | 'insufficient-history'
+  | 'unavailable'
+  | 'stale'
+  | 'future';
+
+export interface CodexQuotaForecast {
+  status: QuotaForecastStatus;
+  current_percent: number | null;
+  rate_percent_per_hour: number | null;
+  projected_percent: number | null;
+  resets_at: string | null;
+  remaining_seconds: number | null;
+  sample_count: number;
+  sample_span_seconds: number | null;
+  confidence: 'high' | 'medium' | 'low' | null;
+}
+
+// A currently-active quota window (`quota.summary.active` + also surfaced in
+// `hero.quota.active`). Carries the opaque `key`, percentages, reset, and
+// freshness — but NO label/duration (those live on the matching history row,
+// joined by key per §6.1).
+export interface CodexQuotaActiveRow {
+  key: string;
+  current_percent: number;
+  captured_at: string;
+  resets_at: string;
+  freshness: QuotaEvidenceFreshness;
+  stale_after_seconds: number | null;
+}
+
+export interface CodexQuotaSummary {
+  window_count: number;
+  active_window_count: number;
+  latest_percent: number | null;
+  freshness: QuotaEvidenceFreshness;
+  active: CodexQuotaActiveRow[];
+}
+
+// A retained quota history row — carries the `label` + `window_minutes` that the
+// §6.1 join attaches to the active rows by matching `key`.
+export interface CodexQuotaHistoryRow {
+  key: string;
+  source: 'codex';
+  label: string;
+  observed_slot: number;
+  window_minutes: number | null;
+  current_percent: number | null;
+  captured_at: string | null;
+  freshness: QuotaEvidenceFreshness;
+  stale_after_seconds: number | null;
+  forecast: CodexQuotaForecast;
+}
+
+export interface CodexQuotaMilestoneRow {
+  key: string;
+  source: 'codex';
+  block_key: string;
+  percent: number;
+  captured_at: string;
+}
+
+// A durable quota-window block (`data.quota.blocks`, from _quota_wire). Distinct
+// `block:` key namespace — the §6.1 quota-history join does NOT apply here.
+export interface CodexQuotaBlockRow {
+  key: string;
+  source: 'codex';
+  label: string;
+  resets_at: string;
+  current_percent: number | null;
+  orphaned: boolean;
+}
+
+export interface CodexQuotaDomain {
+  summary: CodexQuotaSummary;
+  histories: CodexQuotaHistoryRow[];
+  milestones: CodexQuotaMilestoneRow[];
+  blocks: CodexQuotaBlockRow[];
+}
+
+export interface CodexBudgetPace {
+  daily_usd: number | null;
+  projected_low_usd: number | null;
+  projected_high_usd: number | null;
+  week_avg_projection_usd: number | null;
+}
+
+// The live configured-budget status (_configured_codex_budget_status). Uses the
+// existing ok/warn/over verdict vocabulary — NOT the Verdict alias (which is
+// ok/cap/capped for the Claude weekly ceiling).
+export interface CodexBudgetStatus {
+  period: string;
+  budget_usd: number;
+  spent_usd: number;
+  remaining_usd: number;
+  consumption_pct: number;
+  verdict: 'ok' | 'warn' | 'over';
+  low_confidence: boolean;
+  window_start_at: string;
+  window_end_at: string;
+  recent_24h_usd: number;
+  alert_thresholds: number[];
+  pace: CodexBudgetPace;
+}
+
+// Durable budget-milestone history row (_budget_wire) — alert history, distinct
+// from the live `status` above.
+export interface CodexBudgetMilestoneRow {
+  period_start_at: string;
+  period: string;
+  threshold: number;
+  budget_usd: number;
+  spent_usd: number;
+  consumption_pct: number;
+}
+
+export interface CodexProjectedBudgetRow {
+  period: string;
+  threshold: number;
+  projected_value: number;
+  denominator: number;
+  crossed_at: string | null;
+  alerted_at: string | null;
+}
+
+export interface CodexBudgetDomain {
+  status: CodexBudgetStatus | null;
+  milestones: CodexBudgetMilestoneRow[];
+  projected: CodexProjectedBudgetRow[];
+}
+
+// Codex hero counters — the five native token counters + cost, the quota
+// summary, the configured budget, and the alert count.
+export interface CodexHero {
+  cost_usd: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  quota: CodexQuotaSummary;
+  budget: CodexBudgetStatus | null;
+  alerts: { count: number };
+}
+
+export interface CodexPeriodBucket {
+  label: string;
+  cost_usd: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  models: string[];
+}
+
+export interface CodexPeriodView {
+  rows: CodexPeriodBucket[];
+  total_cost_usd: number;
+  total_tokens: number;
+  display_tz: string;
+}
+
+export interface CodexPeriodsDomain {
+  daily: CodexPeriodView;
+  monthly: CodexPeriodView;
+  weekly: CodexPeriodView;
+}
+
+export interface CodexSessionRow {
+  key: string;
+  source: 'codex';
+  label: string;
+  last_activity: string;
+  cost_usd: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  models: string[];
+}
+
+export interface CodexSessionsDomain {
+  rows: CodexSessionRow[];
+  total_sessions: number;
+  total_cost_usd: number;
+  total_tokens: number;
+}
+
+export interface CodexProjectRow {
+  key: string;
+  source: 'codex';
+  label: string;
+  session_count: number;
+  first_seen: string;
+  last_seen: string;
+  cost_usd: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+
+export interface CodexProjectsDomain {
+  rows: CodexProjectRow[];
+  total_cost_usd: number;
+  total_tokens: number;
+}
+
+// Codex source-owned alert rows (_alerts_wire) — a discriminated union on
+// `axis`. The heterogeneous toast-pipeline `SourceAlertRow` union that spans
+// Claude+Codex lands in Stage 2 (§6.7); these are the Codex `data.alerts.rows`.
+export interface CodexBudgetAlertRow {
+  key: string;
+  source: 'codex';
+  axis: 'codex_budget';
+  period: string;
+  threshold: number;
+  value: number;
+  created_at: string;
+}
+export interface CodexProjectedAlertRow {
+  key: string;
+  source: 'codex';
+  axis: 'projected';
+  period: string;
+  threshold: number;
+  value: number;
+  created_at: string;
+}
+export interface CodexQuotaAlertRow {
+  key: string;
+  source: 'codex';
+  axis: 'quota';
+  threshold: number;
+  severity: string;
+  created_at: string;
+}
+export type CodexAlertRow =
+  | CodexBudgetAlertRow
+  | CodexProjectedAlertRow
+  | CodexQuotaAlertRow;
+
+export interface CodexSourceData {
+  hero: CodexHero;
+  periods: CodexPeriodsDomain;
+  sessions: CodexSessionsDomain;
+  quota: CodexQuotaDomain;
+  budget: CodexBudgetDomain;
+  projects: CodexProjectsDomain;
+  alerts: { rows: CodexAlertRow[] };
+}
+
+// ---- Claude provider projection (_tui_project_claude_source_data) -----
+//
+// The Claude source data is the legacy dashboard envelope's already-rendered
+// values re-placed under the S4 source contract, with native route identities
+// replaced by opaque provider-qualified resource keys. Blobs that are direct
+// copies of legacy envelope objects reuse the legacy interfaces above.
+
+// A Claude session source row = the legacy SessionRow minus its raw
+// `session_id`/`project_key` identities, plus the opaque `key` + `source`.
+export interface ClaudeSessionSourceRow {
+  key: string;
+  source: 'claude';
+  started_utc: string | null;
+  duration_min: number;
+  model: string;
+  project: string;
+  cost_usd: number | null;
+  cache_hit_pct?: number | null;
+  title?: string | null;
+}
+
+// A Claude project source row = the legacy projects current-week/trend row
+// minus its raw `bucket_path`, plus the opaque `key` + `source`.
+export interface ClaudeProjectSourceRow {
+  key: string;
+  source: 'claude';
+  cost_usd?: number;
+  attributed_pct?: number | null;
+  sessions_count?: number;
+  // trend rows carry the parallel weekly arrays instead
+  weekly_cost?: number[];
+  weekly_pct?: (number | null)[];
+  sessions_per_week?: number[];
+  first_seen_per_week?: (string | null)[];
+  last_seen_per_week?: (string | null)[];
+}
+
+export interface ClaudeHero {
+  cost_usd: number;
+  total_tokens: number;
+  header: HeaderEnvelope | null;
+  current_week: CurrentWeekEnvelope | null;
+  forecast: ForecastEnvelope | null;
+  trend: TrendEnvelope | null;
+}
+
+export interface ClaudePeriodsDomain {
+  daily: DailyEnvelope;
+  monthly: MonthlyEnvelope;
+  weekly: WeeklyEnvelope;
+}
+
+export interface ClaudeSessionsDomain {
+  total?: number;
+  sort_key?: string;
+  rows: ClaudeSessionSourceRow[];
+}
+
+// The Claude projects domain keeps the legacy current_week/trend sub-shapes
+// (with re-keyed rows) plus a flat `rows` route-lookup collection.
+export interface ClaudeProjectsDomain {
+  current_week: {
+    week_label?: string | null;
+    week_start_date?: string | null;
+    week_start_at?: string | null;
+    total_cost_usd?: number;
+    rows: ClaudeProjectSourceRow[];
+  };
+  trend: {
+    window_weeks?: number;
+    weeks?: ProjectsTrendWeek[];
+    projects: ClaudeProjectSourceRow[];
+  };
+  rows: ClaudeProjectSourceRow[];
+}
+
+// A Claude 5h-block source row = the legacy BlocksPanelRow with the opaque
+// `key` + `source` added (no raw identity removed beyond `key`).
+export interface ClaudeBlockSourceRow {
+  key: string;
+  source: 'claude';
+  start_at: string;
+  end_at: string;
+  anchor: BlockAnchor;
+  is_active: boolean;
+  cost_usd: number;
+  models: ModelCostRow[];
+  label: string;
+}
+
+export interface ClaudeQuotaDomain {
+  current_week: Record<string, unknown>;   // legacy current_week minus milestones
+  blocks: ClaudeBlockSourceRow[];
+  milestones: Array<Record<string, unknown>>;
+  five_hour_milestones: Array<Record<string, unknown>>;
+}
+
+export interface ClaudeSourceData {
+  hero: ClaudeHero;
+  periods: ClaudePeriodsDomain;
+  sessions: ClaudeSessionsDomain;
+  projects: ClaudeProjectsDomain;
+  quota: ClaudeQuotaDomain;
+  budget: { forecast: ForecastEnvelope | null; settings: Record<string, unknown> | null };
+  alerts: { rows: Array<Record<string, unknown>> };
+}
+
+// ---- The `all` composition (compose_all_state) ------------------------
+
+export interface AllCombined {
+  cost_usd: number;
+  total_tokens: number;
+}
+
+export interface AllSourceData {
+  combined: AllCombined | null;
+  // The provider-native union (Claude + Codex source-owned rows). The toast
+  // pipeline's discriminated `SourceAlertRow` union lands in Stage 2 (§6.7);
+  // until then the rows stay `unknown` (each is one provider's own alert row
+  // carrying `source`) so a typed provider-row array assigns without an
+  // index-signature mismatch.
+  alerts: { rows: unknown[] };
+  providers: {
+    claude: ClaudeSourceData | null;
+    codex: CodexSourceData | null;
+  };
+}
+
+// ---- Source-aware alert rows (§6.7) -----------------------------------
+//
+// The heterogeneous toast-pipeline union that spans both providers. Claude
+// source alert rows are the legacy `AlertEntry` (id, axis, threshold, context,
+// alerted_at…) with `source: 'claude'` and an opaque `key` added by the
+// projection (`_tui_claude_resource_row`). That `key` embeds the row ORDINAL,
+// so it is NOT stable across newer-row insertion and must never be used for
+// dedup/identity — the stable Claude identity is the preserved `id`. Codex
+// source alert rows are the lean `_alerts_wire` shapes (budget/projected carry
+// `value`; quota carries `severity`, no `value`) whose `key` IS a stable native
+// identity. Transcribed from bin/_cctally_tui.py (Claude rows ~2297-2320) and
+// bin/_cctally_dashboard_sources.py::_alerts_wire (Codex rows).
+export type ClaudeAlertSourceRow = AlertEntry & { source: 'claude'; key: string };
+
+export type SourceAlertRow = ClaudeAlertSourceRow | CodexAlertRow;
+
+// ---- The flat source map ----------------------------------------------
+//
+// `env.sources` on the wire — the FLAT per-source map. The three sibling bundle
+// fields (`source_schema_version`, `default_source`, `source_order`) live at the
+// envelope TOP LEVEL, NOT inside this object (see the `Envelope` fields above and
+// the server's `_source_bundle_to_envelope`). There is deliberately no
+// `SourcesBundle` wrapper type — that was the phantom nested shape (#294 S5 QA).
+export interface SourcesMap {
+  claude: SourceEntry<ClaudeSourceData>;
+  codex: SourceEntry<CodexSourceData>;
+  all: SourceEntry<AllSourceData>;
+}
+
+// ---- Qualified detail routes (§5.6) -----------------------------------
+//
+// `/api/source/<source>/<resource>/<key>` → `{source, resource, data}` where
+// `data` is one of six adapter bodies discriminated by `detail_kind`. All six
+// are transcribed from the qualified-route builders in bin/_cctally_dashboard.py
+// (the Claude bodies are adapters that reshape/remove legacy fields — NOT the
+// legacy route payloads). The two stable error envelopes render as friendly
+// non-fatal messages.
+
+export interface QualifiedDetailEnvelope<T> {
+  source: SourceName;
+  resource: 'session' | 'project' | 'block';
+  data: T;
+}
+
+// Claude bodies (_source_safe_claude_*_detail).
+export interface ClaudeSessionDetailBody {
+  detail_kind: 'claude_session';
+  key: string;
+  started_utc: string | null;
+  last_activity_utc: string | null;
+  duration_min: number | null;
+  models: SessionDetailModel[];
+  input_tokens: number | null;
+  cache_creation_tokens: number | null;
+  cache_read_tokens: number | null;
+  output_tokens: number | null;
+  cache_hit_pct: number | null;
+  cost_per_model: SessionDetailCostPerModel[];
+  cost_total_usd: number | null;
+}
+export interface ClaudeProjectDetailBody {
+  detail_kind: 'claude_project';
+  key: string;
+  window_weeks: number;
+  window_cost_usd: number;
+  window_attributed_pct: number | null;
+  models: ProjectDetailModelRow[];
+  sessions: Array<{
+    started_at: string;
+    last_activity_at: string;
+    primary_model: string;
+    cost_usd: number;
+  }>;
+  models_total: number;
+  sessions_total: number;
+}
+export interface ClaudeBlockDetailBody {
+  detail_kind: 'claude_block';
+  key: string;
+  start_at: string;
+  end_at: string;
+  actual_end_at: string | null;
+  anchor: BlockAnchor;
+  is_active: boolean;
+  entries_count: number;
+  cost_usd: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cache_hit_pct: number | null;
+  models: ModelCostRow[];
+  burn_rate: BlockDetailBurnRate | null;
+  projection: BlockDetailProjection | null;
+  samples: BlockDetailSample[];
+}
+
+// Codex bodies (_build_codex_*_detail).
+export interface CodexModelBreakdown {
+  modelName?: string;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+  cost?: number;
+  isFallback?: boolean;
+}
+export interface CodexTokenTotals {
+  cost_usd: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+export interface CodexSessionDetailBody extends CodexTokenTotals {
+  detail_kind: 'codex_session';
+  key: string;
+  last_activity: string;
+  models: string[];
+  model_breakdowns: CodexModelBreakdown[];
+}
+export interface CodexProjectDetailBody extends CodexTokenTotals {
+  detail_kind: 'codex_project';
+  key: string;
+  range_start: string;
+  range_end: string;
+  first_seen: string;
+  last_seen: string;
+  session_count: number;
+  models: Array<{ model: string } & CodexTokenTotals>;
+  sessions: Array<{ label: string; last_activity: string } & CodexTokenTotals>;
+}
+export interface CodexBlockDetailBody {
+  detail_kind: 'codex_block';
+  key: string;
+  label: string;
+  observed_slot: number;
+  window_minutes: number | null;
+  resets_at: string;
+  current_percent: number | null;
+  orphaned: boolean;
+  freshness: string;
+  observations: Array<{ captured_at: string; used_percent: number; resets_at: string }>;
+  milestones: Array<{ percent: number; captured_at: string }>;
+  forecast: {
+    status: string;
+    current_percent: number | null;
+    projected_percent: number | null;
+    resets_at: string | null;
+  };
+}
+
+export type SourceDetailBody =
+  | ClaudeSessionDetailBody
+  | ClaudeProjectDetailBody
+  | ClaudeBlockDetailBody
+  | CodexSessionDetailBody
+  | CodexProjectDetailBody
+  | CodexBlockDetailBody;
+
+// The two stable error envelopes (§5.6).
+export interface SourceDetailErrorEnvelope {
+  code: 'source_capability_unavailable' | 'source_resource_not_found';
+  error: string;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -7,40 +7,32 @@ import { resolveVerdict } from '../lib/verdict';
 import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { cardRegionClick } from '../lib/cardRegion';
-import { dispatch } from '../store/store';
+import { joinCodexQuotaLabels } from '../lib/sourceRows';
+import { resolveSourceView } from '../store/sourceView';
+import { dispatch, getState, subscribeStore } from '../store/store';
+import type { AllSourceData, CodexSourceData, Envelope, SourceWarning } from '../types/envelope';
 
-// HeroStrip (#264 S1, spec §4) — the dashboard's full-width at-a-glance hero,
-// rebuilt into THREE zones that answer the two questions users actually ask —
-// "how much have I used?" and "how much have I spent?" — with two dominant
-// numbers instead of the #248 flex band's empty centre:
-//   • usage  — WEEK USAGE big % + paired 5-HOUR + reset countdown
-//   • spent  — SPENT THIS WEEK whole-$ hero + $/1% sub
-//   • support— Forecast @ reset · $/1% vs last week · Snapshot age
-// The hero opens the (rich) Current Week modal on click/Enter/Space. Mounted
-// only on the dashboard branch of App.tsx — never in the conversations view,
-// nor the loading/error branches. Freshness is de-alarmed client-side
-// (heroFreshnessLabel) so a benign 8-minute snapshot reads calm (FRESH-1).
+// HeroStrip (#264 S1, spec §4; #294 S5 §6.1) — the dashboard's full-width
+// at-a-glance hero. Source-aware: Claude keeps its subscription-week hero
+// (usage %, 5h, spent, $/1%, forecast — UNCHANGED); Codex renders provider-
+// native tiles (cost + the five token counters + native quota windows + the
+// calendar-period budget verdict — NO $/1%, NO subscription-week language);
+// All shows the combined tiles (exactly {cost_usd, total_tokens}) or an explicit
+// combined-unavailable state, with quota always side-by-side per provider.
+// Mounted only on the dashboard branch of App.tsx.
 
 export function HeroStrip() {
   const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const h = env?.header;
   const cw = env?.current_week ?? null;
   const freshness = cw?.freshness ?? null;
   const display = useDisplayTz();
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
-  // Forecast metric tint — verdict drives calm-green / amber / red (H1/§4).
   const verdict = resolveVerdict(h?.forecast_verdict ?? null);
-  // #264 S1 (FRESH-1/HERO-4) — re-derive the freshness tint from the
-  // already-shipped age_seconds with dashboard-appropriate thresholds; the
-  // server `freshness.label` is untouched (shared with TUI + refresh-usage).
   const heroLabel = heroFreshnessLabel(freshness?.age_seconds);
 
-  // #248 §6 — mobile-only sticky-collapse. Watch the hero block; once it scrolls
-  // out of the viewport, flip `heroScrolled` so the Header reveals its condensed
-  // Used%/reset readout (keeping the sticky bar one row ≤64px). Guarded for a
-  // missing IntersectionObserver (JSDOM / SSR — mirrors ConversationReader);
-  // disconnects + resets the flag on unmount / view switch (HeroStrip unmounts
-  // when leaving the dashboard view, so the readout never lingers).
+  // #248 §6 — mobile-only sticky-collapse (unchanged; source-agnostic).
   const heroRef = useRef<HTMLElement>(null);
   const isMobile = useIsMobile();
   useEffect(() => {
@@ -53,9 +45,6 @@ export function HeroStrip() {
         if (!entry) return;
         dispatch({ type: 'SET_HERO_SCROLLED', scrolled: !entry.isIntersecting });
       },
-      // Negative top rootMargin = the hero is "gone" the moment it slips behind
-      // the ≤64px sticky bar, not only when it fully clears the viewport top —
-      // so the condensed readout reveals in lockstep with the hero hiding.
       { threshold: 0, rootMargin: '-64px 0px 0px 0px' },
     );
     io.observe(el);
@@ -67,33 +56,74 @@ export function HeroStrip() {
 
   const openCurrentWeek = () => dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
 
+  // The Claude hero opens the (Claude) Current Week modal; the Codex/All heroes
+  // have no equivalent modal in S5, so the region stays a focusable summary
+  // without an activation.
+  const activate = activeSource === 'claude' ? openCurrentWeek : undefined;
+
+  let body: React.ReactNode;
+  if (activeSource === 'codex') {
+    const view = resolveSourceView(env, 'codex');
+    body = <CodexHero data={view.entry?.data as CodexSourceData | undefined} />;
+  } else if (activeSource === 'all') {
+    const view = resolveSourceView(env, 'all');
+    body = <AllHero env={env} data={view.entry?.data as AllSourceData | undefined} warnings={view.entry?.warnings} />;
+  } else {
+    body = (
+      <ClaudeHero
+        h={h}
+        cw={cw}
+        ctx={ctx}
+        verdict={verdict}
+        heroLabel={heroLabel}
+        freshness={freshness}
+      />
+    );
+  }
+
   return (
     <section
       ref={heroRef}
       className="hero-strip"
-      // House pattern (matches all grid panels): a focusable region, NOT
-      // role="button" — a button's accessible name would flatten the KPIs out
-      // of the AT browse tree, defeating the at-a-glance read for SR users. The
-      // region stays keyboard-activatable (Enter/Space) to open the modal.
       role="region"
       tabIndex={0}
       aria-label="Week usage summary"
       data-hero-strip=""
-      // #293 S4 — HeroStrip is the explicit non-card exception: it KEEPS its
-      // focusable region + activation (it is the hero summary, with no Expand
-      // alternative), but adopts the same double-fire guards so a nested control
-      // can't fire the modal twice. The click guard bails on an interactive /
-      // ignore target; the keydown guard only activates when the hero itself
-      // (not a bubbled child) is the event target.
-      onClick={cardRegionClick(openCurrentWeek)}
+      data-source={activeSource}
+      onClick={activate ? cardRegionClick(activate) : undefined}
       onKeyDown={(e) => {
+        if (!activate) return;
         if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          openCurrentWeek();
+          activate();
         }
       }}
     >
+      {body}
+    </section>
+  );
+}
+
+// ---- Claude hero (unchanged subscription-week vocabulary) -------------
+
+function ClaudeHero({
+  h,
+  cw,
+  ctx,
+  verdict,
+  heroLabel,
+  freshness,
+}: {
+  h: Envelope['header'] | undefined;
+  cw: Envelope['current_week'] | null;
+  ctx: FmtCtx;
+  verdict: ReturnType<typeof resolveVerdict>;
+  heroLabel: string;
+  freshness: NonNullable<Envelope['current_week']>['freshness'];
+}) {
+  return (
+    <>
       <div className="hero-zone hero-usage">
         <div className="hu-block">
           <div className="hu-label">
@@ -126,12 +156,6 @@ export function HeroStrip() {
             {fmt.pct0(h?.forecast_pct)}
           </span>
         </div>
-        {/* "vs last week" $/1% delta. The SVG icon is the ONLY arrow — the
-            visible value shows the magnitude; direction is conveyed by the
-            icon, its color, and the aria-label (never a duplicated text arrow)
-            so color-blind / screen-reader users get the direction without hue.
-            Logic ported verbatim from the #248 hero metric (originally the
-            retired Header IIFE, #207 B1); re-wrapped as a support row. */}
         {(() => {
           const d = h?.vs_last_week_delta;
           if (d == null) {
@@ -142,14 +166,14 @@ export function HeroStrip() {
               </div>
             );
           }
-          const flat = Math.abs(d) < 0.02;            // parity with the TUI dim band
-          const good = d < 0;                          // cheaper per 1% is better
+          const flat = Math.abs(d) < 0.02;
+          const good = d < 0;
           const icon = flat ? 'minus' : good ? 'trending-down' : 'trending-up';
           const color = flat
             ? 'var(--text-dim)'
             : good ? 'var(--accent-green)' : 'var(--accent-red)';
           const dirWord = flat ? 'flat' : good ? 'down' : 'up';
-          const mag = fmt.usd2(Math.abs(d));           // e.g. "$0.12"
+          const mag = fmt.usd2(Math.abs(d));
           const aria = flat
             ? '$/1% flat versus last week'
             : `$/1% ${dirWord} ${mag} versus last week`;
@@ -174,13 +198,126 @@ export function HeroStrip() {
               title={`Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`}
             >
               {heroLabel === 'stale' ? '⚠ ' : ''}
-              {/* #259 — humanize the raw-seconds age ("97928s ago" → "1d 3h
-                  ago") so this reads consistently with the sync chip. */}
               {humanizeAge(freshness.age_seconds)}
             </span>
           </div>
         )}
       </div>
-    </section>
+    </>
+  );
+}
+
+// ---- Codex hero (provider-native tiles, §6.1) -------------------------
+
+function CodexHero({ data }: { data: CodexSourceData | undefined }) {
+  if (data?.hero == null) {
+    return <div className="hero-zone hero-empty" data-testid="codex-hero-empty">No Codex activity yet.</div>;
+  }
+  const hero = data.hero;
+  const windows = data.quota ? joinCodexQuotaLabels(hero, data.quota) : [];
+  const budget = hero.budget;
+  return (
+    <>
+      <div className="hero-zone hero-spent" data-testid="codex-hero-spent">
+        <div className="hs-label">CODEX SPEND</div>
+        <div className="hs-big">{fmt.usd2(hero.cost_usd)}</div>
+        <div className="hs-sub">
+          <span>{fmt.tokens(hero.total_tokens)}</span> total tokens
+        </div>
+      </div>
+
+      <div className="hero-zone hero-tokens" data-testid="codex-hero-tokens">
+        <div className="hs-label">TOKENS</div>
+        <ul className="codex-token-list">
+          <li><span className="ctl-k">input</span> <span className="ctl-v">{fmt.tokens(hero.input_tokens)}</span></li>
+          <li><span className="ctl-k">cached input</span> <span className="ctl-v">{fmt.tokens(hero.cached_input_tokens)}</span></li>
+          <li><span className="ctl-k">output</span> <span className="ctl-v">{fmt.tokens(hero.output_tokens)}</span></li>
+          <li><span className="ctl-k">reasoning</span> <span className="ctl-v">{fmt.tokens(hero.reasoning_output_tokens)}</span></li>
+        </ul>
+      </div>
+
+      <div className="hero-zone hero-support" data-testid="codex-hero-support">
+        {windows.length > 0 ? (
+          windows.map((w) => (
+            <div className="sup-row" key={w.key} data-quota-window={w.key}>
+              <span className="sup-l">{w.label}</span>
+              <span className="sup-v">{fmt.pct0(w.current.current_percent)}</span>
+            </div>
+          ))
+        ) : (
+          <div className="sup-row"><span className="sup-l">Quota</span><span className="sup-v">—</span></div>
+        )}
+        {budget != null && (
+          <div className="sup-row" data-metric="codex-budget">
+            <span className="sup-l">Budget</span>
+            <span className={`sup-v is-${budget.verdict}`}>
+              {fmt.pct0(budget.consumption_pct)} of {fmt.usd0(budget.budget_usd)}
+            </span>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ---- All hero (combined tiles / combined-unavailable, §6.1) -----------
+
+function combinedUnavailableCopy(warnings: SourceWarning[] | undefined): string {
+  if (warnings != null && warnings.length > 0) return warnings[0].message;
+  return 'Combined totals are unavailable while a provider is degraded.';
+}
+
+function AllHero({
+  env,
+  data,
+  warnings,
+}: {
+  env: Envelope | null;
+  data: AllSourceData | undefined;
+  warnings: SourceWarning[] | undefined;
+}) {
+  const combined = data?.combined ?? null;
+  // Provider-native quota chips side by side (never a merged gauge): Claude 7d,
+  // Codex latest window.
+  const claudeUsed = env?.header?.used_pct ?? null;
+  const codexData = data?.providers?.codex ?? null;
+  const codexWindows = codexData?.hero && codexData?.quota
+    ? joinCodexQuotaLabels(codexData.hero, codexData.quota)
+    : [];
+  return (
+    <>
+      <div className="hero-zone hero-spent" data-testid="all-hero-combined">
+        <div className="hs-label">COMBINED SPEND</div>
+        {combined != null ? (
+          <>
+            <div className="hs-big">{fmt.usd2(combined.cost_usd)}</div>
+            <div className="hs-sub">
+              <span>{fmt.tokens(combined.total_tokens)}</span> total tokens
+            </div>
+          </>
+        ) : (
+          <div className="hs-sub combined-unavailable" data-testid="combined-unavailable">
+            {combinedUnavailableCopy(warnings)}
+          </div>
+        )}
+      </div>
+
+      <div className="hero-zone hero-support" data-testid="all-hero-quota">
+        <div className="sup-row">
+          <span className="sup-l">Claude 7d</span>
+          <span className="sup-v">{fmt.pct1(claudeUsed)}</span>
+        </div>
+        {codexWindows.length > 0 ? (
+          codexWindows.map((w) => (
+            <div className="sup-row" key={w.key} data-quota-window={w.key}>
+              <span className="sup-l">Codex {w.label}</span>
+              <span className="sup-v">{fmt.pct0(w.current.current_percent)}</span>
+            </div>
+          ))
+        ) : (
+          <div className="sup-row"><span className="sup-l">Codex quota</span><span className="sup-v">—</span></div>
+        )}
+      </div>
+    </>
   );
 }

@@ -183,6 +183,32 @@ def _store_codex_quota_projection_certificate(
         return
 
 
+def _stats_projection_signatures_match(
+    stats_conn: sqlite3.Connection,
+    active_roots: set[str],
+    cert_sigs: Mapping[str, str],
+) -> bool:
+    """True iff stats.db's projection signature matches the certificate for every root.
+
+    The cache certificate alone does not prove stats.db still holds the
+    projection: stats.db can be independently wiped/recovered while cache.db
+    persists (F1).  Require an exact ``quota_projection_state.physical_signature``
+    match for every active root before the reconcile is allowed to short-circuit.
+    A missing row, a mismatch, or any ``sqlite3.Error`` degrades to False, which
+    forces the full reconcile (fail-safe).
+    """
+    try:
+        rows = stats_conn.execute(
+            "SELECT source_root_key, physical_signature FROM quota_projection_state"
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    projection = {str(row[0]): str(row[1]) for row in rows}
+    return all(
+        projection.get(root) == cert_sigs.get(root) for root in active_roots
+    )
+
+
 def load_codex_quota_observations(
     *,
     source_root_keys: Iterable[str] | None = None,
@@ -754,22 +780,48 @@ def reconcile_codex_quota_projection(
         raise ValueError("now must be timezone-aware")
     now_iso = _utc_iso(now)
 
+    alert_eligible_roots = {str(key) for key in alert_eligible_root_keys}
+
     try:
         cache = _cache_connection()
     except (FileNotFoundError, sqlite3.Error):
         return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
     try:
-        active_roots = (
-            _cache_root_keys(cache)
-            if source_root_keys is None else {str(key) for key in source_root_keys}
-        )
-        physical_sequence = codex_physical_mutation_seq(cache)
+        # F2: read active_roots, the physical sequence, and the certificate
+        # inside ONE WAL read snapshot so a concurrent commit cannot interleave
+        # a stale sequence with a fresh certificate.
+        cache.execute("BEGIN")
+        try:
+            active_roots = (
+                _cache_root_keys(cache)
+                if source_root_keys is None else {str(key) for key in source_root_keys}
+            )
+            physical_sequence = codex_physical_mutation_seq(cache)
+            certificate = load_codex_quota_projection_certificate(cache)
+        finally:
+            cache.commit()
+        # Short-circuit: when nothing is alert-eligible and the certificate
+        # proves the cache physical state is current AND the stats-side
+        # projection still matches it (F1), the ~2.9 s observation load and the
+        # whole reconcile are provably a no-op. Any missed concurrent write
+        # leaves cur_seq != cert_seq (or a stats-signature mismatch) on the next
+        # call, so the scheme is self-healing.
+        if not alert_eligible_roots and certificate is not None:
+            cert_seq, cert_sigs = certificate
+            if physical_sequence == cert_seq and active_roots <= set(cert_sigs):
+                stats_conn = _cctally_core.open_db()
+                try:
+                    if _stats_projection_signatures_match(
+                        stats_conn, active_roots, cert_sigs
+                    ):
+                        return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+                finally:
+                    stats_conn.close()
         observations = load_codex_quota_observations(
             source_root_keys=active_roots, cache_conn=cache,
         )
     finally:
         cache.close()
-    alert_eligible_roots = {str(key) for key in alert_eligible_root_keys}
 
     # No configured roots and no existing interpreted history means there is no
     # stats work.  This preserves the existing empty-Codex sync fast path.

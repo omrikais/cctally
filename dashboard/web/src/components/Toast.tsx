@@ -4,19 +4,144 @@ import { OnboardingToast } from './OnboardingToast';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt } from '../lib/fmt';
 import {
-  alertSeverity,
-  AXIS_CHIP_LABEL,
   AXIS_TITLE_LABEL,
   budgetPeriodNoun,
   projectedContextText,
 } from '../lib/alertAxis';
+import { alertDisplay } from '../lib/alertIdentity';
+import type { AlertEntry, CodexAlertRow, ClaudeAlertSourceRow, SourceAlertRow } from '../types/envelope';
+
+// Normalize a toast payload (a legacy AlertEntry from SHOW_ALERT_TOAST /
+// INGEST_SNAPSHOT_ALERTS, or a source-qualified row from INGEST_SOURCE_ALERTS)
+// into a SourceAlertRow so the Toast renders both uniformly (§6.7).
+function normalizeToastRow(p: AlertEntry | SourceAlertRow): SourceAlertRow {
+  return 'source' in p ? p : { ...p, source: 'claude', key: p.id };
+}
 
 // Toast variant pattern (T8). The `status` shape is the legacy
 // transient message (2.5s auto-dismiss); the `alert` shape is a
 // percent-crossing alert with rich content (8s auto-dismiss +
 // click-to-dismiss). Severity color flips amber→red at threshold ≥95.
+//
+// #294 S5 §6.7 — the payload is a source-qualified row. Both Claude and Codex
+// toasts show a source chip in the head; the rich body branches by provider
+// (Claude keeps the full context/cost rendering; Codex renders its lean row).
 const STATUS_DISMISS_MS = 2500;
 const ALERT_DISMISS_MS = 8000;
+
+function ClaudeToastBody({
+  alert,
+  ctx,
+}: {
+  alert: ClaudeAlertSourceRow;
+  ctx: { tz: string; offsetLabel: string };
+}): JSX.Element {
+  return (
+    <>
+      <div className="toast--alert-title">
+        {alert.axis === 'projected' ? (
+          <>
+            {AXIS_TITLE_LABEL.projected} to reach {alert.threshold}%
+          </>
+        ) : alert.axis === 'project_budget' ? (
+          <>
+            {alert.context.project ?? 'Project'} budget {alert.threshold}% reached
+          </>
+        ) : alert.axis === 'codex_budget' ? (
+          <>
+            {AXIS_TITLE_LABEL.codex_budget} {alert.threshold}% reached
+          </>
+        ) : (
+          <>
+            {AXIS_TITLE_LABEL[alert.axis]} usage {alert.threshold}% reached
+          </>
+        )}
+      </div>
+      {alert.context.week_start_date && (
+        <div className="toast--alert-sub">
+          Week starting {fmt.weekStart(alert.context.week_start_date, ctx) ?? '—'}
+        </div>
+      )}
+      {alert.context.block_start_at && (
+        <div className="toast--alert-sub">
+          Block started {fmt.timeOnly(alert.context.block_start_at, ctx)}
+        </div>
+      )}
+      {(alert.axis === 'budget' ||
+        alert.axis === 'project_budget' ||
+        alert.axis === 'codex_budget') &&
+        (alert.context.period_start_at ?? alert.context.week_start_at) && (
+          <div className="toast--alert-sub">
+            {budgetPeriodNoun(alert.context.period)} starting{' '}
+            {fmt.weekStart(
+              (alert.context.period_start_at ?? alert.context.week_start_at ?? '').slice(0, 10),
+              ctx,
+            ) ?? '—'}
+          </div>
+        )}
+      <div className="toast--alert-body">
+        {alert.context.cumulative_cost_usd != null && (
+          <>
+            <span className="num">${alert.context.cumulative_cost_usd.toFixed(2)}</span> spent
+            {alert.context.dollars_per_percent != null && (
+              <>
+                {' '}·{' '}
+                <span className="num">${alert.context.dollars_per_percent.toFixed(2)}</span> per 1%
+              </>
+            )}
+          </>
+        )}
+        {alert.context.block_cost_usd != null && (
+          <>
+            <span className="num">${alert.context.block_cost_usd.toFixed(2)}</span> in this block
+            {alert.context.primary_model && <> · model: {alert.context.primary_model}</>}
+          </>
+        )}
+        {(alert.axis === 'budget' || alert.axis === 'codex_budget') &&
+          alert.context.spent_usd != null &&
+          alert.context.budget_usd != null && (
+            <>
+              <span className="num">${alert.context.spent_usd.toFixed(2)}</span> of{' '}
+              <span className="num">${alert.context.budget_usd.toFixed(2)}</span> budget
+            </>
+          )}
+        {alert.axis === 'projected' && (
+          <span className="num">{projectedContextText(alert) ?? '—'}</span>
+        )}
+        {alert.axis === 'project_budget' &&
+          alert.context.spent_usd != null &&
+          alert.context.budget_usd != null && (
+            <>
+              {alert.context.project && <>{alert.context.project}: </>}
+              <span className="num">${alert.context.spent_usd.toFixed(2)}</span> of{' '}
+              <span className="num">${alert.context.budget_usd.toFixed(2)}</span> budget
+            </>
+          )}
+      </div>
+    </>
+  );
+}
+
+function CodexToastBody({ row }: { row: CodexAlertRow }): JSX.Element {
+  // The lean Codex source rows (budget/projected carry `value`; quota carries
+  // `severity` only). Render an honest title from what the row carries.
+  const title =
+    row.axis === 'quota'
+      ? `Codex quota ${row.threshold}% reached`
+      : row.axis === 'projected'
+        ? `Codex projected to reach ${row.threshold}%`
+        : `Codex budget ${row.threshold}% reached`;
+  return (
+    <>
+      <div className="toast--alert-title">{title}</div>
+      {row.axis !== 'quota' && (
+        <div className="toast--alert-body">
+          <span className="num">{Math.round(row.value)}%</span> of budget
+        </div>
+      )}
+    </>
+  );
+}
 
 export function Toast() {
   const toast = useSyncExternalStore(subscribeStore, () => getState().toast);
@@ -33,6 +158,9 @@ export function Toast() {
     return () => window.clearTimeout(id);
   }, [toast]);
 
+  const alertPayload = toast?.kind === 'alert' ? normalizeToastRow(toast.payload) : null;
+  const d = alertPayload ? alertDisplay(alertPayload) : null;
+
   return (
     <>
       {/* #207 D8 — keep the onboarding toast MOUNTED (so its 8s auto-dismiss
@@ -44,160 +172,23 @@ export function Toast() {
           {toast.text}
         </div>
       )}
-      {toast?.kind === 'alert' && (
+      {alertPayload && d && (
         <div
-          className={`toast toast--alert toast--severity-${alertSeverity(toast.payload)}`}
+          className={`toast toast--alert toast--severity-${d.severity}`}
           role="alert"
           onClick={() => dispatch({ type: 'HIDE_TOAST' })}
         >
           <div className="toast--alert-head">
-            <span className={`chip chip--${toast.payload.axis}`}>
-              {AXIS_CHIP_LABEL[toast.payload.axis]}
-            </span>
-            <span className="toast--alert-threshold num">
-              {toast.payload.threshold}%
-            </span>
+            <span className={`chip ${d.chipClass}`}>{d.chipLabel}</span>
+            <span className={`source-chip source-chip--${d.source}`}>{d.sourceLabel}</span>
+            <span className="toast--alert-threshold num">{d.threshold}%</span>
             <span className="toast--alert-dismiss-hint">click to dismiss</span>
           </div>
-          <div className="toast--alert-title">
-            {toast.payload.axis === 'projected' ? (
-              <>
-                {AXIS_TITLE_LABEL.projected} to reach{' '}
-                {toast.payload.threshold}%
-              </>
-            ) : toast.payload.axis === 'project_budget' ? (
-              <>
-                {toast.payload.context.project ?? 'Project'}{' '}
-                budget {toast.payload.threshold}% reached
-              </>
-            ) : toast.payload.axis === 'codex_budget' ? (
-              // Codex budget axis (calendar-period-codex-budgets, spec §6):
-              // "Codex budget N% reached" so it reads apart from the Claude
-              // equiv-$ budget alert.
-              <>
-                {AXIS_TITLE_LABEL.codex_budget} {toast.payload.threshold}%
-                reached
-              </>
-            ) : (
-              <>
-                {AXIS_TITLE_LABEL[toast.payload.axis]} usage{' '}
-                {toast.payload.threshold}% reached
-              </>
-            )}
-          </div>
-          {toast.payload.context.week_start_date && (
-            <div className="toast--alert-sub">
-              Week starting{' '}
-              {fmt.weekStart(toast.payload.context.week_start_date, ctx) ?? '—'}
-            </div>
+          {alertPayload.source === 'claude' ? (
+            <ClaudeToastBody alert={alertPayload} ctx={ctx} />
+          ) : (
+            <CodexToastBody row={alertPayload} />
           )}
-          {toast.payload.context.block_start_at && (
-            <div className="toast--alert-sub">
-              Block started {fmt.timeOnly(toast.payload.context.block_start_at, ctx)}
-            </div>
-          )}
-          {(toast.payload.axis === 'budget' ||
-            toast.payload.axis === 'project_budget' ||
-            toast.payload.axis === 'codex_budget') &&
-            (toast.payload.context.period_start_at ??
-              toast.payload.context.week_start_at) && (
-              <div className="toast--alert-sub">
-                {/* Period generalization (calendar-period-codex-budgets,
-                    spec §6): the noun is period-aware ("Month starting" /
-                    "Calendar week starting" / "Week starting") from
-                    `context.period`; the subscription-week default keeps the
-                    legacy "Week starting …" byte-stable. The anchor is a full
-                    ISO timestamp; fmt.weekStart expects a date-only
-                    YYYY-MM-DD, so slice the prefix. */}
-                {budgetPeriodNoun(toast.payload.context.period)} starting{' '}
-                {fmt.weekStart(
-                  (
-                    toast.payload.context.period_start_at ??
-                    toast.payload.context.week_start_at ??
-                    ''
-                  ).slice(0, 10),
-                  ctx,
-                ) ?? '—'}
-              </div>
-            )}
-          <div className="toast--alert-body">
-            {toast.payload.context.cumulative_cost_usd != null && (
-              <>
-                <span className="num">
-                  ${toast.payload.context.cumulative_cost_usd.toFixed(2)}
-                </span>{' '}
-                spent
-                {toast.payload.context.dollars_per_percent != null && (
-                  <>
-                    {' '}·{' '}
-                    <span className="num">
-                      ${toast.payload.context.dollars_per_percent.toFixed(2)}
-                    </span>{' '}
-                    per 1%
-                  </>
-                )}
-              </>
-            )}
-            {toast.payload.context.block_cost_usd != null && (
-              <>
-                <span className="num">
-                  ${toast.payload.context.block_cost_usd.toFixed(2)}
-                </span>{' '}
-                in this block
-                {toast.payload.context.primary_model && (
-                  <> · model: {toast.payload.context.primary_model}</>
-                )}
-              </>
-            )}
-            {(toast.payload.axis === 'budget' ||
-              toast.payload.axis === 'codex_budget') &&
-              toast.payload.context.spent_usd != null &&
-              toast.payload.context.budget_usd != null && (
-                // Budget + Codex budget axes: "$spent of $budget budget". The
-                // Codex budget renders the actual API $ (the per-vendor
-                // amount), the Claude budget the equivalent-$ — both come from
-                // the row (snapshotted at crossing), not live config.
-                <>
-                  <span className="num">
-                    ${toast.payload.context.spent_usd.toFixed(2)}
-                  </span>{' '}
-                  of{' '}
-                  <span className="num">
-                    ${toast.payload.context.budget_usd.toFixed(2)}
-                  </span>{' '}
-                  budget
-                </>
-              )}
-            {toast.payload.axis === 'projected' && (
-              // Projected axis (issue #121): metric-aware body via the
-              // shared helper ("projected 102% of cap" / "projected $312
-              // of $300"). Read from the row, not live config (Codex P0-4).
-              <span className="num">
-                {projectedContextText(toast.payload) ?? '—'}
-              </span>
-            )}
-            {toast.payload.axis === 'project_budget' &&
-              toast.payload.context.spent_usd != null &&
-              toast.payload.context.budget_usd != null && (
-                // Per-project budget axis (issue #19/#121): "<project>: $spent
-                // of $budget". The project basename leads so the user knows
-                // WHICH project crossed; numbers come from the row (snapshotted
-                // at crossing), not live config (Codex P0-4).
-                <>
-                  {toast.payload.context.project && (
-                    <>{toast.payload.context.project}: </>
-                  )}
-                  <span className="num">
-                    ${toast.payload.context.spent_usd.toFixed(2)}
-                  </span>{' '}
-                  of{' '}
-                  <span className="num">
-                    ${toast.payload.context.budget_usd.toFixed(2)}
-                  </span>{' '}
-                  budget
-                </>
-              )}
-          </div>
         </div>
       )}
     </>

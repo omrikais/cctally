@@ -2134,6 +2134,14 @@ def _build_cache_sync_parser(subparsers, name, *, help_text, xref=None):
         help="Prune cache rows for source files removed from disk "
              "(e.g. a deleted git worktree) without a full rebuild.",
     )
+    p_cache_sync.add_argument(
+        "--prune-conversations",
+        action="store_true",
+        help="Prune conversation transcripts older than "
+             "conversation.retention_days (default 180) now, without a full "
+             "rebuild. Re-derivable from JSONL; run `cctally db vacuum` to "
+             "reclaim the freed disk space.",
+    )
     p_cache_sync.set_defaults(func=c.cmd_cache_sync)
 
 def _build_project_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
@@ -2802,6 +2810,18 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help=argparse.SUPPRESS,
     )
     db_checkpoint.set_defaults(func=c.cmd_db_checkpoint)
+    db_vacuum = db_sub.add_parser(
+        "vacuum",
+        help="Reclaim disk space after a transcript prune (VACUUM) — "
+             "exclusive, never automatic",
+    )
+    db_vacuum.add_argument(
+        "--db",
+        choices=("cache", "stats", "all"),
+        default="cache",
+        help="Which DB to VACUUM (default: cache)",
+    )
+    db_vacuum.set_defaults(func=c.cmd_db_vacuum)
 
 def _build_doctor_parser(subparsers, name, *, help_text, xref=None):
     """Build the `doctor` parser (registered via _REGISTRATION; #279 S6 W3).

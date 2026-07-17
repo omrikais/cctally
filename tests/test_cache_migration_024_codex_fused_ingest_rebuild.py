@@ -319,6 +319,35 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
         conn.close()
 
 
+def test_024_handler_invalidates_stored_quota_projection_certificate(
+    tmp_path, monkeypatch
+):
+    """F3: 024 clears Codex quota state, so a stale-valid certificate that would
+    let the reconcile short-circuit must be deleted in the same transaction."""
+    _ns, db, core = _seed_existing_cache(tmp_path, monkeypatch)
+    conn = sqlite3.connect(core.CACHE_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_quota_projection_certificate', ?)",
+            ('{"sequence":7,"signatures":{"root-a":"' + "a" * 64 + '"}}',),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='codex_quota_projection_certificate'"
+        ).fetchone()[0] == 1
+
+        _handler(db)(conn)
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='codex_quota_projection_certificate'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_024_per_migration_goldens_pin_the_existing_cache_clear():
     """The pre/post artifacts carry an actual populated Codex-only reset.
 

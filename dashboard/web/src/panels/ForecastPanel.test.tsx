@@ -9,7 +9,13 @@
 import { render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ForecastPanel } from './ForecastPanel';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import {
+  makeAllSourceEntry,
+  makeClaudeSourceEntry,
+  makeCodexSourceEntry,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 import type { Envelope, ForecastEnvelope, Verdict } from '../types/envelope';
 
 function forecast(verdict: Verdict, wkAvg = 88): ForecastEnvelope {
@@ -132,5 +138,53 @@ describe('#248 Task 5 — Forecast calm tile', () => {
     expect(container.querySelector('.warn-banner')).toBeNull();
     expect(container.querySelector('#fc-banner')).toBeNull();
     expect(container.querySelector('use[href*="warn-triangle"]')).toBeNull();
+  });
+});
+
+// #294 S5 — the source seam: ForecastPanel must not leak the legacy top-level
+// `env.forecast` (Claude forecast) under a Codex selection. Wrapped in
+// SourcePanelShell — Claude renders unchanged, Codex renders nothing, All
+// renders the Claude-labeled provider section.
+function forecastLeakEnv(): Envelope {
+  const claude = makeClaudeSourceEntry();
+  const codex = makeCodexSourceEntry();
+  const slice = makeSourceEnvelope({
+    sources: { claude, codex, all: makeAllSourceEntry(claude, codex) },
+  });
+  // A populated legacy top-level forecast (the structural leak surface).
+  return { ...env('ok', 88), ...slice } as unknown as Envelope;
+}
+
+describe('ForecastPanel source seam — no Claude leak under Codex (#294 S5)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('Codex mode renders NO forecast values and no Claude forecast tile', () => {
+    updateSnapshot(forecastLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ForecastPanel />);
+    expect(container.querySelector('[data-panel-kind="forecast"]')).toBeNull();
+    expect(container.querySelector('.fc-num')).toBeNull();
+  });
+
+  it('All mode wraps the Claude forecast tile in a Claude-labeled provider section (no Codex section)', () => {
+    updateSnapshot(forecastLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<ForecastPanel />);
+    const section = container.querySelector('.source-provider-section[data-source="claude"]');
+    expect(section).not.toBeNull();
+    expect(section!.querySelector('.source-chip')?.textContent).toBe('Claude');
+    expect(section!.querySelector('[data-panel-kind="forecast"]')).not.toBeNull();
+    expect(section!.querySelector('.fc-num')?.textContent).toContain('88%');
+    expect(container.querySelector('.source-provider-section[data-source="codex"]')).toBeNull();
+  });
+
+  it('Claude mode still renders the forecast tile through the wrap (transparent)', () => {
+    updateSnapshot(forecastLeakEnv());
+    const { container } = render(<ForecastPanel />);
+    expect(container.querySelector('[data-panel-kind="forecast"]')).not.toBeNull();
+    expect(container.querySelector('.fc-num')?.textContent).toContain('88%');
   });
 });

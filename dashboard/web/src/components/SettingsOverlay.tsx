@@ -659,9 +659,14 @@ export function SettingsOverlay() {
       </span>
     ) : null;
   const tzChanged = tzDirty;
-  const threshChanged = alertsDirty || projectedWeeklyDirty || notifierDirty;
-  const budgetChanged =
-    projectedBudgetDirty || projectAlertsDirty || codexBudgetAlertsDirty || codexProjectedDirty;
+  // #294 S5 Task 8 — three source-scoped alert groups (§6.7 Settings). The
+  // notifier is global; the Claude group owns the threshold master + projected
+  // weekly + the Claude-budget subgroup; the Codex group owns the mirrored
+  // budget.codex.* toggles.
+  const notifChanged = notifierDirty;
+  const claudeChanged =
+    alertsDirty || projectedWeeklyDirty || projectedBudgetDirty || projectAlertsDirty;
+  const codexChanged = codexBudgetAlertsDirty || codexProjectedDirty;
   const viewerChanged = cacheMarkersDirty || liveTailDirty;
   const restoreChanged = resetTableSortStaged || resetCardOrderStaged;
 
@@ -734,56 +739,32 @@ export function SettingsOverlay() {
             {tzError && <div className="modal-error">Failed: {tzError}</div>}
           </fieldset>
           {/*
-            SET-5 (#252) — two-domain Alerts grouping. The single flat Alerts
-            fieldset is split into three by REAL server-side enablement (verified
-            against `_budget_alerts_active`): the threshold master
-            (`alerts.enabled`) governs the weekly + 5h axes and the
-            projected-WEEKLY toggle only; the budget/Codex axes are gated by a
-            configured budget + their own `alerts_enabled`, INDEPENDENT of the
-            threshold master — so they get their own domain. Every control keeps
-            its exact `name`/`aria-label`/handler so existing behavior + the test
-            suite bind unchanged.
+            #294 S5 Task 8 (supersedes SET-5 #252) — three SOURCE-scoped alert
+            groups (§6.7 Settings). Regrouping is PRESENTATION-only: every control
+            keeps its exact `name`/`aria-label`/handler, so the POST /api/settings
+            body stays byte-identical and the reconcile() clobber-guard is
+            unchanged. The three groups:
+              1. Notifications (global) — the notifier backend applies to ALL
+                 dispatches across both vendors, so it lives on its own.
+              2. Claude alerts — the threshold master (`alerts.enabled`) governing
+                 the weekly + 5h axes and projected-weekly, plus a labeled
+                 Claude-budget subgroup (`budget.projected_enabled` +
+                 `budget.project_alerts_enabled`). The budget toggles are gated by
+                 a configured budget, INDEPENDENT of the master (they stay operable
+                 when the master is off).
+              3. Codex alerts — the mirrored `budget.codex.*` toggles, gated on
+                 `codex_budget_configured`, plus a CLI pointer that Codex
+                 quota-rule configuration is not client-writable.
           */}
-          <fieldset className={`settings-fs${threshChanged ? ' is-changed' : ''}`}>
-            <legend>Threshold alerts{changedMark(threshChanged)}</legend>
-            <label>
-              <input
-                type="checkbox"
-                name="alerts-enabled"
-                checked={alertsEnabled}
-                onChange={(e) => setAlertsEnabled(e.target.checked)}
-              />{' '}
-              Enable threshold alerts
-            </label>
+          <fieldset className={`settings-fs${notifChanged ? ' is-changed' : ''}`}>
+            <legend>Notifications{changedMark(notifChanged)}</legend>
             {/*
-              Spec §8.1 — read-only summary of the active threshold lists.
-              Sourced from
-              `state.alertsConfig.{weekly,five_hour,budget}_thresholds`,
-              which the SSE handler keeps mirrored from the envelope each
-              tick (INGEST_SNAPSHOT_ALERTS reducer). v1 has no editor; the
-              user mutates these via `cctally config set
-              alerts.weekly_thresholds …` (and `budget.alert_thresholds`
-              for the budget axis) and the new values flow back through
-              this line on the next snapshot. Budget is its OWN config
-              block (issue #19), so its thresholds come from
-              `alertsConfig.budget_thresholds`, not the alerts block.
-            */}
-            <p className="alerts-summary settings-hint">
-              Weekly: {alertsConfig.weekly_thresholds.map((t) => `${t}%`).join(', ')}
-              {' · '}
-              5h-block: {alertsConfig.five_hour_thresholds.map((t) => `${t}%`).join(', ')}
-              {' · '}
-              Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
-            </p>
-            {/*
-              Notifier backend selector (Phase B). Seeded from the
-              SSE-mirrored `alerts_settings.notifier`. The "Custom command"
-              option is disabled unless the server reports a configured
-              `command_template` (`command_configured`) — the raw template is
-              never sent to the client, so the dashboard can only SELECT the
-              command notifier, not author it. The hint line surfaces that
-              the template is edited via the CLI. The notifier applies to ALL
-              dispatches (threshold + budget), so it lives with the master.
+              Notifier backend selector (Phase B). Seeded from the SSE-mirrored
+              `alerts_settings.notifier`. The "Custom command" option is disabled
+              unless the server reports a configured `command_template`
+              (`command_configured`) — the raw template is never sent to the
+              client, so the dashboard can only SELECT the command notifier, not
+              author it. Global: dispatch is shared across Claude + Codex.
             */}
             <label className="settings-row">
               Notifier{' '}
@@ -807,12 +788,38 @@ export function SettingsOverlay() {
                 Custom command configured (edit via CLI).
               </p>
             )}
+            <p className="settings-hint">
+              The notifier backend applies to all alert dispatches (Claude and Codex).
+            </p>
+          </fieldset>
+          <fieldset className={`settings-fs${claudeChanged ? ' is-changed' : ''}`}>
+            <legend>Claude alerts{changedMark(claudeChanged)}</legend>
+            <label>
+              <input
+                type="checkbox"
+                name="alerts-enabled"
+                checked={alertsEnabled}
+                onChange={(e) => setAlertsEnabled(e.target.checked)}
+              />{' '}
+              Enable threshold alerts
+            </label>
             {/*
-              Projected weekly-% pace alerts (issue #121). Nested under the
-              master via `.settings-subgroup` to convey subordination
-              (`alerts.projected_enabled`). Kept ENABLED even when the master is
-              off — the "pre-configure before flipping on" philosophy; nesting
-              alone conveys the relationship.
+              Spec §8.1 — read-only summary of the active threshold lists.
+              Sourced from `state.alertsConfig.{weekly,five_hour,budget}_thresholds`,
+              mirrored from the envelope each tick. v1 has no editor; the user
+              mutates these via `cctally config set alerts.weekly_thresholds …`.
+            */}
+            <p className="alerts-summary settings-hint">
+              Weekly: {alertsConfig.weekly_thresholds.map((t) => `${t}%`).join(', ')}
+              {' · '}
+              5h-block: {alertsConfig.five_hour_thresholds.map((t) => `${t}%`).join(', ')}
+              {' · '}
+              Budget: {(alertsConfig.budget_thresholds ?? []).map((t) => `${t}%`).join(', ') || '—'}
+            </p>
+            {/*
+              Projected weekly-% pace alerts (issue #121) — `alerts.projected_enabled`.
+              Kept ENABLED even when the master is off ("pre-configure before
+              flipping on"); nesting alone conveys the relationship.
             */}
             <div className="settings-subgroup">
               <label>
@@ -825,20 +832,19 @@ export function SettingsOverlay() {
                 Projected weekly-% pace alerts
               </label>
             </div>
-          </fieldset>
-          {/*
-            BUDGET ALERTS — its own domain (gated by a configured budget, not
-            the threshold master). The two Claude budget toggles stay always-
-            enabled (no reliable "Claude budget configured" client flag exists);
-            the two Codex toggles gate on `codex_budget_configured`.
-          */}
-          <fieldset className={`settings-fs${budgetChanged ? ' is-changed' : ''}`}>
-            <legend>Budget alerts{changedMark(budgetChanged)}</legend>
-            <p className="settings-hint">
-              Fire when a configured budget&apos;s pace or spend crosses a
-              threshold. Set budgets via the CLI (<code>cctally budget set …</code>).
-            </p>
-            <div className="settings-subgroup">
+            {/*
+              Labeled Claude-budget subgroup: `budget.projected_enabled` +
+              `budget.project_alerts_enabled` (their own `budget` config block,
+              gated by a configured budget, INDEPENDENT of the threshold master).
+              Per-project budget AMOUNTS stay CLI-only; the dashboard only toggles
+              the axis on/off.
+            */}
+            <div className="settings-subgroup" role="group" aria-label="Claude budget alerts">
+              <p className="settings-subgroup-label">Claude budget</p>
+              <p className="settings-hint">
+                Fire when a configured budget&apos;s pace or spend crosses a
+                threshold. Set budgets via the CLI (<code>cctally budget set …</code>).
+              </p>
               <label>
                 <input
                   type="checkbox"
@@ -848,14 +854,6 @@ export function SettingsOverlay() {
                 />{' '}
                 Projected budget-$ pace alerts
               </label>
-              {/*
-                Per-project budget alerts (issue #19/#121). A single opt-in,
-                default OFF, routing to `budget.project_alerts_enabled` (its own
-                config block). Gates push alerts only — the per-project display
-                section in `cctally budget` always renders configured projects.
-                Per-project budget AMOUNTS stay CLI-only (cwd-resolved); the
-                dashboard only toggles the axis on/off.
-              */}
               <label>
                 <input
                   type="checkbox"
@@ -865,17 +863,20 @@ export function SettingsOverlay() {
                 />{' '}
                 Per-project budget alerts
               </label>
-              {/*
-                Codex budget toggles (#134). Two dashboard-writable sub-leaves of
-                the nested `budget.codex` block: `alerts_enabled` (actual-spend)
-                and `projected_enabled` (projected-pace). Both DISABLED, and an
-                empty-state hint shown, when no Codex budget exists
-                (`codex_budget_configured`, Q2) — amounts stay CLI-only, and the
-                disable structurally prevents the server's null-codex 400. The
-                two toggles are independent in the UI; server-side, Codex
-                projected requires alerts_enabled to fire (mirrors Claude), noted
-                in budget.md rather than enforced as a cross-toggle dependency.
-              */}
+            </div>
+          </fieldset>
+          {/*
+            CODEX ALERTS — the mirrored `budget.codex.*` toggles (`alerts_enabled`
+            + `projected_enabled`), both DISABLED with a CLI hint when no Codex
+            budget exists (`codex_budget_configured`, Q2) — amounts stay CLI-only,
+            and the disable structurally prevents the server's null-codex 400. The
+            Codex quota-threshold alert rules are NOT client-writable (§6.7); the
+            UI says so with a CLI pointer rather than presenting dead controls.
+          */}
+          <fieldset className={`settings-fs${codexChanged ? ' is-changed' : ''}`}>
+            <legend>Codex alerts{changedMark(codexChanged)}</legend>
+            <div className="settings-subgroup" role="group" aria-label="Codex budget alerts">
+              <p className="settings-subgroup-label">Codex budget</p>
               <label>
                 <input
                   type="checkbox"
@@ -903,6 +904,10 @@ export function SettingsOverlay() {
                 </p>
               )}
             </div>
+            <p className="settings-hint">
+              Codex quota-threshold alert rules are not configurable here — manage
+              them via the CLI (<code>cctally codex quota …</code>).
+            </p>
           </fieldset>
           {/*
             TEST — the lone instant action. Fires a synthetic alert through the

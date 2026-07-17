@@ -1068,6 +1068,86 @@ def _load_recorded_five_hour_windows(*args, **kwargs):
     return sys.modules["cctally"]._load_recorded_five_hour_windows(*args, **kwargs)
 
 
+def _next_deadline(t0: float, interval: float, work: float) -> float:
+    """Monotonic deadline for the next sync iteration (#313 P2 / F10).
+
+    The iteration's work ended at ``t0 + work``; cool down from there for
+    ``max(interval, work)``. So the period is ``work + max(interval, work)``:
+
+    - work >= interval  → period = ``2 * work``  → CPU duty capped at 50% of one
+      core, scale-independent (a slow rebuild on a huge cache can never peg a
+      full core — the exact #313 symptom).
+    - work <  interval  → period = ``work + interval`` — byte-identical to the
+      prior loop (rebuild then a fixed ``interval`` sleep), so normal-cadence
+      behavior and its goldens are unchanged.
+
+    NOTE (spec deviation): the spec §3 pseudocode's ``deadline = t0 + max(
+    interval, work)`` cools down from ``t0`` (before the work), which for
+    work >= interval yields a ZERO cooldown (period = work, 100% duty) — it does
+    not meet the spec's own stated "period = 2*work / duty <= 50%" property or
+    §1's "<= 50% of one core" success criterion, and would leave the peg unfixed
+    (in fact worse than the old work+interval cadence). This formula cools down
+    from the work's END, which is what those properties require.
+    """
+    return (t0 + work) + max(interval, work)
+
+
+def _dashboard_sync_loop(
+    *,
+    stop,
+    interval: float,
+    run_iteration,
+    take_sync_request,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> None:
+    """Run the dashboard's automatic sync loop with a work-proportional cooldown.
+
+    ``run_iteration`` performs one whole automatic iteration (rebuild plus any
+    orphan self-heal / retention maintenance the thread does), so its measured
+    duration — not just the rebuild — drives the deadline (F10). The manual
+    ``POST /api/sync`` refresh is a separate synchronous path under ``sync_lock``
+    and is unaffected; ``take_sync_request`` is the TUI force-refresh flag that
+    breaks the cooldown early.
+    """
+    while not stop.is_set():
+        t0 = monotonic()
+        run_iteration()
+        work = monotonic() - t0
+        deadline = _next_deadline(t0, interval, work)
+        while not stop.is_set() and monotonic() < deadline:
+            if take_sync_request():
+                break
+            sleep(min(0.1, max(0.0, deadline - monotonic())))
+
+
+def _dashboard_maybe_prune_retention() -> None:
+    """#313 P3 (F7): throttled transcript retention prune driven from the
+    dashboard sync thread. Runs once per iteration INSIDE the measured cooldown
+    work (Task 6), so its cost paces the deadline. Opens a dedicated cache
+    connection (no provider flock, no open transaction) for the orchestrator.
+    No-op when retention is disabled; never raises (a prune failure must not
+    crash the sync thread)."""
+    try:
+        c = sys.modules["cctally"]
+        from _cctally_config import resolve_retention_days
+        import _lib_conversation_retention as retention
+        retention_days = resolve_retention_days(c.load_config())
+        if retention_days <= 0:
+            return
+        conn = c.open_cache_db()
+        try:
+            retention._maybe_prune_conversation_retention(
+                conn,
+                now_utc=dt.datetime.now(dt.timezone.utc),
+                retention_days=retention_days,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 def _make_run_sync_now(*args, **kwargs):
     return sys.modules["cctally"]._make_run_sync_now(*args, **kwargs)
 
@@ -6623,23 +6703,38 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     class _DashboardSyncThread(_c_for_subclass._TuiSyncThread):
         def _run(self) -> None:
-            last_heal = _time.monotonic()
-            while not self._stop.is_set():
+            last_heal = [_time.monotonic()]
+
+            def run_iteration() -> None:
                 _run_sync_now(skip_sync=self._skip_sync)
                 # Self-heal removed-worktree orphans on a ~60s cadence (far
                 # rarer than the sync tick — a deleted worktree is not urgent).
                 # Non-blocking on the flock, so a contended tick just retries
-                # next cadence; gated off under --no-sync.
+                # next cadence; gated off under --no-sync. Runs INSIDE the
+                # measured iteration so its cost counts toward the cooldown
+                # deadline (#313 P2 / F10).
                 if (not self._skip_sync
-                        and _time.monotonic() - last_heal >= 60.0):
-                    last_heal = _time.monotonic()
+                        and _time.monotonic() - last_heal[0] >= 60.0):
+                    last_heal[0] = _time.monotonic()
                     _dashboard_self_heal_orphans(skip_sync=self._skip_sync)
-                for _ in range(int(max(1, self._interval * 10))):
-                    if self._stop.is_set():
-                        return
-                    if self._ref.take_sync_request():
-                        break
-                    _time.sleep(0.1)
+                # #313 P3 (F7): throttled transcript retention prune, inside the
+                # measured iteration so its cost is in the cooldown work. Gated
+                # off under --no-sync (frozen mode makes no cache writes).
+                if not self._skip_sync:
+                    _dashboard_maybe_prune_retention()
+
+            # Work-proportional cooldown (F10): sleep to t0 + max(interval, work)
+            # so a slow rebuild cannot peg a full core. The manual POST /api/sync
+            # refresh runs synchronously under sync_lock, independent of this
+            # cooldown, so a user force-refresh is always immediate.
+            _dashboard_sync_loop(
+                stop=self._stop,
+                interval=self._interval,
+                run_iteration=run_iteration,
+                take_sync_request=self._ref.take_sync_request,
+                monotonic=_time.monotonic,
+                sleep=_time.sleep,
+            )
 
     sync_thread = (
         None if args.no_sync

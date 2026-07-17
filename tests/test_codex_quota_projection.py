@@ -74,6 +74,29 @@ def _seed_quota(
                 for captured_at, offset, used_percent in observations
             ],
         )
+        # Every real Codex ingest that writes quota_window_snapshots bumps the
+        # physical mutation sequence in the same commit (_write_codex_file_batch);
+        # mirror that here so the reconcile short-circuit (#313) sees a faithful
+        # physical-state change rather than an out-of-band row insert.
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_physical_mutation_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _bump_physical_seq(ns):
+    """Simulate a real committed Codex prune advancing the physical sequence."""
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_physical_mutation_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -175,6 +198,9 @@ def test_codex_sync_reconciles_only_after_releasing_its_cache_lock(
     tmp_path, monkeypatch
 ):
     ns, quota = _load(tmp_path, monkeypatch)
+    # Stage a real ingest so the sync advances the physical mutation sequence;
+    # the F4 trigger gate only reconciles when the sequence changed (#313).
+    _stage_real_s1_codex_root(tmp_path, monkeypatch)
     observed: list[bool] = []
 
     def reconcile_after_unlock():
@@ -192,6 +218,166 @@ def test_codex_sync_reconciles_only_after_releasing_its_cache_lock(
 
     assert result.lock_contended is False
     assert observed == [True]
+
+
+def test_back_to_back_codex_sync_second_run_is_a_noop(tmp_path, monkeypatch):
+    """Integration (#313 P1): first sync reconciles fully; the second, with no
+    fresh codex data, neither loads observations nor mutates the projection."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    _stage_real_s1_codex_root(tmp_path, monkeypatch)
+
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+    projection_after_first = [
+        tuple(r) for r in _projection_rows(ns, "quota_projection_state")
+    ]
+    assert projection_after_first, "first sync must materialize the projection"
+
+    loader_calls = _spy_loader(quota, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+    projection_after_second = [
+        tuple(r) for r in _projection_rows(ns, "quota_projection_state")
+    ]
+
+    assert result.rows_changed == 0
+    assert loader_calls == [], "second (unchanged) sync must not load observations"
+    assert projection_after_second == projection_after_first, (
+        "second sync must leave the stats projection byte-identical"
+    )
+
+
+def test_noop_codex_sync_does_not_reconcile(tmp_path, monkeypatch):
+    """F4: a pure no-op sync (sequence unchanged) must skip even the O(1) call."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
+    calls: list[int] = []
+    monkeypatch.setattr(
+        quota, "reconcile_codex_quota_projection", lambda *a, **k: calls.append(1)
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+
+    assert result.lock_contended is False
+    assert calls == [], "a pure no-op codex sync must not run the reconcile"
+
+
+def test_quota_only_codex_delta_triggers_reconcile(tmp_path, monkeypatch):
+    """F4: a quota-only batch has rows_changed==0 yet advances the sequence, so
+    gating on rows_changed would wrongly skip it — the seq-advanced gate fires."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    # Build a rollout whose token_count event carries rate_limits but NO
+    # last_token_usage: a quota row + events, ZERO accounting rows.
+    lines = [
+        l.strip() for l in CODEX_S1_FIXTURE.with_name("modern-partial-quota.jsonl")
+        .read_text().splitlines() if l.strip()
+    ]
+    import json as _json
+    session_meta = lines[0]
+    token_count = _json.loads(lines[1])
+    del token_count["payload"]["info"]["last_token_usage"]
+    provider_root = tmp_path / "quota-only-home"
+    rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout-quota.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(session_meta + "\n" + _json.dumps(token_count) + "\n")
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        quota, "reconcile_codex_quota_projection", lambda *a, **k: calls.append(1)
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](cache)
+        codex_quota = cache.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots WHERE source='codex'"
+        ).fetchone()[0]
+        accounting = cache.execute(
+            "SELECT COUNT(*) FROM codex_session_entries"
+        ).fetchone()[0]
+    finally:
+        cache.close()
+
+    assert result.rows_changed == 0, "quota-only batch must not add accounting rows"
+    assert codex_quota >= 1, "quota-only batch must persist a quota observation"
+    assert accounting == 0
+    assert calls == [1], "quota-only delta (seq advanced) must trigger the reconcile"
+
+
+def test_noop_codex_sync_reconciles_when_stats_projection_wiped(tmp_path, monkeypatch):
+    """#313 P1 review (F4/F1): sync_codex_cache's reconcile-trigger gate must
+    skip iff reconcile itself would short-circuit. reconcile's short-circuit
+    additionally requires the STATS-side quota_projection_state to still match
+    the cache certificate (F1). So the gate must ALSO verify the stats-side
+    signatures — otherwise, when the cache certificate is intact at the current
+    sequence but stats.db's projection was wiped/recovered (this user has a
+    documented stats.db corruption history) and no Codex physical change
+    occurred, the gate would set project_after_unlock=False and never repair the
+    wiped projection, leaving the dashboard's Codex source 'unavailable'.
+
+    A pure no-op sync must therefore STILL fire the reconcile when the stats
+    projection is gone even though the cache cert alone looks current."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    _stage_real_s1_codex_root(tmp_path, monkeypatch)
+
+    # First sync with the REAL reconcile: stamps the cache certificate AND the
+    # stats-side quota_projection_state.
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+    assert _projection_rows(ns, "quota_projection_state"), (
+        "first sync must materialize the stats projection"
+    )
+
+    # Baseline (guards against over-firing): a second no-op sync with the cache
+    # cert current AND the stats projection matching must NOT reconcile.
+    calls: list[int] = []
+    monkeypatch.setattr(
+        quota, "reconcile_codex_quota_projection", lambda *a, **k: calls.append(1)
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+    assert calls == [], (
+        "a no-op sync with a current cache cert AND matching stats projection "
+        "must skip the reconcile"
+    )
+
+    # Wipe ONLY the stats-side projection; the cache certificate stays intact at
+    # the current sequence and no Codex physical change occurs.
+    stats = ns["open_db"]()
+    try:
+        stats.execute("DELETE FROM quota_projection_state")
+        stats.commit()
+    finally:
+        stats.close()
+
+    # Third no-op sync: cache cert still current, but the stats projection is
+    # gone → the gate must fire the reconcile so the wiped projection self-heals.
+    calls.clear()
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+    assert calls == [1], (
+        "a wiped stats projection (cache cert intact, no physical change) must "
+        "force the reconcile from a no-op sync — the gate's skip-condition must "
+        "match reconcile's own short-circuit-condition (F1)"
+    )
 
 
 def test_reconciliation_rolls_back_before_stats_commit_then_heals_orphans_and_reappearance(
@@ -216,6 +402,7 @@ def test_reconciliation_rolls_back_before_stats_commit_then_heals_orphans_and_re
         cache.commit()
     finally:
         cache.close()
+    _bump_physical_seq(ns)  # a real committed prune advances the sequence (#313)
 
     with pytest.raises(RuntimeError, match="before commit"):
         quota.reconcile_codex_quota_projection(
@@ -280,6 +467,7 @@ def test_terminal_threshold_rows_survive_rebuild_and_after_commit_interruption(
         cache.commit()
     finally:
         cache.close()
+    _bump_physical_seq(ns)  # a real committed prune advances the sequence (#313)
 
     with pytest.raises(RuntimeError, match="after commit"):
         quota.reconcile_codex_quota_projection(
@@ -414,6 +602,253 @@ def test_real_s1_rebuild_recovery_preserves_generation_and_terminal_claims(
         assert final_events[0]["orphaned_at"] is None
     finally:
         cache.close()
+
+
+def _seed_projection_state(ns, rows: list[tuple[str, str]]):
+    """Seed quota_projection_state (source_root_key, physical_signature)."""
+    conn = ns["open_db"]()
+    try:
+        conn.executemany(
+            """INSERT INTO quota_projection_state
+               (source_root_key, generation, physical_signature, completed_at_utc)
+               VALUES (?, 'gen-x', ?, ?)
+               ON CONFLICT(source_root_key) DO UPDATE SET
+                 physical_signature=excluded.physical_signature""",
+            [(root, sig, _iso(12)) for root, sig in rows],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _store_certificate(ns, sequence: int, signatures: dict[str, str]):
+    conn = ns["open_cache_db"]()
+    try:
+        import json as _json
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_quota_projection_certificate', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_json.dumps({"sequence": sequence, "signatures": signatures}),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _certificate_present(ns) -> bool:
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='codex_quota_projection_certificate'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def _spy_loader(quota, monkeypatch):
+    calls: list[int] = []
+    orig = quota.load_codex_quota_observations
+
+    def spy(*a, **k):
+        calls.append(1)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(quota, "load_codex_quota_observations", spy)
+    return calls
+
+
+def _establish_valid_certificate(ns, quota, now):
+    """Run a full reconcile so the certificate + stats projection are current."""
+    _seed_quota(
+        ns,
+        root_key="root-a",
+        source_path="/codex/root-a/rollout.jsonl",
+        observations=[(_iso(10), 10, 10.0), (_iso(11), 20, 12.0)],
+    )
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+
+
+def test_reconcile_short_circuits_when_physically_unchanged(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+
+    calls = _spy_loader(quota, monkeypatch)
+    result = quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a"}, now=now
+    )
+    assert calls == [], "observation loader must NOT run on the short-circuit path"
+    assert result == quota.QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+
+
+def test_reconcile_short_circuit_is_a_pure_no_op(tmp_path, monkeypatch):
+    """F: a short-circuited call must leave stats.db byte-identical."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+
+    before = {
+        table: _projection_rows(ns, table)
+        for table in (
+            "quota_window_blocks",
+            "quota_percent_milestones",
+            "quota_projection_state",
+        )
+    }
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+    after = {
+        table: _projection_rows(ns, table)
+        for table in (
+            "quota_window_blocks",
+            "quota_percent_milestones",
+            "quota_projection_state",
+        )
+    }
+    for table in before:
+        assert [tuple(r) for r in before[table]] == [tuple(r) for r in after[table]], (
+            f"short-circuit mutated {table}"
+        )
+
+
+def test_reconcile_runs_full_when_certificate_absent(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+    # Wipe the certificate; the reconcile can no longer prove currency.
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    calls = _spy_loader(quota, monkeypatch)
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+    assert calls != [], "absent certificate must force a full reconcile"
+
+
+def test_reconcile_runs_full_when_sequence_advanced(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    cache_mod = importlib.import_module("_cctally_cache")
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+    # Advance the physical sequence past the stamped certificate sequence.
+    conn = ns["open_cache_db"]()
+    try:
+        cache_mod._bump_codex_physical_mutation_seq(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    calls = _spy_loader(quota, monkeypatch)
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+    assert calls != [], "advanced sequence must force a full reconcile"
+
+
+def test_reconcile_runs_full_when_stats_projection_wiped(tmp_path, monkeypatch):
+    """F1: a valid cache certificate does NOT prove stats.db still holds the
+    projection; a wiped/recovered stats.db must force a full reconcile."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+    # Cache certificate intact, but stats.db projection wiped.
+    stats = ns["open_db"]()
+    try:
+        stats.execute("DELETE FROM quota_projection_state")
+        stats.commit()
+    finally:
+        stats.close()
+
+    calls = _spy_loader(quota, monkeypatch)
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+    assert calls != [], "wiped stats projection must force a full reconcile (F1)"
+
+
+def test_reconcile_runs_full_when_alert_eligible_non_empty(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+
+    calls = _spy_loader(quota, monkeypatch)
+    quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a"},
+        alert_eligible_root_keys={"root-a"},
+        now=now,
+    )
+    assert calls != [], "alert-eligible roots must keep the full time-based path"
+
+
+def test_clear_codex_derived_rows_invalidates_certificate(tmp_path, monkeypatch):
+    """F3: the rebuild clear helper must not leave a stale-valid certificate."""
+    ns, _quota = _load(tmp_path, monkeypatch)
+    cache = importlib.import_module("_cctally_cache")
+    _store_certificate(ns, 3, {"root-a": "a" * 64})
+    assert _certificate_present(ns) is True
+    conn = ns["open_cache_db"]()
+    try:
+        cache._clear_codex_derived_rows(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    assert _certificate_present(ns) is False
+
+
+def test_stats_projection_signatures_match_all_roots(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    sig_a = "a" * 64
+    sig_b = "b" * 64
+    _seed_projection_state(ns, [("root-a", sig_a), ("root-b", sig_b)])
+    stats = ns["open_db"]()
+    try:
+        assert quota._stats_projection_signatures_match(
+            stats, {"root-a", "root-b"}, {"root-a": sig_a, "root-b": sig_b}
+        ) is True
+    finally:
+        stats.close()
+
+
+def test_stats_projection_signatures_missing_root_is_false(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    sig_a = "a" * 64
+    sig_b = "b" * 64
+    _seed_projection_state(ns, [("root-a", sig_a)])
+    stats = ns["open_db"]()
+    try:
+        assert quota._stats_projection_signatures_match(
+            stats, {"root-a", "root-b"}, {"root-a": sig_a, "root-b": sig_b}
+        ) is False
+    finally:
+        stats.close()
+
+
+def test_stats_projection_signatures_mismatch_is_false(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    sig_a = "a" * 64
+    _seed_projection_state(ns, [("root-a", "c" * 64)])
+    stats = ns["open_db"]()
+    try:
+        assert quota._stats_projection_signatures_match(
+            stats, {"root-a"}, {"root-a": sig_a}
+        ) is False
+    finally:
+        stats.close()
+
+
+def test_stats_projection_signatures_wiped_stats_is_false(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    # Empty quota_projection_state (simulates a wiped/recovered stats.db) with
+    # a non-empty active-root set must fail the coherence check.
+    stats = ns["open_db"]()
+    try:
+        assert quota._stats_projection_signatures_match(
+            stats, {"root-a"}, {"root-a": "a" * 64}
+        ) is False
+    finally:
+        stats.close()
 
 
 def test_breakdown_correlates_root_qualified_physical_tuples_and_reprices_at_read_time(

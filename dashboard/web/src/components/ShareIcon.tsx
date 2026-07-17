@@ -20,8 +20,9 @@
 //   - `dataTestId` (optional) — sets `data-testid=<dataTestId>` on the
 //     button so tests nested inside an enclosing `<section onClick>`
 //     can target the share button directly without a wrapper element.
-import type { MouseEvent } from 'react';
-import type { SharePanelId } from '../share/types';
+import { useSyncExternalStore, type MouseEvent } from 'react';
+import { getState, subscribeStore } from '../store/store';
+import { isSharePanelAllowed, type SharePanelId } from '../share/types';
 
 interface Props {
   panel: SharePanelId;
@@ -32,6 +33,17 @@ interface Props {
 }
 
 export function ShareIcon({ panel, panelLabel, onClick, triggerId, dataTestId }: Props) {
+  // #294 S5 §7 — the per-source share matrix gates the affordance itself, not
+  // just the keyboard `S` binding. A (source, panel) pair absent from
+  // SHARE_PANEL_MATRIX (e.g. forecast/trend under `all`/`codex`) renders NO
+  // share button at all — not merely an inert one — so a disallowed flow can
+  // never reach the server (whose capability error is only a backstop). This is
+  // the SINGLE chokepoint for every panel/modal ShareIcon callsite, mirroring
+  // the gate in keyboardShare.ts. Reads active source the component-layer way
+  // (like HeroStrip) rather than importing the panels/ hook.
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  if (!isSharePanelAllowed(activeSource, panel)) return null;
+
   // Stop the click from bubbling to the enclosing panel/modal section.
   // Most panels treat any in-section click as "open the panel modal,"
   // so without this guard the share button would also fire the panel

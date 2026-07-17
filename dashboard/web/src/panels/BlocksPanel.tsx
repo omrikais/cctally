@@ -9,6 +9,7 @@ import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openActiveOrNewestBlockModal } from '../store/actions';
 import { openShareModal } from '../store/shareSlice';
+import { SourcePanelShell, CodexBlocksList } from './sourcePanel';
 import type { BlocksPanelRow } from '../types/envelope';
 
 function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number; isFirstMount: boolean }) {
@@ -64,7 +65,22 @@ function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number;
   );
 }
 
+// #294 S5 — source-aware wrapper. Claude = legacy 5h blocks (unchanged, reading
+// data.quota.blocks); Codex = native quota-window blocks under their own labels;
+// All = provider sections.
 export function BlocksPanel() {
+  return (
+    <SourcePanelShell
+      panel="blocks"
+      panelKind="blocks"
+      claude={<ClaudeBlocksPanel />}
+      codex={(d) => <CodexBlocksList data={d} />}
+      emptyLabel="No Codex quota windows yet."
+    />
+  );
+}
+
+function ClaudeBlocksPanel() {
   const env = useSnapshot();
   const collapsed = useSyncExternalStore(
     subscribeStore,

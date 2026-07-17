@@ -13,6 +13,7 @@ import { useReducedMotion } from '../hooks/useReducedMotion';
 import { BoardModeContext } from '../lib/boardModeContext';
 import { summarize } from '../lib/summaryWindow';
 import { cardRegionClick } from '../lib/cardRegion';
+import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
 import type { PeriodRow } from '../types/envelope';
 
 // #264 S2 / #265 — the Monthly summary TILE (restored from the S8 collapse).
@@ -57,7 +58,21 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
   );
 }
 
+// #294 S5 — source-aware wrapper. Claude = calendar-month tile (unchanged);
+// Codex = native calendar-month period table; All = provider sections.
 export function MonthlyPanel() {
+  return (
+    <SourcePanelShell
+      panel="monthly"
+      panelKind="monthly"
+      claude={<ClaudeMonthlyPanel />}
+      codex={(d) => <CodexPeriodTable data={d} label="Monthly" />}
+      emptyLabel="No Codex monthly activity yet."
+    />
+  );
+}
+
+function ClaudeMonthlyPanel() {
   const env = useSnapshot();
   const allRows = env?.monthly?.rows ?? [];
   const mode = useContext(BoardModeContext);

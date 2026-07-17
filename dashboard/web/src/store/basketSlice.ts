@@ -21,6 +21,7 @@
 // BASKET_CLEAR_REJECTED so the toast surface doesn't double-fire on
 // the next mutation.
 import type { SharePanelId, ShareOptions } from '../share/types';
+import type { DashboardSelection } from '../types/envelope';
 
 export interface BasketItem {
   id: string;
@@ -31,6 +32,11 @@ export interface BasketItem {
   data_digest_at_add: string;
   kernel_version: number;
   label_hint: string;
+  // #294 S5 §7 — the source the item was captured under (always-visible chip;
+  // carried into the compose request per section). Additive: legacy stored
+  // items without a `source` load as 'claude' on read WITHOUT rewriting storage
+  // (the field is non-destructive).
+  source: DashboardSelection;
 }
 
 export interface BasketSlice {
@@ -99,7 +105,7 @@ export function basketReducer(state: BasketSlice, action: BasketAction): BasketS
 // here means the master store (which calls makeBasketItem from
 // ActionBar's "+ Basket" handler) and any future tests share the same
 // shape contract.
-export function makeBasketItem(args: Omit<BasketItem, 'id'> & { id?: string }): BasketItem {
+export function makeBasketItem(args: Omit<BasketItem, 'id' | 'source'> & { id?: string; source?: DashboardSelection }): BasketItem {
   return {
     id: args.id ?? cryptoRandomItemId(),
     panel: args.panel,
@@ -109,6 +115,8 @@ export function makeBasketItem(args: Omit<BasketItem, 'id'> & { id?: string }): 
     data_digest_at_add: args.data_digest_at_add,
     kernel_version: args.kernel_version,
     label_hint: args.label_hint,
+    // Additive: default to 'claude' when a caller omits it (legacy call sites).
+    source: args.source ?? 'claude',
   };
 }
 
@@ -123,7 +131,13 @@ export function loadBasketFromStorage(): BasketItem[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isBasketItemShape);
+    // #294 S5 §7 — default a legacy item's missing `source` to 'claude' on READ
+    // only. This is a pure load — it never writes back, so the stored bytes stay
+    // byte-for-byte unchanged (matching the server's Claude resolution).
+    return parsed.filter(isBasketItemShape).map((it) => ({
+      ...it,
+      source: (it as { source?: DashboardSelection }).source ?? 'claude',
+    }));
   } catch {
     return [];
   }

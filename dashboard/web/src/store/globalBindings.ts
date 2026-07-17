@@ -6,6 +6,20 @@ import { buildShareKeyBinding } from '../share/keyboardShare';
 import { buildBasketKeyBindings } from '../share/keyboardBasket';
 import { BENTO_MEDIA_QUERY } from '../lib/breakpoints';
 import type { Binding } from './keymap';
+import type { DashboardSelection } from '../types/envelope';
+
+// #294 S5 — the `v` cycle order for the global source selector. Dashboard-view
+// scoped; the Conversations `v` (cycle focus mode) is view:'conversations' and
+// unaffected. Guarded by `_globalKeyGuard` (inert under any modal / input mode /
+// chrome overlay).
+const SOURCE_CYCLE: readonly DashboardSelection[] = ['claude', 'codex', 'all'];
+
+export function cycleActiveSource(): void {
+  const cur = getState().activeSource;
+  const idx = SOURCE_CYCLE.indexOf(cur);
+  const next = SOURCE_CYCLE[(idx + 1) % SOURCE_CYCLE.length];
+  dispatch({ type: 'SET_ACTIVE_SOURCE', source: next });
+}
 
 // True in the desktop bento (>=900px), where per-card collapse is removed (A3).
 // SSR/JSDOM-safe: no matchMedia → treat as "not bento" so `c` behaves as before.
@@ -73,6 +87,10 @@ export function buildGlobalKeyBindings(): Binding[] {
     // `_globalKeyGuard` blocks it while update/doctor modals are open.
     { key: '0', scope: 'global', when: _globalKeyGuard, action: () => openPanelByPosition(10) },
     { key: 'r', scope: 'global', when: _globalKeyGuard, action: () => triggerSync() },
+    // #294 S5 — cycle the global source (Claude → Codex → All → Claude). Same
+    // modal/input guard as the other dashboard globals. Dashboard-view default
+    // (the Conversations `v` cycles focus mode and is view-scoped).
+    { key: 'v', scope: 'global', when: _globalKeyGuard, action: cycleActiveSource },
     { key: 'q', scope: 'global', when: _globalKeyGuard, action: tryQuit },
     { key: 'n', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(1) },
     { key: 'N', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(-1) },

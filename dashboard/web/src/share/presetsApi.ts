@@ -13,6 +13,7 @@
 //   `catch (err) { if (err instanceof ShareApiError) ... }`
 // without importing two files.
 import type { SharePanelId, ShareOptions } from './types';
+import type { DashboardSelection } from '../types/envelope';
 import { ShareApiError } from './api';
 
 export { ShareApiError };
@@ -21,6 +22,11 @@ export interface PresetRecord {
   template_id: string;
   options: ShareOptions;
   saved_at: string;
+  // #294 S5 §7 — the source the preset was saved under. Presets are keyed by
+  // (panel, name) server-side (unchanged), so saving under another source
+  // OVERWRITES the record and updates this stored source; the dropdown shows the
+  // stored-source label. Optional on read (legacy presets → treated as claude).
+  source?: DashboardSelection;
 }
 
 export interface PresetsResponse {
@@ -32,6 +38,9 @@ export interface SavePresetArgs {
   name: string;
   template_id: string;
   options: ShareOptions;
+  // #294 S5 §7 — stamp the share flow's source; the server records it against
+  // the (panel, name) key (overwrite semantics preserved).
+  source?: DashboardSelection;
 }
 
 export interface SavedPreset extends PresetRecord {
@@ -123,6 +132,10 @@ export interface HistoryRecord {
   format: string | null;
   destination: string | null;
   exported_at: string;
+  // #294 S5 §7 — the source the export was made under. Source participates in
+  // history/digest identity server-side, so "same panel, different source" rows
+  // are DISTINCT (no dedup/collapse). Optional on read (legacy → claude).
+  source?: DashboardSelection;
 }
 
 export interface HistoryResponse {
@@ -136,6 +149,8 @@ export interface AppendHistoryArgs {
   options: ShareOptions;
   format: string;
   destination: string;
+  // #294 S5 §7 — the share flow's captured source (stamped explicitly).
+  source?: DashboardSelection;
 }
 
 export async function listHistory(

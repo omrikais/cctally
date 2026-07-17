@@ -725,6 +725,13 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM codex_conversation_events")
     conn.execute("DELETE FROM codex_session_files")
     conn.execute("DELETE FROM codex_source_roots")
+    # F3: this clears the Codex physical quota state, so any stored
+    # quota-projection certificate would become stale-valid (its cache
+    # sequence unchanged) and let the reconcile short-circuit skip over
+    # now-deleted data. Invalidate it in the same transaction.
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
+    )
 
 
 def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
@@ -1386,6 +1393,30 @@ def _bump_mutation_seq(conn: sqlite3.Connection) -> int:
         "RETURNING value"
     ).fetchone()
     return int(row[0])
+
+
+def _force_retention_prune_after_replay(conn: sqlite3.Connection) -> None:
+    """#313 P3 (F9): run an UNTHROTTLED transcript retention prune after a
+    from-zero replay (a ``--rebuild`` or a truncation/requalification re-ingest,
+    both of which replay from offset 0 and restore >retention-day rows the
+    throttled prune already trimmed). Best-effort — a prune failure must never
+    break a sync. The caller invokes this only after the sync released its
+    provider flock, so the orchestrator can re-acquire it. No-op when retention
+    is disabled (``conversation.retention_days`` 0)."""
+    try:
+        import _lib_conversation_retention as retention
+        from _cctally_config import resolve_retention_days
+        retention_days = resolve_retention_days(_cctally().load_config())
+        if retention_days <= 0:
+            return
+        retention._maybe_prune_conversation_retention(
+            conn,
+            now_utc=dt.datetime.now(dt.timezone.utc),
+            retention_days=retention_days,
+            force=True,
+        )
+    except Exception:
+        pass
 
 
 def sync_cache(
@@ -2340,13 +2371,20 @@ def sync_cache(
         # and the flock is still held, so the short busy_timeout keeps it from
         # stalling the lock under heavy-reader contention.
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
-        return stats
+        # #313 P3 (F9): a rebuild or a truncation escalation replays from offset
+        # 0 and restores >retention-day transcript rows. Force an unthrottled
+        # prune AFTER the flock releases below (early lock-contended / deferred
+        # returns above never reach here, so a no-op sync does not prune).
+        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
             pass
         lock_fh.close()
+    if did_from_zero_replay:
+        _force_retention_prune_after_replay(conn)
+    return stats
 
 
 def backfill_conversation_messages(conn: sqlite3.Connection) -> int:
@@ -3491,6 +3529,17 @@ def sync_codex_cache(
     """
     stats = CodexIngestStats()
     project_after_unlock = False
+    did_from_zero_replay = False
+    # #313 P1 review (F4/F1): when the CACHE certificate is current we cannot
+    # yet decide whether to skip the reconcile — reconcile's own short-circuit
+    # ALSO requires the stats-side quota_projection_state signatures to match
+    # (F1: stats.db can be wiped/recovered while cache.db persists). That
+    # cross-DB read must happen AFTER the Codex flock releases (see the design
+    # comment near the reconcile trigger below), so capture the material for the
+    # deferred stats-side check here. ``None`` means "no deferred check pending"
+    # (the seq-advanced / no-roots / stale-cert branches decide immediately).
+    deferred_cert_roots: "set[str] | None" = None
+    deferred_cert_sigs: "dict[str, str] | None" = None
     c = _cctally()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CACHE_LOCK_CODEX_PATH.touch()
@@ -3504,6 +3553,18 @@ def sync_codex_cache(
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
+
+        # F4 (#313): the reconcile trigger gate is "did the Codex physical
+        # mutation sequence advance during this sync", NOT rows_changed —
+        # rows_changed counts only inserted accounting rows and misses
+        # quota-only / metadata-only / prune-only batches that bump the
+        # sequence. Capture the baseline before any clear/prune/ingest bump.
+        from _cctally_quota import (
+            codex_physical_mutation_seq,
+            load_codex_quota_projection_certificate,
+            _cache_root_keys,
+        )
+        seq_before = codex_physical_mutation_seq(conn)
 
         if rebuild:
             # Clear INSIDE the lock — see sync_cache() for the full
@@ -3892,7 +3953,56 @@ def sync_codex_cache(
         # Codex cache flock in ``finally`` below.  cache.db and stats.db are not
         # cross-database atomic: after this committed ingest, a projection
         # interruption is repaired by the next full reconciliation.
-        project_after_unlock = True
+        #
+        # F4 (#313): reconcile when the physical mutation sequence advanced this
+        # sync (a genuine quota/metadata/prune change — NOT rows_changed, which
+        # misses quota-only batches). A pure no-op with an already-coherent
+        # certificate skips even the O(1) reconcile call.
+        #
+        # A no-op sync must STILL reconcile when there are Codex roots but the
+        # projection certificate is missing/stale at the current sequence — a
+        # lost/failed certificate write (best-effort I/O; can fail under a
+        # cache.db lock storm) leaves the dashboard's Codex source "unavailable"
+        # and is recovered by the next unchanged-file sync re-stamping the
+        # certificate. Claude-only users (no Codex roots) always skip.
+        #
+        # F1 (#313 P1 review): even when the CACHE certificate looks current, the
+        # STATS-side quota_projection_state may have been independently
+        # wiped/recovered (this user has a documented stats.db corruption
+        # history). The cache cert alone does NOT prove stats.db still holds the
+        # projection, so the skip decision on that branch is DEFERRED to the
+        # post-flock stats-side signature check below — making the gate's
+        # skip-condition identical to reconcile's own short-circuit-condition.
+        cur_seq = codex_physical_mutation_seq(conn)
+        if cur_seq != seq_before:
+            project_after_unlock = True
+        else:
+            active_roots = _cache_root_keys(conn)
+            if not active_roots:
+                project_after_unlock = False
+            else:
+                certificate = load_codex_quota_projection_certificate(conn)
+                certificate_current = (
+                    certificate is not None
+                    and certificate[0] == cur_seq
+                    and active_roots <= set(certificate[1])
+                )
+                if certificate_current:
+                    # The CACHE certificate is current, but that alone does NOT
+                    # prove stats.db still holds the projection (F1). Defer the
+                    # stats-side signature match until AFTER the Codex flock
+                    # releases below — only then may the reconcile be skipped.
+                    project_after_unlock = False
+                    deferred_cert_roots = set(active_roots)
+                    assert certificate is not None
+                    deferred_cert_sigs = dict(certificate[1])
+                else:
+                    project_after_unlock = True
+        # #313 P3 (F9): a Codex rebuild or a truncation/requalification
+        # re-ingest replays from offset 0 and restores >retention-day
+        # codex_conversation_events. Force an unthrottled prune after the flock
+        # releases (below), so restored old rows don't persist for up to 24h.
+        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -3900,9 +4010,29 @@ def sync_codex_cache(
             pass
         lock_fh.close()
 
+    if deferred_cert_roots is not None:
+        # F1: the gate's skip-condition must be IDENTICAL to
+        # reconcile_codex_quota_projection's own short-circuit-condition, which
+        # additionally requires the stats-side quota_projection_state signatures
+        # to match the cache certificate for every active root. Read stats.db
+        # HERE — after the Codex flock released in the ``finally`` above — so the
+        # cross-DB read never widens the Codex flock's critical section (the
+        # design invariant documented near the reconcile trigger). A wiped/stale
+        # stats projection (mismatch) forces the reconcile so it self-heals.
+        from _cctally_quota import _stats_projection_signatures_match
+        stats_conn = _cctally_core.open_db()
+        try:
+            if not _stats_projection_signatures_match(
+                stats_conn, deferred_cert_roots, deferred_cert_sigs or {}
+            ):
+                project_after_unlock = True
+        finally:
+            stats_conn.close()
     if project_after_unlock:
         from _cctally_quota import reconcile_codex_quota_projection
         reconcile_codex_quota_projection()
+    if did_from_zero_replay:
+        _force_retention_prune_after_replay(conn)
     return stats
 
 
@@ -4251,6 +4381,41 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"(shared session or missing conversation evidence); "
                 f"run `cache-sync --rebuild` to clear them"
             )
+        return 0
+
+    # --prune-conversations: on-demand, UNTHROTTLED transcript retention prune
+    # (#313 P3). Removes >retention-day conversation transcripts (re-derivable
+    # from JSONL). Reclaim the freed disk space with `cctally db vacuum`.
+    if getattr(args, "prune_conversations", False):
+        from _cctally_config import resolve_retention_days
+        import _lib_conversation_retention as retention
+        retention_days = resolve_retention_days(_cctally().load_config())
+        if retention_days <= 0:
+            eprint(
+                "[cache-sync] transcript retention is disabled "
+                "(conversation.retention_days=0); nothing pruned."
+            )
+            return 0
+        result = retention._maybe_prune_conversation_retention(
+            conn,
+            now_utc=dt.datetime.now(dt.timezone.utc),
+            retention_days=retention_days,
+            force=True,
+        )
+        if result is None:
+            eprint(
+                "[cache-sync] prune-conversations skipped: another process "
+                "holds the maintenance or a provider lock; retry shortly."
+            )
+            return 1
+        eprint(
+            f"[cache-sync] pruned transcripts older than {retention_days}d: "
+            f"claude {result.claude_sessions} session(s) / "
+            f"{result.claude_messages} message(s), "
+            f"codex {result.codex_conversations} conversation(s) / "
+            f"{result.codex_events} event(s). "
+            f"Run `cctally db vacuum` to reclaim the freed space."
+        )
         return 0
 
     # Note: when --rebuild is set we delegate the DELETE to sync_cache /

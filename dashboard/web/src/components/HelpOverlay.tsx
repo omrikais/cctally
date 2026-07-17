@@ -1,11 +1,26 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { PANEL_REGISTRY, type GridPanelId } from '../lib/panelRegistry';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useSnapshot } from '../hooks/useSnapshot';
+import { resolveSourceView } from '../store/sourceView';
+import { deriveVisiblePanelOrder } from '../lib/visiblePanelOrder';
+import { gatePanel, PANEL_GATING } from '../lib/sourceGating';
+import type { PanelId } from '../lib/panelIds';
 import { ModalHeader } from '../modals/ModalHeader';
+
+// #294 S5 §6.9 — one-line pointers for the panels a source intentionally does
+// not show, so a Codex user learns WHERE the equivalent information lives rather
+// than seeing a ghost panel. Panels without a bespoke note fall back to a
+// generic line.
+const HIDDEN_CAPABILITY_NOTES: Partial<Record<PanelId, string>> = {
+  forecast: 'Forecast — native forecasts live in the Blocks (quota) panel',
+  trend: 'Trend — native forecasts live in the Blocks (quota) panel',
+  'cache-report': 'Cache report — token-reuse counters live in the hero',
+};
 
 interface KeyTableProps {
   panelOrder: readonly GridPanelId[];
@@ -21,6 +36,8 @@ interface KeyTableProps {
 // excluded from the coverage assertion and stays untouched.
 export const HELP_ROWS: ReadonlyArray<{ keys: string[]; desc: string }> = [
   { keys: ['r'], desc: 'force refresh' },
+  // #294 S5 — the global source selector cycle.
+  { keys: ['v'], desc: 'cycle source (Claude / Codex / All)' },
   { keys: ['s'], desc: 'open Settings' },
   { keys: ['d'], desc: 'open Doctor' },
   { keys: ['S'], desc: 'share the focused panel (focus a panel first)' },
@@ -121,8 +138,33 @@ function GestureGuide() {
 export function HelpOverlay() {
   const [open, setOpen] = useState(false);
   const isMobile = useIsMobile();
-  const panelOrder = useSyncExternalStore(subscribeStore, () => getState().prefs.panelOrder);
+  const fullPanelOrder = useSyncExternalStore(subscribeStore, () => getState().prefs.panelOrder);
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const env = useSnapshot();
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
+  const sourceView = useMemo(
+    () => resolveSourceView(env, activeSource),
+    [env, activeSource],
+  );
+  // #294 S5 §6.11 — the Help digit rows + panel list derive from the DERIVED
+  // visible-panel order (what the digits actually address for the active
+  // source), not the raw persisted full order.
+  const panelOrder = useMemo(
+    () => deriveVisiblePanelOrder(fullPanelOrder, sourceView),
+    [fullPanelOrder, sourceView],
+  );
+  // #294 S5 §6.9 — the panels the active source intentionally hides (per §5.5),
+  // each with a one-line pointer. Suppressed while hydrating (§5.2) and outside
+  // the dashboard workspace (the selector doesn't apply to conversations).
+  const hiddenItems = useMemo(() => {
+    if (sourceView.hydrating || view !== 'dashboard') return [];
+    return (Object.keys(PANEL_GATING) as PanelId[])
+      .filter((p) => gatePanel(sourceView, p).mode === 'hidden')
+      .map((p) => ({
+        panel: p,
+        note: HIDDEN_CAPABILITY_NOTES[p] ?? `${PANEL_REGISTRY[p as GridPanelId]?.label ?? p} — not shown for this source`,
+      }));
+  }, [sourceView, view]);
   useKeymap([
     // `?` is all-views chrome (#156).
     { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },
@@ -175,6 +217,19 @@ export function HelpOverlay() {
             <KeyTable panelOrder={panelOrder} />
             {view === 'conversations' && <ConversationsKeyTable />}
           </>
+        )}
+        {hiddenItems.length > 0 && (
+          <div className="help-hidden-capabilities">
+            <p className="help-hidden-heading">
+              The {activeSource === 'all' ? 'All' : activeSource === 'codex' ? 'Codex' : 'Claude'} source
+              doesn&apos;t show:
+            </p>
+            <ul className="help-hidden-list">
+              {hiddenItems.map((it) => (
+                <li key={it.panel}>{it.note}</li>
+              ))}
+            </ul>
+          </div>
         )}
         <p className="meta">
           cctally · <span id="help-server-url">{window.location.origin}</span>

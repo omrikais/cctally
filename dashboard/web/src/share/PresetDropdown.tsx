@@ -26,6 +26,7 @@ import {
 } from './presetsApi';
 import { useKeymap } from '../hooks/useKeymap';
 import type { SharePanelId, ShareOptions } from './types';
+import { SELECTION_LABEL } from './types';
 
 interface Props {
   panel: SharePanelId;
@@ -138,7 +139,7 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
           {names.length > 0 ? (
             <ul className="share-presets-list">
               {names.map((n) => (
-                <li key={n}>
+                <li key={n} className="share-presets-row">
                   <button
                     type="button"
                     role="menuitem"
@@ -150,6 +151,14 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
                   >
                     {n}
                   </button>
+                  {/* #294 S5 §7 — stored-source label, a SIBLING of the button so
+                      the menuitem's accessible name stays the preset name.
+                      (panel, name) is the server preset key, so saving under
+                      another source overwrites the record and this label
+                      updates. */}
+                  <span className={`source-chip source-chip--${presets[n].source ?? 'claude'}`}>
+                    {SELECTION_LABEL[presets[n].source ?? 'claude']}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -164,7 +173,7 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
               </div>
               <ul className="share-presets-history-list">
                 {history.map((h) => (
-                  <li key={h.recipe_id}>
+                  <li key={h.recipe_id} className="share-presets-history-row">
                     <button
                       type="button"
                       role="menuitem"
@@ -173,7 +182,7 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
                         onPick(h.template_id, h.options);
                         setOpen(false);
                       }}
-                      title={`${h.template_id} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
+                      title={`${h.template_id} · ${SELECTION_LABEL[h.source ?? 'claude']} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
                     >
                       <span className="share-presets-history-template">
                         {h.template_id}
@@ -182,6 +191,13 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
                         {' · '}{h.format ?? 'unknown'}{' · '}{formatHistoryTimestamp(h.exported_at)}
                       </span>
                     </button>
+                    {/* #294 S5 §7 — history rows are per-source DISTINCT (source
+                        participates in server-side identity — no cross-source
+                        collapse); show the stored source as a sibling so the
+                        menuitem name stays clean. */}
+                    <span className={`source-chip source-chip--${h.source ?? 'claude'}`}>
+                      {SELECTION_LABEL[h.source ?? 'claude']}
+                    </span>
                   </li>
                 ))}
               </ul>

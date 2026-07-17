@@ -1,7 +1,8 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ShareIcon } from './ShareIcon';
+import { _resetForTests, dispatch } from '../store/store';
 
 describe('<ShareIcon>', () => {
   it('renders with accessible label', () => {
@@ -80,5 +81,65 @@ describe('<ShareIcon>', () => {
     render(<ShareIcon panel="weekly" panelLabel="Weekly" onClick={() => {}} />);
     const btn = screen.getByRole('button', { name: /share weekly report/i });
     expect(btn.hasAttribute('data-testid')).toBe(false);
+  });
+});
+
+// #294 S5 §7 — the per-source share matrix gates the ShareIcon render itself
+// (the click-path chokepoint), so a disallowed (source, panel) pair exposes NO
+// share affordance at all — not merely an inert button the server later
+// rejects. Every panel/modal share entry point routes through <ShareIcon>, so
+// gating here covers all of them at once.
+describe('<ShareIcon> source-matrix gating (§7)', () => {
+  // The default store source is claude; reset after each so the plain suite
+  // above (which never touches the store) keeps rendering under claude.
+  afterEach(() => {
+    _resetForTests();
+  });
+
+  it('renders NO affordance for forecast under `all` (forecast is not in the All matrix)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
+    render(<ShareIcon panel="forecast" panelLabel="Forecast" onClick={() => {}} />);
+    expect(screen.queryByRole('button', { name: /share forecast report/i })).toBeNull();
+  });
+
+  it('renders NO affordance for trend under `all` (trend is not in the All matrix)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
+    render(<ShareIcon panel="trend" panelLabel="Trend" onClick={() => {}} />);
+    expect(screen.queryByRole('button', { name: /share trend report/i })).toBeNull();
+  });
+
+  it('renders NO affordance for forecast under `codex` (codex hides forecast/trend)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
+    render(<ShareIcon panel="forecast" panelLabel="Forecast" onClick={() => {}} />);
+    expect(screen.queryByRole('button', { name: /share forecast report/i })).toBeNull();
+  });
+
+  it('KEEPS the forecast/trend affordance under `claude` (full 9-panel set)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' }));
+    for (const panel of ['forecast', 'trend'] as const) {
+      const { unmount } = render(
+        <ShareIcon panel={panel} panelLabel={panel} onClick={() => {}} />,
+      );
+      expect(
+        screen.getByRole('button', { name: new RegExp(`share ${panel} report`, 'i') }),
+      ).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('KEEPS the affordance for a codex-visible panel (weekly) under `codex` (7-panel set)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
+    render(<ShareIcon panel="weekly" panelLabel="Weekly" onClick={() => {}} />);
+    expect(
+      screen.getByRole('button', { name: /share weekly report/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('KEEPS the hero current-week affordance under `all` (current-week is in every matrix)', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
+    render(<ShareIcon panel="current-week" panelLabel="Current week" onClick={() => {}} />);
+    expect(
+      screen.getByRole('button', { name: /share current week report/i }),
+    ).toBeInTheDocument();
   });
 });

@@ -20,10 +20,26 @@ import { ExpandButton } from '../components/ExpandButton';
 import { openShareModal } from '../store/shareSlice';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
+import { SourcePanelShell, CodexProjectsTable } from './sourcePanel';
 
 const TOP_N = 5;
 
+// #294 S5 — source-aware wrapper. Claude = legacy leaderboard (unchanged);
+// Codex = native qualified-attribution table; All = provider sections
+// (identical labels across providers stay distinct rows — different keys).
 export function ProjectsPanel() {
+  return (
+    <SourcePanelShell
+      panel="projects"
+      panelKind="projects"
+      claude={<ClaudeProjectsPanel />}
+      codex={(d) => <CodexProjectsTable data={d} />}
+      emptyLabel="No Codex projects yet."
+    />
+  );
+}
+
+function ClaudeProjectsPanel() {
   const env = useSnapshot();
   const cw = env?.projects?.current_week;
   const rows = cw?.rows ?? [];

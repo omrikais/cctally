@@ -92,3 +92,64 @@ def test_prune_orphans_source_all(env, capsys):
     rc = ns["cmd_cache_sync"](args)
     assert rc == 0
     assert "pruned 1 orphaned file" in capsys.readouterr().err.lower()
+
+
+def test_prune_conversations_cli(env, capsys):
+    # On-demand transcript retention prune (#313 P3, Task 10). Far-past /
+    # far-future timestamps keep the assertion time-independent (the command
+    # uses real `now`).
+    ns, tmp_path, monkeypatch = env
+    conn = ns["open_cache_db"]()
+    for off, (sid, ts) in enumerate(
+        [("old", "2020-01-01T00:00:00.000Z"),
+         ("fresh", "2099-01-01T00:00:00.000Z")], start=1
+    ):
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(session_id, uuid, source_path, byte_offset, timestamp_utc, entry_type, text) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (sid, f"u{off}", "seed.jsonl", off, ts, "human", "hi"))
+    conn.commit()
+    conn.close()
+
+    args = argparse.Namespace(
+        source="all", rebuild=False, prune_orphans=False, prune_conversations=True)
+    rc = ns["cmd_cache_sync"](args)
+    assert rc == 0
+    assert "pruned transcripts" in capsys.readouterr().err.lower()
+
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE session_id='old'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE session_id='fresh'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_prune_conversations_disabled_when_retention_zero(env, capsys):
+    ns, tmp_path, monkeypatch = env
+    ns["save_config"]({"conversation": {"retention_days": 0}})
+    conn = ns["open_cache_db"]()
+    conn.execute(
+        "INSERT INTO conversation_messages "
+        "(session_id, uuid, source_path, byte_offset, timestamp_utc, entry_type, text) "
+        "VALUES ('old','u1','seed.jsonl',1,'2020-01-01T00:00:00.000Z','human','hi')")
+    conn.commit()
+    conn.close()
+
+    args = argparse.Namespace(
+        source="all", rebuild=False, prune_orphans=False, prune_conversations=True)
+    rc = ns["cmd_cache_sync"](args)
+    assert rc == 0
+    assert "disabled" in capsys.readouterr().err.lower()
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE session_id='old'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
