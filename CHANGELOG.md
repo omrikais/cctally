@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.69.2] - 2026-07-17
+
+### Fixed
+- Completed the 1.69.0/1.69.1 packaging fix: the four source-aware runtime modules were added to the public mirror allowlist in 1.69.1 but were still missing from the npm `package.json` `files` list, so the npm tarball kept excluding them and installed commands crashed at import; they now ship in the npm package. Brew was unaffected — it archives the whole public tree.
+
 ## [1.69.1] - 2026-07-17
 
 ### Fixed
