@@ -75,6 +75,8 @@ from _cctally_core import (
     _AlertsConfigError,
     _get_budget_config,
     _BudgetConfigError,
+    _validate_codex_budget_block,
+    CODEX_BUDGET_LEAVES,
 )
 from _lib_display_tz import normalize_display_tz_value
 
@@ -300,6 +302,7 @@ ALLOWED_CONFIG_KEYS = (
     "alerts.projected_enabled",
     "alerts.notifier",
     "alerts.command_template",
+    "alerts.quota",
     "dashboard.bind",
     "dashboard.expose_transcripts",
     "dashboard.cache_failure_markers",
@@ -318,8 +321,234 @@ ALLOWED_CONFIG_KEYS = (
     "budget.projects",
     "budget.project_alerts_enabled",
     "budget.codex",
+    "budget.codex.amount_usd",
+    "budget.codex.period",
+    "budget.codex.alerts_enabled",
+    "budget.codex.alert_thresholds",
+    "budget.codex.projected_enabled",
     "telemetry.enabled",
 )
+
+
+_CODEX_BUDGET_LEAF_PREFIX = "budget.codex."
+
+
+def _config_codex_leaf_value(config: dict, key: str) -> object:
+    """Read one nested Codex budget leaf with its public default.
+
+    ``config get`` is deliberately forgiving of a hand-edited corrupt block,
+    just like the existing whole-object ``budget.codex`` read: it reports the
+    defaults without repairing the file. Mutations use the strict setter below.
+    """
+    if not key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
+        raise ValueError(f"not a Codex budget leaf: {key!r}")
+    leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
+    if leaf not in CODEX_BUDGET_LEAVES:
+        raise ValueError(f"unknown Codex budget leaf: {key!r}")
+    try:
+        block = _get_budget_config(config)["codex"]
+    except _BudgetConfigError:
+        block = None
+    if block is None:
+        defaults = {
+            "amount_usd": None,
+            "period": "calendar-month",
+            "alerts_enabled": False,
+            "alert_thresholds": [90, 100],
+            "projected_enabled": False,
+        }
+        value = defaults[leaf]
+    else:
+        value = block[leaf]
+    return list(value) if isinstance(value, list) else value
+
+
+def _parse_codex_budget_leaf_value(leaf: str, raw_value: str) -> object:
+    """Parse exactly the command-line wire format for one Codex leaf."""
+    if leaf == "amount_usd":
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise _BudgetConfigError(
+                "budget.codex.amount_usd must be a finite number > 0"
+            ) from exc
+    if leaf == "period":
+        return raw_value.strip()
+    if leaf in {"alerts_enabled", "projected_enabled"}:
+        normalized = raw_value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+        raise _BudgetConfigError(f"budget.codex.{leaf} must be a boolean")
+    if leaf == "alert_thresholds":
+        if not raw_value.strip():
+            return []
+        parsed: list[int] = []
+        for part in raw_value.split(","):
+            try:
+                parsed.append(int(part.strip(), 10))
+            except ValueError as exc:
+                raise _BudgetConfigError(
+                    "budget.codex.alert_thresholds must be a comma-separated "
+                    "list of integers"
+                ) from exc
+        return parsed
+    raise _BudgetConfigError(f"unknown Codex budget leaf {leaf!r}")
+
+
+def _set_codex_budget_leaf(config: dict, key: str, raw_value: str) -> dict:
+    """Return the canonical prospective nested Codex budget block.
+
+    The caller owns the writer lock and persistence. This pure merge helper
+    validates existing state before mutating it, so malformed user state never
+    becomes a partially repaired write.
+    """
+    if not key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
+        raise _BudgetConfigError(f"unknown Codex budget leaf {key!r}")
+    leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
+    if leaf not in CODEX_BUDGET_LEAVES:
+        raise _BudgetConfigError(f"unknown Codex budget leaf {key!r}")
+    budget = config.get("budget")
+    if budget is not None and not isinstance(budget, dict):
+        raise _BudgetConfigError("budget must be an object")
+    existing = (budget or {}).get("codex")
+    if existing is None:
+        if leaf != "amount_usd":
+            raise _BudgetConfigError(
+                "budget.codex.amount_usd must be configured before setting "
+                f"budget.codex.{leaf}"
+            )
+        prospective: dict = {}
+    else:
+        if not isinstance(existing, dict):
+            raise _BudgetConfigError(
+                f"budget.codex must be an object or null, got {type(existing).__name__}"
+            )
+        # Strictly validate first: malformed existing data must abort without
+        # mutation, while valid unknown siblings retain the validator's
+        # existing warn-and-drop behavior when the prospective block is built.
+        validated_existing = _validate_codex_budget_block(existing)
+        assert validated_existing is not None
+        prospective = dict(validated_existing)
+    prospective[leaf] = _parse_codex_budget_leaf_value(leaf, raw_value)
+    validated = _validate_codex_budget_block(prospective)
+    assert validated is not None
+    return validated
+
+
+# ``alerts.quota`` is an additive nested object owned by the provider-neutral
+# quota projection. Keep the existing core alert reader byte-compatible for
+# Claude axes while making this now-known child exempt from its unknown-key
+# warning path.
+_cctally_core._ALERTS_CONFIG_VALID_KEYS.add("quota")
+
+_QUOTA_ALERT_KEYS = {
+    "enabled", "actual_thresholds", "projected_thresholds", "rules",
+}
+_QUOTA_RULE_KEYS = {
+    "source", "source_root_key", "logical_limit_key",
+    "actual_thresholds", "projected_thresholds",
+}
+
+
+def _quota_alert_error(message: str) -> None:
+    raise _cctally_core._AlertsConfigError(message)
+
+
+def _validate_quota_thresholds(name: str, value: object) -> list[int]:
+    """Validate a quota list; unlike legacy axis lists, [] deliberately silences."""
+    if not isinstance(value, list):
+        _quota_alert_error(f"alerts.quota.{name} must be a list of integers")
+    result: list[int] = []
+    prior = 0
+    for item in value:
+        if not isinstance(item, int) or isinstance(item, bool):
+            _quota_alert_error(
+                f"alerts.quota.{name} items must be integers, got "
+                f"{type(item).__name__}: {item!r}"
+            )
+        if not 1 <= item <= 100:
+            _quota_alert_error(
+                f"alerts.quota.{name} items must be in [1, 100], got {item}"
+            )
+        if item <= prior:
+            _quota_alert_error(f"alerts.quota.{name} must be strictly increasing")
+        result.append(item)
+        prior = item
+    return result
+
+
+def _get_quota_alerts_config(cfg: "dict | None") -> dict:
+    """Return the strict, defaults-filled ``alerts.quota`` configuration."""
+    alerts = (cfg or {}).get("alerts", {})
+    if alerts is None:
+        alerts = {}
+    if not isinstance(alerts, dict):
+        _quota_alert_error("alerts must be an object")
+    quota = alerts.get("quota", {})
+    if quota is None or not isinstance(quota, dict):
+        _quota_alert_error("alerts.quota must be an object")
+    for key in quota:
+        if key not in _QUOTA_ALERT_KEYS:
+            print(
+                f"warning: ignoring unknown alerts.quota config key: {key}",
+                file=sys.stderr,
+            )
+    enabled = quota.get("enabled", False)
+    if not isinstance(enabled, bool):
+        _quota_alert_error(
+            "alerts.quota.enabled must be a JSON boolean, got "
+            f"{type(enabled).__name__}: {enabled!r}"
+        )
+    actual = _validate_quota_thresholds(
+        "actual_thresholds", quota.get("actual_thresholds", [90, 95])
+    )
+    projected = _validate_quota_thresholds(
+        "projected_thresholds", quota.get("projected_thresholds", [])
+    )
+    raw_rules = quota.get("rules", [])
+    if not isinstance(raw_rules, list):
+        _quota_alert_error("alerts.quota.rules must be a list")
+    rules: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for index, raw_rule in enumerate(raw_rules):
+        prefix = f"alerts.quota.rules[{index}]"
+        if not isinstance(raw_rule, dict):
+            _quota_alert_error(f"{prefix} must be an object")
+        if set(raw_rule) != _QUOTA_RULE_KEYS:
+            _quota_alert_error(
+                f"{prefix} must contain exactly {sorted(_QUOTA_RULE_KEYS)}"
+            )
+        normalized: dict[str, object] = {}
+        for key in ("source", "source_root_key", "logical_limit_key"):
+            value = raw_rule[key]
+            if not isinstance(value, str) or not value:
+                _quota_alert_error(f"{prefix}.{key} must be a non-empty string")
+            normalized[key] = value
+        normalized["actual_thresholds"] = _validate_quota_thresholds(
+            f"rules[{index}].actual_thresholds", raw_rule["actual_thresholds"]
+        )
+        normalized["projected_thresholds"] = _validate_quota_thresholds(
+            f"rules[{index}].projected_thresholds", raw_rule["projected_thresholds"]
+        )
+        identity = (
+            str(normalized["source"]), str(normalized["source_root_key"]),
+            str(normalized["logical_limit_key"]),
+        )
+        if identity in seen:
+            _quota_alert_error(
+                "alerts.quota.rules must be unique by source, source_root_key, "
+                "and logical_limit_key"
+            )
+        seen.add(identity)
+        rules.append(normalized)
+    return {
+        "enabled": enabled,
+        "actual_thresholds": actual,
+        "projected_thresholds": projected,
+        "rules": rules,
+    }
 
 
 # === statusline config validators (issue #86 Session G) ===================
@@ -459,6 +688,11 @@ def _config_known_value(config: dict, key: str) -> "object":
             return _get_alerts_config(config)["command_template"]
         except c._AlertsConfigError:
             return None
+    if key == "alerts.quota":
+        try:
+            return _get_quota_alerts_config(config)
+        except c._AlertsConfigError:
+            return _get_quota_alerts_config({})
     if key == "dashboard.bind":
         # Default semantic alias is 'loopback' (resolves to 127.0.0.1 at
         # bind time). LAN exposure is opt-in via `set dashboard.bind lan`
@@ -580,6 +814,8 @@ def _config_known_value(config: dict, key: str) -> "object":
             return c._validate_update_check_ttl_hours_value(stored)
         except ValueError:
             return c.UPDATE_DEFAULT_TTL_HOURS
+    if key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
+        return _config_codex_leaf_value(config, key)
     if key in (
         "statusline.visual_burn_rate",
         "statusline.cost_source",
@@ -649,7 +885,10 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     # (including None) must survive into the render layer — the generic
     # None->"" coercion below would break the JSON shape / round-trip.
     def _coerce(k: str, v: "object") -> "object":
-        if k in ("alerts.command_template", "budget.projects", "budget.codex"):
+        if k in (
+            "alerts.command_template", "alerts.quota", "budget.projects",
+            "budget.codex",
+        ) or k.startswith(_CODEX_BUDGET_LEAF_PREFIX):
             return v
         return v if v is not None else ""
 
@@ -667,7 +906,19 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
         # a flat tail (`{"update": {"check.enabled": ...}}`) and
         # diverged from `config set --json` / on-disk shape.
         out: "dict[str, object]" = {}
+        nested_parents = {
+            candidate
+            for candidate, _value in pairs
+            if any(child.startswith(candidate + ".") for child, _value in pairs)
+        }
         for k, v in pairs:
+            # A bulk read includes both `budget.codex` (null when not
+            # configured) and its additive `budget.codex.*` leaves.  A scalar
+            # parent cannot coexist with those children in JSON, so let the
+            # specific leaves build their object.  Direct `config get
+            # budget.codex --json` has no descendant pair and remains null.
+            if k in nested_parents and not isinstance(v, dict):
+                continue
             segments = k.split(".")
             node: dict = out
             for seg in segments[:-1]:
@@ -679,7 +930,8 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
             # Preserve canonical bool stringification (true/false) so
             # round-trips via `config set alerts.enabled <plain-text>` work.
             if k in (
-                "alerts.command_template", "budget.projects", "budget.codex"
+                "alerts.command_template", "alerts.quota", "budget.projects",
+                "budget.codex",
             ):
                 # JSON-encoded so `config get` output round-trips through the
                 # matching `config set` branch (both JSON-parse their value).
@@ -687,6 +939,8 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
                 # `budget.projects` is an object {git-root: usd};
                 # `budget.codex` is an object|null (the no-budget sentinel).
                 rendered = json.dumps(v)
+            elif k.startswith(_CODEX_BUDGET_LEAF_PREFIX) and v is None:
+                rendered = "null"
             elif isinstance(v, bool):
                 rendered = "true" if v else "false"
             elif isinstance(v, list):
@@ -705,6 +959,36 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
     if key not in ALLOWED_CONFIG_KEYS:
         eprint(f"cctally config: unknown config key {key!r}")
         return 2
+    if key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
+        try:
+            with config_writer_lock():
+                config = _load_config_unlocked()
+                configured = _set_codex_budget_leaf(config, key, raw)
+                budget = config.get("budget")
+                if budget is not None and not isinstance(budget, dict):
+                    raise _BudgetConfigError("budget must be an object")
+                block = dict(budget or {})
+                block["codex"] = configured
+                config["budget"] = block
+                save_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally config: {exc}")
+            return 2
+        # Deliberately outside the config lock: this helper opens and locks DBs.
+        c._reconcile_codex_budget_on_config_write({"codex": configured})
+        leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
+        value = configured[leaf]
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"budget": {"codex": {leaf: value}}}, indent=2))
+        else:
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, list):
+                rendered = ",".join(str(item) for item in value)
+            else:
+                rendered = str(value)
+            print(f"{key}={rendered}")
+        return 0
     if key == "display.tz":
         try:
             canonical = normalize_display_tz_value(raw)
@@ -877,6 +1161,44 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             print(json.dumps({"alerts": {"command_template": parsed}}, indent=2))
         else:
             print(f"alerts.command_template={json.dumps(parsed)}")
+        return 0
+    if key == "alerts.quota":
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            print(
+                f"cctally: alerts.quota must be a JSON object: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(parsed, dict):
+            print("cctally: alerts.quota must be a JSON object", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_alerts = config.get("alerts")
+            if existing_alerts is not None and not isinstance(existing_alerts, dict):
+                print(
+                    "cctally: alerts config error: alerts must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            alerts_block = dict(existing_alerts or {})
+            alerts_block["quota"] = parsed
+            candidate = {**config, "alerts": alerts_block}
+            try:
+                _get_alerts_config(candidate)
+                normalized = _get_quota_alerts_config(candidate)
+            except _AlertsConfigError as exc:
+                print(f"cctally: alerts config error: {exc}", file=sys.stderr)
+                return 2
+            alerts_block["quota"] = normalized
+            config["alerts"] = alerts_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"alerts": {"quota": normalized}}, indent=2))
+        else:
+            print(f"alerts.quota={json.dumps(normalized)}")
         return 0
     if key == "dashboard.bind":
         # Validation rejects whitespace / empty / non-string up front;
@@ -1350,6 +1672,49 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
     if key not in ALLOWED_CONFIG_KEYS:
         eprint(f"cctally config: unknown config key {key!r}")
         return 2
+    if key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
+        c = _cctally()
+        configured: dict | None = None
+        try:
+            with config_writer_lock():
+                config = _load_config_unlocked()
+                budget = config.get("budget")
+                if budget is not None and not isinstance(budget, dict):
+                    raise _BudgetConfigError("budget must be an object")
+                existing = (budget or {}).get("codex")
+                if existing is None:
+                    return 0
+                if not isinstance(existing, dict):
+                    raise _BudgetConfigError(
+                        f"budget.codex must be an object or null, got {type(existing).__name__}"
+                    )
+                validated_existing = _validate_codex_budget_block(existing)
+                assert validated_existing is not None
+                leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
+                block = dict(budget or {})
+                if leaf == "amount_usd":
+                    block.pop("codex", None)
+                    if block:
+                        config["budget"] = block
+                    else:
+                        config.pop("budget", None)
+                    save_config(config)
+                    return 0
+                prospective = dict(validated_existing)
+                prospective.pop(leaf, None)
+                configured = _validate_codex_budget_block(prospective)
+                assert configured is not None
+                block["codex"] = configured
+                config["budget"] = block
+                save_config(config)
+        except _BudgetConfigError as exc:
+            eprint(f"cctally config: {exc}")
+            return 2
+        # An optional leaf leaves a configured block, even when it already
+        # held its default; the forward-only state must be reconciled once.
+        assert configured is not None
+        c._reconcile_codex_budget_on_config_write({"codex": configured})
+        return 0
     if key == "display.tz":
         with config_writer_lock():
             config = _load_config_unlocked()
@@ -1366,6 +1731,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "alerts.projected_enabled",
         "alerts.notifier",
         "alerts.command_template",
+        "alerts.quota",
     ):
         # Mirror the display.tz branch: writer-lock + _load_config_unlocked
         # (NOT load_config — fcntl.flock is per-fd so re-entry would

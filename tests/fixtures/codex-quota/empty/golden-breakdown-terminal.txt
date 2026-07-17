@@ -1,0 +1,2 @@
+cctally codex quota: no quota identity matches the exact selectors; candidates:
+  (no active Codex quota identities)

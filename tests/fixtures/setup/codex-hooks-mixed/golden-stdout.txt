@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "install": {
+    "symlinks_present": 0,
+    "symlinks_total": 15,
+    "symlinks_stale": [],
+    "path_includes": false
+  },
+  "hooks": {
+    "PostToolBatch": 0,
+    "Stop": 0,
+    "SubagentStop": 0
+  },
+  "auth": {
+    "oauth_token_present": false,
+    "last_fetch_age_s": null
+  },
+  "activity_24h": {
+    "fires": 0,
+    "by_event": {},
+    "oauth_ok": 0,
+    "throttled": 0,
+    "errors": 0,
+    "last_fire_ago_s": null
+  },
+  "codex_hooks": {
+    "roots": [
+      {
+        "source_root_key": "ROOT_KEY",
+        "codex_home": "/FAKE/.codex",
+        "hooks_path": "/FAKE/.codex/hooks.json",
+        "stop_count": 1,
+        "subagent_stop_count": 1,
+        "feature_enabled": true,
+        "requires_review": null,
+        "remediation": "Verify the exact cctally handler in Codex /hooks.",
+        "error": null,
+        "state": "installed_trust_unobservable"
+      },
+      {
+        "source_root_key": "ROOT_KEY",
+        "codex_home": "/FAKE/alt-codex",
+        "hooks_path": "/FAKE/alt-codex/hooks.json",
+        "stop_count": 0,
+        "subagent_stop_count": 0,
+        "feature_enabled": true,
+        "requires_review": false,
+        "remediation": "Fix the malformed hooks.json before cctally can manage it.",
+        "error": "hooks.json: `hooks.Stop` is not a list",
+        "state": "malformed"
+      }
+    ],
+    "installed_count": 1,
+    "error_count": 1
+  },
+  "legacy": {
+    "statusline_snippet": null,
+    "bespoke_hooks": {
+      "detected": false,
+      "settings_entries": [],
+      "files": []
+    }
+  },
+  "data": {
+    "path": "/FAKE/.local/share/cctally",
+    "size_bytes": 0
+  }
+}

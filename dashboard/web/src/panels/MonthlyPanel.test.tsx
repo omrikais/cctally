@@ -3,11 +3,17 @@
 // meaningful) + a whole-window footer total, opens its OWN monthly modal
 // (whole-section click AND the ⤢ ExpandButton), and its ShareIcon dispatches
 // openShareModal('monthly').
-import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MonthlyPanel } from './MonthlyPanel';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
+import * as store from '../store/store';
+import { BoardModeContext } from '../lib/boardModeContext';
+import { useReducedMotion } from '../hooks/useReducedMotion';
 import type { Envelope, ModelCostRow, PeriodRow } from '../types/envelope';
+
+vi.mock('../hooks/useReducedMotion');
 
 const models: ModelCostRow[] = [
   { model: 'claude-opus-4-8', display: 'opus-4-8', chip: 'opus', cost_usd: 6, cost_pct: 50 },
@@ -75,7 +81,7 @@ describe('<MonthlyPanel /> (#264 S2)', () => {
     expect(screen.getByText(/model split/i)).toBeInTheDocument();
   });
 
-  it('renders ALL rows (no 3-cap) so the inner scroll is meaningful, with a NOW pill', () => {
+  it('bento (default, no provider): renders ALL rows so the inner scroll is meaningful, with a NOW pill', () => {
     render(<MonthlyPanel />);
     expect(document.querySelectorAll('#panel-monthly .period').length).toBe(4);
     expect(document.querySelectorAll('#panel-monthly .pill-current').length).toBe(1);
@@ -106,5 +112,116 @@ describe('<MonthlyPanel /> (#264 S2)', () => {
     render(<MonthlyPanel />);
     fireEvent.click(screen.getByRole('button', { name: /Share Monthly report/i }));
     expect(getState().shareModal?.panel).toBe('monthly');
+  });
+});
+
+function renderAt(mode: 'stack' | 'bento') {
+  return render(
+    <BoardModeContext.Provider value={mode}>
+      <MonthlyPanel />
+    </BoardModeContext.Provider>,
+  );
+}
+
+describe('#293 S3 — stacked summary window', () => {
+  beforeEach(() => {
+    vi.mocked(useReducedMotion).mockReturnValue(false);
+  });
+
+  it('stack: slices to 3 newest rows, keeps the NOW pill', () => {
+    renderAt('stack');
+    expect(document.querySelectorAll('#panel-monthly .period').length).toBe(3);
+    expect(document.querySelectorAll('#panel-monthly .pill-current').length).toBe(1);
+  });
+
+  it('stack: shows a "+N more" button spelling the full N, and the whole-window total', () => {
+    renderAt('stack');
+    const more = document.querySelector('#panel-monthly .period-foot-more') as HTMLButtonElement;
+    expect(more).toBeTruthy();
+    expect(more.textContent).toContain('+1 more');
+    expect(more.getAttribute('aria-label')).toBe('Show all 4 months');
+    expect(document.querySelector('#panel-monthly .period-foot .total')?.textContent).toContain('560');
+  });
+
+  it('bento: renders ALL rows and NO "+N more" button', () => {
+    renderAt('bento');
+    expect(document.querySelectorAll('#panel-monthly .period').length).toBe(4);
+    expect(document.querySelector('#panel-monthly .period-foot-more')).toBeNull();
+  });
+
+  it('"+N more" opens the monthly modal EXACTLY once (click)', async () => {
+    const spy = vi.spyOn(store, 'dispatch');
+    renderAt('stack');
+    spy.mockClear();
+    await userEvent.click(document.querySelector('#panel-monthly .period-foot-more')!);
+    const opens = spy.mock.calls.filter(
+      ([a]) => (a as { type: string; kind?: string }).type === 'OPEN_MODAL'
+            && (a as { kind?: string }).kind === 'monthly',
+    );
+    expect(opens).toHaveLength(1);
+  });
+
+  it('"+N more" keydown Enter opens exactly once and does not double-fire the region', async () => {
+    const spy = vi.spyOn(store, 'dispatch');
+    renderAt('stack');
+    const more = document.querySelector('#panel-monthly .period-foot-more') as HTMLButtonElement;
+    more.focus();
+    spy.mockClear();
+    await userEvent.keyboard('{Enter}');
+    const opens = spy.mock.calls.filter(
+      ([a]) => (a as { type: string; kind?: string }).type === 'OPEN_MODAL'
+            && (a as { kind?: string }).kind === 'monthly',
+    );
+    expect(opens).toHaveLength(1);
+  });
+
+  it('keydown guard is Enter/Space-scoped: a non-activation key bubbles', () => {
+    const bubbled: string[] = [];
+    render(
+      <div onKeyDown={(e) => bubbled.push(e.key)}>
+        <BoardModeContext.Provider value="stack">
+          <MonthlyPanel />
+        </BoardModeContext.Provider>
+      </div>,
+    );
+    const more = document.querySelector('#panel-monthly .period-foot-more') as HTMLButtonElement;
+    fireEvent.keyDown(more, { key: 'Enter' });
+    fireEvent.keyDown(more, { key: 'ArrowDown' });
+    expect(bubbled).not.toContain('Enter');   // stopped
+    expect(bubbled).toContain('ArrowDown');    // allowed to bubble (Shift+Arrow reorder)
+  });
+
+  it('reduced motion: bars render at target width immediately (no width:0 frame)', () => {
+    vi.mocked(useReducedMotion).mockReturnValue(true);
+    renderAt('stack');
+    const firstBar = document.querySelector('#panel-monthly .model-stack > span') as HTMLElement;
+    expect(firstBar.style.width).not.toBe('0%');
+  });
+
+  it('reduced motion: rows revealed by a stack→bento transition do not animate (§4a)', () => {
+    vi.mocked(useReducedMotion).mockReturnValue(true);
+    const { rerender } = renderAt('stack');   // 3 rows visible
+    rerender(
+      <BoardModeContext.Provider value="bento">
+        <MonthlyPanel />
+      </BoardModeContext.Provider>,
+    );
+    const bars = document.querySelectorAll('#panel-monthly .model-stack > span');
+    expect(bars.length).toBeGreaterThan(0);
+    bars.forEach((b) => expect((b as HTMLElement).style.width).not.toBe('0%'));
+  });
+
+  it('"+N more" keydown Space opens exactly once', async () => {
+    const spy = vi.spyOn(store, 'dispatch');
+    renderAt('stack');
+    const more = document.querySelector('#panel-monthly .period-foot-more') as HTMLButtonElement;
+    more.focus();
+    spy.mockClear();
+    await userEvent.keyboard(' ');
+    const opens = spy.mock.calls.filter(
+      ([a]) => (a as { type: string; kind?: string }).type === 'OPEN_MODAL'
+            && (a as { kind?: string }).kind === 'monthly',
+    );
+    expect(opens).toHaveLength(1);
   });
 });

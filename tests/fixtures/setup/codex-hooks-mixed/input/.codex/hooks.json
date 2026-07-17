@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/REPO/bin/cctally hook-tick --foreground --source codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/REPO/bin/cctally hook-tick --foreground --source codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

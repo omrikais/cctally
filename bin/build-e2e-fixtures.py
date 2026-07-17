@@ -129,7 +129,7 @@ def _user_row(uuid, parent, sid, step, text, *, is_sidechain=False):
     return row
 
 
-def _asst_row(uuid, parent, sid, step, text, rng, *, is_sidechain=False):
+def _asst_row(uuid, parent, sid, step, text, rng, *, is_sidechain=False, model=MODEL):
     row = {
         "type": "assistant",
         "uuid": uuid,
@@ -141,7 +141,7 @@ def _asst_row(uuid, parent, sid, step, text, rng, *, is_sidechain=False):
         "message": {
             "id": f"msg_{uuid}",
             "role": "assistant",
-            "model": MODEL,
+            "model": model,
             "content": [{"type": "text", "text": text}],
             "usage": _usage(rng),
         },
@@ -378,6 +378,44 @@ def build_live(projects: pathlib.Path, rng: random.Random) -> dict:
     }
 
 
+SECOND_MODEL = "claude-sonnet-4-5"   # a real CLAUDE_MODEL_PRICING key, DISTINCT
+                                     # family from MODEL (opus) so the served
+                                     # Sessions table is mixed-model.
+
+
+def build_second_model(projects: pathlib.Path, rng: random.Random) -> dict:
+    """A tiny SECOND-model session (claude-sonnet-4-5) so the served Sessions
+    table renders mixed-model — i.e. the Model column is present, exercising
+    #293 S2 SESS-1's 7-column tight case at span-6 (1440). Structurally
+    minimal (4 turns); its only job is to make the client's
+    singleModelLabel(rows) predicate return null (a second distinct real model
+    across the session set). It is inert to the reader scenario specs (they
+    open sessions by explicit manifest id); it only bumps the conversations-
+    rail fixture count from 4 to 5 (asserted in smoke.spec.ts)."""
+    sid = "e2e-sonnet"
+    rows = []
+    prev = None
+    last_uuid = None
+    for i in range(4):
+        is_user = (i % 2 == 0)
+        uuid = _uuid(f"sonnet{'u' if is_user else 'a'}", i)
+        step = 800_000 + i * 10
+        if is_user:
+            rows.append(_user_row(uuid, prev, sid, step,
+                                  f"Second-model prompt {i} for the mixed-model Sessions column."))
+        else:
+            rows.append(_asst_row(uuid, prev, sid, step,
+                                  f"Second-model reply {i}.", rng, model=SECOND_MODEL))
+        prev = uuid
+        last_uuid = uuid
+    _write(projects / PROJECT_DIR / f"{sid}.jsonl", rows)
+    return {
+        "second_model_session_id": sid,
+        "second_model": SECOND_MODEL,
+        "second_model_last_uuid": last_uuid,
+    }
+
+
 def build(out: pathlib.Path) -> dict:
     scratch = out / "scratch"
     data = scratch / "data"
@@ -393,6 +431,7 @@ def build(out: pathlib.Path) -> dict:
     manifest.update(build_single(projects, rng))
     manifest.update(build_sidechain(projects, rng))
     manifest.update(build_live(projects, rng))
+    manifest.update(build_second_model(projects, rng))
     manifest["project_dir"] = PROJECT_DIR
     manifest["cwd"] = CWD
     manifest["page_size"] = PAGE

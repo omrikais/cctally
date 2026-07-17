@@ -174,6 +174,22 @@ def _weekly_payload(threshold):
     }
 
 
+def _quota_payload(threshold):
+    return {
+        "axis": "quota", "threshold": threshold, "kind": "actual",
+        "source": "codex", "source_root_key": "root-a",
+        "logical_limit_key": "limit-primary", "observed_slot": "primary",
+        "window_minutes": 300, "resets_at_utc": "2026-07-15T15:00:00+00:00",
+        "context": {
+            "source": "codex", "source_root_key": "root-a",
+            "logical_limit_key": "limit-primary", "observed_slot": "primary",
+            "window_minutes": 300, "resets_at_utc": "2026-07-15T15:00:00+00:00",
+            "kind": "actual", "qualifying_percent": float(threshold),
+            "projected_percent": None,
+        },
+    }
+
+
 def test_glue_linux_builds_notify_send(tmp_path, monkeypatch):
     core = _load("_cctally_core")
     monkeypatch.setattr(core, "LOG_DIR", tmp_path)
@@ -191,6 +207,21 @@ def test_glue_linux_builds_notify_send(tmp_path, monkeypatch):
     log = (tmp_path / "alerts.log").read_text().strip().split("\t")
     assert log[-1] == "critical"                        # appended severity column
     assert log[-2] == "queued"                          # status column unchanged
+
+
+def test_glue_quota_axis_uses_provider_neutral_text(tmp_path, monkeypatch):
+    core = _load("_cctally_core")
+    monkeypatch.setattr(core, "LOG_DIR", tmp_path)
+    alerts = _load("_cctally_alerts")
+    monkeypatch.setattr(alerts, "load_config", lambda *a, **k: {"alerts": {"enabled": True}})
+    sink = []
+    status = alerts._dispatch_alert_notification(
+        _quota_payload(95), popen_factory=_capturing_factory(sink),
+        mode="real", platform="linux", which_on_path=lambda n: n == "notify-send",
+    )
+    assert status == "queued"
+    assert sink[0][0] == "notify-send"
+    assert "quota" in sink[0][-2].lower()  # title, not generic fallback body
 
 
 def test_glue_linux_no_notify_send_is_no_notifier(tmp_path, monkeypatch):

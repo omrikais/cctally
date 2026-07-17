@@ -104,7 +104,6 @@ export function BlocksPanel() {
     <section
       className={'panel accent-blue' + (collapsed ? ' blocks-collapsed' : '')}
       id="panel-blocks"
-      tabIndex={0}
       role="region"
       aria-label="Blocks panel"
       data-panel-kind="blocks"

@@ -1,0 +1,1609 @@
+{
+  "capabilityStates": [
+    "supported",
+    "derived",
+    "unavailable",
+    "deferred",
+    "not_applicable"
+  ],
+  "combinedArithmetic": {
+    "additive": [
+      "usdCost",
+      "compatibleTokenTotals",
+      "explicitCombinedUsdBudget"
+    ],
+    "nonAdditive": [
+      "quotaUsedPercent",
+      "quotaReset",
+      "quotaWindow",
+      "dollarsPerPercent",
+      "percentMilestones"
+    ]
+  },
+  "corpusId": "cctally-codex-parity",
+  "fieldInventory": [
+    {
+      "path": "timestamp",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "type",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.id",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.session_id",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.cwd",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.git",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.source",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.source",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "stale-cache",
+      "types": [
+        "object"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.thread_source",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.forked_from_id",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.model_provider",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.context_window",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.model_context_window",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "modern-session-meta"
+    },
+    {
+      "path": "payload.turn_id",
+      "recordSelector": {
+        "type": "turn_context"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "turn-context"
+    },
+    {
+      "path": "payload.model",
+      "recordSelector": {
+        "type": "turn_context"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "turn-context"
+    },
+    {
+      "path": "payload.model_context_window",
+      "recordSelector": {
+        "type": "turn_context"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "turn-context"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.last_token_usage",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.last_token_usage.input_tokens",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.last_token_usage.cached_input_tokens",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.last_token_usage.output_tokens",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.last_token_usage.reasoning_output_tokens",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.total_token_usage.total_tokens",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.info.rate_limits",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "token-count-info-quota"
+    },
+    {
+      "path": "payload.rate_limits",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "object"
+      ],
+      "variant": "token-count-payload-quota"
+    },
+    {
+      "path": "payload.info.rate_limits.primary",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.secondary",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.credits",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.plan_type",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.limit_id",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.limit_name",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.individual_limit",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "number",
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.rate_limit_reached_type",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-full",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.primary.used_percent",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.primary.window_minutes",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.primary.resets_at",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.secondary.used_percent",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.secondary.window_minutes",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.info.rate_limits.secondary.resets_at",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.primary",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "object"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.secondary",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.credits",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.plan_type",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.limit_id",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "string"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.limit_name",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.individual_limit",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number",
+        "object",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.rate_limit_reached_type",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": false,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "string",
+        "null"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.primary.used_percent",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.primary.window_minutes",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.primary.resets_at",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.secondary.used_percent",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.secondary.window_minutes",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.rate_limits.secondary.resets_at",
+      "recordSelector": {
+        "payload.type": "token_count",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-quota-payload",
+      "types": [
+        "number"
+      ],
+      "variant": "quota-window"
+    },
+    {
+      "path": "payload.role",
+      "recordSelector": {
+        "payload.type": "message",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.content",
+      "recordSelector": {
+        "payload.type": "message",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.content",
+      "recordSelector": {
+        "payload.type": "reasoning",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.encrypted_content",
+      "recordSelector": {
+        "payload.type": "reasoning",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.summary",
+      "recordSelector": {
+        "payload.type": "reasoning",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.arguments",
+      "recordSelector": {
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.name",
+      "recordSelector": {
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.namespace",
+      "recordSelector": {
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "function_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.output",
+      "recordSelector": {
+        "payload.type": "function_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "custom_tool_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.input",
+      "recordSelector": {
+        "payload.type": "custom_tool_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.name",
+      "recordSelector": {
+        "payload.type": "custom_tool_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.status",
+      "recordSelector": {
+        "payload.type": "custom_tool_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "custom_tool_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.output",
+      "recordSelector": {
+        "payload.type": "custom_tool_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.arguments",
+      "recordSelector": {
+        "payload.type": "tool_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "tool_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.execution",
+      "recordSelector": {
+        "payload.type": "tool_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.status",
+      "recordSelector": {
+        "payload.type": "tool_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "tool_search_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.execution",
+      "recordSelector": {
+        "payload.type": "tool_search_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.status",
+      "recordSelector": {
+        "payload.type": "tool_search_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.tools",
+      "recordSelector": {
+        "payload.type": "tool_search_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.action",
+      "recordSelector": {
+        "payload.type": "web_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.status",
+      "recordSelector": {
+        "payload.type": "web_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "agent_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.message",
+      "recordSelector": {
+        "payload.type": "agent_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.phase",
+      "recordSelector": {
+        "payload.type": "agent_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "agent_reasoning",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.text",
+      "recordSelector": {
+        "payload.type": "agent_reasoning",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "task_started",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.collaboration_mode_kind",
+      "recordSelector": {
+        "payload.type": "task_started",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.model_context_window",
+      "recordSelector": {
+        "payload.type": "task_started",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.turn_id",
+      "recordSelector": {
+        "payload.type": "task_started",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "task_complete",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.duration_ms",
+      "recordSelector": {
+        "payload.type": "task_complete",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.last_agent_message",
+      "recordSelector": {
+        "payload.type": "task_complete",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.turn_id",
+      "recordSelector": {
+        "payload.type": "task_complete",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "context_compacted",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.changes",
+      "recordSelector": {
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.success",
+      "recordSelector": {
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "boolean"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.turn_id",
+      "recordSelector": {
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.duration",
+      "recordSelector": {
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "number"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.invocation",
+      "recordSelector": {
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.result",
+      "recordSelector": {
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "object"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.action",
+      "recordSelector": {
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.call_id",
+      "recordSelector": {
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.query",
+      "recordSelector": {
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.type",
+      "recordSelector": {
+        "payload.type": "user_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.images",
+      "recordSelector": {
+        "payload.type": "user_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.local_images",
+      "recordSelector": {
+        "payload.type": "user_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.message",
+      "recordSelector": {
+        "payload.type": "user_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "string"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload.text_elements",
+      "recordSelector": {
+        "payload.type": "user_message",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "modern-full",
+      "types": [
+        "array"
+      ],
+      "variant": "event-taxonomy"
+    },
+    {
+      "path": "payload",
+      "recordSelector": {
+        "type": "world_state"
+      },
+      "required": true,
+      "scenario": "unknown-records",
+      "types": [
+        "object"
+      ],
+      "variant": "world-state"
+    },
+    {
+      "path": "record_type",
+      "recordSelector": {
+        "record_type": "token_count"
+      },
+      "required": true,
+      "scenario": "legacy-envelope",
+      "types": [
+        "string"
+      ],
+      "variant": "legacy-envelope"
+    }
+  ],
+  "history": [
+    {
+      "change": "Initial synthetic snapshot from issue 294 audit",
+      "date": "2026-07-14",
+      "version": 1
+    }
+  ],
+  "identityFields": [
+    "version",
+    "source",
+    "resourceKind",
+    "sourceRootKey",
+    "nativeKey",
+    "parentKey"
+  ],
+  "observedAsOf": "2026-07-14",
+  "observedRecordTypes": [
+    "session_meta",
+    "turn_context",
+    "event_msg",
+    "response_item",
+    "world_state",
+    "record_type"
+  ],
+  "quotaWindowFields": [
+    "observedSlot",
+    "limitId",
+    "limitName",
+    "windowMinutes",
+    "usedPercent",
+    "resetsAtUtc",
+    "capturedAtUtc",
+    "planType",
+    "individualLimit",
+    "reachedType"
+  ],
+  "requiredCapabilityFamilies": [
+    "accounting",
+    "quota",
+    "analytics-share",
+    "dashboard",
+    "conversations",
+    "lifecycle-governance"
+  ],
+  "scenarios": {
+    "claude-collision": "rollouts/claude-collision.jsonl",
+    "claude-only": "rollouts/claude-only.jsonl",
+    "codex-only": "rollouts/codex-only.jsonl",
+    "duplicate-token-count": "rollouts/duplicate-token-count.jsonl",
+    "empty-source": "rollouts/empty-source.jsonl",
+    "legacy-envelope": "rollouts/legacy-envelope.jsonl",
+    "malformed-tail": "rollouts/malformed-tail.jsonl",
+    "metadata-only-tail": "rollouts/metadata-only-tail.jsonl",
+    "mixed-source": "rollouts/mixed-source.jsonl",
+    "modern-dual-location-conflict": "rollouts/modern-dual-location-conflict.jsonl",
+    "modern-full": "rollouts/modern-full.jsonl",
+    "modern-no-quota": "rollouts/modern-no-quota.jsonl",
+    "modern-partial-quota": "rollouts/modern-partial-quota.jsonl",
+    "modern-quota-payload": "rollouts/modern-quota-payload.jsonl",
+    "nested-child": "rollouts/nested-child.jsonl",
+    "nested-parent": "rollouts/nested-parent.jsonl",
+    "quota-kernel-history": "rollouts/quota-kernel-history.jsonl",
+    "root-a-collision": "rollouts/root-a-collision.jsonl",
+    "root-b-collision": "rollouts/root-b-collision.jsonl",
+    "secret-canary": "rollouts/secret-canary.jsonl",
+    "stale-cache": "rollouts/stale-cache.jsonl",
+    "unknown-records": "rollouts/unknown-records.jsonl"
+  },
+  "schemaPosture": {
+    "missingRateLimits": "degrade-quota-only",
+    "mode": "version-tolerant-feature-detection",
+    "partialFinalLine": "retain-valid-prefix",
+    "snapshotIsClosedSchema": false,
+    "unknownRecords": "ignore-or-preserve-without-aborting-accounting"
+  },
+  "schemaVersion": 1,
+  "sources": [
+    "claude",
+    "codex"
+  ]
+}

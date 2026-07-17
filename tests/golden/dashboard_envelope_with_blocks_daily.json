@@ -125,6 +125,8 @@
   "envelope_version": 2,
   "forecast": null,
   "generated_at": "2026-04-26T12:00:00Z",
+  "data_version": "",
+  "default_source": "claude",
   "header": {
     "dollar_per_pct": null,
     "five_hour_pct": null,
@@ -148,6 +150,59 @@
     "rows": [],
     "sort_key": "started_desc",
     "total": 0
+  },
+  "source_order": [
+    "claude",
+    "codex",
+    "all"
+  ],
+  "source_schema_version": 1,
+  "sources": {
+    "all": {
+      "availability": "unavailable",
+      "capabilities": {},
+      "data": null,
+      "data_version": "",
+      "freshness": "stale",
+      "last_success_at": null,
+      "warnings": [
+        {
+          "code": "source_build_failed",
+          "domain": "read_model",
+          "message": "Source data could not be built."
+        }
+      ]
+    },
+    "claude": {
+      "availability": "unavailable",
+      "capabilities": {},
+      "data": null,
+      "data_version": "",
+      "freshness": "stale",
+      "last_success_at": null,
+      "warnings": [
+        {
+          "code": "source_build_failed",
+          "domain": "read_model",
+          "message": "Source data could not be built."
+        }
+      ]
+    },
+    "codex": {
+      "availability": "unavailable",
+      "capabilities": {},
+      "data": null,
+      "data_version": "",
+      "freshness": "stale",
+      "last_success_at": null,
+      "warnings": [
+        {
+          "code": "source_build_failed",
+          "domain": "read_model",
+          "message": "Source data could not be built."
+        }
+      ]
+    }
   },
   "sync_age_s": null,
   "trend": null,

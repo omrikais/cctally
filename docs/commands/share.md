@@ -2,11 +2,36 @@
 
 > The dashboard ships a **GUI** for these flags — see [`share-v2.md`](share-v2.md). The two paths share the render kernel (`bin/_lib_share.py`), so output is byte-stable across them.
 
-`cctally` has a cross-command shareable-output surface: 8 reporting subcommands accept a `--format {md,html,svg}` flag that produces a self-contained artifact suitable for chat paste, GitHub issue, or screenshot. This page is the single reference for the flag surface; per-command pages document the per-command chart and table layouts.
+`cctally` has a cross-command shareable-output surface: the explicitly listed command families below accept a `--format {md,html,svg}` flag that produces a self-contained artifact suitable for chat paste, GitHub issue, or screenshot. This page is the single reference for the flag surface; per-command pages document the per-command chart and table layouts.
 
 ## Supported subcommands
 
-`report`, `daily`, `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`. Codex-* subcommands and forensic subcommands (`diff`, `cache-report`, etc.) are not in v1.
+`report`, `daily`, `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`, the four `codex-*` accounting reports, and the source-aware `project`, `diff`, `range-cost`, `cache-report`, and `report` routes. The dashboard has its own share UI; its source-selection/history work remains deferred.
+
+For each source-aware command, the flat command and both fixed subgroup forms
+(`cctally claude <command>` and `cctally codex <command>`) expose the same
+share flags, including `--reveal-projects`; normal share validation runs before
+provider reads or output-destination I/O.
+
+## Provider identity and privacy
+
+Source-aware CLI artifacts always identify their source. A direct Codex
+artifact shows `Codex`; an all-source artifact is composed as exactly two
+sections, Claude then Codex, rather than a synthetic `all` source. Empty
+sections render `No data`; unavailable sections render `Unavailable: <stable
+reason>` and are not silently dropped.
+
+Project anonymization remains fail-closed at the share kernel's single scrub
+chokepoint. Source-aware project cells carry opaque qualified identities, so
+two equal visible labels from different Codex roots receive different aliases
+(`project-1`, `project-2`) while the same identity is consistently aliased in
+table cells, charts, and columns. Artifacts must not expose a canonical root,
+home directory, source path/fingerprint, conversation key, or logical-limit
+key. `--reveal-projects` opts out only of the project-basename anonymization;
+it does not authorize exposing those internal identities.
+
+Review every rendered MD/HTML/SVG artifact before sharing. S3 covers CLI
+artifacts only: dashboard composer/history/source selection remains deferred.
 
 ## Flags
 

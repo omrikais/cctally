@@ -46,8 +46,8 @@ def _migration_handler(ns):
     raise AssertionError("migration 011 not registered")
 
 
-def test_pre_fixture_has_legacy_shape(ns):
-    """Sanity: pre.sqlite is at the pre-011 schema (no period column)."""
+def test_pre_fixture_has_legacy_shape_and_exact_pre_011_topology(ns):
+    """Sanity: pre.sqlite is the fully migrated pre-011 database shape."""
     assert PRE_DB.exists(), f"missing pre fixture: {PRE_DB}"
     conn = sqlite3.connect(PRE_DB)
     try:
@@ -55,6 +55,18 @@ def test_pre_fixture_has_legacy_shape(ns):
                       "projected_milestones"):
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             assert "period" not in cols, f"{table} cols={cols}"
+
+        markers = [
+            row[0]
+            for row in conn.execute("SELECT name FROM schema_migrations ORDER BY name")
+        ]
+        expected = [
+            migration.name
+            for migration in ns["_STATS_MIGRATIONS"]
+            if migration.seq <= 10
+        ]
+        assert markers == expected
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
     finally:
         conn.close()
 

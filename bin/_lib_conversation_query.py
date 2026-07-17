@@ -247,39 +247,55 @@ def _looks_like_command_plumbing(text) -> bool:
     return bool(text) and _CMD_FAMILY_RE.fullmatch(text) is not None
 
 
-def _session_titles_map(conn, session_ids):
-    """{sid: title} for the first non-marker, non-blank MAIN-session human line
-    per session (read-time, no migration). Windowed to the earliest 12 human
-    rows/session (rides idx_conv_session_ts); Python skips system markers. A
-    session whose first 12 human rows are all markers/blank is simply absent
-    (caller falls back). NOTE (Codex P1.2): the window ranks the full per-session
-    human partition before rn<=12 — confirmed index-ordered + bounded by the page
-    (≤200 sessions); per-session human counts are modest. If EXPLAIN QUERY PLAN
-    ever shows a temp B-tree sort here, switch to a per-session correlated
-    LIMIT 12 candidate fetch."""
+def _session_ai_titles_map(conn, session_ids):
+    """{sid: ai_title} for sessions carrying a TRUTHY ``conversation_ai_titles``
+    row (#193). The indexed lookup that was ``_session_titles_map``'s first step,
+    extracted so the fill (first-prompt only) and the rail's live overlay share
+    ONE source (#302 Q2-B, so stored-vs-live can never drift).
+
+    Falsey (empty-string) titles are DROPPED — ``ai_title`` is ``NOT NULL`` but
+    not non-empty-constrained, so this preserves the prior ``if at:`` guard
+    (Codex P1-3) and never suppresses the first-prompt fallback. Tolerates the
+    table being absent (pre-migration / :memory:) by returning {}."""
+    if not session_ids:
+        return {}
+    out = {}
+    try:
+        ph = ",".join("?" for _ in session_ids)
+        for sid, at in conn.execute(
+            f"SELECT session_id, ai_title FROM conversation_ai_titles "
+            f"WHERE session_id IN ({ph})", tuple(session_ids)
+        ).fetchall():
+            if at:
+                out[sid] = at
+    except sqlite3.OperationalError:
+        pass  # table absent -> {} (caller falls back to the first-prompt title)
+    return out
+
+
+def _session_first_prompt_titles_map(conn, session_ids):
+    """{sid: title} from the first non-marker, non-blank MAIN-session human line
+    per session — the expensive windowed ``conversation_messages`` scan #302
+    materializes onto the rollup. Windowed to the earliest 12 human rows/session
+    (rides idx_conv_session_ts); Python skips system markers / command plumbing /
+    compaction / notification / bash-echo / (while reingest is pending) skill
+    preamble, then strips the remote-control stamp. A session whose first 12
+    human rows are all markers/blank is simply absent (caller falls back).
+
+    Keeps its OWN first-wins guard (``if sid in titles: continue``, re-localized
+    to this helper's result dict): once a sid resolves a first-prompt title, later
+    rows in its 12-row window do not overwrite it (Codex P1-3).
+
+    NOTE (Codex P1.2): the window ranks the full per-session human partition before
+    rn<=12 — confirmed index-ordered + bounded by the page (≤200 sessions);
+    per-session human counts are modest. Honors ``_reingest_pending(conn)``'s
+    skip_skill_titles gate: while 005's reingest is pending a stale ``human`` row
+    may actually be an injected skill body, so skip those as title candidates
+    (gated on the flag so a genuine post-reingest human prompt starting with the
+    preamble stays a normal title — Codex code-review P2)."""
     if not session_ids:
         return {}
     titles = {}
-    # #193: AI title wins when present. Query the dedicated table first; the
-    # existing first-prompt scan below fills only sessions WITHOUT one (its
-    # ``if sid in titles: continue`` guard skips ai-title sessions for free).
-    try:
-        ph0 = ",".join("?" for _ in session_ids)
-        for sid, at in conn.execute(
-            f"SELECT session_id, ai_title FROM conversation_ai_titles "
-            f"WHERE session_id IN ({ph0})", tuple(session_ids)
-        ).fetchall():
-            if at:
-                titles[sid] = at
-    except sqlite3.OperationalError:
-        pass  # table absent (pre-migration / :memory:) -> fall through to first-prompt
-    # While 005's reingest is pending, a stale `human` row may actually be an
-    # injected skill body (a SessionStart skill can even lead the transcript) —
-    # skip those as title candidates so the rail never shows "Base directory for
-    # this skill: …" until the next sync reclassifies them to `meta` (which the
-    # entry_type='human' filter below then excludes). Gated on the flag for the
-    # same reason as the render fallback: a genuine post-reingest human prompt
-    # starting with the preamble stays a normal title (Codex code-review P2).
     skip_skill_titles = _reingest_pending(conn)
     ph = ",".join("?" for _ in session_ids)
     rows = conn.execute(
@@ -295,7 +311,7 @@ def _session_titles_map(conn, session_ids):
     ).fetchall()
     for sid, text in rows:
         if sid in titles:
-            continue                 # already resolved to the first non-marker
+            continue                 # first-wins: already resolved a title
         if _is_system_marker(text) or _looks_like_command_plumbing(text):
             continue
         if (_is_compaction_body(text) or _is_notification_body(text)
@@ -306,6 +322,21 @@ def _session_titles_map(conn, session_ids):
         t = _title_from_text(_strip_remote_control_prefix(text))   # #191: strip the stamp
         if t:
             titles[sid] = t
+    return titles
+
+
+def _session_titles_map(conn, session_ids):
+    """{sid: title} — the TRUTHY AI title wins, else the first-prompt title.
+    Contract UNCHANGED (the live/degraded rail branch still calls this as-is); now
+    single-sources the two seams (``_session_ai_titles_map`` +
+    ``_session_first_prompt_titles_map``) so the fill (first-prompt only) and the
+    rail overlay (AI live) cannot drift (#302). #193: the AI title wins when
+    present; the first-prompt scan fills only sessions WITHOUT one."""
+    if not session_ids:
+        return {}
+    titles = dict(_session_ai_titles_map(conn, session_ids))
+    for sid, t in _session_first_prompt_titles_map(conn, session_ids).items():
+        titles.setdefault(sid, t)   # AI title (truthy) wins; else first-prompt
     return titles
 
 
@@ -1065,8 +1096,10 @@ def _model_clause(conn, families):
     to everything. Family classification goes through ``_chip_for_model`` — the
     SAME classifier ``list_conversation_facets`` uses — so a family's facet count
     equals the rows its chip yields, and 'any appearance' semantics + correct
-    'other'-exclusion come for free. 'other' is unreachable as a selectable
-    family (never emitted by the client) and is simply never collected here.
+    'other'-exclusion come for free. 'other' is never emitted by the client, but a
+    hand-crafted models=other would collect unknown-family model ids
+    (``_chip_for_model`` returns 'other' for unrecognized ids); it is simply not a
+    normal selectable family.
 
     The fragment ANDs into any WHERE that has a ``session_id`` column, so the
     IDENTICAL string composes into both the ``conversation_sessions`` rollup and
@@ -1085,9 +1118,18 @@ def _model_clause(conn, families):
         # Present-but-empty: match nothing (NOT ("", []) which would be unfiltered).
         return "session_id IN (SELECT session_id FROM conversation_messages WHERE 0)", []
     ph = ",".join("?" for _ in ids)
+    # #301: pin the partial covering index idx_conversation_messages_model_session so
+    # this ?models= filter is an index-only model seek, never a heap-walk. The explicit
+    # `model IS NOT NULL AND model != ''` makes the partial index eligible (SQLite won't
+    # infer it from `model IN (...)`) — a no-op since ids are all non-null/non-empty.
+    # DISTINCT dropped: this is the RHS of `session_id IN (...)`, where duplicates don't
+    # affect membership, so dropping it is output-identical and removes a temp b-tree.
+    # INDEXED BY makes the covering plan deterministic even if the DB has been ANALYZEd.
     return (
-        "session_id IN (SELECT DISTINCT session_id FROM conversation_messages "
-        "WHERE session_id IS NOT NULL AND model IN (%s))" % ph,
+        "session_id IN (SELECT session_id FROM conversation_messages "
+        "INDEXED BY idx_conversation_messages_model_session "
+        "WHERE session_id IS NOT NULL AND model IS NOT NULL AND model != '' "
+        "AND model IN (%s))" % ph,
         ids,
     )
 
@@ -1199,17 +1241,21 @@ def _list_session_rows_rollup(conn, order, limit, offset, filters=None,
                               model_clause=("", [])):
     """FAST path: read the pre-aggregated rail rows straight from the
     conversation_sessions rollup (spec §3). No GROUP BY, no temp B-tree for the
-    ``recent`` sort. Returns (session_id, msg_count, started, last_activity)
-    tuples — the same shape the live aggregate yields, so the downstream
-    assembly is identical. The optional ``filters`` dict pushes the four-axis
-    browse predicate (date/project/cost/rebuild — all stored columns) into the
-    WHERE BEFORE LIMIT/OFFSET, so ``has_more``/``next_offset`` stay correct over
-    the filtered set. ``model_clause`` (#278 Theme C) is the precomputed model
+    ``recent`` sort. Returns (session_id, msg_count, started, last_activity,
+    cost_usd, project_label, git_branch, models_json, title) tuples — the 4
+    structural columns PLUS the #302 materialized enrichment the rail displays,
+    riding along on rows already fetched (same WHERE/ORDER BY/LIMIT/OFFSET). The
+    live aggregate yields only the 4 structural columns, so list_conversations
+    unpacks per branch. The optional ``filters`` dict pushes the four-axis browse
+    predicate (date/project/cost/rebuild — all stored columns) into the WHERE
+    BEFORE LIMIT/OFFSET, so ``has_more``/``next_offset`` stay correct over the
+    filtered set. ``model_clause`` (#278 Theme C) is the precomputed model
     predicate folded into the same WHERE."""
     where, params = _rollup_where(filters or _empty_filters(), model_clause)
     return conn.execute(
         "SELECT session_id, msg_count, "
-        "       started_utc AS started, last_activity_utc AS last_activity "
+        "       started_utc AS started, last_activity_utc AS last_activity, "
+        "       cost_usd, project_label, git_branch, models_json, title "
         "FROM conversation_sessions"
         + where +
         " ORDER BY " + order + " LIMIT ? OFFSET ?",
@@ -1255,16 +1301,22 @@ def list_conversation_facets(conn) -> dict:
     """Distinct projects (+ conversation counts) AND per-model-family session
     counts for the browse filter multi-selects (spec §2 + #278 Theme C).
 
-    ``projects`` reads the rollup; cheap GROUP BY. Empty/NULL project labels are
-    dropped (a no-cwd session stores '' and a not-yet-filled row stores NULL —
-    neither is a real selectable project). Sorted ascending by label so the
-    popover renders a stable list.
+    ``projects`` reads the ``conversation_sessions`` rollup; a cheap GROUP BY over
+    the stored ``project_label`` column. Empty/NULL project labels are dropped (a
+    no-cwd session stores '' and a not-yet-filled row stores NULL — neither is a
+    real selectable project). Sorted ascending by label so the popover renders a
+    stable list.
 
-    ``models`` folds distinct ``(session_id, model)`` pairs from
-    ``conversation_messages`` (where ``session_id IS NOT NULL`` — matching the
-    browse/live row sources, so a null-session row can't inflate a count above
-    the filterable sessions) to distinct ``(session_id, family)`` via
-    ``_chip_for_model``, then counts sessions per family. Fold-then-count, NOT
+    ``models``, by contrast, does NOT touch the rollup — it scans
+    ``conversation_messages`` directly. It folds distinct ``(session_id, model)``
+    pairs (where ``session_id IS NOT NULL AND model IS NOT NULL AND model != ''`` —
+    matching the browse/live row sources, so a null-session row can't inflate a
+    count above the filterable sessions) to distinct ``(session_id, family)`` via
+    ``_chip_for_model``, then counts sessions per family. Since #301 that DISTINCT
+    is an index-only walk of the partial covering index
+    ``idx_conversation_messages_model_session`` on
+    ``conversation_messages(model, session_id)`` (a full index->heap walk of the
+    whole table — ~22s cold on a large cache — before the index existed). Fold-then-count, NOT
     sum-of-per-model-distinct: a session that used two Opus point-releases counts
     ONCE under opus, and an Opus+Haiku session counts under BOTH. Families are
     emitted present-only, excluding ``other``, in a fixed display order so the
@@ -1338,7 +1390,11 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
     model_clause = _model_clause(conn, filters["models"])
     degraded = False
     sort_degraded = False
-    if _rollup_authoritative(conn):
+    # Compute the authoritative decision ONCE and reuse it for BOTH the row
+    # source and the enrichment split — the same predicate must key both, or a
+    # race between them could unpack a rollup 9-tuple as a live 4-tuple.
+    authoritative = _rollup_authoritative(conn)
+    if authoritative:
         order = _SORTS.get(sort, _SORTS["recent"])
         rows = _list_session_rows_rollup(conn, order, limit, offset, filters,
                                          model_clause)
@@ -1355,25 +1411,58 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
     has_more = len(rows) > limit
     rows = rows[:limit]
     session_ids = [r[0] for r in rows]
-    costs = _session_cost_map(conn, session_ids)
-    models = _session_models_map(conn, session_ids)
-    # cwd/git_branch as the latest non-null (reader posture), NOT a lexical MAX().
-    meta = _session_latest_meta_map(conn, session_ids)
-    titles = _session_titles_map(conn, session_ids)
-    conversations = [
-        {
-            "session_id": sid,
-            "title": titles.get(sid) or _project_label(meta.get(sid, (None, None))[0]) or sid,
-            "project_label": _project_label(meta.get(sid, (None, None))[0]),
-            "git_branch": meta.get(sid, (None, None))[1],
-            "started_utc": started,
-            "last_activity_utc": last_activity,
-            "msg_count": msg_count,
-            "cost_usd": round(costs.get(sid, 0.0), 6),
-            "models": models.get(sid, []),
-        }
-        for (sid, msg_count, started, last_activity) in rows
-    ]
+    if authoritative:
+        # FAST PATH (#302): cost/project/git_branch/models are materialized on
+        # the rollup rows, and title is the stored STABLE first-prompt title. The
+        # ONLY per-page read besides the rollup rows is the cheap indexed
+        # conversation_ai_titles overlay — NO _session_cost_map /
+        # _session_models_map / _session_latest_meta_map /
+        # _session_first_prompt_titles_map (each an O(messages-on-page)
+        # conversation_messages re-read). By `or`-associativity the emitted dict
+        # is byte-identical to the live branch below: rollup_title is the stored
+        # first-prompt title and project_label is the stored _project_label(cwd),
+        # so `ai or rollup_title or project_label or sid` == the live
+        # `titles.get(sid) or _project_label(cwd) or sid` (AI title wins live too).
+        ai = _session_ai_titles_map(conn, session_ids)
+        conversations = [
+            {
+                "session_id": sid,
+                "title": ai.get(sid) or rollup_title or project_label or sid,
+                "project_label": project_label,
+                "git_branch": git_branch,
+                "started_utc": started,
+                "last_activity_utc": last_activity,
+                "msg_count": msg_count,
+                # cost_usd is already 6dp-rounded at fill; keep the round for safety.
+                "cost_usd": round(cost_usd or 0.0, 6),
+                "models": _json.loads(models_json) if models_json else [],
+            }
+            for (sid, msg_count, started, last_activity, cost_usd,
+                 project_label, git_branch, models_json, rollup_title) in rows
+        ]
+    else:
+        # LIVE/DEGRADED branch (backfill pending / --no-sync): UNCHANGED — recompute
+        # enrichment at request time via the four retained maps over
+        # conversation_messages. Correct, possibly slower, never an empty rail.
+        costs = _session_cost_map(conn, session_ids)
+        models = _session_models_map(conn, session_ids)
+        # cwd/git_branch as the latest non-null (reader posture), NOT a lexical MAX().
+        meta = _session_latest_meta_map(conn, session_ids)
+        titles = _session_titles_map(conn, session_ids)
+        conversations = [
+            {
+                "session_id": sid,
+                "title": titles.get(sid) or _project_label(meta.get(sid, (None, None))[0]) or sid,
+                "project_label": _project_label(meta.get(sid, (None, None))[0]),
+                "git_branch": meta.get(sid, (None, None))[1],
+                "started_utc": started,
+                "last_activity_utc": last_activity,
+                "msg_count": msg_count,
+                "cost_usd": round(costs.get(sid, 0.0), 6),
+                "models": models.get(sid, []),
+            }
+            for (sid, msg_count, started, last_activity) in rows
+        ]
     page = {
         "next_offset": offset + len(conversations) if has_more else None,
         "has_more": has_more,

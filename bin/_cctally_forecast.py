@@ -1011,9 +1011,12 @@ def cmd_report(args: argparse.Namespace) -> int:
                 c._share_render_and_emit(snap, args)
                 return 0
             if args.json:
-                print(json.dumps(
-                    c.stamp_schema_version({"current": None, "trend": []}),
-                    indent=2))
+                payload = c.stamp_schema_version({"current": None, "trend": []})
+                sink = getattr(args, "_source_result_sink", None)
+                if sink is not None:
+                    sink(payload)
+                else:
+                    print(json.dumps(payload, indent=2))
             else:
                 print("No data yet. Add record-usage to your status line script (see record-usage --help).")
             return 0
@@ -1206,7 +1209,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             return 0
 
         if args.json:
-            print(json.dumps(c.stamp_schema_version(output), indent=2))
+            payload = c.stamp_schema_version(output)
+            sink = getattr(args, "_source_result_sink", None)
+            if sink is not None:
+                sink(payload)
+            else:
+                print(json.dumps(payload, indent=2))
             return 0
 
         if current_row is not None:

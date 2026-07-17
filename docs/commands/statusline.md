@@ -43,6 +43,12 @@ cctally statusline [-h]
 Reads the Claude Code hook payload from stdin. Writes the rendered line
 to stdout. Exits 0 on success.
 
+As a side effect, `statusline` also **persists** the `rate_limits` object
+Claude Code hands it (see *Usage persistence* below) — making the status
+line the primary automatic writer of weekly/5h usage snapshots. The
+persist is a pure side effect that runs after the line is rendered and can
+never change the rendered output or slow it down.
+
 ## Output line shape
 
 ```
@@ -243,6 +249,35 @@ cctally config get statusline.cost_source
 | 1 | Stdin is not parseable JSON, OR the root is not a JSON object (e.g. `[]`, `42`, `"x"`). The error message is on stderr; stdout is empty. |
 | 2 | argparse rejected a flag (e.g. `--cost-source ccusage`), OR `--config PATH` is missing / unreadable / non-object JSON. |
 
+## Usage persistence
+
+After rendering, `statusline` persists the `rate_limits` object Claude Code
+supplies on stdin into cctally's weekly/5h usage snapshots — through the same
+`record-usage` kernel, so it fires the same percent milestones, 3-tier alerts,
+and budget axis. This makes the **status line the primary automatic writer** of
+usage: because Claude Code sources the live `rate_limits` as a side effect of
+inference (not from `/api/oauth/usage`), usage keeps updating from active
+sessions even when Anthropic's OAuth usage endpoint is rate-limiting cctally's
+background poll. The OAuth poll (`hook-tick`) is now a **backfill** that only
+runs when the status line has not fed recently.
+
+Properties of the persist (all side effects — the rendered line never changes):
+
+- **Throttled.** At most one persist per short window, keyed off a dedicated
+  liveness marker (not snapshot age — the kernel dedups unchanged percentages
+  without refreshing the capture time, so an unchanged-value render still
+  refreshes the liveness marker).
+- **Concurrency-safe.** A cross-process lock plus an under-lock liveness
+  re-check mean simultaneous renders across sessions produce at most one
+  snapshot — no thundering herd of duplicate rows.
+- **Detached + fail-safe.** The write runs in a detached child so the render
+  stays fast, and the whole persist is guarded so it can never break rendering.
+  If `rate_limits` is absent (older Claude Code, or none supplied), the persist
+  is a clean no-op and the OAuth backfill covers that case.
+
+Snapshots written this way are labeled `source=statusline`; OAuth-fed rows are
+labeled `source=api`.
+
 ## Examples
 
 ```bash
@@ -267,7 +302,7 @@ cctally statusline --config /tmp/custom-cctally.json < /tmp/cc-hook-payload.json
 
 ## See also
 
-- `cctally record-usage` — writes the `rate_limits` snapshots that segment 5 reads from when stdin lacks them.
-- `cctally hook-tick` — internal CC hook that keeps the session-entry cache warm.
+- `cctally record-usage` — the shared kernel that both this command (see *Usage persistence*) and the OAuth backfill feed to write `rate_limits` snapshots; also usable directly for manual replay.
+- `cctally hook-tick` — internal CC hook that keeps the session-entry cache warm and runs the OAuth **backfill** poll (only when the status line has not fed recently, honoring `Retry-After` + `429` backoff).
 - `cctally blocks --active` — the same active-5h-block kernel statusline reuses for segments 2's `block` slot + segment 3's burn rate.
 - `cctally claude statusline` — canonical hierarchical form.

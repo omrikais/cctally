@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
 import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import _cctally_core
 import _lib_statusline
 from _cctally_core import _command_as_of, eprint, open_db
 
@@ -259,7 +261,233 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         eprint(f"cctally statusline: render failed: {exc}")
         return 1
     print(line)
+
+    # Persist the CC-provided rate_limits as the PRIMARY automatic usage
+    # writer (spec 2026-07-17-usage-statusline-fallback). This is a pure
+    # side effect that runs AFTER the line is printed and is FULLY guarded:
+    # persistence must NEVER break or slow rendering, so the whole call is
+    # wrapped here (the feeder itself forks detached + swallows its own
+    # errors, but this is belt-and-suspenders). Absence of rate_limits, a
+    # lost persist lock, or the throttle window all degrade to a clean
+    # no-op; the OAuth backfill covers the "no statusline feeding" case.
+    try:
+        _statusline_persist(inp)
+    except Exception:
+        pass
     return 0
+
+
+# =========================================================================
+# Statusline usage-persistence feeder (spec 2026-07-17)
+# =========================================================================
+#
+# The statusline is the PRIMARY automatic writer of weekly/5h usage
+# snapshots: it persists the CC-provided stdin `rate_limits` (which stay
+# current as a side effect of inference, even while /api/oauth/usage is
+# 429-banned) through the UNCHANGED cmd_record_usage kernel. Guards:
+#   - a cross-process flock (STATUSLINE_PERSIST_LOCK_PATH) so a multi-
+#     session render herd yields at most one snapshot per throttle window;
+#   - a liveness throttle keyed off the observation marker (NOT snapshot
+#     age — the kernel dedups unchanged percentages without refreshing
+#     captured_at, so snapshot age keeps growing while the statusline is
+#     actively feeding);
+#   - a DETACHED child so the render stays fast (cmd_record_usage may sync
+#     weekly cost, scan 5h totals, and evaluate budget axes).
+
+
+def _try_acquire_persist_lock() -> "int | None":
+    """Non-blocking acquire of the cross-process statusline persist lock.
+
+    Returns the open fd on success; ``None`` when another render already
+    holds it (EWOULDBLOCK) or the lock file can't be opened/locked — in
+    which case the caller renders without forking."""
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            _cctally_core.STATUSLINE_PERSIST_LOCK_PATH,
+            os.O_WRONLY | os.O_CREAT, 0o644,
+        )
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _release_persist_lock(fd: "int | None") -> None:
+    """Release + close a persist-lock fd (best-effort)."""
+    if fd is None or fd < 0:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _record_args(*, percent, resets_at, five_hour_percent, five_hour_resets_at,
+                 source):
+    """Build the cmd_record_usage Namespace the feeder passes to the kernel.
+
+    Percents pass through UNTOUCHED — the kernel's ingress `_normalize_percent`
+    is the single clamp site (no new clamp here). Epochs are stringified to
+    match the shape cmd_record_usage expects (`int(args.resets_at)`)."""
+    return argparse.Namespace(
+        percent=percent,
+        resets_at=str(int(resets_at)),
+        five_hour_percent=five_hour_percent,
+        five_hour_resets_at=(
+            str(int(five_hour_resets_at))
+            if five_hour_resets_at is not None else None
+        ),
+        source=source,
+    )
+
+
+def _fork_persist(args, parent_lock_fd: int) -> None:
+    """Run cmd_record_usage in a DETACHED child so the render stays fast.
+
+    Lifecycle (spec §2, Codex P2-3): single ``fork()``; **on fork() failure
+    SKIP persistence entirely** (unlike hook-tick we must NOT run inline —
+    cmd_record_usage may sync weekly cost / scan 5h totals / evaluate budget
+    axes, any of which would stall the render). In the child: ``setsid()``,
+    immediately redirect fd 0/1/2 to /dev/null (an inherited stdout pipe
+    would delay the statusline's EOF), then record and ``os._exit(0)``.
+
+    Lock contract: the PARENT releases only its OWN fd (in the caller's
+    ``finally``); the child CLOSES its inherited copy of the parent fd and
+    RE-ACQUIRES the persist lock on a fresh, INDEPENDENT fd (blocking) — so
+    the parent's release cannot race a second render into a duplicate insert.
+    The child then re-checks the observation marker UNDER that held lock and
+    records only if still stale, which is the authoritative herd guard: a
+    concurrent render's non-blocking acquire fails until this child has
+    recorded AND touched the marker."""
+    c = _cctally()
+    try:
+        pid = os.fork()
+    except OSError:
+        # Out of pids/memory — skip persistence, render fast (spec §2).
+        return
+    if pid > 0:
+        # Parent: return at once; the caller's finally releases parent_lock_fd.
+        return
+
+    # --- child ---
+    try:
+        # Drop the inherited copy of the parent's lock fd so only the parent's
+        # own fd holds the shared lock; the child owns the lock ONLY via the
+        # independent fd re-acquired below (avoids a self-block on our own
+        # inherited exclusive lock).
+        try:
+            os.close(parent_lock_fd)
+        except OSError:
+            pass
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        # Detach stdio immediately so nothing keeps the render's pipe open.
+        try:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            if devnull > 2:
+                os.close(devnull)
+        except OSError:
+            pass
+
+        child_fd = -1
+        try:
+            child_fd = os.open(
+                _cctally_core.STATUSLINE_PERSIST_LOCK_PATH,
+                os.O_WRONLY | os.O_CREAT, 0o644,
+            )
+            # BLOCKING: wait for the parent to release its copy, then hold the
+            # lock across record + marker-touch so a concurrent render can't
+            # observe a stale marker and double-insert.
+            fcntl.flock(child_fd, fcntl.LOCK_EX)
+        except OSError:
+            child_fd = -1
+        try:
+            throttle = float(_cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS)
+            if c._statusline_observe_age_seconds() >= throttle:
+                c.cmd_record_usage(args)
+                # Touch the liveness marker even on a dedup no-op return.
+                c._statusline_observe_touch()
+        finally:
+            if child_fd >= 0:
+                try:
+                    fcntl.flock(child_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(child_fd)
+                except OSError:
+                    pass
+    except BaseException:
+        # A detached child must never surface a traceback onto the render.
+        pass
+    finally:
+        os._exit(0)
+
+
+def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
+    """Persist the parsed CC `rate_limits` (the primary automatic writer).
+
+    Fully guarded — cmd_statusline also wraps this in try/except, and every
+    step degrades to a clean no-op. ``sync_for_test=True`` runs the kernel
+    INLINE (no fork) so persistence tests are deterministic and no detached
+    child outlives fixture cleanup."""
+    c = _cctally()
+    # 1. Require a usable 7d reading. Absence is a clean no-op (older CC / CC
+    #    not supplying rate_limits — the OAuth backfill covers that case).
+    if parsed.rate_limits_7d_pct is None or parsed.rate_limits_7d_resets_at is None:
+        return
+    # 2. 5h pair-gate: pass both or neither. An inactive 5h window arrives as
+    #    {used_percentage: 0, resets_at: null}; the parser surfaces the two
+    #    fields independently, so drop the whole pair when either is missing
+    #    (mirrors both OAuth paths).
+    five_pct = parsed.rate_limits_5h_pct
+    five_reset = parsed.rate_limits_5h_resets_at
+    if five_pct is None or five_reset is None:
+        five_pct = None
+        five_reset = None
+    # 3. Non-blocking cross-process lock — losers render without forking.
+    lock_fd = _try_acquire_persist_lock()
+    if lock_fd is None:
+        return
+    try:
+        # 4. Liveness throttle UNDER the lock (observation marker, NOT
+        #    snapshot age).
+        throttle = float(_cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS)
+        if c._statusline_observe_age_seconds() < throttle:
+            return
+        args = _record_args(
+            percent=parsed.rate_limits_7d_pct,
+            resets_at=parsed.rate_limits_7d_resets_at,
+            five_hour_percent=five_pct,
+            five_hour_resets_at=five_reset,
+            source="statusline",
+        )
+        # 5. Run the kernel — detached unless test-sync.
+        if sync_for_test:
+            c.cmd_record_usage(args)
+            # Touch the liveness marker even on a dedup no-op return.
+            c._statusline_observe_touch()
+            return
+        _fork_persist(args, lock_fd)
+    finally:
+        _release_persist_lock(lock_fd)
 
 
 def _resolve_context_window(model_id, warn_once) -> "int | None":

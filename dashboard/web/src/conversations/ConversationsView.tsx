@@ -2,7 +2,7 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
-import { useIsMobile } from '../hooks/useIsMobile';
+import { useCompactWorkspace } from '../hooks/useCompactWorkspace';
 import { useIsWide } from '../hooks/useIsWide';
 import { useConversationOutline } from '../hooks/useConversationOutline';
 import { useConversationLiveTail } from '../hooks/useConversationLiveTail';
@@ -26,6 +26,10 @@ export function ConversationsView() {
   // below). Subscribed here so an OPEN_COMPARE / SWAP_COMPARE / CLOSE_COMPARE
   // re-renders the view.
   const compare = useSyncExternalStore(subscribeStore, () => getState().compare);
+  // #304 S2 (F2) — pick-mode must survive on compact: the rail owns the whole
+  // pick UI, so the compact branch below renders it whenever a pick is in
+  // flight, even though the anchor stays selected (cancel returns to it).
+  const comparePick = useSyncExternalStore(subscribeStore, () => getState().comparePick);
   const outlineOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineOpen);
   // #217 S3 E6(b) — the persisted outline column width, driven into the grid as a
   // CSS custom property on the desktop shell only.
@@ -35,11 +39,15 @@ export function ConversationsView() {
   // transcript on open; the desktop column below keeps gating on convOutlineOpen.
   const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
   const env = useSnapshot();
-  const isMobile = useIsMobile();
+  // #304 S1 — the workspace is single-pane (rail OR reader) at/below 880px, where
+  // a second pane would crush the reader (rail 340 + shell ~44 leaves <480px), and
+  // two-pane above. Split from the old 640 `isMobile` cutover so 641–880 stops
+  // rendering the crushed two-pane shell.
+  const compactWorkspace = useCompactWorkspace();
   // #228 S3 F1 — the outline rides as a SHEET across the whole no-column band
   // (≤1100px, keyed on !isWide), not just on mobile (≤640px). The persistent
-  // column + resizer render only when wide. Distinct from `isMobile` (the
-  // single-pane / 44px-target / two-row-header cutover) — see §8.
+  // column + resizer render only when wide. Distinct from `compactWorkspace` (the
+  // single-pane cutover at 880) — see §8.
   const isWide = useIsWide();
   // #228 S3 F1 (Codex P3) — `convOutlineMobileOpen` is ephemeral but only resets
   // on a conversation switch, so a tablet→wide→tablet resize would resurrect the
@@ -79,13 +87,13 @@ export function ConversationsView() {
     );
   }
 
-  // #217 S7 F10 — comparison takes over the workspace. On desktop the rail
-  // stays visible (so the user can pick a different pair or click away — the
-  // reverse-clear actions drop `compare`); on mobile the comparison goes
-  // full-width (the rail is hidden, matching the single-reader mobile flow). The
-  // ComparisonView itself owns its header's ✕ close (CLOSE_COMPARE).
+  // #217 S7 F10 — comparison takes over the workspace. In two-pane widths the
+  // rail stays visible (so the user can pick a different pair or click away — the
+  // reverse-clear actions drop `compare`); in the compact-workspace band the
+  // comparison goes full-width (the rail is hidden, matching the single-reader
+  // flow). The ComparisonView itself owns its header's ✕ close (CLOSE_COMPARE).
   if (compare !== null) {
-    if (isMobile) {
+    if (compactWorkspace) {
       return (
         <div className="conv-view conv-view--mobile conv-view--compare">
           <ComparisonView a={compare.a} b={compare.b} />
@@ -133,12 +141,17 @@ export function ConversationsView() {
     )
   );
 
-  // Mobile: rail until a conversation is chosen, then reader (+ back) with the
-  // outline as the slide-over sheet (always a sheet ≤640px since !isWide holds).
-  if (isMobile) {
+  // #304 S1 — compact workspace (≤880px): rail until a conversation is chosen,
+  // then reader (+ back) with the outline as the slide-over sheet (a sheet across
+  // the whole ≤880 band since !isWide holds there). The `--mobile` modifier class
+  // is retained (component + CSS + tests reference it); the single-pane grid CSS
+  // is class-driven off it, self-gating to this branch.
+  // #304 S2 — comparePick also selects the rail here so the pick banner is
+  // reachable in single-pane (the anchor selection is preserved for cancel).
+  if (compactWorkspace) {
     return (
       <div className="conv-view conv-view--mobile">
-        {selected == null
+        {comparePick != null || selected == null
           ? <ConversationRail />
           : <>
               <ConversationReader sessionId={selected} outline={outline} growthNonce={growthNonce} live={live} mobileBack />
@@ -199,6 +212,15 @@ export const CONVERSATIONS_BINDINGS = [
     // input mode) gates both, per the global-hotkeys-need-modal-guard rule.
     key: '/', scope: 'global' as const, view: 'conversations' as const, when: inView,
     action: () => {
+      // #304 S2 (Codex F3) — during comparison pick-mode the rail is the
+      // foreground activity (on compact it is the ONLY pane), so '/' targets
+      // the pick-target search instead of opening the find bar of a possibly
+      // unmounted reader (convFindOpen would then pop it open on cancel).
+      if (getState().comparePick) {
+        const el = document.querySelector<HTMLInputElement>('.conv-rail-search input');
+        el?.focus(); el?.select();
+        return;
+      }
       if (getState().selectedConversationId) {
         dispatch({ type: 'OPEN_CONV_FIND' });
         return;

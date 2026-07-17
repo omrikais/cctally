@@ -1,0 +1,1 @@
+cctally codex quota: --reset-at rejects date-only input; include HH:MM

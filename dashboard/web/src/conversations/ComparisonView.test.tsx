@@ -105,4 +105,22 @@ describe('ComparisonView', () => {
     render(<ComparisonView a="A" b="B" />);
     await waitFor(() => expect(screen.getByText(/not (be )?found|couldn't load/i)).toBeInTheDocument());
   });
+
+  // #304 S2 (F5 / Codex F11) — Run identity must be programmatically associated
+  // per side: within each .conv-cmp-head-side the tag is real (non-hidden) text
+  // preceding the title, A then B in document order.
+  it('associates Run A / Run B with each side title for AT', async () => {
+    mockFetch();
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    const { container } = render(<ComparisonView a="A" b="B" />);
+    await waitFor(() => expect(screen.getByText(/Comparing/i)).toBeInTheDocument());
+    const sides = Array.from(container.querySelectorAll('.conv-cmp-head-side'));
+    expect(sides).toHaveLength(2);
+    const [a, b] = sides.map((s) => s.querySelector('.conv-cmp-head-side-tag')!);
+    expect(a.textContent).toBe('Run A');
+    expect(b.textContent).toBe('Run B');
+    expect(a.getAttribute('aria-hidden')).toBeNull();
+    expect(b.getAttribute('aria-hidden')).toBeNull();
+    for (const s of sides) expect(s.querySelector('.conv-cmp-head-side-name')).not.toBeNull();
+  });
 });

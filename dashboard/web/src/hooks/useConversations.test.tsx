@@ -5,10 +5,14 @@ import { _resetForTests, dispatch, getState } from '../store/store';
 import { clearRailPrefs } from '../store/conversationRailPrefs';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick
-// signal the first-page effect keys on) deterministically between renders.
+// heartbeat) and `data_version` (the #305 change signal the first-page effect
+// now keys on) deterministically between renders. `mockDataVersion` defaults to
+// `undefined` so `revalToken` falls back to `generated_at` — keeping the
+// pre-#305 tick tests on the every-tick path.
 let mockGeneratedAt = 't0';
+let mockDataVersion: string | undefined;
 vi.mock('./useSnapshot', () => ({
-  useSnapshot: () => ({ generated_at: mockGeneratedAt }),
+  useSnapshot: () => ({ generated_at: mockGeneratedAt, data_version: mockDataVersion }),
 }));
 
 const page1 = {
@@ -26,7 +30,7 @@ function mockFetchOnce(body: unknown, status = 200) {
   } as Response);
 }
 
-beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; clearRailPrefs(); _resetForTests(); });
+beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; mockDataVersion = undefined; clearRailPrefs(); _resetForTests(); });
 afterEach(() => { vi.restoreAllMocks(); clearRailPrefs(); _resetForTests(); });
 
 // A full first page (exactly PAGE=50 rows) with more to come. Generated
@@ -290,5 +294,69 @@ describe('useConversations', () => {
     await act(async () => { result.current.retry(); });
     await waitFor(() => expect(result.current.rows).toHaveLength(1));
     expect(result.current.error).toBeNull();
+  });
+
+  // #305 — the page-1 revalidation now keys on the change signal (revalToken),
+  // not the 5s generated_at heartbeat. A finished/static rail refetches once and
+  // stays quiet until the underlying data actually changes.
+  it('with data_version present, a generated_at-only tick does NOT refetch page 1 (#305)', async () => {
+    mockDataVersion = 'v0';
+    mockFetchOnce(page1);                       // mount load only
+    const { result, rerender } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    const callsAfterMount = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // SSE heartbeat: generated_at advances, data_version stays flat → no refetch.
+    mockGeneratedAt = 't1';
+    await act(async () => { rerender(); await Promise.resolve(); });
+    await act(async () => { await Promise.resolve(); });   // give an erroneous refetch a chance
+
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsAfterMount);
+  });
+
+  it('a data_version change DOES refetch page 1 (#305)', async () => {
+    mockDataVersion = 'v0';
+    mockFetchOnce(page1);                        // mount load
+    const { result, rerender } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    const callsBefore = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // A real change signal: data_version advances (generated_at held fixed at 't0').
+    mockFetchOnce(page1);
+    mockDataVersion = 'v1';
+    await act(async () => { rerender(); await Promise.resolve(); });
+    await waitFor(() => {
+      expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(callsBefore);
+    });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(url).toContain('offset=0');           // a page-1 revalidation
+  });
+
+  it('a data_version change during the initial fetch aborts req1; only req2 populates (no residual-B, #305)', async () => {
+    mockDataVersion = 'v0';
+    let req1Aborted = false;
+    // Hold the initial page-1 fetch pending; reject with AbortError when aborted
+    // (matching a real aborted fetch — fetchJson's .catch treats it via isAbortError).
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      (_url: string, opts?: { signal?: AbortSignal }) =>
+        new Promise((_res, rej) => {
+          opts?.signal?.addEventListener('abort', () => { req1Aborted = true; rej(new DOMException('Aborted', 'AbortError')); });
+        }),
+    );
+    const { result, rerender } = renderHook(() => useConversations());
+    // req1 is in flight, nothing populated yet.
+    await waitFor(() => expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1));
+    expect(result.current.rows).toHaveLength(0);
+
+    // data_version changes WHILE req1 is unresolved → the effect re-fires: its
+    // cleanup aborts req1 (via ctlRef) and it issues req2. Queue req2's response.
+    const freshPage = { conversations: [{ session_id: 'fresh', project_label: 'np', git_branch: null, started_utc: '2026-03-01T00:00:00Z', last_activity_utc: '2026-03-01T01:00:00Z', msg_count: 2, cost_usd: 0.5, models: ['opus'] }], page: { next_offset: null, has_more: false } };
+    mockFetchOnce(freshPage);
+    mockDataVersion = 'v1';
+    await act(async () => { rerender(); await Promise.resolve(); });
+
+    // req1 was aborted; only req2 (the fresh page) populated the list.
+    await waitFor(() => expect(result.current.rows.map((r) => r.session_id)).toEqual(['fresh']));
+    expect(req1Aborted).toBe(true);
   });
 });

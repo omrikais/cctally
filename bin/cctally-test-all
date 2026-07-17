@@ -96,6 +96,17 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # ---- harness discovery (read-only; safe in plan mode) ------------------
 # reconcile is kept in final_harnesses ONLY as a summary-ordering device so it
 # stays the last row; it now runs inside the pool, not as a serial phase.
+# S2's canonical nested quota surface is a required deterministic harness.
+# Discovery still supplies its ordering, while this guard prevents an
+# accidental executable-bit regression from silently dropping it from every
+# bundle run.
+required_harnesses=(codex-quota source-aware)
+for required in "${required_harnesses[@]}"; do
+    if [ ! -x "$REPO_ROOT/bin/cctally-${required}-test" ]; then
+        echo "cctally-test-all: required harness is not executable: $required" >&2
+        exit 2
+    fi
+done
 final_harnesses=(reconcile)
 parallel_harnesses=()
 final_set=" ${final_harnesses[*]} "

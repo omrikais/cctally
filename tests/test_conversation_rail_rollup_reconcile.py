@@ -91,11 +91,22 @@ def _entry(conn, *, source_path, line_offset, model, msg_id, req_id,
     )
 
 
+def _ai_title(conn, *, session_id, ai_title):
+    conn.execute(
+        "INSERT OR REPLACE INTO conversation_ai_titles "
+        "(session_id, ai_title, source_path, byte_offset) VALUES (?,?,?,?)",
+        (session_id, ai_title, "seed.jsonl", 0))
+
+
 def _seed(conn):
     """Several sessions with varied msg_count / started / last_activity so the
-    recent (MAX) and oldest (MIN) orderings, pagination, and cost/title/meta
-    columns are all exercised — not a single-row degenerate rail."""
+    recent (MAX) and oldest (MIN) orderings, pagination, and every enrichment
+    axis (#302: git_branch incl. a NULL, a multi-model MAIN-FIRST session, an
+    empty-model session, an AI-title session vs a first-prompt-only session) are
+    all exercised — a real (non-vacuous) byte-identity guard for
+    title/models/git_branch/cost/project across the rollup and live branches."""
     # s1: human prompt + one assistant turn with cost; spans two timestamps.
+    # git_branch "main", first-prompt-only title.
     _msg(conn, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi",
          cwd="/home/u/proj", git_branch="main")
@@ -105,10 +116,13 @@ def _seed(conn):
          model=_MODEL, msg_id="m1", req_id="r1")
     _entry(conn, source_path="a.jsonl", line_offset=1, model=_MODEL,
            msg_id="m1", req_id="r1", inp=1000, out=500)
-    # s2: human-only, latest activity (sorts first under recent).
+    # s2: human-only, latest activity (sorts first under recent), git_branch
+    # "dev". Carries an AI TITLE -> the rollup branch must overlay it LIVE over
+    # the stored first-prompt title (Q2-B) and match the live branch exactly.
     _msg(conn, session_id="s2", uuid="h2", source_path="b.jsonl", byte_offset=0,
          timestamp_utc="2026-06-04T00:00:00Z", entry_type="human",
          text="how do I set a budget", cwd="/home/u/other", git_branch="dev")
+    _ai_title(conn, session_id="s2", ai_title="Budget setup help")
     # s3: earliest start (sorts first under oldest), three rows.
     for i, off in enumerate((0, 1, 2)):
         _msg(conn, session_id="s3", uuid=f"c{i}", source_path="c.jsonl",
@@ -119,13 +133,31 @@ def _seed(conn):
              git_branch="main")
     # A NULL session_id row must NOT contribute a rail row (the recompute
     # GROUP BY filters NULLs by construction; the fallback's WHERE clause does
-    # the same) — so it is excluded by BOTH branches, leaving 4 rail sessions.
+    # the same) — so it is excluded by BOTH branches.
     _msg(conn, session_id=None, uuid="nx", source_path="d.jsonl", byte_offset=0,
          timestamp_utc="2026-06-09T00:00:00Z", entry_type="human", text="orphan")
-    # s5: a single-row session (msg_count == 1) at a mid timestamp.
+    # s5: a single-row session (msg_count == 1) at a mid timestamp. NO cwd (->
+    # project_label ''), NO git_branch (-> NULL), NO model (-> models_json NULL).
     _msg(conn, session_id="s5", uuid="e1", source_path="e.jsonl", byte_offset=0,
          timestamp_utc="2026-06-03T12:00:00Z", entry_type="human",
-         text="quick one", cwd="/home/u/proj")
+         text="quick one")
+    # s6: a MULTI-MODEL session — a MAIN opus turn + a SIDECHAIN haiku turn. The
+    # main-first ordering must put opus BEFORE haiku even though haiku sorts
+    # alphabetically first, so json.loads(models_json) == [opus, haiku] proves the
+    # stored order round-trips (not a plain sorted()).
+    _msg(conn, session_id="s6", uuid="f0", source_path="f.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-03T18:00:00Z", entry_type="human",
+         text="multi model please", cwd="/home/u/proj", git_branch="main")
+    _msg(conn, session_id="s6", uuid="f1", source_path="f.jsonl", byte_offset=1,
+         timestamp_utc="2026-06-03T18:00:05Z", entry_type="assistant",
+         text="ok", blocks_json='[{"kind":"text","text":"ok"}]',
+         model=_MODEL, msg_id="m6", req_id="r6", is_sidechain=0)
+    _entry(conn, source_path="f.jsonl", line_offset=1, model=_MODEL,
+           msg_id="m6", req_id="r6", inp=200, out=100)
+    _msg(conn, session_id="s6", uuid="f2", source_path="f.jsonl", byte_offset=2,
+         timestamp_utc="2026-06-03T18:00:10Z", entry_type="assistant",
+         text="sub", blocks_json='[{"kind":"text","text":"sub"}]',
+         model="claude-haiku-4-5", msg_id="m6b", req_id="r6b", is_sidechain=1)
     conn.commit()
 
 
@@ -206,7 +238,7 @@ def test_rollup_read_matches_live_aggregate(tmp_path, monkeypatch):
         assert cc._conversation_sessions_backfill_pending(conn) is False
         assert conn.execute(
             "SELECT COUNT(*) FROM conversation_sessions"
-        ).fetchone()[0] == 4  # 4 non-null sessions (the NULL row is excluded)
+        ).fetchone()[0] == 5  # 5 non-null sessions (the NULL row is excluded)
 
         rollup = _dump(cq, conn)
         assert rollup == reference, "rollup read diverged from live GROUP BY"
@@ -250,7 +282,7 @@ def test_fallback_branch_matches_live_aggregate(tmp_path, monkeypatch):
         # The fallback rail is non-empty (proves it did NOT read the empty
         # rollup) and byte-identical to the populated-rollup reference.
         first = json.loads(fallback["recent-50-0"])
-        assert len(first["conversations"]) == 4
+        assert len(first["conversations"]) == 5
         assert fallback == reference, "fallback read diverged from rollup read"
         # The rollup-only sorts degrade to recent + page.sort_degraded here.
         _assert_degrade_path(cq, conn)

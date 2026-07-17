@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
+import { revalToken } from '../lib/revalToken';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
 import { planTrim } from '../conversations/windowedCap';
 import { VIRTUAL_INDEX_BASE, applyFirstItemDelta } from '../conversations/virtuosoFirstIndex';
@@ -789,13 +790,23 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // (below), so an idle unchanged reader issues no per-tick request. When live-
   // tail is off/passive/degraded (`live` never true) the global tick stays as the
   // fallback, made cheap by the #278 backend assembly memo.
+  // #303: gate that non-live fallback on the change signal `revalToken(env)` (the
+  // all-inputs `data_version`, falling back to `generated_at`) instead of the raw
+  // 5s `generated_at` heartbeat — mirroring #300's outline gating — so a
+  // finished/static conversation body polls once and stays quiet until its data
+  // actually changes. This narrows only WHEN the effect fires; `pollTail`'s body
+  // (the empty-poll no-op, the `corpusChanged` `tailRevision` bump, and the
+  // bottom-edge/overlap guards) is unchanged. Documented residual (spec §Revision):
+  // a human-turn-only or AI-title-only ingest bumps no signature leg, so with
+  // live-tail off it lags until the next signature-moving change — default
+  // live-tail=ON users use the untouched `growthNonce` path.
   const env = useSnapshot();
-  const generatedAt = env?.generated_at ?? '';
+  const token = revalToken(env);
   useEffect(() => {
     if (live) return;                       // live-tail covers growth; memo-backed fallback only when off
     if (detailRef.current && !hasMoreRef.current) void pollTail();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generatedAt, live]);
+  }, [token, live]);
 
   // #278: genuine per-conversation growth push (from the shared live-tail hook,
   // via the `ready`/`tail` events). pollTail self-guards to the bottom edge

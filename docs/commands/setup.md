@@ -1,7 +1,10 @@
 # `cctally setup`
 
-Install cctally into Claude Code. Symlinks user-facing binaries into
-`~/.local/bin/` and adds hook entries to `~/.claude/settings.json` (additive).
+Install cctally into each available local provider. It symlinks user-facing
+binaries into `~/.local/bin/`, adds Claude hook entries to
+`~/.claude/settings.json` when Claude Code is initialized, and independently
+manages native Codex handlers in every configured Codex home. A Codex-only
+machine does not need a `~/.claude/` directory.
 
 ## Modes
 
@@ -118,6 +121,66 @@ run in the background child.
 `command` field: a path whose basename is `cctally` followed by `hook-tick`.
 Both bare and absolute paths match; quoted paths (with spaces) match too.
 
+## Codex quota lifecycle hooks
+
+When Codex homes are available, setup also manages native Codex quota hooks.
+It resolves the comma-separated `$CODEX_HOME` value, or the default Codex home
+only when that variable is unset or blank. An explicit override with no valid
+home does not fall back to the default. Each detected home is handled
+independently at `<codex-home>/hooks.json`.
+
+On install, setup additively adds one owned command handler to each `Stop` and
+`SubagentStop` event:
+
+```text
+<absolute-installed-cctally> hook-tick --foreground --source codex
+```
+
+The handler has a 30-second Codex timeout. It runs a bounded, local lifecycle
+tick: at most one all-root Codex cache sync, quota reconciliation, due-root
+quota alert evaluation, and existing Codex budget alert evaluation. It makes
+no network request or provider-live refresh. A per-root 15-second throttle and
+non-blocking locks make concurrent or unchanged hook fires successful no-ops;
+an all-root sync can still update reporting state for throttled or contended
+roots, but only due roots can claim quota alerts in that tick.
+
+`setup` is the installation consent boundary, so this Codex hook integration is
+enabled by default. It validates every existing `hooks.json` before changing
+any setup-managed file, preserves unrelated keys, matcher groups, and
+handlers, and performs the authoritative reread, validation, reconciliation,
+backup decision, and atomic replacement while holding that root's writer lock.
+The resulting home/file permissions are `0700`/`0600`. Re-running setup
+collapses token-recognized owned duplicates or obsolete handler shapes into
+exactly one current handler per event; status reports installed only for that
+exact canonical shape. `--uninstall` removes every token-recognized
+cctally-owned Codex handler and retains unrelated configuration.
+
+Codex requires a user or administrator to review/trust non-managed hook
+definitions. cctally cannot inspect Codex's undocumented trust store, so it
+never claims a handler is trusted. Immediately after installation a root is
+`installed_review_required` (`requires_review: true`); later status with the
+exact owned handler is `installed_trust_unobservable`
+(`requires_review: null`). Review the exact handler in Codex `/hooks` before
+expecting end-to-end alert delivery.
+
+The existing snake-case `schema_version: 1` setup JSON gains an additive
+`codex_hooks` object:
+
+```text
+codex_hooks = {
+  roots: [{source_root_key, codex_home, hooks_path, state,
+           stop_count, subagent_stop_count, feature_enabled,
+           requires_review, remediation, error}],
+  installed_count,
+  error_count
+}
+```
+
+`codex_home` and `hooks_path` are intentionally local setup diagnostics; they
+are not share/export data. Per-root states can also be `absent`, `malformed`,
+`feature_disabled`, or `unavailable`. A malformed document fails before any
+mutation; use the stated remediation, correct the JSON, and rerun setup.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -161,3 +224,5 @@ previews the migration without touching disk.
 - [`hook-tick`](hook-tick.md) — internal per-fire runtime invoked by hooks
 - [`refresh-usage`](refresh-usage.md) — manual OAuth fetch (mostly for debugging)
 - [`record-usage`](record-usage.md) — opt-in status-line integration (alternative to hooks)
+- [`codex-quota`](codex-quota.md) — native quota reports run from retained
+  local rollout data

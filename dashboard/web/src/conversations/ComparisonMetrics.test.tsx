@@ -80,4 +80,14 @@ describe('ComparisonMetrics', () => {
     expect(strip).not.toBeNull();
     expect(strip!.parentElement?.className).toContain('conv-cmp-metrics-wrap');
   });
+
+  // #304 S2 (F5) — the A→B values are named per run for AT; the arrow stays
+  // decorative. Visible text is unchanged (prefixes are sr-only).
+  it('names each value as Run A / Run B via sr-only prefixes', () => {
+    const { container } = render(<ComparisonMetrics a={M()} b={M()} />);
+    const cell = container.querySelector('[data-metric="cost"]') as HTMLElement;
+    expect(cell.querySelector('.conv-cmp-metric-a .sr-only')!.textContent).toBe('Run A ');
+    expect(cell.querySelector('.conv-cmp-metric-b .sr-only')!.textContent).toBe('Run B ');
+    expect(cell.querySelector('.conv-cmp-metric-arrow')!.getAttribute('aria-hidden')).toBe('true');
+  });
 });

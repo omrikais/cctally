@@ -1,15 +1,16 @@
 # project
 
-Roll Claude usage up by project (git-root resolved), with per-project
-`Used %` attribution against the subscription's weekly ceiling.
-Answers the mid-week question *"which project is eating my budget?"*
+Roll Claude or Codex usage up by project. Claude has per-project `Used %`
+against a subscription-week ceiling; Codex has calendar-week cost and token
+rollups without a fabricated `Used %`. In `--source all`, provider sections
+stay separate and `--weeks` resolves one absolute calendar range.
 
 ## Quick examples
 
-    # Current subscription week, sorted by cost desc
+    # Current Claude subscription week, sorted by cost desc
     cctally project
 
-    # Last 2 subscription weeks
+    # Last 2 Claude subscription weeks
     cctally project --weeks 2
 
     # Drill into one project with per-model breakdown
@@ -17,6 +18,12 @@ Answers the mid-week question *"which project is eating my budget?"*
 
     # Machine-readable output
     cctally project --json
+
+    # Fixed Codex route; --weeks means calendar weeks
+    cctally codex project --weeks 2 --breakdown
+
+    # Keep provider rows separate while adding only physical cost/token totals
+    cctally project --source all --since 2026-07-14 --until 2026-07-20
 
     # Or via the wrapper (after `install.sh`)
     cctally-project --weeks 2
@@ -26,19 +33,47 @@ Answers the mid-week question *"which project is eating my budget?"*
 | Flag | Default | Description |
 |---|---|---|
 | `--since DATE`, `--until DATE` | — | Inclusive range (YYYY-MM-DD). |
-| `--weeks N` | — | Last N subscription weeks ending at the current week. Mutually exclusive with `--since`/`--until`. |
-| *(no range flags)* | current subscription week | Zero-arg default. |
-| `--project PATTERN` | — | Case-insensitive substring filter on project display key. Repeatable (OR). |
+| `--weeks N` | — | Last N weeks ending now: Claude subscription weeks, Codex calendar weeks; `all` resolves one absolute calendar range. Mutually exclusive with `--since`/`--until`. |
+| *(no range flags)* | source-native current week | Claude subscription week or Codex calendar week; `all` resolves one absolute calendar range. |
+| `--project PATTERN` | — | Claude: case-insensitive substring filter on display key. Fixed Codex: exact opaque `projectKey` or exact collision-safe display label. Repeatable (OR). |
 | `--model PATTERN` | — | Same but for model names. Repeatable. |
 | `--breakdown` | off | Parent project row + one child row per model used. |
 | `--order asc\|desc` | `desc` | |
-| `--sort cost\|used\|name\|last-seen` | `cost` | Ties break on display key ascending. |
+| `--sort cost\|used\|name\|last-seen` | `cost` | Ties break on display key ascending. `used` is Claude-only and is rejected by the fixed Codex route and `--source all`. |
 | `--group git-root\|full-path` | `git-root` | `full-path` skips the walker and buckets by `realpath(project_path)` (symlink-aliased spellings collapse into one row; the displayed label is whichever spelling was seen first). |
 | `--tz TZ` | config | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | off | Emit structured JSON. |
 | `--no-color` | off | Disable ANSI color. |
+| `--source {claude,codex,all}` | `claude` | Analytics provider. The default and explicit `claude` preserve the established Claude report. `all` renders Claude then Codex as separate sections. |
+| `--speed {auto,standard,fast}` | `auto` | Codex pricing tier for the Codex or all-source leg. A non-`auto` value is rejected for Claude-only requests. |
 
-## What `Used %` means
+## Provider-aware routing
+
+The flat command defaults to `--source claude`; `cctally project` and
+`cctally project --source claude` therefore retain the existing
+subscription-week semantics and bytes. The fixed subgroup forms are equivalent
+but do not expose `--source`:
+
+```bash
+cctally claude project ...  # fixed Claude
+cctally codex project ...   # fixed Codex
+```
+
+Codex project rows use an opaque `projectKey` and a privacy-safe
+`displayLabel`; neither a home/root path nor a source-root fingerprint is a
+user-facing identity. `--project` accepts either an exact opaque key or an
+exact display label. A label that matches more than one qualified Codex project
+is rejected with exit 2; no match is an ordinary empty result. In an all-source
+request the same filter is applied independently to each provider, and equal
+labels never merge.
+
+For Codex, `--weeks N` means configured **calendar** weeks. For `--source all`,
+that calendar interval is resolved once and used for both provider sections.
+Codex cannot calculate Claude-style `--sort used`, so that value is rejected
+for Codex and all-source requests. Other project filters, grouping, ordering,
+breakdown, timezone, and share flags apply inside each source section.
+
+## Claude `Used %`
 
 For a single subscription week *W* and project *P*:
 
@@ -52,7 +87,7 @@ weeks of 20% → `60.0% (3wk)`. The `(Nwk)` suffix makes this explicit.
 `weekly_usage_snapshots` row (usually: very fresh install). `$/1%` is
 `cost / attributed_pct`.
 
-## Grouping
+## Claude grouping
 
 `git-root` (default) walks from each entry's `cwd` upward looking for a
 `.git` (file or dir) and buckets by that path. Non-git directories
@@ -67,7 +102,7 @@ parent segment: `foo (repos)` vs `foo (forks)`.
 
 ## Output
 
-Terminal output is a ccusage-style ANSI table matching the shape of
+Claude terminal output is a ccusage-style ANSI table matching the shape of
 `session` / `daily`:
 
     Claude Token Usage Report - Projects (2026-04-13 — 2026-04-19)
@@ -78,6 +113,18 @@ Terminal output is a ccusage-style ANSI table matching the shape of
 `--json` emits a payload with `rangeStart`, `rangeEnd`, `weeksInRange`,
 `groupMode`, `totals.{costUsd,usedPercent,weeklyAttributionAvailable}`,
 `projects[]`, and `warnings[]`.
+
+Codex output uses source-native project identities, cost, and token fields; it
+does not invent Claude `Used %` or `$/1%` values.
+
+For a direct Codex request, the outer envelope is
+`schemaVersion, source, status, data, warnings`; `status` is `ok`, `empty`,
+`partial`, or `unavailable`. A qualified-metadata failure is an explicit
+`unavailable` Codex envelope and exit 3. In `--source all`, `sources[]` always
+contains Claude then Codex; an unavailable Codex project block remains visible
+beside an available Claude block. The all-source wrapper may add only the
+compatible physical `costUsd` and `totalTokens` summary—never a blended project
+percentage or quota.
 
 ## Exit codes
 

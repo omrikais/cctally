@@ -39,6 +39,13 @@ def test_conversation_routes_precede_catch_all():
         assert names.index(earlier) < catch, earlier
 
 
+def test_source_detail_route_is_registered_before_legacy_catch_alls():
+    dash = _dash()
+    route = next(entry for entry in dash._GET_ROUTES if entry[2] == "_handle_get_source_detail")
+    assert route[:2] == ("prefix", "/api/source/")
+    assert route[4] is True
+
+
 def test_delete_share_asymmetry_preserved():
     dash = _dash()
     kinds = {e[2]: (e[0], e[1]) for e in dash._DELETE_ROUTES}

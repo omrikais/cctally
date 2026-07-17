@@ -1,7 +1,8 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { SessionsPanel } from './SessionsPanel';
-import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import type { Envelope, SessionRow } from '../types/envelope';
 
 beforeEach(() => {
@@ -214,5 +215,207 @@ describe('#253 SESS-2 — current-match emphasis + in-cell marks', () => {
     const s1Marks = Array.from(s1Row.querySelectorAll('mark')).map((m) => m.textContent);
     expect(s1Marks).toContain('alpha');       // project cell "alpha" is marked
     expect(s3Row.querySelector('mark')).toBeNull();  // "gamma" has no 'alpha'
+  });
+});
+
+describe('SessionsPanel row-open button (#293 S2 A11Y-2)', () => {
+  function renderWith(rows: SessionRow[]) {
+    const env = baseEnvelope();
+    env.sessions = { total: rows.length, sort_key: 'started_desc', rows };
+    act(() => { updateSnapshot(env); });
+    return render(<SessionsPanel />);
+  }
+
+  it('renders the title as a button with a title-based aria-label when session_id present', () => {
+    renderWith([sessRow({ session_id: 's1', title: 'Fix the parser' })]);
+    const btn = screen.getByRole('button', { name: 'Open session details: Fix the parser' });
+    expect(btn).toHaveClass('sess-open-title');
+  });
+
+  it('uses the started-time fallback aria-label when the title is empty', () => {
+    renderWith([sessRow({ session_id: 's2', title: null })]);
+    expect(
+      screen.getByRole('button', { name: /^Open session details, started / }),
+    ).toBeInTheDocument();
+  });
+
+  it('renders a plain title span (no button) when session_id is absent', () => {
+    // session_id is declared non-null in the envelope type, but the component
+    // defensively guards `r.session_id ?` for the id-less row the server may
+    // emit before session_files is ingested — exercise that real branch.
+    renderWith([sessRow({ session_id: null as unknown as string, title: 'orphan' })]);
+    expect(screen.queryByRole('button', { name: /Open session details/ })).toBeNull();
+    expect(screen.getByText('orphan')).toBeInTheDocument();
+  });
+
+  // RETARGET of the former 'never puts role=button / tabIndex on the <tr>' test
+  // (#299). The <tr> is now the grid's roving unit — role="row" + a roving
+  // tabIndex — but the invalid-nested-interactive guard it originally protected
+  // (a <tr> with nested buttons must NEVER be role="button") is preserved.
+  it('makes the <tr> a role=row grid row with a roving tabIndex (never role=button)', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 2, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 'b', project: 'beta', project_key: 'beta' }),
+    ] };
+    updateSnapshot(env);
+    const { container } = render(<SessionsPanel />);
+    const rows = Array.from(container.querySelectorAll('tr.session-row')) as HTMLElement[];
+    rows.forEach((tr) => {
+      expect(tr.getAttribute('role')).toBe('row');
+      // The invalid-nested-interactive guard the original test protected:
+      expect(tr.getAttribute('role')).not.toBe('button');
+      expect(tr.getAttribute('tabindex')).not.toBeNull();
+    });
+  });
+
+  it('opens the session modal via keyboard on the title button (no double-dispatch)', async () => {
+    const user = userEvent.setup();
+    renderWith([sessRow({ session_id: 's1', title: 't' })]);
+    const btn = screen.getByRole('button', { name: 'Open session details: t' });
+    btn.focus();
+    await user.keyboard('{Enter}');
+    // The store keeps the modal kind + its target in sibling fields
+    // (openModal is a bare ModalKind string; the id lives in openSessionId).
+    expect(getState().openModal).toBe('session');
+    expect(getState().openSessionId).toBe('s1');
+  });
+
+  it('activating the project link opens the projects modal, not the session modal', async () => {
+    const user = userEvent.setup();
+    renderWith([sessRow({ session_id: 's1', title: 't', project: 'proj', project_key: 'proj' })]);
+    await user.click(screen.getByRole('button', { name: /Open Projects modal for proj/ }));
+    // Genuine no-double-dispatch guard: if the link's stopPropagation failed,
+    // the <tr> onClick would ALSO fire OPEN_MODAL{session} and overwrite this.
+    expect(getState().openModal).toBe('projects');
+  });
+});
+
+describe('SessionsPanel Dur fold structure (#293 S2 SESS-1)', () => {
+  it('renders both the standalone .dur cell and an inline .dur-fold (not aria-hidden)', () => {
+    const env = baseEnvelope();
+    env.sessions = { total: 1, sort_key: 'started_desc',
+      rows: [sessRow({ session_id: 's1', duration_min: 7 })] };
+    act(() => { updateSnapshot(env); });
+    const { container } = render(<SessionsPanel />);
+    const durCell = container.querySelector('td.dur');
+    const durFold = container.querySelector('.dur-fold');
+    expect(durCell).toBeInTheDocument();
+    expect(durFold).toBeInTheDocument();
+    expect(durFold).not.toHaveAttribute('aria-hidden');
+    expect(durFold!.textContent).toContain('7m');
+  });
+});
+
+describe('SessionsPanel roving-tabindex invariant (#299)', () => {
+  function threeRows() {
+    const env = baseEnvelope();
+    env.sessions = { total: 3, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 'b', project: 'beta', project_key: 'beta' }),
+      sessRow({ session_id: 'c', project: 'gamma', project_key: 'gamma' }),
+    ] };
+    updateSnapshot(env);
+    return env;
+  }
+
+  it('table is role=grid; exactly one row is the tab stop and all nested buttons are -1', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('table.sess-table')?.getAttribute('role')).toBe('grid');
+    expect(container.querySelector('#sess-rows')?.getAttribute('role')).toBe('rowgroup');
+    const rows = Array.from(container.querySelectorAll('tr.session-row')) as HTMLElement[];
+    const zero = rows.filter((r) => r.getAttribute('tabindex') === '0');
+    expect(zero.length).toBe(1);
+    rows.forEach((r) => expect(['0', '-1']).toContain(r.getAttribute('tabindex')));
+    // Every nested control is removed from the Tab order.
+    container.querySelectorAll(
+      '#sess-rows .sess-open-conv, #sess-rows .chip.model-chip, #sess-rows .sess-open-title, #sess-rows .project-cell-link',
+    ).forEach((btn) => expect(btn.getAttribute('tabindex')).toBe('-1'));
+    // Body cells are gridcells.
+    expect(container.querySelector('#sess-rows td')?.getAttribute('role')).toBe('gridcell');
+  });
+
+  it('default tab stop is the first row when no search is active', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = Array.from(container.querySelectorAll('tr.session-row')) as HTMLElement[];
+    expect(rows[0].getAttribute('tabindex')).toBe('0');
+  });
+
+  it('empty session list renders no body tab stop', () => {
+    updateSnapshot(baseEnvelope()); // sessions.rows = []
+    const { container } = render(<SessionsPanel />);
+    expect(container.querySelector('tr.session-row')).toBeNull();
+  });
+});
+
+describe('SessionsPanel roving keydown (#299)', () => {
+  function threeRows() {
+    const env = baseEnvelope();
+    env.sessions = { total: 3, sort_key: 'started_desc', rows: [
+      sessRow({ session_id: 'a', project: 'alpha', project_key: 'alpha' }),
+      sessRow({ session_id: 'b', project: 'beta', project_key: 'beta' }),
+      sessRow({ session_id: 'c', project: 'gamma', project_key: 'gamma' }),
+    ] };
+    updateSnapshot(env);
+  }
+  const rowsOf = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll('tr.session-row')) as HTMLElement[];
+
+  it('ArrowDown moves the tabIndex=0 stop to the next row and focuses it', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = rowsOf(container);
+    rows[0].focus();
+    fireEvent.keyDown(rows[0], { key: 'ArrowDown' });
+    expect(rows[1].getAttribute('tabindex')).toBe('0');
+    expect(rows[0].getAttribute('tabindex')).toBe('-1');
+    expect(document.activeElement).toBe(rows[1]);
+  });
+
+  it('ArrowUp clamps at the first row (no wrap)', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = rowsOf(container);
+    rows[0].focus();
+    fireEvent.keyDown(rows[0], { key: 'ArrowUp' });
+    expect(rows[0].getAttribute('tabindex')).toBe('0');
+    expect(document.activeElement).toBe(rows[0]);
+  });
+
+  it('ArrowRight from the row focuses the first visible control', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = rowsOf(container);
+    rows[0].focus();
+    fireEvent.keyDown(rows[0], { key: 'ArrowRight' });
+    // threeRows() is single-model (oneModel drops the chip column) and
+    // transcripts-off, so the first control is the .sess-open-title button;
+    // assert focus left the row and landed on a control button within it.
+    expect(document.activeElement).not.toBe(rows[0]);
+    expect(rows[0].contains(document.activeElement)).toBe(true);
+    expect((document.activeElement as HTMLElement).tagName).toBe('BUTTON');
+  });
+
+  it('Enter on the focused row opens the session modal', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = rowsOf(container);
+    rows[1].focus();
+    fireEvent.keyDown(rows[1], { key: 'Enter' });
+    expect(getState().openModal).toBe('session');
+    expect(getState().openSessionId).toBe('b');
+  });
+
+  it('Shift+ArrowDown is NOT consumed (bubbles to panel reorder)', () => {
+    threeRows();
+    const { container } = render(<SessionsPanel />);
+    const rows = rowsOf(container);
+    rows[0].focus();
+    fireEvent.keyDown(rows[0], { key: 'ArrowDown', shiftKey: true });
+    // The roving stop must be unchanged — the handler bailed on the modifier.
+    expect(rows[0].getAttribute('tabindex')).toBe('0');
+    expect(rows[1].getAttribute('tabindex')).toBe('-1');
   });
 });

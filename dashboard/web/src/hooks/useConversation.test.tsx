@@ -8,9 +8,13 @@ import type { OutlineTurn } from '../types/conversation';
 // useConversationLiveTail (tested separately). useConversation now consumes a
 // shared { growthNonce, live } signal, so this test only drives `generated_at`
 // (the global-tick fallback) plus the two new props.
+// #303 — also expose `data_version` (the real change signal the fallback poll
+// now keys on). `undefined` (the default) makes `revalToken` fall back to
+// `generated_at`, so the pre-#303 tick tests keep exercising the every-tick path.
 let mockGeneratedAt = 't0';
+let mockDataVersion: string | undefined = undefined;
 vi.mock('./useSnapshot', () => ({
-  useSnapshot: () => ({ generated_at: mockGeneratedAt }),
+  useSnapshot: () => ({ generated_at: mockGeneratedAt, data_version: mockDataVersion }),
 }));
 
 function detail(items: unknown[], next_after: number | null, over: Record<string, unknown> = {}) {
@@ -32,6 +36,7 @@ function mockOnce(body: unknown, status = 200) {
 beforeEach(() => {
   globalThis.fetch = vi.fn();
   mockGeneratedAt = 't0';
+  mockDataVersion = undefined;
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -1111,5 +1116,37 @@ describe('useConversation — virtualFirstItemIndex (#232)', () => {
     await waitFor(() => expect(result.current.detail?.items).toHaveLength(1000));
     expect(result.current.lastOp?.droppedTop).toBe(200);
     expect(result.current.virtualFirstItemIndex).toBe(VIRTUAL_INDEX_BASE + 200);
+  });
+});
+
+// #303 — the non-live body tail-poll must gate on the change signal
+// (data_version), not the 5s generated_at heartbeat: a finished/static
+// conversation open in the reader (live-tail off) tail-polls once and is not
+// re-GET every tick. (Human-turn-only / title-only growth that bumps no
+// signature leg is a DOCUMENTED residual — deliberately not asserted here.)
+describe('useConversation — #303 body-poll data_version gate', () => {
+  it('with data_version present, a generated_at-only tick does NOT tail-poll', async () => {
+    mockDataVersion = 'v1';
+    // Fully paged (next_after null) → hasMore false → the fallback poll is armed.
+    mockOnce(detail([it1, it2], null));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    const callsAfterLoad = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    // generated_at advances twice, data_version stays flat → no tail-poll GET.
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await act(async () => { bumpTick(rerender, 't2'); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsAfterLoad);
+  });
+
+  it('a data_version change tail-polls and appends the new turn (generated_at unchanged)', async () => {
+    mockDataVersion = 'v1';
+    mockOnce(detail([it1, it2], null));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    // The tail poll (cursor null — 2 ≤ TAIL_WINDOW) re-returns the window plus it3.
+    mockOnce(detail([it1, it2, it3], null));
+    // generated_at is left at 't0'; only the change signal advances → tail-poll.
+    await act(async () => { mockDataVersion = 'v2'; rerender(); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
   });
 });

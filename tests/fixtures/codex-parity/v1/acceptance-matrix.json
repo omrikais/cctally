@@ -1,0 +1,734 @@
+{
+  "requiredCapabilityFamilies": [
+    "accounting",
+    "quota",
+    "analytics-share",
+    "dashboard",
+    "conversations",
+    "lifecycle-governance"
+  ],
+  "requirements": [
+    {
+      "capability": "public-contract",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_parity_contract.py"
+      ],
+      "id": "public-capability-matrix",
+      "ownerSession": "S0",
+      "requirement": "Public matrix names every outcome, owner, state, reason, and evidence.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "physical-quota-retention",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "modern-quota-payload",
+        "modern-dual-location-conflict"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "s1-physical-quota-retention",
+      "ownerSession": "S1",
+      "requirement": "Physically retain root-qualified native quota observations and complete rollout records; S2 owns history selection and user-facing interpretation.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "physical-qualified-identity",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "root-a-collision",
+        "root-b-collision",
+        "claude-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "s1-db-provider-root-thread-collision-safety",
+      "ownerSession": "S1",
+      "requirement": "Database source-root and thread identities keep colliding provider values distinct; routes, FTS, export, share, and browser storage remain deferred.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "physical-file-lifecycle",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "malformed-tail",
+        "metadata-only-tail",
+        "duplicate-token-count"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "s1-codex-file-lifecycle-atomicity",
+      "ownerSession": "S1",
+      "requirement": "Per-file fused ingest atomically retains accounting, physical events, quota facts, thread facts, and its resume watermark across append, requalification, prune, rebuild, and retry.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "accounting-ingest",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "duplicate-token-count",
+        "legacy-envelope"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "four-codex-reports-reconcile",
+      "ownerSession": "S1",
+      "requirement": "Existing Codex reports reconcile and preserve their deliberate dedup divergence.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "quota-interpretation",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "modern-quota-payload",
+        "stale-cache"
+      ],
+      "futureTestTargets": [
+        "tests/test_lib_quota.py",
+        "tests/test_codex_quota_projection.py",
+        "tests/test_codex_quota_cli.py",
+        "bin/cctally-codex-quota-test"
+      ],
+      "id": "s2-quota-interpretation-cli-kernel",
+      "ownerSession": "S2",
+      "requirement": "The pure quota kernel and native history, statusline, forecast, blocks, and breakdown CLI interpret root-qualified native windows without slot assumptions.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "dashboard-quota-reconciliation",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "modern-quota-payload",
+        "mixed-source",
+        "stale-cache",
+        "root-a-collision",
+        "root-b-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_dashboard_source_read_model.py",
+        "tests/test_dashboard_source_invalidation.py"
+      ],
+      "id": "s4-dashboard-quota-reconciliation",
+      "ownerSession": "S4",
+      "requirement": "Dashboard quota blocks and alerts reconcile to the S2 native CLI kernels without blending independent windows.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "project-attribution",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "root-a-collision",
+        "root-b-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_analytics.py",
+        "tests/test_source_aware_cli.py",
+        "bin/cctally-source-aware-test"
+      ],
+      "id": "source-derived-project-attribution",
+      "ownerSession": "S3",
+      "requirement": "Cwd, git, projects, diff, and range cost remain provider-qualified.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "qualified-identity",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "root-a-collision",
+        "root-b-collision",
+        "claude-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "provider-qualified-collision-safety",
+      "ownerSession": "S1",
+      "requirement": "Qualified identities protect DB, routes, FTS, modals, exports, share, and browser storage.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "dashboard-source-state",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "claude-only",
+        "codex-only",
+        "mixed-source",
+        "empty-source",
+        "stale-cache",
+        "malformed-tail"
+      ],
+      "futureTestTargets": [
+        "tests/test_dashboard_source_read_model.py",
+        "tests/test_dashboard_source_invalidation.py"
+      ],
+      "id": "dashboard-source-switch-stale-safety",
+      "ownerSession": "S4",
+      "requirement": "Published source state fails closed or retains the complete prior provider generation; it never cross-falls back.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "provider-ingest",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "malformed-tail",
+        "metadata-only-tail",
+        "stale-cache",
+        "empty-source"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py",
+        "tests/test_codex_hook_lifecycle.py",
+        "tests/test_codex_quota_cli.py"
+      ],
+      "id": "provider-ingest-lifecycle",
+      "ownerSession": "S2",
+      "requirement": "One S1 all-root sync per Codex lifecycle tick preserves no-sync, throttle, lock, truncation, rebuild, prune, and metadata-tail semantics.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "lifecycle-alerts",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_quota_alerts.py",
+        "tests/test_codex_hook_lifecycle.py",
+        "tests/test_codex_hooks_setup.py"
+      ],
+      "id": "autonomous-codex-alerts",
+      "ownerSession": "S2",
+      "requirement": "Opt-in pure-Codex quota and budget alerts integrate additive setup-managed hooks, due-root evaluation, and owned-only uninstall.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "share-identity",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "mixed-source",
+        "root-a-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_share.py",
+        "bin/cctally-source-aware-test"
+      ],
+      "id": "source-aware-cli-share-identity",
+      "ownerSession": "S3",
+      "requirement": "CLI share artifacts and the source-bearing share kernel preserve opaque source-qualified identity.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "share-identity",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "mixed-source",
+        "root-a-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_dashboard_share.py"
+      ],
+      "id": "source-aware-dashboard-share-identity",
+      "ownerSession": "S5",
+      "requirement": "Dashboard share, composer, and history preserve source identity.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "dashboard-share-backend",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "claude-only",
+        "codex-only",
+        "mixed-source",
+        "empty-source",
+        "stale-cache",
+        "root-a-collision",
+        "root-b-collision",
+        "malformed-tail"
+      ],
+      "futureTestTargets": [
+        "tests/test_dashboard_source_share.py",
+        "tests/test_dashboard_source_routes.py"
+      ],
+      "id": "s4-dashboard-share-backend-contract",
+      "ownerSession": "S4",
+      "requirement": "Provider-qualified dashboard detail routes resolve bounded relational native data with collision safety, while canonical source-bearing share snapshots drive render, digest identity, composition, presets, and history before S5 adds source controls.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "conversation-reader",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "modern-full",
+        "nested-child"
+      ],
+      "futureTestTargets": [
+        "dashboard/web/src/conversations/CodexConversationReader.test.tsx"
+      ],
+      "id": "native-codex-conversation-stack",
+      "ownerSession": "S8",
+      "requirement": "Native browse, search, reader, find, export, and live-tail consume normalized qualified identities.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-privacy",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "secret-canary"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "codex-anonymization-privacy-gate",
+      "ownerSession": "S7",
+      "requirement": "Roots, usernames, encoded paths, and secret patterns obey the same privacy gate.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "synthetic-corpus",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "claude-only",
+        "codex-only",
+        "mixed-source",
+        "empty-source",
+        "stale-cache",
+        "malformed-tail",
+        "duplicate-token-count",
+        "root-a-collision",
+        "nested-child"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_parity_contract.py"
+      ],
+      "id": "synthetic-source-coverage",
+      "ownerSession": "S0",
+      "requirement": "Corpus covers source-only, mixed, empty, stale, malformed, collision, and nested cases.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "compatibility",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "legacy-envelope",
+        "duplicate-token-count"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "existing-codex-compatibility",
+      "ownerSession": "S1",
+      "requirement": "Existing accounting, budget, pricing, aliases, and deliberate divergences remain compatible.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "ui-certification",
+      "contractState": "deferred",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "dashboard/web/src/conversations/CodexConversationReader.test.tsx"
+      ],
+      "id": "s5-s8-ui-qa-gates",
+      "ownerSession": "S9",
+      "requirement": "React/CSS tests, typecheck/build, dashboard goldens, and browser QA gate S5 and S8.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "documentation",
+      "contractState": "deferred",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "tests/test_codex_parity_certification.py"
+      ],
+      "id": "root-docs-cover-both-sources",
+      "ownerSession": "S9",
+      "requirement": "Root help, commands, dashboard, transcript/share/privacy, config, setup, and doctor docs cover both sources.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "production-scale-certification",
+      "contractState": "deferred",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "tests/test_codex_parity_certification.py"
+      ],
+      "id": "production-scale-final-certification",
+      "ownerSession": "S9",
+      "requirement": "S9 certifies production-scale source-qualified behavior.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "tui-governance",
+      "contractState": "not_applicable",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "tests/test_codex_parity_certification.py"
+      ],
+      "id": "tui-freeze-explicit-disposition",
+      "ownerSession": "S9",
+      "requirement": "TUI presentation stays under the approved bugfix-only freeze.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "schema-tolerance",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "modern-quota-payload",
+        "unknown-records",
+        "legacy-envelope"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_parity_contract.py"
+      ],
+      "id": "schema-drift-tolerance",
+      "ownerSession": "S0",
+      "requirement": "Observed schema is tolerant and captures both quota locations.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "quota-degradation",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-no-quota",
+        "modern-partial-quota",
+        "malformed-tail"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_parity_contract.py"
+      ],
+      "id": "missing-rate-limits-degrades-quota-only",
+      "ownerSession": "S0",
+      "requirement": "Missing or malformed quota preserves recoverable accounting.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "report",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_analytics.py",
+        "tests/test_source_aware_cli.py",
+        "bin/cctally-source-aware-test"
+      ],
+      "id": "report-per-source-never-blended",
+      "ownerSession": "S3",
+      "requirement": "Report and dollars per percent use S2 quota kernels but remain per source.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "percent-breakdown",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_quota_projection.py",
+        "tests/test_codex_quota_cli.py",
+        "bin/cctally-codex-quota-test"
+      ],
+      "id": "percent-breakdown-per-source",
+      "ownerSession": "S2",
+      "requirement": "Native Codex quota breakdown keeps percent milestones and query-time cost correlation per source root and logical limit.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "five-hour-breakdown",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_quota.py"
+      ],
+      "id": "five-hour-breakdown-per-source",
+      "ownerSession": "S2",
+      "requirement": "Breakdowns preserve native quota identity rather than slot aliases.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "provider-live-refresh",
+      "contractState": "unavailable",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_quota.py"
+      ],
+      "id": "codex-refresh-is-local-rollout-reread",
+      "ownerSession": "S2",
+      "requirement": "Codex has no provider-live or OAuth refresh analogue.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "local-rollout-quota-freshness",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "stale-cache"
+      ],
+      "futureTestTargets": [
+        "tests/test_lib_quota.py",
+        "tests/test_codex_quota_cli.py",
+        "tests/test_codex_quota_doctor.py"
+      ],
+      "id": "codex-local-rollout-quota-freshness",
+      "ownerSession": "S2",
+      "requirement": "Local rollout captures surface native-window freshness only; this is not a provider-live refresh.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "cache-hit-rate",
+      "contractState": "not_applicable",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_analytics.py",
+        "tests/test_source_aware_cli.py"
+      ],
+      "id": "codex-cache-hit-rate-not-applicable",
+      "ownerSession": "S3",
+      "requirement": "Codex cached input is not relabeled as Claude cache hit rate.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "token-reuse",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_source_aware_analytics.py",
+        "tests/test_source_aware_cli.py",
+        "bin/cctally-source-aware-test"
+      ],
+      "id": "codex-token-reuse-forensics",
+      "ownerSession": "S3",
+      "requirement": "Cached input is a truthful Codex token-reuse outcome.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "pricing-coverage",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "codex-pricing-coverage-supported",
+      "ownerSession": "S1",
+      "requirement": "Existing Codex pricing coverage and drift semantics remain supported.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "budget",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_fused_ingest.py"
+      ],
+      "id": "codex-budget-existing-semantics",
+      "ownerSession": "S1",
+      "requirement": "Existing Codex budget calculation and actual/projected semantics remain supported.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-title",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py"
+      ],
+      "id": "codex-title-first-prompt-fallback",
+      "ownerSession": "S6",
+      "requirement": "Initial title uses the first meaningful user prompt.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-threading",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "nested-parent",
+        "nested-child"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py"
+      ],
+      "id": "codex-threading-uses-thread-metadata",
+      "ownerSession": "S6",
+      "requirement": "Nesting uses thread metadata, not filenames.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "anon-plan",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "secret-canary"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "codex-anon-plan-includes-roots",
+      "ownerSession": "S7",
+      "requirement": "The anonymization plan includes provider roots and labels.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "debug-diagnostics",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "mixed-source",
+        "stale-cache",
+        "root-a-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_dashboard_debug_backend.py",
+        "tests/test_dashboard_source_invalidation.py"
+      ],
+      "id": "debug-backend-source-counts",
+      "ownerSession": "S4",
+      "requirement": "Loopback-only backend diagnostics expose source-aware aggregate counts and opaque versions without private identities.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "reading-position",
+      "contractState": "deferred",
+      "fixtureScenarios": [
+        "root-a-collision",
+        "root-b-collision"
+      ],
+      "futureTestTargets": [
+        "dashboard/web/src/store/readingPosition.test.ts"
+      ],
+      "id": "reading-position-qualified-key",
+      "ownerSession": "S8",
+      "requirement": "Reading positions use opaque qualified conversation keys.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "dashboard-sequencing",
+      "contractState": "deferred",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "tests/test_source_aware_dashboard.py"
+      ],
+      "id": "dashboard-s5-after-293-s4",
+      "ownerSession": "S5",
+      "requirement": "S5 waits for issue 293 S4 or an approved ownership split.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "conversation-phase",
+      "contractState": "deferred",
+      "fixtureScenarios": [],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py"
+      ],
+      "id": "conversation-phase-independently-deferrable",
+      "ownerSession": "S6",
+      "requirement": "S6 through S8 may defer without falsely certifying the whole epic.",
+      "sources": [
+        "all"
+      ]
+    }
+  ],
+  "schemaVersion": 1
+}

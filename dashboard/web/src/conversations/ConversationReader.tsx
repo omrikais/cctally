@@ -1,10 +1,11 @@
-import React, { forwardRef, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Virtuoso, type VirtuosoHandle, type ListItem, type Components } from 'react-virtuoso';
 import { dispatch, getState, selectMarkersEnabled, subscribeStore } from '../store/store';
 import { useConversation } from '../hooks/useConversation';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useIsWide } from '../hooks/useIsWide';
+import { useReaderControlsDensity } from '../hooks/useReaderControlsDensity';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { groupSidechains, flattenSubagents, walkSubagents, type RenderNode } from './groupSidechains';
 import { isSystemMarker } from './systemMarkers';
@@ -265,6 +266,9 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
   // trigger; instead we consume the store flag once detail is ready.
+  // #304 S2 — the flag also serves CANCEL_COMPARE_PICK now (it generalized to
+  // "compare-flow focus return pending"), so this same consume effect returns
+  // focus on cancel too, with a fallback chain extended for compact headers.
   const compareCloseFocusPending = useSyncExternalStore(
     subscribeStore, () => getState().compareCloseFocusPending,
   );
@@ -273,6 +277,9 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     if (loading && !detail) return;          // wait for the detail branch
     const el =
       document.getElementById('conv-compare-with') ??
+      // #304 S2 — compact headers have no #conv-compare-with; the ⋯ overflow
+      // toggle is the control that launched the compare flow there.
+      document.querySelector<HTMLElement>('.conv-overflow-toggle') ??
       document.querySelector<HTMLElement>('.conv-reader');
     el?.focus();
     dispatch({ type: 'CLEAR_COMPARE_CLOSE_FOCUS' });
@@ -288,6 +295,19 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   const outlineMobileOpen = useSyncExternalStore(subscribeStore, () => getState().convOutlineMobileOpen);
   const isMobile = useIsMobile();
   const isWide = useIsWide();
+  // #304 S3 §1 — the reader-column element-width fold axis. Called
+  // unconditionally (hooks rules); consulted only in the isWide (≥1101) branch.
+  // In the ≤1100 compact band the S1 window axis already governs, so density is
+  // ignored there. `readerRef` attaches to the .conv-reader detail root below.
+  const { density, readerRef } = useReaderControlsDensity();
+  // #304 S3 (Codex F2) — a parallel ref to the same root so the focus-continuity
+  // layout effect can query the header subtree after a density flip (the hook's
+  // readerRef is a callback, not a stored node).
+  const readerRootRef = useRef<HTMLElement | null>(null);
+  const setReaderRoot = useCallback((el: HTMLElement | null) => {
+    readerRootRef.current = el;
+    readerRef(el);
+  }, [readerRef]);
   const effectiveOutlineOpen = isWide ? outlineOpen : outlineMobileOpen;
   // #177 S5 — the active focus mode (all/chat/prompts/errors) + scroll-sync
   // cursor uuid. focusMode drives the `visible` pipeline below; the cursor uuid
@@ -461,6 +481,53 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // must read the live wide-state, not the mobile-state.
   const isWideRef = useRef(isWide);
   isWideRef.current = isWide;
+  // #304 S3 (Codex F2) — focus continuity across a density flip. A flip unmounts
+  // the focused header control (e.g. clicking ☰ Outline opens the outline column
+  // → reader narrows → fold → the very button clicked unmounts), and React fires
+  // no onBlur on unmount → focus falls to <body> and the reader keymap deadens
+  // (the same failure class S2 fixed for compare-cancel). Identity is captured on
+  // every header focus (cheap capture handler); a layout effect keyed on density
+  // restores focus to the new mode's semantic equivalent. S2's
+  // compareCloseFocusPending chain runs in its own effect and takes precedence
+  // (this effect bails when it is armed). Initial mount is not a flip.
+  const headIdentityRef = useRef<{ role: string | null; group: string | null }>({ role: null, group: null });
+  const onHeadFocusCapture = useCallback((e: React.FocusEvent) => {
+    const t = (e.target as HTMLElement).closest?.(
+      '[data-hdr-role], [data-hdr-group], .conv-overflow-menu, .conv-overflow-toggle, .conv-focus-compact, .conv-find-toggle, .conv-outline-toggle',
+    );
+    if (!(t instanceof HTMLElement)) return;
+    const role = t.getAttribute('data-hdr-role')
+      ?? (t.classList.contains('conv-find-toggle') ? 'find'
+        : t.classList.contains('conv-outline-toggle') ? 'outline'
+        : t.classList.contains('conv-focus-compact') ? 'focus'
+        : (t.classList.contains('conv-overflow-menu') || t.classList.contains('conv-overflow-toggle')) ? 'overflow'
+        : null);
+    headIdentityRef.current = { role, group: t.closest('[data-hdr-group]')?.getAttribute('data-hdr-group') ?? null };
+  }, []);
+  const prevDensityRef = useRef<'full' | 'compact' | null>(null);
+  useLayoutEffect(() => {
+    const prev = prevDensityRef.current;
+    prevDensityRef.current = density;
+    if (prev == null || prev === density || !isWideRef.current) return;     // mount / no flip / compact band
+    const ae = document.activeElement;
+    if (ae && ae !== document.body) return;                                 // focus survived elsewhere
+    if (getState().compareCloseFocusPending) return;                        // S2 precedence
+    const { role, group } = headIdentityRef.current;
+    if (!role && !group) return;
+    const head = readerRootRef.current?.querySelector('.conv-reader-head');
+    if (!head) return;
+    const sel = density === 'compact'
+      ? (role === 'find' ? '.conv-find-toggle'
+        : role === 'outline' ? '.conv-outline-toggle'
+        : (role === 'focus' || group === 'reading') ? '.conv-focus-compact-toggle'
+        : '.conv-overflow-toggle')
+      : (role === 'find' ? '.conv-find-toggle'
+        : role === 'outline' ? '.conv-outline-toggle'
+        : (role === 'focus' || group === 'reading') ? '.conv-focus-seg-btn[aria-checked="true"]'
+        : role === 'overflow' ? '[data-hdr-role="anon"]'
+        : `[data-hdr-role="${role}"]`);
+    (head.querySelector(sel) as HTMLElement | null)?.focus();
+  }, [density]);
   // #177 S5 §4 — live mirrors for the stable jump-to-next key closures (the
   // keymap array is built once; its actions read refs, never re-registering).
   const outlineRef = useRef<ConversationOutline | null | undefined>(outline);
@@ -2237,20 +2304,22 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     }
   }, []);
 
+  // #304 S2 (Codex F6) — every reader-state shell is programmatically focusable
+  // so the compare focus-return last resort works on loading/error/empty paths too.
   if (loading && !detail) return (
-    <div className="conv-reader conv-reader--loading">
+    <div className="conv-reader conv-reader--loading" tabIndex={-1}>
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><SpinnerIcon /></span>
         <div className="conv-state-title">Loading conversation…</div></div>
     </div>
   );
   if (error) return (
-    <div className="conv-reader conv-reader--error">
+    <div className="conv-reader conv-reader--error" tabIndex={-1}>
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><WarningIcon /></span>
         <div className="conv-state-title">{error}</div></div>
     </div>
   );
   if (!detail) return (
-    <div className="conv-reader conv-reader--empty">
+    <div className="conv-reader conv-reader--empty" tabIndex={-1}>
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><ChatIcon /></span>
         <div className="conv-state-title">Select a conversation</div>
         <div className="conv-state-hint">Choose one from the list to start reading.</div></div>
@@ -2258,14 +2327,19 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   );
 
   return (
-    <div className="conv-reader" tabIndex={-1}>
-      {isMobile ? (
-        // #228 S3 C2 — the two-row mobile header (≤640px only). Row 1: ← Back ·
+    <div className="conv-reader" tabIndex={-1} ref={setReaderRoot}>
+      {!isWide ? (
+        // #304 S1 — the compact two-row header now applies across the whole
+        // constrained band (!isWide, ≤1100px), not only phones. Row 1: ← Back ·
         // title · ⋯ overflow. Row 2 (slim): the compact Focus dropdown · 🔍 Find
         // · ☰ Outline. The secondary actions (Export, Compare, Latest, bulk
         // expand/collapse) + the completion/cost summaries fold into the ⋯ menu so
-        // reading starts in the top ~40% of the screen. Desktop/tablet keep the
-        // full inline header below — this branch is ≤640px ONLY.
+        // reading starts in the top ~40% of the screen. Back is gated on the
+        // `mobileBack` prop (single-pane ≤880 only), so 881–1100 gets this compact
+        // header WITHOUT Back beside the rail. The full desktop strip renders only
+        // when wide (≥1101px). The `--mobile` class name is retained (component +
+        // CSS + tests reference it); its structural CSS is self-gating on the
+        // class across ≤1100.
         <div className="conv-reader-head conv-reader-head--mobile">
           <div className="conv-reader-row1">
             {mobileBack && (
@@ -2294,6 +2368,10 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
               costCumulative={cumCost.cost}
               costTotal={detail.cost_usd}
               costApprox={cumCost.approx}
+              // #304 S3 (Codex F3) — the repaired ✓ Complete JUMP in the compact
+              // band: promotes the read-only completion row to an actionable
+              // menuitem when the session is all-done.
+              onCompletionJump={outline?.task_completion?.all_done ? () => jumpToCompletion(outline.task_completion!.anchor_uuid) : null}
             />
           </div>
           <div className="conv-reader-row2">
@@ -2324,7 +2402,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
           </div>
         </div>
       ) : (
-      <div className="conv-reader-head">
+      <div className={`conv-reader-head${density === 'compact' ? ' conv-reader-head--folded' : ''}`}>
         {mobileBack && (
           <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
         )}
@@ -2337,157 +2415,233 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
             {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
           </div>
         </div>
-        <div className="conv-reader-controls">
-          {/* #228 S2 — surface the keyboard-only bulk collapse/expand
-              (sweepDetails, bound to ] / [) as a discoverable control. Sweeps
-              all MOUNTED disclosures, in lockstep with the keys. */}
-          <div className="conv-bulk-toggle" role="group" aria-label="Expand or collapse all threads">
-            <button
-              type="button"
-              className="conv-bulk-btn"
-              aria-label="Expand all threads"
-              title="Expand all (])"
-              onClick={() => sweepDetails(true)}
-            >⤢</button>
-            <button
-              type="button"
-              className="conv-bulk-btn"
-              aria-label="Collapse all threads"
-              title="Collapse all ([)"
-              onClick={() => sweepDetails(false)}
-            >⤡</button>
+        <div className="conv-reader-controls" onFocusCapture={onHeadFocusCapture}>
+          {density === 'compact' ? (
+            /* #304 S3 §1 — FOLDED desktop (reader element <720px — in practice the
+               outline column open at 1101–~1400px): swap the four clusters for the
+               S1 compact primitives, LITERALLY reused. The DESKTOP title/meta head
+               layout above stays (no Back, full model ids); completion + cost
+               surface as the ⋯ menu's rows (Q2). The completion row is the
+               repaired JUMP (onCompletionJump — Codex F3). */
+            <>
+              <FocusCompactMenu
+                focusMode={focusMode}
+                subagents={subagentOptions}
+                onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
+                errorCount={targetLists.error.length}
+              />
+              <button
+                type="button"
+                className="conv-find-toggle"
+                data-hdr-role="find"
+                aria-pressed={convFindOpen}
+                aria-label="Find in conversation"
+                title="Find in conversation (/ or ⌘F / Ctrl+F)"
+                onClick={toggleFind}
+              ><SearchIcon /> Find</button>
+              <button
+                type="button"
+                className="conv-outline-toggle"
+                data-hdr-role="outline"
+                aria-pressed={effectiveOutlineOpen}
+                aria-label="Toggle session outline"
+                title="Toggle session outline (o)"
+                onClick={toggleOutline}
+              >☰ Outline</button>
+              <ReaderOverflowMenu
+                sessionId={sessionId}
+                exportTitle={detail.title}
+                anonMode={anonMode}
+                onToggleAnon={toggleAnonMode}
+                onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+                onLatest={detail.last_anchor ? () => { void jumpToLatest(); } : null}
+                latestBusy={jumpingLatest}
+                onExpandAll={() => sweepDetails(true)}
+                onCollapseAll={() => sweepDetails(false)}
+                completionTotal={outline?.task_completion?.all_done ? outline.task_completion.total : null}
+                costCumulative={cumCost.cost}
+                costTotal={detail.cost_usd}
+                costApprox={cumCost.approx}
+                onCompletionJump={outline?.task_completion?.all_done ? () => jumpToCompletion(outline.task_completion!.anchor_uuid) : null}
+              />
+            </>
+          ) : (
+          <>
+          {/* #304 S3 §1 — the wide strip is regrouped into intent clusters
+              (reading / nav / share / bulk) plus a quiet right-aligned status
+              cluster. Each cluster is an atomic wrap unit (internally nowrap; the
+              outer row keeps #238 R1's flex-wrap so whole GROUPS reflow). Grouping
+              + order + the status demotion carry the hierarchy — no per-control
+              chrome redesign. Keyboard bindings (] [ End / o) are unaffected (they
+              live on the reader keymap, not the buttons). */}
+          {/* READING — the focus radiogroup + the ▾ More menu. */}
+          <div className="conv-hdr-group" data-hdr-group="reading">
+            {/* #177 S5 §5 — focus-mode segmented control. A labeled radiogroup;
+                each button's aria-checked reflects the active mode (the valid
+                selected-state attribute for role="radio" — #184 dropped the
+                invalid aria-pressed, which belongs to toggle buttons, not radios).
+                Errors carries a count badge from the outline stats when > 0. */}
+            <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
+              {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
+                // #217 S5 E4 — only the four PRIMARY modes live in the segmented
+                // control (edits/bash/subagent ride the FocusMoreMenu), so the
+                // label map is keyed to that narrowed union, not the full FocusMode.
+                const labels: Record<'all' | 'chat' | 'prompts' | 'errors', string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
+                // #217 S3 E10#2 — the badge is the error-TURN count (== the jump
+                // cluster chip == what clicking the Errors filter navigates to),
+                // NOT stats.error_count (the server's total error-EVENT count, which
+                // double-counts a turn with multiple error tools). The Stats card
+                // keeps the reconciliation phrasing "N errors in M turns".
+                const errCount = targetLists.error.length;
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    className={['conv-focus-seg-btn', focusMode === m ? 'conv-focus-seg-btn--on' : ''].filter(Boolean).join(' ')}
+                    role="radio"
+                    aria-checked={focusMode === m}
+                    onClick={() => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: m })}
+                  >
+                    {labels[m]}
+                    {m === 'errors' && errCount > 0 && (
+                      <span className="conv-focus-seg-badge">{errCount}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            {/* #217 S5 E4 — the focus "▾ More" menu: Edits / Bash / per-Subagent.
+                Single-select on the same axis (a More-mode shows the four primary
+                segmented buttons unselected + the ▾ trigger labelled active). */}
+            <FocusMoreMenu
+              focusMode={focusMode}
+              subagents={subagentOptions}
+              onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
+            />
           </div>
-          {/* #217 S6 F3 — cumulative-cost chip: $through-current-turn / $session
-              total + a progress bar. The reader computes the prefix-sum keyed off
-              the scroll-sync current turn; `approx` flags a lower bound when
-              earlier pages aren't loaded. Hidden for a costless session
-              (total === 0), and while no current turn is established yet
-              (`pending` — #226) to suppress the transient $0.00 flash. First
-              control in the row. */}
-          <CumulativeCostChip cumulative={cumCost.cost} total={detail.cost_usd} approx={cumCost.approx} pending={currentTurnUuid == null} />
-          {/* #217 S5 F7 — task-completion chip. Always visible (regardless of
-              scroll position) when the main thread's final task snapshot is fully
-              done; clicking jumps to the snapshot turn. Hidden otherwise.
-              Reduced-motion handled in CSS; ≥44px touch target (#205 mobile). */}
-          {outline?.task_completion?.all_done && (
+          {/* NAV — Find · Outline · Latest (the on-screen navigation cluster). */}
+          <div className="conv-hdr-group" data-hdr-group="nav">
+            {/* #205 S2 (F3) — Find toggle. Mirrors the outline toggle's
+                aria-pressed semantics + chrome; gives the `/` shortcut a visible,
+                tappable counterpart (the only find affordance on touch). */}
             <button
               type="button"
-              className="conv-complete-chip"
-              aria-label={`Session complete: ${outline.task_completion.total} tasks done — jump to the final checklist`}
-              title="Jump to the final task checklist"
-              onClick={() => jumpToCompletion(outline.task_completion!.anchor_uuid)}
+              className="conv-find-toggle"
+              data-hdr-role="find"
+              aria-pressed={convFindOpen}
+              aria-label="Find in conversation"
+              title="Find in conversation (/ or ⌘F / Ctrl+F)"
+              onClick={toggleFind}
+            ><SearchIcon /> Find</button>
+            {/* outline toggle. Visible on desktop + tablet; aria-pressed reflects
+                the EFFECTIVE open flag (sheet flag ≤1100px, persisted pref ≥1101px).
+                In the tablet band it opens the slide-over sheet (#228 S3 F1). */}
+            <button
+              type="button"
+              className="conv-outline-toggle"
+              data-hdr-role="outline"
+              aria-pressed={effectiveOutlineOpen}
+              aria-label="Toggle session outline"
+              title="Toggle session outline (o)"
+              onClick={toggleOutline}
+            >☰ Outline</button>
+            {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
+                last_anchor is null (a genuinely empty conversation). Disabled with
+                a spinner glyph while jumpToLatest() resets to the tail. Bound to `End`. */}
+            {detail.last_anchor && (
+              <button
+                type="button"
+                className="conv-jump-latest"
+                data-hdr-role="latest"
+                aria-label="Jump to latest message"
+                title="Jump to latest (End)"
+                disabled={jumpingLatest}
+                onClick={() => { void jumpToLatest(); }}
+              >{jumpingLatest ? '… ' : ''}Latest ↓</button>
+            )}
+          </div>
+          {/* SHARE — Anon · Export ▾ · Compare (the sharing / comparison cluster). */}
+          <div className="conv-hdr-group" data-hdr-group="share">
+            {/* #281 S4 — the "Anonymize" mode toggle chip, next to Export ▾.
+                Default ON, persisted; single source for the menu + per-card copy. */}
+            <button
+              type="button"
+              className="conv-anon-toggle"
+              data-hdr-role="anon"
+              aria-pressed={anonMode}
+              aria-label="Anonymize shared transcripts"
+              title={
+                anonMode
+                  ? 'Anonymize ON — exports & copies redact project paths, home, username & known secrets (best-effort; review before sharing)'
+                  : 'Anonymize OFF — exports & copies are raw'
+              }
+              onClick={toggleAnonMode}
             >
-              ✓ Complete · {outline.task_completion.total}
+              {anonMode ? '🎭 Anon' : 'Anon off'}
             </button>
-          )}
-          {/* #177 S5 §5 — focus-mode segmented control. A labeled radiogroup;
-              each button's aria-checked reflects the active mode (the valid
-              selected-state attribute for role="radio" — #184 dropped the
-              invalid aria-pressed, which belongs to toggle buttons, not radios).
-              Errors carries a count badge from the outline stats when > 0. */}
-          <div className="conv-focus-seg" role="radiogroup" aria-label="Focus mode">
-            {(['all', 'chat', 'prompts', 'errors'] as const).map((m) => {
-              // #217 S5 E4 — only the four PRIMARY modes live in the segmented
-              // control (edits/bash/subagent ride the FocusMoreMenu), so the
-              // label map is keyed to that narrowed union, not the full FocusMode.
-              const labels: Record<'all' | 'chat' | 'prompts' | 'errors', string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
-              // #217 S3 E10#2 — the badge is the error-TURN count (== the jump
-              // cluster chip == what clicking the Errors filter navigates to),
-              // NOT stats.error_count (the server's total error-EVENT count, which
-              // double-counts a turn with multiple error tools). The Stats card
-              // keeps the reconciliation phrasing "N errors in M turns".
-              const errCount = targetLists.error.length;
-              return (
-                <button
-                  key={m}
-                  type="button"
-                  className={['conv-focus-seg-btn', focusMode === m ? 'conv-focus-seg-btn--on' : ''].filter(Boolean).join(' ')}
-                  role="radio"
-                  aria-checked={focusMode === m}
-                  onClick={() => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: m })}
-                >
-                  {labels[m]}
-                  {m === 'errors' && errCount > 0 && (
-                    <span className="conv-focus-seg-badge">{errCount}</span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-          {/* #217 S5 E4 — the focus "▾ More" menu: Edits / Bash / per-Subagent.
-              Single-select on the same axis (a More-mode shows the four primary
-              segmented buttons unselected + the ▾ trigger labelled active). */}
-          <FocusMoreMenu
-            focusMode={focusMode}
-            subagents={subagentOptions}
-            onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
-          />
-          {/* #281 S4 — the "Anonymize" mode toggle chip, next to Export ▾.
-              Default ON, persisted; single source for the menu + per-card copy. */}
-          <button
-            type="button"
-            className="conv-anon-toggle"
-            aria-pressed={anonMode}
-            aria-label="Anonymize shared transcripts"
-            title={
-              anonMode
-                ? 'Anonymize ON — exports & copies redact project paths, home, username & known secrets (best-effort; review before sharing)'
-                : 'Anonymize OFF — exports & copies are raw'
-            }
-            onClick={toggleAnonMode}
-          >
-            {anonMode ? '🎭 Anon' : 'Anon off'}
-          </button>
-          {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
-              its own Esc/outside-click close; fetches the new /export route. */}
-          <ExportMenu sessionId={sessionId} title={detail.title} anonMode={anonMode} />
-          {/* jump-to-latest spec §5 — "Latest ↓" control. Hidden when
-              last_anchor is null (a genuinely empty conversation). Disabled with
-              a spinner glyph while jumpToLatest() resets to the tail. Bound to `End`. */}
-          {detail.last_anchor && (
+            {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
+                its own Esc/outside-click close; fetches the new /export route. */}
+            <ExportMenu sessionId={sessionId} title={detail.title} anonMode={anonMode} />
+            {/* #217 S7 F10 — "Compare with…" — enters rail pick-mode with this
+                session as the anchor (START_COMPARE_PICK). The rail then shows a
+                banner and rows pick the second session. #304 S3 (Codex F9) — the
+                #228 S5 E4 leading ::before divider + margin are suppressed inside
+                the sharing cluster (the group border IS the divider now). */}
             <button
               type="button"
-              className="conv-jump-latest"
-              aria-label="Jump to latest message"
-              title="Jump to latest (End)"
-              disabled={jumpingLatest}
-              onClick={() => { void jumpToLatest(); }}
-            >{jumpingLatest ? '… ' : ''}Latest ↓</button>
+              id="conv-compare-with"
+              className="conv-compare-with"
+              data-hdr-role="compare"
+              aria-label="Compare this session with another"
+              title="Compare with another session"
+              onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+            ><span className="conv-compare-with-glyph" aria-hidden="true">⟷ </span>Compare with…</button>
+          </div>
+          {/* BULK — ⤢⤡ moves from first to LAST action position (least-used
+              cluster; its old leading spot was unearned). #228 S2 surfaced the
+              keyboard-only ] / [ sweeps as a discoverable control. */}
+          <div className="conv-hdr-group" data-hdr-group="bulk">
+            <div className="conv-bulk-toggle" role="group" aria-label="Expand or collapse all threads">
+              <button
+                type="button"
+                className="conv-bulk-btn"
+                data-hdr-role="bulk-expand"
+                aria-label="Expand all threads"
+                title="Expand all (])"
+                onClick={() => sweepDetails(true)}
+              >⤢</button>
+              <button
+                type="button"
+                className="conv-bulk-btn"
+                data-hdr-role="bulk-collapse"
+                aria-label="Collapse all threads"
+                title="Collapse all ([)"
+                onClick={() => sweepDetails(false)}
+              >⤡</button>
+            </div>
+          </div>
+          {/* #304 S3 §1 (Q2) — quiet, right-aligned STATUS cluster (non-action):
+              the #217 S6 F3 cumulative-cost chip + the #217 S5 F7 ✓ Complete jump.
+              Complete keeps its jump affordance; its accent-button chrome is
+              demoted in CSS. Both were the FIRST controls in the old flat strip;
+              here they sit apart from the actions as glanceable status. */}
+          <div className="conv-hdr-status">
+            <CumulativeCostChip cumulative={cumCost.cost} total={detail.cost_usd} approx={cumCost.approx} pending={currentTurnUuid == null} />
+            {outline?.task_completion?.all_done && (
+              <button
+                type="button"
+                className="conv-complete-chip"
+                data-hdr-role="complete"
+                aria-label={`Session complete: ${outline.task_completion.total} tasks done — jump to the final checklist`}
+                title="Jump to the final task checklist"
+                onClick={() => jumpToCompletion(outline.task_completion!.anchor_uuid)}
+              >
+                ✓ Complete · {outline.task_completion.total}
+              </button>
+            )}
+          </div>
+          </>
           )}
-          {/* #217 S7 F10 — "Compare with…" — enters rail pick-mode with this
-              session as the anchor (START_COMPARE_PICK). The rail then shows a
-              banner and rows pick the second session. ≥44px touch target (#205);
-              CSS in index.css. */}
-          <button
-            type="button"
-            id="conv-compare-with"
-            className="conv-compare-with"
-            aria-label="Compare this session with another"
-            title="Compare with another session"
-            onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
-          ><span className="conv-compare-with-glyph" aria-hidden="true">⟷ </span>Compare with…</button>
-          {/* #205 S2 (F3) — Find toggle. Mirrors the outline toggle's
-              aria-pressed semantics + chrome; gives the `/` shortcut a visible,
-              tappable counterpart (the only find affordance on touch). */}
-          <button
-            type="button"
-            className="conv-find-toggle"
-            aria-pressed={convFindOpen}
-            aria-label="Find in conversation"
-            title="Find in conversation (/ or ⌘F / Ctrl+F)"
-            onClick={toggleFind}
-          ><SearchIcon /> Find</button>
-          {/* outline toggle. Visible on desktop + tablet; aria-pressed reflects
-              the EFFECTIVE open flag (sheet flag ≤1100px, persisted pref ≥1101px).
-              In the tablet band it opens the slide-over sheet (#228 S3 F1). */}
-          <button
-            type="button"
-            className="conv-outline-toggle"
-            aria-pressed={effectiveOutlineOpen}
-            aria-label="Toggle session outline"
-            title="Toggle session outline (o)"
-            onClick={toggleOutline}
-          >☰ Outline</button>
         </div>
       </div>
       )}

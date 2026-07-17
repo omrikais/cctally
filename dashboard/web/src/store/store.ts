@@ -1057,6 +1057,9 @@ export function dispatch(action: Action): void {
         // mode, so the reader replaces the comparison view.
         compare: null,
         comparePick: null,
+        // #304 S2 (Codex F8) — a direct open makes any pending compare focus
+        // return moot (mirrors SELECT_CONVERSATION's unconditional clear).
+        compareCloseFocusPending: false,
         selectedConversationId: action.sessionId,
         conversationJump: action.jump ?? null,
         // #177 S6 — a GENUINE session switch closes the find bar (its anchor
@@ -1209,10 +1212,23 @@ export function dispatch(action: Action): void {
       break;
     // #217 S7 F10 — session comparison.
     case 'START_COMPARE_PICK':
-      state = { ...state, comparePick: { anchor: action.anchor } };
+      // #304 S2 (Codex F2) — enforce the caller invariant `comparePick ⇒
+      // selectedConversationId === anchor` at the reducer: both entries
+      // dispatch from the open reader, and the compact view-layer gate relies
+      // on the anchor selection surviving pick-mode (cancel returns to the
+      // anchor reader). (Codex F7) — also close the ephemeral outline sheet:
+      // restoring it after cancel would bury the remounted reader and obscure
+      // the focus-return target behind the sheet backdrop.
+      if (action.anchor !== state.selectedConversationId) break;
+      state = { ...state, comparePick: { anchor: action.anchor }, convOutlineMobileOpen: false };
       break;
     case 'CANCEL_COMPARE_PICK':
-      state = { ...state, comparePick: null };
+      // #304 S2 — cancel returns to the anchor reader; arm the SAME focus-
+      // return flag CLOSE_COMPARE uses (its meaning generalizes to
+      // "compare-flow focus return pending"), and normalize convFiltersOpen
+      // (mirrors OPEN_COMPARE) so a banner-Cancel click with the popover open
+      // can't strand the flag through a compact rail unmount (Codex F1).
+      state = { ...state, comparePick: null, convFiltersOpen: false, compareCloseFocusPending: true };
       break;
     case 'OPEN_COMPARE': {
       if (action.a === action.b) break;               // guard: never A===B

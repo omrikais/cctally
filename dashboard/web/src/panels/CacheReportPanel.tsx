@@ -37,6 +37,7 @@ import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ExpandButton } from '../components/ExpandButton';
 import { CacheSparkline } from '../modals/CacheSparkline';
 import { CacheNetBars } from '../modals/CacheNetBars';
+import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
 
@@ -55,19 +56,9 @@ export function CacheReportPanel() {
   const isMobile = useIsMobile();
   const collapseClass = isMobile ? ' cache-report-collapsed' : '';
   const openModal = () => dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
-
-  // Shared keyboard handler attached to all three render branches
-  // (loading / empty / healthy) so a focused panel opens the modal on
-  // Enter / Space in every state — M2 in /check-review round 4. The
-  // section-focus-only guard mirrors SessionsPanel / ProjectsPanel so
-  // a key press inside a child element doesn't double-fire.
-  const handlePanelKeyDown = (e: React.KeyboardEvent) => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      openModal();
-    }
-  };
+  // #293 S4 — the region describes (role=region + aria-label); the Expand
+  // button is the sole keyboard/SR open path. The guarded pointer body-click is
+  // preserved via cardRegionClick so a nested control / grip never double-fires.
 
   // No data yet — minimal placeholder (envelope cold-start). The panel
   // still renders so panelOrder / drag-and-drop / keymap routing have
@@ -81,9 +72,7 @@ export function CacheReportPanel() {
         data-panel-kind="cache-report"
         role="region"
         aria-label="Cache Report"
-        tabIndex={0}
-        onClick={openModal}
-        onKeyDown={handlePanelKeyDown}
+        onClick={cardRegionClick(openModal)}
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
@@ -119,9 +108,7 @@ export function CacheReportPanel() {
         data-panel-kind="cache-report"
         role="region"
         aria-label="Cache Report"
-        tabIndex={0}
-        onClick={openModal}
-        onKeyDown={handlePanelKeyDown}
+        onClick={cardRegionClick(openModal)}
         style={{ cursor: 'pointer' }}
       >
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
@@ -256,9 +243,7 @@ export function CacheReportPanel() {
       data-panel-kind="cache-report"
       role="region"
       aria-label="Cache Report"
-      tabIndex={0}
-      onClick={openModal}
-      onKeyDown={handlePanelKeyDown}
+      onClick={cardRegionClick(openModal)}
       style={{ cursor: 'pointer' }}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>

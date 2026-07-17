@@ -1,5 +1,5 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 13 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 14 known
   ✓ 001_five_hour_block_models_backfill_v1         applied <REDACTED>
   ✓ 002_five_hour_block_projects_backfill_v1       applied <REDACTED>
   ✓ 003_merge_5h_block_duplicates_v1               applied <REDACTED>
@@ -12,9 +12,10 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 13 known
   · 010_recompute_percent_milestones_dedup_fix     pending
   · 011_budget_milestone_period_keys               pending
   · 012_unify_budget_milestones_vendor             pending
-  · 013_test_failure_injection                     pending
+  · 013_codex_quota_projection_state               pending
+  · 014_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 22 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 25 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
@@ -36,7 +37,10 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 22 known
   · 019_create_conversation_file_touches           pending
   · 020_session_entries_physical_unique            pending
   · 021_index_conversation_messages_cwd            pending
-  · 022_test_cache_migration                       pending
+  · 022_index_conversation_messages_model          pending
+  · 023_conversation_sessions_enrichment_columns   pending
+  · 024_codex_fused_ingest_rebuild                 pending
+  · 025_test_cache_migration                       pending
 ## stderr
 
 ## exit

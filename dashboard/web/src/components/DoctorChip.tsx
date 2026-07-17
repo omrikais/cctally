@@ -33,11 +33,18 @@ export function DoctorChip(): JSX.Element | null {
   if (!doctor) return null;
 
   const { severity, counts, generated_at } = doctor;
-  let label = 'Doctor';
+  // #293 S4 (§4c): split the label into a "Doctor" WORD + an ALWAYS-present
+  // compact status token (OK / warn-count / fail-count — never a bare dot), so
+  // the ≤360px topbar can hide the word and keep the color-coded status even in
+  // the tight FAIL+basket state. Mirrors the prior single-label precedence
+  // (a fail count wins over a warn count).
+  let status: string;
   if (counts.fail > 0) {
-    label = `Doctor · ${counts.fail} fail`;
+    status = `${counts.fail} fail`;
   } else if (severity === 'warn' && counts.warn > 0) {
-    label = `Doctor · ${counts.warn} warn`;
+    status = `${counts.warn} warn`;
+  } else {
+    status = 'OK';
   }
   const aria = `Doctor diagnostic: ${SEVERITY_LABEL[severity]} — ${counts.ok} OK, ${counts.warn} warn, ${counts.fail} fail`;
   let tooltip = `Doctor · ${SEVERITY_LABEL[severity]} (click for report)`;
@@ -56,8 +63,8 @@ export function DoctorChip(): JSX.Element | null {
       aria-label={aria}
       onClick={() => dispatch({ type: 'OPEN_DOCTOR_MODAL' })}
     >
-      <span className="doctor-chip__dot" aria-hidden="true">●</span>
-      <span className="doctor-chip__label">{label}</span>
+      <span className="doctor-chip-label">Doctor</span>
+      <span className="doctor-chip-status">{status}</span>
     </button>
   );
 }

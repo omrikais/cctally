@@ -283,6 +283,7 @@ import urllib.parse
 import urllib.request
 import webbrowser as _wb
 from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -459,6 +460,505 @@ from _cctally_dashboard_envelope import (
     _build_alerts_envelope_array,
     _model_breakdowns_to_models,
 )
+
+_ensure_sibling_loaded("_cctally_dashboard_sources")
+from _cctally_dashboard_sources import (
+    SourceCapabilityUnavailable,
+    SourceResourceNotFound,
+    source_detail_lookup,
+)
+from _lib_dashboard_sources import dashboard_resource_key
+
+
+def _source_safe_native_detail(row: Mapping, *, source: str,
+                               resource: str, key: str) -> dict[str, Any]:
+    """Return a provider-native detail envelope without raw source identity.
+
+    The published source adapter supplies resource-specific normalized facts;
+    details deliberately omit display-only labels and every raw identity field.
+    This keeps an opaque key opaque while preserving the provider's native
+    vocabulary (inclusive Codex tokens, qualified project totals, or quota
+    window state).
+    """
+    common = {"detail_kind": f"{source}_{resource}", "key": key}
+    allowed = {
+        "session": (
+            "last_activity", "cost_usd", "input_tokens", "cached_input_tokens",
+            "output_tokens", "reasoning_output_tokens", "total_tokens", "models",
+        ),
+        "project": (
+            "first_seen", "last_seen", "cost_usd", "input_tokens",
+            "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+            "total_tokens", "session_count", "sessions_count",
+        ),
+        "block": (
+            "resets_at", "current_percent", "orphaned", "forecast",
+            "window_minutes", "observed_slot", "milestones",
+        ),
+    }[resource]
+    common.update({name: row[name] for name in allowed if name in row})
+    return common
+
+
+def _codex_model_breakdowns(rows) -> list[dict[str, Any]]:
+    """Copy canonical Codex model totals into the safe dashboard vocabulary."""
+    result: list[dict[str, Any]] = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        result.append({
+            name: row[name]
+            for name in (
+                "modelName", "inputTokens", "cachedInputTokens", "outputTokens",
+                "reasoningOutputTokens", "totalTokens", "cost", "isFallback",
+            )
+            if name in row
+        })
+    return result
+
+
+def _codex_totals_wire(totals) -> dict[str, Any]:
+    return {
+        "cost_usd": float(getattr(totals, "cost_usd", 0.0)),
+        "input_tokens": int(getattr(totals, "input_tokens", 0)),
+        "cached_input_tokens": int(getattr(totals, "cached_input_tokens", 0)),
+        "output_tokens": int(getattr(totals, "output_tokens", 0)),
+        "reasoning_output_tokens": int(getattr(totals, "reasoning_output_tokens", 0)),
+        "total_tokens": int(getattr(totals, "total_tokens", 0)),
+    }
+
+
+def _codex_detail_inputs(snapshot):
+    """Open one bounded, sync-free Codex relational read for a detail route."""
+    from _cctally_cache import open_cache_db
+    from _cctally_dashboard_sources import (
+        DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+        DASHBOARD_QUOTA_RECENT_DAYS,
+        DashboardReadContext,
+        _codex_entries_from_qualified,
+        resolve_dashboard_source_semantics,
+    )
+    from _cctally_quota import load_codex_quota_observations
+    from _cctally_source_analytics import load_qualified_codex_entries
+
+    now_utc = getattr(snapshot, "generated_at", None) or _command_as_of()
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    now_utc = now_utc.astimezone(dt.timezone.utc)
+    range_start = now_utc - dt.timedelta(days=365)
+    config = sys.modules["cctally"].load_config()
+    codex_state = snapshot.source_bundle.sources["codex"]
+    data = codex_state.data if isinstance(codex_state.data, Mapping) else {}
+    periods = data.get("periods") if isinstance(data.get("periods"), Mapping) else {}
+    daily = periods.get("daily") if isinstance(periods.get("daily"), Mapping) else {}
+    display_tz_name = daily.get("display_tz")
+    if not isinstance(display_tz_name, str) or not display_tz_name:
+        display_tz_name = "UTC"
+    semantics = resolve_dashboard_source_semantics(
+        config, display_tz_name=display_tz_name,
+    )
+    cache_conn = open_cache_db()
+    stats_conn = open_db()
+    try:
+        context = DashboardReadContext(
+            cache_conn=cache_conn,
+            stats_conn=stats_conn,
+            range_start=range_start,
+            now_utc=now_utc,
+            display_tz_name=semantics.display_tz_name,
+            week_start_idx=semantics.week_start_idx,
+            week_start_name=semantics.week_start_name,
+            speed=semantics.speed,
+            codex_budget=semantics.codex_budget,
+        )
+        qualified = load_qualified_codex_entries(
+            range_start,
+            now_utc + dt.timedelta(microseconds=1),
+            speed=semantics.speed,
+            sync=False,
+            cache_conn=cache_conn,
+        )
+        entries = _codex_entries_from_qualified(qualified)
+        active_roots = tuple(sorted(
+            str(row[0]) for row in cache_conn.execute(
+                "SELECT source_root_key FROM codex_source_roots"
+            )
+        ))
+        observations = load_codex_quota_observations(
+            source_root_keys=active_roots,
+            cache_conn=cache_conn,
+            captured_at_or_after=(
+                now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
+            ),
+            active_at=now_utc,
+            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+        )
+        yield context, qualified, entries, observations
+    finally:
+        cache_conn.close()
+        stats_conn.close()
+
+
+def _build_codex_session_detail(context, entries, *, key: str) -> dict[str, Any]:
+    view = sys.modules["cctally"].build_codex_session_view(
+        entries,
+        now_utc=context.now_utc,
+        tz_name=context.display_tz_name,
+        speed=context.speed,
+    )
+    for row in view.rows:
+        candidate = dashboard_resource_key(
+            "session", "codex", row.codex_root or "single-root", row.session_id_path,
+        )
+        if candidate != key:
+            continue
+        return {
+            "detail_kind": "codex_session",
+            "key": key,
+            "last_activity": row.last_activity.astimezone(dt.timezone.utc).isoformat(),
+            "cost_usd": row.cost_usd,
+            "input_tokens": row.input_tokens,
+            "cached_input_tokens": row.cached_input_tokens,
+            "output_tokens": row.output_tokens,
+            "reasoning_output_tokens": row.reasoning_output_tokens,
+            "total_tokens": row.total_tokens,
+            "models": list(row.models),
+            "model_breakdowns": _codex_model_breakdowns(row.model_breakdowns),
+        }
+    raise SourceResourceNotFound()
+
+
+def _build_codex_project_detail(context, qualified, observations, *, key: str) -> dict[str, Any]:
+    from _lib_quota import build_blocks
+    from _lib_source_analytics import build_codex_project_result
+
+    result = build_codex_project_result(
+        qualified,
+        range_start=context.range_start,
+        range_end=context.now_utc + dt.timedelta(microseconds=1),
+        blocks=build_blocks(observations),
+        as_of=context.now_utc,
+        allocation_entries=qualified,
+        include_breakdown=True,
+    )
+    data = result.data
+    if data is None:
+        raise SourceResourceNotFound()
+    for row in data.projects:
+        if dashboard_resource_key("project", "codex", row.project_key) != key:
+            continue
+        selected = tuple(entry for entry in qualified if entry.project_key == row.project_key)
+        by_session: dict[str, list[object]] = {}
+        for entry in selected:
+            by_session.setdefault(entry.conversation_key, []).append(entry)
+        sessions = []
+        for ordinal, values in enumerate(
+            sorted(by_session.values(), key=lambda group: max(item.timestamp for item in group), reverse=True),
+            start=1,
+        ):
+            totals = sys.modules["_lib_source_analytics"]._totals(values)
+            sessions.append({
+                "label": f"Session {ordinal}",
+                "last_activity": max(item.timestamp for item in values).astimezone(dt.timezone.utc).isoformat(),
+                **_codex_totals_wire(totals),
+            })
+        return {
+            "detail_kind": "codex_project",
+            "key": key,
+            "range_start": data.range_start.astimezone(dt.timezone.utc).isoformat(),
+            "range_end": data.range_end.astimezone(dt.timezone.utc).isoformat(),
+            "first_seen": row.first_seen.astimezone(dt.timezone.utc).isoformat(),
+            "last_seen": row.last_seen.astimezone(dt.timezone.utc).isoformat(),
+            "session_count": row.session_count,
+            **_codex_totals_wire(row.totals),
+            "models": [
+                {"model": model, **_codex_totals_wire(totals)}
+                for model, totals in row.models
+            ],
+            "sessions": sessions,
+        }
+    raise SourceResourceNotFound()
+
+
+def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, Any]:
+    from _lib_quota import build_blocks, forecast_quota, percent_milestones, quota_freshness
+
+    rows = context.stats_conn.execute(
+        "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
+        "limit_name, resets_at_utc, current_percent, orphaned_at "
+        "FROM quota_window_blocks WHERE source='codex' "
+        "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot LIMIT 250"
+    ).fetchall()
+    matched = None
+    for row in rows:
+        candidate = dashboard_resource_key(
+            "block", "codex", row[0], row[1], row[2], row[3], row[5],
+        )
+        if candidate == key:
+            matched = row
+            break
+    if matched is None:
+        raise SourceResourceNotFound()
+    reset_at = parse_iso_datetime(str(matched[5]), "codex.block.resets_at")
+    matching_observations = tuple(
+        observation for observation in observations
+        if observation.identity.source_root_key == matched[0]
+        and observation.identity.logical_limit_key == matched[1]
+        and observation.identity.observed_slot == matched[2]
+        and observation.identity.window_minutes == matched[3]
+        and observation.resets_at == reset_at
+    )
+    block = next(
+        (item for item in build_blocks(matching_observations) if item.resets_at == reset_at),
+        None,
+    )
+    if block is None:
+        raise SourceResourceNotFound()
+    forecast = forecast_quota(block.observations, context.now_utc)
+    freshness = quota_freshness(block.observations, context.now_utc)
+    return {
+        "detail_kind": "codex_block",
+        "key": key,
+        "label": matched[4] or "Codex quota",
+        "observed_slot": matched[2],
+        "window_minutes": matched[3],
+        "resets_at": reset_at.astimezone(dt.timezone.utc).isoformat(),
+        "current_percent": matched[6],
+        "orphaned": matched[7] is not None,
+        "freshness": freshness.state,
+        "observations": [
+            {
+                "captured_at": item.captured_at.astimezone(dt.timezone.utc).isoformat(),
+                "used_percent": item.used_percent,
+                "resets_at": item.resets_at.astimezone(dt.timezone.utc).isoformat(),
+            }
+            for item in block.observations[-250:]
+        ],
+        "milestones": [
+            {
+                "percent": milestone.percent,
+                "captured_at": milestone.captured_at.astimezone(dt.timezone.utc).isoformat(),
+            }
+            for milestone in percent_milestones(block)
+        ],
+        "forecast": {
+            "status": forecast.status,
+            "current_percent": forecast.current_percent,
+            "projected_percent": forecast.projected_percent,
+            "resets_at": (
+                forecast.resets_at.astimezone(dt.timezone.utc).isoformat()
+                if forecast.resets_at else None
+            ),
+        },
+    }
+
+
+def _build_codex_source_detail(snapshot, *, resource: str, key: str) -> dict[str, Any]:
+    for context, qualified, entries, observations in _codex_detail_inputs(snapshot):
+        if resource == "session":
+            return _build_codex_session_detail(context, entries, key=key)
+        if resource == "project":
+            return _build_codex_project_detail(context, qualified, observations, key=key)
+        return _build_codex_block_detail(context, observations, key=key)
+    raise SourceResourceNotFound()
+
+
+def _source_safe_claude_session_detail(detail, *, key: str) -> dict[str, Any]:
+    """Adapt the existing Claude session detail builder to S4's safe route."""
+    payload = _session_detail_to_envelope(detail)
+    return {
+        "detail_kind": "claude_session",
+        "key": key,
+        "started_utc": payload["started_utc"],
+        "last_activity_utc": payload["last_activity_utc"],
+        "duration_min": payload["duration_min"],
+        "models": payload["models"],
+        "input_tokens": payload["input_tokens"],
+        "cache_creation_tokens": payload["cache_creation_tokens"],
+        "cache_read_tokens": payload["cache_read_tokens"],
+        "output_tokens": payload["output_tokens"],
+        "cache_hit_pct": payload["cache_hit_pct"],
+        "cost_per_model": payload["cost_per_model"],
+        "cost_total_usd": payload["cost_total_usd"],
+    }
+
+
+def _source_safe_claude_project_detail(detail: Mapping, *, key: str) -> dict[str, Any]:
+    """Drop legacy raw bucket/session identifiers from a Claude project drill."""
+    return {
+        "detail_kind": "claude_project",
+        "key": key,
+        "window_weeks": detail.get("window_weeks"),
+        "window_cost_usd": detail.get("window_cost_usd"),
+        "window_attributed_pct": detail.get("window_attributed_pct"),
+        "models": detail.get("models", []),
+        "sessions": [
+            {
+                "started_at": item.get("started_at"),
+                "last_activity_at": item.get("last_activity_at"),
+                "primary_model": item.get("primary_model"),
+                "cost_usd": item.get("cost_usd"),
+            }
+            for item in detail.get("sessions", [])
+            if isinstance(item, Mapping)
+        ],
+        "models_total": detail.get("models_total", 0),
+        "sessions_total": detail.get("sessions_total", 0),
+    }
+
+
+def _source_safe_claude_block_detail(detail: Mapping, *, key: str) -> dict[str, Any]:
+    """Reuse the shipped block builder while retaining source-safe fields."""
+    allowed = (
+        "start_at", "end_at", "actual_end_at", "anchor", "is_active",
+        "entries_count", "cost_usd", "total_tokens", "input_tokens",
+        "output_tokens", "cache_creation_tokens", "cache_read_tokens",
+        "cache_hit_pct", "models", "burn_rate", "projection", "samples",
+    )
+    return {
+        "detail_kind": "claude_block",
+        "key": key,
+        **{name: detail[name] for name in allowed if name in detail},
+    }
+
+
+def _claude_session_id_for_source_key(snapshot, key: str) -> str | None:
+    for row in getattr(snapshot, "sessions", ()) or ():
+        session_id = getattr(row, "session_id", None)
+        if isinstance(session_id, str) and session_id and (
+            dashboard_resource_key("session", "claude", session_id) == key
+        ):
+            return session_id
+    return None
+
+
+def _claude_project_key_for_source_key(snapshot, key: str) -> str | None:
+    env = getattr(snapshot, "projects_envelope", None)
+    if not isinstance(env, Mapping):
+        return None
+    candidates: list[object] = []
+    current = env.get("current_week")
+    if isinstance(current, Mapping):
+        candidates.extend(current.get("rows") or ())
+    trend = env.get("trend")
+    if isinstance(trend, Mapping):
+        candidates.extend(trend.get("projects") or ())
+    for row in candidates:
+        if not isinstance(row, Mapping):
+            continue
+        project_key = row.get("key")
+        if isinstance(project_key, str) and project_key and (
+            dashboard_resource_key("project", "claude", project_key) == key
+        ):
+            return project_key
+    return None
+
+
+def _claude_block_start_for_source_key(snapshot, key: str) -> dt.datetime | None:
+    for row in getattr(snapshot, "blocks_panel", ()) or ():
+        raw_start = getattr(row, "start_at", None)
+        if not isinstance(raw_start, str):
+            continue
+        try:
+            start_at = parse_iso_datetime(raw_start, "source.block.start_at")
+        except ValueError:
+            continue
+        identities = (raw_start, start_at.astimezone(dt.timezone.utc).isoformat(), start_at)
+        if any(dashboard_resource_key("block", "claude", value) == key for value in identities):
+            return start_at.astimezone(dt.timezone.utc)
+    return None
+
+
+def _build_claude_source_detail(snapshot, *, resource: str, key: str) -> dict[str, Any]:
+    """Map a bounded legacy row to its existing, cache-only detail builder."""
+    now_utc = getattr(snapshot, "generated_at", None) or _command_as_of()
+    if resource == "session":
+        session_id = _claude_session_id_for_source_key(snapshot, key)
+        if session_id is None:
+            raise SourceResourceNotFound()
+        detail = sys.modules["cctally"]._tui_build_session_detail(
+            session_id, now_utc=now_utc,
+        )
+        if detail is None:
+            raise SourceResourceNotFound()
+        return _source_safe_claude_session_detail(detail, key=key)
+
+    if resource == "project":
+        project_key = _claude_project_key_for_source_key(snapshot, key)
+        if project_key is None:
+            raise SourceResourceNotFound()
+        conn = open_db()
+        try:
+            conn.execute("ATTACH DATABASE ? AS cache_db", (str(_cctally_core.CACHE_DB_PATH),))
+            conn.execute("CREATE TEMP VIEW session_entries AS SELECT * FROM cache_db.session_entries")
+            conn.execute("CREATE TEMP VIEW session_files AS SELECT * FROM cache_db.session_files")
+            detail = _project_detail_for_window(
+                conn,
+                project_key=project_key,
+                weeks_back=1,
+                now_utc=now_utc,
+                current_week=getattr(snapshot, "current_week", None),
+                projects_envelope=getattr(snapshot, "projects_envelope", None),
+            )
+        finally:
+            try:
+                conn.execute("DROP VIEW IF EXISTS session_entries")
+                conn.execute("DROP VIEW IF EXISTS session_files")
+                conn.execute("DETACH DATABASE cache_db")
+            except sqlite3.Error:
+                pass
+            conn.close()
+        if detail is None:
+            raise SourceResourceNotFound()
+        return _source_safe_claude_project_detail(detail, key=key)
+
+    start_at = _claude_block_start_for_source_key(snapshot, key)
+    if start_at is None:
+        raise SourceResourceNotFound()
+    end_at = start_at + BLOCK_DURATION
+    cache_conn = open_cache_db()
+    try:
+        entries = list(iter_entries(cache_conn, start_at, end_at))
+    finally:
+        cache_conn.close()
+    recorded_windows, block_start_overrides, canonical_intervals = (
+        _load_recorded_five_hour_windows(start_at - BLOCK_DURATION, end_at + BLOCK_DURATION)
+    )
+    blocks = _group_entries_into_blocks(
+        entries,
+        mode="auto",
+        recorded_windows=recorded_windows,
+        block_start_overrides=block_start_overrides,
+        canonical_intervals=canonical_intervals,
+        now=now_utc,
+    )
+    target = next(
+        (block for block in blocks if not block.is_gap and block.start_time == start_at),
+        None,
+    )
+    if target is None:
+        raise SourceResourceNotFound()
+    block_entries = [
+        entry for entry in entries if target.start_time <= entry.timestamp < target.end_time
+    ]
+    return _source_safe_claude_block_detail(
+        _build_block_detail(target, block_entries), key=key,
+    )
+
+
+def build_source_detail(*, snapshot, source: str, resource: str,
+                        key: str) -> dict[str, Any]:
+    """Resolve one qualified opaque key to a provider-native read-only detail.
+
+    The frozen published bundle is the first bounded key index.  Claude then
+    invokes the existing detail builders with cache-only reads; Codex returns
+    the native S1-S3 adapter detail without a Claude fallback or a rollout
+    parse.  Every branch preserves the generic handler errors above it.
+    """
+    row = source_detail_lookup(snapshot.source_bundle, source, resource, key)
+    if source == "claude":
+        return _build_claude_source_detail(snapshot, resource=resource, key=key)
+    return _build_codex_source_detail(snapshot, resource=resource, key=key)
 
 _ensure_sibling_loaded("_cctally_dashboard_share")
 from _cctally_dashboard_share import (
@@ -3492,6 +3992,100 @@ def _debug_cache_table_counts(cache_conn) -> dict:
     return counts
 
 
+_DEBUG_SOURCE_CACHE_TABLES = {
+    "claude": (("session_entries", None), ("session_files", None)),
+    "codex": (
+        ("codex_session_entries", None),
+        ("codex_session_files", None),
+        ("codex_source_roots", None),
+        ("quota_window_snapshots", "source='codex'"),
+    ),
+}
+
+_DEBUG_SOURCE_STATS_TABLES = {
+    "codex": (
+        ("quota_window_blocks", "source='codex'"),
+        ("quota_percent_milestones", "source='codex'"),
+        ("quota_threshold_events", "source='codex'"),
+        ("budget_milestones", "vendor='codex'"),
+        ("projected_milestones", "metric='codex_budget_usd'"),
+    ),
+}
+
+
+def _debug_source_state_wire(bundle, source: str) -> dict:
+    """Return only public availability/version state from a published bundle."""
+    try:
+        state = bundle.sources[source]
+        availability = getattr(state, "availability", "unavailable")
+        freshness = getattr(state, "freshness", "stale")
+        version = getattr(state, "data_version", None)
+        data = getattr(state, "data", None)
+    except (AttributeError, KeyError, TypeError):
+        availability, freshness, version, data = "unavailable", "stale", None, None
+    def resource_count(domain: str) -> int:
+        try:
+            value = data[domain]["rows"]
+            return len(value) if isinstance(value, (list, tuple)) else 0
+        except (KeyError, TypeError):
+            return 0
+    return {
+        "availability": availability if availability in ("ok", "empty", "partial") else "unavailable",
+        "freshness": freshness if freshness in ("fresh", "stale") else "stale",
+        "data_version": version if isinstance(version, str) else None,
+        "tables": {},
+        "resources": {
+            "projects": resource_count("projects"),
+            "alerts": resource_count("alerts"),
+        },
+    }
+
+
+def _debug_source_counts(cache_conn, bundle) -> dict:
+    """Bounded, source-owned counts and opaque state for the debug endpoint.
+
+    Every table and predicate is fixed here.  This deliberately reports no
+    values from rows: roots, paths, logical limits, conversation IDs, and
+    project labels never cross the diagnostic boundary.
+    """
+    result = {
+        source: _debug_source_state_wire(bundle, source)
+        for source in ("claude", "codex", "all")
+    }
+    if cache_conn is None:
+        return result
+    for source, tables in _DEBUG_SOURCE_CACHE_TABLES.items():
+        for table, where in tables:
+            try:
+                predicate = f" WHERE {where}" if where else ""
+                row = cache_conn.execute(
+                    f"SELECT COUNT(*) FROM {table}{predicate}"  # noqa: S608 -- fixed allowlist
+                ).fetchone()
+                result[source]["tables"][table] = int(row[0])
+            except sqlite3.Error:
+                pass
+    stats_conn = None
+    try:
+        stats_conn = sqlite3.connect(
+            f"{_cctally_core.DB_PATH.as_uri()}?mode=ro", uri=True
+        )
+        for source, tables in _DEBUG_SOURCE_STATS_TABLES.items():
+            for table, where in tables:
+                try:
+                    row = stats_conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {where}"  # noqa: S608 -- fixed allowlist
+                    ).fetchone()
+                    result[source]["tables"][table] = int(row[0])
+                except sqlite3.Error:
+                    pass
+    except sqlite3.Error:
+        pass
+    finally:
+        if stats_conn is not None:
+            stats_conn.close()
+    return result
+
+
 def _debug_cache_state(cache_conn) -> dict:
     """On-demand signature legs + pending-reingest flags + generation.
 
@@ -3528,8 +4122,8 @@ def _debug_cache_state(cache_conn) -> dict:
                 "max_entry_id": sc._max_id(cache_conn, "session_entries"),
                 "entry_mutation_seq": sc._entry_mutation_seq(cache_conn),
             }
-    except sqlite3.Error as exc:
-        state["signature"] = {"_error": f"{type(exc).__name__}: {exc}"}
+    except sqlite3.Error:
+        state["signature"] = {"status": "unavailable"}
     finally:
         if stats_conn is not None:
             stats_conn.close()
@@ -3587,6 +4181,7 @@ def _debug_tool_version() -> str:
 _GET_ROUTES = (
     ("exact", "/api/data", "_serve_api_data", None, False),
     ("exact", "/api/events", "_serve_api_events", None, False),
+    ("prefix", "/api/source/", "_handle_get_source_detail", None, True),
     ("prefix", "/api/session/", "_handle_get_session_detail", None, True),
     ("prefix", "/api/project/", "_handle_get_project_detail", None, False),
     ("prefix", "/api/block/", "_handle_get_block_detail", None, True),
@@ -4053,14 +4648,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         dataset: dict = {}
         cache_state: dict = {}
         try:
+            source_bundle = self.snapshot_ref.get().source_bundle
+        except Exception:  # noqa: BLE001 -- diagnostics fail closed.
+            source_bundle = None
+        sources = _debug_source_counts(None, source_bundle)
+        try:
             conn = open_cache_db()
             try:
                 dataset = _debug_cache_table_counts(conn)
                 cache_state = _debug_cache_state(conn)
+                sources = _debug_source_counts(conn, source_bundle)
             finally:
                 conn.close()
-        except Exception as exc:  # noqa: BLE001 — a diagnostic must not 500 loudly
-            cache_state = {"_error": f"{type(exc).__name__}: {exc}"}
+        except Exception:  # noqa: BLE001 -- a diagnostic must not expose raw errors.
+            cache_state = {"status": "unavailable"}
         body = {
             "schemaVersion": 1,
             "version": _debug_tool_version(),
@@ -4068,6 +4669,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             "dataset": dataset,
             "phases": (last or {}).get("phases"),
             "cache_state": cache_state,
+            "sources": sources,
         }
         if body["phases"] is None:
             body["note"] = "tracing_disabled"
@@ -5124,6 +5726,78 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_get_source_detail(self, path: str) -> None:
+        """Serve one source-qualified provider detail with read-only access."""
+        import re
+        import urllib.parse as _urlparse
+
+        raw = path[len("/api/source/"):]
+        parts = raw.split("/", 2)
+        if len(parts) != 3:
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        source, resource, raw_key = parts
+        if (
+            source not in ("claude", "codex")
+            or resource not in ("session", "project", "block")
+            or not raw_key
+            or re.search(r"%(?![0-9A-Fa-f]{2})", raw_key)
+        ):
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        try:
+            key = _urlparse.unquote_to_bytes(raw_key).decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        if not key or "/" in key:
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        try:
+            snap = self.snapshot_ref.get()
+            detail = build_source_detail(
+                snapshot=snap,
+                source=source,
+                resource=resource,
+                key=key,
+            )
+        except SourceResourceNotFound:
+            self._respond_json(404, {
+                "code": "source_resource_not_found",
+                "error": "source resource not found",
+            })
+            return
+        except SourceCapabilityUnavailable:
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        except Exception as exc:  # noqa: BLE001 — detailed diagnostics stay server-only.
+            self.log_error("/api/source/%s/%s failed: %r", source, resource, exc)
+            self._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
+        self._respond_json(200, {
+            "source": source,
+            "resource": resource,
+            "data": detail,
+        })
+
 
     # ---- conversation viewer (spec §6) — thin delegators to the F4 sibling ----
     # Bodies live in bin/_cctally_dashboard_conversation.py as *_impl(handler, …)
@@ -5770,6 +6444,7 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
         hydrating=True,
+        source_bundle=tui._tui_hydrating_source_bundle(),
     )
 
 
@@ -6062,4 +6737,3 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         http_thread.join(timeout=2)
         print("dashboard: stopped", flush=True)
     return 0
-

@@ -62,20 +62,14 @@ writer-version bytes (96-99); without that the committed fixture re-dirties on
 every harness run.
 
 Migration posture mirrors ``build-dashboard-fixtures.py``: the empty stats.db
-is stamped fully-migrated (``stamp_all_stats_migrations_applied``) so a read
-command's ``sync_cache`` walk can't flip the upgrade-gate to PROCEED. The
-conversation routes never read stats.db, but the dashboard server opens it at
-boot, so it must exist and be migration-clean.
-
-The cache.db half is NOT pre-stamped to head: ``create_cache_db`` stamps only
-cache-001 (``001_dedup_highest_wins``, ``user_version = 1``), while the cache
-migration registry also holds ``002_conversation_messages_backfill``. So on the
-first ``cctally`` open the dispatcher sees ``user_version 1 != registry len 2``,
-runs the ``002`` handler (advancing ``user_version`` -> 2 and setting
-``cache_meta.conversation_backfill_pending = '1'``, which stays set under the
-harness's ``--no-sync``). This is benign here: the conversation routes read the
-``conversation_messages`` / ``session_entries`` tables directly and never gate
-on that flag, and the gitignored ``.db`` doesn't re-dirty the tree.
+is stamped fully-migrated (``stamp_all_stats_migrations_applied``), and
+``create_cache_db`` stamps the current cache registry head after building the
+current physical schema. Directly seeded render fixtures must not replay
+data-shape migrations on startup. In particular, migration 010 is already
+complete, its pending flag is absent, and the search route reports
+``search_depth: full`` even though the harness runs the dashboard with
+``--no-sync``. The conversation routes never read stats.db, but the dashboard
+server opens it at boot, so it must exist and be migration-clean.
 
 Run: ``bin/build-conversation-fixtures.py`` (idempotent; overwrites).
 """

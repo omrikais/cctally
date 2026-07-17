@@ -85,6 +85,12 @@ class SnapshotSignature(NamedTuple):
     # finalization UPSERT advances this leg while `max_entry_id` stays flat, so
     # the dashboard leaves the idle path and recomputes the affected bucket.
     entry_mutation_seq: int = 0
+    # #294 S4: Codex metadata, root, quota, and destructive mutations can
+    # leave `MAX(codex_session_entries.id)` flat. The cache-local physical
+    # sequence supplies that missing identity leg; the stats digest arrives
+    # from the independently-committed quota/budget projection database.
+    codex_physical_mutation_seq: int = 0
+    codex_stats_digest: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -127,6 +133,23 @@ def _entry_mutation_seq(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
+def _codex_physical_mutation_seq(conn: sqlite3.Connection) -> int:
+    """Read the O(1) Codex physical mutation sequence, degrading to zero."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None or row[0] is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
 def _reset_sig(conn: sqlite3.Connection) -> tuple[int, int]:
     """Change-signal over the two reset-event tables combined (spec §3).
 
@@ -155,6 +178,7 @@ def compute_signature(
     stats_conn: sqlite3.Connection,
     *,
     generation: int,
+    codex_stats_digest: str = "",
 ) -> SnapshotSignature:
     """Composite data-version signature across cache.db + stats.db (spec §3).
 
@@ -173,6 +197,8 @@ def compute_signature(
         max_codex_id=_max_id(cache_conn, "codex_session_entries"),
         generation=int(generation),
         entry_mutation_seq=_entry_mutation_seq(cache_conn),
+        codex_physical_mutation_seq=_codex_physical_mutation_seq(cache_conn),
+        codex_stats_digest=str(codex_stats_digest),
     )
 
 

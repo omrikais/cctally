@@ -1,8 +1,8 @@
 # `cache-report`
 
-Cache-hit %, cost-saved-vs-baseline, write-premium tracking, and anomaly
-triggers across days or sessions. The most feature-rich command in the
-suite.
+Claude cache diagnostics or Codex cached-input/token-reuse analytics across
+days or sessions. Provider sections stay separate because their token and cache
+semantics differ.
 
 ## Synopsis
 
@@ -12,23 +12,30 @@ cctally cache-report
     [--by-session]
     [--offline] [--project PROJECT] [--json]
     [--anomaly-threshold-pp PP] [--anomaly-window-days N] [--no-anomaly]
-    [--sort {date,net,cache,recent,cost,anomaly}]
+    [--sort {date,net,cache,recent,cost,anomaly,reuse}]
+    [--source {claude,codex,all}] [--speed {auto,standard,fast}]
 ```
 
 ## Purpose
 
-Surface caching behavior so regressions (e.g. a Claude Code update that
-silently disables prompt caching for a model) become visible in days
-rather than dollars.
+For Claude, surface cache behavior so a prompt-caching regression becomes
+visible in days rather than dollars. For Codex, surface cached-input/token reuse
+without relabeling it as Claude cache behavior.
 
 ## What it shows
 
+**Claude cache diagnostics** show:
+
 - **Cache %** = `cache_read_tokens / (input + cache_create + cache_read)`
-- **$ Saved** — counterfactual: what cost would have been with no caching, minus actual
-- **$ Wasted** — premium paid for cache writes that didn't yield enough reads
-- **Net $** — `Saved – Wasted`; negative means the caching is costing you
-- **Anomaly glyph (⚠)** — fires when `Net $ < 0` or `Cache % drops ≥ 15pp` vs. the trailing 14-day median
-- Per-model breakdown rows under each parent row (always shown)
+- **$ Saved** — counterfactual no-cache cost minus actual cost
+- **$ Wasted** — cache-write premium that did not yield enough reads
+- **Net $** — `Saved – Wasted`; negative means caching is costing you
+- **Anomaly glyph (⚠)** — `Net $ < 0` or Cache % drops ≥15pp vs. the trailing median
+
+**Codex token reuse** shows inclusive input, cached input, non-cached input,
+cached-input percent, output, reasoning output, and source-native cost. It has
+no cache-hit rate, cache-create/read tokens, savings, waste, net, or Claude
+anomaly verdict. Per-model rows remain visible for both providers.
 
 ## Options
 
@@ -36,15 +43,17 @@ rather than dollars.
 | --- | --- |
 | `--days N` | Recent days to include (default `7`). |
 | `--since` / `--until` | ISO 8601 window bounds. Override `--days` when set. |
-| `--by-session` | Group by Claude `sessionId` (resume-merged) instead of by date. Adds SessionId / Last Activity / Project columns. |
+| `--by-session` | Group by source-native session identity instead of by date. Adds identity / Last Activity / Project columns. |
 | `--offline` | No-op (pricing always embedded). |
 | `--project PROJECT` | Filter to a specific project. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Machine-readable JSON. |
-| `--anomaly-threshold-pp PP` | Cache% drop threshold for the `cache_drop` trigger. Default `15`. |
-| `--anomaly-window-days N` | Trailing window (days) for baseline median. Default `14`. |
-| `--no-anomaly` | Disable both `cache_drop` and `net_negative` triggers. |
-| `--sort` | Override sort order. Defaults: `date` in daily mode, `net` in `--by-session`. Options: `date`, `net`, `cache`, `recent`, `cost`, `anomaly`. |
+| `--anomaly-threshold-pp PP` | Claude Cache% drop threshold for the `cache_drop` trigger. Default `15`. |
+| `--anomaly-window-days N` | Claude trailing baseline window in days. Default `14`. |
+| `--no-anomaly` | Disable Claude `cache_drop` and `net_negative` triggers. |
+| `--sort` | Override the source-native sort order. `reuse` is Codex-only; `net`, `cache`, and `anomaly` are Claude-only. |
+| `--source {claude,codex,all}` | Analytics provider; default `claude`. `cctally claude cache-report` and `cctally codex cache-report` are fixed-source equivalents. |
+| `--speed {auto,standard,fast}` | Codex pricing tier; default `auto`. Applies to Codex/all, not a non-default Claude-only request. |
 
 ## Examples
 
@@ -55,9 +64,34 @@ cctally cache-report --since 2026-04-10 --until 2026-04-18
 cctally cache-report --by-session --days 14
 cctally cache-report --by-session --sort cache
 cctally cache-report --json
+cctally codex cache-report --since 2026-07-14 --until 2026-07-16 --sort reuse
+cctally cache-report --source all --by-session --json
 ```
 
 ## Gotchas
+
+### Codex token reuse, not a cache-hit rate
+
+`--source codex` is a **Codex Token Reuse Report**, not a Claude cache report.
+It reports inclusive input, cached input, non-cached input (`input - cached`,
+floored at zero), cached-input percent (when input is positive), output,
+reasoning output, and source-native cost. It has no cache-create/read tokens,
+hit count/rate, savings, waste, net, or Claude anomaly verdict. In particular,
+`cacheHitPercent` is deliberately not a Codex wire field.
+
+`--sort reuse` is Codex-only and sorts descending by cached-input percent.
+Codex accepts `date`, `recent`, and `cost`; `net`, `cache`, and `anomaly` are
+Claude-only. `--anomaly-*` and `--no-anomaly` are rejected for Codex when
+explicitly non-default, while in `--source all` they affect the Claude section
+only. `--by-session` groups Codex by qualified conversation/root; all-source
+output renders the Claude cache and Codex reuse sections separately.
+
+Codex can retain truthful daily/model reuse when project metadata is missing;
+the direct source becomes `partial` and marks its project-metadata section
+`unavailable`. A requested Codex `--project` filter instead requires the
+qualified join and returns the explicit unavailable envelope with exit 3. The
+all-source form retains both source blocks and has the same exit-3 rule for that
+requested filter.
 
 - **Anomaly baseline silent-skips when samples are thin.** The
   `cache_drop` trigger needs ≥5 daily rows or ≥10 session rows in the

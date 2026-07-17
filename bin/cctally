@@ -86,6 +86,16 @@ def _load_sibling(name: str):
     Registers in sys.modules BEFORE exec_module so dataclass(frozen=True)
     paths that inspect cls.__module__'s sys.modules entry work correctly.
 
+    Thread-safe (#306). That pre-registration opens a window — the module is in
+    sys.modules but its top-level names are not yet bound — which, under the
+    dashboard's ThreadingHTTPServer, let a second request thread observe the
+    half-initialized module and AttributeError on a not-yet-bound name (e.g.
+    `_lib_transcript_access.transcripts_allowed`), then self-heal once the body
+    finished. `_SIBLING_LOCK` serializes the load so a concurrent caller blocks
+    until the body completes; `_LOADED_SIBLINGS` gates a lock-free fast path for
+    already-loaded siblings. Fail-closed by construction — a race waits, it never
+    returns a partial module early.
+
     For `_cctally_*.py` siblings that back-reference `cctally`, the sibling
     module exposes a `_cctally()` accessor that reads `sys.modules['cctally']`
     at call-time (spec §5.5). We re-pin `sys.modules['cctally']` on every
@@ -104,16 +114,53 @@ def _load_sibling(name: str):
     # reference to whichever bin/cctally module instance owns this
     # _load_sibling closure — regardless of pytest re-imports.
     sys.modules["cctally"] = _THIS_MODULE
-    cached = sys.modules.get(name)
-    if cached is not None:
-        return cached
-    import importlib.util as _ilu
-    p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
-    spec = _ilu.spec_from_file_location(name, p)
-    mod = _ilu.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # Fast path: a sibling whose body has FULLY executed is returned without
+    # contending on the load lock. `_LOADED_SIBLINGS` is only ever added to,
+    # after a successful exec_module (below), so its membership is a stable
+    # "complete" signal — keeping the hot path lock-free for the ~50 sequential
+    # sibling loads at CLI startup and every warm request-thread lazy-load.
+    if name in _LOADED_SIBLINGS:
+        return sys.modules[name]
+    # Slow path — serialize the actual load (#306). Any concurrent caller blocks
+    # here until the owning thread finishes exec_module and records the name
+    # complete, so it can never observe the half-initialized module.
+    with _SIBLING_LOCK:
+        # Completed while we waited for the lock.
+        if name in _LOADED_SIBLINGS:
+            return sys.modules[name]
+        cached = sys.modules.get(name)
+        if cached is not None:
+            # Registered but not yet recorded complete. Under the lock this is
+            # NOT another thread mid-load (that thread would hold the lock) — it
+            # is either OUR OWN thread re-entering mid-exec_module (a circular
+            # import: return the partial module, matching CPython's semantics and
+            # the prior behavior) or a module some normal `import` already fully
+            # loaded. Either way the existing sys.modules entry is the object to
+            # return; do NOT record it complete here — a circular partial must
+            # never be published to the lock-free fast path (only the owning
+            # exec_module below does that, once the body has finished).
+            return cached
+        import importlib.util as _ilu
+        p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
+        # The target itself is located by path, but leaf siblings may use a
+        # normal ``from _lib_x import ...`` import.  SourceFileLoader / exec
+        # callers do not necessarily put bin/ on sys.path, so make the sibling
+        # directory available before executing that module.
+        bin_dir = str(p.parent)
+        if bin_dir not in sys.path:
+            sys.path.insert(0, bin_dir)
+        spec = _ilu.spec_from_file_location(name, p)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            # Failed mid-body — unregister so a later call retries cleanly and a
+            # broken module is never recorded complete (mirrors importlib).
+            sys.modules.pop(name, None)
+            raise
+        _LOADED_SIBLINGS.add(name)
+        return mod
 
 
 # Stable reference to THIS bin/cctally module instance, used by
@@ -131,6 +178,19 @@ def _load_sibling(name: str):
 #      passing `globals()` to `sys.modules[__name__] = …` is unnecessary
 #      since `_THIS_MODULE` is the value we want to keep stable).
 _THIS_MODULE = sys.modules.get(__name__) or sys.modules.get("cctally")
+
+
+# Thread-safety for _load_sibling (#306). The dashboard's ThreadingHTTPServer
+# serves each request on its own thread, and the transcript- / perf- /
+# conversation-path siblings are lazy-loaded on those threads. `_SIBLING_LOCK`
+# serializes the actual load so a concurrent caller can never observe a module
+# that is registered in sys.modules but whose exec_module is still mid-body (the
+# pre-registration window below), and `_LOADED_SIBLINGS` records the names whose
+# bodies have fully executed, gating a lock-free fast path. RLock (not Lock) so a
+# circular import that re-enters _load_sibling on the SAME thread during
+# exec_module cannot self-deadlock.
+_SIBLING_LOCK = threading.RLock()
+_LOADED_SIBLINGS: set[str] = set()
 
 
 # Hook-tick non-path constants (Section 1 of onboarding spec).
@@ -251,6 +311,15 @@ HOOK_TICK_LOG_PATH = _cctally_core.HOOK_TICK_LOG_PATH
 HOOK_TICK_LOG_ROTATED_PATH = _cctally_core.HOOK_TICK_LOG_ROTATED_PATH
 HOOK_TICK_THROTTLE_PATH = _cctally_core.HOOK_TICK_THROTTLE_PATH
 HOOK_TICK_THROTTLE_LOCK_PATH = _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH
+
+# Statusline usage-persistence markers + tunables (spec 2026-07-17).
+STATUSLINE_OBSERVE_MARKER_PATH = _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH
+STATUSLINE_PERSIST_LOCK_PATH = _cctally_core.STATUSLINE_PERSIST_LOCK_PATH
+OAUTH_BACKOFF_MARKER_PATH = _cctally_core.OAUTH_BACKOFF_MARKER_PATH
+STATUSLINE_PERSIST_THROTTLE_SECONDS = _cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS
+OAUTH_BACKFILL_STALE_SECONDS = _cctally_core.OAUTH_BACKFILL_STALE_SECONDS
+OAUTH_BACKOFF_BASE_SECONDS = _cctally_core.OAUTH_BACKOFF_BASE_SECONDS
+OAUTH_BACKOFF_CAP_SECONDS = _cctally_core.OAUTH_BACKOFF_CAP_SECONDS
 
 UPDATE_STATE_PATH = _cctally_core.UPDATE_STATE_PATH
 UPDATE_SUPPRESS_PATH = _cctally_core.UPDATE_SUPPRESS_PATH
@@ -375,6 +444,7 @@ _build_codex_daily_parser = _cctally_parser._build_codex_daily_parser
 _build_codex_monthly_parser = _cctally_parser._build_codex_monthly_parser
 _build_codex_weekly_parser = _cctally_parser._build_codex_weekly_parser
 _build_codex_session_parser = _cctally_parser._build_codex_session_parser
+_build_codex_quota_parser = _cctally_parser._build_codex_quota_parser
 
 
 _lib_alert_axes = _load_sibling("_lib_alert_axes")
@@ -425,6 +495,37 @@ _iter_jsonl_entries_with_offsets = _lib_jsonl._iter_jsonl_entries_with_offsets
 _CODEX_FILENAME_UUID_RE = _lib_jsonl._CODEX_FILENAME_UUID_RE
 _CodexIterState = _lib_jsonl._CodexIterState
 _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_with_offsets
+
+# Provider-neutral quota interpretation kernel (#294 S2).  The module is pure
+# and contains no database, config, filesystem, notifier, parser, or command
+# dependency; adapters added in later stages own those concerns.
+_lib_quota = _load_sibling("_lib_quota")
+QuotaWindowIdentity = _lib_quota.QuotaWindowIdentity
+QuotaObservation = _lib_quota.QuotaObservation
+QuotaHistory = _lib_quota.QuotaHistory
+QuotaBlock = _lib_quota.QuotaBlock
+QuotaPercentMilestone = _lib_quota.QuotaPercentMilestone
+QuotaFreshness = _lib_quota.QuotaFreshness
+QuotaForecast = _lib_quota.QuotaForecast
+QuotaRule = _lib_quota.QuotaRule
+ResolvedQuotaRule = _lib_quota.ResolvedQuotaRule
+QuotaThresholdDecision = _lib_quota.QuotaThresholdDecision
+identity_sort_key = _lib_quota.identity_sort_key
+physical_order_key = _lib_quota.physical_order_key
+logical_value_tuple = _lib_quota.logical_value_tuple
+source_path_key = _lib_quota.source_path_key
+build_history = _lib_quota.build_history
+latest_physical_observation = _lib_quota.latest_physical_observation
+select_baseline = _lib_quota.select_baseline
+build_blocks = _lib_quota.build_blocks
+percent_milestones = _lib_quota.percent_milestones
+stale_after_seconds = _lib_quota.stale_after_seconds
+quota_freshness = _lib_quota.quota_freshness
+forecast_quota = _lib_quota.forecast_quota
+validate_thresholds = _lib_quota.validate_thresholds
+resolve_quota_rule = _lib_quota.resolve_quota_rule
+quota_rule_fingerprint = _lib_quota.quota_rule_fingerprint
+quota_threshold_decisions = _lib_quota.quota_threshold_decisions
 
 _lib_blocks = _load_sibling("_lib_blocks")
 BLOCK_DURATION = _lib_blocks.BLOCK_DURATION
@@ -628,6 +729,12 @@ _setup_data_dir_size_bytes = _cctally_setup._setup_data_dir_size_bytes
 _setup_format_bytes = _cctally_setup._setup_format_bytes
 _setup_recent_log_stats = _cctally_setup._setup_recent_log_stats
 _setup_compute_symlink_state = _cctally_setup._setup_compute_symlink_state
+CodexHooksError = _cctally_setup.CodexHooksError
+_codex_hooks_plan_install = _cctally_setup._codex_hooks_plan_install
+_codex_hooks_plan_uninstall = _cctally_setup._codex_hooks_plan_uninstall
+_write_codex_hooks_atomic = _cctally_setup._write_codex_hooks_atomic
+_setup_codex_hook_roots = _cctally_setup._setup_codex_hook_roots
+_setup_manage_codex_hooks = _cctally_setup._setup_manage_codex_hooks
 _setup_status = _cctally_setup._setup_status
 _setup_uninstall = _cctally_setup._setup_uninstall
 _setup_dry_run = _cctally_setup._setup_dry_run
@@ -660,6 +767,8 @@ _cctally_alerts = _load_sibling("_cctally_alerts")
 _alerts_log_path = _cctally_alerts._alerts_log_path
 _dispatch_alert_notification = _cctally_alerts._dispatch_alert_notification
 cmd_alerts_test = _cctally_alerts.cmd_alerts_test
+_build_alert_payload_quota = _cctally_alerts._build_alert_payload_quota
+_alert_text_quota = _cctally_alerts._alert_text_quota
 
 # Eager re-export of bin/_cctally_sync_week.py — `cmd_sync_week` is
 # called by bare name from non-extracted `cmd_record_usage` (the
@@ -746,6 +855,7 @@ _config_known_value = _cctally_config._config_known_value
 _cmd_config_get = _cctally_config._cmd_config_get
 _cmd_config_set = _cctally_config._cmd_config_set
 _cmd_config_unset = _cctally_config._cmd_config_unset
+_get_quota_alerts_config = _cctally_config._get_quota_alerts_config
 
 
 # `cctally refresh-usage` + the OAuth-usage fetch/render/config surface,
@@ -768,6 +878,7 @@ CLAUDE_CODE_UA_FALLBACK_VERSION = _cctally_refresh.CLAUDE_CODE_UA_FALLBACK_VERSI
 _discover_cc_version = _cctally_refresh._discover_cc_version
 _resolve_oauth_usage_user_agent = _cctally_refresh._resolve_oauth_usage_user_agent
 _fetch_oauth_usage = _cctally_refresh._fetch_oauth_usage
+_parse_retry_after = _cctally_refresh._parse_retry_after
 _REFRESH_USAGE_ANSI = _cctally_refresh._REFRESH_USAGE_ANSI
 _render_refresh_usage_text = _cctally_refresh._render_refresh_usage_text
 _serialize_refresh_usage_json = _cctally_refresh._serialize_refresh_usage_json
@@ -930,9 +1041,20 @@ _hook_tick_log_line = _cctally_record._hook_tick_log_line
 _hook_tick_log_rotate_if_needed = _cctally_record._hook_tick_log_rotate_if_needed
 _hook_tick_throttle_age_seconds = _cctally_record._hook_tick_throttle_age_seconds
 _hook_tick_throttle_touch = _cctally_record._hook_tick_throttle_touch
+# Statusline usage-persistence markers (spec 2026-07-17). Re-exported so
+# `cctally.X` (the `_cctally()` accessor + test monkeypatch surface) resolves.
+_statusline_observe_age_seconds = _cctally_record._statusline_observe_age_seconds
+_statusline_observe_touch = _cctally_record._statusline_observe_touch
+_oauth_backoff_remaining_seconds = _cctally_record._oauth_backoff_remaining_seconds
+_oauth_backoff_set = _cctally_record._oauth_backoff_set
+_oauth_backoff_clear = _cctally_record._oauth_backoff_clear
+_oauth_backoff_count = _cctally_record._oauth_backoff_count
+_oauth_backoff_register_429 = _cctally_record._oauth_backoff_register_429
+_oauth_backoff_reset = _cctally_record._oauth_backoff_reset
 _hook_tick_read_stdin_event = _cctally_record._hook_tick_read_stdin_event
 _hook_tick_session_short = _cctally_record._hook_tick_session_short
 _hook_tick_format_log_line = _cctally_record._hook_tick_format_log_line
+_cmd_hook_tick_codex = _cctally_record._cmd_hook_tick_codex
 cmd_hook_tick = _cctally_record.cmd_hook_tick
 _safe_float = _cctally_record._safe_float
 _validate_date_optional = _cctally_record._validate_date_optional
@@ -1182,6 +1304,14 @@ cmd_statusline = _cctally_statusline.cmd_statusline
 _resolve_context_window = _cctally_statusline._resolve_context_window
 _read_last_assistant_usage = _cctally_statusline._read_last_assistant_usage
 _build_statusline_injections = _cctally_statusline._build_statusline_injections
+# Statusline usage-persistence feeder (spec 2026-07-17). Re-exported so
+# `cctally._statusline_persist` (test surface) + the `_cctally()` accessor
+# resolve them.
+_statusline_persist = _cctally_statusline._statusline_persist
+_fork_persist = _cctally_statusline._fork_persist
+_record_args = _cctally_statusline._record_args
+_try_acquire_persist_lock = _cctally_statusline._try_acquire_persist_lock
+_release_persist_lock = _cctally_statusline._release_persist_lock
 
 
 # Eager re-export of bin/_cctally_codex.py — the four cmd_codex_* are the
@@ -1204,6 +1334,50 @@ cmd_codex_daily = _cctally_codex.cmd_codex_daily
 cmd_codex_monthly = _cctally_codex.cmd_codex_monthly
 cmd_codex_weekly = _cctally_codex.cmd_codex_weekly
 cmd_codex_session = _cctally_codex.cmd_codex_session
+
+# Eager re-export of bin/_cctally_quota.py — the five canonical nested
+# `cctally codex quota` leaves use the durable S2 projection/interpretation
+# adapter while retaining the existing Codex accounting commands unchanged.
+_cctally_quota = _load_sibling("_cctally_quota")
+reconcile_codex_quota_projection = _cctally_quota.reconcile_codex_quota_projection
+cmd_codex_quota_history = _cctally_quota.cmd_codex_quota_history
+cmd_codex_quota_statusline = _cctally_quota.cmd_codex_quota_statusline
+cmd_codex_quota_forecast = _cctally_quota.cmd_codex_quota_forecast
+cmd_codex_quota_blocks = _cctally_quota.cmd_codex_quota_blocks
+cmd_codex_quota_breakdown = _cctally_quota.cmd_codex_quota_breakdown
+
+# S3's qualified Codex accounting adapter is intentionally cache-only: callers
+# that need project identity must not downgrade to an unqualified rollout parse.
+try:
+    _cctally_source_analytics = _load_sibling("_cctally_source_analytics")
+    QualifiedMetadataUnavailable = _cctally_source_analytics.QualifiedMetadataUnavailable
+    load_qualified_codex_entries = _cctally_source_analytics.load_qualified_codex_entries
+    cmd_source_project = _cctally_source_analytics.cmd_source_project
+    cmd_source_diff = _cctally_source_analytics.cmd_source_diff
+    cmd_source_range_cost = _cctally_source_analytics.cmd_source_range_cost
+    cmd_source_cache_report = _cctally_source_analytics.cmd_source_cache_report
+    cmd_source_report = _cctally_source_analytics.cmd_source_report
+    validate_source_project_selectors = _cctally_source_analytics.validate_source_project_selectors
+    _lib_source_analytics = _load_sibling("_lib_source_analytics")
+    QualifiedCodexEntry = _lib_source_analytics.QualifiedCodexEntry
+    SourceWarning = _lib_source_analytics.SourceWarning
+    SourceResult = _lib_source_analytics.SourceResult
+    opaque_project_key = _lib_source_analytics.opaque_project_key
+except Exception:
+    # The Task 1 foundation remains private until its later CLI/share surfaces
+    # are promoted; public mirror builds must retain their current import path.
+    QualifiedMetadataUnavailable = None
+    load_qualified_codex_entries = None
+    QualifiedCodexEntry = None
+    SourceWarning = None
+    SourceResult = None
+    opaque_project_key = None
+    cmd_source_project = None
+    cmd_source_diff = None
+    cmd_source_range_cost = None
+    cmd_source_cache_report = None
+    cmd_source_report = None
+    validate_source_project_selectors = None
 
 # Eager re-export of bin/_cctally_reporting.py — the five cmd_* are the
 # parser's `set_defaults(func=c.cmd_*)` targets; `cmd_session` + the others
@@ -2569,6 +2743,125 @@ _cctally_diff = _load_sibling("_cctally_diff")
 cmd_diff                 = _cctally_diff.cmd_diff                  # parser: c.cmd_diff (_cctally_parser.py:2032)
 _emit_diff_debug_samples = _cctally_diff._emit_diff_debug_samples  # test_debug_sample_emission mod._emit_diff_debug_samples
 
+
+# Provider-aware analytics deliberately wrap the established command entries
+# here, leaving their Claude implementation modules untouched below the branch.
+_cmd_project_claude = cmd_project
+_cmd_diff_claude = cmd_diff
+_cmd_range_cost_claude = cmd_range_cost
+_cmd_cache_report_claude = cmd_cache_report
+_cmd_report_claude = cmd_report
+
+
+def _dispatch_source_aware(args, claude_command, source_command):
+    """Preserve ordinary Claude bytes; route share/non-Claude requests to S3."""
+    if getattr(args, "source", "claude") == "claude":
+        # S3 adds share artifacts to three legacy Claude commands.  Keep the
+        # established terminal and JSON routes exactly as they were, but route
+        # the new format-only surface through the structured legacy-result
+        # adapter.  That adapter never captures or reparses stdout.
+        if (
+            getattr(args, "format", None)
+            and getattr(args, "command", None) in {
+                "diff", "range-cost", "cache-report",
+            }
+        ):
+            if source_command is None:
+                raise RuntimeError("provider-aware analytics are unavailable")
+            return source_command(args)
+        return claude_command(args)
+    if source_command is None:
+        raise RuntimeError("provider-aware analytics are unavailable")
+    # The historical diff renderer calls this field ``emit_json`` while the
+    # S3 source adapter uses the shared ``json`` spelling.
+    if hasattr(args, "emit_json"):
+        args.json = bool(args.emit_json)
+    return source_command(args)
+
+
+def cmd_project(args):
+    return _dispatch_source_aware(args, _cmd_project_claude, cmd_source_project)
+
+
+def cmd_diff(args):
+    return _dispatch_source_aware(args, _cmd_diff_claude, cmd_source_diff)
+
+
+def cmd_range_cost(args):
+    return _dispatch_source_aware(args, _cmd_range_cost_claude, cmd_source_range_cost)
+
+
+def cmd_cache_report(args):
+    return _dispatch_source_aware(args, _cmd_cache_report_claude, cmd_source_cache_report)
+
+
+def cmd_report(args):
+    return _dispatch_source_aware(args, _cmd_report_claude, cmd_source_report)
+
+
+def _validate_source_args(args) -> None:
+    """Fail incompatible provider options before cache sync or rendering."""
+    command = getattr(args, "command", None)
+    if command not in {"project", "diff", "range-cost", "cache-report", "report"}:
+        return
+    source = getattr(args, "source", "claude")
+    speed = getattr(args, "speed", "auto")
+    if source == "claude" and speed != "auto":
+        raise ValueError("--speed is only valid for Codex or all-source requests")
+    if command == "project" and source in {"codex", "all"} and getattr(args, "sort", None) == "used":
+        raise ValueError("project --sort used is only valid for Claude")
+    if command in {"project", "range-cost", "cache-report"} and source in {"codex", "all"}:
+        if validate_source_project_selectors is not None:
+            validate_source_project_selectors(getattr(args, "project", None))
+    if command == "range-cost" and source == "codex" and getattr(args, "mode", "auto") != "auto":
+        raise ValueError("range-cost --mode is only valid for Claude")
+    if command == "report" and source in {"codex", "all"}:
+        weeks = getattr(args, "weeks", None)
+        if not isinstance(weeks, int) or isinstance(weeks, bool) or weeks <= 0:
+            raise ValueError("report --weeks must be a positive integer")
+    if command == "report" and source == "codex":
+        if getattr(args, "week_start_name", None) is not None:
+            raise ValueError("report --week-start-name is only valid for Claude")
+        if getattr(args, "mode", "auto") != "auto":
+            raise ValueError("report --mode is only valid for Claude")
+        if getattr(args, "offline", False):
+            raise ValueError("report --offline is only valid for Claude")
+        if getattr(args, "project", None):
+            raise ValueError("report --project is only valid for Claude")
+    if command == "cache-report":
+        sort = getattr(args, "sort", None)
+        if source == "claude" and sort == "reuse":
+            raise ValueError("cache-report --sort reuse is only valid for Codex")
+        if source == "codex" and sort in {"net", "cache", "anomaly"}:
+            raise ValueError(f"cache-report --sort {sort} is only valid for Claude")
+        if source == "codex" and (
+            getattr(args, "anomaly_threshold_pp", 15) != 15
+            or getattr(args, "anomaly_window_days", 14) != 14
+            or getattr(args, "no_anomaly", False)
+        ):
+            raise ValueError("cache-report anomaly options are only valid for Claude")
+    if command == "diff":
+        explicit_only = getattr(args, "only", None)
+        selected = {
+            item.strip() for item in (explicit_only or "").split(",")
+            if item.strip()
+        }
+        if source in {"codex", "all"} and explicit_only is not None and not selected:
+            raise ValueError(
+                "diff --only specified no sections. Supported: "
+                "cache, models, overall, projects, token-reuse"
+            )
+        if source == "claude" and "token-reuse" in selected:
+            raise ValueError("diff --only token-reuse is only valid for Codex")
+        if source == "codex" and "cache" in selected:
+            raise ValueError("diff --only cache is only valid for Claude")
+        supported = {"overall", "models", "projects", "cache", "token-reuse"}
+        unknown = selected - supported
+        if unknown:
+            raise ValueError(
+                "diff --only contains unknown section(s): " + ", ".join(sorted(unknown))
+            )
+
 # #281 S4: the `transcript export|search` command module. Eager re-export so the
 # parser's set_defaults(func=c.cmd_transcript) resolves at build_parser time.
 _cctally_transcript = _load_sibling("_cctally_transcript")
@@ -2742,6 +3035,7 @@ _tui_build_session_detail = _cctally_tui._tui_build_session_detail
 _tui_build_session_detail_indexed = _cctally_tui._tui_build_session_detail_indexed
 _tui_build_snapshot = _cctally_tui._tui_build_snapshot
 _tui_empty_snapshot = _cctally_tui._tui_empty_snapshot
+_snapshot_data_version = _cctally_tui._snapshot_data_version  # #300 change-signal helper
 # Key reader + dispatcher + sync thread base class
 TuiKeyReader = _cctally_tui.TuiKeyReader
 _tui_handle_key = _cctally_tui._tui_handle_key
@@ -2824,6 +3118,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not getattr(args, "func", None):
         parser.error("a subcommand is required")
+    # Validate share destination shape before the migration banner, config
+    # load, cache sync, quota reconciliation, or any output side effect.  The
+    # command handlers repeat this idempotent check for direct-call safety.
+    _share_validate_args(args)
+    # Provider-aware parsers accept the common output destination flags but
+    # defer several presentation defaults to the source share composer. Give
+    # their outer namespace the established share defaults before any handler
+    # can hand it to ``_share_render_and_emit``.
+    for _share_name, _share_default in (
+        ("theme", "light"),
+        ("no_branding", False),
+        ("reveal_projects", False),
+    ):
+        if not hasattr(args, _share_name):
+            setattr(args, _share_name, _share_default)
+    try:
+        _validate_source_args(args)
+    except ValueError as exc:
+        eprint(f"cctally: {exc}")
+        return 2
     _print_migration_error_banner_if_needed(args)
     try:
         rc = int(args.func(args))

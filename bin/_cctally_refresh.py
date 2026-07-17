@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import email.utils
 import json
 import os
 import pathlib
@@ -46,6 +47,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -64,6 +66,7 @@ def _cctally():
 # `_newest_snapshot_age_seconds`, `_normalize_percent`,
 # `_forecast_color_enabled`, `_discover_cc_version`, `cmd_record_usage`)
 # stay on the _cctally() accessor.
+import _cctally_core
 from _cctally_core import (
     eprint,
     now_utc_iso,
@@ -87,7 +90,15 @@ class RefreshUsageRateLimitError(RefreshUsageNetworkError):
     callers that already except RefreshUsageNetworkError continue to
     catch this; specific handlers can except RefreshUsageRateLimitError
     first to branch on the rate-limit case.
+
+    ``retry_after_deadline`` carries the absolute epoch parsed from the
+    response's ``Retry-After`` header (spec §4), or ``None`` when the header
+    is absent/malformed — in which case callers apply exponential backoff.
     """
+
+    def __init__(self, message="", retry_after_deadline=None):
+        super().__init__(message)
+        self.retry_after_deadline = retry_after_deadline
 
 
 class RefreshUsageMalformedError(Exception):
@@ -227,6 +238,45 @@ def _resolve_oauth_usage_user_agent(
 # Core OAuth fetch
 # =========================================================================
 
+def _parse_retry_after(header_value, now: float) -> "float | None":
+    """Parse an HTTP ``Retry-After`` header into an absolute epoch deadline.
+
+    Supports both RFC 7231 forms:
+      - delta-seconds: a non-negative integer number of seconds from ``now``.
+      - HTTP-date: an absolute timestamp (IMF-fixdate / RFC 850 / asctime),
+        parsed via ``email.utils.parsedate_to_datetime`` (stdlib).
+
+    Returns the absolute epoch, or ``None`` when the header is absent, empty,
+    or unparseable (the caller then falls back to exponential backoff)."""
+    if header_value is None:
+        return None
+    s = str(header_value).strip()
+    if not s:
+        return None
+    # delta-seconds (a bare non-negative integer).
+    try:
+        delta = int(s)
+    except ValueError:
+        delta = None
+    if delta is not None:
+        if delta < 0:
+            return None
+        return float(now) + float(delta)
+    # HTTP-date form.
+    try:
+        parsed = email.utils.parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _fetch_oauth_usage(token: str, timeout_seconds: float) -> dict:
     """GET the OAuth usage API and return the parsed JSON object.
 
@@ -259,7 +309,18 @@ def _fetch_oauth_usage(token: str, timeout_seconds: float) -> dict:
             pass
         msg = f"HTTP {e.code} {e.reason}" + (f": {snippet}" if snippet else "")
         if e.code == 429:
-            raise RefreshUsageRateLimitError(msg) from e
+            # Parse Retry-After (delta-seconds OR HTTP-date) into an absolute
+            # deadline the backoff state honors (spec §4). Best-effort — a
+            # missing/garbage header degrades to exponential backoff downstream.
+            retry_after_deadline = None
+            try:
+                hdr = e.headers.get("Retry-After") if e.headers else None
+                retry_after_deadline = _parse_retry_after(hdr, time.time())
+            except Exception:
+                retry_after_deadline = None
+            raise RefreshUsageRateLimitError(
+                msg, retry_after_deadline=retry_after_deadline
+            ) from e
         raise RefreshUsageNetworkError(msg) from e
     except urllib.error.URLError as e:
         raise RefreshUsageNetworkError(f"URLError: {e.reason}") from e
@@ -545,6 +606,13 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
+        # Force-refresh bypasses the backfill/backoff GATE (user asked for
+        # it), but a resulting 429 MUST advance the shared backoff deadline
+        # so automatic polling still honors it (spec §4).
+        c._oauth_backoff_register_429(
+            retry_after_deadline=getattr(exc, "retry_after_deadline", None),
+            now=time.time(),
+        )
         return _RefreshUsageResult(status="rate_limited", fallback=True,
                                     reason=str(exc))
     except RefreshUsageNetworkError as exc:
@@ -556,6 +624,9 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
             status="fetch_failed",
             reason=f"invalid oauth_usage config: {exc}",
         )
+    # Successful API response — clear any pending 429 backoff + counter, so a
+    # user-confirmed recovery lets automatic polling resume (spec §4).
+    c._oauth_backoff_reset()
 
     seven = api.get("seven_day") or {}
     try:
@@ -606,6 +677,9 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
         five_hour_resets_at=(
             str(five_resets_epoch) if five_resets_epoch is not None else None
         ),
+        # This is the OAuth feeder — label the row "api" (spec §5). Without
+        # this, cmd_record_usage would fall back to its "statusline" default.
+        source="api",
     )
     try:
         rc = c.cmd_record_usage(record_args)
@@ -789,7 +863,8 @@ def _hook_tick_oauth_refresh(
     Returns (status_str, payload_or_none) where status_str is one of:
         "ok(7d=N,5h=M)"  | "ok(7d=N)"
         "skipped-no-token" | "skipped(fresh:Ns)"
-        "err(network)"   | "err(parse)" | "err(record-usage=K)"
+        "skipped(statusline-fresh:Ns)" | "skipped(backoff:Ns)"
+        "err(rate-limit)" | "err(network)" | "err(parse)" | "err(record-usage=K)"
     payload_or_none is the raw OAuth-API response dict (`seven_day` /
     `five_hour`) on success, or None on any non-ok branch.
     """
@@ -802,17 +877,42 @@ def _hook_tick_oauth_refresh(
             throttle_seconds = float(_get_oauth_usage_config(c.load_config())["throttle_seconds"])
         except OauthUsageConfigError:
             throttle_seconds = float(c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS)
+    # Backfill gate (spec §4). The automatic OAuth poll is now a BACKFILL
+    # behind the statusline (the primary writer). It fetches only when the
+    # statusline has NOT fed recently AND no 429 cooldown is pending — so a
+    # live statusline keeps usage fresh with zero API calls, and a 429 streak
+    # is suppressed by the shared deadline instead of re-polled every tick.
+    # Gating on the observation marker (not snapshot age) is what makes the
+    # demotion correct: cmd_record_usage dedups unchanged percentages without
+    # refreshing captured_at, so snapshot age keeps growing while the
+    # statusline is alive. Force-refresh (_refresh_usage_inproc) never routes
+    # through here, so it is exempt (user-initiated).
+    obs_age = c._statusline_observe_age_seconds()
+    if obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS):
+        return f"skipped(statusline-fresh:{int(obs_age)}s)", None
+    backoff_remaining = c._oauth_backoff_remaining_seconds()
+    if backoff_remaining > 0:
+        return f"skipped(backoff:{int(backoff_remaining)}s)", None
     age_s = c._newest_snapshot_age_seconds()
     if age_s is not None and age_s < throttle_seconds:
         return f"skipped(fresh:{int(age_s)}s)", None
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
-    except RefreshUsageRateLimitError:
+    except RefreshUsageRateLimitError as exc:
+        # Arm the shared backoff deadline so the next tick is suppressed
+        # rather than immediately re-polling (spec §4). Honors Retry-After
+        # when present, else conservative exponential backoff.
+        c._oauth_backoff_register_429(
+            retry_after_deadline=getattr(exc, "retry_after_deadline", None),
+            now=time.time(),
+        )
         return "err(rate-limit)", None
     except RefreshUsageNetworkError:
         return "err(network)", None
     except RefreshUsageMalformedError:
         return "err(parse)", None
+    # Successful API response — clear any pending 429 backoff + counter.
+    c._oauth_backoff_reset()
     seven = api["seven_day"]
     try:
         seven_pct = c._normalize_percent(float(seven["utilization"]))
@@ -839,6 +939,8 @@ def _hook_tick_oauth_refresh(
         resets_at=str(seven_resets_epoch),
         five_hour_percent=five_pct,
         five_hour_resets_at=str(five_resets_epoch) if five_resets_epoch is not None else None,
+        # OAuth feeder — label the row "api" (spec §5).
+        source="api",
     )
     try:
         rc = c.cmd_record_usage(record_args)

@@ -70,9 +70,9 @@ export function ComparisonMetrics({ a, b }: { a: Metrics; b: Metrics }) {
             <div key={r.key} className="conv-cmp-metric" data-metric={r.key}>
               <div className="conv-cmp-metric-label">{r.label}</div>
               <div className="conv-cmp-metric-vals">
-                <span className="conv-cmp-metric-a">{r.fmtVal(r.a)}</span>
+                <span className="conv-cmp-metric-a"><span className="sr-only">Run A </span>{r.fmtVal(r.a)}</span>
                 <span className="conv-cmp-metric-arrow" aria-hidden="true"> → </span>
-                <span className="conv-cmp-metric-b">{r.fmtVal(r.b)}</span>
+                <span className="conv-cmp-metric-b"><span className="sr-only">Run B </span>{r.fmtVal(r.b)}</span>
               </div>
               {showDelta && (
                 <div className={`conv-cmp-metric-delta ${pres.className}`}>

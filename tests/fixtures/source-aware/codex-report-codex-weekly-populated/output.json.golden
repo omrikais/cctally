@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "weekly": [
+    {
+      "week": "Jun 29, 2026",
+      "inputTokens": 900,
+      "cachedInputTokens": 400,
+      "outputTokens": 334,
+      "reasoningOutputTokens": 34,
+      "totalTokens": 1234,
+      "costUSD": 4.25,
+      "models": {}
+    }
+  ],
+  "totals": {
+    "inputTokens": 900,
+    "cachedInputTokens": 400,
+    "outputTokens": 334,
+    "reasoningOutputTokens": 34,
+    "totalTokens": 1234,
+    "costUSD": 4.25
+  }
+}

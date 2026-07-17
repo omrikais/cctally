@@ -26,24 +26,44 @@ describe('modelChipSummary', () => {
   });
   it('a known model → a chip labelled by its family name', () => {
     expect(modelChipSummary(['claude-opus-4-8']))
-      .toEqual({ chips: [{ cls: 'opus', label: 'opus' }], extra: 0 });
+      .toEqual({ chips: [{ cls: 'opus', label: 'opus', full: 'opus' }], extra: 0 });
   });
   it('a fable model → a fable chip (not sonnet)', () => {
     expect(modelChipSummary(['claude-fable-5']))
-      .toEqual({ chips: [{ cls: 'fable', label: 'fable' }], extra: 0 });
+      .toEqual({ chips: [{ cls: 'fable', label: 'fable', full: 'fable' }], extra: 0 });
   });
   it('an unrecognized model → an `other` chip labelled by its abbreviation', () => {
     expect(modelChipSummary(['gpt-5']))
-      .toEqual({ chips: [{ cls: 'other', label: 'gpt-5' }], extra: 0 });
+      .toEqual({ chips: [{ cls: 'other', label: 'gpt-5', full: 'gpt-5' }], extra: 0 });
     expect(modelChipSummary(['<synthetic>']))
-      .toEqual({ chips: [{ cls: 'other', label: '<synthetic>' }], extra: 0 });
+      .toEqual({ chips: [{ cls: 'other', label: '<synthetic>', full: '<synthetic>' }], extra: 0 });
   });
   it('dedupes models that share a chip class', () => {
     expect(modelChipSummary(['claude-opus-4-8', 'claude-opus-4-7']))
-      .toEqual({ chips: [{ cls: 'opus', label: 'opus' }], extra: 0 });
+      .toEqual({ chips: [{ cls: 'opus', label: 'opus', full: 'opus' }], extra: 0 });
   });
   it('caps at 2 distinct classes and reports the overflow, preserving order', () => {
     expect(modelChipSummary(['claude-haiku-4-5', 'claude-opus-4-8', 'claude-sonnet-4-6']))
-      .toEqual({ chips: [{ cls: 'haiku', label: 'haiku' }, { cls: 'opus', label: 'opus' }], extra: 1 });
+      .toEqual({ chips: [{ cls: 'haiku', label: 'haiku', full: 'haiku' }, { cls: 'opus', label: 'opus', full: 'opus' }], extra: 1 });
+  });
+  // #304 S3 (Codex F4) — the rigid two-line rail stats line must not grow with
+  // arbitrary model-id length. An `other` chip's DISPLAY label is bounded to
+  // OTHER_CHIP_LABEL_MAX (12) chars + ellipsis; the untruncated label rides on
+  // `full` for the chip's title / accessible name. Known families are already
+  // short and stay unchanged.
+  it('caps an unbounded other-model label at 12 chars + ellipsis, keeping the full label', () => {
+    const s = modelChipSummary(['internal-experimental-model-v2-preview-20260701'], 1);
+    expect(s.chips).toHaveLength(1);
+    expect(s.chips[0].cls).toBe('other');
+    // abbreviateModel strips the -YYYYMMDD stamp first
+    expect(s.chips[0].full).toBe('internal-experimental-model-v2-preview');
+    expect(s.chips[0].label).toBe('internal-exp…');
+    expect(s.chips[0].label.length).toBe(13); // 12 + ellipsis
+  });
+
+  it('leaves short other labels and known-family labels unbounded/unchanged', () => {
+    const s = modelChipSummary(['gpt-5', 'claude-opus-4-8'], 2);
+    expect(s.chips.map((c) => c.label)).toEqual(['gpt-5', 'opus']);
+    expect(s.chips.map((c) => c.full)).toEqual(['gpt-5', 'opus']);
   });
 });

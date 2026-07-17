@@ -31,6 +31,11 @@
     ],
     "settings_path": "/FAKE/.claude/settings.json"
   },
+  "codex_hooks": {
+    "roots": [],
+    "installed_count": 0,
+    "error_count": 0
+  },
   "legacy": {
     "statusline_snippet": null,
     "bespoke_hooks": {

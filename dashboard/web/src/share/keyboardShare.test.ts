@@ -54,14 +54,22 @@ const appendedNodes: Element[] = [];
 function focusPanel(kind: string): HTMLElement {
   const section = document.createElement('section');
   section.setAttribute('data-panel-kind', kind);
-  section.setAttribute('tabindex', '0');
-  // Off-screen but focusable; visibility doesn't matter for
-  // activeElement.
+  // #293 S4: the card region is no longer a keyboard tab-stop — the region
+  // describes, and the real Tab target is a descendant control (the Expand
+  // button / ShareIcon). Focus a REAL descendant so `closest('[data-panel-kind]')`
+  // resolves the panel exactly as production does now that the region has no
+  // tabIndex. (Previously this focused a fabricated `tabindex=0` section.)
+  const action = document.createElement('button');
+  action.type = 'button';
+  action.className = 'panel-expand';
+  action.textContent = 'Expand';
+  section.appendChild(action);
+  // Off-screen but focusable; visibility doesn't matter for activeElement.
   section.style.position = 'absolute';
   section.style.left = '-9999px';
   document.body.appendChild(section);
   appendedNodes.push(section);
-  section.focus();
+  action.focus();
   return section;
 }
 
@@ -218,9 +226,9 @@ describe('S keybinding (share modal)', () => {
       kind: 'status',
       text: UNFOCUSED_TOAST_TEXT,
     });
-    // Sanity: the exact spec-mandated text.
+    // Sanity: the exact spec-mandated text (#293 S4 — describe-only regions).
     expect(UNFOCUSED_TOAST_TEXT).toBe(
-      'Click a panel first, then press S to share it.',
+      'Focus a panel action, then press S to share it.',
     );
   });
 

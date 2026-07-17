@@ -163,6 +163,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import json
@@ -201,6 +202,13 @@ from _cctally_core import (
 )
 from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
 from _lib_pricing import _calculate_entry_cost
+from _lib_codex_hooks import (
+    CODEX_HOOK_THROTTLE_SECONDS,
+    acquire_due_lifecycle_locks,
+    codex_hook_roots,
+    mark_lifecycle_success,
+    release_lifecycle_locks,
+)
 
 
 import importlib.util as _ilu
@@ -794,8 +802,9 @@ def maybe_record_milestone(
 
 
 def _record_budget_milestone_for_vendor(
-    *, vendor, target, thresholds, period, config, tz, build_payload
-) -> None:
+    *, vendor, target, thresholds, period, config, tz, build_payload,
+    raise_errors: bool = False,
+) -> int:
     """Shared budget-milestone firing core for both vendors (#143).
 
     Hot-path ordering is preserved verbatim (spec §4.2 / [Pre-probe before
@@ -827,7 +836,7 @@ def _record_budget_milestone_for_vendor(
             config=config, tz=tz,
         )
         if start_at is None:
-            return  # no resolvable window yet (claude subscription-week pre-snapshot)
+            return 0  # no resolvable window yet (claude subscription-week pre-snapshot)
         period_key = start_at.isoformat(timespec="seconds")
 
         present = {
@@ -840,7 +849,7 @@ def _record_budget_milestone_for_vendor(
         }
         pending = [t for t in sorted(thresholds) if t not in present]
         if not pending:
-            return  # nothing left this window → skip the cost SUM
+            return 0  # nothing left this window → skip the cost SUM
 
         spent = _budget_spend_for_vendor(
             conn, vendor=vendor, start_at=start_at, now_utc=now_utc
@@ -870,6 +879,8 @@ def _record_budget_milestone_for_vendor(
         conn.commit()
     except Exception as exc:
         eprint(f"[budget-milestone:{vendor}] error recording budget milestone: {exc}")
+        if raise_errors:
+            raise
     finally:
         conn.close()
 
@@ -881,6 +892,7 @@ def _record_budget_milestone_for_vendor(
             _dispatch_alert_notification(payload, mode="real")
         except Exception as dispatch_exc:
             eprint(f"[budget-alerts:{vendor}] dispatch failed: {dispatch_exc}")
+    return len(pending_alerts)
 
 
 def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
@@ -1108,7 +1120,9 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
             eprint(f"[project-budget-alerts] dispatch failed: {dispatch_exc}")
 
 
-def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
+def maybe_record_codex_budget_milestone(
+    saved: dict[str, Any], *, raise_errors: bool = False,
+) -> int:
     """Fire Codex budget alerts on ACTUAL-Codex-spend threshold crossings (axis
     ``codex_budget``, calendar-period-codex-budgets spec §6 — the gap the Codex
     spec review flagged: Codex usage never flows through ``record-usage``, so the
@@ -1143,16 +1157,16 @@ def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
         budget_cfg = _get_budget_config(config)
     except _BudgetConfigError as exc:
         _warn_budget_bad_config_once(exc)
-        return
+        return 0
     codex_cfg = budget_cfg.get("codex")
     if not codex_cfg or not codex_cfg.get("alerts_enabled"):
-        return
+        return 0
     target = codex_cfg.get("amount_usd")
     thresholds = codex_cfg.get("alert_thresholds") or []
     if target is None or not thresholds:
-        return
+        return 0
     tz = resolve_display_tz(argparse.Namespace(tz=None), config)
-    _record_budget_milestone_for_vendor(
+    return _record_budget_milestone_for_vendor(
         vendor="codex",
         target=target,
         thresholds=thresholds,
@@ -1171,6 +1185,7 @@ def maybe_record_codex_budget_milestone(saved: dict[str, Any]) -> None:
             spent_usd=kw["spent_usd"],
             consumption_pct=kw["consumption_pct"],
         ),
+        raise_errors=raise_errors,
     )
 
 
@@ -3562,7 +3577,13 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         return 0
 
     payload = {
-        "source": "statusline",
+        # Record the true feeder. Defaults to "statusline" for the public
+        # `record-usage` CLI (preserves prior behavior); the OAuth callers
+        # (_hook_tick_oauth_refresh / _refresh_usage_inproc) pass "api", and
+        # the statusline persist feeder passes "statusline". Previously this
+        # was hard-coded "statusline" for EVERY caller, mislabeling OAuth
+        # rows (spec §5). No migration — the column already exists.
+        "source": getattr(args, "source", "statusline"),
         "capturedAt": now_utc_iso(),
         "weeklyPercent": weekly_percent,
         "weekStartDate": week_start_date,
@@ -3735,6 +3756,166 @@ def _hook_tick_throttle_touch() -> None:
         pass
 
 
+# =========================================================================
+# Statusline observation marker + OAuth backoff deadline (spec 2026-07-17)
+# =========================================================================
+#
+# Two independent markers with two DIFFERENT time encodings:
+#   - The observation marker is MTIME-based (mirrors _hook_tick_throttle_*):
+#     it answers "how long since the statusline last fed?", so its age is
+#     the signal. It is touched even on a dedup no-op.
+#   - The OAuth backoff marker is CONTENT-based: it stores a FUTURE absolute
+#     epoch deadline as text. Its mtime is meaningless (~now). Encoding the
+#     deadline as mtime would future-date the file and, if ever confused
+#     with a throttle marker, corrupt an mtime-age reading — hence the
+#     deliberate split (Codex P1-3).
+
+
+def _statusline_observe_age_seconds() -> float:
+    """Seconds since the statusline last successfully fed usage; +inf if
+    never. Mtime-based, mirroring ``_hook_tick_throttle_age_seconds``."""
+    try:
+        mtime = _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return float("inf")
+    except OSError:
+        return float("inf")
+    return max(0.0, time.time() - mtime)
+
+
+def _statusline_observe_touch() -> None:
+    """Mark the statusline as alive (mtime := now, creating if missing).
+
+    Called after every persist attempt that fed valid 7d input through
+    ``cmd_record_usage`` successfully — INCLUDING a dedup (no-insert)
+    return, so the throttles reflect liveness rather than snapshot age."""
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.touch(exist_ok=True)
+        os.utime(_cctally_core.STATUSLINE_OBSERVE_MARKER_PATH, None)
+    except OSError:
+        pass
+
+
+def _oauth_backoff_remaining_seconds() -> float:
+    """Seconds until the shared OAuth 429 backoff deadline; ``0.0`` when the
+    marker is absent, empty, malformed, or already elapsed.
+
+    Reads the ABSOLUTE epoch deadline from the marker's text CONTENT (not
+    its mtime) and returns ``max(0.0, deadline - now)``."""
+    try:
+        raw = _cctally_core.OAUTH_BACKOFF_MARKER_PATH.read_text()
+    except FileNotFoundError:
+        return 0.0
+    except OSError:
+        return 0.0
+    try:
+        deadline = float(raw.strip())
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, deadline - time.time())
+
+
+def _oauth_backoff_set(deadline_epoch: float) -> None:
+    """Persist the shared OAuth 429 backoff deadline (absolute epoch).
+
+    Never SHORTENS an existing deadline: writes ``max(deadline_epoch,
+    existing_deadline)`` so concurrent/repeated 429s keep the furthest-out
+    cooldown. The write is atomic (tmp + ``os.replace``) so a reader never
+    sees a half-written file. Best-effort — any OSError is swallowed."""
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    # Compare against the existing ABSOLUTE deadline, not the remaining
+    # seconds, so "never shorten" holds regardless of when we read it.
+    existing_abs = 0.0
+    try:
+        existing_raw = _cctally_core.OAUTH_BACKOFF_MARKER_PATH.read_text()
+        existing_abs = float(existing_raw.strip())
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        existing_abs = 0.0
+    target = max(float(deadline_epoch), existing_abs)
+    path = _cctally_core.OAUTH_BACKOFF_MARKER_PATH
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(f"{target:.6f}")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _oauth_backoff_clear() -> None:
+    """Remove the OAuth backoff deadline marker (ignore if absent)."""
+    try:
+        _cctally_core.OAUTH_BACKOFF_MARKER_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _oauth_backoff_count() -> int:
+    """The consecutive-429 count (0 when absent/malformed)."""
+    try:
+        raw = _cctally_core.OAUTH_BACKOFF_COUNT_PATH.read_text()
+    except (FileNotFoundError, OSError):
+        return 0
+    try:
+        return max(0, int(raw.strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _oauth_backoff_register_429(*, retry_after_deadline, now) -> float:
+    """Record a 429: set/extend the shared backoff deadline and bump the
+    consecutive-429 counter. Returns the effective deadline (absolute epoch).
+
+    Policy (spec §4):
+      - A valid ``Retry-After`` (``retry_after_deadline`` is not None) is used
+        verbatim.
+      - Otherwise conservative exponential backoff:
+        ``now + min(CAP, BASE * 2**consecutive_429)``.
+      - ``_oauth_backoff_set`` keeps the MAX, so concurrent/repeated 429s
+        never shorten the cooldown."""
+    count = _oauth_backoff_count()
+    if retry_after_deadline is not None:
+        deadline = float(retry_after_deadline)
+    else:
+        base = float(_cctally_core.OAUTH_BACKOFF_BASE_SECONDS)
+        cap = float(_cctally_core.OAUTH_BACKOFF_CAP_SECONDS)
+        # Clamp the exponent so a corrupt/huge counter can't overflow 2**n.
+        exp = 2 ** min(count, 30)
+        deadline = float(now) + min(cap, base * exp)
+    _oauth_backoff_set(deadline)
+    # Bump the counter atomically (best-effort).
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        path = _cctally_core.OAUTH_BACKOFF_COUNT_PATH
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(str(count + 1))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except (OSError, NameError, UnboundLocalError):
+            pass
+    return deadline
+
+
+def _oauth_backoff_reset() -> None:
+    """Clear the backoff deadline AND the consecutive-429 counter — called on
+    any successful OAuth API response (spec §4)."""
+    _oauth_backoff_clear()
+    try:
+        _cctally_core.OAUTH_BACKOFF_COUNT_PATH.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def _hook_tick_read_stdin_event(stdin_max_bytes: int = 32 * 1024) -> dict:
     """Read CC's hook payload (JSON on stdin). Best-effort.
 
@@ -3783,6 +3964,116 @@ def _hook_tick_format_log_line(
     )
 
 
+def _codex_lifecycle_log_line(
+    *, source_root_key: str, event: str, sync: str, result: str,
+    blocks: int, milestones: int, alert_eligible_roots: int,
+    quota_alerts: int, budget_alerts: int, dur_ms: int,
+) -> str:
+    """Render one privacy-safe root-qualified Codex lifecycle outcome.
+
+    Native hook input can contain session paths and conversation identifiers;
+    this durable diagnostic deliberately carries only the bounded event label,
+    opaque source root key, aggregate reconciliation counts, and duration.
+    """
+    safe_event = "".join(
+        char for char in str(event)[:40] if char.isalnum() or char in "-_"
+    ) or "unknown"
+    return (
+        f"{now_utc_iso()} provider=codex source_root_key={source_root_key} "
+        f"event={safe_event} sync={sync} blocks={int(blocks)} "
+        f"milestones={int(milestones)} "
+        f"alert_eligible_roots={int(alert_eligible_roots)} "
+        f"quota_alerts={int(quota_alerts)} budget_alerts={int(budget_alerts)} "
+        f"dur_ms={max(0, int(dur_ms))} result={result}"
+    )
+
+
+def _codex_lifecycle_roots():
+    """Snapshot usable configured Codex homes in stable root-key order."""
+    return codex_hook_roots(_cctally()._codex_home_roots())
+
+
+def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") -> int:
+    """Run one quiet, foreground Codex lifecycle tick.
+
+    Native Codex Stop/SubagentStop hooks may fire concurrently.  Per-root
+    lifecycle locks narrow alert eligibility while the one S1 cache sync and
+    reporting reconciliation still observe the complete active root set.
+    """
+    c = _cctally()
+    roots = _codex_lifecycle_roots()
+    locks = acquire_due_lifecycle_locks(
+        _cctally_core.APP_DIR,
+        roots,
+        now=time.time(),
+        throttle_seconds=CODEX_HOOK_THROTTLE_SECONDS,
+    )
+    if not locks:
+        return 0
+    all_root_keys = tuple(root.source_root_key for root in roots)
+    due_root_keys = tuple(lock.root.source_root_key for lock in locks)
+    started_at = time.monotonic()
+
+    def log_outcome(
+        *, sync: str, result: str, projection=None, budget_alerts: int = 0,
+    ) -> None:
+        blocks = int(getattr(projection, "blocks_upserted", 0) or 0)
+        milestones = int(getattr(projection, "milestones_upserted", 0) or 0)
+        quota_alerts = int(getattr(projection, "alerts_dispatched", 0) or 0)
+        dur_ms = int((time.monotonic() - started_at) * 1000)
+        for lock in locks:
+            _hook_tick_log_line(_codex_lifecycle_log_line(
+                source_root_key=lock.root.source_root_key,
+                event=event,
+                sync=sync,
+                result=result,
+                blocks=blocks,
+                milestones=milestones,
+                alert_eligible_roots=len(due_root_keys),
+                quota_alerts=quota_alerts,
+                budget_alerts=budget_alerts,
+                dur_ms=dur_ms,
+            ))
+        _hook_tick_log_rotate_if_needed()
+
+    try:
+        # Hook stdout/stderr is contractually silent.  Cache migration and
+        # ingest diagnostics remain available to explicit CLI operations.
+        with open(os.devnull, "w", encoding="utf-8") as quiet, \
+                contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+            cache = c.open_cache_db()
+            try:
+                stats = c.sync_codex_cache(cache, lock_timeout=0)
+            finally:
+                cache.close()
+            if stats.lock_contended:
+                log_outcome(sync="contended", result="noop")
+                return 0
+            projection = c.reconcile_codex_quota_projection(
+                source_root_keys=all_root_keys,
+                alert_eligible_root_keys=due_root_keys,
+                now=dt.datetime.now(dt.timezone.utc),
+            )
+            # Vendor-scoped spend is intentionally evaluated once per
+            # successful due-set tick, not once per root.
+            budget_alerts = c.maybe_record_codex_budget_milestone(
+                {}, raise_errors=True,
+            )
+        mark_lifecycle_success(locks)
+        log_outcome(
+            sync="ok", result="success", projection=projection,
+            budget_alerts=budget_alerts,
+        )
+    except Exception:
+        # A failed sync, projection, or budget evaluation must acknowledge no
+        # root.  Hooks are best-effort and remain a successful no-op to Codex.
+        log_outcome(sync="error", result="error")
+        return 0
+    finally:
+        release_lifecycle_locks(locks)
+    return 0
+
+
 def cmd_hook_tick(args: argparse.Namespace) -> int:
     """Per-fire hook runtime (Section 3 of onboarding spec).
 
@@ -3790,11 +4081,25 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     sync_cache + (throttled) OAuth refresh, writes one log line, returns 0
     UNCONDITIONALLY (even on internal failure — hook discipline).
 
-    --explain mode: synchronous, prints to stdout, returns informative
-    exit code.
+    --foreground mode: reads stdin and runs the normal best-effort body in the
+    current process without detaching. --explain mode is synchronous, prints
+    to stdout, and returns an informative exit code.
     """
     c = _cctally()
+    source = getattr(args, "source", "claude")
+    if source == "codex":
+        # Codex's native handler always uses --foreground.  Drain stdin before
+        # any further decision so its event payload is never lost to detaching
+        # shell semantics; the lifecycle body itself is intentionally quiet.
+        meta = _hook_tick_read_stdin_event()
+        # The production reader always returns a mapping, but this boundary is
+        # deliberately best-effort: hook callers and lightweight lifecycle
+        # probes may only drain stdin.  Do not turn an absent payload into a
+        # hook failure merely because event observability is unavailable.
+        event = meta.get("event", "unknown") if isinstance(meta, dict) else "unknown"
+        return _cmd_hook_tick_codex(args, event=event)
     explain = bool(getattr(args, "explain", False))
+    foreground = bool(getattr(args, "foreground", False))
     no_oauth = bool(getattr(args, "no_oauth", False))
     # Use an explicit `is None` check so `--throttle-seconds 0` survives the
     # default-fallback (a `0 or DEFAULT` short-circuit would silently drop
@@ -3834,7 +4139,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     # mid-stack.
     forked = False
     pid = 0
-    if not explain:
+    if not explain and not foreground:
         try:
             pid = os.fork()
             forked = True
@@ -3855,7 +4160,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     # In the inline-fallback path the parent process re-routes its own stdout/
     # stderr to the log file for the rest of its short life. Function returns
     # immediately after Step 7, so the leak is bounded.
-    if not explain:
+    if not explain and not foreground:
         try:
             _cctally_core.HOOK_TICK_LOG_DIR.mkdir(parents=True, exist_ok=True)
             log_fd = os.open(

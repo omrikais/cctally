@@ -15,7 +15,7 @@ Auth
       → Log into Claude Code to populate the OAuth token
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       33 pending
+  ⚠ Pending migrations       37 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing
@@ -24,4 +24,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 23 OK · 7 WARN · 1 FAIL
+Summary: 26 OK · 7 WARN · 1 FAIL

@@ -322,6 +322,52 @@ def test_walker_dedups_symlinked_root_alias(cc, tmp_path):
     assert len(found) == 1, f"alias double-glob not deduped: {found}"
 
 
+def test_root_aware_discovery_uses_first_canonical_provider_root(cc, tmp_path, monkeypatch):
+    """One physical rollout has one resolved path and the first configured
+    provider root wins, even when later entries overlap through aliases."""
+    cache = cc._load_sibling("_cctally_cache")
+    provider = tmp_path / "provider"
+    rollout = provider / "sessions" / "2026" / "04" / "17" / "rollout-x.jsonl"
+    _write_rollout(rollout, "xxxx", "gpt-5", 1000, 0, 500)
+    alias_parent = tmp_path / "alias-parent"
+    os.symlink(provider, alias_parent)
+    # The first entry is a Codex home (provider root != sessions walk root).
+    # The next two entries reach the same file directly and via a symlink.
+    monkeypatch.setenv(
+        "CODEX_HOME",
+        f"{provider},{provider / 'sessions'},{alias_parent / 'sessions'}",
+    )
+
+    discovered = cache._discover_codex_files_with_roots()
+
+    assert len(discovered) == 1
+    item = discovered[0]
+    assert item.physical_path == rollout.resolve()
+    assert item.provider_root == provider.resolve()
+    assert item.walk_root == (provider / "sessions").resolve()
+    assert item.source_root_key == __import__("hashlib").sha256(
+        b"cctally-source-root-v1\0" + str(provider.resolve()).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def test_root_aware_discovery_keeps_configured_path_spelling_for_rows(
+    cc, tmp_path, monkeypatch,
+):
+    """Physical de-dup must not rewrite the path reporting uses for roots."""
+    cache = cc._load_sibling("_cctally_cache")
+    real = tmp_path / "real-provider"
+    rollout = real / "sessions" / "proj" / "rollout-x.jsonl"
+    _write_rollout(rollout, "xxxx", "gpt-5", 1000, 0, 500)
+    alias = tmp_path / "configured-provider"
+    os.symlink(real, alias)
+    monkeypatch.setenv("CODEX_HOME", str(alias))
+
+    [item] = cache._discover_codex_files_with_roots()
+
+    assert item.physical_path == rollout.resolve()
+    assert item.source_path == alias / "sessions" / "proj" / "rollout-x.jsonl"
+
+
 # ── P1: cache scoped to current $CODEX_HOME (prior-root purge) ────────────
 def test_codex_home_switch_purges_prior_root(cc, tmp_path):
     # P1 (issue #108): reusing one cache.db across `CODEX_HOME=/A` then

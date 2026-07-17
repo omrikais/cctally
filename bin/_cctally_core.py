@@ -65,6 +65,8 @@ def _init_paths_from_env() -> None:
     global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
     global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
     global HOOK_TICK_THROTTLE_PATH, HOOK_TICK_THROTTLE_LOCK_PATH
+    global STATUSLINE_OBSERVE_MARKER_PATH, STATUSLINE_PERSIST_LOCK_PATH
+    global OAUTH_BACKOFF_MARKER_PATH, OAUTH_BACKOFF_COUNT_PATH
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
     global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
@@ -118,6 +120,31 @@ def _init_paths_from_env() -> None:
     HOOK_TICK_LOG_ROTATED_PATH = HOOK_TICK_LOG_DIR / "hook-tick.log.1"
     HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
     HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
+
+    # Statusline usage-persistence markers + lock (spec 2026-07-17
+    # usage-statusline-fallback). The statusline is the PRIMARY automatic
+    # writer of weekly/5h usage snapshots; these gate it.
+    #   - STATUSLINE_OBSERVE_MARKER_PATH: liveness marker (mtime-based,
+    #     like HOOK_TICK_THROTTLE_PATH) — touched after every statusline
+    #     persist that fed valid 7d input through cmd_record_usage, INCLUDING
+    #     a dedup no-op. Represents "the statusline is alive and feeding".
+    #     The statusline persist throttle AND the OAuth backfill gate both
+    #     key off this, NOT snapshot age (cmd_record_usage dedups unchanged
+    #     percentages without refreshing captured_at, so snapshot age keeps
+    #     growing while the statusline is actively feeding).
+    #   - STATUSLINE_PERSIST_LOCK_PATH: cross-process flock serializing the
+    #     detached persist feeder so a multi-session render herd yields at
+    #     most one snapshot per throttle window.
+    #   - OAUTH_BACKOFF_MARKER_PATH: shared 429 cooldown. Stores an ABSOLUTE
+    #     epoch deadline in the file CONTENT (never the mtime — future-dating
+    #     an mtime would corrupt HOOK_TICK_THROTTLE_PATH's age reading).
+    STATUSLINE_OBSERVE_MARKER_PATH = APP_DIR / "statusline-observe.last"
+    STATUSLINE_PERSIST_LOCK_PATH = APP_DIR / "statusline-persist.lock"
+    OAUTH_BACKOFF_MARKER_PATH = APP_DIR / "oauth-backoff.until"
+    # Consecutive-429 counter (text int) driving the headerless exponential
+    # backoff (base * 2**count). Separate from the deadline marker so the
+    # deadline file stays a single parseable float.
+    OAUTH_BACKOFF_COUNT_PATH = APP_DIR / "oauth-backoff.count"
 
     UPDATE_STATE_PATH = APP_DIR / "update-state.json"
     UPDATE_SUPPRESS_PATH = APP_DIR / "update-suppress.json"
@@ -208,6 +235,24 @@ def _real_prod_data_dir() -> pathlib.Path:
     except Exception:
         home = pathlib.Path.home()
     return home / ".local" / "share" / "cctally"
+
+
+# === Statusline-persist / OAuth-backfill tunables ==========================
+# Internal (no config UI — YAGNI, spec §Out of scope); test injection only.
+# Spec 2026-07-17-usage-statusline-fallback-design.
+#
+# STATUSLINE_PERSIST_THROTTLE_SECONDS: min seconds between statusline
+#   persist attempts (keyed off STATUSLINE_OBSERVE_MARKER_PATH liveness).
+# OAUTH_BACKFILL_STALE_SECONDS: the OAuth poll only backfills once the
+#   observation marker is at least this stale (i.e. the statusline has
+#   NOT fed recently). Strictly greater than the persist throttle so the
+#   statusline is the primary writer and OAuth only covers its absence.
+# OAUTH_BACKOFF_BASE_SECONDS / OAUTH_BACKOFF_CAP_SECONDS: the headerless
+#   exponential 429 backoff (base * 2**consecutive_429, capped).
+STATUSLINE_PERSIST_THROTTLE_SECONDS = 60.0
+OAUTH_BACKFILL_STALE_SECONDS = 300.0
+OAUTH_BACKOFF_BASE_SECONDS = 60.0
+OAUTH_BACKOFF_CAP_SECONDS = 3600.0
 
 
 _init_paths_from_env()
@@ -681,6 +726,10 @@ def _validate_positive_budget_amount(v: object, label: str) -> float:
 # are reused by the parser (`--period` choices) and the config layer.
 BUDGET_PERIODS = ("subscription-week", "calendar-week", "calendar-month")
 CODEX_BUDGET_PERIODS = ("calendar-week", "calendar-month")
+CODEX_BUDGET_LEAVES = (
+    "amount_usd", "period", "alerts_enabled", "alert_thresholds",
+    "projected_enabled",
+)
 _BUDGET_DEFAULTS = {
     "weekly_usd": None,            # None = no budget (default)
     "alerts_enabled": True,        # "on when set"
@@ -843,12 +892,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
             f"budget.codex must be an object or null, got {type(v).__name__}"
         )
     # warn-and-ignore unknown sub-keys (forward compat, like the parent block)
-    _codex_valid = {
-        "amount_usd", "period", "alerts_enabled", "alert_thresholds",
-        "projected_enabled",
-    }
     for k in v.keys():
-        if k not in _codex_valid:
+        if k not in CODEX_BUDGET_LEAVES:
             print(
                 f"warning: ignoring unknown budget.codex config key: {k}",
                 file=sys.stderr,
@@ -912,6 +957,118 @@ def _budget_alerts_active(budget_cfg: dict) -> bool:
 
 
 # === DB primitive ===================================================
+
+
+def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
+    """Create the current durable provider-neutral quota projection schema.
+
+    The physical observations remain in cache.db.  These tables are the
+    idempotent interpreted index consumed by the Codex quota adapter; migration
+    013 calls this same helper for old databases while ``open_db`` calls it for
+    fresh installs before the migration dispatcher stamps the migration.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS quota_window_blocks (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            source                TEXT    NOT NULL,
+            source_root_key       TEXT    NOT NULL,
+            logical_limit_key     TEXT    NOT NULL,
+            observed_slot         TEXT    NOT NULL,
+            window_minutes        INTEGER NOT NULL CHECK(window_minutes > 0),
+            limit_id              TEXT,
+            limit_name            TEXT,
+            resets_at_utc         TEXT    NOT NULL,
+            nominal_start_at_utc  TEXT    NOT NULL,
+            first_observed_at_utc TEXT    NOT NULL,
+            last_observed_at_utc  TEXT    NOT NULL,
+            first_percent         REAL    NOT NULL,
+            current_percent       REAL    NOT NULL,
+            last_source_path      TEXT    NOT NULL,
+            last_line_offset      INTEGER NOT NULL,
+            generation            TEXT    NOT NULL,
+            orphaned_at           TEXT,
+            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
+                   window_minutes, resets_at_utc)
+        );
+        CREATE INDEX IF NOT EXISTS idx_quota_blocks_active
+            ON quota_window_blocks(source, source_root_key, orphaned_at,
+                                   logical_limit_key, observed_slot,
+                                   window_minutes, resets_at_utc);
+
+        CREATE TABLE IF NOT EXISTS quota_percent_milestones (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            source                TEXT    NOT NULL,
+            source_root_key       TEXT    NOT NULL,
+            logical_limit_key     TEXT    NOT NULL,
+            observed_slot         TEXT    NOT NULL,
+            window_minutes        INTEGER NOT NULL CHECK(window_minutes > 0),
+            resets_at_utc         TEXT    NOT NULL,
+            percent_threshold     INTEGER NOT NULL CHECK(percent_threshold BETWEEN 1 AND 100),
+            captured_at_utc       TEXT    NOT NULL,
+            source_path           TEXT    NOT NULL,
+            line_offset           INTEGER NOT NULL,
+            high_water_percent    INTEGER NOT NULL CHECK(high_water_percent BETWEEN 1 AND 100),
+            generation            TEXT    NOT NULL,
+            orphaned_at           TEXT,
+            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
+                   window_minutes, resets_at_utc, percent_threshold)
+        );
+        CREATE INDEX IF NOT EXISTS idx_quota_milestones_active
+            ON quota_percent_milestones(source, source_root_key, orphaned_at,
+                                        logical_limit_key, observed_slot,
+                                        window_minutes, resets_at_utc,
+                                        percent_threshold);
+
+        CREATE TABLE IF NOT EXISTS quota_threshold_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            source                TEXT    NOT NULL,
+            source_root_key       TEXT    NOT NULL,
+            logical_limit_key     TEXT    NOT NULL,
+            observed_slot         TEXT    NOT NULL,
+            window_minutes        INTEGER NOT NULL CHECK(window_minutes > 0),
+            resets_at_utc         TEXT    NOT NULL,
+            threshold             INTEGER NOT NULL CHECK(threshold BETWEEN 1 AND 100),
+            qualifying_kind       TEXT    NOT NULL CHECK(qualifying_kind IN ('actual','projected')),
+            qualifying_percent    REAL,
+            projected_percent     REAL,
+            severity              TEXT    NOT NULL,
+            created_at_utc        TEXT    NOT NULL,
+            disposition           TEXT    NOT NULL CHECK(disposition IN ('alerted','suppressed_backfill')),
+            alerted_at             TEXT,
+            suppressed_at          TEXT,
+            orphaned_at            TEXT,
+            CHECK((disposition = 'alerted' AND alerted_at IS NOT NULL AND suppressed_at IS NULL)
+               OR (disposition = 'suppressed_backfill' AND suppressed_at IS NOT NULL AND alerted_at IS NULL)),
+            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
+                   window_minutes, resets_at_utc, threshold)
+        );
+        CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_active
+            ON quota_threshold_events(source, source_root_key, orphaned_at,
+                                      logical_limit_key, observed_slot,
+                                      window_minutes, resets_at_utc, threshold);
+
+        CREATE TABLE IF NOT EXISTS quota_projection_state (
+            source_root_key    TEXT PRIMARY KEY,
+            generation         TEXT NOT NULL,
+            physical_signature TEXT NOT NULL,
+            completed_at_utc   TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS quota_alert_arming (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            source            TEXT NOT NULL,
+            source_root_key   TEXT NOT NULL,
+            logical_limit_key TEXT NOT NULL,
+            observed_slot     TEXT NOT NULL,
+            window_minutes    INTEGER NOT NULL CHECK(window_minutes > 0),
+            rule_fingerprint  TEXT NOT NULL,
+            activated_at_utc  TEXT NOT NULL,
+            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
+                   window_minutes)
+        );
+        """
+    )
 
 
 def open_db() -> sqlite3.Connection:
@@ -1473,6 +1630,12 @@ def open_db() -> sqlite3.Connection:
         )
         """
     )
+
+    # Stats migration 013 owns durable quota interpretation.  Keep the current
+    # schema in the fresh-install path before the dispatcher, exactly like the
+    # existing live CREATE tables; its handler calls this same idempotent helper
+    # for an older stats.db and the dispatcher central-stamps on clean return.
+    _apply_quota_projection_schema(conn)
 
     # Migration framework dispatcher. Replaces the prior inline gate stack
     # (has_blocks + _migration_done) with the framework's _run_pending_-

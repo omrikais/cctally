@@ -51,6 +51,20 @@ severity != `OK`.
 - `hooks.installed` — WARN when any of `PostToolBatch`/`Stop`/`SubagentStop` entries are missing.
 - `hooks.recent_activity_24h` — WARN when no hook has fired in 24h, or error/fire ratio ≥ 0.5.
 - `hooks.last_fire_age` — WARN when the last fire was >1h ago or never.
+- `hooks.codex_installed` — root-qualified Codex hook state. With no detected
+  Codex root it is OK/not applicable. It is WARN when any detected root is
+  missing, malformed, or feature-disabled; exact owned handlers are OK only
+  when every root is installed. Its additive details include sorted
+  `states: [{source_root_key, state}]`, root/install counts,
+  `requires_review`, and `trust_state`. A status of
+  `installed_trust_unobservable` means cctally can recognize the handler but
+  cannot determine whether Codex has trusted it; verify it in Codex `/hooks`.
+- `hooks.codex_recent_activity` — root-qualified success/error activity from
+  the last 24 hours for installed Codex handlers. It is WARN when any installed
+  root has never succeeded or was last successful more than 24 hours ago; it
+  is OK/not applicable when no owned Codex handler is installed. Details carry
+  a sorted `roots` array plus the worst-state representative, never a session
+  path or conversation payload.
 
 ### Auth
 - `oauth.token_present` — FAIL when the OAuth token file is missing.
@@ -68,6 +82,14 @@ severity != `OK`.
 - `data.latest_snapshot_age` — WARN at 5min-1h, FAIL >1h or never.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
+- `data.codex_quota` — physical local-rollout quota freshness per qualified
+  Codex window. No Codex corpus is OK/not applicable; Codex files with no
+  safely interpreted quota, or any applicable `future`, `stale`, or
+  `unavailable` window, are WARN. Details include the sorted `windows` array,
+  the latest local capture, aggregate worst freshness, and its responsible
+  identity. This is not an OAuth or provider-live check; run a local
+  `cctally cache-sync --source codex` (or trigger trusted Codex activity) to
+  reread rollout data.
 - `data.parse_health` — WARN when the rolling ingest parse-health record (per vendor, kept in `cache_meta`) shows a malformed or drift-skipped JSONL line within the trailing 7 days — a signal that a Claude Code / Codex session-format change may be silently affecting your numbers; the summary carries the counts and the dominant skip reason. OK otherwise: absent record (pre-first-sync), all-zero counters, or a *stale* anomaly older than 7 days (surfaced as historical counts in the details so a one-off bad line doesn't nag forever). Remediation points at checking for a cctally update / filing an issue; `cctally cache-sync --rebuild` re-baselines the counters.
 - `data.conversation_sessions_rollup` — WARN when the conversation-viewer browse-rail rollup (`conversation_sessions`) has drifted from its source — its row count differs from `COUNT(DISTINCT session_id)` over `conversation_messages` — **and only in a quiescent cache**. OK when the counts match, when either is unavailable (the table is absent on a pre-rollup cache, or cache.db can't be read), or while a sync/reingest/backfill is in progress. The in-progress signal is a non-blocking `cache.db.lock` flock probe (a writer mid-walk holds it) plus the presence of any pending reingest/split/backfill `cache_meta` flag — so a transient mid-sync mismatch (the rollup is recomputed *after* `conversation_messages` commits per file) never WARNs. Informational only; the next full sync re-derives the rollup (`cctally cache-sync --rebuild` forces it). Read-only — the probe never blocks on the lock.
 
@@ -125,4 +147,5 @@ The dashboard exposes the same diagnostic via:
 - [`db status`](db.md) — migration inventory
 - [`refresh-usage`](refresh-usage.md) — force-fetch OAuth usage
 - [`cache-sync`](cache-sync.md) — rebuild the session-entry cache
+- [`codex-quota`](codex-quota.md) — local-rollout quota semantics and recovery
 - [`update`](update.md) — upgrade cctally

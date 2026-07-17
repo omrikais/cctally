@@ -38,7 +38,9 @@ import json
 import pathlib
 import sqlite3
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from _cctally_core import open_db, parse_iso_datetime
@@ -1254,6 +1256,405 @@ def _share_load_templates_module_impl(handler):
         raise
     return mod
 
+
+def _share_source_selection(req: dict) -> tuple[str, bool]:
+    """Resolve S4's optional source field without changing legacy requests."""
+    explicit = "source" in req
+    source = req.get("source", "claude")
+    if source not in ("claude", "codex", "all"):
+        raise ValueError("source capability unavailable")
+    return source, explicit
+
+
+def _source_state_for_share(data_snap, source: str):
+    try:
+        bundle = data_snap.source_bundle
+        return bundle.sources[source]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError("source capability unavailable") from exc
+
+
+def _share_codex_range_start(panel: str, now_utc: "dt.datetime",
+                             custom_start: "dt.datetime | None") -> "dt.datetime":
+    """Return the bounded cache range used for a non-current Codex share.
+
+    The native source projection has no hidden live-current fallback: every
+    range is derived from the requested panel period and the source builder is
+    called with ``sync=False`` by construction.  Keep these spans aligned with
+    the legacy dashboard builders' visible windows.
+    """
+    if custom_start is not None:
+        return custom_start
+    if panel == "daily":
+        return now_utc - dt.timedelta(days=31)  # 30 rows plus boundary slack
+    if panel == "monthly":
+        year, month = now_utc.year, now_utc.month
+        for _ in range(11):
+            month -= 1
+            if month == 0:
+                year, month = year - 1, 12
+        return dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
+    if panel == "weekly":
+        return now_utc - dt.timedelta(days=7 * 13)
+    if panel == "blocks":
+        return now_utc - dt.timedelta(days=7)
+    return now_utc - dt.timedelta(days=30)
+
+
+def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
+    """Return the selected Codex state, rebuilding non-current requests safely.
+
+    Dashboard snapshots intentionally contain the live/current source bundle.
+    Share period overrides rebuild their legacy Claude panel fields, but using
+    that unchanged bundle for Codex would mislabel current provider data as a
+    past/custom export.  Rebuild only the selected Codex read model over the
+    requested bounded range; its source adapters are cache/stats readers and
+    use ``sync=False`` internally.  The resulting state is request-local and
+    never replaces the published snapshot.
+    """
+    now_override, start_override, err = _share_resolve_period(panel, options)
+    if err is not None:
+        raise ValueError("source capability unavailable")
+    if now_override is None:
+        return _source_state_for_share(data_snap, "codex")
+
+    from _cctally_cache import open_cache_db
+    from _cctally_dashboard_sources import (
+        DashboardReadContext,
+        build_codex_source_state,
+        resolve_dashboard_source_semantics,
+    )
+
+    range_start = _share_codex_range_start(panel, now_override, start_override)
+    config = sys.modules["cctally"].load_config()
+    display_tz_name = options.get("display_tz")
+    if display_tz_name == "utc":
+        display_tz_name = "UTC"
+    elif display_tz_name == "local" or not isinstance(display_tz_name, str):
+        display_tz_name = None
+    semantics = resolve_dashboard_source_semantics(
+        config, display_tz_name=display_tz_name,
+    )
+    stats_conn = open_db()
+    cache_conn = open_cache_db()
+    try:
+        return build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache_conn,
+                stats_conn=stats_conn,
+                range_start=range_start,
+                now_utc=now_override,
+                display_tz_name=semantics.display_tz_name,
+                week_start_idx=semantics.week_start_idx,
+                week_start_name=semantics.week_start_name,
+                speed=semantics.speed,
+                codex_budget=semantics.codex_budget,
+            ),
+            data_version=(
+                f"share:codex:{panel}:{range_start.isoformat()}:"
+                f"{now_override.isoformat()}:{semantics.identity}"
+            ),
+        )
+    finally:
+        cache_conn.close()
+        stats_conn.close()
+
+
+def _share_parse_bucket_start(panel: str, label: object) -> "dt.datetime | None":
+    try:
+        if panel == "monthly":
+            return dt.datetime.strptime(str(label), "%Y-%m").replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.fromisoformat(str(label)).replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _share_codex_period_bounds(*, state, panel: str, options: dict, rows) -> tuple:
+    now_override, start_override, err = _share_resolve_period(panel, options)
+    if err is not None:
+        raise ValueError("source capability unavailable")
+    end = now_override or state.last_success_at or dt.datetime.now(dt.timezone.utc)
+    if end.tzinfo is None or end.utcoffset() is None:
+        end = end.replace(tzinfo=dt.timezone.utc)
+    end = end.astimezone(dt.timezone.utc)
+    if start_override is not None:
+        return start_override.astimezone(dt.timezone.utc), end
+    starts = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        raw = row.get("first_seen") or row.get("last_activity") or row.get("label")
+        parsed = _share_parse_bucket_start("monthly" if panel == "monthly" else "daily", raw)
+        if parsed is not None:
+            starts.append(parsed)
+    if panel == "current-week":
+        starts = [
+            parsed for row in rows if isinstance(row, Mapping)
+            if (parsed := _share_parse_bucket_start("weekly", row.get("label"))) is not None
+        ]
+        return (max(starts) if starts else end - dt.timedelta(days=7)), end
+    return (min(starts) if starts else end), end
+
+
+def _build_codex_source_share_snapshot(ls, *, state, panel: str,
+                                       template_id: str, options: dict):
+    """Adapt S4 normalized data through canonical Codex share kernels."""
+    data = state.data
+    if not isinstance(data, Mapping) or state.availability == "unavailable":
+        raise ValueError("source capability unavailable")
+    required_domain = {
+        "current-week": "hero",
+        "daily": "periods",
+        "monthly": "periods",
+        "weekly": "periods",
+        "blocks": "quota",
+        "sessions": "sessions",
+        "projects": "projects",
+    }.get(panel)
+    if required_domain is None or required_domain not in data:
+        raise ValueError("source capability unavailable")
+    availability = state.availability if state.availability in ("ok", "empty") else "unavailable"
+    reason = "source data unavailable" if availability == "unavailable" else None
+    hero = data.get("hero") if isinstance(data.get("hero"), Mapping) else {}
+    if panel == "current-week":
+        periods = data.get("periods")
+        weekly = periods.get("weekly") if isinstance(periods, Mapping) else None
+        if not isinstance(weekly, Mapping):
+            raise ValueError("source capability unavailable")
+        all_rows = tuple(weekly.get("rows", ()))
+        source_rows = all_rows[-1:] if all_rows else ()
+        command = "codex-weekly"
+        display_tz = str(weekly.get("display_tz") or "UTC")
+    elif panel in ("daily", "monthly", "weekly"):
+        periods = data.get("periods")
+        panel_data = periods.get(panel) if isinstance(periods, Mapping) else {}
+        if not isinstance(panel_data, Mapping):
+            raise ValueError("source capability unavailable")
+        source_rows = tuple(panel_data.get("rows", ()))
+        command = f"codex-{panel}"
+        display_tz = str(panel_data.get("display_tz") or "UTC")
+    elif panel == "sessions":
+        panel_data = data.get(panel) if isinstance(data.get(panel), Mapping) else {}
+        source_rows = tuple(panel_data.get("rows", ())) if isinstance(panel_data, Mapping) else ()
+        command = "codex-session"
+        display_tz = "UTC"
+    elif panel == "projects":
+        panel_data = data.get("projects") if isinstance(data.get("projects"), Mapping) else {}
+        source_rows = tuple(panel_data.get("rows", ())) if isinstance(panel_data, Mapping) else ()
+        start, end = _share_codex_period_bounds(
+            state=state, panel=panel, options=options, rows=source_rows,
+        )
+        rows = tuple(ls.Row(cells={
+            "project": ls.ProjectCell(
+                str(row.get("label", "Project")),
+                float(row.get("cost_usd", 0.0) or 0.0),
+                identity=str(row.get("key")),
+            ),
+            "tokens": ls.TextCell(f"{int(row.get('total_tokens', 0) or 0):,}"),
+            "cost": ls.MoneyCell(float(row.get("cost_usd", 0.0) or 0.0)),
+        }) for row in source_rows if isinstance(row, Mapping))
+        return ls.ShareSnapshot(
+            cmd="project", title="Codex Project Usage", subtitle=None,
+            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            columns=(
+                ls.ColumnSpec(key="project", label="Project"),
+                ls.ColumnSpec(key="tokens", label="Tokens", align="right"),
+                ls.ColumnSpec(key="cost", label="$ Cost", align="right"),
+            ),
+            rows=rows, chart=None,
+            totals=(ls.Totalled(label="Total", value=f"${float(panel_data.get('total_cost_usd', 0.0) or 0.0):,.2f}"),),
+            notes=(), generated_at=end, version=sys.modules["cctally"]._share_resolve_version(),
+            template_id=template_id, source="codex", source_label="Codex",
+            availability=availability, availability_reason=reason,
+        )
+    else:  # blocks
+        quota = data.get("quota")
+        panel_data = quota if isinstance(quota, Mapping) else {}
+        source_rows = tuple(panel_data.get("blocks", ())) if isinstance(panel_data, Mapping) else ()
+        start, end = _share_codex_period_bounds(
+            state=state, panel=panel, options=options, rows=source_rows,
+        )
+        columns = (
+            ls.ColumnSpec(key="label", label="Quota", align="left"),
+            ls.ColumnSpec(key="usage", label="Usage", align="right"),
+            ls.ColumnSpec(key="resets", label="Resets", align="right"),
+        )
+        def cells(row):
+            percent = row.get("current_percent", 0.0)
+            return {
+                "label": ls.TextCell(str(row.get("label", "Codex quota"))),
+                "usage": ls.TextCell(f"{float(percent or 0.0):.1f}%"),
+                "resets": ls.TextCell(str(row.get("resets_at", "—"))),
+            }
+        rows = tuple(ls.Row(cells=cells(row)) for row in source_rows if isinstance(row, Mapping))
+        return ls.ShareSnapshot(
+            cmd="codex-quota", title="Codex Quota Windows", subtitle=None,
+            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            columns=columns, rows=rows, chart=None,
+            totals=(), notes=(), generated_at=end,
+            version=sys.modules["cctally"]._share_resolve_version(),
+            template_id=template_id, source="codex", source_label="Codex",
+            availability=availability, availability_reason=reason,
+        )
+
+    start, end = _share_codex_period_bounds(
+        state=state, panel=panel, options=options, rows=source_rows,
+    )
+    normalized_rows = tuple(
+        SimpleNamespace(
+            bucket=str(row.get("label", "—")),
+            total_tokens=int(row.get("total_tokens", 0) or 0),
+            cost_usd=float(row.get("cost_usd", 0.0) or 0.0),
+            last_activity=parse_iso_datetime(str(row.get("last_activity")), "codex.session.last_activity")
+            if command == "codex-session" else None,
+        )
+        for row in source_rows if isinstance(row, Mapping)
+    )
+    view = SimpleNamespace(
+        rows=normalized_rows,
+        total_cost_usd=stable_sum(row.cost_usd for row in normalized_rows),
+        total_tokens=sum(row.total_tokens for row in normalized_rows),
+        period_start=start,
+        period_end=end,
+        display_tz_label=display_tz,
+    )
+    codex_module = sys.modules["cctally"]._load_sibling("_cctally_codex")
+    return replace(
+        codex_module._build_codex_share_snapshot(command, view, normalized_rows),
+        template_id=template_id,
+    )
+
+
+def _share_plain_value(value):
+    if isinstance(value, Mapping):
+        return {str(key): _share_plain_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_share_plain_value(item) for item in value]
+    if isinstance(value, dt.datetime):
+        return value.astimezone(dt.timezone.utc).isoformat()
+    return value
+
+
+def _share_state_domain(state, panel: str):
+    data = state.data if isinstance(state.data, Mapping) else {}
+    if panel in ("daily", "monthly", "weekly", "current-week"):
+        periods = data.get("periods") if isinstance(data.get("periods"), Mapping) else {}
+        key = "weekly" if panel == "current-week" else panel
+        return periods.get(key)
+    if panel == "blocks":
+        return data.get("quota")
+    return data.get(panel)
+
+
+def _share_digest_input(*, panel: str, template_id: str, source: str,
+                        source_explicit: bool, states, snapshots,
+                        panel_data):
+    if not source_explicit:
+        return {
+            "panel": panel,
+            "template_id": template_id,
+            "panel_data": panel_data,
+        }
+    providers = []
+    for state, snapshot in zip(states, snapshots):
+        providers.append({
+            "source": state.source,
+            "data_version": state.data_version,
+            "availability": state.availability,
+            "period": {
+                "start": snapshot.period.start,
+                "end": snapshot.period.end,
+                "display_tz": snapshot.period.display_tz,
+            },
+            "data": _share_plain_value(_share_state_domain(state, panel)),
+        })
+    return {
+        "panel": panel,
+        "template_id": template_id,
+        "source": source,
+        "providers": providers,
+        **(
+            {"claude_panel_data": panel_data}
+            if source in ("claude", "all") else {}
+        ),
+    }
+
+
+def _share_build_source_snapshots(*, ls, template, template_id: str,
+                                  panel: str, options: dict, source: str,
+                                  source_explicit: bool, data_snap):
+    """Branch by provider before invoking any provider-specific builder."""
+    claude_snapshot = None
+    claude_state = None
+    panel_data = None
+    if source in ("claude", "all"):
+        claude_data_snap, period_err = _share_apply_period_override(
+            panel, options, data_snap,
+        )
+        if period_err is not None:
+            raise _SharePeriodError(period_err)
+        panel_data = _build_share_panel_data(panel, options, claude_data_snap)
+        claude_snapshot = replace(
+            template.builder(panel_data=panel_data, options=options),
+            template_id=template_id,
+        )
+        if source_explicit or source == "all":
+            claude_snapshot = replace(
+                claude_snapshot, source="claude", source_label="Claude",
+            )
+        # A source-less request is the shipped legacy Claude contract.  It
+        # must remain usable by callers whose synthetic/older DataSnapshot
+        # does not carry the additive S4 source bundle.
+        if source_explicit or source == "all":
+            claude_state = _source_state_for_share(data_snap, "claude")
+
+    codex_snapshot = None
+    codex_state = None
+    if source in ("codex", "all"):
+        codex_state = _share_codex_state_for_period(
+            data_snap, panel=panel, options=options,
+        )
+        codex_snapshot = _build_codex_source_share_snapshot(
+            ls,
+            state=codex_state,
+            panel=panel,
+            template_id=template_id,
+            options=options,
+        )
+
+    if source == "claude":
+        return (claude_snapshot,), (claude_state,), panel_data
+    if source == "codex":
+        return (codex_snapshot,), (codex_state,), None
+    return (
+        (claude_snapshot, codex_snapshot),
+        (claude_state, codex_state),
+        panel_data,
+    )
+
+
+class _SharePeriodError(ValueError):
+    """Carry the established period-validation envelope across dispatch."""
+
+    def __init__(self, payload: Mapping):
+        super().__init__(str(payload.get("error", "invalid period")))
+        self.payload = dict(payload)
+
+
+def _share_public_failure(handler, exc: Exception, *, phase: str,
+                          capability: bool = False) -> None:
+    handler.log_error("/api/share/%s failed: %r", phase, exc)
+    if capability:
+        handler._respond_json(400, {
+            "code": "source_capability_unavailable",
+            "error": "source capability unavailable",
+        })
+    else:
+        handler._respond_json(500, {
+            "code": "source_render_failed",
+            "error": "source render failed",
+        })
+
 def _handle_share_templates_get_impl(handler) -> None:
     """List share templates registered for the requested panel.
 
@@ -1324,6 +1725,14 @@ def _handle_share_render_post_impl(handler) -> None:
         return
     if not isinstance(req, dict):
         handler._respond_json(400, {"error": "expected JSON object"})
+        return
+    try:
+        source, source_explicit = _share_source_selection(req)
+    except ValueError:
+        handler._respond_json(400, {
+            "code": "source_capability_unavailable",
+            "error": "source capability unavailable",
+        })
         return
     panel = req.get("panel")
     template_id = req.get("template_id")
@@ -1405,53 +1814,60 @@ def _handle_share_render_post_impl(handler) -> None:
         })
         return
 
-    # Build panel_data from the live dashboard snapshot — reuses the
-    # already-built `DataSnapshot` so we don't re-query the DB on the
-    # share hot path. `_build_share_panel_data` dispatches per panel.
     snap_ref = type(handler).snapshot_ref
     data_snap = snap_ref.get() if snap_ref is not None else None
-    # Period override (current / previous / custom). For
-    # `kind='current'` (the default) this is a no-op; otherwise we
-    # re-build the relevant panel's DataSnapshot field from DB with
-    # a shifted `now_utc` before slicing.
-    data_snap, period_err = _share_apply_period_override(panel, options,
-                                                          data_snap)
-    if period_err is not None:
-        handler._respond_json(400, period_err)
-        return
-    try:
-        panel_data = _build_share_panel_data(panel, options, data_snap)
-    except Exception as exc:
-        handler._respond_json(500, {"error": f"panel_data build failed: {exc}"})
-        return
-
-    # Run template builder → kernel render. Builder produces a
-    # ShareSnapshot; `_scrub` anonymizes project labels when the
-    # client opted in to anon-on-export (`reveal_projects=False`).
     ls = _share_load_lib()
     try:
-        snap_built = template.builder(panel_data=panel_data, options=options)
-    except Exception as exc:
-        handler._respond_json(500, {"error": f"builder failed: {exc}"})
+        source_snaps, source_states, panel_data = _share_build_source_snapshots(
+            ls=ls,
+            template=template,
+            template_id=template_id,
+            panel=panel,
+            options=options,
+            source=source,
+            source_explicit=source_explicit,
+            data_snap=data_snap,
+        )
+    except _SharePeriodError as exc:
+        handler._respond_json(400, exc.payload)
         return
-    snap_built = replace(snap_built, template_id=template_id)
-    # Content toggles (spec §Q4). Defaults match the existing
-    # behavior (chart on, table on); explicit False strips the
-    # corresponding section from the ShareSnapshot. ShareSnapshot
-    # is frozen so we use dataclasses.replace.
-    snap_built = _share_apply_content_toggles(snap_built, options)
+    except ValueError as exc:
+        _share_public_failure(handler, exc, phase="render provider", capability=True)
+        return
+    except Exception as exc:
+        _share_public_failure(handler, exc, phase="render provider")
+        return
+    source_snaps = tuple(
+        _share_apply_content_toggles(item, options) for item in source_snaps
+    )
     reveal = bool(options.get("reveal_projects", True))
     if not reveal:
-        snap_built = ls._scrub(snap_built, reveal_projects=False)
-    try:
-        body = ls.render(
-            snap_built,
-            format=fmt,
-            theme=options.get("theme", "light"),
-            branding=not options.get("no_branding", False),
+        source_snaps = tuple(
+            ls._scrub(item, reveal_projects=False) for item in source_snaps
         )
+    try:
+        if source == "all":
+            body = ls.compose(
+                tuple(
+                    ls.ComposedSection(snap=item, drift_detected=False)
+                    for item in source_snaps
+                ),
+                opts=ls.ComposeOptions(
+                    title=f"Claude + Codex {panel.replace('-', ' ').title()}",
+                    theme=options.get("theme", "light"), format=fmt,
+                    no_branding=bool(options.get("no_branding", False)),
+                    reveal_projects=reveal,
+                ),
+            )
+        else:
+            body = ls.render(
+                source_snaps[0],
+                format=fmt,
+                theme=options.get("theme", "light"),
+                branding=not options.get("no_branding", False),
+            )
     except Exception as exc:
-        handler._respond_json(500, {"error": f"render failed: {exc}"})
+        _share_public_failure(handler, exc, phase="render kernel")
         return
     content_type = {
         "md":   "text/markdown",
@@ -1465,11 +1881,15 @@ def _handle_share_render_post_impl(handler) -> None:
     # detect "section data has drifted since add-time" (spec §5.2 /
     # §7.1) — flipping anon-on-export must not register as drift, since
     # the underlying data is identical.
-    digest_input = {
-        "panel": panel,
-        "template_id": template_id,
-        "panel_data": panel_data,
-    }
+    digest_input = _share_digest_input(
+        panel=panel,
+        template_id=template_id,
+        source=source,
+        source_explicit=source_explicit,
+        states=source_states,
+        snapshots=source_snaps,
+        panel_data=panel_data,
+    )
     try:
         data_digest = ls._data_digest(digest_input)
     except Exception:
@@ -1488,6 +1908,7 @@ def _handle_share_render_post_impl(handler) -> None:
             "options": options,
             "generated_at": _share_now_utc_iso(),
             "data_digest": data_digest,
+            **({"source": source} if source_explicit else {}),
         },
     })
 
@@ -1578,6 +1999,17 @@ def _handle_share_compose_post_impl(handler) -> None:
         template_id = snap_recipe.get("template_id")
         sec_opts = snap_recipe.get("options") or {}
         digest_at_add = snap_recipe.get("data_digest_at_add") or ""
+        try:
+            source, source_explicit = _share_source_selection(
+                {"source": snap_recipe["source"]}
+                if "source" in snap_recipe else {}
+            )
+        except ValueError:
+            handler._respond_json(400, {
+                "code": "source_capability_unavailable",
+                "error": "source capability unavailable",
+            })
+            return
         if (not isinstance(panel, str)
                 or panel not in tpl_mod.SHARE_CAPABLE_PANELS):
             handler._respond_json(400, {
@@ -1613,59 +2045,71 @@ def _handle_share_compose_post_impl(handler) -> None:
                           "theme": theme, "format": fmt,
                           "no_branding": no_branding}
         composite_opts.setdefault("display_tz", composite_display_tz)
-        # Per-section period override — each basket item carries its
-        # own period recipe, independent of the composite anon flag.
-        sec_snap, period_err = _share_apply_period_override(
-            panel, composite_opts, data_snap,
-        )
-        if period_err is not None:
+        try:
+            source_snaps, source_states, panel_data = _share_build_source_snapshots(
+                ls=ls,
+                template=template,
+                template_id=template_id,
+                panel=panel,
+                options=composite_opts,
+                source=source,
+                source_explicit=source_explicit,
+                data_snap=data_snap,
+            )
+        except _SharePeriodError as exc:
             handler._respond_json(400, {
-                "error": f"sections[{idx}]: {period_err['error']}",
-                "field": f"sections[{idx}].snapshot.{period_err['field']}",
+                "error": f"sections[{idx}]: {exc.payload['error']}",
+                "field": f"sections[{idx}].snapshot.{exc.payload['field']}",
             })
             return
-        try:
-            panel_data = _build_share_panel_data(panel, composite_opts,
-                                                 sec_snap)
+        except ValueError as exc:
+            _share_public_failure(
+                handler, exc, phase=f"compose section {idx} provider", capability=True,
+            )
+            return
         except Exception as exc:
-            handler._respond_json(500, {
-                "error": f"sections[{idx}] panel_data build failed: {exc}",
-            })
+            _share_public_failure(
+                handler, exc, phase=f"compose section {idx} provider",
+            )
             return
-        try:
-            snap_built = template.builder(panel_data=panel_data,
-                                          options=composite_opts)
-        except Exception as exc:
-            handler._respond_json(500, {
-                "error": f"sections[{idx}] builder failed: {exc}",
-            })
-            return
-        snap_built = replace(snap_built, template_id=template_id)
         # Same content toggles as the single-section render path.
         # Per-section `show_chart`/`show_table` from the basket
         # recipe are applied here; the composite anon flag is
         # already merged into composite_opts upstream.
-        snap_built = _share_apply_content_toggles(snap_built, composite_opts)
+        source_snaps = tuple(
+            _share_apply_content_toggles(item, composite_opts)
+            for item in source_snaps
+        )
         if not reveal_projects:
-            snap_built = ls._scrub(snap_built, reveal_projects=False)
+            source_snaps = tuple(
+                ls._scrub(item, reveal_projects=False) for item in source_snaps
+            )
 
         # Defensive: digest is non-blocking metadata — fall back to
         # "" on failure rather than 500-ing the whole compose
         # (mirrors the render handler at bin/cctally:33402-33408).
         try:
-            digest_now = ls._data_digest({
-                "panel": panel,
-                "template_id": template_id,
-                "panel_data": panel_data,
-            })
+            digest_now = ls._data_digest(_share_digest_input(
+                panel=panel,
+                template_id=template_id,
+                source=source,
+                source_explicit=source_explicit,
+                states=source_states,
+                snapshots=source_snaps,
+                panel_data=panel_data,
+            ))
         except Exception:
             digest_now = ""
-        composed_sections.append(ls.ComposedSection(
-            snap=snap_built,
-            drift_detected=(digest_now != digest_at_add),
-        ))
+        composed_sections.extend(
+            ls.ComposedSection(
+                snap=item,
+                drift_detected=(digest_now != digest_at_add),
+            )
+            for item in source_snaps
+        )
         section_results.append({
             "snapshot_id": f"{idx:02d}",
+            "source": source,
             "drift_detected": digest_now != digest_at_add,
             "data_digest_at_add": digest_at_add,
             "data_digest_now": digest_now,
@@ -1678,7 +2122,7 @@ def _handle_share_compose_post_impl(handler) -> None:
     try:
         body = ls.compose(tuple(composed_sections), opts=compose_opts)
     except Exception as exc:
-        handler._respond_json(500, {"error": f"compose failed: {exc}"})
+        _share_public_failure(handler, exc, phase="compose kernel")
         return
 
     content_type = {
@@ -1720,7 +2164,17 @@ def _handle_share_presets_get_impl(handler) -> None:
     """
     cfg = sys.modules["cctally"].load_config()
     presets = (cfg.get("share") or {}).get("presets") or {}
-    handler._respond_json(200, {"presets": presets})
+    # Old records predate S4. Resolve them as Claude on read without mutating
+    # config (a GET must remain read-only).
+    resolved = {
+        panel: {
+            name: ({**record, "source": record.get("source", "claude")}
+                   if isinstance(record, dict) else record)
+            for name, record in bucket.items()
+        }
+        for panel, bucket in presets.items() if isinstance(bucket, dict)
+    }
+    handler._respond_json(200, {"presets": resolved})
 
 def _handle_share_presets_post_impl(handler) -> None:
     """Create or overwrite a preset (idempotent on `(panel, name)`).
@@ -1757,6 +2211,14 @@ def _handle_share_presets_post_impl(handler) -> None:
     name = req.get("name")
     template_id = req.get("template_id")
     options = req.get("options")
+    try:
+        source, _ = _share_source_selection(req)
+    except ValueError:
+        handler._respond_json(400, {
+            "code": "source_capability_unavailable",
+            "error": "source capability unavailable",
+        })
+        return
     if not isinstance(panel, str) or not panel:
         handler._respond_json(400, {
             "error": "missing or non-string panel",
@@ -1807,7 +2269,10 @@ def _handle_share_presets_post_impl(handler) -> None:
         return
 
     saved_at = _share_now_utc_iso()
-    record = {"template_id": template_id, "options": options, "saved_at": saved_at}
+    record = {
+        "template_id": template_id, "options": options,
+        "source": source, "saved_at": saved_at,
+    }
 
     with sys.modules["cctally"].config_writer_lock():
         cfg = _load_config_unlocked()
@@ -1878,7 +2343,11 @@ def _handle_share_history_get_impl(handler) -> None:
     """Return the recent-shares ring buffer (newest last, spec §11.4)."""
     cfg = sys.modules["cctally"].load_config()
     history = (cfg.get("share") or {}).get("history") or []
-    handler._respond_json(200, {"history": history})
+    handler._respond_json(200, {"history": [
+        ({**record, "source": record.get("source", "claude")}
+         if isinstance(record, dict) else record)
+        for record in history
+    ]})
 
 def _handle_share_history_post_impl(handler) -> None:
     """Append a recipe to the ring buffer; FIFO trim to 20.
@@ -1914,6 +2383,14 @@ def _handle_share_history_post_impl(handler) -> None:
     options = req.get("options") or {}
     fmt = req.get("format")
     destination = req.get("destination")
+    try:
+        source, _ = _share_source_selection(req)
+    except ValueError:
+        handler._respond_json(400, {
+            "code": "source_capability_unavailable",
+            "error": "source capability unavailable",
+        })
+        return
     if not isinstance(panel, str) or not panel:
         handler._respond_json(400, {
             "error": "missing or non-string panel",
@@ -1978,6 +2455,7 @@ def _handle_share_history_post_impl(handler) -> None:
         "panel": panel,
         "template_id": template_id,
         "options": options,
+        "source": source,
         "format": fmt,
         "destination": destination,
         "exported_at": _share_now_utc_iso(),

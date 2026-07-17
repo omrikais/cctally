@@ -938,7 +938,7 @@ def _cx_seed_codex_entries(ns, rows):
         for i, (ts, model, inp, cached, out) in enumerate(rows):
             seed_codex_session_entry(
                 conn,
-                source_path=f"/fx/codex-{i}.jsonl",
+                source_path=f"fixtures/budget/codex-{i}.jsonl",
                 line_offset=i,
                 timestamp_utc=_pj_iso(ts),
                 session_id=f"cx-s{i}",
@@ -955,8 +955,13 @@ def _cx_seed_codex_entries(ns, rows):
 
 
 def test_sum_codex_cost_for_range_sums_in_range(cxns):
-    """`_sum_codex_cost_for_range` sums `_calculate_codex_entry_cost` over the
-    in-range entries and excludes out-of-range ones."""
+    """Relative fixture rows survive the read-triggered Codex sync and sum only
+    when they are inside the requested range.
+
+    Synthetic cache rows deliberately have no discoverable ``codex_session_files``
+    parent.  A relative path marks that baked-fixture carve-out; an absolute
+    synthetic path must not be used here because normal sync correctly prunes it.
+    """
     ns = cxns
     in1 = CX_MONTH_START + dt.timedelta(days=2)
     in2 = CX_MONTH_START + dt.timedelta(days=5)
@@ -978,6 +983,19 @@ def test_sum_codex_cost_for_range_sums_in_range(cxns):
         + calc("gpt-5", 200_000, 0, 80_000, 0, speed="standard")
     )
     assert abs(got - expected) < 1e-9, f"got={got} expected={expected}"
+    conn = ns["open_cache_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT source_path FROM codex_session_entries ORDER BY line_offset"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [row[0] for row in rows] == [
+        "fixtures/budget/codex-0.jsonl",
+        "fixtures/budget/codex-1.jsonl",
+        "fixtures/budget/codex-2.jsonl",
+        "fixtures/budget/codex-3.jsonl",
+    ]
 
 
 def test_sum_codex_cost_for_range_empty_is_zero(cxns):

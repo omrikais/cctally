@@ -5,14 +5,15 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { shouldSuppressNextClick } from '../lib/clickSuppression';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { PANEL_REGISTRY, type GridPanelId } from '../lib/panelRegistry';
-import { CARD_LAYOUT } from '../lib/panelIds';
+import { boardSpan, type BoardMode } from '../lib/boardLayout';
 
 export interface PanelHostProps {
   id: GridPanelId;
   index: number;
+  mode: BoardMode;
 }
 
-export function PanelHost({ id, index }: PanelHostProps) {
+export function PanelHost({ id, index, mode }: PanelHostProps) {
   const def = PANEL_REGISTRY[id];
 
   // Disable drag activation while a modal is open. Subscribed via
@@ -76,7 +77,9 @@ export function PanelHost({ id, index }: PanelHostProps) {
   // property, so prefers-reduced-motion must be honored here in JS — a
   // media-query rule in index.css cannot suppress an inline value.
   const style: React.CSSProperties = {
-    transform: CSS.Transform.toString(transform),
+    // #293 S2: CSS.Translate (not CSS.Transform) drops rectSortingStrategy's
+    // scaleX/scaleY so displaced tall cards slide instead of stretching.
+    transform: CSS.Translate.toString(transform),
     transition: reducedMotion ? undefined : transition,
   };
 
@@ -90,8 +93,10 @@ export function PanelHost({ id, index }: PanelHostProps) {
       // #264 S1: the bento CSS drives `grid-column: span N` from this
       // attribute (not an inline style — an inline gridColumn would beat the
       // mobile 1-col media override; an attribute selector keeps mobile the
-      // default and desktop the enhancement).
-      data-span={CARD_LAYOUT[id].span}
+      // default and desktop the enhancement). #293 S1: the span is now
+      // board-mode-driven (boardSpan) — intermediate (900–1199) makes the
+      // three tall cards Sessions-full / Trend·Projects-paired.
+      data-span={boardSpan(id, mode)}
       aria-label={`Reorder ${label}`}
       onKeyDown={onKeyDown}
       onClickCapture={onClickCapture}

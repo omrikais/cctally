@@ -173,16 +173,35 @@ export function ConversationRail() {
   // Esc cancels pick-mode from anywhere in the rail (the banner's Cancel button
   // is the visible affordance; this is the keyboard parity). Bound only while
   // pick-mode is active so it never competes with the view-level Esc otherwise.
+  // #304 S2 (Codex F1) — layered: while the search input owns focus (inputMode)
+  // or the filters popover is open, THEIR Escape handlers must run (clear+blur /
+  // close) — and on compact, stealing their Esc would unmount the rail with
+  // `inputMode`/`convFiltersOpen` stranded (React fires no onBlur on unmount),
+  // deadening the view keymap via inView. The next Escape cancels the pick.
   useEffect(() => {
     if (!comparePick) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        dispatch({ type: 'CANCEL_COMPARE_PICK' });
-      }
+      if (e.key !== 'Escape') return;
+      const s = getState();
+      if (s.inputMode !== null || s.convFiltersOpen) return;
+      e.stopPropagation();
+      dispatch({ type: 'CANCEL_COMPARE_PICK' });
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
+  }, [comparePick]);
+
+  // #304 S2 (Codex F5) — on compact the rail MOUNTS with pick already active
+  // (the view-layer gate swaps the reader out), which strands focus on <body>
+  // after the ⋯ trigger unmounts. Keyed on comparePick (not a previous-value
+  // ref) so mount-with-active-pick counts as entry; the stranded-focus guard
+  // keeps desktop entry (focus still on #conv-compare-with) untouched.
+  useEffect(() => {
+    if (!comparePick) return;
+    const ae = document.activeElement;
+    if (ae === null || ae === document.body) {
+      document.querySelector<HTMLElement>('.conv-rail-pickcancel')?.focus();
+    }
   }, [comparePick]);
 
   const isSearching = search.trim() !== '';
@@ -462,9 +481,12 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
       onClick={pickOr(pickAnchor, row.session_id, () => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id }))}
     >
       <div className="conv-rail-row-title">{row.title}</div>
-      {/* #228 S4 D2 — one non-wrapping meta line: a left group ([project ·] branch
-          · when) that ellipsizes, and a right stats cluster (model chip + $cost +
-          msg count). Spacing dots come from CSS gaps (Task 9). */}
+      {/* #304 S3 §2 — TWO-LINE meta contract. Line 1 = IDENTITY: [project ·]
+          branch (ellipsize inside the overflow-hidden metaleft) + when (a rigid
+          protected sibling, #238 S2 D4). Line 2 = STATS: the model chip + $cost +
+          msg count, all rigid. Splitting the dense one-line meta lands the #243
+          rigid-chip guarantee trivially (line-2 min-content ≈130px vs the 280px
+          worst-case rail), so cost/msgs can never be pushed off. */}
       <div className="conv-rail-row-meta">
         <span className="conv-rail-row-metaleft">
           {!hideProject && <span className="conv-rail-row-project">{row.project_label || '—'}</span>}
@@ -474,15 +496,24 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
             the overflow-hidden metaleft, so project/branch ellipsize first and the
             time is never clipped. */}
         <span className="conv-rail-row-when">{fmt.startedShort(row.last_activity_utc, ctx, { noSuffix: true })}</span>
-        {/* #238 S2 / #243 — the model chip is its OWN meta item, NOT inside the
-            stats cluster, so it never inflates the cluster's min-content and
-            forces the cost/msg numbers off the fixed-width rail. With the #243
-            cap=1 it holds a single rigid chip (+ optional "+N"); metaleft
-            (project/branch) is the sole shrink valve, so the chip is never
-            clipped mid-glyph. */}
+      </div>
+      <div className="conv-rail-row-stats">
+        {/* #243 — the #243 cap=1 rigid chip (+ optional "+N"). #304 S3 (Codex F4)
+            — an `other` chip's DISPLAY label is bounded (Task 1); the untruncated
+            id rides on `c.full` and is surfaced as the chip's title + accessible
+            name only when it differs (a known family's text IS its name). The pill
+            stays rigid — the bound lives in the label text, honoring #243 (never
+            clip a chip mid-glyph). */}
         {models.chips.length > 0 && (
           <span className="conv-rail-row-model">
-            {models.chips.map((c) => <span key={c.cls} className={`chip ${c.cls}`}>{c.label}</span>)}
+            {models.chips.map((c) => (
+              <span
+                key={c.cls}
+                className={`chip ${c.cls}`}
+                title={c.full !== c.label ? c.full : undefined}
+                aria-label={c.full !== c.label ? c.full : undefined}
+              >{c.label}</span>
+            ))}
             {models.extra > 0 && <span className="conv-rail-row-model-more">+{models.extra}</span>}
           </span>
         )}

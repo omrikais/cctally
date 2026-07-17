@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 
 # --- Version + digest ---
@@ -74,6 +75,7 @@ class ProjectCell:
     MoneyCells (back-compat for every non-budget construction site)."""
     label: str
     rank_cost: float | None = None
+    identity: str | None = None
 
 Cell = TextCell | MoneyCell | PercentCell | DateCell | DeltaCell | ProjectCell
 
@@ -87,6 +89,7 @@ class ColumnSpec:
     align: str = "left"   # "left" | "right" | "center"
     emphasis: bool = False
     kind: str | None = None   # "project" | "model" | None — privacy chokepoint signal
+    project_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,7 @@ class ChartPoint:
     y_value: float
     project_label: str | None = None
     series_key: str | None = None
+    project_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,21 @@ class ShareSnapshot:
     generated_at: datetime
     version: str
     template_id: str | None = None
+    source: Literal["claude", "codex"] = "claude"
+    source_label: str | None = None
+    availability: Literal["ok", "empty", "unavailable"] = "ok"
+    availability_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.source not in {"claude", "codex"}:
+            raise ValueError("share source must be claude or codex")
+        if self.availability not in {"ok", "empty", "unavailable"}:
+            raise ValueError("share availability must be ok, empty, or unavailable")
+        if self.availability == "unavailable":
+            if not self.availability_reason:
+                raise ValueError("unavailable share snapshots require a reason")
+        elif self.availability_reason is not None:
+            raise ValueError("availability reason is only valid for unavailable snapshots")
 
 
 # --- Compose: multi-section stitching (M3.1) ---
@@ -720,10 +739,23 @@ def _render_svg_header(snap: ShareSnapshot, *, palette: dict,
     if snap.subtitle:
         elements.append(svg_text(x, y + 36, snap.subtitle,
                                  font_size=12, fill=palette["muted"]))
+    source_label, availability = _source_chrome(snap)
+    if source_label:
+        source_text = source_label if availability is None else f"{source_label} · {availability}"
+        elements.append(svg_text(x, y + 54, source_text,
+                                 font_size=10, fill=palette["muted"]))
     elements.append(svg_text(x + width, y + 18,
                              _format_generated_at_iso(snap.generated_at),
                              font_size=10, fill=palette["muted"], anchor="end"))
     return svg_group(elements)
+
+
+def _svg_header_height(snap: ShareSnapshot, *, include_chrome: bool) -> float:
+    """Reserve the added source/availability line without perturbing v1 SVGs."""
+    if not include_chrome:
+        return 0.0
+    source_label, _availability = _source_chrome(snap)
+    return _SVG_HEADER_H + (18.0 if source_label else 0.0)
 
 
 def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
@@ -739,6 +771,26 @@ def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
     ])
 
 
+def _source_chrome(snap: ShareSnapshot) -> tuple[str | None, str | None]:
+    """Return privacy-safe provider and availability text for new snapshots.
+
+    The all-default Claude shape deliberately returns no provider line so every
+    existing share artifact remains byte-for-byte unchanged.
+    """
+    show_source = (
+        snap.source != "claude"
+        or snap.source_label is not None
+        or snap.availability != "ok"
+    )
+    label = snap.source_label or ("Claude" if snap.source == "claude" else "Codex")
+    status = (
+        "No data" if snap.availability == "empty" else
+        f"Unavailable: {snap.availability_reason}"
+        if snap.availability == "unavailable" else None
+    )
+    return (label if show_source else None, status)
+
+
 # --- Scrubber ---
 #
 # Anonymization chokepoint (spec Section 5.3 / 7 / 8.4). Operates on a
@@ -751,7 +803,15 @@ def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
 # costs` (gather) and `_apply_anon_mapping` (rewrite) must be extended.
 
 
-def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
+_ProjectAnonKey = tuple[Literal["legacy", "qualified"], str]
+
+
+def _project_anon_key(label: str, identity: str | None) -> _ProjectAnonKey:
+    """Keep opaque qualified keys disjoint from legacy display labels."""
+    return ("qualified", identity) if identity is not None else ("legacy", label)
+
+
+def _collect_project_identity_costs(snap: ShareSnapshot) -> dict[_ProjectAnonKey, float]:
     """Walk rows: for each row containing a ProjectCell, sum MoneyCell values
     in the same row under the project label — unless the ProjectCell carries an
     explicit ``rank_cost``, which takes precedence over the MoneyCell sum (#130).
@@ -759,20 +819,19 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
     Charts also contribute via ChartPoint.project_label + y_value (when y_value
     is in $). For consistency we union both sources; rows take precedence on
     duplicates."""
-    costs: dict[str, float] = {}
+    costs: dict[_ProjectAnonKey, float] = {}
     for row in snap.rows:
-        proj_label: str | None = None
+        project: ProjectCell | None = None
         money = 0.0
-        explicit_rank: float | None = None
         for cell in row.cells.values():
             if isinstance(cell, ProjectCell):
-                proj_label = cell.label
-                explicit_rank = cell.rank_cost
+                project = cell
             elif isinstance(cell, MoneyCell):
                 money += cell.usd
-        if proj_label is not None:
-            contribution = explicit_rank if explicit_rank is not None else money
-            costs[proj_label] = costs.get(proj_label, 0.0) + contribution
+        if project is not None:
+            key = _project_anon_key(project.label, project.identity)
+            contribution = project.rank_cost if project.rank_cost is not None else money
+            costs[key] = costs.get(key, 0.0) + contribution
 
     if snap.chart is not None:
         chart_pts: list[ChartPoint] = []
@@ -792,8 +851,10 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
         # bar charts but may be a ratio for trend charts. Affects sort order of
         # project-N labels, not anonymization correctness.
         for p in chart_pts:
-            if p.project_label and p.project_label not in costs:
-                costs[p.project_label] = p.y_value
+            if p.project_label:
+                key = _project_anon_key(p.project_label, p.project_identity)
+                if key not in costs:
+                    costs[key] = p.y_value
 
     # project-typed columns (cross-tab Detail templates, issue #33). Sum the
     # MoneyCell values for each kind='project' column across all rows; the
@@ -809,32 +870,58 @@ def _collect_project_costs(snap: ShareSnapshot) -> dict[str, float]:
             cell = row.cells.get(col.key)
             if isinstance(cell, MoneyCell):
                 col_total += cell.usd
-        costs[col.label] = costs.get(col.label, 0.0) + col_total
+        key = _project_anon_key(col.label, col.project_identity)
+        costs[key] = costs.get(key, 0.0) + col_total
 
     return costs
 
 
-def _build_anon_mapping(project_costs: dict[str, float]) -> dict[str, str]:
-    """Sort labels by descending cost (lex tie-break); assign project-1, project-2, ...
+def _collect_project_costs(
+    snap: ShareSnapshot,
+) -> dict[_ProjectAnonKey, float] | dict[str, float]:
+    """Return the historical legacy shape unless qualified identity is present.
+
+    The scrubber consumes :func:`_collect_project_identity_costs` directly so
+    its internal keys remain domain tagged. This compatibility facade keeps
+    callers of the older all-``None`` model on their established string-key
+    contract.
+    """
+    costs = _collect_project_identity_costs(snap)
+    if all(domain == "legacy" for domain, _value in costs):
+        return {label: cost for (_domain, label), cost in costs.items()}
+    return costs
+
+
+def _build_anon_mapping(
+    project_costs: dict[_ProjectAnonKey, float] | dict[str, float],
+) -> dict[_ProjectAnonKey, str] | dict[str, str]:
+    """Sort identities by descending cost (lex tie-break); assign project-1, project-2, ...
 
     "(unknown)" is never numbered — keeps its literal label.
     """
+    legacy_input = all(isinstance(key, str) for key in project_costs)
+    normalized: dict[_ProjectAnonKey, float] = {
+        (("legacy", key) if isinstance(key, str) else key): cost
+        for key, cost in project_costs.items()
+    }
     items = [
-        (label, cost)
-        for label, cost in project_costs.items()
-        if label != "(unknown)"
+        (key, cost)
+        for key, cost in normalized.items()
+        if key != ("legacy", "(unknown)")
     ]
     items.sort(key=lambda kv: (-kv[1], kv[0]))
-    mapping: dict[str, str] = {
-        label: f"project-{i + 1}" for i, (label, _cost) in enumerate(items)
+    mapping: dict[_ProjectAnonKey, str] = {
+        key: f"project-{i + 1}" for i, (key, _cost) in enumerate(items)
     }
-    if "(unknown)" in project_costs:
-        mapping["(unknown)"] = "(unknown)"
+    if ("legacy", "(unknown)") in normalized:
+        mapping[("legacy", "(unknown)")] = "(unknown)"
+    if legacy_input:
+        return {key[1]: value for key, value in mapping.items()}
     return mapping
 
 
 def _apply_anon_mapping(
-    snap: ShareSnapshot, mapping: dict[str, str],
+    snap: ShareSnapshot, mapping: dict[_ProjectAnonKey, str] | dict[str, str],
 ) -> ShareSnapshot:
     """Return a new ShareSnapshot with project labels replaced everywhere.
 
@@ -842,13 +929,20 @@ def _apply_anon_mapping(
     (b) ChartPoint.project_label AND .x_label (when x_label == project_label,
     i.e. project-axis charts) on chart.points + multi_series + stacks.
     """
+    tagged_mapping: dict[_ProjectAnonKey, str] = {
+        ("legacy", key) if isinstance(key, str) else key: value
+        for key, value in mapping.items()
+    }
     new_rows: list[Row] = []
     for row in snap.rows:
         new_cells: dict[str, Cell] = {}
         for key, cell in row.cells.items():
-            if isinstance(cell, ProjectCell) and cell.label in mapping:
+            if isinstance(cell, ProjectCell):
+                project_key = _project_anon_key(cell.label, cell.identity)
                 new_cells[key] = ProjectCell(
-                    mapping[cell.label], rank_cost=cell.rank_cost
+                    tagged_mapping.get(project_key, "(unknown)"),
+                    rank_cost=cell.rank_cost,
+                    identity=cell.identity,
                 )
             else:
                 new_cells[key] = cell
@@ -863,7 +957,8 @@ def _apply_anon_mapping(
                 # points after gather) is mapped to "(unknown)" rather than
                 # passed through. Privacy invariant: never leak a non-anonymized
                 # label, even if the gather pass missed it.
-                new_label = mapping.get(p.project_label, "(unknown)")
+                project_key = _project_anon_key(p.project_label, p.project_identity)
+                new_label = tagged_mapping.get(project_key, "(unknown)")
             else:
                 new_label = None
             # x_label rewrite stays guarded — only anonymize if x_label is the
@@ -871,8 +966,8 @@ def _apply_anon_mapping(
             # x_label values like time labels).
             if (p.project_label
                     and p.x_label == p.project_label
-                    and p.x_label in mapping):
-                new_x = mapping[p.x_label]
+                    and project_key in tagged_mapping):
+                new_x = tagged_mapping[project_key]
             else:
                 new_x = p.x_label
             return ChartPoint(
@@ -881,6 +976,7 @@ def _apply_anon_mapping(
                 y_value=p.y_value,
                 project_label=new_label,
                 series_key=p.series_key,
+                project_identity=p.project_identity,
             )
 
         if isinstance(snap.chart, LineChart):
@@ -918,10 +1014,13 @@ def _apply_anon_mapping(
     new_columns: list[ColumnSpec] = []
     for col in snap.columns:
         if col.kind == "project":
-            new_label = mapping.get(col.label, "(unknown)")
+            new_label = tagged_mapping.get(
+                _project_anon_key(col.label, col.project_identity), "(unknown)",
+            )
             new_columns.append(ColumnSpec(
                 key=col.key, label=new_label,
                 align=col.align, emphasis=col.emphasis, kind=col.kind,
+                project_identity=col.project_identity,
             ))
         else:
             new_columns.append(col)
@@ -941,6 +1040,10 @@ def _apply_anon_mapping(
         generated_at=snap.generated_at,
         version=snap.version,
         template_id=snap.template_id,
+        source=snap.source,
+        source_label=snap.source_label,
+        availability=snap.availability,
+        availability_reason=snap.availability_reason,
     )
 
 
@@ -955,7 +1058,7 @@ def _scrub(snap: ShareSnapshot, *, reveal_projects: bool) -> ShareSnapshot:
     """
     if reveal_projects:
         return snap
-    project_costs = _collect_project_costs(snap)
+    project_costs = _collect_project_identity_costs(snap)
     if not project_costs:
         return snap
     mapping = _build_anon_mapping(project_costs)
@@ -974,6 +1077,11 @@ def _render_md_fragment(snap: ShareSnapshot, *, branding: bool) -> str:
     so future surfaces (compose, history) extend it once.
     """
     parts = [f"# {_md_escape(snap.title)}"]
+    source_label, availability = _source_chrome(snap)
+    if source_label:
+        parts.extend(["", f"**{_md_escape(source_label)}**"])
+    if availability:
+        parts.extend(["", _md_escape(availability)])
     if snap.subtitle:
         parts.append(f"_{_md_escape(snap.subtitle)}_")
         parts.append(f"_{_format_generated_at_iso(snap.generated_at)}_")
@@ -1277,10 +1385,11 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
     """
     has_table = include_table and bool(snap.columns)
     chart_h = _SVG_CHART_H if snap.chart is not None else 0
+    header_h = _svg_header_height(snap, include_chrome=include_chrome)
 
     # Pre-layout the table (we need its height before declaring outer SVG height).
     if has_table:
-        table_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0) + chart_h + _SVG_TABLE_GAP
+        table_y = _SVG_PADDING + header_h + chart_h + _SVG_TABLE_GAP
         table_svg, table_h, table_w = _render_svg_table(
             snap, palette=palette, x=_SVG_PADDING, y=table_y, max_width=_SVG_WIDTH,
         )
@@ -1297,7 +1406,7 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
     table_block_h = (_SVG_TABLE_GAP + table_h) if has_table else 0
 
     if include_chrome:
-        height = _SVG_HEADER_H + chart_h + table_block_h + _SVG_FOOTER_H + (_SVG_PADDING * 2)
+        height = header_h + chart_h + table_block_h + _SVG_FOOTER_H + (_SVG_PADDING * 2)
     else:
         height = chart_h + table_block_h + (_SVG_PADDING * 2)
 
@@ -1309,7 +1418,7 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
             x=_SVG_PADDING, y=_SVG_PADDING, width=_SVG_WIDTH,
         ))
 
-    chart_y = _SVG_PADDING + (_SVG_HEADER_H if include_chrome else 0)
+    chart_y = _SVG_PADDING + header_h
     if snap.chart is not None:
         if isinstance(snap.chart, LineChart):
             pieces.append(_render_line_chart_svg(
@@ -1331,7 +1440,7 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
         pieces.append(table_svg)
 
     if include_chrome:
-        footer_y = _SVG_PADDING + _SVG_HEADER_H + chart_h + table_block_h + _SVG_FOOTER_BASELINE
+        footer_y = _SVG_PADDING + header_h + chart_h + table_block_h + _SVG_FOOTER_BASELINE
         pieces.append(_render_svg_footer(
             snap, palette=palette,
             x=_SVG_PADDING, y=footer_y,
@@ -1429,6 +1538,15 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
         if snap.chart is not None else ""
     )
     title_html = f'<h1 style="font-size:20px;color:{palette["fg"]};margin:0">{_xml_escape(snap.title)}</h1>'
+    source_label, availability = _source_chrome(snap)
+    source_html = (
+        f'<div style="font-size:13px;color:{palette["muted"]};margin-top:4px">{_xml_escape(source_label)}</div>'
+        if source_label else ""
+    )
+    availability_html = (
+        f'<div style="font-size:13px;color:{palette["fg"]};margin-top:4px">{_xml_escape(availability)}</div>'
+        if availability else ""
+    )
     subtitle_html = (
         f'<div style="font-size:13px;color:{palette["muted"]};margin-top:4px">{_xml_escape(snap.subtitle)}</div>'
         if snap.subtitle else ""
@@ -1452,7 +1570,7 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
     else:
         footer_html = ""
     return (
-        f'<header>{title_html}{subtitle_html}{timestamp_html}</header>'
+        f'<header>{title_html}{source_html}{availability_html}{subtitle_html}{timestamp_html}</header>'
         f'{chart_html}'
         f'{table_html}'
         f'{footer_html}'

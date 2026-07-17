@@ -3,6 +3,7 @@ import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { resolveVerdict } from '../lib/verdict';
+import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -28,17 +29,10 @@ export function ForecastPanel() {
     <section
       className={`panel accent-purple fc-tile fc-esc-${esc}${hasEdge ? ' fc-accent-edge' : ''}`}
       id="panel-forecast"
-      tabIndex={0}
       role="region"
       aria-label="Forecast panel"
       data-panel-kind="forecast"
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' })}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'forecast' });
-        }
-      }}
+      onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' }))}
     >
       <div className="panel-header">
         <svg className="icon" aria-hidden="true">

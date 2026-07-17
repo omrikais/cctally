@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -23,6 +23,15 @@ import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { openShareModal } from '../store/shareSlice';
 import { HighlightText } from '../lib/highlightText';
+import { rovingAction } from '../lib/sessionsRovingKeyboard';
+import type { SessionRow } from '../types/envelope';
+
+// #299 — the row's focusable per-row controls, in DOM (= visual L→R) order.
+const CONTROL_SELECTOR =
+  '.sess-open-conv, .chip.model-chip, .sess-open-title, .project-cell-link';
+
+// #299 — stable per-row identity for roving-focus tracking; matches the React key.
+const rowKey = (r: SessionRow) => r.session_id || `${r.started_utc}-${r.model}`;
 
 export function SessionsPanel() {
   const env = useSnapshot();
@@ -99,6 +108,85 @@ export function SessionsPanel() {
   const currentSessionId =
     searchIndex >= 0 ? filtered[searchMatches[searchIndex]]?.session_id ?? null : null;
 
+  // #299 roving-tabindex state: the single body tab stop is the ROW keyed by
+  // `activeRowKey` (same identity as the React key). The delegated keydown
+  // handler (below) sets it on Up/Down/Home/End; between keystrokes it survives
+  // re-sort / re-filter because it is keyed by identity, not index.
+  const [activeRowKey, setActiveRowKey] = useState<string | null>(null);
+  // #299 default-landing (P3-G): the current `/`-search match
+  // (searchMatches[searchIndex], already a rendered index) if one exists, else
+  // row 0; -1 (no body stop) only when the list is empty. Re-sort/re-filter or a
+  // search never strands the single tab stop — worst case it falls back to row 0.
+  const searchCurrentIdx = searchIndex >= 0 ? searchMatches[searchIndex] : -1;
+  const activeIdx = activeRowKey
+    ? filtered.findIndex((r) => rowKey(r) === activeRowKey)
+    : -1;
+  const tabStopIdx =
+    filtered.length === 0
+      ? -1
+      : activeIdx >= 0
+        ? activeIdx
+        : searchCurrentIdx >= 0
+          ? searchCurrentIdx
+          : 0;
+
+  // #299 — one delegated keydown on <tbody>. Every keydown from a row or a
+  // nested button bubbles here; context is derived from the event (no separate
+  // cell-focus state → no focus/state desync). Stable identity: reads live DOM
+  // via e.currentTarget/e.target and only touches the module-stable `dispatch`
+  // and `setActiveRowKey`, so [] deps are correct.
+  const onRowsKeyDown = useCallback((e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    // Modifier bail (folded P2-C) — FIRST line: let Shift+Arrow bubble to
+    // PanelHost's panel reorder, and never swallow OS/browser chords.
+    if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+    const targetEl = e.target as HTMLElement;
+    const tr = targetEl.closest('tr.session-row') as HTMLElement | null;
+    if (!tr) return;
+    const tbody = e.currentTarget;
+    const onRow = targetEl === tr;
+    const allControls = Array.from(tr.querySelectorAll<HTMLElement>(CONTROL_SELECTOR));
+    // Confine the cell axis to on-screen controls: `offsetParent === null` drops
+    // a display:none control (the mobile-hidden Project column). jsdom has no
+    // layout (offsetParent is always null), so fall back to the full set when the
+    // filter removes everything — in a real browser the always-present title
+    // button keeps `visible` non-empty, so this fallback only engages under
+    // jsdom. The real display:none exclusion is browser-verified at the ui-qa gate.
+    const visible = allControls.filter((el) => el.offsetParent !== null);
+    const controls = visible.length > 0 ? visible : allControls;
+    const cellIdx = onRow ? -1 : controls.indexOf(targetEl);
+    const action = rovingAction(e.key, { onRow, cellIdx, cellCount: controls.length });
+    if (!action) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (action.kind === 'cell') {
+      controls[action.to]?.focus();
+      return;
+    }
+    if (action.kind === 'rowFocus') {
+      tr.focus();
+      return;
+    }
+    if (action.kind === 'activateRow') {
+      const sid = tr.dataset.sessionId;
+      if (sid) dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: sid });
+      return;
+    }
+    // action.kind === 'row' — resolve + clamp against the rendered rows (no wrap).
+    const len = tbody.children.length;
+    if (len === 0) return;
+    const curIdx = Number(tr.dataset.rowIndex);
+    const target =
+      action.to === 'next' ? Math.min(curIdx + 1, len - 1)
+      : action.to === 'prev' ? Math.max(curIdx - 1, 0)
+      : action.to === 'first' ? 0
+      : len - 1; // 'last'
+    const targetTr = tbody.children[target] as HTMLElement | undefined;
+    if (!targetTr) return;
+    targetTr.focus();
+    targetTr.scrollIntoView({ block: 'nearest' });
+    setActiveRowKey(targetTr.dataset.rowKey ?? null);
+  }, []);
+
   useEffect(() => {
     if (searchIndex < 0) return;
     const renderedIdx = searchMatches[searchIndex];
@@ -114,20 +202,9 @@ export function SessionsPanel() {
     <section
       className={'panel accent-orange' + (collapsed ? ' sessions-collapsed' : '')}
       id="panel-sessions"
-      tabIndex={0}
       role="region"
       aria-label="Recent Sessions panel"
       data-panel-kind="sessions"
-      onKeyDown={(e) => {
-        // Only fire when the section itself is focused — not when activation
-        // bubbles from a control inside SessionsControls (filter/search input,
-        // sort pill, search nav buttons). Matches main's focus-handler scope.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'session' });
-        }
-      }}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div className="panel-title-wrap" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -182,21 +259,31 @@ export function SessionsPanel() {
           // show a loading skeleton rather than an empty table shell.
           <PanelSkeleton lines={4} />
         ) : (
-        <table className="sess-table">
+        <table className="sess-table" role="grid">
           <SortableHeader
             columns={columns}
             override={sessionsOverride}
+            grid
             onChange={(next) =>
               dispatch({ type: 'SET_TABLE_SORT', table: 'sessions', override: next })
             }
           />
-          <tbody id="sess-rows">
-            {filtered.map((r) => {
+          <tbody id="sess-rows" role="rowgroup" onKeyDown={onRowsKeyDown}>
+            {filtered.map((r, i) => {
               const isMatch = r.session_id ? matchedSessionIds.has(r.session_id) : false;
               const isCurrent = !!r.session_id && r.session_id === currentSessionId;
               const chipCls = modelChipClass(r.model);
               const cCls = costClass(r.cost_usd ?? null);
               const chipLabel = r.model ? `Filter by ${r.model}` : 'Filter by model';
+              // Computed once: reused by the Started cell, the Started-cell
+              // folded duration (SESS-1), and the title button's empty-title
+              // fallback aria-label (A11Y-2).
+              const startedShort = fmt.startedShort(r.started_utc, ctx, { noSuffix: true });
+              const titleContent = r.title ? (
+                <HighlightText text={r.title} query={searchText} />
+              ) : (
+                <span className="sess-title-empty" aria-hidden="true">—</span>
+              );
               return (
                 <tr
                   key={r.session_id || `${r.started_utc}-${r.model}`}
@@ -205,8 +292,12 @@ export function SessionsPanel() {
                     + (isMatch ? ' search-match' : '')
                     + (isCurrent ? ' search-match-current' : '')
                   }
+                  role="row"
+                  tabIndex={i === tabStopIdx ? 0 : -1}
                   aria-current={isCurrent ? 'true' : undefined}
                   data-session-id={r.session_id}
+                  data-row-index={i}
+                  data-row-key={rowKey(r)}
                   onClick={() =>
                     r.session_id &&
                     dispatch({
@@ -216,11 +307,12 @@ export function SessionsPanel() {
                     })
                   }
                 >
-                  <td className="started">
+                  <td className="started" role="gridcell">
                     {transcriptsOn && r.session_id && (
                       <button
                         type="button"
                         className="sess-open-conv"
+                        tabIndex={-1}
                         title="Open conversation"
                         aria-label="Open conversation"
                         onClick={(e) => {
@@ -238,17 +330,16 @@ export function SessionsPanel() {
                         </svg>
                       </button>
                     )}
-                    <HighlightText
-                      text={fmt.startedShort(r.started_utc, ctx, { noSuffix: true })}
-                      query={searchText}
-                    />
+                    <HighlightText text={startedShort} query={searchText} />
+                    <span className="dur-fold"> · <HighlightText text={`${r.duration_min}m`} query={searchText} /></span>
                   </td>
-                  <td className="dur"><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
+                  <td className="dur" role="gridcell"><HighlightText text={`${r.duration_min}m`} query={searchText} /></td>
                   {!oneModel && (
-                    <td className="model model-chip-cell" onClick={(e) => e.stopPropagation()}>
+                    <td className="model model-chip-cell" role="gridcell" onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"
                         className={`chip model-chip ${chipCls}`}
+                        tabIndex={-1}
                         aria-label={chipLabel}
                         onClick={() => dispatch({ type: 'SET_FILTER', text: r.model })}
                       >
@@ -256,18 +347,40 @@ export function SessionsPanel() {
                       </button>
                     </td>
                   )}
-                  <td className="session" title={r.title ?? undefined}>
-                    {r.title ? (
-                      <HighlightText text={r.title} query={searchText} />
+                  <td className="session" role="gridcell" title={r.title ?? undefined}>
+                    {r.session_id ? (
+                      <button
+                        type="button"
+                        className="sess-open-title"
+                        tabIndex={-1}
+                        aria-label={
+                          r.title
+                            ? `Open session details: ${r.title}`
+                            : `Open session details, started ${startedShort}`
+                        }
+                        onClick={(e) => {
+                          // stopPropagation so the enclosing <tr> onClick
+                          // doesn't ALSO dispatch (single OPEN_MODAL).
+                          e.stopPropagation();
+                          dispatch({
+                            type: 'OPEN_MODAL',
+                            kind: 'session',
+                            sessionId: r.session_id!,
+                          });
+                        }}
+                      >
+                        {titleContent}
+                      </button>
                     ) : (
-                      <span className="sess-title-empty" aria-hidden="true">—</span>
+                      titleContent
                     )}
                   </td>
-                  <td className="project">
+                  <td className="project" role="gridcell">
                     {r.project_key && r.project_key !== '(unknown)' ? (
                       <button
                         type="button"
                         className="project-cell-link"
+                        tabIndex={-1}
                         title={r.project}
                         aria-label={`Open Projects modal for ${r.project_key}`}
                         onClick={(e) => {
@@ -295,10 +408,10 @@ export function SessionsPanel() {
                       </span>
                     )}
                   </td>
-                  <td className="num cache">
+                  <td className="num cache" role="gridcell">
                     {r.cache_hit_pct == null ? '—' : fmt.pct0(r.cache_hit_pct)}
                   </td>
-                  <td className={`num ${cCls}`}>
+                  <td className={`num ${cCls}`} role="gridcell">
                     <HighlightText text={fmt.usd2(r.cost_usd)} query={searchText} />
                   </td>
                 </tr>

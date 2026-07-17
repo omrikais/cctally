@@ -1,0 +1,35 @@
+---
+title: Token Reuse Report — Claude + Codex
+generated_at: 2026-07-02T12:00:00Z
+period: 2026-07-02T12:00:00Z..2026-07-02T12:00:00Z
+panel: composed
+anonymized: false
+cctally_version: 1.68.0
+---
+
+# Token Reuse Report — Claude + Codex
+
+## Token Reuse Report
+
+# Token Reuse Report
+
+**Claude**
+_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02T12:00:00Z_
+
+| Group | Cached Input | $ Cost |
+|:---|---:|---:|
+| 2026-07-01 | 23.5% | $3.75 |
+
+- **Total:** $3.75
+- **Tokens:** 570
+
+## Token Reuse Report
+
+# Token Reuse Report
+
+**Codex**
+
+Unavailable: Codex qualified project metadata is unavailable.
+_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02T12:00:00Z_

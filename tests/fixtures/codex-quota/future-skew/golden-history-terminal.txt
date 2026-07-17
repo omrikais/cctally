@@ -1,0 +1,3 @@
+Codex quota history · local-rollout
+primary · 1h · root=skew-root · limit=limit-skew
+  2026-07-15T12:05:00Z  30.0%  reset 2026-07-15T15:00:00Z  path eed2b57b56023fc5fdb0d3caa31fd4b7

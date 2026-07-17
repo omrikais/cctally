@@ -30,7 +30,9 @@ def test_kernel_symbols_have_no_shims_in_siblings():
     """
     sym_alt = "|".join(re.escape(s) for s in KERNEL_SYMBOLS)
     shim_pattern = re.compile(rf'sys\.modules\["cctally"\]\.({sym_alt})\b')
-    accessor_pattern = re.compile(rf'\bc\.({sym_alt})\s*\(')
+    accessor_pattern = re.compile(
+        rf'(?:\bc\.|\b_cctally\(\)\.)({sym_alt})\s*\('
+    )
     offenders = []
     for sib in SIBLINGS:
         if sib.name == "_cctally_core.py":

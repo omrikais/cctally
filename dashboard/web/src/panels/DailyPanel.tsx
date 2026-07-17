@@ -117,7 +117,6 @@ export function DailyPanel() {
     <section
       className={'panel accent-indigo' + (collapsed ? ' daily-collapsed' : '')}
       id="panel-daily"
-      tabIndex={0}
       role="region"
       aria-label="Daily heatmap panel"
       data-panel-kind="daily"

@@ -196,11 +196,15 @@ Before merging or releasing v2 changes, run through:
 |---|---|
 | `GET /` | The dashboard HTML |
 | `GET /static/*` | CSS / JS / SVG sprite |
-| `GET /api/data` | One-shot JSON snapshot (curl-friendly) |
+| `GET /api/data` | One-shot JSON snapshot (curl-friendly). It retains the legacy Claude fields and appends source-aware backend fields (`source_schema_version`, `default_source`, `source_order`, `sources`). |
 | `GET /api/events` | SSE stream — full snapshot on every sync tick |
 | `GET /api/session/:id` | Per-session detail (v2) — powers the Sessions modal |
+| `GET /api/source/<source>/<resource>/<opaque-key>` | Bounded provider-owned detail for `source ∈ {claude,codex}` and `resource ∈ {session,project,block}`. Codex reads are relational and `sync=False`; they expose native model/token, project/session, and quota observation/milestone/forecast data without walking rollout files. `all` has no physical details. Invalid/unavailable pairs return `400 source_capability_unavailable`; a valid missing key returns `404 source_resource_not_found`; neither response exposes raw provider identities or exception text. |
+| `POST /api/share/render`, `POST /api/share/compose` | Server-rendered share artifact/composition. Optional backend `source ∈ {claude,codex,all}` is source-bearing in the digest and response; omission remains the legacy Claude contract. Codex report panels use the native share vocabulary and configured calendar-week boundary. `all` composes labelled provider sections rather than blending quota. |
+| `GET`/`POST` `/api/share/presets`, `GET`/`POST`/`DELETE` `/api/share/history` | Saved share recipes persist the backend source; legacy source-less records resolve to Claude on read without being rewritten. |
+| `GET /api/debug/backend` | Loopback-only diagnostic with safe per-source table counts, availability, and opaque data versions. It never returns paths, roots, logical limits, conversation keys, or raw exceptions. |
 | `GET /api/conversations` | Conversation-viewer browse rail — all-history per-session rows with per-session cost. `?sort=` (#217 S4) ∈ `{recent (default), oldest, cost, messages, project}` orders the list; an unknown value falls back to `recent` (the endpoint stays lenient). Optional server-side filter params (`date_from`/`date_to`/`projects`/`cost_min`/`cost_max`/`rebuild_min`); a malformed value is `400`. The `page` object carries an additive `sort_degraded: true` when a `cost`/`project` sort fell back to `recent` order during the brief non-authoritative indexing window (beside `filter_degraded`). See [Rail sort](#rail-sort) and [Browse filters](#browse-filters). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
-| `GET /api/conversations/facets` | Conversation-viewer filter facets — sorted distinct project labels with per-label conversation counts, for the Filters popover's project multi-select. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Browse filters](#browse-filters). |
+| `GET /api/conversations/facets` | Conversation-viewer filter facets — sorted distinct project labels with per-label conversation counts, plus per-model-family session counts (fold-then-count), for the Filters popover's project + model multi-selects. Project counts are a rollup GROUP BY; the model-family counts are an index-only scan of `conversation_messages(model, session_id)` (#301). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Browse filters](#browse-filters). |
 | `GET /api/conversation/<id>` | Conversation-viewer reader — one session's deduped, turn-grouped messages with cost-once. Pages with `?after=<id>` (forward), `?before=<id>` (backward), or `?tail=1` (open at the bottom — the last page in one request), plus `?limit=N` (default `500`, clamped `1`–`1000`); the three cursors are mutually exclusive (supplying more than one is `400`). The `page` object carries `next_after`/`has_more` (more newer turns) and the additive `prev_before`/`has_prev` (more older turns), so a client can page both directions; a stale cursor yields an empty page (never a head/tail re-serve). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Reader pagination](#reader-pagination-217-s2). |
 | `GET /api/conversation/search` | Conversation-viewer cross-session FTS search (`?q=…&kind=…&limit=…&offset=…`; LIKE fallback when FTS5 is unavailable). `kind ∈ {all, prompts, assistant, tools, thinking, title, files}` (default `all`; an unknown value is `400`). `kind=title` searches the AI-generated session titles and returns one session-level hit per match, anchored to the session's first turn. `kind=files` searches the write-class file paths each session edited/created and returns one hit per distinct `(session, file path)`, anchored to that path's most-recent touch. Also accepts the same server-side filter params as the browse rail (`date_from`/`date_to`/`projects`/`cost_min`/`cost_max`/`rebuild_min`), applied as a session-scope restriction across every kind; a malformed filter value is `400`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Search depth](#search-depth-177-s6) and [Browse filters](#browse-filters). |
 | `GET /api/conversation/<id>/find` | Conversation-viewer in-conversation find (#177 S6) — document-ordered rendered-turn anchors for one open session (`?q=…&kind=…`). `kind ∈ {all, prompts, assistant, tools, thinking}` — the cross-session-only `title` and `files` kinds are **not** valid here and return `400`. `?regex=1` / `?case=1` (#217 S4) switch to a physical-row scan (`mode: "regex"` / `"like"`, always `search_depth: "full"`); an invalid regex is pre-validated → `400`, never `500`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Search depth](#search-depth-177-s6). |
@@ -227,6 +231,14 @@ Before merging or releasing v2 changes, run through:
 Sort-pill click (top-right of Sessions panel) cycles the session sort;
 the choice persists in `localStorage`. The Settings overlay (`s`) stores
 the default sort + remembered filter term in the same `localStorage` slot.
+
+### Source-aware backend (S4)
+
+S4 makes the dashboard server publish Claude, Codex, and presentation-only
+`all` states atomically. It does not add a visible source selector: S5 owns the
+React control and browser interaction. Until then, the source-aware endpoints
+above are a backend contract for the dashboard client and integrations; the
+existing dashboard UI remains the established Claude-first surface.
 
 ## Conversation viewer endpoints (Plan 2)
 

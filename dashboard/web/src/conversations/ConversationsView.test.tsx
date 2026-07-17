@@ -34,7 +34,7 @@ import {
 import { openPanelByPosition } from '../lib/openPanelByPosition';
 import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
-import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
+import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY, COMPACT_WORKSPACE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { Envelope, SessionRow } from '../types/envelope';
 
 // #232 — render-all react-virtuoso mock (mirrors ConversationReader.test.tsx).
@@ -149,6 +149,18 @@ const conversationsPage = {
       last_activity_utc: '2026-05-13T09:30:00Z',
       msg_count: 4,
       cost_usd: 1.25,
+      models: ['claude-opus-4'],
+    },
+    // #304 S2 — a second row so a compact pick can click a NON-anchor row. Shares
+    // repo-a so the single-project label suppression is unchanged.
+    {
+      session_id: 'sess-2',
+      project_label: 'repo-a',
+      git_branch: 'main',
+      started_utc: '2026-05-13T08:00:00Z',
+      last_activity_utc: '2026-05-13T08:30:00Z',
+      msg_count: 2,
+      cost_usd: 0.5,
       models: ['claude-opus-4'],
     },
   ],
@@ -272,6 +284,21 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+// four-band resolver (#304 S1): phone ≤640 | compact 641–880 (single-pane) |
+// upperTablet 881–1100 (two-pane + sheet) | wide ≥1101 (column). Per-query so the
+// 640 / 880 / 1100 breakpoints stay independent (stubMobileMedia returns one
+// value for every query and can't model them). Shared by the #228 outline-sheet
+// band tests and the #304 compact-workspace single-pane tests. The compact query
+// matches at phone too (880 ≥ 640), mirroring the real matchMedia.
+function bandResolver(band: 'phone' | 'compact' | 'upperTablet' | 'wide') {
+  return (q: string): boolean => {
+    if (q === MOBILE_MEDIA_QUERY) return band === 'phone';
+    if (q === COMPACT_WORKSPACE_MEDIA_QUERY) return band === 'phone' || band === 'compact';
+    if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+    return false;
+  };
+}
 
 describe('Conversations workspace integration', () => {
   it('1: switcher is shown; clicking Conversations enters the view and renders the rail', async () => {
@@ -886,24 +913,19 @@ describe('Conversations workspace integration', () => {
 
 // #228 S3 F1 — the outline lives as a slide-over SHEET across the whole
 // no-column band (≤1100px, keyed on !useIsWide), not just on mobile (≤640px).
-// The persistent column + resizer render only when wide (≥1101px). These branch
-// tests model the THREE bands distinctly via the per-query matchMedia stub
-// (stubMobileMedia returns one value for all queries, so it can't express the
-// tablet band where useIsMobile=false but useIsWide=false too). The visual
+// The persistent column + resizer render only when wide (≥1101px). #304 S1
+// split the old 641–1100 tablet band in two (single-pane ≤880 / two-pane
+// 881–1100), so these branch tests now use the shared FOUR-band resolver above
+// and probe the UPPER tablet band (881–1100) for the two-pane-with-sheet case
+// (stubMobileMedia returns one value for all queries, so it can't express a
+// band where useIsMobile=false but useIsWide=false too). The visual
 // sheet animation / first-paint is the ui-qa gate; here we pin the DOM branch.
 describe('Conversations outline sheet generalized to the tablet band (#228 S3 F1)', () => {
-  // Build a resolver for the three bands keyed on the project's two media
-  // queries. Tablet band: NOT mobile (≤640 false) AND NOT wide (≥1101 false).
-  function bandResolver(band: 'mobile' | 'tablet' | 'wide') {
-    return (q: string): boolean => {
-      if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
-      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
-      return false;
-    };
-  }
-
-  it('renders the outline SHEET (not the column) in the 641–1100 tablet band', async () => {
-    stubResponsiveMedia(bandResolver('tablet'));
+  // #304 S1 — the two-pane-with-sheet behavior now belongs to the UPPER tablet
+  // band (881–1100); 641–880 became single-pane (see the compact-workspace
+  // describe). Uses the shared four-band module resolver above.
+  it('renders the outline SHEET (not the column) in the 881–1100 upper-tablet band', async () => {
+    stubResponsiveMedia(bandResolver('upperTablet'));
     updateSnapshot(baseEnvelope(true));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
     act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
@@ -936,8 +958,8 @@ describe('Conversations outline sheet generalized to the tablet band (#228 S3 F1
     localStorage.removeItem('cctally.conv.outlineOpen');
   });
 
-  it('crossing from tablet (sheet open) into wide closes the sheet (no resurrect-on-resize)', async () => {
-    const ctl = stubResponsiveMedia(bandResolver('tablet'));
+  it('crossing from upper-tablet (sheet open) into wide closes the sheet (no resurrect-on-resize)', async () => {
+    const ctl = stubResponsiveMedia(bandResolver('upperTablet'));
     updateSnapshot(baseEnvelope(true));
     dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
     act(() => { dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' }); });
@@ -953,6 +975,55 @@ describe('Conversations outline sheet generalized to the tablet band (#228 S3 F1
     act(() => { ctl.set(bandResolver('wide')); });
     expect(getState().convOutlineMobileOpen).toBe(false);
     await waitFor(() => expect(document.querySelector('.conv-outline-sheet')).toBeNull());
+  });
+});
+
+// #304 S1 — the compact-workspace band (641–880) uses single-pane rail/reader
+// navigation (like phones), not the crushed two-pane shell. Upper-tablet
+// (881–1100) keeps two panes. Per-query matchMedia stub so the 880 and 1100
+// breakpoints stay distinct.
+describe('Conversations compact-workspace single-pane band (#304 S1)', () => {
+  it('641–880: selecting a conversation REPLACES the rail with the reader (single-pane)', async () => {
+    stubResponsiveMedia(bandResolver('compact'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('.conv-rail')).not.toBeNull());
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    // Single-pane: reader mounts, rail is gone, Back is present.
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    expect(document.querySelector('.conv-rail')).toBeNull();
+    expect(document.querySelector('.conv-back')).not.toBeNull();
+    // Back returns to the rail.
+    act(() => { (document.querySelector('.conv-back') as HTMLButtonElement).click(); });
+    await waitFor(() => expect(document.querySelector('.conv-rail')).not.toBeNull());
+  });
+
+  it('881–1100: selecting a conversation keeps the rail mounted beside the reader (two-pane)', async () => {
+    stubResponsiveMedia(bandResolver('upperTablet'));
+    updateSnapshot(baseEnvelope(true));
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    expect(document.querySelector('.conv-rail')).not.toBeNull();
+  });
+
+  it('641–880: an open comparison goes full-width (rail hidden)', async () => {
+    stubResponsiveMedia(bandResolver('compact'));
+    updateSnapshot(baseEnvelope(true));
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    await waitFor(() => expect(document.querySelector('.conv-view--compare')).not.toBeNull());
+    expect(document.querySelector('.conv-rail')).toBeNull();
+  });
+
+  it('881–1100: an open comparison keeps the rail beside it', async () => {
+    stubResponsiveMedia(bandResolver('upperTablet'));
+    updateSnapshot(baseEnvelope(true));
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    await waitFor(() => expect(document.querySelector('.conv-view--compare')).not.toBeNull());
+    expect(document.querySelector('.conv-rail')).not.toBeNull();
   });
 });
 
@@ -1014,5 +1085,165 @@ describe('#289 Escape peel — CONVERSATIONS_BINDINGS action matrix', () => {
   it('no selection, no search, no compare → leaves to the dashboard', () => {
     escapeAction();
     expect(getState().view).toBe('dashboard');
+  });
+});
+
+// #304 S2 — compact comparison pick flow (spec §1). The view-layer gate makes
+// the rail (with its pick banner) the visible pane whenever comparePick is
+// set, so the F2 five-step dead end is structurally impossible.
+describe('#304 S2 compact comparison pick flow', () => {
+  async function openCompactReader(): Promise<void> {
+    stubResponsiveMedia(bandResolver('compact'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+  }
+
+  it('⋯ → Compare with… swaps the reader for the rail in pick mode, anchor retained', async () => {
+    await openCompactReader();
+    fireEvent.click(document.querySelector('.conv-overflow-toggle') as HTMLButtonElement);
+    fireEvent.click(screen.getByRole('menuitem', { name: /compare with/i }));
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    expect(document.querySelector('.conv-reader')).toBeNull();      // single-pane: rail took over
+    expect(document.querySelector('.conv-back')).toBeNull();        // no Back in pick mode
+    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });
+    expect(getState().selectedConversationId).toBe('sess-1');       // anchor retained
+  });
+
+  it('full chain: pick a non-anchor row → comparison → swap → close → Back to rail', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    const rows = Array.from(document.querySelectorAll<HTMLButtonElement>('.conv-rail-row'));
+    const target = rows.find((r) => !r.disabled)!;                  // anchor row is disabled
+    fireEvent.click(target);
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+    expect(getState().compare).toEqual({ a: 'sess-1', b: 'sess-2' });
+    expect(document.querySelector('.conv-rail')).toBeNull();        // full-width compact comparison
+    fireEvent.click(screen.getByRole('button', { name: /swap the two sessions/i }));
+    expect(getState().compare).toEqual({ a: 'sess-2', b: 'sess-1' });
+    fireEvent.click(screen.getByRole('button', { name: /close comparison/i }));
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    expect(getState().selectedConversationId).toBe('sess-1');       // anchor reader is back
+    act(() => { (document.querySelector('.conv-back') as HTMLButtonElement).click(); });
+    await waitFor(() => expect(document.querySelector('.conv-rail')).not.toBeNull());
+    expect(document.querySelector('.conv-rail-pickbanner')).toBeNull(); // Back leaves no stale pick
+  });
+
+  it('banner Cancel returns to the anchor reader (pick cleared, selection kept)', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: /cancel comparison pick/i }));
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    expect(getState().comparePick).toBeNull();
+    expect(getState().selectedConversationId).toBe('sess-1');
+  });
+
+  it('Escape cancels pick back to the anchor reader (rail capture listener)', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    expect(getState().comparePick).toBeNull();
+    expect(getState().selectedConversationId).toBe('sess-1');
+  });
+
+  it("'/' during pick focuses the rail search, never the (unmounted) reader find", async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    fireEvent.keyDown(document, { key: '/' });
+    expect(getState().convFindOpen).toBe(false);
+    expect(document.activeElement).toBe(document.querySelector('.conv-rail-search input'));
+  });
+
+  it('881–1100 two-pane pick is unchanged: rail shows the banner beside the reader', async () => {
+    stubResponsiveMedia(bandResolver('upperTablet'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    expect(document.querySelector('.conv-reader')).not.toBeNull();  // reader stays mounted
+  });
+
+  it('compact entry steals stranded focus to the banner Cancel', async () => {
+    await openCompactReader();
+    fireEvent.click(document.querySelector('.conv-overflow-toggle') as HTMLButtonElement);
+    fireEvent.click(screen.getByRole('menuitem', { name: /compare with/i }));
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    // The ⋯ trigger the menu refocused has unmounted with the reader — the
+    // rail's entry effect must move the stranded focus onto Cancel.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(document.querySelector('.conv-rail-pickcancel')));
+  });
+
+  it('desktop (two-pane) entry does NOT steal focus from the compare trigger', async () => {
+    stubResponsiveMedia(bandResolver('wide'));
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    render(<App />);
+    act(() => { dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' }); });
+    await waitFor(() => expect(document.getElementById('conv-compare-with')).not.toBeNull());
+    (document.getElementById('conv-compare-with') as HTMLButtonElement).focus();
+    fireEvent.click(document.getElementById('conv-compare-with') as HTMLButtonElement);
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    expect(document.activeElement).toBe(document.getElementById('conv-compare-with'));
+  });
+
+  it('compact cancel lands focus on the compact ⋯ toggle once the reader is back', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: /cancel comparison pick/i }));
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    await waitFor(() => {
+      expect(document.activeElement).toBe(document.querySelector('.conv-overflow-toggle'));
+      expect(getState().compareCloseFocusPending).toBe(false);      // consumed
+    });
+  });
+
+  it('compact comparison ✕ Close lands focus on the ⋯ toggle too', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' }); });
+    await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: /close comparison/i }));
+    await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(document.querySelector('.conv-overflow-toggle')));
+  });
+
+  it('Escape in the focused search input clears the needle, NOT the pick', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    const input = document.querySelector('.conv-rail-search-input') as HTMLInputElement;
+    fireEvent.focus(input);                                  // SET_INPUT_MODE 'search'
+    fireEvent.change(input, { target: { value: 'abc' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });   // pick survives
+    expect(getState().conversationSearch).toBe('');                 // input handled its Esc
+    fireEvent.blur(input);                                   // (the real handler blurs; JSDOM needs the explicit event)
+    fireEvent.keyDown(document, { key: 'Escape' });          // next Esc cancels the pick
+    expect(getState().comparePick).toBeNull();
+  });
+
+  it('Escape with the filters popover open closes the popover, NOT the pick', async () => {
+    await openCompactReader();
+    act(() => { dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-1' }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
+    act(() => { dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true }); });
+    await waitFor(() => expect(document.querySelector('.conv-rail-filters')).not.toBeNull());
+    fireEvent.keyDown(document.querySelector('.conv-rail-filters') as HTMLElement, { key: 'Escape' });
+    expect(getState().convFiltersOpen).toBe(false);
+    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });   // pick survives
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().comparePick).toBeNull();
   });
 });

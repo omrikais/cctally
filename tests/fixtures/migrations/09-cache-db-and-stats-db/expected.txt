@@ -1,5 +1,5 @@
 ## stdout
-stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
+stats.db (<HOME>/.local/share/cctally/stats.db)  version 14 / 14 known
   ✓ 001_five_hour_block_models_backfill_v1         applied <REDACTED>
   ✓ 002_five_hour_block_projects_backfill_v1       applied <REDACTED>
   ✓ 003_merge_5h_block_duplicates_v1               applied <REDACTED>
@@ -12,9 +12,10 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 13 / 13 known
   ✓ 010_recompute_percent_milestones_dedup_fix     applied <REDACTED>
   ✓ 011_budget_milestone_period_keys               applied <REDACTED>
   ✓ 012_unify_budget_milestones_vendor             applied <REDACTED>
-  ✓ 013_test_failure_injection                     applied <REDACTED>
+  ✓ 013_codex_quota_projection_state               applied <REDACTED>
+  ✓ 014_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 22 / 22 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 25 / 25 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -36,14 +37,17 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 22 / 22 known
   ✓ 019_create_conversation_file_touches           applied <REDACTED>
   ✓ 020_session_entries_physical_unique            applied <REDACTED>
   ✓ 021_index_conversation_messages_cwd            applied <REDACTED>
-  ✓ 022_test_cache_migration                       applied <REDACTED>
+  ✓ 022_index_conversation_messages_model          applied <REDACTED>
+  ✓ 023_conversation_sessions_enrichment_columns   applied <REDACTED>
+  ✓ 024_codex_fused_ingest_rebuild                 applied <REDACTED>
+  ✓ 025_test_cache_migration                       applied <REDACTED>
 ## stderr
 
 ## exit
 0
 ## state
 stats.db:
-  user_version: 13
+  user_version: 14
   schema_migrations:
     001_five_hour_block_models_backfill_v1
     002_five_hour_block_projects_backfill_v1
@@ -57,10 +61,11 @@ stats.db:
     010_recompute_percent_milestones_dedup_fix
     011_budget_milestone_period_keys
     012_unify_budget_milestones_vendor
-    013_test_failure_injection
+    013_codex_quota_projection_state
+    014_test_failure_injection
   schema_migrations_skipped:
 cache.db:
-  user_version: 22
+  user_version: 25
   schema_migrations:
     001_dedup_highest_wins
     002_conversation_messages_backfill
@@ -83,7 +88,10 @@ cache.db:
     019_create_conversation_file_touches
     020_session_entries_physical_unique
     021_index_conversation_messages_cwd
-    022_test_cache_migration
+    022_index_conversation_messages_model
+    023_conversation_sessions_enrichment_columns
+    024_codex_fused_ingest_rebuild
+    025_test_cache_migration
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>

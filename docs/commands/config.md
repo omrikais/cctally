@@ -22,6 +22,12 @@ cctally config unset <key>
 | `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`) | `local` |
 | `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. See [Alerts dispatch keys](#alerts-dispatch-keys). | `auto` |
 | `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. See [Alerts dispatch keys](#alerts-dispatch-keys). | `null` |
+| `budget.codex` | Whole Codex budget object, or `null` for no Codex budget. This compatibility key remains round-trippable; the leaf keys below are preferred for partial edits. | `null` |
+| `budget.codex.amount_usd` | Finite decimal strictly greater than zero. Writing it creates a missing Codex block with every default below. Unsetting it removes the whole Codex block. | `null` |
+| `budget.codex.period` | `calendar-week` or `calendar-month`; Codex never uses `subscription-week`. | `calendar-month` |
+| `budget.codex.alerts_enabled` | Boolean (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`). | `false` |
+| `budget.codex.alert_thresholds` | Comma-separated base-10 integers in `[1,100]`; values are sorted/deduplicated and an empty string means `[]`. | `90,100` |
+| `budget.codex.projected_enabled` | Boolean controlling the Codex projected-budget alert. | `false` |
 
 ## Examples
 
@@ -35,6 +41,36 @@ cctally config get display.tz
 
 cctally config unset display.tz
 ```
+
+## Codex budget leaf writes
+
+The five `budget.codex.*` leaves share the whole-object validator. A first
+`amount_usd` write creates a complete block with `calendar-month`, disabled
+alerts, `90,100` thresholds, and disabled projected alerts; setting any other
+leaf before an amount exists exits 2. Each successful leaf write is a locked,
+validated nested merge and, while a budget remains configured, performs the
+same one forward-only Codex budget reconciliation as the whole-object write.
+
+```bash
+cctally config set budget.codex.amount_usd 200
+# budget.codex.amount_usd=200
+cctally config set budget.codex.period calendar-week
+cctally config set budget.codex.alert_thresholds 100,90,90
+# budget.codex.alert_thresholds=90,100
+cctally config get budget.codex.period --json
+# {"budget":{"codex":{"period":"calendar-week"}}}
+```
+
+Human `get` prints the canonical `dotted.key=value`; JSON is the existing
+unversioned nested CRUD echo, not a schema-stamped analytics envelope. Unknown
+leaves, invalid values, or a malformed existing `budget.codex` object exit 2
+without mutation. `unset` is idempotent and silent: unsetting `amount_usd`
+removes the block; unsetting any optional leaf restores its default while
+preserving the amount and other leaves.
+
+Provider selection is intentionally **not** a config leaf. Use the per-command
+`--source {claude,codex,all}` flag or the fixed `cctally claude|codex` subgroup
+forms; `claude` remains the default.
 
 ## Alerts dispatch keys
 

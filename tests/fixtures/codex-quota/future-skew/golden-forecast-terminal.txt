@@ -1,0 +1,2 @@
+Codex quota forecast · local-rollout
+primary · 1h · root=skew-root · limit=limit-skew · unavailable

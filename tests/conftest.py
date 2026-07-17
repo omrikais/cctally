@@ -357,6 +357,13 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "HOOK_TICK_LOG_ROTATED_PATH": share / "logs" / "hook-tick.log.1",
         "HOOK_TICK_THROTTLE_PATH": share / "hook-tick.last-fetch",
         "HOOK_TICK_THROTTLE_LOCK_PATH": share / "hook-tick.last-fetch.lock",
+        # Statusline usage-persistence markers + lock (spec 2026-07-17).
+        # Pinned so a persist/backoff write during any test lands in the
+        # per-test tmp APP_DIR, never the developer's real prod data dir.
+        "STATUSLINE_OBSERVE_MARKER_PATH": share / "statusline-observe.last",
+        "STATUSLINE_PERSIST_LOCK_PATH": share / "statusline-persist.lock",
+        "OAUTH_BACKOFF_MARKER_PATH": share / "oauth-backoff.until",
+        "OAUTH_BACKOFF_COUNT_PATH": share / "oauth-backoff.count",
         "UPDATE_STATE_PATH": share / "update-state.json",
         "UPDATE_SUPPRESS_PATH": share / "update-suppress.json",
         "UPDATE_LOCK_PATH": share / "update.lock",

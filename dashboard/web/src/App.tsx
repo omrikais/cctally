@@ -19,6 +19,8 @@ import { deriveAppState } from './lib/appState';
 import { ConnectionBanner } from './components/ConnectionBanner';
 import { SkeletonGrid } from './components/SkeletonGrid';
 import { CARD_LAYOUT } from './lib/panelIds';
+import { useBoardMode } from './hooks/useBoardMode';
+import { BoardModeContext } from './lib/boardModeContext';
 
 export function App() {
   // Stable items array for the sortable grid. dnd-kit's rectSortingStrategy
@@ -44,6 +46,12 @@ export function App() {
   const env = useSnapshot();
   const { disconnected, bootstrapError } = useConnectionStatus();
   const appState = deriveAppState(env, bootstrapError);
+  // #293 S1 — resolve the responsive board mode ONCE here and thread it into
+  // both the live grid (PanelHost data-span) and the loading skeleton, so we
+  // never register ~22 duplicate MediaQueryList listeners and the load→ready
+  // swap can't reflow. The mode also stamps `data-board-mode` on .dash-grid
+  // for the one CSS dense-flow rule (intermediate tall-row determinism).
+  const boardModeValue = useBoardMode();
   // Bento partition (#264 S1) — split panelOrder into the three height-class
   // rows by CARD_LAYOUT[id].row. Memoized on the store-stable `panelOrder`
   // reference so an SSE tick mid-drag (App re-renders on every snapshot)
@@ -74,7 +82,7 @@ export function App() {
         {view === 'conversations' ? (
           <ConversationsView />
         ) : appState === 'loading' ? (
-          <SkeletonGrid />
+          <SkeletonGrid mode={boardModeValue} />
         ) : appState === 'error' ? (
           <ConnectionBanner kind="error" />
         ) : (
@@ -88,23 +96,30 @@ export function App() {
                 index are memoized above (drag-stable). Each row is its own
                 DndContext so a pointer drag can't cross height classes. The
                 stale-dim class lives on the .dash-grid wrapper. */}
-            <div className={`dash-grid${disconnected ? ' is-stale' : ''}`}>
-              <PanelGridDnd items={tall} className="bento-row row-tall">
-                {tall.map((id) => (
-                  <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
-                ))}
-              </PanelGridDnd>
-              <PanelGridDnd items={medium} className="bento-row row-medium">
-                {medium.map((id) => (
-                  <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
-                ))}
-              </PanelGridDnd>
-              <PanelGridDnd items={short} className="bento-row row-short">
-                {short.map((id) => (
-                  <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} />
-                ))}
-              </PanelGridDnd>
-            </div>
+            {/* #293 S3 — provide the ONE resolved board mode to every panel so
+                stacked Weekly/Monthly slice their summary window via
+                useContext(BoardModeContext) instead of a second useBoardMode()
+                call (no duplicate matchMedia listeners, no transient
+                slice-vs-grid disagreement on resize). */}
+            <BoardModeContext.Provider value={boardModeValue}>
+              <div className={`dash-grid${disconnected ? ' is-stale' : ''}`} data-board-mode={boardModeValue}>
+                <PanelGridDnd items={tall} className="bento-row row-tall">
+                  {tall.map((id) => (
+                    <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} mode={boardModeValue} />
+                  ))}
+                </PanelGridDnd>
+                <PanelGridDnd items={medium} className="bento-row row-medium">
+                  {medium.map((id) => (
+                    <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} mode={boardModeValue} />
+                  ))}
+                </PanelGridDnd>
+                <PanelGridDnd items={short} className="bento-row row-short">
+                  {short.map((id) => (
+                    <PanelHost key={id} id={id} index={globalIndex.get(id) ?? 0} mode={boardModeValue} />
+                  ))}
+                </PanelGridDnd>
+              </div>
+            </BoardModeContext.Provider>
           </>
         )}
       </main>

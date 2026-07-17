@@ -6,6 +6,15 @@ offline.
 
 > Canonical form: [`cctally codex daily`](codex.md) (this flat form remains as an alias).
 
+## Config and sharing
+
+`codex-daily` keeps its established daily accounting output and accepts
+`--config PATH` as a read-only per-invocation config path. It also accepts the
+shared `--format {md,html,svg}`, `--theme`, `--no-branding`, `--output`,
+`--copy`, and `--open` flags. Without `--format`, legacy terminal, JSON, and
+empty output remain unchanged. A Codex share artifact visibly identifies Codex
+and still requires a privacy review before distribution; see [share.md](share.md).
+
 ## Synopsis
 
 ```

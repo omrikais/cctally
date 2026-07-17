@@ -66,6 +66,8 @@
     "cache_failure_markers": true,
     "live_tail": true
   },
+  "data_version": "__VER__",
+  "default_source": "claude",
   "display": {
     "offset_label": "UTC",
     "offset_seconds": 0,
@@ -118,6 +120,486 @@
     "rows": [],
     "sort_key": "started_desc",
     "total": 0
+  },
+  "source_order": [
+    "claude",
+    "codex",
+    "all"
+  ],
+  "source_schema_version": 1,
+  "sources": {
+    "all": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native-union",
+          "status": "derived"
+        },
+        "budget": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        },
+        "hero": {
+          "semantics": "compatible-provider-totals",
+          "status": "derived"
+        },
+        "quota": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "combined": {
+          "cost_usd": 0.0,
+          "total_tokens": 0
+        },
+        "providers": {
+          "claude": {
+            "alerts": {
+              "rows": []
+            },
+            "budget": {
+              "forecast": null,
+              "settings": {
+                "budget_enabled": false,
+                "budget_thresholds": [
+                  90,
+                  100
+                ],
+                "command_configured": false,
+                "enabled": false,
+                "five_hour_thresholds": [
+                  90,
+                  95
+                ],
+                "notifier": "auto",
+                "project_alerts_enabled": false,
+                "projected_budget_enabled": false,
+                "projected_weekly_enabled": false,
+                "weekly_thresholds": [
+                  90,
+                  95
+                ]
+              }
+            },
+            "hero": {
+              "cost_usd": 0.0,
+              "current_week": {},
+              "forecast": null,
+              "header": {
+                "dollar_per_pct": null,
+                "five_hour_pct": null,
+                "forecast_pct": null,
+                "forecast_verdict": null,
+                "used_pct": null,
+                "vs_last_week_delta": null,
+                "week_label": null
+              },
+              "total_tokens": 0,
+              "trend": null
+            },
+            "periods": {
+              "daily": {
+                "peak": null,
+                "quantile_thresholds": [],
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "monthly": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "weekly": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "current_week": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "week_label": "wk Apr 20",
+                "week_start_at": "2026-04-20T00:00:00Z",
+                "week_start_date": "2026-04-20"
+              },
+              "rows": [],
+              "trend": {
+                "projects": [],
+                "weeks": [
+                  {
+                    "total_cost_usd": 0.0,
+                    "total_pct": null,
+                    "week_label": "wk Apr 20",
+                    "week_start_date": "2026-04-20"
+                  }
+                ],
+                "window_weeks": 1
+              }
+            },
+            "quota": {
+              "blocks": [],
+              "current_week": {},
+              "five_hour_milestones": [],
+              "milestones": []
+            },
+            "sessions": {
+              "rows": [],
+              "sort_key": "started_desc",
+              "total": 0
+            }
+          },
+          "codex": {
+            "alerts": {
+              "rows": []
+            },
+            "budget": {
+              "milestones": [],
+              "projected": [],
+              "status": null
+            },
+            "hero": {
+              "alerts": {
+                "count": 0
+              },
+              "budget": null,
+              "cached_input_tokens": 0,
+              "cost_usd": 0.0,
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "quota": {
+                "active": [],
+                "active_window_count": 0,
+                "freshness": "unavailable",
+                "latest_percent": null,
+                "window_count": 0
+              },
+              "reasoning_output_tokens": 0,
+              "total_tokens": 0
+            },
+            "periods": {
+              "daily": {
+                "display_tz": "Etc/UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "monthly": {
+                "display_tz": "Etc/UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "weekly": {
+                "display_tz": "Etc/UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "rows": [],
+              "total_cost_usd": 0.0,
+              "total_tokens": 0
+            },
+            "quota": {
+              "blocks": [],
+              "histories": [],
+              "milestones": [],
+              "summary": {
+                "active": [],
+                "active_window_count": 0,
+                "freshness": "unavailable",
+                "latest_percent": null,
+                "window_count": 0
+              }
+            },
+            "sessions": {
+              "rows": [],
+              "total_cost_usd": 0.0,
+              "total_sessions": 0,
+              "total_tokens": 0
+            }
+          }
+        }
+      },
+      "data_version": "__VER__",
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": []
+    },
+    "claude": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "sessions": {
+          "semantics": "legacy-session-rollup",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "budget": {
+          "forecast": null,
+          "settings": {
+            "budget_enabled": false,
+            "budget_thresholds": [
+              90,
+              100
+            ],
+            "command_configured": false,
+            "enabled": false,
+            "five_hour_thresholds": [
+              90,
+              95
+            ],
+            "notifier": "auto",
+            "project_alerts_enabled": false,
+            "projected_budget_enabled": false,
+            "projected_weekly_enabled": false,
+            "weekly_thresholds": [
+              90,
+              95
+            ]
+          }
+        },
+        "hero": {
+          "cost_usd": 0.0,
+          "current_week": {},
+          "forecast": null,
+          "header": {
+            "dollar_per_pct": null,
+            "five_hour_pct": null,
+            "forecast_pct": null,
+            "forecast_verdict": null,
+            "used_pct": null,
+            "vs_last_week_delta": null,
+            "week_label": null
+          },
+          "total_tokens": 0,
+          "trend": null
+        },
+        "periods": {
+          "daily": {
+            "peak": null,
+            "quantile_thresholds": [],
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "monthly": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "weekly": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "current_week": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "week_label": "wk Apr 20",
+            "week_start_at": "2026-04-20T00:00:00Z",
+            "week_start_date": "2026-04-20"
+          },
+          "rows": [],
+          "trend": {
+            "projects": [],
+            "weeks": [
+              {
+                "total_cost_usd": 0.0,
+                "total_pct": null,
+                "week_label": "wk Apr 20",
+                "week_start_date": "2026-04-20"
+              }
+            ],
+            "window_weeks": 1
+          }
+        },
+        "quota": {
+          "blocks": [],
+          "current_week": {},
+          "five_hour_milestones": [],
+          "milestones": []
+        },
+        "sessions": {
+          "rows": [],
+          "sort_key": "started_desc",
+          "total": 0
+        }
+      },
+      "data_version": "__VER__",
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": []
+    },
+    "codex": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "calendar-period",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "inclusive-input-token-reuse",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "calendar-accounting",
+          "status": "supported"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "qualified-attribution",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "native-windows",
+          "status": "derived"
+        },
+        "sessions": {
+          "semantics": "inclusive-input-tokens",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "calendar-week",
+          "status": "supported"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "budget": {
+          "milestones": [],
+          "projected": [],
+          "status": null
+        },
+        "hero": {
+          "alerts": {
+            "count": 0
+          },
+          "budget": null,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "quota": {
+            "active": [],
+            "active_window_count": 0,
+            "freshness": "unavailable",
+            "latest_percent": null,
+            "window_count": 0
+          },
+          "reasoning_output_tokens": 0,
+          "total_tokens": 0
+        },
+        "periods": {
+          "daily": {
+            "display_tz": "Etc/UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "monthly": {
+            "display_tz": "Etc/UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "weekly": {
+            "display_tz": "Etc/UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "rows": [],
+          "total_cost_usd": 0.0,
+          "total_tokens": 0
+        },
+        "quota": {
+          "blocks": [],
+          "histories": [],
+          "milestones": [],
+          "summary": {
+            "active": [],
+            "active_window_count": 0,
+            "freshness": "unavailable",
+            "latest_percent": null,
+            "window_count": 0
+          }
+        },
+        "sessions": {
+          "rows": [],
+          "total_cost_usd": 0.0,
+          "total_sessions": 0,
+          "total_tokens": 0
+        }
+      },
+      "data_version": "__VER__",
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": []
+    }
   },
   "sync_age_s": null,
   "transcriptsEnabled": true,

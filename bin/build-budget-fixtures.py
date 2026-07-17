@@ -181,7 +181,10 @@ def _seed_codex_entries(cache_conn, *, anchor: dt.datetime, n: int) -> None:
     for j in range(n):
         seed_codex_session_entry(
             cache_conn,
-            source_path=f"/fx/codex-budget-{j}.jsonl",
+            # Baked fixture rows intentionally have no discoverable source-file
+            # parent. Keep their path relative so Codex sync preserves this
+            # fixture-only carve-out while pruning stale real absolute paths.
+            source_path=f"fixtures/budget/codex-budget-{j}.jsonl",
             line_offset=j,
             timestamp_utc=_iso(anchor),
             session_id=f"cx-s{j}",

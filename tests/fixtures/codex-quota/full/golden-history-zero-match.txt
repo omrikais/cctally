@@ -1,0 +1,4 @@
+cctally codex quota: no quota identity matches the exact selectors; candidates:
+  root-key=root-a limit-key=limit-primary
+  root-key=root-a limit-key=limit-secondary
+  root-key=root-b limit-key=limit-primary

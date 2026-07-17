@@ -918,13 +918,13 @@ def _resolve_cache_report_window(
     return since, until
 
 
-def _emit_cache_report_json(
+def _cache_report_json_payload(
     rows: list["crk.CacheRow"],
     mode: str,
     *,
     now_utc: dt.datetime | None = None,
-) -> str:
-    """Serialize rows + totals to JSON matching the spec schema.
+) -> dict[str, Any]:
+    """Build rows + totals matching the cache-report JSON schema.
 
     Daily mode keeps the top-level `days` key and per-row `totalCost` /
     totals.totalCost aliases for backward compat. Session mode uses
@@ -1010,7 +1010,19 @@ def _emit_cache_report_json(
         for row_dict in output[top_key]:
             row_dict["totalCost"] = row_dict["cost"]
         output["totals"]["totalCost"] = output["totals"]["cost"]
-    return json.dumps(_cctally().stamp_schema_version(output), indent=2)
+    return _cctally().stamp_schema_version(output)
+
+
+def _emit_cache_report_json(
+    rows: list["crk.CacheRow"],
+    mode: str,
+    *,
+    now_utc: dt.datetime | None = None,
+) -> str:
+    """Serialize :func:`_cache_report_json_payload` without changing bytes."""
+    return json.dumps(
+        _cache_report_json_payload(rows, mode, now_utc=now_utc), indent=2,
+    )
 
 
 def _build_cache_report_title(args: argparse.Namespace, mode: str) -> str:
@@ -1094,6 +1106,7 @@ def _sort_cache_rows(
 
 def cmd_cache_report(args: argparse.Namespace) -> int:
     c = _cctally()
+    c._share_validate_args(args)
     config = c._load_claude_config_for_args(args)
     # Session A (spec §7.2): bridge -z/--timezone into args.tz so the
     # existing resolve_display_tz precedence absorbs the new alias. The
@@ -1140,12 +1153,15 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
     if since == until:
         if args.json:
-            print(json.dumps(
-                c.stamp_schema_version(
-                    {top_key: [], "totals": None,
-                     "generatedAt": now_utc_iso(now_utc=now_utc)}),
-                indent=2,
-            ))
+            payload = c.stamp_schema_version(
+                {top_key: [], "totals": None,
+                 "generatedAt": now_utc_iso(now_utc=now_utc)}
+            )
+            sink = getattr(args, "_source_result_sink", None)
+            if sink is not None:
+                sink(payload)
+            else:
+                print(json.dumps(payload, indent=2))
         else:
             print("(no cache activity in window)")
         return 0
@@ -1163,12 +1179,15 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
     if not rows:
         if args.json:
-            print(json.dumps(
-                c.stamp_schema_version(
-                    {top_key: [], "totals": None,
-                     "generatedAt": now_utc_iso(now_utc=now_utc)}),
-                indent=2,
-            ))
+            payload = c.stamp_schema_version(
+                {top_key: [], "totals": None,
+                 "generatedAt": now_utc_iso(now_utc=now_utc)}
+            )
+            sink = getattr(args, "_source_result_sink", None)
+            if sink is not None:
+                sink(payload)
+            else:
+                print(json.dumps(payload, indent=2))
         else:
             print("(no cache activity in window)")
         return 0
@@ -1186,7 +1205,12 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
     _sort_cache_rows(rows, resolved_sort, mode)
 
     if args.json:
-        print(_emit_cache_report_json(rows, mode, now_utc=now_utc))
+        payload = _cache_report_json_payload(rows, mode, now_utc=now_utc)
+        sink = getattr(args, "_source_result_sink", None)
+        if sink is not None:
+            sink(payload)
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
 
     title = _build_cache_report_title(args, mode)

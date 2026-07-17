@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { revalToken } from '../lib/revalToken';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
 import { filterParams } from './conversationFilterParams';
 import type { ConversationSummary, ConversationsPage } from '../types/conversation';
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
-// FIRST page on every SSE tick (the list shifts as new sessions ingest)
-// — stale-while-revalidate: rows stay mounted across the refetch — but
-// ONLY while the user is still on page 1. Once they've paged (a tail
-// beyond PAGE accumulated, or a loadMore is in flight), the tick reload
+// FIRST page when the shared change signal (`revalToken(env)` — the
+// all-inputs `data_version`, falling back to `generated_at` on a server
+// without the field) changes, per #305 — NOT on every 5s SSE heartbeat, so a
+// finished/static rail refetches once and stays quiet until the underlying
+// data actually changes — stale-while-revalidate: rows stay mounted across
+// the refetch — but ONLY while the user is still on page 1. Once they've paged
+// (a tail beyond PAGE accumulated, or a loadMore is in flight), the reload
 // is suppressed so it can't clobber the accumulated tail or rewind the
 // cursor; a fresh page-1 load only happens on remount. loadMore()
 // appends. #217 S4 / I-2.3 — the sort key is read from the store
@@ -17,12 +21,13 @@ import type { ConversationSummary, ConversationsPage } from '../types/conversati
 // sort OR filter change resets the offset and invalidates in-flight appends
 // via ONE combined `{filters, sort}` generation token.
 //
-// Visibility-gating (spec §4): the per-tick page-1 revalidation is skipped
-// while the tab is hidden (a backgrounded reader idle for hours otherwise
-// re-issues the rail query on every 5s SSE tick, forever). On the
-// hidden→visible transition exactly one refetch fires so a freshly-revealed
-// tab is current immediately rather than up to 5s stale. The SSE stream
-// itself (/api/events) is never gated — only the rail's page-1 refetch is.
+// Visibility-gating (spec §4): the page-1 revalidation is skipped while the tab
+// is hidden (a backgrounded reader idle for hours otherwise re-issues the rail
+// query on every change signal — and, on the `generated_at` fallback path, on
+// every 5s SSE tick, forever). On the hidden→visible transition exactly one
+// refetch fires so a freshly-revealed tab is current immediately rather than
+// stale. The SSE stream itself (/api/events) is never gated — only the rail's
+// page-1 refetch is.
 export interface UseConversations {
   rows: ConversationSummary[];
   loading: boolean;
@@ -66,7 +71,7 @@ export function useConversations(): UseConversations {
   const sortRef = useRef(sort);
   sortRef.current = sort;
   const env = useSnapshot();
-  const generatedAt = env?.generated_at ?? '';
+  const revalTok = revalToken(env);
   // Sync in-flight guard (loadingMoreRef) gates re-entrancy + the page-1
   // revalidation suppression; the loadingMore STATE drives the rail's Load-more
   // disabled/loading affordance (#217 S3 E10#7). Two surfaces: the ref must flip
@@ -76,13 +81,15 @@ export function useConversations(): UseConversations {
   const [loadingMore, setLoadingMore] = useState(false);
   // Mirror rows.length through a ref so loadFirstPage can read the page-1
   // suppression predicate WITHOUT closing over rows.length — that would
-  // recreate the callback on every row update and could re-trigger the tick
-  // effect (Codex gate, MAJOR 5: loadFirstPage must be ref-stable).
+  // recreate the callback on every row update and could re-trigger the
+  // change-signal effect (Codex gate, MAJOR 5: loadFirstPage must be ref-stable).
   const rowsLenRef = useRef(0);
   useEffect(() => { rowsLenRef.current = rows.length; }, [rows.length]);
   // Single in-flight controller: each invocation aborts the prior before
   // starting a new one, so a refocus burst (the visibilitychange listener +
-  // the [generatedAt] tick effect) collapses to a single completing fetch.
+  // the [revalTok] change-signal effect) collapses to a single completing
+  // fetch. #305: a data_version change while req1 is in flight re-fires the
+  // effect, whose cleanup aborts req1 here before req2 starts (no residual-B).
   const ctlRef = useRef<AbortController | null>(null);
   // Combined {filters, sort} generation token, bumped on every filter OR sort
   // change (the [queryKey] reset effect — #217 S4 / I-2.3). loadMore captures it
@@ -136,10 +143,10 @@ export function useConversations(): UseConversations {
   // sort change wipes the accumulated tail, rewinds the cursor to offset 0, and
   // refetches page 1 with the new params. Keyed on a stable JSON key of BOTH
   // filters AND sort so a no-op SET (same values) doesn't refetch but EITHER axis
-  // changing does. The MOUNT run is skipped (mountQueryKeyRef) — the
-  // [generatedAt] mount/tick effect below already issues the initial page-1 load;
-  // double-firing here would re-fetch page 1 and, mid-paging, clobber the
-  // accumulated tail.
+  // changing does. The MOUNT run is skipped (mountQueryKeyRef) — the mount/tick
+  // effect below (now keyed on the `revalToken` change signal, #305) already
+  // issues the initial page-1 load; double-firing here would re-fetch page 1
+  // and, mid-paging, clobber the accumulated tail.
   const queryKey = JSON.stringify({ filters, sort });
   const mountQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
@@ -166,16 +173,20 @@ export function useConversations(): UseConversations {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryKey]);
 
-  // First-page (re)load on mount + every SSE tick — but never while hidden.
-  // Keyed on [generatedAt, loadFirstPage]; loadFirstPage is ref-stable so the
-  // effect re-runs only when generatedAt changes (the SSE tick), never on a
-  // plain row update. The tick reload reads filtersRef so it always carries the
-  // active filters (a tick must never repaint an UNfiltered page 1).
+  // First-page (re)load on mount + whenever the change signal fires — but never
+  // while hidden. Keyed on [revalTok, loadFirstPage] (#305): revalTok is
+  // revalToken(env), the all-inputs data_version that changes iff the underlying
+  // data changed, falling back to generated_at on a server without the field.
+  // loadFirstPage is ref-stable so the effect re-runs only when revalTok
+  // changes, never on a plain row update — so a finished/static rail stops
+  // refetching on every 5s heartbeat. The reload reads filtersRef so it always
+  // carries the active filters (a revalidation must never repaint an UNfiltered
+  // page 1).
   useEffect(() => {
     if (typeof document !== 'undefined' && document.hidden) return;
     loadFirstPage();
     return () => ctlRef.current?.abort();
-  }, [generatedAt, loadFirstPage]);
+  }, [revalTok, loadFirstPage]);
 
   // Refetch once on the hidden→visible transition so a freshly-revealed tab is
   // current immediately (covers the case where the SSE stream was idle or
@@ -214,10 +225,10 @@ export function useConversations(): UseConversations {
   }, [nextOffset]);
 
   // #227 — feed the shared session_id → title cache as rows land (page 1, every
-  // loadMore append, and each SSE-tick revalidation). The reducer merges
+  // loadMore append, and each change-signal revalidation). The reducer merges
   // non-empty titles and no-ops when nothing changed, so re-dispatching the same
-  // rows on every tick is cheap. ComparisonView reads this so its header can show
-  // the real derived title without issuing its own browse fetch.
+  // rows is cheap. ComparisonView reads this so its header can show the real
+  // derived title without issuing its own browse fetch.
   useEffect(() => {
     if (rows.length === 0) return;
     dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: rows.map((r) => [r.session_id, r.title]) });

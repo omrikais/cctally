@@ -135,6 +135,101 @@ for d in "$FIXTURES_DIR"/*/; do
 done
 
 # ---------------------------------------------------------------------
+# Native Codex foreground lifecycle fixture.  Its all-root ingest is
+# intentionally empty; the golden instead pins the important contract for a
+# normal native handler: no stdout/stderr leakage and one success marker for
+# the configured root.  The Python fake-home suite covers the richer mixed
+# due/throttled/contended combinations.
+# ---------------------------------------------------------------------
+run_codex_foreground_fixture () {
+    local name="codex-foreground-empty"
+    local dir="$FIXTURES_DIR/$name"
+    [ -d "$dir" ] || { echo "SKIP $name: no fixture dir"; return 0; }
+    [ -f "$dir/stdin.json" ] || { echo "SKIP $name: no stdin fixture"; return 0; }
+    [ -f "$dir/golden-stdout.txt" ] || { echo "SKIP $name: no stdout golden"; return 0; }
+    [ -f "$dir/golden-marker-count.txt" ] || { echo "SKIP $name: no marker golden"; return 0; }
+
+    local fake; fake=$(mktemp -d)
+    mkdir -p "$fake/.codex" "$fake/.local/share/cctally"
+    local raw rc out
+    raw=$(HOME="$fake" CODEX_HOME="$fake/.codex" TZ=Etc/UTC \
+        "$HARNESS_BIN" hook-tick --foreground --source codex \
+        < "$dir/stdin.json" 2>&1; echo "EXIT=$?")
+    rc=${raw##*EXIT=}
+    rc=${rc%$'\n'}
+    out=${raw%EXIT=*}
+    local fail_local=0
+    local GOLDEN_DIFF_TMPDIR="$fake"
+    _golden_diff_str "codex stdout" "$dir/golden-stdout.txt" "$out" 40 || fail_local=1
+    local marker_count
+    marker_count=$(find "$fake/.local/share/cctally/codex-hook-tick" \
+        -name '*.last-success' -type f 2>/dev/null | wc -l | tr -d ' ')
+    _golden_diff_str "codex marker count" "$dir/golden-marker-count.txt" "$marker_count" 10 || fail_local=1
+    local expected_rc; expected_rc=$(cat "$dir/golden-exit.txt")
+    if [ "$rc" != "$expected_rc" ]; then
+        echo "exit mismatch for $name: got $rc want $expected_rc"
+        fail_local=1
+    fi
+    if [ "$fail_local" = 0 ]; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name"
+        fail_count=$((fail_count + 1))
+    fi
+    rm -rf "$fake"
+}
+
+run_codex_foreground_fixture
+
+# ---------------------------------------------------------------------
+# Native Codex foreground mode. The process that accepts stdin must also
+# complete the refresh body: when it returns, the event line is already
+# durable and there is no detached child left to finish later.
+# ---------------------------------------------------------------------
+run_foreground_payload () {
+    local name="$1" payload="$2" expected_event="$3" expected_session="$4"
+    local fake; fake=$(mktemp -d)
+    mkdir -p "$fake/.local/share/cctally"
+    local rc=0
+    printf '%s' "$payload" \
+        | HOME="$fake" TZ=Etc/UTC "$HARNESS_BIN" hook-tick \
+            --foreground --no-oauth >/dev/null 2>"$fake/stderr" || rc=$?
+    local foreground_log="$fake/.local/share/cctally/logs/hook-tick.log"
+    if [ "$rc" -eq 0 ] \
+       && [ -s "$foreground_log" ] \
+       && grep -q "event=$expected_event" "$foreground_log" \
+       && grep -q "session=$expected_session" "$foreground_log"; then
+        echo "PASS foreground-$name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL foreground-$name"
+        echo "  rc=$rc log=$foreground_log"
+        [ -f "$fake/stderr" ] && sed -n '1,5p' "$fake/stderr"
+        [ -f "$foreground_log" ] && sed -n '1,5p' "$foreground_log"
+        fail_count=$((fail_count + 1))
+    fi
+    rm -rf "$fake"
+}
+
+run_foreground_payload valid \
+    '{"hook_event_name":"Stop","session_id":"foreground-valid"}' \
+    Stop foregrou
+run_foreground_payload partial \
+    '{"hook_event_name":"SubagentStop"}' \
+    SubagentStop unknown
+run_foreground_payload malformed '{not-json' unknown unknown
+run_foreground_payload empty '' unknown unknown
+
+if "$HARNESS_BIN" hook-tick --help | grep -q -- '--foreground'; then
+    echo "FAIL foreground-hidden-help"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS foreground-hidden-help"
+    pass_count=$((pass_count + 1))
+fi
+
+# ---------------------------------------------------------------------
 # Real-shell + async test — guards against the POSIX stdin-redirect-on-&
 # bug. CC invokes hooks via /bin/sh -c '<command>'; if our settings.json
 # command had a trailing `&`, POSIX async-list semantics redirect the

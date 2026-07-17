@@ -14,7 +14,9 @@ import { fmt } from '../lib/fmt';
 // (dashboard-gotchas): container-level Escape (onKeyDown on the role="menu" div,
 // NOT per-item), focus captured at open + restored to the trigger on close,
 // ≥44px touch targets (CSS), reduced-motion via CSS only. The action items are
-// role="menuitem" with a single roving tabindex (only the active item is
+// role="menuitem" (the Anonymize toggle is role="menuitemcheckbox" +
+// aria-checked per the APG toggle-menu pattern, #304 S2 F5) with a single roving
+// tabindex (only the active item is
 // Tab-reachable); ArrowUp/Down wrap, Home/End jump, Escape closes. Index math is
 // the pure `nextRovingIndex` helper; this component owns the imperative
 // `.focus()`. Presentational — every action is a passed callback so the reader
@@ -49,6 +51,14 @@ export interface ReaderOverflowMenuProps {
   costCumulative?: number;
   costTotal?: number;
   costApprox?: boolean;
+  // #304 S3 (Codex F3) — folding the desktop strip must not remove the ✓
+  // Complete JUMP (the full strip's ✓ Complete is a scroll-to-completion
+  // button). When the reader passes this callback AND `completionTotal` is set,
+  // the read-only completion summary row becomes a real actionable menuitem
+  // ("✓ Complete · N") that runs the jump then closes; the ≤1100 compact band
+  // gains the repaired jump too. When unset, the read-only summary row renders
+  // exactly as before. The cost row stays read-only.
+  onCompletionJump?: (() => void) | null;
 }
 
 export function ReaderOverflowMenu({
@@ -65,6 +75,7 @@ export function ReaderOverflowMenu({
   costCumulative = 0,
   costTotal = 0,
   costApprox = false,
+  onCompletionJump = null,
 }: ReaderOverflowMenuProps) {
   const [open, setOpen] = useState(false);
   const restoreRef = useRef<Element | null>(null);
@@ -85,6 +96,13 @@ export function ReaderOverflowMenu({
     onLatest ? { key: 'latest', kind: 'action', label: `${latestBusy ? '… ' : ''}Latest ↓`, run: onLatest, busy: latestBusy } : null,
     { key: 'expand', kind: 'action', label: '⤢ Expand all', run: onExpandAll },
     { key: 'collapse', kind: 'action', label: '⤡ Collapse all', run: onCollapseAll },
+    // #304 S3 (Codex F3) — the completion JUMP, appended LAST so the existing
+    // roving indices above are undisturbed. Only present when the reader passes
+    // the jump callback AND there is a completion total; otherwise completion
+    // stays the read-only summary row below.
+    onCompletionJump != null && completionTotal != null
+      ? { key: 'complete', kind: 'action', label: `✓ Complete · ${completionTotal}`, run: onCompletionJump }
+      : null,
   ].filter(Boolean) as (
     | { key: 'anon'; kind: 'toggle'; label: string; pressed: boolean }
     | { key: string; kind: 'action'; label: string; run: () => void; busy?: boolean }
@@ -170,7 +188,9 @@ export function ReaderOverflowMenu({
   );
 
   const showCost = costTotal > 0;
-  const showCompletion = completionTotal != null;
+  // #304 S3 (Codex F3) — the read-only completion summary row is suppressed when
+  // the jump callback promotes completion to an actionable menuitem above.
+  const showCompletion = completionTotal != null && onCompletionJump == null;
 
   return (
     <div
@@ -231,7 +251,10 @@ export function ReaderOverflowMenu({
             <button
               key={it.key}
               type="button"
-              role="menuitem"
+              // #304 S2 (F5) — the Anonymize toggle uses APG toggle-menu semantics
+              // (role=menuitemcheckbox + aria-checked); the flat actions stay
+              // role=menuitem. Both share the role-agnostic roving tabindex set.
+              role={it.kind === 'toggle' ? 'menuitemcheckbox' : 'menuitem'}
               tabIndex={i === activeIndex ? 0 : -1}
               ref={(el) => {
                 itemRefs.current[i] = el;
@@ -241,7 +264,7 @@ export function ReaderOverflowMenu({
                   ? 'conv-overflow-item conv-overflow-item--toggle'
                   : 'conv-overflow-item'
               }
-              aria-pressed={it.kind === 'toggle' ? it.pressed : undefined}
+              aria-checked={it.kind === 'toggle' ? it.pressed : undefined}
               disabled={it.kind === 'action' ? it.busy : undefined}
               // The toggle flips in place (menu stays open — mirrors the desktop
               // chip); actions run then close the menu (focus-return).

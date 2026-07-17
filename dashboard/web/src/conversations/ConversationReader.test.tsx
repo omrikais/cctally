@@ -11,8 +11,8 @@ import {
 } from '../store/keymap';
 import { installIntersectionObserverStub } from '../test-utils/intersectionObserver';
 import { clearReadingPositions, recordReadingPos } from '../store/readingPosition';
-import { stubMobileMedia, stubResponsiveMedia } from '../test-utils/mobileMedia';
-import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY } from '../lib/breakpoints';
+import { stubResponsiveMedia } from '../test-utils/mobileMedia';
+import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY, COMPACT_WORKSPACE_MEDIA_QUERY } from '../lib/breakpoints';
 import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
 import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
 import { SUBAGENT_WINDOW_CAP } from './subagentWindow';
@@ -102,6 +102,16 @@ vi.mock('react-virtuoso', async () => {
   return { Virtuoso, VirtuosoMockContext: React.createContext(undefined) };
 });
 
+// #304 S3 — the reader-controls density is an ELEMENT-width resolver
+// (ResizeObserver), which JSDOM can't drive. Mock it so tests force the fold
+// deterministically; `readerRef` is a spy so the ref-wiring can be asserted.
+// Reset to 'full' in beforeEach so a 'compact' test can't leak into the others.
+const densityMock = vi.hoisted(() => ({ value: 'full' as 'full' | 'compact', readerRef: vi.fn() }));
+vi.mock('../hooks/useReaderControlsDensity', () => ({
+  COMPACT_READER_CONTROLS_PX: 720,
+  useReaderControlsDensity: () => ({ density: densityMock.value, readerRef: densityMock.readerRef }),
+}));
+
 // §6 overlap-upsert keys the live-tail merge off `anchor.id`, so fixtures need
 // DISTINCT, STABLE ids (the real server's anchor.id is the cache rowid). A
 // per-uuid registry assigns a deterministic monotonic id so the SAME uuid always
@@ -173,6 +183,8 @@ function spyScrollTo() {
 }
 
 beforeEach(() => {
+  densityMock.value = 'full';
+  densityMock.readerRef.mockClear();
   _resetForTests();
   _resetKeymapForTests();
   globalThis.fetch = vi.fn();
@@ -2435,8 +2447,22 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
     return d;
   }
 
-  it('abbreviates the model list on mobile', async () => {
-    stubMobileMedia(true);
+  // #304 S1 (Codex F3) — the reader-meta abbreviation is decided by the header
+  // branch, which now keys on !isWide (compact header ≤1100), not the 640 mobile
+  // query. stubMobileMedia returned ONE value for EVERY query, so once the header
+  // keys on WIDE it inverts (mobile=true also makes WIDE true → desktop header).
+  // Drive mobile-ness and wide-ness independently with the per-query stub.
+  function metaBand(band: 'compact' | 'wide') {
+    return (q: string): boolean => {
+      if (q === MOBILE_MEDIA_QUERY) return false;
+      if (q === COMPACT_WORKSPACE_MEDIA_QUERY) return band === 'compact';
+      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+      return false;
+    };
+  }
+
+  it('abbreviates the model list when the reader is constrained (≤1100)', async () => {
+    stubResponsiveMedia(metaBand('compact'));
     _resetForTests();
     mockFetchOnce(multiModelDetail());
     const { container } = render(<ConversationReader sessionId="s" />);
@@ -2447,14 +2473,34 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
     expect(meta).not.toContain('claude-haiku-4-5-20251001');
   });
 
-  it('renders the full ids on desktop', async () => {
-    stubMobileMedia(false);
+  it('renders the full ids when wide (≥1101)', async () => {
+    stubResponsiveMedia(metaBand('wide'));
     _resetForTests();
     mockFetchOnce(multiModelDetail());
     const { container } = render(<ConversationReader sessionId="s" />);
     await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
     const meta = container.querySelector('.conv-reader-meta')!.textContent!;
     expect(meta).toContain('claude-haiku-4-5-20251001');
+  });
+
+  // #304 S2 (Codex F6) — the focus-return last resort (.conv-reader) must work
+  // even when the remounted anchor's detail fetch FAILS: the error shell needs
+  // tabIndex={-1} or focus() silently no-ops and the flag is consumed for
+  // nothing (focus stays stranded on <body>).
+  it('consumes the compare focus return on the ERROR shell (shell is focusable)', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      ({ ok: false, status: 500, json: async () => ({}) }) as Response) as unknown as typeof fetch;
+    act(() => {
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-err' });
+      dispatch({ type: 'START_COMPARE_PICK', anchor: 'sess-err' });
+      dispatch({ type: 'CANCEL_COMPARE_PICK' });                    // arms the flag
+    });
+    render(<ConversationReader sessionId="sess-err" outline={null} growthNonce={0} live={false} />);
+    await waitFor(() => expect(document.querySelector('.conv-reader--error')).not.toBeNull());
+    await waitFor(() => {
+      expect(document.activeElement).toBe(document.querySelector('.conv-reader--error'));
+      expect(getState().compareCloseFocusPending).toBe(false);
+    });
   });
 });
 
@@ -2467,14 +2513,17 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
 // (per-query) so the 640 vs 1100 breakpoints stay distinct; the visual
 // first-paint reclaim + 44px targets are the ui-qa gate.
 describe('ConversationReader two-row mobile header (#228 S3 C2)', () => {
-  function bandResolver(band: 'mobile' | 'wide') {
+  // #304 S1 — the compact header now keys on !isWide (≤1100). `upperTablet` is
+  // the 881–1100 band: neither mobile (≤640) nor wide (≥1101), so the compact
+  // two-row header renders WITHOUT the phone touch floor.
+  function bandResolver(band: 'mobile' | 'upperTablet' | 'wide') {
     return (q: string): boolean => {
       if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
       if (q === WIDE_MEDIA_QUERY) return band === 'wide';
-      return false;
+      return false; // upperTablet: neither mobile nor wide (881–1100)
     };
   }
-  async function renderHeader(band: 'mobile' | 'wide') {
+  async function renderHeader(band: 'mobile' | 'upperTablet' | 'wide') {
     stubResponsiveMedia(bandResolver(band));
     _resetForTests();
     // last_anchor present so the "Latest ↓" control is reachable (it gates on it,
@@ -2534,6 +2583,313 @@ describe('ConversationReader two-row mobile header (#228 S3 C2)', () => {
     expect(container.querySelector('.conv-overflow-toggle')).toBeNull();
     expect(container.querySelector('.conv-focus-compact-toggle')).toBeNull();
     expect(container.querySelector('.conv-reader-head--mobile')).toBeNull();
+  });
+
+  // #304 S1 — the compact two-row header now applies across the whole ≤1100
+  // constrained band, not only phones. In 881–1100 (not mobile, not wide) the
+  // reader must render the compact header structure, NOT the full desktop strip.
+  it('renders the COMPACT two-row header in the 881–1100 band (not mobile, not wide)', async () => {
+    const utils = await renderHeader('upperTablet');
+    // compact header structure present; the full desktop control strip is not.
+    expect(utils.container.querySelector('.conv-reader-head--mobile')).not.toBeNull();
+    expect(utils.container.querySelector('.conv-reader-row1')).not.toBeNull();
+    expect(utils.container.querySelector('.conv-reader-row2')).not.toBeNull();
+    expect(utils.container.querySelector('.conv-reader-controls')).toBeNull();
+  });
+});
+
+// #304 S3 §1 — the wide (≥1101px) reader header regroups its flat control strip
+// into four intent clusters (reading / nav / share / bulk) plus a quiet,
+// right-aligned status cluster. DOM/state contract only (grouping, order,
+// data-hdr-role identities, membership); layout truths (wrap, dividers,
+// demotion) are ui-qa. No control is removed, renamed, or re-iconed.
+describe('reader header intent clusters (#304 S3 §1 hdr)', () => {
+  function wideResolver(q: string): boolean {
+    return q === WIDE_MEDIA_QUERY; // isWide=true; not mobile, not compact-workspace
+  }
+  async function renderWideHeader(withCompletion: boolean) {
+    stubResponsiveMedia(wideResolver);
+    _resetForTests();
+    const d = detail([makeItem({ uuid: 'h1' })]);
+    (d as { last_anchor?: unknown }).last_anchor = { session_id: 's', uuid: 'h1' };
+    d.models = ['claude-haiku-4-5-20251001', 'claude-opus-4-8'];
+    mockFetchOnce(d);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const outline = withCompletion
+      ? ({
+          session_id: 's',
+          stats: {} as never,
+          turns: [
+            { uuid: 'h1', kind: 'human', ts: 't', label: 'go', member_uuids: ['h1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+          ] as OutlineTurn[],
+          task_completion: { all_done: true, total: 12, completed: 12, anchor_uuid: 'h1' },
+        } as ConversationOutline)
+      : undefined;
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-controls')).not.toBeNull());
+    // Establish a current turn so the cumulative-cost chip is not suppressed by
+    // its pending-flash guard (it hides until the scroll-sync cursor is set).
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    return utils;
+  }
+
+  it('hdr: groups the wide strip into four intent clusters in DOM order', async () => {
+    const { container } = await renderWideHeader(false);
+    const groups = container.querySelectorAll('.conv-reader-controls > .conv-hdr-group');
+    expect(groups).toHaveLength(4);
+    expect(Array.from(groups).map((g) => g.getAttribute('data-hdr-group')))
+      .toEqual(['reading', 'nav', 'share', 'bulk']);
+  });
+
+  it('hdr: cluster membership matches the intent grouping', async () => {
+    const { container } = await renderWideHeader(false);
+    const group = (name: string) => container.querySelector(`.conv-hdr-group[data-hdr-group="${name}"]`)!;
+    // reading: the focus radiogroup + the FocusMore ▾ toggle
+    expect(group('reading').querySelector('.conv-focus-seg')).not.toBeNull();
+    expect(group('reading').querySelector('.conv-focus-more-toggle')).not.toBeNull();
+    // nav: Find · Outline · Latest
+    expect(group('nav').querySelector('[data-hdr-role="find"]')).not.toBeNull();
+    expect(group('nav').querySelector('[data-hdr-role="outline"]')).not.toBeNull();
+    expect(group('nav').querySelector('[data-hdr-role="latest"]')).not.toBeNull();
+    // share: Anon · Export ▾ · Compare
+    expect(group('share').querySelector('[data-hdr-role="anon"]')).not.toBeNull();
+    expect(group('share').querySelector('.conv-export-toggle')).not.toBeNull();
+    expect(group('share').querySelector('#conv-compare-with')).not.toBeNull();
+    // bulk: the two ⤢⤡ buttons
+    expect(group('bulk').querySelectorAll('.conv-bulk-btn')).toHaveLength(2);
+  });
+
+  it('hdr: the status cluster is the LAST child, holding cumcost + complete chip', async () => {
+    const { container } = await renderWideHeader(true);
+    const controls = container.querySelector('.conv-reader-controls')!;
+    const status = controls.querySelector('.conv-hdr-status');
+    expect(status).not.toBeNull();
+    expect(controls.lastElementChild).toBe(status);
+    expect(status!.querySelector('.conv-cumcost-chip')).not.toBeNull();
+    expect(status!.querySelector('.conv-complete-chip')).not.toBeNull();
+  });
+
+  it('hdr: every control still present exactly once (no removals)', async () => {
+    const { container } = await renderWideHeader(true);
+    expect(container.querySelectorAll('.conv-focus-seg')).toHaveLength(1);
+    expect(container.querySelectorAll('.conv-focus-more-toggle')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-hdr-role="find"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-hdr-role="outline"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-hdr-role="latest"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-hdr-role="anon"]')).toHaveLength(1);
+    expect(container.querySelectorAll('.conv-export-toggle')).toHaveLength(1);
+    expect(container.querySelectorAll('#conv-compare-with')).toHaveLength(1);
+    expect(container.querySelectorAll('.conv-bulk-btn')).toHaveLength(2);
+    expect(container.querySelectorAll('.conv-cumcost-chip')).toHaveLength(1);
+    expect(container.querySelectorAll('.conv-complete-chip')).toHaveLength(1);
+    // No overflow menu / compact focus dropdown in the full wide strip.
+    expect(container.querySelector('.conv-overflow-toggle')).toBeNull();
+    expect(container.querySelector('.conv-focus-compact-toggle')).toBeNull();
+  });
+});
+
+// #304 S3 §1 — the reader-width-governed FOLD: at ≥1101px, when the outline
+// column squeezes the reader element below 720px the desktop branch swaps the
+// four clusters for the S1 compact primitives (FocusCompactMenu + Find + Outline
+// + ⋯), keeping the DESKTOP title/meta layout (no Back, full model ids). Density
+// is driven by the mocked resolver.
+describe('folded desktop reader header (#304 S3 §1)', () => {
+  function wideResolver(q: string): boolean {
+    return q === WIDE_MEDIA_QUERY;
+  }
+  function completionOutline(anchor: string, total = 12): ConversationOutline {
+    return {
+      session_id: 's',
+      stats: {} as never,
+      turns: [
+        { uuid: 'h1', kind: 'human', ts: 't', label: 'go', member_uuids: ['h1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+        { uuid: anchor, kind: 'assistant', ts: 't', label: 'done', member_uuids: [anchor], subagent_key: null, parent_uuid: null, is_sidechain: false },
+      ] as OutlineTurn[],
+      task_completion: { all_done: true, total, completed: total, anchor_uuid: anchor },
+    } as ConversationOutline;
+  }
+  async function renderWide(opts: { withCompletion?: boolean; twoModels?: boolean } = {}) {
+    stubResponsiveMedia(wideResolver);
+    _resetForTests();
+    const d = detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'a1', kind: 'assistant' })]);
+    (d as { last_anchor?: unknown }).last_anchor = { session_id: 's', uuid: 'a1' };
+    if (opts.twoModels) d.models = ['claude-haiku-4-5-20251001', 'claude-opus-4-8'];
+    mockFetchOnce(d);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const outline = opts.withCompletion ? completionOutline('a1') : undefined;
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-head')).not.toBeNull());
+    return utils;
+  }
+
+  it('wide + compact density renders the compact primitives inside the desktop branch', async () => {
+    densityMock.value = 'compact';
+    const { container } = await renderWide({ twoModels: true });
+    const head = container.querySelector('.conv-reader-head')!;
+    expect(head.classList.contains('conv-reader-head--folded')).toBe(true);
+    const controls = container.querySelector('.conv-reader-controls')!;
+    expect(controls.querySelector('.conv-focus-compact-toggle')).not.toBeNull();
+    expect(controls.querySelector('.conv-find-toggle')).not.toBeNull();
+    expect(controls.querySelector('.conv-outline-toggle')).not.toBeNull();
+    expect(controls.querySelector('.conv-overflow-toggle')).not.toBeNull();
+    // The full clusters + status cluster are NOT rendered in folded mode.
+    expect(controls.querySelector('.conv-hdr-group')).toBeNull();
+    expect(controls.querySelector('.conv-hdr-status')).toBeNull();
+    // DESKTOP title/meta layout (not the two-row mobile header, no Back).
+    expect(container.querySelector('.conv-reader-head--mobile')).toBeNull();
+    expect(container.querySelector('.conv-reader-row1')).toBeNull();
+    expect(container.querySelector('.conv-reader-row2')).toBeNull();
+    expect(container.querySelector('.conv-back')).toBeNull();
+    // Desktop meta = full unabbreviated model ids.
+    expect(container.querySelector('.conv-reader-meta')!.textContent!).toContain('claude-haiku-4-5-20251001');
+  });
+
+  it('wide + full density renders the four clusters, no --folded class', async () => {
+    densityMock.value = 'full';
+    const { container } = await renderWide();
+    const head = container.querySelector('.conv-reader-head')!;
+    expect(head.classList.contains('conv-reader-head--folded')).toBe(false);
+    expect(container.querySelectorAll('.conv-reader-controls > .conv-hdr-group')).toHaveLength(4);
+    expect(container.querySelector('.conv-overflow-toggle')).toBeNull();
+  });
+
+  it('attaches the density readerRef to the .conv-reader detail root', async () => {
+    densityMock.value = 'full';
+    await renderWide();
+    expect(densityMock.readerRef).toHaveBeenCalled();
+    const carriedReaderRoot = densityMock.readerRef.mock.calls.some(
+      (c) => c[0] instanceof HTMLElement && c[0].classList.contains('conv-reader'),
+    );
+    expect(carriedReaderRoot).toBe(true);
+  });
+
+  it('folded: the completion row jumps via ReaderOverflowMenu (Codex F3 wiring)', async () => {
+    densityMock.value = 'compact';
+    const { container } = await renderWide({ withCompletion: true });
+    fireEvent.click(container.querySelector('.conv-overflow-toggle') as HTMLButtonElement);
+    const item = screen.getByRole('menuitem', { name: /✓ Complete · 12/i });
+    act(() => { fireEvent.click(item); });
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+  });
+
+  it('compact (!isWide) overflow menu also carries the repaired completion jump', async () => {
+    stubResponsiveMedia(() => false); // not wide, not mobile → compact header (881–1100)
+    _resetForTests();
+    const d = detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'a1', kind: 'assistant' })]);
+    mockFetchOnce(d);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const { container } = render(<ConversationReader sessionId="s" outline={completionOutline('a1')} />);
+    await waitFor(() => expect(container.querySelector('.conv-overflow-toggle')).not.toBeNull());
+    fireEvent.click(container.querySelector('.conv-overflow-toggle') as HTMLButtonElement);
+    const item = screen.getByRole('menuitem', { name: /✓ Complete · 12/i });
+    act(() => { fireEvent.click(item); });
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'a1' });
+  });
+});
+
+// #304 S3 (Codex F2) — focus continuity across a density flip. A flip unmounts
+// the focused header control (React fires no onBlur on unmount → focus falls to
+// <body> and the reader keymap deadens). A layout effect keyed on density
+// restores focus to the new mode's semantic equivalent. Density is mocked; the
+// flip is a rerender with the new density value.
+describe('focus continuity across header density flips (#304 S3 Codex F2)', () => {
+  function wideResolver(q: string): boolean {
+    return q === WIDE_MEDIA_QUERY;
+  }
+  function completionOutline(anchor: string, total = 12): ConversationOutline {
+    return {
+      session_id: 's',
+      stats: {} as never,
+      turns: [
+        { uuid: 'h1', kind: 'human', ts: 't', label: 'go', member_uuids: ['h1'], subagent_key: null, parent_uuid: null, is_sidechain: false },
+        { uuid: anchor, kind: 'assistant', ts: 't', label: 'done', member_uuids: [anchor], subagent_key: null, parent_uuid: null, is_sidechain: false },
+      ] as OutlineTurn[],
+      task_completion: { all_done: true, total, completed: total, anchor_uuid: anchor },
+    } as ConversationOutline;
+  }
+  async function renderWideFocus() {
+    stubResponsiveMedia(wideResolver);
+    _resetForTests();
+    const d = detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'a1', kind: 'assistant' })]);
+    (d as { last_anchor?: unknown }).last_anchor = { session_id: 's', uuid: 'a1' };
+    mockFetchOnce(d);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const outline = completionOutline('a1');
+    const utils = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-head')).not.toBeNull());
+    const flip = (to: 'full' | 'compact') => {
+      densityMock.value = to;
+      act(() => { utils.rerender(<ConversationReader sessionId="s" outline={outline} />); });
+    };
+    return { ...utils, flip };
+  }
+
+  it('(a) Find → fold → the folded Find button', async () => {
+    densityMock.value = 'full';
+    const { container, flip } = await renderWideFocus();
+    (container.querySelector('[data-hdr-role="find"]') as HTMLElement).focus();
+    flip('compact');
+    expect(document.activeElement).toBe(container.querySelector('.conv-reader-head--folded .conv-find-toggle'));
+  });
+
+  it('(b) Outline → fold → the folded Outline button', async () => {
+    densityMock.value = 'full';
+    const { container, flip } = await renderWideFocus();
+    (container.querySelector('[data-hdr-role="outline"]') as HTMLElement).focus();
+    flip('compact');
+    expect(document.activeElement).toBe(container.querySelector('.conv-reader-head--folded .conv-outline-toggle'));
+  });
+
+  it('(c) a focus-seg radio → fold → the compact focus toggle', async () => {
+    densityMock.value = 'full';
+    const { container, flip } = await renderWideFocus();
+    (container.querySelector('.conv-focus-seg-btn') as HTMLElement).focus();
+    flip('compact');
+    expect(document.activeElement).toBe(container.querySelector('.conv-focus-compact-toggle'));
+  });
+
+  it('(d) Anon → fold → the ⋯ overflow toggle', async () => {
+    densityMock.value = 'full';
+    const { container, flip } = await renderWideFocus();
+    (container.querySelector('[data-hdr-role="anon"]') as HTMLElement).focus();
+    flip('compact');
+    expect(document.activeElement).toBe(container.querySelector('.conv-overflow-toggle'));
+  });
+
+  it('(e) folded ⋯ (menu open) → unfold → the Anon toggle; the menu is gone', async () => {
+    densityMock.value = 'compact';
+    const { container, flip } = await renderWideFocus();
+    fireEvent.click(container.querySelector('.conv-overflow-toggle') as HTMLButtonElement);
+    expect(container.querySelector('.conv-overflow-menu')).not.toBeNull();
+    flip('full');
+    expect(container.querySelector('.conv-overflow-menu')).toBeNull(); // menu unmounts on flip
+    expect(document.activeElement).toBe(container.querySelector('[data-hdr-role="anon"]'));
+  });
+
+  it('(f) compact focus toggle → unfold → the active focus-seg radio', async () => {
+    densityMock.value = 'compact';
+    const { container, flip } = await renderWideFocus();
+    (container.querySelector('.conv-focus-compact-toggle') as HTMLElement).focus();
+    flip('full');
+    const activeRadio = container.querySelector('.conv-focus-seg-btn[aria-checked="true"]');
+    expect(activeRadio).not.toBeNull();
+    expect(document.activeElement).toBe(activeRadio);
+  });
+
+  it('(g) initial mount in compact steals nothing (focus stays on body)', async () => {
+    densityMock.value = 'compact';
+    await renderWideFocus();
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it('(h) focus in the reader body (not a header control) is not yanked by a flip', async () => {
+    densityMock.value = 'full';
+    const { container, flip } = await renderWideFocus();
+    const root = container.querySelector('.conv-reader') as HTMLElement;
+    root.focus();
+    expect(document.activeElement).toBe(root);
+    flip('compact');
+    expect(document.activeElement).toBe(root);
   });
 });
 

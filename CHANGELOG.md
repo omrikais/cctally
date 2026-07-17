@@ -5,6 +5,62 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.69.0] - 2026-07-17
+
+### Added
+- Dashboard source-aware backend read model (#294 S4): `/api/data` now appends
+  immutable Claude, Codex, and labelled all-source states; provider-owned
+  session/project/quota details use opaque qualified routes backed by bounded
+  relational native reads; render/composer/preset/history requests use
+  source-bearing canonical provider share snapshots and preserve identity
+  without blending independent quota windows; and loopback-only diagnostics
+  expose safe aggregate source counts. The existing Claude dashboard UI is
+  unchanged; S5 owns the visible source selector and sharing controls.
+- Provider-aware CLI analytics for `project`, `diff`, `range-cost`,
+  `cache-report`, and `report`: choose Claude, Codex, or separate all-source
+  sections with `--source`, or use fixed `cctally claude|codex` subgroup forms.
+  Codex projects use privacy-safe qualified identities; its cache surface is
+  truthful token reuse rather than a fabricated cache-hit rate; and report
+  keeps overlapping native logical-limit series unblended. The same
+  source-labelled CLI views now support share artifacts, while the established
+  Codex daily/monthly/weekly/session reports gain read-only `--config PATH` and
+  share flags (#294 S3).
+- Published the Claude/Codex product-parity contract for #294 S0, backed by a deterministic synthetic rollout corpus and executable acceptance matrix that pin source-qualified identity, generic quota windows, schema-drift degradation, and safe mixed-source arithmetic without claiming the later parity sessions are implemented.
+- Codex local-rollout ingest now retains complete physical records, provider-root-qualified native quota observations, and source thread metadata alongside the existing reports. Migration 024 rederives this local cache foundation safely; S2 interprets the observations through native quota commands, while dashboard panels and the Codex conversation UI remain future work. (#294)
+- Native `cctally codex quota` history, statusline, forecast, blocks, and breakdown commands now interpret locally retained Codex quota windows without combining roots or limits. Optional setup-managed Codex hooks refresh local observations on trusted Codex activity and deliver opt-in quota alerts; `doctor` reports local freshness, hook configuration, and recent lifecycle activity. (#294)
+- The status line is now the primary automatic writer of weekly/5h usage: it persists the `rate_limits` Claude Code already hands it on every render, so usage stays fresh from live sessions even while Anthropic's `/api/oauth/usage` endpoint is rate-limiting the background poll. The write is throttled, guarded against concurrent sessions by a cross-process lock, and runs detached so the render stays fast.
+
+### Changed
+- The background OAuth usage poll is now a backfill behind the status line: it only fetches when the status line has not fed recently and no rate-limit cooldown is pending, honoring the `Retry-After` header and backing off exponentially on `429` — so a transient rate-limit can no longer snowball into a persistent ban.
+- Dashboard Sessions table is now keyboard-navigable as an ARIA grid: the ~100-row body is a single Tab stop, with Up/Down/Home/End moving the active row, Enter opening its detail, and Left/Right reaching the per-row controls — replacing ~400 sequential tab stops (#299).
+- Dashboard board is now responsive across three width modes: below 900px it stacks, 900–1199px shows Sessions full-width with Trend and Projects paired (no more crushed columns), and 1200px+ keeps the dense three-across bento. (#293)
+- Touch targets on the dashboard board (topbar actions, sort headers, expand/collapse, model chips, drag grip) now meet the 44px floor on any coarse-pointer device, including tablets. (#293)
+- The unscrolled phone hero is tighter so the start of the board is visible above the fold on short phones. (#293)
+- Dashboard Sessions: each session row is now openable by keyboard and touch via its title, not mouse only (#293 S2, A11Y-2).
+- Dashboard: below 900px the Weekly and Monthly cards now preview the 3 most-recent periods with a "+N more" button to the full-table modal, and the Blocks card scrolls within a bounded height — so a phone dashboard is a glanceable summary instead of a 5–6k-pixel scroll (#293 S3, MOBILE-1). Every row stays reachable in the detail modal / by in-card scroll; ≥900px layouts are unchanged.
+- Dashboard cards now describe rather than impersonate buttons: activating a card's Share or Expand control no longer also opens the card's own modal, and Tab skips the card body straight to its actions — the Expand button is the keyboard/screen-reader way into each card's detail. (#293 S4, A11Y-1/ACTION-1)
+- The 44px touch-target floor now extends off the board — to modal close buttons and modal sort headers, and to every Share and Composer control (preset menu, manage rows, checkboxes, the drag handle) — on any coarse-pointer device, phones and tablets alike. (#293 S4)
+- The phone Share form no longer zooms on focus (16px inputs) and shows a live preview above the options so edits are visible as you make them; the Composer's controls are touch-sized. (#293 S4, SHARE-1/COMPOSER-1)
+- A non-empty Composer basket now stays reachable in the condensed mobile header after you scroll, and the topbar no longer overflows sideways on a 320px-wide phone (the doctor chip compacts to its status glyph). (#293 S4, BASKET-1)
+- **Conversation viewer:** the browse rail renders far faster on large caches — per-session enrichment (git branch, models, title, cost) is now materialized onto the session rollup at ingest (cache migration 023) instead of re-read from the message table per request; the AI title stays live and the rollup cost auto-refreshes on a pricing change. (#302)
+- Dashboard detail surfaces (the session-detail modal, the projects drill, and the conversation reader's outline) no longer re-fetch their detail endpoint on every 5-second refresh tick — they revalidate only when the underlying data actually changes, so a finished/static session, project, or conversation is fetched once instead of every ~5s while open, cutting redundant network round-trips and the cache reads they drive. (#300)
+- The conversation reader's transcript-body growth check now follows that same change signal (#300): with the reader open and live-tail turned off, a finished/static conversation stops re-requesting its transcript tail on every ~5s refresh tick and only re-checks when its data changes — the live-tail default path is unchanged. (#303)
+- Dashboard: the conversation browse rail (sessions list) no longer refetches on every 5s tick while idle — its page-1 revalidation is now gated on a data-version change signal, matching the #300/#303 detail-surface and reader-body gating (#305).
+- **Conversation viewer:** the desktop reader header is regrouped into intent clusters (reading / navigation / sharing / bulk) with a quiet right-aligned status cluster, and a reader-width-governed fold reuses the compact controls when the outline column squeezes the reader below 720px — so the header reads as reading chrome instead of an eleven-control palette (#304 S3).
+- **Conversation viewer:** rail rows split their metadata into an identity line (project · branch · time) and a stats line (model · cost · messages); model chips now render at the 11px typography floor, and a long unknown-model name is bounded so it can never push cost or message counts off the rail (#304 S3).
+- **Conversation viewer:** all sub-floor viewer text is raised to the 11px floor (reader model chips, the export anonymize note, Codex card labels) and guarded by a static typography-floor scan; the overflow menu's completion row is now an actionable jump on compact and folded widths (#304 S3).
+
+### Fixed
+- Usage snapshots now record the true source of each write (`statusline` vs `api`); OAuth-fed rows were previously mislabeled `statusline`.
+- Dashboard Sessions: the Cost column now stays visible at every width instead of hiding behind a horizontal scrollbar — the card folds Duration into the start time and sheds Cache then Project as it narrows (#293 S2, SESS-1).
+- Dashboard board: dragging to reorder a tall card no longer stretches or squashes the displaced card (#293 S2).
+- Removed the decorative swipe handle from the top of dashboard modals — it advertised a swipe-to-dismiss gesture that was never wired up; dismissal stays Esc, backdrop tap, or the × button. (#293 S4, MODAL-1)
+- **Conversation viewer:** the browse filter popover and `?models=`-filtered rail no longer do a ~22 s cold full-table scan of the message `model` column on large caches — a new partial covering index (`conversation_messages(model, session_id)`, cache migration 022) makes facets and model-filtering index-only. (#301)
+- **Conversation viewer:** fixed the 640/641px responsive cliff (#304 S1) — the workspace now stays single-pane until ~880px so the reader is never crushed beside the rail, and the compact reader header now applies across the whole ≤1100px constrained band instead of only phones.
+- **Conversation viewer:** comparison is now fully operable on compact/single-pane widths (#304 S2) — `⋯ → Compare with…` opens the rail picker (previously a dead end at ≤880px), Cancel/Escape return to the anchor reader with focus restored, pick-mode Escape defers to the search input / filters popover, and `/` targets the pick search. Comparison accessibility: the Anonymize menu toggle is a real `menuitemcheckbox`, and Run A/Run B identity is spoken with the header titles and metric values.
+- **Dashboard:** fixed a startup race where the first one or two transcript-gated requests (e.g. an SSE `/api/events` reconnect from an already-open tab) could error out the instant the port opened — a request thread could observe an internal module that was registered but still mid-initialization. Module loading is now serialized so every request always sees a fully-loaded module; clients previously recovered on retry, and now there is nothing to recover from. (#306)
+- **Dashboard Blocks panel:** each model's stacked-bar segment now paints the same color as its legend dot beneath it (and as the model chip everywhere else). The gauge segments were drawing from a generic accent palette, so opus/sonnet/haiku appeared in a different hue in the bar than in the legend — for sonnet and haiku a full green↔blue swap.
+
 ## [1.68.0] - 2026-07-13
 
 ### Added

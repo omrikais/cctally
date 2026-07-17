@@ -8,6 +8,12 @@ import types
 import pytest
 
 from conftest import load_script
+from _lib_dashboard_sources import (
+    CapabilityRecord,
+    SourceDashboardBundle,
+    SourceDashboardState,
+    compose_all_state,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +50,72 @@ def test_envelope_has_all_top_level_keys():
         "generated_at", "last_sync_at", "sync_age_s", "last_sync_error",
         "header", "current_week", "forecast", "trend", "sessions",
     }
+
+
+def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
+    """S4 appends its read-model contract; the legacy Claude envelope is intact."""
+    ns = load_script()
+    now = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    snap = ns["_empty_dashboard_snapshot"]()
+    legacy = {
+        key: value
+        for key, value in ns["snapshot_to_envelope"](snap, now_utc=now).items()
+        if key not in {"source_schema_version", "default_source", "source_order", "sources"}
+    }
+    claude = SourceDashboardState(
+        source="claude",
+        availability="ok",
+        freshness="fresh",
+        warnings=(),
+        data_version="claude-v1",
+        last_success_at=now,
+        capabilities={"hero": CapabilityRecord("supported", "subscription-week")},
+        data={"hero": {"cost_usd": 1.25, "total_tokens": 42}},
+    )
+    codex = SourceDashboardState(
+        source="codex",
+        availability="empty",
+        freshness="fresh",
+        warnings=(),
+        data_version="codex-v1",
+        last_success_at=now,
+        capabilities={"hero": CapabilityRecord("supported", "calendar-week")},
+        data={"hero": {"cost_usd": 0.0, "total_tokens": 0}},
+    )
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=1,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
+    )
+
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+
+    assert {key: envelope[key] for key in legacy} == legacy
+    assert envelope["source_schema_version"] == 1
+    assert envelope["default_source"] == "claude"
+    assert envelope["source_order"] == ["claude", "codex", "all"]
+    assert envelope["sources"]["claude"]["data"] == {
+        "hero": {"cost_usd": 1.25, "total_tokens": 42},
+    }
+    assert envelope["sources"]["all"]["data"]["combined"] == {
+        "cost_usd": 1.25,
+        "total_tokens": 42,
+    }
+    json.dumps(envelope)
+
+
+def test_envelope_without_source_bundle_fails_closed_with_unavailable_sources():
+    ns = load_script()
+    snap = ns["_empty_dashboard_snapshot"]()
+
+    envelope = ns["snapshot_to_envelope"](
+        snap,
+        now_utc=dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc),
+    )
+
+    assert envelope["sources"]["claude"]["availability"] == "unavailable"
+    assert envelope["sources"]["codex"]["data"] is None
 
 
 def test_envelope_null_panels_on_empty_snapshot():

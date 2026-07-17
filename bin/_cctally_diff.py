@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import shutil
 import sqlite3
 import sys
@@ -104,14 +105,24 @@ def _emit_diff_debug_samples(args, window_a, window_b) -> None:
 def cmd_diff(args: argparse.Namespace) -> int:
     """Compare Claude usage between two windows."""
     c = _cctally()
+    c._share_validate_args(args)
     now_utc = _command_as_of()
     if getattr(args, "debug_now", False):
         print(f"now_utc={c._iso_z(now_utc)}")
         return 0
 
-    # Resolve anchors (None when no snapshots exist; week tokens then
-    # raise NoAnchorError in the parser).
-    anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(now_utc)
+    # The source-aware all-provider path resolves calendar week tokens once
+    # before dispatching either provider.  Reuse those absolute, half-open
+    # windows for Claude instead of attempting to reinterpret the original
+    # tokens against its subscription-week anchor.  Ordinary Claude invocations
+    # keep the established anchor/parser path byte-for-byte.
+    supplied_windows = getattr(args, "_source_analytics_windows", None)
+    if supplied_windows is None:
+        # Resolve anchors (None when no snapshots exist; week tokens then
+        # raise NoAnchorError in the parser).
+        anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(now_utc)
+    else:
+        anchor_week_start, anchor_resets_at = None, None
 
     # Validation already happened via _argparse_tz; resolve now to a ZoneInfo
     # (or None for "local") and derive the IANA name for window resolution.
@@ -124,18 +135,35 @@ def cmd_diff(args: argparse.Namespace) -> int:
     tz_name = (tz_obj.key if tz_obj is not None else c._local_tz_name())
 
     try:
-        window_a = dk._parse_diff_window(
-            args.a, now_utc=now_utc,
-            anchor_resets_at=anchor_resets_at,
-            anchor_week_start=anchor_week_start,
-            tz_name=tz_name,
-        )
-        window_b = dk._parse_diff_window(
-            args.b, now_utc=now_utc,
-            anchor_resets_at=anchor_resets_at,
-            anchor_week_start=anchor_week_start,
-            tz_name=tz_name,
-        )
+        if supplied_windows is not None:
+            def _from_source_window(window):
+                start = window.start_at
+                end = window.end_at
+                return dk.ParsedWindow(
+                    label=window.label,
+                    start_utc=start,
+                    end_utc=end,
+                    length_days=(end - start).total_seconds() / 86400,
+                    kind=window.kind,
+                    week_aligned=False,
+                    full_weeks_count=0,
+                )
+
+            window_a = _from_source_window(supplied_windows[0])
+            window_b = _from_source_window(supplied_windows[1])
+        else:
+            window_a = dk._parse_diff_window(
+                args.a, now_utc=now_utc,
+                anchor_resets_at=anchor_resets_at,
+                anchor_week_start=anchor_week_start,
+                tz_name=tz_name,
+            )
+            window_b = dk._parse_diff_window(
+                args.b, now_utc=now_utc,
+                anchor_resets_at=anchor_resets_at,
+                anchor_week_start=anchor_week_start,
+                tz_name=tz_name,
+            )
     except dk.NoAnchorError as exc:
         print(f"diff: {exc}", file=sys.stderr)
         return 1
@@ -221,7 +249,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
     }
 
     if args.emit_json:
-        print(dk._diff_render_json(result, options=options))
+        payload = dk._diff_to_json_payload(result, options=options)
+        sink = getattr(args, "_source_result_sink", None)
+        if sink is not None:
+            sink(payload)
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
 
     # Session A (spec §7.3): route through the new color resolver so

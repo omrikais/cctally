@@ -1,0 +1,3 @@
+Codex quota blocks · local-rollout
+secondary · 1h · root=future-root · limit=limit-future · 25.0% → 25.0% · reset 2026-07-15T15:00:00Z
+primary · 1h · root=stale-root · limit=limit-stale · 75.0% → 75.0% · reset 2026-07-15T15:00:00Z

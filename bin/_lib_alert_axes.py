@@ -66,3 +66,14 @@ AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
 )
 
 AXIS_BY_ID: "dict[str, AlertAxisDescriptor]" = {d.id: d for d in AXIS_REGISTRY}
+
+# Durable notifier-only quota thresholds deliberately do not participate in
+# the dashboard envelope. Keep their metadata available to backend callers
+# without expanding the complete Python↔TypeScript dashboard registry.
+BACKEND_ONLY_AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
+    AlertAxisDescriptor("quota", "QUOTA", "Quota", "quota_threshold_events"),
+)
+
+BACKEND_ONLY_AXIS_BY_ID: "dict[str, AlertAxisDescriptor]" = {
+    d.id: d for d in BACKEND_ONLY_AXIS_REGISTRY
+}

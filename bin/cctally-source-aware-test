@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Deterministic golden harness for source-bearing share artifacts.
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-golden-diff.sh"
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIXTURES="$REPO_ROOT/tests/fixtures/source-aware"
+SCRATCH="$(mktemp -d -t cctally-source-aware.XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+export TZ=Etc/UTC
+export GOLDEN_DIFF_TMPDIR="$SCRATCH"
+
+if ! python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --out "$SCRATCH/artifacts"; then
+    echo "FAIL source-aware: fixture builder exited non-zero"
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+pass_count=0
+fail_count=0
+expected_paths=()
+while IFS= read -r rel; do
+    expected_paths+=("$rel")
+done < <(python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --manifest)
+expected_count=${#expected_paths[@]}
+for rel in "${expected_paths[@]}"; do
+    golden="$FIXTURES/$rel"
+    actual="$SCRATCH/artifacts/$rel"
+    name="${rel%%/*}"
+    if [[ ! -f "$actual" ]]; then
+        echo "FAIL $name: missing $rel"
+        fail_count=$((fail_count + 1))
+    elif _golden_diff_files "$rel" "$golden" "$actual"; then
+        pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+expected_count=${#expected_paths[@]}
+fixture_count=$(find "$FIXTURES" -type f -name '*.golden' | wc -l | tr -d ' ')
+if [[ "$fixture_count" != "$expected_count" ]]; then
+    echo "FAIL source-aware: fixture count expected $expected_count, got $fixture_count"
+    fail_count=$((fail_count + 1))
+fi
+
+actual_count=$(find "$SCRATCH/artifacts" -type f -name '*.golden' | wc -l | tr -d ' ')
+if [[ "$actual_count" != "$expected_count" ]]; then
+    echo "FAIL source-aware: artifact count expected $expected_count, got $actual_count"
+    fail_count=$((fail_count + 1))
+fi
+
+canaries=()
+while IFS= read -r canary; do
+    canaries+=("$canary")
+done < <(python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --canaries)
+for canary in "${canaries[@]}"; do
+    if rg -n -F -- "$canary" "$SCRATCH/artifacts" >/dev/null; then
+        echo "FAIL source-aware: privacy canary found in generated artifact: $canary"
+        rg -n -F -- "$canary" "$SCRATCH/artifacts"
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

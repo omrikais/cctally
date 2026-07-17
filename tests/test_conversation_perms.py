@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import json
 from pathlib import Path
 
 _BIN = Path(__file__).resolve().parent.parent / "bin"
@@ -70,6 +71,53 @@ def test_sidecars_hardened_after_a_write(tmp_path, monkeypatch):
     if shm.exists():
         assert _mode(shm) == 0o600
     conn.close()
+
+
+def test_codex_only_sync_hardens_db_and_sidecars(tmp_path, monkeypatch):
+    """Codex's own write path hardens privacy-sensitive cache artifacts; it
+    does not rely on a later Claude sync happening in the same process."""
+    cache, core = _load_cache(tmp_path, monkeypatch)
+    codex_home = tmp_path / "codex"
+    rollout = codex_home / "sessions" / "2026" / "07" / "15" / "rollout-perms.jsonl"
+    rollout.parent.mkdir(parents=True)
+    records = [
+        {"timestamp": "2026-07-15T12:00:00Z", "type": "session_meta",
+         "payload": {"id": "perms", "session_id": "perms-native", "thread_source": "perms-root"}},
+        {"timestamp": "2026-07-15T12:00:01Z", "type": "turn_context",
+         "payload": {"model": "gpt-5"}},
+        {"timestamp": "2026-07-15T12:00:02Z", "type": "event_msg",
+         "payload": {"type": "token_count", "info": {
+             "last_token_usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+             "total_token_usage": {"total_tokens": 2},
+         }}},
+    ]
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    conn = cache.open_cache_db()
+    try:
+        # Materialize a WAL before deliberately loosening all observable modes.
+        conn.execute("INSERT INTO cache_meta(key,value) VALUES('codex-perms','1')")
+        conn.commit()
+        wal = Path(str(core.CACHE_DB_PATH) + "-wal")
+        shm = Path(str(core.CACHE_DB_PATH) + "-shm")
+        os.chmod(core.CACHE_DB_PATH, 0o644)
+        if wal.exists():
+            os.chmod(wal, 0o644)
+        if shm.exists():
+            os.chmod(shm, 0o644)
+
+        stats = cache.sync_codex_cache(conn)
+
+        assert stats.files_processed == 1
+        assert _mode(core.CACHE_DB_PATH) == 0o600
+        assert _mode(core.APP_DIR) == 0o700
+        assert wal.exists()
+        assert _mode(wal) == 0o600
+        if shm.exists():
+            assert _mode(shm) == 0o600
+    finally:
+        conn.close()
 
 
 def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):

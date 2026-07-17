@@ -20,8 +20,8 @@ FLAG = "conversation_sessions_backfill_pending"
 # Synthetic Claude JSONL lines (same shape the #179 reingest test seeds with).
 # ---------------------------------------------------------------------------
 def _asst_line(uuid, msg_id, req_id, text, *, session_id, ts,
-               model="claude-opus-4-7"):
-    return json.dumps({
+               model="claude-opus-4-7", cwd=None, git_branch=None):
+    obj = {
         "type": "assistant", "uuid": uuid, "sessionId": session_id,
         "requestId": req_id, "timestamp": ts,
         "message": {
@@ -31,14 +31,24 @@ def _asst_line(uuid, msg_id, req_id, text, *, session_id, ts,
                       "cache_creation_input_tokens": 0,
                       "cache_read_input_tokens": 0},
         },
-    }) + "\n"
+    }
+    if cwd is not None:
+        obj["cwd"] = cwd
+    if git_branch is not None:
+        obj["gitBranch"] = git_branch
+    return json.dumps(obj) + "\n"
 
 
-def _user_line(uuid, text, *, session_id, ts):
-    return json.dumps({
+def _user_line(uuid, text, *, session_id, ts, cwd=None, git_branch=None):
+    obj = {
         "type": "user", "uuid": uuid, "sessionId": session_id, "timestamp": ts,
         "message": {"role": "user", "content": text},
-    }) + "\n"
+    }
+    if cwd is not None:
+        obj["cwd"] = cwd
+    if git_branch is not None:
+        obj["gitBranch"] = git_branch
+    return json.dumps(obj) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +85,14 @@ def _get_meta(conn, key):
 def _row_for(conn, session_id):
     return conn.execute(
         "SELECT session_id, msg_count, started_utc, last_activity_utc "
+        "FROM conversation_sessions WHERE session_id=?", (session_id,)).fetchone()
+
+
+def _enrichment_for(conn, session_id):
+    """(git_branch, models_json, title, project_label, cost_usd) for a rollup row
+    — the #302 materialized enrichment columns (+ the reused 015 ones)."""
+    return conn.execute(
+        "SELECT git_branch, models_json, title, project_label, cost_usd "
         "FROM conversation_sessions WHERE session_id=?", (session_id,)).fetchone()
 
 
@@ -287,4 +305,106 @@ def test_reingest_recompute(env):
     assert {r[0] for r in _rollup(conn)} == {"s1", "s2"}
     assert _get_meta(conn, FLAG) is None
     assert _get_meta(conn, "conversation_reingest_enrichment_pending") is None
+    assert_rollup_matches_live(conn)
+
+
+# ---------------------------------------------------------------------------
+# 8. #302 — the fill materializes git_branch / models_json / title.
+# ---------------------------------------------------------------------------
+def test_fill_populates_enrichment_columns(env):
+    cache_mod, conn, projects = env
+    # s1: a human first-prompt then a multi-model main-session pair, on branch
+    # "main" in /home/u/proj. s2: a human-only session (NO model -> models_json
+    # must be NULL) with no git_branch.
+    (projects / "a.jsonl").write_text(
+        _user_line("h1", "first prompt hi", session_id="s1",
+                   ts="2026-06-01T00:00:00Z", cwd="/home/u/proj", git_branch="main")
+        + _asst_line("a1", "ma1", "ra1", "reply", session_id="s1",
+                     ts="2026-06-01T00:01:00Z", model="claude-opus-4-8",
+                     cwd="/home/u/proj", git_branch="main")
+        + _asst_line("a2", "ma2", "ra2", "reply2", session_id="s1",
+                     ts="2026-06-01T00:02:00Z", model="claude-haiku-4-5",
+                     cwd="/home/u/proj", git_branch="main"))
+    (projects / "b.jsonl").write_text(
+        _user_line("h2", "just a question", session_id="s2",
+                   ts="2026-06-02T00:00:00Z"))
+    cache_mod.sync_cache(conn)
+
+    branch, models_json, title, proj, cost = _enrichment_for(conn, "s1")
+    assert branch == "main"
+    # main-first ordering, alphabetical within the main group (both on the main
+    # session): haiku < opus -> ["claude-haiku-4-5", "claude-opus-4-8"].
+    assert json.loads(models_json) == ["claude-haiku-4-5", "claude-opus-4-8"]
+    assert title == "first prompt hi"
+    assert proj == "proj"
+    assert cost > 0  # priced models -> non-zero materialized cost
+
+    b_branch, b_models, b_title, b_proj, _ = _enrichment_for(conn, "s2")
+    assert b_branch is None
+    assert b_models is None, "empty-model session -> models_json NULL, not '[]'"
+    assert b_title == "just a question"
+    assert b_proj == ""  # no cwd -> _project_label(None) == '' sentinel
+    assert_rollup_matches_live(conn)
+
+
+# ---------------------------------------------------------------------------
+# 9. #302 — a scoped append that changes git_branch / model REPLACES the stored
+#    enrichment (not stale).
+# ---------------------------------------------------------------------------
+def test_scoped_append_replaces_stored_enrichment(env):
+    cache_mod, conn, projects = env
+    a = projects / "a.jsonl"
+    a.write_text(
+        _user_line("h1", "first prompt hi", session_id="s1",
+                   ts="2026-06-01T00:00:00Z", cwd="/home/u/proj", git_branch="main")
+        + _asst_line("a1", "ma1", "ra1", "reply", session_id="s1",
+                     ts="2026-06-01T00:01:00Z", model="claude-opus-4-8",
+                     cwd="/home/u/proj", git_branch="main"))
+    cache_mod.sync_cache(conn)
+    assert _enrichment_for(conn, "s1")[0] == "main"
+    assert json.loads(_enrichment_for(conn, "s1")[1]) == ["claude-opus-4-8"]
+
+    # Append a later row on a DIFFERENT branch + a new model -> scoped recompute
+    # of s1 must REPLACE the stored branch (latest non-null) and grow the model
+    # set. The title (stable first-prompt) is unchanged.
+    with open(a, "a") as fh:
+        fh.write(_asst_line("a2", "ma2", "ra2", "later", session_id="s1",
+                            ts="2026-06-01T05:00:00Z", model="claude-haiku-4-5",
+                            cwd="/home/u/proj", git_branch="feature-x"))
+    cache_mod.sync_cache(conn)
+
+    branch, models_json, title, _, _ = _enrichment_for(conn, "s1")
+    assert branch == "feature-x", "stored branch must be the latest non-null"
+    assert json.loads(models_json) == ["claude-haiku-4-5", "claude-opus-4-8"]
+    assert title == "first prompt hi", "stable first-prompt title unchanged"
+    assert_rollup_matches_live(conn)
+
+
+# ---------------------------------------------------------------------------
+# 10. #302 — a flag-driven FULL backfill replaces stale enrichment on an
+#     existing row (the migration-023 path: columns present but unfilled/stale).
+# ---------------------------------------------------------------------------
+def test_full_backfill_replaces_stale_enrichment(env):
+    cache_mod, conn, projects = env
+    (projects / "a.jsonl").write_text(
+        _user_line("h1", "real title", session_id="s1",
+                   ts="2026-06-01T00:00:00Z", cwd="/home/u/proj", git_branch="main")
+        + _asst_line("a1", "ma1", "ra1", "reply", session_id="s1",
+                     ts="2026-06-01T00:01:00Z", model="claude-opus-4-8",
+                     cwd="/home/u/proj", git_branch="main"))
+    cache_mod.sync_cache(conn)
+    # Corrupt the stored enrichment in place, then arm the backfill flag (023's
+    # arm): the next sync full-recomputes and must OVERWRITE the stale values.
+    conn.execute(
+        "UPDATE conversation_sessions SET git_branch='STALE', "
+        "models_json='[\"STALE\"]', title='STALE' WHERE session_id='s1'")
+    conn.commit()
+    _set_meta(conn, FLAG, "1")
+
+    cache_mod.sync_cache(conn)
+    branch, models_json, title, _, _ = _enrichment_for(conn, "s1")
+    assert branch == "main"
+    assert json.loads(models_json) == ["claude-opus-4-8"]
+    assert title == "real title"
+    assert _get_meta(conn, FLAG) is None
     assert_rollup_matches_live(conn)

@@ -187,6 +187,20 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     });
     expect(getState().openModal).toBe('current-week');
   });
+
+  // #293 S4 — the hero keeps its own activation but adopts the region guards so
+  // a bubbled activation from a nested descendant can NOT double-fire the modal.
+  // Non-vacuous: without the `e.target !== e.currentTarget` keydown guard, an
+  // Enter that bubbles from a child span would ALSO open current-week.
+  it('does NOT open on an Enter that bubbles from a nested descendant', () => {
+    const { container } = render(<HeroStrip />);
+    const child = container.querySelector('.hs-big') as HTMLElement;
+    expect(child).not.toBeNull();
+    act(() => {
+      child.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    });
+    expect(getState().openModal).toBeNull();
+  });
 });
 
 // The "vs last week" $/1% delta (#207 B1) — icon-only direction + color + aria,

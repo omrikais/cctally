@@ -15,17 +15,19 @@ Hooks
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
   ⚠ Last hook fire           never
       → No hook has fired yet. Restart Claude Code.
+  ✓ Codex hooks installed    not applicable
+  ✓ Codex recent activity    not applicable
 Auth
   ✗ OAuth token              missing
       → Log into Claude Code to populate the OAuth token
 Database
-  ✓ stats.db                 version 0 / 12 known
+  ✓ stats.db                 version 0 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       32 pending
+  ⚠ Pending migrations       36 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -34,6 +36,7 @@ Data
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Codex quota              not applicable
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
@@ -50,4 +53,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 20 OK · 8 WARN · 3 FAIL
+Summary: 23 OK · 8 WARN · 3 FAIL

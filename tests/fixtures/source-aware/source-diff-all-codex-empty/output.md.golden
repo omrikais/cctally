@@ -1,0 +1,53 @@
+---
+title: Diff Report — Claude + Codex
+generated_at: 2026-07-02T00:00:00Z
+period: 2026-07-01T00:00:00Z..2026-07-02T00:00:00Z
+panel: composed
+anonymized: false
+cctally_version: 1.68.0
+---
+
+# Diff Report — Claude + Codex
+
+## Diff Report
+
+# Diff Report
+
+**Claude**
+_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-02T00:00:00Z_
+
+| Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |
+|:---|:---|:---|---:|---:|---:|---:|---:|---:|
+| Overall | Overall | changed | $1.25 | $2.50 | +$1.25 | 190 | 380 | +190 |
+| Models | claude-sonnet-4-20250514 | changed | $1.25 | $2.50 | +$1.25 | 190 | 380 | +190 |
+| Projects | project-1 | changed | $1.25 | $2.50 | +$1.25 | 190 | 380 | +190 |
+| Cache | cache:claude | changed | $1.25 | $2.50 | +$1.25 | 170 | 340 | +170 |
+| Cache | cache:overall | changed | $1.25 | $2.50 | +$1.25 | 170 | 340 | +170 |
+
+- **A total:** $1.25
+- **B total:** $2.50
+- **Δ total:** +$1.25
+- **A tokens:** 190
+- **B tokens:** 380
+- **Δ tokens:** +190
+
+## Diff Report
+
+# Diff Report
+
+**Codex**
+
+No data
+_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-02T00:00:00Z_
+
+| Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |
+|:---|:---|:---|---:|---:|---:|---:|---:|---:|
+
+- **A total:** $0.00
+- **B total:** $0.00
+- **Δ total:** +$0.00
+- **A tokens:** 0
+- **B tokens:** 0
+- **Δ tokens:** +0

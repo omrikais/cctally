@@ -175,7 +175,7 @@ def test_reconcile_on_set_records_without_dispatch_then_later_fires(ns, monkeypa
     # Later tick at 100% spend ($200): 90 already a row (skip), 100 pending →
     # fires ONLY 100.
     _patch_codex_spend(ns, monkeypatch, value=200.0)
-    ns["maybe_record_codex_budget_milestone"]({})
+    assert ns["maybe_record_codex_budget_milestone"]({}) == 1
 
     rows = _rows(ns)
     assert [r["threshold"] for r in rows] == [90, 100]
@@ -193,7 +193,7 @@ def test_crossing_fires_once_no_refire(ns, monkeypatch):
     _patch_codex_spend(ns, monkeypatch, value=200.0)
     captured = _patch_dispatch(ns, monkeypatch)
 
-    ns["maybe_record_codex_budget_milestone"]({})
+    assert ns["maybe_record_codex_budget_milestone"]({}) == 2
 
     rows = _rows(ns)
     assert [r["threshold"] for r in rows] == [90, 100]
@@ -216,9 +216,22 @@ def test_crossing_fires_once_no_refire(ns, monkeypatch):
     # new rows.
     first = len(captured)
     assert first == 2
-    ns["maybe_record_codex_budget_milestone"]({})
+    assert ns["maybe_record_codex_budget_milestone"]({}) == 0
     assert len(captured) == first
     assert len(_rows(ns)) == 2
+
+
+def test_budget_core_is_resilient_by_default_but_strict_for_lifecycle(ns, monkeypatch):
+    _ensure_schema(ns)
+    _write_codex_config(ns, amount_usd=200.0, thresholds=(90,))
+
+    def fail_sum(*_args, **_kwargs):
+        raise RuntimeError("budget boom")
+
+    monkeypatch.setitem(ns, "_sum_codex_cost_for_range", fail_sum)
+    assert ns["maybe_record_codex_budget_milestone"]({}) == 0
+    with pytest.raises(RuntimeError, match="budget boom"):
+        ns["maybe_record_codex_budget_milestone"]({}, raise_errors=True)
 
 
 # ── (c) period rollover re-arms ──────────────────────────────────────────────

@@ -6,6 +6,7 @@ import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
+import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
@@ -71,17 +72,10 @@ export function TrendPanel() {
     <section
       className="panel accent-amber"
       id="panel-trend"
-      tabIndex={0}
       role="region"
       aria-label="$/1% Trend panel"
       data-panel-kind="trend"
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' })}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'trend' });
-        }
-      }}
+      onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' }))}
     >
       <div className="panel-header">
         <svg className="icon" aria-hidden="true">

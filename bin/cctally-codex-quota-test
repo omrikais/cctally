@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Fixture-based validation for the canonical `cctally codex quota` subgroup.
+#
+# Each scenario runs all five leaves in terminal + JSON mode; breakdown also
+# exercises the Codex fast pricing tier.  Fixtures are rebuilt in a scratch
+# HOME so command projection/sync work cannot modify committed inputs.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FIXTURES="$REPO_ROOT/tests/fixtures/codex-quota"
+BIN="$REPO_ROOT/bin/cctally"
+SCRATCH=$(mktemp -d -t cctally-codex-quota-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+
+build_fixtures_cached "$REPO_ROOT/bin/build-codex-quota-fixtures.py" "$SCRATCH" || {
+    echo "FAIL: build-codex-quota-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+run_one() {
+    local scenario=$1 leaf=$2 mode=$3 flags=$4 golden=$5
+    local dir="$FIXTURES/$scenario"
+    local fake_home="$SCRATCH/$scenario"
+    local actual actual_exit expected_exit expected_exit_file output_ok=0 exit_ok=0
+    actual=$(HOME="$fake_home" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="2026-07-15T12:00:00Z" \
+        CCTALLY_DISABLE_UPDATE_CHECK=1 CCTALLY_DISABLE_TELEMETRY=1 \
+        "$BIN" codex quota "$leaf" --no-sync $flags 2>&1)
+    actual_exit=$?
+    expected_exit_file="$dir/golden-$leaf-$mode.exit"
+    if [ "${HARNESS_REGEN:-}" = "1" ]; then
+        printf '%s\n' "$actual" > "$dir/$golden"
+        printf '%s\n' "$actual_exit" > "$expected_exit_file"
+        echo "REGEN $scenario/$leaf/$mode"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+    expected_exit=$(tr -d '[:space:]' < "$expected_exit_file")
+    local GOLDEN_DIFF_TMPDIR="$SCRATCH"
+    if _golden_diff_str "$scenario/$leaf/$mode" "$dir/$golden" "$actual" 200; then
+        output_ok=1
+    fi
+    if [ "$actual_exit" -eq "$expected_exit" ]; then
+        exit_ok=1
+    else
+        echo "FAIL $scenario/$leaf/$mode: exit $actual_exit (expected $expected_exit)"
+    fi
+    if [ "$output_ok" -eq 1 ] && [ "$exit_ok" -eq 1 ]; then
+        echo "PASS $scenario/$leaf/$mode"
+        pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+for dir in "$FIXTURES"/*/; do
+    scenario=$(basename "$dir")
+    # shellcheck disable=SC1091
+    . "$dir/input.env"
+    for leaf in history statusline forecast blocks; do
+        upper=$(printf '%s' "$leaf" | tr '[:lower:]' '[:upper:]')
+        flags_var="${upper}_FLAGS"
+        flags=${!flags_var:-}
+        run_one "$scenario" "$leaf" terminal "$flags" "golden-$leaf-terminal.txt"
+        run_one "$scenario" "$leaf" json "$flags --json" "golden-$leaf-json.txt"
+    done
+    run_one "$scenario" breakdown terminal "$BREAKDOWN_FLAGS" "golden-breakdown-terminal.txt"
+    run_one "$scenario" breakdown json "$BREAKDOWN_FLAGS --json" "golden-breakdown-json.txt"
+    run_one "$scenario" breakdown speed-fast "$BREAKDOWN_FLAGS --speed fast" "golden-breakdown-speed-fast.txt"
+done
+
+run_one full history zero-match \
+    "--root-key missing-root --limit-key limit-primary" \
+    "golden-history-zero-match.txt"
+run_one full breakdown ambiguous-identity \
+    "--reset-at 2026-07-15T15:00:00Z" \
+    "golden-breakdown-ambiguous-identity.txt"
+run_one full breakdown no-block \
+    "--root-key root-a --limit-key limit-primary --reset-at 2026-07-15T16:00:00Z" \
+    "golden-breakdown-no-block.txt"
+run_one full breakdown malformed-reset \
+    "--root-key root-a --limit-key limit-primary --reset-at not-a-timestamp" \
+    "golden-breakdown-malformed-reset.txt"
+run_one full breakdown date-only-reset \
+    "--root-key root-a --limit-key limit-primary --reset-at 2026-07-15" \
+    "golden-breakdown-date-only-reset.txt"
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -55,11 +55,14 @@ export function ComparisonHeader({
   );
 }
 
+// #304 S2 (F5) — the Run A/B tags are real text for AT; hiding them left run
+// identity unassociated with the titles. Reading order per side is now
+// "Run A, <title>, <date · model>" — identity associated by document order.
 function Side({ side, label, tone }: { side: SideHeader; label: string; tone: 'a' | 'b' }) {
   const meta = [side.date, side.model].filter(Boolean).join(' · ');
   return (
     <div className="conv-cmp-head-side">
-      <span className={`conv-cmp-head-side-tag conv-cmp-head-side-tag--${tone}`} aria-hidden="true">{label}</span>
+      <span className={`conv-cmp-head-side-tag conv-cmp-head-side-tag--${tone}`}>{label}</span>
       <span className="conv-cmp-head-side-name">{side.title}</span>
       {meta && <span className="conv-cmp-head-side-meta">{meta}</span>}
     </div>

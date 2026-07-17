@@ -1,0 +1,2 @@
+secondary · 1h · root=future-root · limit=limit-future · unavailable · FUTURE DATA
+primary · 1h · root=stale-root · limit=limit-stale · 75.0% · resets 2026-07-15T15:00:00Z · STALE

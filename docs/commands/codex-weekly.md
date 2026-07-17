@@ -7,6 +7,15 @@ Codex (OpenAI) usage grouped by week (week-start day from `config.json`).
 
 > Canonical form: [`cctally codex weekly`](codex.md) (this flat form remains as an alias).
 
+## Config and sharing
+
+`codex-weekly` remains the calendar-week Codex accounting view (using the
+configured week-start day), not a native quota-window report. It now accepts
+read-only `--config PATH` plus the common share flags. Those flags add a new
+artifact path only; without `--format`, its legacy terminal/JSON/empty output
+is unchanged. Shared artifacts label Codex and should be reviewed before
+distribution; see [share.md](share.md).
+
 ## Synopsis
 
 ```

@@ -136,3 +136,22 @@ def test_hook_tick_handles_rate_limit_gracefully(ns, monkeypatch, tmp_path):
     assert status == "err(rate-limit)"
     assert payload is None
     assert record_called["n"] == 0
+
+
+def test_hook_tick_rate_limit_arms_backoff(ns, monkeypatch, tmp_path):
+    """A 429 must arm the shared backoff deadline so the next tick is
+    suppressed rather than immediately re-polling (spec §4)."""
+    from conftest import redirect_paths
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "load_config", lambda: {})
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
+    monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
+
+    def boom(token, timeout_seconds):
+        raise ns["RefreshUsageRateLimitError"]("HTTP 429 Too Many Requests")
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", boom)
+
+    assert ns["_oauth_backoff_remaining_seconds"]() == 0.0
+    status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+    assert status == "err(rate-limit)"
+    assert ns["_oauth_backoff_remaining_seconds"]() > 0

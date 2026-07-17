@@ -239,7 +239,7 @@ def _accumulate_entry_into_bucket(
     mb["cache_read"] += entry.cache_read_tokens
 
 
-def _project_json_output(
+def _project_json_payload(
     *,
     since: dt.datetime,
     until: dt.datetime,
@@ -250,8 +250,8 @@ def _project_json_output(
     warnings: list[str],
     include_breakdown: bool,
     week_snapshots: dict[dt.datetime, float],
-) -> str:
-    """Render the project subcommand's --json payload per spec §4.
+) -> dict:
+    """Build the project subcommand's --json payload per spec §4.
 
     Accepts rows already sorted by the caller (so ordering flags apply
     uniformly to both terminal and JSON modes). Aggregates `totals.costUsd`
@@ -325,7 +325,12 @@ def _project_json_output(
         "projects": projects_json,
         "warnings": warnings,
     }
-    return json.dumps(_cctally().stamp_schema_version(payload), indent=2)
+    return _cctally().stamp_schema_version(payload)
+
+
+def _project_json_output(**kwargs) -> str:
+    """Serialize :func:`_project_json_payload` without changing CLI bytes."""
+    return json.dumps(_project_json_payload(**kwargs), indent=2)
 
 
 def _project_sort_key(row: dict, sort_by: str, order: str):
@@ -393,8 +398,14 @@ def cmd_project(args: argparse.Namespace) -> int:
     now = _command_as_of()
     conn = open_db()
 
-    # Resolve [since_dt, until_dt] in UTC.
-    if args.since or args.until:
+    # Resolve [since_dt, until_dt] in UTC.  All-provider project dispatch
+    # resolves its calendar range once, then injects it here so Claude and
+    # Codex describe precisely the same interval.  The normal Claude parser
+    # remains unchanged for every user-facing legacy invocation.
+    source_range = getattr(args, "_source_analytics_range", None)
+    if source_range is not None:
+        since_dt, until_dt = source_range
+    elif args.since or args.until:
         parsed = c._parse_cli_date_range(args, now_utc=now)
         if isinstance(parsed, int):
             # Translate the ccusage-parity helper's exit 1 into project's own
@@ -766,7 +777,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         return 0
 
     if args.json:
-        print(_project_json_output(
+        payload = _project_json_payload(
             since=since_dt,
             until=until_dt,
             weeks_in_range=len(weeks_in_range),
@@ -776,7 +787,12 @@ def cmd_project(args: argparse.Namespace) -> int:
             warnings=warnings,
             include_breakdown=args.breakdown,
             week_snapshots=week_snapshots,
-        ))
+        )
+        sink = getattr(args, "_source_result_sink", None)
+        if sink is not None:
+            sink(payload)
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
 
     # Terminal path

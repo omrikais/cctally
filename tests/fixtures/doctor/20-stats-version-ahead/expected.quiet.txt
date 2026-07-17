@@ -9,9 +9,9 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ✗ Version ahead            stats.db ahead (v99 > known v12)
+  ✗ Version ahead            stats.db ahead (v99 > known v13)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ⚠ Pending migrations       33 pending
+  ⚠ Pending migrations       37 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing
@@ -20,4 +20,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 25 OK · 5 WARN · 1 FAIL
+Summary: 28 OK · 5 WARN · 1 FAIL

@@ -121,6 +121,7 @@ def _cctally():
 # for ``eprint`` is deleted.
 import _cctally_core
 from _cctally_core import eprint
+from _lib_source_identity import source_root_key
 
 
 # Module-level back-ref shims for the three out-of-scope JSONL/project
@@ -165,6 +166,7 @@ CodexEntry = _lib_jsonl.CodexEntry
 _CodexIterState = _lib_jsonl._CodexIterState
 _iter_jsonl_entries_with_offsets = _lib_jsonl._iter_jsonl_entries_with_offsets
 _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_with_offsets
+_iter_codex_fused_records_with_offsets = _lib_jsonl._iter_codex_fused_records_with_offsets
 _parse_usage_entries = _lib_jsonl._parse_usage_entries
 _should_replace = _lib_jsonl._should_replace
 
@@ -181,6 +183,13 @@ _iter_message_rows = _lib_conversation.iter_message_rows
 # shared no-op singleton), so the sync_cache seam wraps below cost nothing on
 # the default path.
 _perf = _load_lib("_lib_perf")
+
+# #302: the single embedded-pricing version knob (bumped on every pricing sync),
+# used to auto-invalidate the rollup's materialized cost when pricing changes.
+# _lib_pricing is a pure stdlib leaf (no sibling imports), so binding it at
+# module-load is circular-safe. Referenced as a module global by
+# _arm_rollup_backfill_on_pricing_change so a test may monkeypatch it.
+PRICING_SNAPSHOT_DATE = _load_lib("_lib_pricing").PRICING_SNAPSHOT_DATE
 
 # Shared by the fused per-file walk AND backfill_conversation_messages so the
 # column list, placeholders, and tuple order live in ONE place — a column
@@ -587,6 +596,361 @@ def _resolve_project_key(
 
 
 # === Region 2: Codex sessions-dir helpers (was bin/cctally:2072-2099) ===
+
+
+@dataclass(frozen=True)
+class CodexProviderRoot:
+    """One configured Codex provider boundary and its JSONL walk directory."""
+
+    provider_root: pathlib.Path
+    walk_root: pathlib.Path
+    source_root_key: str
+
+
+@dataclass(frozen=True)
+class CodexDiscoveredFile:
+    """One physical rollout paired with its first matching provider root.
+
+    ``physical_path`` is only the de-duplication identity. ``source_path``
+    keeps the configured walk spelling because reporting resolves it against
+    the configured ``$CODEX_HOME`` roots.
+    """
+
+    source_path: pathlib.Path
+    physical_path: pathlib.Path
+    provider_root: pathlib.Path
+    walk_root: pathlib.Path
+    source_root_key: str
+
+
+def _canonical_codex_path(path: pathlib.Path) -> pathlib.Path:
+    """Resolve an absolute Codex path, retaining a safe absolute spelling on I/O failure."""
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _codex_provider_roots() -> list[CodexProviderRoot]:
+    """Return configured provider roots with their sessions/direct walk roots.
+
+    Provider identity follows the configured root, not necessarily the walked
+    ``sessions/`` child.  Canonical duplicate provider aliases collapse here;
+    overlapping *distinct* configured roots remain ordered so discovery can
+    honor the first configured match.
+    """
+    roots: list[CodexProviderRoot] = []
+    seen: set[pathlib.Path] = set()
+    for configured in _cctally()._codex_home_roots():
+        provider_root = _canonical_codex_path(configured)
+        if provider_root in seen:
+            continue
+        sessions = configured / "sessions"
+        if sessions.is_dir():
+            walk_root = sessions
+        elif configured.is_dir():
+            walk_root = configured
+        else:
+            continue
+        seen.add(provider_root)
+        roots.append(CodexProviderRoot(
+            provider_root=provider_root,
+            walk_root=walk_root,
+            source_root_key=source_root_key(str(provider_root)),
+        ))
+    return roots
+
+
+def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
+    """Discover each physical rollout once with the first matching root facts."""
+    discovered: list[CodexDiscoveredFile] = []
+    seen: set[pathlib.Path] = set()
+    for root in _codex_provider_roots():
+        for candidate in root.walk_root.glob("**/*.jsonl"):
+            if not candidate.is_file():
+                continue
+            physical_path = _canonical_codex_path(candidate)
+            if physical_path in seen:
+                continue
+            seen.add(physical_path)
+            discovered.append(CodexDiscoveredFile(
+                source_path=candidate,
+                physical_path=physical_path,
+                provider_root=root.provider_root,
+                walk_root=root.walk_root,
+                source_root_key=root.source_root_key,
+            ))
+    return discovered
+
+
+def _delete_codex_file_derived_rows(
+    conn: sqlite3.Connection,
+    path_str: str,
+    *,
+    source_root_key: str | None = None,
+    match_source_root: bool = False,
+) -> None:
+    """Drop Codex rows for one file, optionally qualified to one source root."""
+    root_clause = " AND source_root_key IS ?" if match_source_root else ""
+    params: tuple[str, ...] | tuple[str, str | None]
+    params = (path_str, source_root_key) if match_source_root else (path_str,)
+    conn.execute(
+        "DELETE FROM codex_session_entries WHERE source_path = ?" + root_clause,
+        params,
+    )
+    conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source = 'codex' "
+        "AND source_path = ?" + root_clause,
+        params,
+    )
+    conn.execute(
+        "DELETE FROM codex_conversation_events WHERE source_path = ?" + root_clause,
+        params,
+    )
+    conn.execute(
+        "DELETE FROM codex_conversation_threads WHERE source_path = ?" + root_clause,
+        params,
+    )
+    conn.execute(
+        "DELETE FROM codex_session_files WHERE path = ?" + root_clause,
+        params,
+    )
+
+
+def _clear_codex_derived_rows(conn: sqlite3.Connection) -> None:
+    """Clear every re-derivable Codex row family in child-before-root order."""
+    conn.execute("DELETE FROM codex_session_entries")
+    conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
+    conn.execute("DELETE FROM codex_conversation_threads")
+    conn.execute("DELETE FROM codex_conversation_events")
+    conn.execute("DELETE FROM codex_session_files")
+    conn.execute("DELETE FROM codex_source_roots")
+
+
+def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
+    """Advance the dashboard's Codex physical-identity sequence in this txn."""
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES "
+        "('codex_physical_mutation_seq', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
+    )
+
+
+def _collect_inactive_codex_paths_and_roots(
+    conn: sqlite3.Connection,
+    current_file_identities: set[tuple[str, str]],
+    active_root_keys: set[str],
+) -> tuple[list[tuple[str, str | None]], set[str]]:
+    """Return stale real source identities and their candidate root keys.
+
+    A failed/partial prior write can leave any S1 child family without its
+    terminal ``codex_session_files`` row.  Scope pruning must therefore use
+    every physical family, compare each row's path AND provider root, and leave
+    relative fixture rows alone.
+    """
+    stale_identities: set[tuple[str, str | None]] = set()
+    stale_root_keys: set[str] = set()
+    current_paths = {path for path, _root_key in current_file_identities}
+    terminal_file_identities = {
+        (path, root_key)
+        for path, root_key in conn.execute(
+            "SELECT path, source_root_key FROM codex_session_files"
+        )
+    }
+    family_queries = (
+        "SELECT path, source_root_key FROM codex_session_files",
+        "SELECT source_path, source_root_key FROM codex_session_entries",
+        "SELECT source_path, source_root_key FROM quota_window_snapshots "
+        "WHERE source = 'codex'",
+        "SELECT source_path, source_root_key FROM codex_conversation_threads",
+        "SELECT source_path, source_root_key FROM codex_conversation_events",
+    )
+    for query in family_queries:
+        for source_path, root_key in conn.execute(query):
+            identity = (source_path, root_key)
+            if (
+                not os.path.isabs(source_path)
+                or identity in current_file_identities
+                # An old terminal file at a currently discovered path must
+                # reach the normal requalification loop, which resets every
+                # family as one file transaction and records the reset stat.
+                or (
+                    source_path in current_paths
+                    and identity in terminal_file_identities
+                )
+            ):
+                continue
+            stale_identities.add(identity)
+            if root_key is not None:
+                stale_root_keys.add(root_key)
+    stale_root_keys.update(
+        root_key
+        for (root_key,) in conn.execute(
+            "SELECT source_root_key FROM codex_source_roots"
+        )
+        if root_key not in active_root_keys
+    )
+    return sorted(stale_identities, key=lambda item: (item[0], item[1] or "")), stale_root_keys
+
+
+def _prune_inactive_codex_source_roots(
+    conn: sqlite3.Connection,
+    active_root_keys: set[str],
+    *,
+    candidate_root_keys: set[str] | None = None,
+) -> None:
+    """Remove inactive roots only after every child family has been pruned."""
+    if candidate_root_keys is not None and not candidate_root_keys:
+        return
+    predicates: list[str] = []
+    params: list[str] = []
+    if active_root_keys:
+        placeholders = ",".join("?" for _ in active_root_keys)
+        predicates.append("roots.source_root_key NOT IN (" + placeholders + ")")
+        params.extend(active_root_keys)
+    if candidate_root_keys is not None:
+        placeholders = ",".join("?" for _ in candidate_root_keys)
+        predicates.append("roots.source_root_key IN (" + placeholders + ")")
+        params.extend(candidate_root_keys)
+    inactive = " AND ".join(predicates) if predicates else "1"
+    conn.execute(
+        f"""DELETE FROM codex_source_roots AS roots
+            WHERE {inactive}
+              AND NOT EXISTS (
+                  SELECT 1 FROM codex_session_files AS files
+                  WHERE files.source_root_key = roots.source_root_key
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM codex_session_entries AS entries
+                  WHERE entries.source_root_key = roots.source_root_key
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM quota_window_snapshots AS quotas
+                  WHERE quotas.source = 'codex'
+                    AND quotas.source_root_key = roots.source_root_key
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM codex_conversation_threads AS threads
+                  WHERE threads.source_root_key = roots.source_root_key
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM codex_conversation_events AS events
+                  WHERE events.source_root_key = roots.source_root_key
+              )""",
+        tuple(params),
+    )
+
+
+def _write_codex_file_batch(
+    conn: sqlite3.Connection,
+    *,
+    discovered: CodexDiscoveredFile,
+    path_str: str,
+    size: int,
+    mtime_ns: int,
+    final_offset: int,
+    last_session_id: str | None,
+    last_model: str | None,
+    last_total_tokens: int | None,
+    last_native_thread_id: str | None,
+    last_root_thread_id: str | None,
+    last_parent_thread_id: str | None,
+    last_conversation_key: str | None,
+    reset_file: bool,
+    accounting_rows: list[tuple[Any, ...]],
+    quota_rows: list[tuple[Any, ...]],
+    thread_rows: list[tuple[Any, ...]],
+    event_rows: list[tuple[Any, ...]],
+    active_root_keys: set[str],
+) -> int:
+    """Write one fully-buffered Codex file atomically and return entry changes."""
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    if reset_file:
+        _delete_codex_file_derived_rows(conn, path_str)
+    conn.execute(
+        """INSERT INTO codex_source_roots
+           (source_root_key, canonical_root_path, first_seen_utc, last_seen_utc)
+           VALUES (?,?,?,?)
+           ON CONFLICT(source_root_key) DO UPDATE SET
+             canonical_root_path=excluded.canonical_root_path,
+             last_seen_utc=excluded.last_seen_utc""",
+        (discovered.source_root_key, str(discovered.provider_root), now_iso, now_iso),
+    )
+    rows_changed = 0
+    if accounting_rows:
+        before = conn.total_changes
+        conn.executemany(
+            """INSERT OR IGNORE INTO codex_session_entries
+               (source_path, line_offset, timestamp_utc, session_id, model,
+                input_tokens, cached_input_tokens, output_tokens,
+                reasoning_output_tokens, total_tokens, source_root_key,
+                conversation_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            accounting_rows,
+        )
+        rows_changed = conn.total_changes - before
+    if quota_rows:
+        conn.executemany(
+            """INSERT OR IGNORE INTO quota_window_snapshots
+               (source, source_root_key, source_path, line_offset,
+                captured_at_utc, observed_slot, logical_limit_key, limit_id,
+                limit_name, window_minutes, used_percent, resets_at_utc,
+                plan_type, individual_limit_json, reached_type)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            quota_rows,
+        )
+    if thread_rows:
+        conn.executemany(
+            """INSERT INTO codex_conversation_threads
+               (conversation_key, source_root_key, native_thread_id,
+                root_thread_id, parent_thread_id, source_path, cwd, git_json,
+                source_kind, thread_source_json, model_provider, context_window,
+                first_seen_utc, last_seen_utc)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(conversation_key) DO UPDATE SET
+                 source_root_key=excluded.source_root_key,
+                 native_thread_id=excluded.native_thread_id,
+                 root_thread_id=excluded.root_thread_id,
+                 parent_thread_id=excluded.parent_thread_id,
+                 source_path=excluded.source_path, cwd=excluded.cwd,
+                 git_json=excluded.git_json, source_kind=excluded.source_kind,
+                 thread_source_json=excluded.thread_source_json,
+                 model_provider=excluded.model_provider,
+                 context_window=excluded.context_window,
+                 last_seen_utc=excluded.last_seen_utc""",
+            [(*row, now_iso, now_iso) for row in thread_rows],
+        )
+    if event_rows:
+        conn.executemany(
+            """INSERT OR IGNORE INTO codex_conversation_events
+               (source_path, line_offset, source_root_key, conversation_key,
+                native_thread_id, root_thread_id, parent_thread_id,
+                timestamp_utc, record_type, event_type, turn_id, call_id,
+                payload_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            event_rows,
+        )
+    conn.execute(
+        """INSERT OR REPLACE INTO codex_session_files
+           (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
+            last_session_id, last_model, last_total_tokens, source_root_key,
+            last_native_thread_id, last_root_thread_id, last_parent_thread_id,
+            last_conversation_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
+            last_model, last_total_tokens, discovered.source_root_key,
+            last_native_thread_id, last_root_thread_id, last_parent_thread_id,
+            last_conversation_key,
+        ),
+    )
+    _prune_inactive_codex_source_roots(conn, active_root_keys)
+    # A file batch owns accounting, quota, thread, event, root, and cursor
+    # facts as one physical unit. Keep the version bump in that same commit so
+    # a rolled-back batch never appears newer to the dashboard signature.
+    _bump_codex_physical_mutation_seq(conn)
+    conn.commit()
+    return rows_changed
 
 
 def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]:
@@ -1922,6 +2286,12 @@ def sync_cache(
         # rows the rail's old live aggregate read, so the rollup stays
         # byte-identical to that aggregate.
         with _perf.phase("recompute.conversation_sessions"):
+            # #302: auto-invalidate the rollup's MATERIALIZED cost when the
+            # embedded pricing snapshot changed since it was last derived. Runs
+            # BEFORE the pending check so a mismatch arms the same durable flag
+            # the full-recompute path already consumes below (self-heal on a
+            # pricing sync / cctally upgrade, no manual `cache-sync --rebuild`).
+            _arm_rollup_backfill_on_pricing_change(conn)
             if _conversation_sessions_backfill_pending(conn):
                 _recompute_conversation_sessions(conn)
                 conn.execute(
@@ -2215,6 +2585,37 @@ def _conversation_sessions_backfill_pending(conn) -> bool:
         return False
 
 
+def _arm_rollup_backfill_on_pricing_change(conn) -> None:
+    """Arm the conversation_sessions full backfill when the embedded pricing
+    snapshot changed since the rollup's stored cost was last derived (#302). The
+    rail now reads MATERIALIZED cost off the rollup, so a pricing sync / cctally
+    upgrade would otherwise leave untouched sessions' cost (and the cost
+    filter/sort axis) stale until a manual `cache-sync --rebuild`. This self-heals
+    it: compares a stored cache_meta fingerprint against the current
+    PRICING_SNAPSHOT_DATE and, on mismatch, arms
+    conversation_sessions_backfill_pending + advances the stored fingerprint (one
+    committed txn). The existing full-recompute-then-drop-flag-last machinery then
+    re-derives every session's cost + enrichment.
+
+    Crash-safety is unchanged: the DURABLE backfill flag remains the recompute
+    signal, so advancing the fingerprint here cannot strand stale cost (a crash
+    after arming leaves the flag set -> next sync recomputes regardless of the
+    fingerprint). No-op when cache_meta is unavailable (path-less / degraded
+    conn). Caller path holds the cache.db.lock flock."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='conversation_sessions_pricing_fp'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row is not None and row[0] == PRICING_SNAPSHOT_DATE:
+        return
+    _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+    _set_cache_meta(conn, "conversation_sessions_pricing_fp", PRICING_SNAPSHOT_DATE)
+    conn.commit()
+
+
 def _recompute_conversation_sessions(conn, session_ids=None) -> None:
     """Recompute the ``conversation_sessions`` browse-rail rollup from
     ``conversation_messages``. The caller holds the cache.db.lock flock and owns
@@ -2265,26 +2666,34 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
 
 def _fill_conversation_sessions_filter_columns(conn, session_ids):
     """Fill the rollup's browse-FILTER columns (project_label / cost_usd /
-    cache_rebuild_count, migration 015) for the given sessions, or ALL when
+    cache_rebuild_count, migration 015) AND the #302 DISPLAYED-enrichment columns
+    (git_branch / models_json / title) for the given sessions, or ALL when
     ``session_ids is None``. The structural COUNT/MIN/MAX columns are filled by
     the INSERT in _recompute_conversation_sessions; this is the second pass that
-    materializes the three filter axes so the rail's date/project/cost/rebuild
-    filters are pure-SQL predicates.
+    materializes the filter axes (pure-SQL predicates) AND the displayed
+    enrichment the rail reads straight off the rollup instead of re-scanning
+    conversation_messages per session on every cold page.
 
-    project_label + cost reuse the query kernel's batch maps (the SAME
-    _project_label / _session_cost_map the rail's per-page Python path used), so
-    a filtered/displayed value equals what the live rail produced. cost is
-    rounded to 6dp to match list_conversations' per-row rounding.
-    cache_rebuild_count is a per-session lightweight rebuild-count via the
-    query kernel's single-source-of-truth helper (no full assembly — U1; the
-    rule is shared with the reader path) — a whole-session property
-    (recompute, never increment).
+    Every value reuses the query kernel's batch maps — the SAME
+    _project_label / _session_cost_map / _session_latest_meta_map /
+    _session_models_map / _session_first_prompt_titles_map the rail's live path
+    uses — so a materialized value equals what the live rail produces for that
+    session (byte-identity by construction; #302 Section 1). cost is rounded to
+    6dp to match list_conversations' per-row rounding. cache_rebuild_count is a
+    per-session lightweight rebuild-count via the query kernel's
+    single-source-of-truth helper (no full assembly — U1). git_branch is the
+    latest non-null branch (already computed in ``meta`` for project_label, so
+    zero extra query). models_json stores the ordered raw model-ID list
+    (_models_main_first order) as ``json.dumps(models) if models else None`` ->
+    NULL when the session used no non-null model (read back ``[]`` on NULL). title
+    stores ONLY the stable first-prompt title; the volatile AI title is overlaid
+    live by list_conversations (#302 Q2-B), so it is NOT stored here.
 
-    No-op when the columns are absent (a pre-migration-015 cache.db being
-    re-derived before its 015 ALTER lands), so an early/partial sync never
-    raises ``no such column``. The CALLER owns the commit (this never commits)."""
+    No-op when any of the columns is absent (a pre-015 / pre-023 cache.db being
+    re-derived before _apply_cache_schema adds them), so an early/partial sync
+    never raises ``no such column``. The CALLER owns the commit (never commits)."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(conversation_sessions)")}
-    if "cache_rebuild_count" not in cols:
+    if not {"cache_rebuild_count", "git_branch", "models_json", "title"} <= cols:
         return
     lq = _load_lib("_lib_conversation_query")
     if session_ids is None:
@@ -2296,13 +2705,21 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids):
         return
     cost = lq._session_cost_map(conn, ids)
     meta = lq._session_latest_meta_map(conn, ids)
+    models = lq._session_models_map(conn, ids)
+    first_titles = lq._session_first_prompt_titles_map(conn, ids)
     for sid in ids:
         proj = lq._project_label(meta.get(sid, (None, None))[0])
+        branch = meta.get(sid, (None, None))[1]
         rebuilds = lq.session_cache_rebuild_count(conn, sid)
+        m = models.get(sid) or []
+        models_json = json.dumps(m) if m else None
+        title = first_titles.get(sid)
         conn.execute(
             "UPDATE conversation_sessions SET project_label=?, cost_usd=?, "
-            "cache_rebuild_count=? WHERE session_id=?",
-            (proj, round(cost.get(sid, 0.0), 6), rebuilds, sid),
+            "cache_rebuild_count=?, git_branch=?, models_json=?, title=? "
+            "WHERE session_id=?",
+            (proj, round(cost.get(sid, 0.0), 6), rebuilds, branch, models_json,
+             title, sid),
         )
 
 
@@ -3059,6 +3476,7 @@ def sync_codex_cache(
     progress: Callable[[CodexIngestStats], None] | None = None,
     rebuild: bool = False,
     lock_timeout: "float | None" = None,
+    _on_first_file_rollback: Callable[[], None] | None = None,
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
@@ -3072,6 +3490,7 @@ def sync_codex_cache(
     untouched and the caller sees `lock_contended=True`.
     """
     stats = CodexIngestStats()
+    project_after_unlock = False
     c = _cctally()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CACHE_LOCK_CODEX_PATH.touch()
@@ -3090,18 +3509,19 @@ def sync_codex_cache(
             # Clear INSIDE the lock — see sync_cache() for the full
             # rationale. Done before the existing SELECT so delta
             # detection sees an empty baseline.
-            conn.execute("DELETE FROM codex_session_entries")
-            conn.execute("DELETE FROM codex_session_files")
+            before_clear = conn.total_changes
+            _clear_codex_derived_rows(conn)
+            if conn.total_changes != before_clear:
+                _bump_codex_physical_mutation_seq(conn)
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
 
-        roots = _cctally()._codex_session_roots()
         # Pure read (glob + is_file only); safe to run before the SELECT and
         # the per-file loop, where no cache.db write lock may be held.
         with _perf.phase("discover") as _p_disc:
-            paths: list[pathlib.Path] = list(_iter_codex_jsonl_paths(roots))
-            stats.files_total = len(paths)
-            _p_disc.set_count(len(paths))
+            files = _discover_codex_files_with_roots()
+            stats.files_total = len(files)
+            _p_disc.set_count(len(files))
 
         # Scope the cache to the CURRENT root set: drop rows ingested under a
         # prior $CODEX_HOME (issue #108). iter_codex_entries() has NO root
@@ -3117,7 +3537,9 @@ def sync_codex_cache(
         # processes with different $CODEX_HOME would prune each other; the
         # flock serializes them and that is a pathological configuration.
         if not rebuild:  # --rebuild already cleared both tables above
-            current_paths = {str(p) for p in paths}
+            current_file_identities = {
+                (str(item.source_path), item.source_root_key) for item in files
+            }
             # Only prune ABSOLUTE source_paths. _codex_home_roots() makes
             # every real root absolute (via .absolute()), so a real ingested
             # row always stores an absolute str(jp) — INCLUDING a relative
@@ -3126,22 +3548,27 @@ def sync_codex_cache(
             # synthetic baked-cache fixture row (e.g. build-speed-fixtures.py)
             # with no on-disk JSONL to scope against; pruning it would wipe a
             # cache meant to be read as-is (issue #108).
-            orphan_paths = [
-                row[0]
-                for row in conn.execute("SELECT path FROM codex_session_files")
-                if row[0] not in current_paths and os.path.isabs(row[0])
-            ]
-            if orphan_paths:
-                conn.executemany(
-                    "DELETE FROM codex_session_entries WHERE source_path = ?",
-                    [(p,) for p in orphan_paths],
+            active_root_keys = {item.source_root_key for item in files}
+            orphan_sources, orphan_root_keys = _collect_inactive_codex_paths_and_roots(
+                conn, current_file_identities, active_root_keys,
+            )
+            if orphan_sources or orphan_root_keys:
+                before_prune = conn.total_changes
+                for orphan_path, orphan_root_key in orphan_sources:
+                    _delete_codex_file_derived_rows(
+                        conn,
+                        orphan_path,
+                        source_root_key=orphan_root_key,
+                        match_source_root=True,
+                    )
+                _prune_inactive_codex_source_roots(
+                    conn, active_root_keys,
+                    candidate_root_keys=orphan_root_keys,
                 )
-                conn.executemany(
-                    "DELETE FROM codex_session_files WHERE path = ?",
-                    [(p,) for p in orphan_paths],
-                )
+                if conn.total_changes != before_prune:
+                    _bump_codex_physical_mutation_seq(conn)
                 conn.commit()
-                stats.files_pruned = len(orphan_paths)
+                stats.files_pruned = len({path for path, _root in orphan_sources})
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
@@ -3154,10 +3581,15 @@ def sync_codex_cache(
         # append-only, so a size change is a sufficient signal and mtime
         # is prone to clock-skew false-positives).
         existing = {
-            row[0]: (row[1], row[2], row[3], row[4], row[5], row[6])
+            row[0]: (
+                row[1], row[2], row[3], row[4], row[5], row[6], row[7],
+                row[8], row[9], row[10], row[11],
+            )
             for row in conn.execute(
                 "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
-                "last_session_id, last_model, last_total_tokens "
+                "last_session_id, last_model, last_total_tokens, source_root_key, "
+                "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
+                "last_conversation_key "
                 "FROM codex_session_files"
             )
         }
@@ -3167,7 +3599,8 @@ def sync_codex_cache(
         # the loop stays flat, mirroring sync_cache's walk seam.
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
-        for jp in paths:
+        for discovered in files:
+            jp = discovered.source_path
             path_str = str(jp)
             try:
                 st = jp.stat()
@@ -3184,17 +3617,25 @@ def sync_codex_cache(
             initial_model: str | None = None
             initial_total_tokens = 0
             prev_total_tokens: int | None = None
+            prev_native_thread_id: str | None = None
+            prev_root_thread_id: str | None = None
+            prev_parent_thread_id: str | None = None
+            prev_conversation_key: str | None = None
+            requalified = False
             if prev is not None:
                 (
                     prev_size, _, prev_offset, prev_sid, prev_model, prev_ttot,
+                    prev_root_key, prev_native_thread_id, prev_root_thread_id,
+                    prev_parent_thread_id, prev_conversation_key,
                 ) = prev
                 prev_total_tokens = (
                     int(prev_ttot) if prev_ttot is not None else None
                 )
-                if size == prev_size:
+                requalified = prev_root_key != discovered.source_root_key
+                if not requalified and size == prev_size:
                     stats.files_skipped_unchanged += 1
                     continue
-                if size > prev_size:
+                if not requalified and size > prev_size:
                     start_offset = prev_offset
                     initial_session_id = prev_sid
                     initial_model = prev_model
@@ -3207,7 +3648,10 @@ def sync_codex_cache(
                     initial_total_tokens = 0
                     prev_total_tokens = None
 
-            rows: list[tuple[Any, ...]] = []
+            accounting_rows: list[tuple[Any, ...]] = []
+            quota_rows: list[tuple[Any, ...]] = []
+            thread_rows: list[tuple[Any, ...]] = []
+            event_rows: list[tuple[Any, ...]] = []
             final_offset = start_offset
             # Mutable tracker that the iterator updates on every
             # session_meta / turn_context record, regardless of whether a
@@ -3228,21 +3672,76 @@ def sync_codex_cache(
                 model=initial_model,
                 total_tokens=initial_total_tokens,
             )
+            if (
+                prev is not None and not truncated and not requalified
+                and prev_native_thread_id is not None
+                and prev_root_thread_id is not None
+            ):
+                iter_state.thread = _lib_jsonl.CodexThreadMetadata(
+                    source_root_key=discovered.source_root_key,
+                    source_path=path_str,
+                    native_thread_id=prev_native_thread_id,
+                    root_thread_id=prev_root_thread_id,
+                    parent_thread_id=prev_parent_thread_id,
+                    conversation_key=prev_conversation_key,
+                    cwd=None,
+                    git_json=None,
+                    source_kind=None,
+                    thread_source_json=None,
+                    model_provider=None,
+                    context_window=None,
+                )
             yielded_count = 0
             try:
-                with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+                with open(jp, "rb") as fh:
                     fh.seek(start_offset)
-                    for offset, entry in _iter_codex_jsonl_entries_with_offsets(
+                    for emission in _iter_codex_fused_records_with_offsets(
                         fh,
                         path_str,
                         initial_session_id=initial_session_id,
                         initial_model=initial_model,
                         initial_total_tokens=initial_total_tokens,
+                        source_root_key=discovered.source_root_key,
                         state=iter_state,
                     ):
-                        rows.append((
+                        event = emission.event
+                        event_rows.append((
+                            event.source_path, event.line_offset,
+                            event.source_root_key, event.conversation_key,
+                            event.native_thread_id, event.root_thread_id,
+                            event.parent_thread_id, event.timestamp_utc,
+                            event.record_type, event.event_type, event.turn_id,
+                            event.call_id, event.payload_json,
+                        ))
+                        for quota in emission.quotas:
+                            quota_rows.append((
+                                quota.source, quota.source_root_key,
+                                quota.source_path, quota.line_offset,
+                                quota.captured_at_utc, quota.observed_slot,
+                                quota.logical_limit_key, quota.limit_id,
+                                quota.limit_name, quota.window_minutes,
+                                quota.used_percent, quota.resets_at_utc,
+                                quota.plan_type, quota.individual_limit_json,
+                                quota.reached_type,
+                            ))
+                        if (thread := emission.thread) is not None and (
+                            thread.conversation_key is not None
+                            and thread.native_thread_id is not None
+                            and thread.root_thread_id is not None
+                        ):
+                            thread_rows.append((
+                                thread.conversation_key, thread.source_root_key,
+                                thread.native_thread_id, thread.root_thread_id,
+                                thread.parent_thread_id, thread.source_path,
+                                thread.cwd, thread.git_json, thread.source_kind,
+                                thread.thread_source_json, thread.model_provider,
+                                thread.context_window,
+                            ))
+                        if (entry := emission.accounting) is None:
+                            continue
+                        accounting_rows.append((
                             path_str,
-                            offset,
+                            emission.line_offset,
                             entry.timestamp.astimezone(dt.timezone.utc).isoformat(),
                             entry.session_id,
                             entry.model,
@@ -3251,6 +3750,8 @@ def sync_codex_cache(
                             entry.output_tokens,
                             entry.reasoning_output_tokens,
                             entry.total_tokens,
+                            discovered.source_root_key,
+                            event.conversation_key,
                         ))
                         yielded_count += 1
                     final_offset = fh.tell()
@@ -3292,49 +3793,69 @@ def sync_codex_cache(
             new_last_total_tokens: int | None = (
                 iter_state.total_tokens if yielded_count > 0 else prev_total_tokens
             )
+            terminal_thread = iter_state.thread
+            new_last_native_thread_id = (
+                terminal_thread.native_thread_id
+                if terminal_thread is not None else prev_native_thread_id
+            )
+            new_last_root_thread_id = (
+                terminal_thread.root_thread_id
+                if terminal_thread is not None else prev_root_thread_id
+            )
+            new_last_parent_thread_id = (
+                terminal_thread.parent_thread_id
+                if terminal_thread is not None else prev_parent_thread_id
+            )
+            new_last_conversation_key = (
+                terminal_thread.conversation_key
+                if terminal_thread is not None else prev_conversation_key
+            )
 
-            # Python's sqlite3 module starts an implicit transaction on the
-            # first DML statement and commits on conn.commit(). We do NOT
-            # call "BEGIN IMMEDIATE" ourselves — see sync_cache() for the
-            # full rationale. DELETE + INSERTs + UPDATE happen atomically in
-            # a single commit.
-            try:
-                if truncated:
-                    conn.execute(
-                        "DELETE FROM codex_session_entries WHERE source_path = ?",
-                        (path_str,),
+            # Every derived row above was buffered before the first DML. A
+            # late database failure therefore rolls the whole file back and
+            # retries that same in-memory batch exactly once.
+            committed = False
+            for attempt in range(2):
+                try:
+                    file_rows_changed = _write_codex_file_batch(
+                        conn,
+                        discovered=discovered,
+                        path_str=path_str,
+                        size=size,
+                        mtime_ns=mtime_ns,
+                        final_offset=final_offset,
+                        last_session_id=new_last_session_id,
+                        last_model=new_last_model,
+                        last_total_tokens=new_last_total_tokens,
+                        last_native_thread_id=new_last_native_thread_id,
+                        last_root_thread_id=new_last_root_thread_id,
+                        last_parent_thread_id=new_last_parent_thread_id,
+                        last_conversation_key=new_last_conversation_key,
+                        reset_file=truncated or requalified,
+                        accounting_rows=accounting_rows,
+                        quota_rows=quota_rows,
+                        thread_rows=thread_rows,
+                        event_rows=event_rows,
+                        active_root_keys={item.source_root_key for item in files},
                     )
+                except sqlite3.DatabaseError as exc:
+                    conn.rollback()
+                    if attempt == 0:
+                        # Private test seam: the callback runs after the
+                        # failed file transaction has rolled back, and before
+                        # the sole in-memory-batch retry starts.
+                        if _on_first_file_rollback is not None:
+                            _on_first_file_rollback()
+                        continue
+                    eprint(f"[codex-cache] db error on {jp}: {exc}")
+                    break
+                stats.rows_changed += file_rows_changed
+                if truncated or requalified:
                     stats.files_reset_truncated += 1
-                if rows:
-                    before = conn.total_changes
-                    conn.executemany(
-                        """INSERT OR IGNORE INTO codex_session_entries
-                           (source_path, line_offset, timestamp_utc, session_id,
-                            model, input_tokens, cached_input_tokens,
-                            output_tokens, reasoning_output_tokens,
-                            total_tokens)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        rows,
-                    )
-                    stats.rows_changed += conn.total_changes - before
-                conn.execute(
-                    """INSERT OR REPLACE INTO codex_session_files
-                       (path, size_bytes, mtime_ns, last_byte_offset,
-                        last_ingested_at, last_session_id, last_model,
-                        last_total_tokens)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (
-                        path_str, size, mtime_ns, final_offset,
-                        dt.datetime.now(dt.timezone.utc).isoformat(),
-                        new_last_session_id, new_last_model,
-                        new_last_total_tokens,
-                    ),
-                )
-                conn.commit()
                 stats.files_processed += 1
-            except sqlite3.DatabaseError as exc:
-                eprint(f"[codex-cache] db error on {jp}: {exc}")
-                conn.rollback()
+                committed = True
+                break
+            if not committed:
                 continue
 
             if progress is not None:
@@ -3357,19 +3878,32 @@ def sync_codex_cache(
             skip_reasons=stats.skip_reasons,
             rebuild=rebuild,
         )
+        # Codex creates/extends cache.db sidecars independently of Claude's
+        # sync path. Harden them while the Codex flock is still held and after
+        # all Codex writes, before the optional checkpoint can rotate a WAL.
+        _harden_cache_sidecars()
         # #297: forced end-of-sync WAL drain (Codex half). Claude and Codex
         # ingests use SEPARATE flocks but commit into the SAME cache.db WAL, so
         # the fail-fast short timeout naturally dedupes concurrent attempts —
         # whoever wins truncates; the other gets `busy` immediately and moves
         # on. All Codex ingest work is committed here (no active txn).
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
-        return stats
+        # Projection intentionally runs only after this function releases the
+        # Codex cache flock in ``finally`` below.  cache.db and stats.db are not
+        # cross-database atomic: after this committed ingest, a projection
+        # interruption is repaired by the next full reconciliation.
+        project_after_unlock = True
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
             pass
         lock_fh.close()
+
+    if project_after_unlock:
+        from _cctally_quota import reconcile_codex_quota_projection
+        reconcile_codex_quota_projection()
+    return stats
 
 
 def iter_codex_entries(
@@ -3445,24 +3979,27 @@ def get_codex_entries(
     except (sqlite3.DatabaseError, OSError) as exc:
         eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
         return _collect_codex_entries_direct(range_start, range_end)
-    if skip_sync:
+    try:
+        if skip_sync:
+            return iter_codex_entries(conn, range_start, range_end)
+        stats = sync_codex_cache(conn)
+        if stats.lock_contended:
+            # Sync commits file-by-file, so contention on the ingest lock
+            # (e.g. a concurrent --rebuild, or a first-run sync still in
+            # flight) can leave the cache PARTIALLY populated — some files
+            # ingested, others pending. An "is the table empty?" guard passes
+            # in that window and we'd silently return results missing the
+            # caller's range. Fall back to a direct JSONL parse unconditionally
+            # on contention; correctness > speed in the rare-but-real window
+            # where cache state does not match disk.
+            eprint(
+                "[cache] concurrent codex ingest in progress; "
+                "falling back to direct JSONL parse for correctness"
+            )
+            return _collect_codex_entries_direct(range_start, range_end)
         return iter_codex_entries(conn, range_start, range_end)
-    stats = sync_codex_cache(conn)
-    if stats.lock_contended:
-        # Sync commits file-by-file, so contention on the ingest lock
-        # (e.g. a concurrent --rebuild, or a first-run sync still in
-        # flight) can leave the cache PARTIALLY populated — some files
-        # ingested, others pending. An "is the table empty?" guard passes
-        # in that window and we'd silently return results missing the
-        # caller's range. Fall back to a direct JSONL parse unconditionally
-        # on contention; correctness > speed in the rare-but-real window
-        # where cache state does not match disk.
-        eprint(
-            "[cache] concurrent codex ingest in progress; "
-            "falling back to direct JSONL parse for correctness"
-        )
-        return _collect_codex_entries_direct(range_start, range_end)
-    return iter_codex_entries(conn, range_start, range_end)
+    finally:
+        conn.close()
 
 
 def _sum_codex_cost_for_range(

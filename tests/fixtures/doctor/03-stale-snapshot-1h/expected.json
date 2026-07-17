@@ -107,6 +107,34 @@
                     "severity": "warn",
                     "summary": "never",
                     "title": "Last hook fire"
+                },
+                {
+                    "details": {
+                        "installed_root_count": 0,
+                        "requires_review": false,
+                        "root_count": 0,
+                        "states": [],
+                        "trust_state": "not-applicable"
+                    },
+                    "id": "hooks.codex_installed",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex hooks installed"
+                },
+                {
+                    "details": {
+                        "activity_state": "not-applicable",
+                        "age_seconds": null,
+                        "error_count_24h": 0,
+                        "last_tick_at": null,
+                        "responsible_root_key": null,
+                        "roots": [],
+                        "success_count_24h": 0
+                    },
+                    "id": "hooks.codex_recent_activity",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex recent activity"
                 }
             ],
             "id": "hooks",
@@ -132,12 +160,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
-                        "registry_size": 12,
+                        "registry_size": 13,
                         "user_version": 0
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 0 / 12 known",
+                    "summary": "version 0 / 13 known",
                     "title": "stats.db"
                 },
                 {
@@ -163,12 +191,12 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 21,
+                            "registry_size": 24,
                             "user_version": 0
                         },
                         "stats.db": {
                             "ahead": false,
-                            "registry_size": 12,
+                            "registry_size": 13,
                             "user_version": 0
                         }
                     },
@@ -204,7 +232,10 @@
                                     "018_create_conversation_title_fts",
                                     "019_create_conversation_file_touches",
                                     "020_session_entries_physical_unique",
-                                    "021_index_conversation_messages_cwd"
+                                    "021_index_conversation_messages_cwd",
+                                    "022_index_conversation_messages_model",
+                                    "023_conversation_sessions_enrichment_columns",
+                                    "024_codex_fused_ingest_rebuild"
                                 ],
                                 "skipped": []
                             },
@@ -223,7 +254,8 @@
                                     "009_recompute_five_hour_blocks_dedup_fix",
                                     "010_recompute_percent_milestones_dedup_fix",
                                     "011_budget_milestone_period_keys",
-                                    "012_unify_budget_milestones_vendor"
+                                    "012_unify_budget_milestones_vendor",
+                                    "013_codex_quota_projection_state"
                                 ],
                                 "skipped": []
                             }
@@ -231,7 +263,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/33 applied",
+                    "summary": "0/37 applied",
                     "title": "Migrations"
                 },
                 {
@@ -284,6 +316,10 @@
                             [
                                 "stats.db",
                                 "012_unify_budget_milestones_vendor"
+                            ],
+                            [
+                                "stats.db",
+                                "013_codex_quota_projection_state"
                             ],
                             [
                                 "cache.db",
@@ -368,13 +404,25 @@
                             [
                                 "cache.db",
                                 "021_index_conversation_messages_cwd"
+                            ],
+                            [
+                                "cache.db",
+                                "022_index_conversation_messages_model"
+                            ],
+                            [
+                                "cache.db",
+                                "023_conversation_sessions_enrichment_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "024_codex_fused_ingest_rebuild"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "33 pending",
+                    "summary": "37 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -435,6 +483,21 @@
                     "severity": "ok",
                     "summary": "none (no Codex session JSONL found)",
                     "title": "Codex cache"
+                },
+                {
+                    "details": {
+                        "age_seconds": null,
+                        "freshness_state": "unavailable",
+                        "latest_capture_at": null,
+                        "responsible_identity": null,
+                        "stale_after_seconds": null,
+                        "window_count": 0,
+                        "windows": []
+                    },
+                    "id": "data.codex_quota",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex quota"
                 },
                 {
                     "details": {
@@ -573,7 +636,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 23,
+            "ok": 26,
             "warn": 7
         },
         "severity": "fail"

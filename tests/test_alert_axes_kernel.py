@@ -39,12 +39,17 @@ def _restore_sys_modules():
             sys.modules[name] = mod
 
 
-def test_registry_has_six_axes_in_order():
+def test_dashboard_registry_has_six_mapped_axes_and_quota_is_backend_only():
     m = _load("_lib_alert_axes")
     assert [d.id for d in m.AXIS_REGISTRY] == [
         "weekly", "five_hour", "budget", "projected", "project_budget",
         "codex_budget",
     ]
+    assert [d.id for d in m.BACKEND_ONLY_AXIS_REGISTRY] == ["quota"]
+    assert "quota" not in m.AXIS_BY_ID
+    quota = m.BACKEND_ONLY_AXIS_BY_ID["quota"]
+    assert quota.chip_label == "QUOTA"
+    assert quota.milestone_table == "quota_threshold_events"
 
 
 def test_severity_for_three_tier_bands():

@@ -4,6 +4,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { fmt } from '../lib/fmt';
 import { alertSeverity, AXIS_CHIP_LABEL } from '../lib/alertAxis';
+import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
 import { ExpandButton } from './ExpandButton';
@@ -58,18 +59,10 @@ export function RecentAlertsPanel(): JSX.Element {
     <section
       className={'panel accent-amber' + (collapsed ? ' alerts-collapsed' : '')}
       id="panel-alerts"
-      tabIndex={0}
       role="region"
       aria-label="Recent alerts panel"
       data-panel-kind="alerts"
-      onClick={openModal}
-      onKeyDown={(e) => {
-        if (e.target !== e.currentTarget) return;
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          openModal();
-        }
-      }}
+      onClick={cardRegionClick(openModal)}
     >
       <div
         className="panel-header"

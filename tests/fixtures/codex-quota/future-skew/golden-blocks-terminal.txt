@@ -1,0 +1,2 @@
+Codex quota blocks · local-rollout
+primary · 1h · root=skew-root · limit=limit-skew · 30.0% → 30.0% · reset 2026-07-15T15:00:00Z

@@ -42,6 +42,65 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+def _codex_lifecycle_activity_24h(
+    *, root_keys: set[str], now_utc: dt.datetime,
+) -> dict[str, dict]:
+    """Read root-qualified Codex lifecycle outcomes from bounded local logs.
+
+    The parser intentionally accepts only timestamped token records and retains
+    aggregate lifecycle counters.  It never loads session, prompt, or response
+    content into doctor state.
+    """
+    cutoff = now_utc - dt.timedelta(hours=24)
+    records: dict[str, dict] = {}
+    for path in (
+        _cctally_core.HOOK_TICK_LOG_ROTATED_PATH,
+        _cctally_core.HOOK_TICK_LOG_PATH,
+    ):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            try:
+                captured_at = parse_iso_datetime(tokens[0], "codex lifecycle log timestamp")
+                captured_at = captured_at.astimezone(dt.timezone.utc)
+            except (IndexError, ValueError, TypeError):
+                continue
+            if captured_at > now_utc:
+                continue
+            fields = {
+                token.split("=", 1)[0]: token.split("=", 1)[1]
+                for token in tokens[1:] if "=" in token
+            }
+            if fields.get("provider") != "codex":
+                continue
+            key = fields.get("source_root_key")
+            if key not in root_keys:
+                continue
+            outcome = fields.get("result")
+            if outcome not in {"success", "error"}:
+                continue
+            row = records.setdefault(key, {
+                "last_tick_at": None,
+                "success_count_24h": 0,
+                "error_count_24h": 0,
+            })
+            if outcome == "success":
+                prior = row["last_tick_at"]
+                if prior is None or captured_at > prior:
+                    row["last_tick_at"] = captured_at
+            if captured_at >= cutoff:
+                if outcome == "success":
+                    row["success_count_24h"] += 1
+                else:
+                    row["error_count_24h"] += 1
+    return records
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
@@ -398,6 +457,62 @@ def doctor_gather_state(
     except Exception:
         pass
 
+    # ── Codex quota lifecycle (#294 S2) ──────────────────────────────
+    # All three probes are read-only and root-qualified.  The physical cache
+    # adapter preserves S1's per-window degradation, while setup's existing
+    # inspector supplies the exact owned-hook state without exposing paths.
+    codex_quota_windows: list[dict] = []
+    try:
+        observations = c._cctally_quota.load_codex_quota_observations()
+        by_identity: dict[object, list] = {}
+        for observation in observations:
+            by_identity.setdefault(observation.identity, []).append(observation)
+        for identity in sorted(
+            by_identity,
+            key=lambda item: (
+                item.source, item.source_root_key, item.logical_limit_key,
+                item.observed_slot, item.window_minutes,
+            ),
+        ):
+            freshness = c.quota_freshness(by_identity[identity], now_utc)
+            codex_quota_windows.append({
+                "identity": {
+                    "source": identity.source,
+                    "source_root_key": identity.source_root_key,
+                    "logical_limit_key": identity.logical_limit_key,
+                    "observed_slot": identity.observed_slot,
+                    "window_minutes": identity.window_minutes,
+                },
+                "latest_capture_at": freshness.captured_at,
+                "freshness_state": freshness.state,
+                "age_seconds": freshness.age_seconds,
+                "stale_after_seconds": freshness.stale_after_seconds,
+            })
+    except Exception:
+        codex_quota_windows = []
+
+    codex_hook_roots: list[dict] = []
+    try:
+        codex_binary = str(c._setup_resolve_hook_target(repo_root))
+        hook_rows = [
+            c._cctally_setup._codex_hook_row(root, codex_binary)
+            for root in c._setup_codex_hook_roots()
+        ]
+        codex_hook_roots = [
+            {"source_root_key": row["source_root_key"], "state": row["state"]}
+            for row in sorted(hook_rows, key=lambda row: row["source_root_key"])
+        ]
+    except Exception:
+        codex_hook_roots = []
+
+    try:
+        codex_lifecycle_activity_24h = _codex_lifecycle_activity_24h(
+            root_keys={row["source_root_key"] for row in codex_hook_roots},
+            now_utc=now_utc,
+        )
+    except Exception:
+        codex_lifecycle_activity_24h = {}
+
     # ── Parse health (#279 S2 F5a) ───────────────────────────────────
     parse_health_claude = parse_health_codex = None
     try:
@@ -659,6 +774,9 @@ def doctor_gather_state(
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,
+        codex_quota_windows=codex_quota_windows,
+        codex_hook_roots=codex_hook_roots,
+        codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,
     )
 
 

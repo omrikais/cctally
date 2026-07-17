@@ -1,0 +1,653 @@
+{
+    "categories": [
+        {
+            "checks": [
+                {
+                    "details": {
+                        "app_dir": "$HOME/.local/share/cctally",
+                        "channel": "prod",
+                        "dev_mode": false,
+                        "is_dev_checkout": false
+                    },
+                    "id": "install.mode",
+                    "severity": "ok",
+                    "summary": "installed",
+                    "title": "Mode"
+                },
+                {
+                    "details": {
+                        "missing": [],
+                        "present": 15,
+                        "stale": [],
+                        "total": 15
+                    },
+                    "id": "install.symlinks",
+                    "severity": "ok",
+                    "summary": "15/15 available",
+                    "title": "Symlinks"
+                },
+                {
+                    "details": {},
+                    "id": "install.path",
+                    "severity": "ok",
+                    "summary": "cctally reachable on $PATH",
+                    "title": "PATH"
+                },
+                {
+                    "details": {},
+                    "id": "install.legacy_snippet",
+                    "severity": "ok",
+                    "summary": "not detected",
+                    "title": "Legacy status-line snippet"
+                },
+                {
+                    "details": {},
+                    "id": "install.legacy_bespoke_hooks",
+                    "severity": "ok",
+                    "summary": "not detected",
+                    "title": "Legacy bespoke hooks"
+                }
+            ],
+            "id": "install",
+            "severity": "ok",
+            "title": "Install"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "counts": {
+                            "PostToolBatch": 1,
+                            "Stop": 1,
+                            "SubagentStop": 1
+                        }
+                    },
+                    "id": "hooks.installed",
+                    "severity": "ok",
+                    "summary": "PostToolBatch, Stop, SubagentStop",
+                    "title": "Hook entries installed"
+                },
+                {
+                    "details": {
+                        "by_event": {},
+                        "errors": 0,
+                        "fires": 0,
+                        "last_fire_age_s": null
+                    },
+                    "id": "hooks.recent_activity_24h",
+                    "remediation": "No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.",
+                    "severity": "warn",
+                    "summary": "0 fires",
+                    "title": "Recent activity (24h)"
+                },
+                {
+                    "details": {
+                        "last_fire_age_s": null
+                    },
+                    "id": "hooks.last_fire_age",
+                    "remediation": "No hook has fired yet. Restart Claude Code.",
+                    "severity": "warn",
+                    "summary": "never",
+                    "title": "Last hook fire"
+                },
+                {
+                    "details": {
+                        "installed_root_count": 2,
+                        "requires_review": null,
+                        "root_count": 2,
+                        "states": [
+                            {
+                                "source_root_key": "$CODEX_ROOT_1",
+                                "state": "installed_trust_unobservable"
+                            },
+                            {
+                                "source_root_key": "$CODEX_ROOT_2",
+                                "state": "installed_trust_unobservable"
+                            }
+                        ],
+                        "trust_state": "unobservable"
+                    },
+                    "id": "hooks.codex_installed",
+                    "severity": "ok",
+                    "summary": "2/2 root(s) installed",
+                    "title": "Codex hooks installed"
+                },
+                {
+                    "details": {
+                        "activity_state": "stale",
+                        "age_seconds": 86401,
+                        "error_count_24h": 0,
+                        "last_tick_at": "2026-05-12T14:22:30Z",
+                        "responsible_root_key": "$CODEX_ROOT_2",
+                        "roots": [
+                            {
+                                "activity_state": "recent",
+                                "age_seconds": 30,
+                                "error_count_24h": 1,
+                                "last_tick_at": "2026-05-13T14:22:01Z",
+                                "source_root_key": "$CODEX_ROOT_1",
+                                "success_count_24h": 1
+                            },
+                            {
+                                "activity_state": "stale",
+                                "age_seconds": 86401,
+                                "error_count_24h": 0,
+                                "last_tick_at": "2026-05-12T14:22:30Z",
+                                "source_root_key": "$CODEX_ROOT_2",
+                                "success_count_24h": 0
+                            }
+                        ],
+                        "success_count_24h": 0
+                    },
+                    "id": "hooks.codex_recent_activity",
+                    "remediation": "Trigger Codex activity, then verify `cctally setup` hooks.",
+                    "severity": "warn",
+                    "summary": "2 installed root(s); stale",
+                    "title": "Codex recent activity"
+                }
+            ],
+            "id": "hooks",
+            "severity": "warn",
+            "title": "Hooks"
+        },
+        {
+            "checks": [
+                {
+                    "details": {},
+                    "id": "oauth.token_present",
+                    "severity": "ok",
+                    "summary": "present",
+                    "title": "OAuth token"
+                }
+            ],
+            "id": "auth",
+            "severity": "ok",
+            "title": "Auth"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "path": "$HOME/.local/share/cctally/stats.db",
+                        "registry_size": 13,
+                        "user_version": 0
+                    },
+                    "id": "db.stats.file",
+                    "severity": "ok",
+                    "summary": "version 0 / 13 known",
+                    "title": "stats.db"
+                },
+                {
+                    "details": {
+                        "path": "$HOME/.local/share/cctally/cache.db"
+                    },
+                    "id": "db.cache.file",
+                    "severity": "warn",
+                    "summary": "absent (fresh install)",
+                    "title": "cache.db"
+                },
+                {
+                    "details": {
+                        "cache_quick_check": null,
+                        "stats_quick_check": "ok"
+                    },
+                    "id": "db.integrity",
+                    "severity": "ok",
+                    "summary": "quick_check ok",
+                    "title": "Integrity"
+                },
+                {
+                    "details": {
+                        "cache.db": {
+                            "ahead": false,
+                            "registry_size": 24,
+                            "user_version": 0
+                        },
+                        "stats.db": {
+                            "ahead": false,
+                            "registry_size": 13,
+                            "user_version": 0
+                        }
+                    },
+                    "id": "db.version_ahead",
+                    "severity": "ok",
+                    "summary": "none ahead",
+                    "title": "Version ahead"
+                },
+                {
+                    "details": {
+                        "by_db": {
+                            "cache.db": {
+                                "applied": [],
+                                "failed": [],
+                                "pending": [
+                                    "001_dedup_highest_wins",
+                                    "002_conversation_messages_backfill",
+                                    "003_conversation_reingest_tool_ids",
+                                    "004_conversation_reingest_subagent_kind",
+                                    "005_conversation_reingest_meta",
+                                    "006_conversation_reingest_source_tool_use_id",
+                                    "007_conversation_reingest_enrichment",
+                                    "008_session_entries_speed_backfill",
+                                    "009_conversation_media_reingest",
+                                    "010_conversation_search_split",
+                                    "011_conversation_promote_command_args",
+                                    "012_create_conversation_ai_titles",
+                                    "013_create_conversation_sessions",
+                                    "014_conversation_queued_prompt_reingest",
+                                    "015_conversation_sessions_filter_columns",
+                                    "016_drop_search_aux",
+                                    "017_arm_nested_agent_reingest",
+                                    "018_create_conversation_title_fts",
+                                    "019_create_conversation_file_touches",
+                                    "020_session_entries_physical_unique",
+                                    "021_index_conversation_messages_cwd",
+                                    "022_index_conversation_messages_model",
+                                    "023_conversation_sessions_enrichment_columns",
+                                    "024_codex_fused_ingest_rebuild"
+                                ],
+                                "skipped": []
+                            },
+                            "stats.db": {
+                                "applied": [],
+                                "failed": [],
+                                "pending": [
+                                    "001_five_hour_block_models_backfill_v1",
+                                    "002_five_hour_block_projects_backfill_v1",
+                                    "003_merge_5h_block_duplicates_v1",
+                                    "004_heal_forked_week_start_date_buckets",
+                                    "005_percent_milestones_reset_event_id",
+                                    "006_five_hour_milestones_reset_event_id",
+                                    "007_observed_pre_credit_pct",
+                                    "008_recompute_weekly_cost_snapshots_dedup_fix",
+                                    "009_recompute_five_hour_blocks_dedup_fix",
+                                    "010_recompute_percent_milestones_dedup_fix",
+                                    "011_budget_milestone_period_keys",
+                                    "012_unify_budget_milestones_vendor",
+                                    "013_codex_quota_projection_state"
+                                ],
+                                "skipped": []
+                            }
+                        }
+                    },
+                    "id": "db.migrations.applied",
+                    "severity": "ok",
+                    "summary": "0/37 applied",
+                    "title": "Migrations"
+                },
+                {
+                    "details": {
+                        "pending": [
+                            [
+                                "stats.db",
+                                "001_five_hour_block_models_backfill_v1"
+                            ],
+                            [
+                                "stats.db",
+                                "002_five_hour_block_projects_backfill_v1"
+                            ],
+                            [
+                                "stats.db",
+                                "003_merge_5h_block_duplicates_v1"
+                            ],
+                            [
+                                "stats.db",
+                                "004_heal_forked_week_start_date_buckets"
+                            ],
+                            [
+                                "stats.db",
+                                "005_percent_milestones_reset_event_id"
+                            ],
+                            [
+                                "stats.db",
+                                "006_five_hour_milestones_reset_event_id"
+                            ],
+                            [
+                                "stats.db",
+                                "007_observed_pre_credit_pct"
+                            ],
+                            [
+                                "stats.db",
+                                "008_recompute_weekly_cost_snapshots_dedup_fix"
+                            ],
+                            [
+                                "stats.db",
+                                "009_recompute_five_hour_blocks_dedup_fix"
+                            ],
+                            [
+                                "stats.db",
+                                "010_recompute_percent_milestones_dedup_fix"
+                            ],
+                            [
+                                "stats.db",
+                                "011_budget_milestone_period_keys"
+                            ],
+                            [
+                                "stats.db",
+                                "012_unify_budget_milestones_vendor"
+                            ],
+                            [
+                                "stats.db",
+                                "013_codex_quota_projection_state"
+                            ],
+                            [
+                                "cache.db",
+                                "001_dedup_highest_wins"
+                            ],
+                            [
+                                "cache.db",
+                                "002_conversation_messages_backfill"
+                            ],
+                            [
+                                "cache.db",
+                                "003_conversation_reingest_tool_ids"
+                            ],
+                            [
+                                "cache.db",
+                                "004_conversation_reingest_subagent_kind"
+                            ],
+                            [
+                                "cache.db",
+                                "005_conversation_reingest_meta"
+                            ],
+                            [
+                                "cache.db",
+                                "006_conversation_reingest_source_tool_use_id"
+                            ],
+                            [
+                                "cache.db",
+                                "007_conversation_reingest_enrichment"
+                            ],
+                            [
+                                "cache.db",
+                                "008_session_entries_speed_backfill"
+                            ],
+                            [
+                                "cache.db",
+                                "009_conversation_media_reingest"
+                            ],
+                            [
+                                "cache.db",
+                                "010_conversation_search_split"
+                            ],
+                            [
+                                "cache.db",
+                                "011_conversation_promote_command_args"
+                            ],
+                            [
+                                "cache.db",
+                                "012_create_conversation_ai_titles"
+                            ],
+                            [
+                                "cache.db",
+                                "013_create_conversation_sessions"
+                            ],
+                            [
+                                "cache.db",
+                                "014_conversation_queued_prompt_reingest"
+                            ],
+                            [
+                                "cache.db",
+                                "015_conversation_sessions_filter_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "016_drop_search_aux"
+                            ],
+                            [
+                                "cache.db",
+                                "017_arm_nested_agent_reingest"
+                            ],
+                            [
+                                "cache.db",
+                                "018_create_conversation_title_fts"
+                            ],
+                            [
+                                "cache.db",
+                                "019_create_conversation_file_touches"
+                            ],
+                            [
+                                "cache.db",
+                                "020_session_entries_physical_unique"
+                            ],
+                            [
+                                "cache.db",
+                                "021_index_conversation_messages_cwd"
+                            ],
+                            [
+                                "cache.db",
+                                "022_index_conversation_messages_model"
+                            ],
+                            [
+                                "cache.db",
+                                "023_conversation_sessions_enrichment_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "024_codex_fused_ingest_rebuild"
+                            ]
+                        ]
+                    },
+                    "id": "db.migrations.pending",
+                    "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
+                    "severity": "warn",
+                    "summary": "37 pending",
+                    "title": "Pending migrations"
+                },
+                {
+                    "details": {
+                        "locks": {
+                            "cache.db.codex.lock": false,
+                            "cache.db.lock": false
+                        }
+                    },
+                    "id": "db.lock_state",
+                    "severity": "ok",
+                    "summary": "free",
+                    "title": "Locks"
+                },
+                {
+                    "details": {
+                        "cache_db_wal_bytes": 0
+                    },
+                    "id": "db.wal_size",
+                    "severity": "ok",
+                    "summary": "within limit",
+                    "title": "cache.db WAL size"
+                }
+            ],
+            "id": "db",
+            "severity": "warn",
+            "title": "Database"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "latest_snapshot_age_s": 2,
+                        "latest_snapshot_at": "2026-05-13T14:22:29+00:00"
+                    },
+                    "id": "data.latest_snapshot_age",
+                    "severity": "ok",
+                    "summary": "2s ago",
+                    "title": "Latest snapshot"
+                },
+                {
+                    "details": {
+                        "claude_jsonl_present": false,
+                        "entries": 0
+                    },
+                    "id": "data.cache_sync_state",
+                    "severity": "ok",
+                    "summary": "0 entries (no JSONL corpus)",
+                    "title": "Claude cache"
+                },
+                {
+                    "details": {
+                        "codex_jsonl_present": false,
+                        "entries": 0
+                    },
+                    "id": "data.codex_cache",
+                    "severity": "ok",
+                    "summary": "none (no Codex session JSONL found)",
+                    "title": "Codex cache"
+                },
+                {
+                    "details": {
+                        "age_seconds": null,
+                        "freshness_state": "unavailable",
+                        "latest_capture_at": null,
+                        "responsible_identity": null,
+                        "stale_after_seconds": null,
+                        "window_count": 0,
+                        "windows": []
+                    },
+                    "id": "data.codex_quota",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex quota"
+                },
+                {
+                    "details": {
+                        "claude": null,
+                        "codex": null
+                    },
+                    "id": "data.parse_health",
+                    "severity": "ok",
+                    "summary": "no parse-health data yet (pre-first-sync)",
+                    "title": "Ingest parse health"
+                },
+                {
+                    "details": {
+                        "cost": 0,
+                        "milestones": 0,
+                        "usage": 0
+                    },
+                    "id": "data.forked_buckets",
+                    "severity": "ok",
+                    "summary": "none",
+                    "title": "Forked week buckets"
+                },
+                {
+                    "details": {
+                        "credited_weeks": 0
+                    },
+                    "id": "data.post_credit_milestones",
+                    "severity": "ok",
+                    "summary": "no credited weeks",
+                    "title": "Post-credit milestones"
+                },
+                {
+                    "details": {
+                        "messages_distinct_sessions": null,
+                        "rollup_count": null
+                    },
+                    "id": "data.conversation_sessions_rollup",
+                    "severity": "ok",
+                    "summary": "no data",
+                    "title": "Conversation rollup"
+                }
+            ],
+            "id": "data",
+            "severity": "ok",
+            "title": "Data"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "fallback": [],
+                        "unpriced": []
+                    },
+                    "id": "pricing.coverage",
+                    "severity": "ok",
+                    "summary": "all observed models priced",
+                    "title": "Coverage"
+                }
+            ],
+            "id": "pricing",
+            "severity": "ok",
+            "title": "Pricing"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "config": "loopback",
+                        "runtime_bind": null
+                    },
+                    "id": "safety.dashboard_bind",
+                    "severity": "ok",
+                    "summary": "config: loopback",
+                    "title": "Dashboard bind"
+                },
+                {
+                    "details": {},
+                    "id": "safety.config_json_valid",
+                    "severity": "ok",
+                    "summary": "absent or parses cleanly",
+                    "title": "config.json"
+                },
+                {
+                    "details": {},
+                    "id": "safety.update_state",
+                    "remediation": "Run `cctally update --check` to populate",
+                    "severity": "warn",
+                    "summary": "absent (first run)",
+                    "title": "update-state.json"
+                },
+                {
+                    "details": {
+                        "remind_after": null,
+                        "skipped_versions": []
+                    },
+                    "id": "safety.update_suppress",
+                    "severity": "ok",
+                    "summary": "parses cleanly",
+                    "title": "update-suppress.json"
+                },
+                {
+                    "details": {
+                        "current_version": null,
+                        "latest_version": null
+                    },
+                    "id": "safety.update_available",
+                    "severity": "ok",
+                    "summary": "no",
+                    "title": "Update available"
+                }
+            ],
+            "id": "safety",
+            "severity": "warn",
+            "title": "Safety"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "enabled": true,
+                        "reason": "enabled"
+                    },
+                    "id": "telemetry.state",
+                    "severity": "ok",
+                    "summary": "enabled (enabled)",
+                    "title": "State"
+                }
+            ],
+            "id": "telemetry",
+            "severity": "ok",
+            "title": "Telemetry"
+        }
+    ],
+    "cctally_version": "<redacted>",
+    "generated_at": "2026-05-13T14:22:31Z",
+    "overall": {
+        "counts": {
+            "fail": 0,
+            "ok": 28,
+            "warn": 6
+        },
+        "severity": "warn"
+    },
+    "schema_version": 1
+}

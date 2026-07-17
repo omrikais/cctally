@@ -602,6 +602,7 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 def cmd_range_cost(args: argparse.Namespace) -> int:
     c = _cctally()
+    c._share_validate_args(args)
     # Session A (spec §7.2 / §7.6 row note): range-cost has no --tz of
     # its own — start/end carry their own zone via ISO 8601. Calling the
     # bridge keeps the alias-surface contract uniform across the 10
@@ -701,7 +702,12 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
             ),
             "modelBreakdowns": breakdowns,
         }
-        print(json.dumps(c.stamp_schema_version(output), indent=2))
+        payload = c.stamp_schema_version(output)
+        sink = getattr(args, "_source_result_sink", None)
+        if sink is not None:
+            sink(payload)
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
 
     if args.breakdown:

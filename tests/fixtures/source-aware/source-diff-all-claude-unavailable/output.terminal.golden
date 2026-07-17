@@ -1,0 +1,18 @@
+Claude Diff Report
+Unavailable: Claude analytics are unavailable.
+
+Codex Diff Report
+Overall: A $4.250000 / 1,234 tokens; B $7.500000 / 2,300 tokens; Δ +$3.250000 / +1,066 tokens
+- Overall: ok
+  - Overall [changed]: A $4.250000 / 1,234 tokens; B $7.500000 / 2,300 tokens; Δ +$3.250000 / +1,066 tokens
+- Models: ok
+  - gpt-5 [changed]: A $4.250000 / 1,234 tokens; B $5.500000 / 1,500 tokens; Δ +$1.250000 / +266 tokens
+  - gpt-5.5 [new]: A $0.000000 / 0 tokens; B $2.000000 / 800 tokens; Δ +$2.000000 / +800 tokens
+- Projects: ok
+  - project [changed]: A $4.250000 / 1,234 tokens; B $5.500000 / 1,500 tokens; Δ +$1.250000 / +266 tokens
+  - other-project [new]: A $0.000000 / 0 tokens; B $2.000000 / 800 tokens; Δ +$2.000000 / +800 tokens
+- Token reuse: ok
+  - gpt-5 [changed]: A $4.250000 / 1,234 tokens; B $5.500000 / 1,500 tokens; Δ +$1.250000 / +266 tokens
+  - gpt-5.5 [new]: A $0.000000 / 0 tokens; B $2.000000 / 800 tokens; Δ +$2.000000 / +800 tokens
+
+Combined physical accounting: A $4.250000; B $7.500000; Δ +$3.250000; A 1,234 tokens; B 2,300 tokens; Δ +1,066 tokens

@@ -6,6 +6,7 @@ import { fmt, type FmtCtx } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
 import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
+import { cardRegionClick } from '../lib/cardRegion';
 import { dispatch } from '../store/store';
 
 // HeroStrip (#264 S1, spec §4) — the dashboard's full-width at-a-glance hero,
@@ -78,8 +79,15 @@ export function HeroStrip() {
       tabIndex={0}
       aria-label="Week usage summary"
       data-hero-strip=""
-      onClick={openCurrentWeek}
+      // #293 S4 — HeroStrip is the explicit non-card exception: it KEEPS its
+      // focusable region + activation (it is the hero summary, with no Expand
+      // alternative), but adopts the same double-fire guards so a nested control
+      // can't fire the modal twice. The click guard bails on an interactive /
+      // ignore target; the keydown guard only activates when the hero itself
+      // (not a bubbled child) is the event target.
+      onClick={cardRegionClick(openCurrentWeek)}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           openCurrentWeek();

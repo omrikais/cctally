@@ -54,6 +54,14 @@ write_canonical_settings() {
 }
 JSON
 }
+
+write_codex_hooks() {
+  local root="$1"
+  mkdir -p "$root/sessions"
+  cat > "$root/hooks.json" <<JSON
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}],"SubagentStop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}]}}
+JSON
+}
 # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
 # Reachability source for the empty ~/.local/bin slots → `ok`.
 mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"

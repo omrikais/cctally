@@ -7,7 +7,8 @@
 // a single sr-only live region conveys "loading" to AT. The shimmer animation
 // is gated in CSS by prefers-reduced-motion. Not drag-enabled and registers no
 // keymap — a pure placeholder.
-import { CARD_LAYOUT, DEFAULT_PANEL_ORDER } from '../lib/panelIds';
+import { DEFAULT_PANEL_ORDER, CARD_LAYOUT } from '../lib/panelIds';
+import { boardSpan, type BoardMode } from '../lib/boardLayout';
 
 const ROWS: Array<'tall' | 'medium' | 'short'> = ['tall', 'medium', 'short'];
 
@@ -25,19 +26,22 @@ function SkelCard({ span }: { span: number }) {
   );
 }
 
-export function SkeletonGrid() {
+export function SkeletonGrid({ mode }: { mode: BoardMode }) {
   return (
     <>
       <span className="sr-only" role="status" aria-live="polite">Loading dashboard…</span>
       {/* Hero-strip placeholder (echoes the at-a-glance hero). */}
       <div className="skel-hero" aria-hidden="true" />
-      <div className="dash-grid" aria-hidden="true">
+      {/* #293 S1 — the skeleton reads the SAME board mode as the live grid so
+          the load→ready swap can't reflow (at 900–1199 both tile Sessions-full
+          / Trend·Projects-paired instead of the crushed 6/3/3). */}
+      <div className="dash-grid" aria-hidden="true" data-board-mode={mode}>
         {ROWS.map((row) => {
           const ids = DEFAULT_PANEL_ORDER.filter((id) => CARD_LAYOUT[id].row === row);
           return (
             <div key={row} className={`bento-row row-${row}`}>
               {ids.map((id) => (
-                <SkelCard key={id} span={CARD_LAYOUT[id].span} />
+                <SkelCard key={id} span={boardSpan(id, mode)} />
               ))}
             </div>
           );

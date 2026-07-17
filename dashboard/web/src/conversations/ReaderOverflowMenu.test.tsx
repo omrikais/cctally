@@ -178,16 +178,17 @@ describe('ReaderOverflowMenu', () => {
     it('renders the Anonymize row and reflects anonMode=true (pressed, On)', () => {
       render(<ReaderOverflowMenu {...baseProps} anonMode />);
       const menu = openMenu();
-      const row = within(menu).getByRole('menuitem', { name: /anonymize/i });
-      expect(row).toHaveAttribute('aria-pressed', 'true');
+      const row = within(menu).getByRole('menuitemcheckbox', { name: /anonymize/i });
+      expect(row).toHaveAttribute('aria-checked', 'true');
+      expect(row.getAttribute('aria-pressed')).toBeNull();   // #304 S2 — APG checkbox semantics replace the pressed-button hybrid
       expect(within(row).getByText('On')).not.toBeNull();
     });
 
     it('reflects anonMode=false (not pressed, Off)', () => {
       render(<ReaderOverflowMenu {...baseProps} anonMode={false} />);
       const menu = openMenu();
-      const row = within(menu).getByRole('menuitem', { name: /anonymize/i });
-      expect(row).toHaveAttribute('aria-pressed', 'false');
+      const row = within(menu).getByRole('menuitemcheckbox', { name: /anonymize/i });
+      expect(row).toHaveAttribute('aria-checked', 'false');
       expect(within(row).getByText('Off')).not.toBeNull();
     });
 
@@ -195,7 +196,7 @@ describe('ReaderOverflowMenu', () => {
       const onToggleAnon = vi.fn();
       render(<ReaderOverflowMenu {...baseProps} onToggleAnon={onToggleAnon} />);
       openMenu();
-      fireEvent.click(screen.getByRole('menuitem', { name: /anonymize/i }));
+      fireEvent.click(screen.getByRole('menuitemcheckbox', { name: /anonymize/i }));
       expect(onToggleAnon).toHaveBeenCalledTimes(1);
       // Unlike Compare/Expand/etc., the toggle does NOT close the menu.
       expect(screen.queryByRole('menu', { name: /more actions/i })).not.toBeNull();
@@ -239,17 +240,67 @@ describe('ReaderOverflowMenu', () => {
       }
       render(<Harness />);
       const menu = openMenu();
-      const row = within(menu).getByRole('menuitem', { name: /anonymize/i });
-      expect(row).toHaveAttribute('aria-pressed', 'true'); // default ON
+      const row = within(menu).getByRole('menuitemcheckbox', { name: /anonymize/i });
+      expect(row).toHaveAttribute('aria-checked', 'true'); // default ON
       fireEvent.click(row);
       // Persisted OFF ('0') and the row re-renders reflecting the new state.
       expect(localStorage.getItem(ANON_MODE_KEY)).toBe('0');
       expect(loadAnonMode()).toBe(false);
       expect(
-        within(screen.getByRole('menu', { name: /more actions/i })).getByRole('menuitem', {
+        within(screen.getByRole('menu', { name: /more actions/i })).getByRole('menuitemcheckbox', {
           name: /anonymize/i,
         }),
-      ).toHaveAttribute('aria-pressed', 'false');
+      ).toHaveAttribute('aria-checked', 'false');
+    });
+  });
+
+  // #304 S3 (Codex F3) — folding the desktop strip must not drop the ✓ Complete
+  // JUMP. When the reader passes onCompletionJump, the read-only completion
+  // summary row becomes a real actionable menuitem (the ≤1100 compact band
+  // gains the repaired jump too). Without the callback, today's read-only row
+  // is byte-identical.
+  describe('#304 S3 actionable completion jump (Codex F3)', () => {
+    it('with onCompletionJump: completion is the LAST roving menuitem, fires the jump + closes, and is NOT a read-only summary row', () => {
+      const onCompletionJump = vi.fn();
+      render(
+        <ReaderOverflowMenu
+          {...baseProps}
+          completionTotal={12}
+          costCumulative={1.2}
+          costTotal={3.4}
+          onCompletionJump={onCompletionJump}
+        />,
+      );
+      const menu = openMenu();
+      const item = within(menu).getByRole('menuitem', { name: /✓ Complete · 12/i });
+      expect(item).not.toBeNull();
+      // Appended after Collapse-all → it is the LAST roving menuitem.
+      const menuitems = within(menu).getAllByRole('menuitem');
+      expect(menuitems[menuitems.length - 1]).toBe(item);
+      // No read-only completion summary row (the "✓ 12" summary value is gone).
+      expect(within(menu).queryByText('✓ 12')).toBeNull();
+      // The cost summary row still renders.
+      expect(within(menu).getByText(/\$1\.20 \/ \$3\.40/)).not.toBeNull();
+      // Clicking fires the jump once and closes the menu (focus-return path).
+      fireEvent.click(item);
+      expect(onCompletionJump).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('menu', { name: /more actions/i })).toBeNull();
+    });
+
+    it('without onCompletionJump: completion renders as the read-only summary row (unchanged)', () => {
+      render(<ReaderOverflowMenu {...baseProps} completionTotal={12} />);
+      const menu = openMenu();
+      // Read-only summary value, NOT a menuitem.
+      expect(within(menu).getByText('✓ 12')).not.toBeNull();
+      expect(within(menu).queryByRole('menuitem', { name: /✓ Complete/i })).toBeNull();
+    });
+
+    it('with onCompletionJump but no completion (completionTotal null): no completion menuitem and no summary row', () => {
+      const onCompletionJump = vi.fn();
+      render(<ReaderOverflowMenu {...baseProps} completionTotal={null} onCompletionJump={onCompletionJump} />);
+      const menu = openMenu();
+      expect(within(menu).queryByRole('menuitem', { name: /✓ Complete/i })).toBeNull();
+      expect(within(menu).queryByText(/✓/)).toBeNull();
     });
   });
 });

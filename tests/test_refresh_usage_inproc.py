@@ -1,5 +1,45 @@
 """Unit tests for the in-process refresh-usage helper."""
+import time
+
 from conftest import load_script, redirect_paths
+
+
+def _newest_source(ns):
+    """The `source` of the most-recent weekly_usage_snapshots row, or None."""
+    conn = ns["open_db"]()
+    try:
+        row = conn.execute(
+            "SELECT source FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["source"] if row is not None else None
+
+
+def test_refresh_inproc_writes_source_api(monkeypatch, tmp_path):
+    """The OAuth-fed record must be labeled source='api', not the previously
+    hard-coded 'statusline'. Drives _refresh_usage_inproc with a mocked ok
+    fetch and lets the REAL cmd_record_usage write the row, then reads it back.
+
+    resets_at is a near-future epoch so cmd_record_usage's plausibility guard
+    (weekly band [now-30d, now+8d]) accepts it and a row actually lands."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda: "tok")
+
+    now = int(time.time())
+    seven_iso = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3 * 86400)
+    )
+    fake_api = {"seven_day": {"utilization": 37.0, "resets_at": seven_iso}}
+    monkeypatch.setitem(ns, "_fetch_oauth_usage",
+                        lambda token, timeout_seconds: fake_api)
+    monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "absent")
+
+    result = ns["_refresh_usage_inproc"]()
+    assert result.status == "ok"
+    assert _newest_source(ns) == "api"
 
 
 def test_refresh_inproc_ok(monkeypatch, tmp_path):

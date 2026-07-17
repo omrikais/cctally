@@ -947,6 +947,77 @@ describe('ConversationRail', () => {
   });
 });
 
+// #304 S3 §2 — the browse-row two-line meta contract: line 1 is IDENTITY
+// (metaleft + when), line 2 is a `.conv-rail-row-stats` sibling holding the model
+// chip + $cost + msg count. Search-hit rows stay single-line.
+describe('rail two-line meta regroup (#304 S3 §2)', () => {
+  it('browse row splits meta (identity) from a stats sibling (model · cost · msgs)', () => {
+    browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8'] })];
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row')!;
+    const meta = row.querySelector('.conv-rail-row-meta')!;
+    // line 1: identity only — metaleft + when, NOT model/cluster.
+    expect(meta.querySelector('.conv-rail-row-metaleft')).toBeTruthy();
+    expect(meta.querySelector('.conv-rail-row-when')).toBeTruthy();
+    expect(meta.querySelector('.conv-rail-row-model')).toBeNull();
+    expect(meta.querySelector('.conv-rail-row-cluster')).toBeNull();
+    // line 2: the stats sibling holds model + cluster.
+    const stats = row.querySelector('.conv-rail-row-stats')!;
+    expect(stats).toBeTruthy();
+    expect(stats.querySelector('.conv-rail-row-model .chip.opus')).toBeTruthy();
+    expect(stats.querySelector('.conv-rail-row-cluster .conv-rail-row-cost')).toBeTruthy();
+    expect(stats.querySelector('.conv-rail-row-cluster .conv-rail-row-msgs')).toBeTruthy();
+    expect(meta.nextElementSibling).toBe(stats);
+  });
+
+  it('hideProject variant: no project span; branch + when intact on line 1', () => {
+    browseRows = [
+      summary({ session_id: 's1', project_label: 'A' }),
+      summary({ session_id: 's2', project_label: 'A' }),
+    ]; // single project → hideProject
+    render(<ConversationRail />);
+    const meta = document.querySelector('.conv-rail-row-meta')!;
+    expect(meta.querySelector('.conv-rail-row-project')).toBeNull();
+    expect(meta.querySelector('.conv-rail-row-branch')).toBeTruthy();
+    expect(meta.querySelector('.conv-rail-row-when')).toBeTruthy();
+  });
+
+  it('bounds a long unknown-model chip: 12-char+ellipsis text, full id in title + aria-label', () => {
+    browseRows = [summary({ session_id: 's1', models: ['internal-experimental-model-v2-preview-20260701'] })];
+    render(<ConversationRail />);
+    const chip = document.querySelector('.conv-rail-row-stats .conv-rail-row-model .chip.other')!;
+    expect(chip.textContent).toBe('internal-exp…');
+    expect(chip.getAttribute('title')).toBe('internal-experimental-model-v2-preview');
+    expect(chip.getAttribute('aria-label')).toBe('internal-experimental-model-v2-preview');
+  });
+
+  it('a known-family chip carries no title/aria-label (the text IS the name)', () => {
+    browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8'] })];
+    render(<ConversationRail />);
+    const chip = document.querySelector('.conv-rail-row-model .chip.opus')!;
+    expect(chip.textContent).toBe('opus');
+    expect(chip.getAttribute('title')).toBeNull();
+    expect(chip.getAttribute('aria-label')).toBeNull();
+  });
+
+  it('multi-model: the "+N" counter renders in the stats line', () => {
+    browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8', 'claude-haiku-4-5-20251001'] })];
+    render(<ConversationRail />);
+    const stats = document.querySelector('.conv-rail-row-stats')!;
+    expect(stats.querySelector('.conv-rail-row-model-more')?.textContent).toBe('+1');
+  });
+
+  it('search-hit rows stay single-line (meta only, no stats)', () => {
+    searchHits = [hit({})];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const row = document.querySelector('.conv-rail-row--hit')!;
+    expect(row.querySelectorAll('.conv-rail-row-meta').length).toBe(1);
+    expect(row.querySelector('.conv-rail-row-stats')).toBeNull();
+  });
+});
+
 describe('ConversationRail browse-list error state (#205 S3 F8)', () => {
   it('shows a Retry button in the error state that calls retry()', () => {
     browseError = "Couldn't load conversations.";
@@ -1032,6 +1103,7 @@ describe('ConversationRail filtered search (#217 S4 / I-2.5)', () => {
 describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
   it('shows the aria-live pick banner with the anchor when comparePick is set', () => {
     browseRows = [summary({ session_id: 's2', title: 'pick me' })];
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'anchorsid-1234' }); // #304 S2 F2 — anchor precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'anchorsid-1234' });
     render(<ConversationRail />);
     const banner = document.querySelector('.conv-rail-pickbanner')!;
@@ -1043,6 +1115,7 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
   });
 
   it('Cancel in the banner dispatches CANCEL_COMPARE_PICK', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' }); // #304 S2 F2 — anchor precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     render(<ConversationRail />);
     fireEvent.click(screen.getByRole('button', { name: /cancel comparison pick/i }));
@@ -1051,6 +1124,7 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
 
   it('clicking a NON-anchor browse row in pick-mode dispatches OPEN_COMPARE, not SELECT_CONVERSATION', () => {
     browseRows = [summary({ session_id: 'B', title: 'pick me' })];
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' }); // #304 S2 F2 — anchor precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     render(<ConversationRail />);
     fireEvent.click(screen.getByText('pick me'));
@@ -1061,6 +1135,7 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
 
   it('the anchor row is disabled (non-pickable) in pick-mode', () => {
     browseRows = [summary({ session_id: 'A', title: 'the anchor' })];
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' }); // #304 S2 F2 — anchor precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     render(<ConversationRail />);
     const row = screen.getByText('the anchor').closest('button') as HTMLButtonElement;

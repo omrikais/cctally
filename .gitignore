@@ -5,7 +5,12 @@
 __pycache__/
 .worktrees/
 .superpowers/
-.agents/
+# Codex CLI scratch: .codex/ is partially tracked (agents/*.toml, config.toml,
+# model-profiles.lock.toml), but .codex/tmp/ is per-run temporary output. Ignore
+# only tmp/ so the tracked config survives; anchored to root (worktree copies are
+# already covered by .worktrees/).
+.codex/tmp/
+.claude-memory/.cctally-memory-update-journal.json
 # Ignore everything in .claude/ EXCEPT the project-scoped skills + agents trees
 # (which are tracked so skill/agent definitions survive fresh clones / propagate
 # to CI). Use `.claude/*` rather than `.claude/` so git still traverses
@@ -81,3 +86,4 @@ baseline/
 # passes — e.g. cctally-qa-comparison/, cctally-qa-discovery/. Tool-generated,
 # regenerated each session. Anchored to root.
 /cctally-qa-*/
+.agentmem/local/

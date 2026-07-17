@@ -2331,11 +2331,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     can call it without an import cycle. Idempotent (CREATE ... IF NOT EXISTS +
     ``add_column_if_missing``). Does NOT run the dispatcher and does NOT include
     the Codex ``last_total_tokens`` ALTER, which carries a one-time purge
-    side-effect that stays in ``open_cache_db``: a future cross-DB migration
-    that needs a Codex column on the eager-apply path must revisit that
-    exception. The eager-apply path provably never touches Codex (cache 001 +
-    the 008/009/010 RO joins are all Claude-side), so the column's absence here
-    cannot surface a ``no such column``.
+    side-effect that stays in ``open_cache_db``. The eager dispatcher can run
+    024, but that handler acquires its own Codex flock and only deletes
+    Codex-derived rows; it neither reads nor requires ``last_total_tokens``.
+    Normal ``open_cache_db`` remains responsible for the ALTER and its historic
+    purge, so leaving it outside this shared schema is safe.
     """
     conn.executescript(
         """
@@ -2411,6 +2411,19 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON conversation_messages(cwd)
             WHERE cwd IS NOT NULL AND cwd != '';
 
+        -- #301: partial covering index on (model, session_id). list_conversation_facets
+        -- and _model_clause source model facets/filters with `SELECT DISTINCT ... model
+        -- FROM conversation_messages WHERE model IS NOT NULL AND model != ''`; without
+        -- this index those DISTINCTs do an index->heap walk of the whole table (~22s
+        -- cold on a 5.5 GB cache). The partial (model, session_id) index answers all
+        -- three model queries index-only: the facets DISTINCT and distinct-model
+        -- enumeration as ordered index walks, and the ?models= filter as a model seek.
+        -- MIRRORS migration 022 (base schema here for fresh/rebuilt caches, migration
+        -- for existing ones) — same discipline as idx_conversation_messages_cwd (#289).
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_model_session
+            ON conversation_messages(model, session_id)
+            WHERE model IS NOT NULL AND model != '';
+
         -- #193: per-session AI-generated title, isolated from the six places
         -- that iterate conversation_messages. The explicit NOT NULL on the
         -- non-INTEGER PRIMARY KEY matters (SQLite's legacy NULL-in-PK bug);
@@ -2429,18 +2442,25 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         -- render a 50-row page, PLUS three filter columns
         -- (project_label/cost_usd/cache_rebuild_count, migration 015) so the
         -- Browse list's date/project/cost/cache-rebuild filters are pure-SQL
-        -- predicates. The structural columns are recomputed by a COUNT/MIN/MAX
-        -- GROUP BY; the filter columns are filled per-session by
+        -- predicates, PLUS three DISPLAYED-enrichment columns
+        -- (git_branch/models_json/title, migration 023 / #302) so the rail's
+        -- per-session enrichment (git branch, ordered model list, stable
+        -- first-prompt title) is read straight off the rollup instead of
+        -- re-scanning conversation_messages per session on every cold page.
+        -- The structural columns are recomputed by a COUNT/MIN/MAX GROUP BY; the
+        -- filter + enrichment columns are filled per-session by
         -- _fill_conversation_sessions_filter_columns in the same flock-held
-        -- recompute (cost via the query kernel's batch maps, cache_rebuild_count
-        -- via a per-session assemble). The explicit NOT NULL on the non-INTEGER PK
-        -- matters (SQLite's legacy NULL-in-PK bug); the rail keys on a concrete
-        -- session_id and the recompute's GROUP BY already filters nulls. The
-        -- index lets the only paginated ordering (recent) early-terminate at
-        -- LIMIT with no temp B-tree. Re-derivable like the rest of cache.db;
-        -- sync_cache keeps it honest (scoped DELETE+INSERT re-derive +
-        -- flag-gated full recompute) — migration 013 arms the one-time
-        -- history backfill.
+        -- recompute (cost/models/title/branch via the query kernel's batch maps,
+        -- cache_rebuild_count via a per-session assemble). The AI title is NOT
+        -- stored here — it is volatile, so list_conversations overlays it live
+        -- from conversation_ai_titles (#302 Q2-B). The explicit NOT NULL on the
+        -- non-INTEGER PK matters (SQLite's legacy NULL-in-PK bug); the rail keys
+        -- on a concrete session_id and the recompute's GROUP BY already filters
+        -- nulls. The index lets the only paginated ordering (recent)
+        -- early-terminate at LIMIT with no temp B-tree. Re-derivable like the
+        -- rest of cache.db; sync_cache keeps it honest (scoped DELETE+INSERT
+        -- re-derive + flag-gated full recompute) — migration 013 arms the
+        -- one-time history backfill, 023 re-arms it for the enrichment columns.
         CREATE TABLE IF NOT EXISTS conversation_sessions (
             session_id          TEXT NOT NULL PRIMARY KEY,
             msg_count           INTEGER NOT NULL DEFAULT 0,
@@ -2448,7 +2468,10 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             last_activity_utc   TEXT,
             project_label       TEXT,
             cost_usd            REAL NOT NULL DEFAULT 0,
-            cache_rebuild_count INTEGER NOT NULL DEFAULT 0
+            cache_rebuild_count INTEGER NOT NULL DEFAULT 0,
+            git_branch          TEXT,
+            models_json         TEXT,
+            title               TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent
             ON conversation_sessions(last_activity_utc DESC, session_id DESC);
@@ -2517,6 +2540,87 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_codex_entries_source
             ON codex_session_entries(source_path);
 
+        -- #294 S1: physical Codex rollout retention. These tables deliberately
+        -- live in the unconditional base-schema script, before the legacy-FTS
+        -- topology checks below: an existing cache with an old FTS shape must
+        -- still gain the S1 tables on every open, just as conversation_file_touches
+        -- does above.
+        CREATE TABLE IF NOT EXISTS codex_source_roots (
+            source_root_key      TEXT NOT NULL PRIMARY KEY,
+            canonical_root_path  TEXT NOT NULL UNIQUE,
+            first_seen_utc       TEXT NOT NULL,
+            last_seen_utc        TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS codex_conversation_threads (
+            conversation_key     TEXT NOT NULL PRIMARY KEY,
+            source_root_key      TEXT NOT NULL,
+            native_thread_id     TEXT NOT NULL,
+            root_thread_id       TEXT NOT NULL,
+            parent_thread_id     TEXT,
+            source_path          TEXT NOT NULL,
+            cwd                  TEXT,
+            git_json             TEXT,
+            source_kind          TEXT,
+            thread_source_json   TEXT,
+            model_provider       TEXT,
+            context_window       INTEGER,
+            first_seen_utc       TEXT,
+            last_seen_utc        TEXT,
+            UNIQUE(source_root_key, root_thread_id, native_thread_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_threads_source_root
+            ON codex_conversation_threads(source_root_key);
+        CREATE INDEX IF NOT EXISTS idx_codex_threads_source_path
+            ON codex_conversation_threads(source_path);
+
+        CREATE TABLE IF NOT EXISTS quota_window_snapshots (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            source                TEXT NOT NULL CHECK(source IN ('claude','codex')),
+            source_root_key       TEXT,
+            source_path           TEXT NOT NULL,
+            line_offset           INTEGER NOT NULL,
+            captured_at_utc       TEXT NOT NULL,
+            observed_slot         TEXT,
+            logical_limit_key     TEXT NOT NULL,
+            limit_id              TEXT,
+            limit_name            TEXT,
+            window_minutes        INTEGER NOT NULL CHECK(window_minutes > 0),
+            used_percent          REAL NOT NULL CHECK(used_percent >= 0 AND used_percent <= 100),
+            resets_at_utc         TEXT NOT NULL,
+            plan_type             TEXT,
+            individual_limit_json TEXT,
+            reached_type          TEXT,
+            UNIQUE(source, source_path, line_offset, logical_limit_key),
+            CHECK(source != 'codex' OR source_root_key IS NOT NULL)
+        );
+        CREATE INDEX IF NOT EXISTS idx_quota_window_source_root
+            ON quota_window_snapshots(source_root_key);
+        CREATE INDEX IF NOT EXISTS idx_quota_window_captured_at
+            ON quota_window_snapshots(captured_at_utc);
+
+        CREATE TABLE IF NOT EXISTS codex_conversation_events (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path          TEXT NOT NULL,
+            line_offset          INTEGER NOT NULL,
+            source_root_key      TEXT NOT NULL,
+            conversation_key     TEXT,
+            native_thread_id     TEXT,
+            root_thread_id       TEXT,
+            parent_thread_id     TEXT,
+            timestamp_utc        TEXT,
+            record_type          TEXT,
+            event_type           TEXT,
+            turn_id              TEXT,
+            call_id              TEXT,
+            payload_json         TEXT NOT NULL,
+            UNIQUE(source_path, line_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_events_conversation
+            ON codex_conversation_events(conversation_key);
+        CREATE INDEX IF NOT EXISTS idx_codex_events_timestamp
+            ON codex_conversation_events(timestamp_utc);
+
         CREATE TABLE IF NOT EXISTS cache_meta (
             key   TEXT PRIMARY KEY,
             value TEXT
@@ -2528,6 +2632,44 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # populated lazily in sync_cache() / _ensure_session_files_row().
     add_column_if_missing(conn, "session_files", "session_id", "TEXT")
     add_column_if_missing(conn, "session_files", "project_path", "TEXT")
+    # #294 S1: old Codex accounting rows have no truthful provider-root or
+    # conversation identity, so the linkage remains nullable until migration
+    # 024 clears them for a source-derived reingest. Existing report selectors
+    # intentionally keep selecting their shipped columns only.
+    add_column_if_missing(conn, "codex_session_entries", "source_root_key", "TEXT")
+    add_column_if_missing(conn, "codex_session_entries", "conversation_key", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_entries_source_root "
+        "ON codex_session_entries(source_root_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_entries_conversation "
+        "ON codex_session_entries(conversation_key)"
+    )
+    # #294 S3: the qualified accounting adapter is bounded by timestamp and
+    # joins only through the S1 root-qualified conversation identity.  Keep
+    # this re-derivable index in the unconditional schema path so an existing
+    # cache gains the same scale-safe plan without a data migration.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_entries_ts_root_conversation "
+        "ON codex_session_entries(timestamp_utc, source_root_key, conversation_key)"
+    )
+    # The per-file terminal thread facts seed a later append without rereading
+    # the prefix. They are nullable for old cache rows; migration 024 never
+    # fabricates these source facts and instead clears/rederives them.
+    add_column_if_missing(conn, "codex_session_files", "source_root_key", "TEXT")
+    add_column_if_missing(conn, "codex_session_files", "last_native_thread_id", "TEXT")
+    add_column_if_missing(conn, "codex_session_files", "last_root_thread_id", "TEXT")
+    add_column_if_missing(conn, "codex_session_files", "last_parent_thread_id", "TEXT")
+    add_column_if_missing(conn, "codex_session_files", "last_conversation_key", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_files_source_root "
+        "ON codex_session_files(source_root_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_files_conversation "
+        "ON codex_session_files(last_conversation_key)"
+    )
     # #181: materialize the only-ever-consumed extra `usage` key (`speed`) into
     # a real session_entries column so the hot cache read paths (iter_entries /
     # get_claude_session_entries) stop json.loads-ing the deeply-nested
@@ -2604,6 +2746,17 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         conn, "conversation_messages", "search_tool", "TEXT NOT NULL DEFAULT ''")
     add_column_if_missing(
         conn, "conversation_messages", "search_thinking", "TEXT NOT NULL DEFAULT ''")
+    # #302: the browse-rail DISPLAYED-enrichment columns on the conversation_sessions
+    # rollup (git_branch / models_json / title). Idempotent column-adds (no marker,
+    # no version — the repo's column-addition rule, NOT a raw ALTER in a migration
+    # handler; Codex P1-2). They MUST land here — after the CREATE TABLE above (so
+    # the table exists on a fresh DB) and BEFORE the legacy-FTS early-return below
+    # (so an old-shape existing cache.db still receives them before any rail read
+    # SELECTs them). Migration 023 arms the one-time full backfill that fills the
+    # values on existing history; a fresh DB fills them at ingest.
+    add_column_if_missing(conn, "conversation_sessions", "git_branch", "TEXT")
+    add_column_if_missing(conn, "conversation_sessions", "models_json", "TEXT")
+    add_column_if_missing(conn, "conversation_sessions", "title", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -3266,6 +3419,29 @@ def _cache_db_lock_path_for_conn(conn: sqlite3.Connection) -> "pathlib.Path | No
             if not db_file:
                 return None  # :memory: / temp -> no sibling lock file
             return pathlib.Path(str(db_file) + ".lock")
+    return None
+
+
+def _cache_db_codex_lock_path_for_conn(
+    conn: sqlite3.Connection,
+) -> "pathlib.Path | None":
+    """Return this connection's ``<cache.db>.codex.lock`` sibling.
+
+    Codex ingest deliberately uses a separate fcntl lock from Claude ingest.
+    Derive it from the connection rather than the global path constant so a
+    migration test or recovery connection never contends on the caller's real
+    cache lock. ``sync_codex_cache`` opens this exact sibling in production.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        if row[1] == "main":
+            db_file = row[2]
+            if not db_file:
+                return None
+            return pathlib.Path(str(db_file) + ".codex.lock")
     return None
 
 
@@ -4016,6 +4192,103 @@ def _021_index_conversation_messages_cwd(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_conversation_messages_cwd "
         "ON conversation_messages(cwd) WHERE cwd IS NOT NULL AND cwd != ''"
     )
+
+
+@cache_migration("022_index_conversation_messages_model")
+def _022_index_conversation_messages_model(conn: sqlite3.Connection) -> None:
+    """#301: partial covering index on conversation_messages(model, session_id) to
+    collapse the full-table `SELECT DISTINCT ... model` walks in
+    list_conversation_facets and _model_clause (~22s cold on a 5.5 GB cache) into
+    index-only walks/seeks.
+
+    Fresh installs never run this handler: the dispatcher stamps it WITHOUT running
+    (the fresh-install branch), and `_apply_cache_schema` already created the index
+    on the fresh DB. NO self-stamp — the dispatcher central-stamps on a clean return
+    (#140). Run-twice safe: CREATE INDEX is IF NOT EXISTS. cache.db is re-derivable —
+    `cache-sync --rebuild` is the escape hatch.
+
+    No flock/BEGIN IMMEDIATE (like 021): a single CREATE INDEX IF NOT EXISTS performs
+    no row mutations (it reads the table once to build the index but modifies no
+    rows), so it needs no mutual-exclusion scaffolding.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_messages_model_session "
+        "ON conversation_messages(model, session_id) "
+        "WHERE model IS NOT NULL AND model != ''"
+    )
+
+
+@cache_migration("023_conversation_sessions_enrichment_columns")
+def _023_conversation_sessions_enrichment_columns(conn: sqlite3.Connection) -> None:
+    """Flag-only arm for the #302 browse-rail enrichment columns (git_branch,
+    models_json, title). The columns themselves are added by _apply_cache_schema's
+    CREATE TABLE + add_column_if_missing (the repo's column-addition rule, NOT an
+    ALTER here); this migration only arms the SHARED
+    conversation_sessions_backfill_pending flag so the next sync_cache full
+    recompute fills the new (empty) columns via the augmented
+    _fill_conversation_sessions_filter_columns. Central stamp via the dispatcher
+    (#140); the handler does NOT self-stamp.
+
+    A fresh install gets the columns from _apply_cache_schema's CREATE TABLE and
+    stamps 023 WITHOUT running this handler; its empty rollup needs no backfill
+    (the incremental DELETE+INSERT re-derive fills all columns in lockstep).
+    Mirrors 013/015."""
+    _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+    conn.commit()
+
+
+@cache_migration("024_codex_fused_ingest_rebuild")
+def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
+    """Clear stale Codex cache state for #294 S1's fused source reingest.
+
+    Pre-S1 Codex rows lack provider-root identity, qualified conversation
+    linkage, quota observations, and physical event payloads. Those facts are
+    not recoverable from the cache, so this migration clears only the Codex
+    accounting/file surface and partial S1 derived rows; the next normal Codex
+    sync rederives them from rollout source. Claude tables and Claude quota
+    snapshots remain untouched.
+
+    The handler takes ``cache.db.codex.lock`` before ``BEGIN IMMEDIATE`` — the
+    same fcntl-then-SQLite order as ``sync_codex_cache``. Contention raises
+    ``MigrationGateNotMet`` before any DML, so both ordinary and eager cache
+    dispatch defer without a partial clear. The DELETE-only transition is safe
+    to retry after a crash between this commit and the dispatcher's separate
+    marker stamp: rerunning against its own empty Codex state is a no-op.
+    Never self-stamp; the dispatcher owns ``schema_migrations`` and
+    ``user_version``.
+    """
+    lock_path = _cache_db_codex_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
+                "deferring cache 024 fused-ingest rebuild (#294 S1)"
+            )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM codex_session_entries")
+            conn.execute("DELETE FROM codex_session_files")
+            conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
+            conn.execute("DELETE FROM codex_conversation_threads")
+            conn.execute("DELETE FROM codex_conversation_events")
+            conn.execute("DELETE FROM codex_source_roots")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
@@ -4999,6 +5272,19 @@ def _migration_unify_budget_milestones_vendor(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+@stats_migration("013_codex_quota_projection_state")
+def _migration_codex_quota_projection_state(conn: sqlite3.Connection) -> None:
+    """Create the durable provider-neutral quota projection tables.
+
+    All physical evidence stays in cache.db's ``quota_window_snapshots``.  This
+    migration deliberately performs no cache read or data backfill: a later
+    full projector transaction creates the interpreted rows from the committed
+    physical set.  The schema helper is safe after a crash before central
+    stamping, so the dispatcher can retry without duplicate state.
+    """
+    _cctally_core._apply_quota_projection_schema(conn)
 
 
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===

@@ -1,0 +1,45 @@
+---
+title: Diff Report — Claude + Codex
+generated_at: 2026-07-02T12:00:00Z
+period: 2026-07-01T00:00:00Z..2026-07-02T12:00:00Z
+panel: composed
+anonymized: false
+cctally_version: 1.68.0
+---
+
+# Diff Report — Claude + Codex
+
+## Diff Report
+
+# Diff Report
+
+**Claude**
+
+Unavailable: Source analytics are unavailable.
+_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02T12:00:00Z_
+
+## Diff Report
+
+# Diff Report
+
+**Codex**
+_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-02T00:00:00Z_
+
+| Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |
+|:---|:---|:---|---:|---:|---:|---:|---:|---:|
+| Overall | Overall | changed | $4.25 | $7.50 | +$3.25 | 1,234 | 2,300 | +1,066 |
+| Models | gpt-5 | changed | $4.25 | $5.50 | +$1.25 | 1,234 | 1,500 | +266 |
+| Models | gpt-5.5 | new | $0.00 | $2.00 | +$2.00 | 0 | 800 | +800 |
+| Projects | project-1 | changed | $4.25 | $5.50 | +$1.25 | 1,234 | 1,500 | +266 |
+| Projects | project-2 | new | $0.00 | $2.00 | +$2.00 | 0 | 800 | +800 |
+| Token reuse | gpt-5 | changed | $4.25 | $5.50 | +$1.25 | 1,234 | 1,500 | +266 |
+| Token reuse | gpt-5.5 | new | $0.00 | $2.00 | +$2.00 | 0 | 800 | +800 |
+
+- **A total:** $4.25
+- **B total:** $7.50
+- **Δ total:** +$3.25
+- **A tokens:** 1,234
+- **B tokens:** 2,300
+- **Δ tokens:** +1,066

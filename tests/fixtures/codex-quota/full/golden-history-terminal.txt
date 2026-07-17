@@ -1,0 +1,11 @@
+Codex quota history · local-rollout
+primary · 5h 30m · root=root-a · limit=limit-primary
+  2026-07-15T09:00:00Z  10.0%  reset 2026-07-15T15:00:00Z  path cc8fb94c7c23ad967fe32246025519dc
+  2026-07-15T10:00:00Z  12.4%  reset 2026-07-15T15:00:00Z  path cc8fb94c7c23ad967fe32246025519dc
+  2026-07-15T11:00:00Z  16.1%  reset 2026-07-15T15:00:00Z  path cc8fb94c7c23ad967fe32246025519dc
+secondary · 1h · root=root-a · limit=limit-secondary
+  2026-07-15T09:00:00Z  40.0%  reset 2026-07-15T15:00:00Z  path cc8fb94c7c23ad967fe32246025519dc
+  2026-07-15T10:00:00Z  41.0%  reset 2026-07-15T15:00:00Z  path cc8fb94c7c23ad967fe32246025519dc
+primary · 5h 30m · root=root-b · limit=limit-primary
+  2026-07-15T09:00:00Z  10.0%  reset 2026-07-15T15:00:00Z  path 73f4086a2893774aa7f6d3b5363f95ce
+  2026-07-15T10:00:00Z  12.4%  reset 2026-07-15T15:00:00Z  path 73f4086a2893774aa7f6d3b5363f95ce

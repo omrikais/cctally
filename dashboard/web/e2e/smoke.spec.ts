@@ -13,10 +13,13 @@ test('dashboard renders its panel grid', async ({ page }) => {
   await expect(page.locator('#main-content .panel-host').first()).toBeVisible();
 });
 
-test('conversations rail lists the four fixture conversations', async ({ page }) => {
+test('conversations rail lists the five fixture conversations', async ({ page }) => {
+  // #293 S2 added a fifth fixture — a minimal second-model (sonnet) session —
+  // so the served Sessions table is mixed-model (Model column present) for the
+  // 7-column SESS-1 tight case. It is inert to the reader scenario specs.
   await page.goto('/#/conversations');
   await expect(page.locator('.conv-rail')).toBeVisible();
-  await expect(page.locator('.conv-rail-row')).toHaveCount(4);
+  await expect(page.locator('.conv-rail-row')).toHaveCount(5);
 });
 
 test('opening the long conversation mounts the reader with content', async ({ page }) => {

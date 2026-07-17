@@ -17,12 +17,14 @@ effects for the threshold-actions feature, plus the test-entry command:
   `_dispatch_alert_notification` with `mode="test"`, and reports the
   outcome via stdout / exit code.
 
-The pure payload primitives (`_alert_text_weekly`,
+The established pure payload primitives (`_alert_text_weekly`,
 `_alert_text_five_hour`, `_escape_applescript_string`,
 `_build_alert_payload_weekly`, `_build_alert_payload_five_hour`) live
 in `bin/_lib_alerts_payload.py` (Phase A extraction); this module
 imports them directly via `_load_lib`, which keeps the dispatch path
-free of an extra bounce through cctally's re-exports.
+free of an extra bounce through cctally's re-exports. The S2 quota payload is
+defined below beside its provider-neutral dispatch text because this stage does
+not yet expose a dashboard payload consumer.
 
 Kernel reads from `bin/_cctally_core` (call-time module-attribute access):
 - `LOG_DIR` — base dir under which `alerts.log` lives. Promoted to
@@ -80,6 +82,54 @@ _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
 _build_alert_payload_codex_budget = _lib_alerts_payload._build_alert_payload_codex_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
+
+
+def _build_alert_payload_quota(
+    *, source: str, source_root_key: str, logical_limit_key: str,
+    observed_slot: str, window_minutes: int, resets_at_utc: str,
+    threshold: int, kind: str, crossed_at_utc: str,
+    qualifying_percent: float | None, projected_percent: float | None,
+) -> dict:
+    """Build the provider-neutral durable quota alert payload."""
+    context = {
+        "source": str(source), "source_root_key": str(source_root_key),
+        "logical_limit_key": str(logical_limit_key), "observed_slot": str(observed_slot),
+        "window_minutes": int(window_minutes), "resets_at_utc": str(resets_at_utc),
+        "kind": str(kind),
+        "qualifying_percent": (
+            None if qualifying_percent is None else float(qualifying_percent)
+        ),
+        "projected_percent": (
+            None if projected_percent is None else float(projected_percent)
+        ),
+    }
+    return {
+        "id": "quota:{source}:{root}:{limit}:{slot}:{minutes}:{reset}:{threshold}".format(
+            source=source, root=source_root_key, limit=logical_limit_key,
+            slot=observed_slot, minutes=int(window_minutes), reset=resets_at_utc,
+            threshold=int(threshold),
+        ),
+        "axis": "quota", "threshold": int(threshold), "kind": str(kind),
+        "crossed_at": crossed_at_utc, "alerted_at": crossed_at_utc,
+        **context, "context": context,
+    }
+
+
+def _alert_text_quota(payload: dict, _tz) -> tuple[str, str, str]:
+    """Render provider-native quota wording without Claude-window aliases."""
+    context = payload.get("context") or {}
+    threshold = int(payload["threshold"])
+    source = context.get("source") or payload.get("source") or "provider"
+    slot = context.get("observed_slot") or payload.get("observed_slot") or "quota"
+    minutes = context.get("window_minutes") or payload.get("window_minutes")
+    title = f"cctally - {source} quota {threshold}% reached"
+    subtitle = f"{slot} · {minutes}m window" if minutes is not None else str(slot)
+    kind = context.get("kind") or payload.get("kind") or "actual"
+    if kind == "projected":
+        body = f"Projected {float(context.get('projected_percent') or 0):.0f}% by reset"
+    else:
+        body = f"Actual usage {float(context.get('qualifying_percent') or 0):.0f}%"
+    return title, subtitle, body
 
 # Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
 # pure (parameterized on platform + which_on_path); this module is the I/O glue
@@ -181,6 +231,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_codex_budget(payload, tz)
     elif axis == "projected":
         title, subtitle, body = _alert_text_projected(payload, tz)
+    elif axis == "quota":
+        title, subtitle, body = _alert_text_quota(payload, tz)
     else:
         title, subtitle, body = (
             "cctally - alert",

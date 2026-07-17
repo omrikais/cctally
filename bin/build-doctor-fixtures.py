@@ -49,12 +49,24 @@ SCENARIOS = {
     # user_version (no dispatcher), so it reports without healing/bricking.
     "19-cache-version-ahead":    "cache_version_ahead",
     "20-stats-version-ahead":    "stats_version_ahead",
+    "21-codex-quota-fresh-stale": "codex_quota_fresh_stale",
+    "22-codex-quota-fresh-future": "codex_quota_fresh_future",
+    "23-codex-lifecycle-recent-never": "codex_lifecycle_recent_never",
+    "24-codex-lifecycle-recent-stale": "codex_lifecycle_recent_stale",
 }
 
 # user_version sentinel bumped well past either registry head so the
 # version-ahead check fires regardless of how many migrations ship later
 # (mirrors the migrations scenario-07 fixture's PRAGMA user_version = 99).
 _VERSION_AHEAD_SENTINEL = 99
+
+
+CODEX_HOMES = {
+    "21-codex-quota-fresh-stale": ("codex-a", "codex-b"),
+    "22-codex-quota-fresh-future": ("codex-a", "codex-b"),
+    "23-codex-lifecycle-recent-never": ("codex-a", "codex-b"),
+    "24-codex-lifecycle-recent-stale": ("codex-a", "codex-b"),
+}
 
 
 def _common_setup_preamble() -> str:
@@ -113,6 +125,14 @@ def _common_setup_preamble() -> str:
             ]
           }
         }
+        JSON
+        }
+
+        write_codex_hooks() {
+          local root="$1"
+          mkdir -p "$root/sessions"
+          cat > "$root/hooks.json" <<JSON
+        {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}],"SubagentStop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}]}}
         JSON
         }
     """)
@@ -217,7 +237,20 @@ def _scenario_body(slug: str) -> str:
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-cache \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
-            """)
+        """)
+    if slug in {
+        "codex_quota_fresh_stale", "codex_quota_fresh_future",
+        "codex_lifecycle_recent_never", "codex_lifecycle_recent_stale",
+    }:
+        case = slug.removeprefix("codex_").replace("_", "-")
+        return _scenario_body("all_ok") + textwrap.dedent(f"""\
+            write_codex_hooks "$HARNESS_FAKE_HOME/codex-a"
+            write_codex_hooks "$HARNESS_FAKE_HOME/codex-b"
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" \\
+                --emit-codex-doctor-case {case} \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally" \\
+                "$HARNESS_FAKE_HOME/codex-a" "$HARNESS_FAKE_HOME/codex-b"
+        """)
     if slug == "pricing_unpriced_model":
         # Reuse the clean all_ok baseline (install/hooks/oauth/snapshot all
         # OK), then seed cache.db with one in-window Claude model cctally
@@ -456,7 +489,12 @@ def main():
     p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
     p.add_argument("--emit-codex-cache", action="store_true")
     p.add_argument("--emit-pricing-cache", action="store_true")
+    p.add_argument("--emit-codex-doctor-case", choices=[
+        "quota-fresh-stale", "quota-fresh-future",
+        "lifecycle-recent-never", "lifecycle-recent-stale",
+    ])
     p.add_argument("path", nargs="?")
+    p.add_argument("roots", nargs="*")
     args = p.parse_args()
 
     if args.emit_snapshot and args.path:
@@ -467,6 +505,15 @@ def main():
         return
     if args.emit_pricing_cache and args.path:
         _emit_pricing_cache(pathlib.Path(args.path))
+        return
+    if args.emit_codex_doctor_case:
+        if not args.path or len(args.roots) != 2:
+            raise SystemExit("--emit-codex-doctor-case needs an app directory and two roots")
+        _emit_codex_doctor_case(
+            args.emit_codex_doctor_case,
+            pathlib.Path(args.path),
+            *(pathlib.Path(root) for root in args.roots),
+        )
         return
 
     # Plain mode: scaffold every scenario directory.
@@ -485,6 +532,12 @@ def main():
             env_path.write_text(INPUT_ENV[dir_name])
         elif env_path.exists():
             env_path.unlink()
+        homes_path = d / ".codex-homes"
+        homes = CODEX_HOMES.get(dir_name)
+        if homes:
+            homes_path.write_text("\n".join(homes) + "\n")
+        elif homes_path.exists():
+            homes_path.unlink()
     print(f"Scaffolded {len(SCENARIOS)} scenarios under {ROOT}")
 
 
@@ -580,6 +633,93 @@ def _emit_codex_cache(db_path: pathlib.Path) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _emit_codex_doctor_case(
+    case: str, app_dir: pathlib.Path, first_root: pathlib.Path,
+    second_root: pathlib.Path,
+) -> None:
+    """Seed root-qualified quota evidence and lifecycle logs for doctor goldens."""
+    import datetime as dt
+    import hashlib
+    import os
+    import sqlite3
+
+    def root_key(root: pathlib.Path) -> str:
+        return hashlib.sha256(
+            b"cctally-source-root-v1\0" + str(root.resolve()).encode("utf-8")
+        ).hexdigest()[:32]
+
+    as_of = dt.datetime.fromisoformat(
+        os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")
+    ).astimezone(dt.timezone.utc)
+    roots = sorted(((root_key(first_root), first_root), (root_key(second_root), second_root)))
+    app_dir.mkdir(parents=True, exist_ok=True)
+    log_path = app_dir / "logs" / "hook-tick.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log_line(at: dt.datetime, key: str, *, result: str = "success") -> str:
+        return (
+            f"{at.isoformat().replace('+00:00', 'Z')} provider=codex "
+            f"source_root_key={key} event=Stop sync=ok blocks=1 milestones=1 "
+            f"alert_eligible_roots=1 dur_ms=12 result={result}\n"
+        )
+
+    if case in {"quota-fresh-stale", "quota-fresh-future"}:
+        db_path = app_dir / "cache.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE quota_window_snapshots (
+                    source TEXT NOT NULL, source_root_key TEXT, source_path TEXT NOT NULL,
+                    line_offset INTEGER NOT NULL, captured_at_utc TEXT NOT NULL,
+                    observed_slot TEXT, logical_limit_key TEXT NOT NULL, limit_id TEXT,
+                    limit_name TEXT, window_minutes INTEGER NOT NULL, used_percent REAL NOT NULL,
+                    resets_at_utc TEXT NOT NULL, plan_type TEXT, individual_limit_json TEXT,
+                    reached_type TEXT
+                )
+            """)
+            unhealthy_capture = (
+                as_of - dt.timedelta(seconds=901)
+                if case == "quota-fresh-stale"
+                else as_of + dt.timedelta(seconds=301)
+            )
+            conn.executemany("""
+                INSERT INTO quota_window_snapshots(
+                    source, source_root_key, source_path, line_offset, captured_at_utc,
+                    observed_slot, logical_limit_key, limit_id, limit_name, window_minutes,
+                    used_percent, resets_at_utc, plan_type, individual_limit_json, reached_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                ("codex", roots[0][0], str(roots[0][1] / "sessions" / "a.jsonl"), 1,
+                 unhealthy_capture.isoformat().replace("+00:00", "Z"), "secondary",
+                 "secondary", "secondary", "Secondary", 60, 42.0,
+                 "2026-05-13T15:00:00Z", None, None, None),
+                ("codex", roots[1][0], str(roots[1][1] / "sessions" / "b.jsonl"), 2,
+                 (as_of - dt.timedelta(seconds=20)).isoformat().replace("+00:00", "Z"),
+                 "primary", "primary", "primary", "Primary", 300, 12.0,
+                 "2026-05-13T19:00:00Z", None, None, None),
+            ])
+            conn.commit()
+        finally:
+            conn.close()
+        log_path.write_text(
+            log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
+            + log_line(as_of - dt.timedelta(seconds=20), roots[1][0])
+        )
+        return
+
+    if case == "lifecycle-recent-never":
+        log_path.write_text(log_line(as_of - dt.timedelta(seconds=30), roots[0][0]))
+        return
+    if case == "lifecycle-recent-stale":
+        log_path.write_text(
+            log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
+            + log_line(as_of - dt.timedelta(seconds=10), roots[0][0], result="error")
+            + log_line(as_of - dt.timedelta(seconds=24 * 3600 + 1), roots[1][0])
+        )
+        return
+    raise ValueError(f"unsupported Codex doctor fixture case: {case}")
 
 
 if __name__ == "__main__":

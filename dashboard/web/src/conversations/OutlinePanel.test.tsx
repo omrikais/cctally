@@ -773,3 +773,75 @@ describe('OutlinePanel — Files tab (#217 S5 F2)', () => {
     expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
   });
 });
+
+// #304 S3 (Q5) — outline coverage pins. Q5 is COVERAGE ONLY: no outline CSS/DOM
+// changes this session. These lock in the single-line label contract (truncation
+// is CSS ellipsis, never a DOM change) and the state landmarks/glyphs so the S3
+// typography raises + guard can't silently regress the outline. Cross-negatives
+// keep each pin non-vacuous (a cache glyph is NOT the compaction glyph).
+describe('outline coverage pins — no visual change (#304 S3 Q5)', () => {
+  // 148 chars — a genuinely long technical prompt label.
+  const LONG = 'refactor the reader header into intent clusters and verify the density resolver measures the .conv-reader root element width across the outline squeeze';
+
+  it('a long entry label stays single-line-structured: full text in one .conv-outline-entry-label span + the full title, no wrap markup', () => {
+    expect(LONG.length).toBeGreaterThanOrEqual(120);
+    const o = outline({ turns: [turn({ uuid: 'h1', kind: 'human', label: LONG })] });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const entry = container.querySelector('.conv-outline-entry--human')!;
+    const labels = entry.querySelectorAll('.conv-outline-entry-label');
+    expect(labels.length).toBe(1);                       // one span, not a wrapped multi-node structure
+    expect(labels[0].textContent).toBe(LONG);            // full label in the DOM (CSS ellipsis, not DOM truncation)
+    expect(labels[0].querySelector('*')).toBeNull();     // no nested wrap markup added
+    expect(entry.getAttribute('title')).toBe(LONG);      // the full label is the hover title
+  });
+
+  it('the cache state landmark renders its amber ⚡ glyph (not the compaction/completion glyph)', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.75 } }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const entry = container.querySelector('.conv-outline-entry--cache')!;
+    expect(entry.querySelector('.conv-outline-entry-cache-glyph')).toBeTruthy();
+    expect(entry.querySelector('.conv-outline-entry-compaction-glyph')).toBeNull();
+    expect(entry.querySelector('.conv-outline-entry-completion-glyph')).toBeNull();
+  });
+
+  it('the compaction state landmark renders its ⊟ glyph', () => {
+    const o = outline({
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'cx', kind: 'meta', label: 'Conversation compacted', meta_kind: 'compaction' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const entry = container.querySelector('.conv-outline-entry--compaction')!;
+    expect(entry.querySelector('.conv-outline-entry-compaction-glyph')).toBeTruthy();
+    expect(entry.querySelector('.conv-outline-entry-cache-glyph')).toBeNull();
+  });
+
+  it('the completion state landmark renders its ✓ glyph when task_completion.all_done', () => {
+    const o = outline({
+      task_completion: { all_done: true, total: 5, completed: 5, anchor_uuid: 'a1' },
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'done' }),
+      ],
+    });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const entry = container.querySelector('.conv-outline-entry--completion')!;
+    expect(entry).toBeTruthy();
+    expect(entry.querySelector('.conv-outline-entry-completion-glyph')).toBeTruthy();
+    expect(entry.querySelector('.conv-outline-entry-compaction-glyph')).toBeNull();
+  });
+
+  it('the outline tabs render the Files count badge', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline()} />);
+    expect(container.querySelectorAll('.conv-outline-tab').length).toBeGreaterThan(0);
+    const count = container.querySelector('.conv-outline-tab-count')!;
+    expect(count).toBeTruthy();
+    expect(count.textContent).toBe('0'); // empty files → the "0" affordance still renders
+  });
+});

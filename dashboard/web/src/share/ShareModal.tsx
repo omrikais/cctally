@@ -33,6 +33,7 @@ import { ManagePresetsModal } from './ManagePresetsModal';
 import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { getState } from '../store/store';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ModalCloseButton } from '../modals/ModalCloseButton';
@@ -108,6 +109,13 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
   // M1-1: lock background page scroll. ShareModal mounts only when
   // ShareModalRoot's slot is non-null, so it's always "open" when mounted.
   useScrollLock(true);
+
+  // SHARE-1 (#293 S4): on phone the Live preview leads the body so editing any
+  // top-of-stack knob gives immediate feedback. `.share-preview-col` is nested
+  // inside `.share-main-section` — a separate flex parent from the sibling
+  // gallery — so a CSS `order` cannot hoist it; a render reorder is required.
+  // Desktop keeps the two-pane (knobs | preview) layout byte-identical.
+  const isMobile = useIsMobile();
 
   // Esc-to-close at overlay scope. Overlay > modal in SCOPE_ORDER so
   // Esc closes the share modal first when layered atop a panel modal.
@@ -219,6 +227,15 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
       />
 
       <div className="share-modal-body">
+        {isMobile && (
+          <div className="share-preview-col share-preview-col--lead" aria-label="Live preview">
+            <PreviewPane
+              panel={panel}
+              templateId={selectedTemplateId}
+              options={options}
+            />
+          </div>
+        )}
         <section className="share-section share-gallery-section" aria-label="Template gallery">
           <div className="share-gallery-header">
             <PresetDropdown
@@ -246,13 +263,15 @@ export function ShareModal({ panel, onClose, initialParams }: Props) {
           <div className="share-knobs-col" aria-label="Render options">
             <Knobs options={options} onChange={handleOptionsChange} />
           </div>
-          <div className="share-preview-col" aria-label="Live preview">
-            <PreviewPane
-              panel={panel}
-              templateId={selectedTemplateId}
-              options={options}
-            />
-          </div>
+          {!isMobile && (
+            <div className="share-preview-col" aria-label="Live preview">
+              <PreviewPane
+                panel={panel}
+                templateId={selectedTemplateId}
+                options={options}
+              />
+            </div>
+          )}
         </section>
       </div>
 

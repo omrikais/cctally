@@ -64,6 +64,15 @@ jobs:
           # doesn't shadow it. Also drop the runner's tool-cache entries
           # that some Actions toolchains inject ahead of brew.
           PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          # Pin the suite's base timezone to UTC. In-process tests that parse
+          # naive date-only --since/--until resolve them in display-tz, which
+          # defaults to the host tz; without this the self-hosted runner's
+          # local tz (Asia/Jerusalem, UTC+3) shifts those bounds by its offset
+          # and TZ-assuming tests fail (e.g. cache-report bound == ...T00:00:00Z).
+          # The PR lane (test-pr), the Linux matrix, and bin/cctally-test-remote
+          # already pin this — test-macos was the lone unpinned suite lane.
+          # Etc/UTC, not UTC (repo gotcha).
+          TZ: "Etc/UTC"
           # Cap the OUTER parallel-harness fan-out below the Mac Studio's core
           # count. cctally-test-all keeps CCTALLY_TEST_JOBS as the outer pool
           # budget; the derived inner cap (min(4,outer)=4 here) is pinned lower

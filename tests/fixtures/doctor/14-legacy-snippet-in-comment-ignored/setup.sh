@@ -54,6 +54,14 @@ write_canonical_settings() {
 }
 JSON
 }
+
+write_codex_hooks() {
+  local root="$1"
+  mkdir -p "$root/sessions"
+  cat > "$root/hooks.json" <<JSON
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}],"SubagentStop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}]}}
+JSON
+}
 # Seed install + hooks + OAuth + valid update-state + 1 fresh snapshot.
 # Symlink every cctally-* binary so install.symlinks is OK.
 # Keep this list aligned with SETUP_SYMLINK_NAMES in bin/cctally.

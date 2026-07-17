@@ -63,6 +63,9 @@ def test_doctor_state_has_required_fields():
         "locks_held",
         # #297: read-only cache.db WAL-size backstop.
         "cache_db_wal_bytes",
+        # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
+        "codex_quota_windows", "codex_hook_roots",
+        "codex_lifecycle_activity_24h",
     }
     assert fields == expected, fields ^ expected
 
@@ -90,6 +93,21 @@ def test_doctor_report_overall_fields():
         categories=(),
     )
     assert rep.schema_version == 1
+
+
+def test_codex_quota_doctor_registers_stable_contract_checks():
+    """S2 doctor IDs are additive and remain stable JSON-contract keys."""
+    check_ids = {
+        check.id
+        for category in L.run_checks(_state()).categories
+        for check in category.checks
+    }
+
+    assert {
+        "data.codex_quota",
+        "hooks.codex_installed",
+        "hooks.codex_recent_activity",
+    } <= check_ids
 
 
 def _state(**overrides) -> L.DoctorState:
@@ -146,6 +164,258 @@ def _state(**overrides) -> L.DoctorState:
     )
     base.update(overrides)
     return L.DoctorState(**base)
+
+
+def _codex_identity(root: str, limit: str, slot: str, minutes: int) -> dict:
+    return {
+        "source": "codex",
+        "source_root_key": root,
+        "logical_limit_key": limit,
+        "observed_slot": slot,
+        "window_minutes": minutes,
+    }
+
+
+def test_codex_quota_mixed_windows_sort_and_expose_worst_responsible_identity():
+    """A fresh root cannot mask a stale root in the doctor aggregate."""
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+    stale_identity = _codex_identity("root-a", "secondary", "secondary", 60)
+    fresh_identity = _codex_identity("root-b", "primary", "primary", 300)
+    state = _state(
+        now_utc=now,
+        codex_quota_windows=[
+            {
+                "identity": fresh_identity,
+                "latest_capture_at": now - dt.timedelta(seconds=10),
+                "freshness_state": "fresh",
+                "age_seconds": 10,
+                "stale_after_seconds": 1800,
+            },
+            {
+                "identity": stale_identity,
+                "latest_capture_at": now - dt.timedelta(seconds=901),
+                "freshness_state": "stale",
+                "age_seconds": 901,
+                "stale_after_seconds": 900,
+            },
+        ],
+    )
+
+    result = L._check_data_codex_quota(state)
+
+    assert result.severity == "warn"
+    assert result.details == {
+        "window_count": 2,
+        "latest_capture_at": "2026-05-13T14:22:21Z",
+        "freshness_state": "stale",
+        "age_seconds": 901,
+        "stale_after_seconds": 900,
+        "responsible_identity": stale_identity,
+        "windows": [
+            {
+                "identity": stale_identity,
+                "latest_capture_at": "2026-05-13T14:07:30Z",
+                "freshness_state": "stale",
+                "age_seconds": 901,
+                "stale_after_seconds": 900,
+            },
+            {
+                "identity": fresh_identity,
+                "latest_capture_at": "2026-05-13T14:22:21Z",
+                "freshness_state": "fresh",
+                "age_seconds": 10,
+                "stale_after_seconds": 1800,
+            },
+        ],
+    }
+
+
+def test_codex_quota_all_fresh_windows_are_ok_and_keep_first_sorted_summary():
+    """All applicable fresh windows stay healthy without losing per-root order."""
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+    first_identity = _codex_identity("root-a", "secondary", "secondary", 60)
+    latest_identity = _codex_identity("root-b", "primary", "primary", 300)
+    result = L._check_data_codex_quota(_state(
+        now_utc=now,
+        codex_quota_windows=[
+            {
+                "identity": latest_identity,
+                "latest_capture_at": now - dt.timedelta(seconds=5),
+                "freshness_state": "fresh",
+                "age_seconds": 5,
+                "stale_after_seconds": 1800,
+            },
+            {
+                "identity": first_identity,
+                "latest_capture_at": now - dt.timedelta(seconds=10),
+                "freshness_state": "fresh",
+                "age_seconds": 10,
+                "stale_after_seconds": 900,
+            },
+        ],
+    ))
+
+    assert result.id == "data.codex_quota"
+    assert result.severity == "ok"
+    assert result.summary == "2 window(s); fresh"
+    assert result.details == {
+        "window_count": 2,
+        "latest_capture_at": "2026-05-13T14:22:26Z",
+        "freshness_state": "fresh",
+        "age_seconds": 10,
+        "stale_after_seconds": 900,
+        "responsible_identity": first_identity,
+        "windows": [
+            {
+                "identity": first_identity,
+                "latest_capture_at": "2026-05-13T14:22:21Z",
+                "freshness_state": "fresh",
+                "age_seconds": 10,
+                "stale_after_seconds": 900,
+            },
+            {
+                "identity": latest_identity,
+                "latest_capture_at": "2026-05-13T14:22:26Z",
+                "freshness_state": "fresh",
+                "age_seconds": 5,
+                "stale_after_seconds": 1800,
+            },
+        ],
+    }
+
+
+def test_codex_quota_future_precedes_stale_and_no_corpus_is_not_applicable():
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+    future_identity = _codex_identity("root-a", "primary", "primary", 300)
+    stale_identity = _codex_identity("root-b", "secondary", "secondary", 60)
+    result = L._check_data_codex_quota(_state(
+        now_utc=now,
+        codex_quota_windows=[
+            {
+                "identity": stale_identity,
+                "latest_capture_at": now - dt.timedelta(seconds=901),
+                "freshness_state": "stale",
+                "age_seconds": 901,
+                "stale_after_seconds": 900,
+            },
+            {
+                "identity": future_identity,
+                "latest_capture_at": now + dt.timedelta(seconds=301),
+                "freshness_state": "future",
+                "age_seconds": -301,
+                "stale_after_seconds": 1800,
+            },
+        ],
+    ))
+    assert result.severity == "warn"
+    assert result.details["freshness_state"] == "future"
+    assert result.details["responsible_identity"] == future_identity
+
+    absent = L._check_data_codex_quota(_state(codex_quota_windows=[]))
+    assert absent.severity == "ok"
+    assert absent.details == {
+        "window_count": 0,
+        "latest_capture_at": None,
+        "freshness_state": "unavailable",
+        "age_seconds": None,
+        "stale_after_seconds": None,
+        "responsible_identity": None,
+        "windows": [],
+    }
+
+    unsafe_corpus = L._check_data_codex_quota(_state(
+        codex_jsonl_present=True, codex_quota_windows=[],
+    ))
+    assert unsafe_corpus.severity == "warn"
+
+
+def test_codex_hook_state_and_activity_are_root_qualified_and_never_masked():
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+    state = _state(
+        now_utc=now,
+        codex_hook_roots=[
+            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
+            {"source_root_key": "root-a", "state": "absent"},
+        ],
+        codex_lifecycle_activity_24h={
+            "root-a": {"last_tick_at": None, "success_count_24h": 0,
+                       "error_count_24h": 2},
+            "root-b": {"last_tick_at": now - dt.timedelta(seconds=30),
+                       "success_count_24h": 4, "error_count_24h": 0},
+        },
+    )
+
+    hooks = L._check_hooks_codex_installed(state)
+    assert hooks.severity == "warn"
+    assert hooks.details == {
+        "root_count": 2,
+        "installed_root_count": 1,
+        "states": [
+            {"source_root_key": "root-a", "state": "absent"},
+            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
+        ],
+        "requires_review": None,
+        "trust_state": "unobservable",
+    }
+
+    activity = L._check_hooks_codex_recent_activity(state)
+    assert activity.severity == "ok"
+    assert activity.details == {
+        "activity_state": "recent",
+        "last_tick_at": "2026-05-13T14:22:01Z",
+        "age_seconds": 30,
+        "success_count_24h": 4,
+        "error_count_24h": 0,
+        "responsible_root_key": "root-b",
+        "roots": [
+            {
+                "source_root_key": "root-b",
+                "activity_state": "recent",
+                "last_tick_at": "2026-05-13T14:22:01Z",
+                "age_seconds": 30,
+                "success_count_24h": 4,
+                "error_count_24h": 0,
+            },
+        ],
+    }
+
+
+def test_codex_activity_error_only_and_stale_success_warn_without_failing_doctor():
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+    stale_success = now - dt.timedelta(days=1, seconds=1)
+    state = _state(
+        now_utc=now,
+        codex_hook_roots=[
+            {"source_root_key": "root-a", "state": "installed_trust_unobservable"},
+            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
+        ],
+        codex_lifecycle_activity_24h={
+            "root-a": {"last_tick_at": None, "success_count_24h": 0,
+                       "error_count_24h": 1},
+            "root-b": {"last_tick_at": stale_success, "success_count_24h": 0,
+                       "error_count_24h": 1},
+        },
+    )
+
+    activity = L._check_hooks_codex_recent_activity(state)
+    assert activity.severity == "warn"
+    assert activity.details["activity_state"] == "never"
+    assert activity.details["responsible_root_key"] == "root-a"
+    assert activity.details["roots"] == [
+        {
+            "source_root_key": "root-a", "activity_state": "never",
+            "last_tick_at": None, "age_seconds": None,
+            "success_count_24h": 0, "error_count_24h": 1,
+        },
+        {
+            "source_root_key": "root-b", "activity_state": "stale",
+            "last_tick_at": "2026-05-12T14:22:30Z", "age_seconds": 86401,
+            "success_count_24h": 0, "error_count_24h": 1,
+        },
+    ]
+    report = L.run_checks(state)
+    assert report.overall_severity == "warn"
+    assert report.counts["fail"] == 0
 
 
 def test_install_symlinks_all_ok():

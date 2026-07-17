@@ -103,7 +103,6 @@ export function UpdateModal() {
         aria-modal="true"
         aria-labelledby="update-modal-title"
       >
-        <div className="modal-handle" aria-hidden="true" />
         <ModalHeader title={title} titleId="update-modal-title" onClose={close} />
         <div className="modal-body">{body}</div>
       </div>

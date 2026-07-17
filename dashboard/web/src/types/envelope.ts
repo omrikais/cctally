@@ -6,6 +6,16 @@ export type Verdict = 'ok' | 'cap' | 'capped';
 export interface Envelope {
   envelope_version: number;
   generated_at: string | null;
+  // #300 — an all-inputs change-signal string derived from the DB dispatch
+  // signature, surfaced so the lazy detail fetchers (session modal, projects
+  // drill, conversation outline) can revalidate on an actual DATA change
+  // instead of the 5s `generated_at` heartbeat. Changes iff any DB leg the
+  // detail endpoints read changed (session entries, weekly usage/cost, reset
+  // events, codex entries, cache generation); flat on an idle tick. Optional /
+  // may be "": a Python without the field, or the non-precompute path, leaves
+  // it absent or empty, and the client (`revalToken`) falls back to
+  // `generated_at`. See `lib/revalToken.ts`.
+  data_version?: string;
   // Conversation viewer (spec §5): true only when the transcript GET
   // routes would serve for THIS request (bind gate AND Host allowlist).
   // Absent on envelopes from a Python without the feature → treat as false.

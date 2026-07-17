@@ -2,7 +2,7 @@
 2
 ## state
 stats.db:
-  user_version: 13
+  user_version: 14
   schema_migrations:
     001_five_hour_block_models_backfill_v1
     002_five_hour_block_projects_backfill_v1
@@ -15,7 +15,8 @@ stats.db:
     010_recompute_percent_milestones_dedup_fix
     011_budget_milestone_period_keys
     012_unify_budget_milestones_vendor
-    013_test_failure_injection
+    013_codex_quota_projection_state
+    014_test_failure_injection
   schema_migrations_skipped:
     003_merge_5h_block_duplicates_v1
 ## log

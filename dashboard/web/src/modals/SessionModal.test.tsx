@@ -2,9 +2,10 @@
 // drives OPEN_CONVERSATION cross-nav (parent-wiring guard; child unit lives in
 // CacheRebuildsSection.test.tsx).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SessionModal } from './SessionModal';
-import { _resetForTests, getState, dispatch } from '../store/store';
+import { _resetForTests, getState, dispatch, updateSnapshot } from '../store/store';
+import type { Envelope } from '../types/envelope';
 
 const SESSION_DETAIL = {
   session_id: 's1', started_utc: '2026-06-01T00:00:00Z',
@@ -128,5 +129,33 @@ describe('SessionModal single-model collapse (SE-2)', () => {
     // Top model bar = 100%, second = ~17% (2.1/12.3), relative to the TOP model.
     const bars = document.querySelectorAll('.drill-bar');
     expect((bars[0] as HTMLElement).style.getPropertyValue('--w')).toBe('100%');
+  });
+});
+
+// #300 — the modal's SWR refetch must gate on the change signal (data_version),
+// not the 5s `generated_at` heartbeat. A finished session open in the modal
+// fetches /api/session once and is not re-GET every tick; a data_version change
+// (genuine data change) still refetches.
+describe('SessionModal gates refetch on the change signal (#300)', () => {
+  function sessionCalls(): number {
+    return (global.fetch as ReturnType<typeof vi.fn>).mock.calls
+      .filter((c) => String(c[0]).includes('/api/session/')).length;
+  }
+  const snap = (generated_at: string, data_version: string) =>
+    ({ generated_at, data_version } as unknown as Envelope);
+
+  it('no refetch on a generated_at-only tick; refetches on a data_version change', async () => {
+    updateSnapshot(snap('t1', 'v1'));
+    render(<SessionModal />);
+    await waitFor(() => expect(sessionCalls()).toBe(1));
+
+    // generated_at advances twice, data_version flat → no new /api/session GET.
+    await act(async () => { updateSnapshot(snap('t2', 'v1')); await Promise.resolve(); });
+    await act(async () => { updateSnapshot(snap('t3', 'v1')); await Promise.resolve(); });
+    expect(sessionCalls()).toBe(1);
+
+    // data_version changes → refetch.
+    await act(async () => { updateSnapshot(snap('t4', 'v2')); await Promise.resolve(); });
+    await waitFor(() => expect(sessionCalls()).toBe(2));
   });
 });

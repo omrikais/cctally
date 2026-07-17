@@ -1,0 +1,3 @@
+Codex quota breakdown · primary · 1h · root=skew-root · limit=limit-skew
+reset 2026-07-15T15:00:00Z · speed standard
+No percent milestones.

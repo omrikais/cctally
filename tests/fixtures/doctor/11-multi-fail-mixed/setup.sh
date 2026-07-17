@@ -54,6 +54,14 @@ write_canonical_settings() {
 }
 JSON
 }
+
+write_codex_hooks() {
+  local root="$1"
+  mkdir -p "$root/sessions"
+  cat > "$root/hooks.json" <<JSON
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}],"SubagentStop":[{"hooks":[{"type":"command","command":"$REPO_ROOT/bin/cctally hook-tick --foreground --source codex","timeout":30}]}]}}
+JSON
+}
 mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/logs"
 echo '{"hooks":{}}' > "$HARNESS_FAKE_HOME/.claude/settings.json"
 # No OAuth token → FAIL

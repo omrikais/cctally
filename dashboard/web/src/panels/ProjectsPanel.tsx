@@ -18,6 +18,7 @@ import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { openShareModal } from '../store/shareSlice';
+import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 
 const TOP_N = 5;
@@ -85,7 +86,6 @@ export function ProjectsPanel() {
         data-panel-kind="projects"
         role="region"
         aria-label="Projects panel"
-        tabIndex={0}
       >
         {header}
         <div className="panel-body projects-body">
@@ -127,17 +127,7 @@ export function ProjectsPanel() {
       data-panel-kind="projects"
       role="region"
       aria-label="Projects panel"
-      tabIndex={0}
-      onClick={onPanelClick}
-      onKeyDown={(e) => {
-        // Mirror SessionsPanel's "section-focus-only" guard so a key
-        // press inside a child row/button doesn't double-fire.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onPanelClick();
-        }
-      }}
+      onClick={cardRegionClick(onPanelClick)}
     >
       {header}
       <div className="panel-body projects-body">

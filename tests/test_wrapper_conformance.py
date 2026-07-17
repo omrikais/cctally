@@ -10,8 +10,9 @@ would reject valid behavior or tempt removal of `--sync-current`.
 Deliberate non-conformers are excluded from the census: the `*-test`
 harnesses, `cctally-test-all` (`set -uo pipefail` intentionally), the
 non-bash entry points (`cctally-bench`/`cctally-mirror-public`/`cctally-release`
-are python; the `*.js` shims are node), and `cctally-preview` (not a thin
-wrapper).
+are python; the `*.js` shims are node), `cctally-preview` (not a thin
+wrapper), and `cctally-test-remote` (a standalone maintainer-local remote
+test-runner, not a thin wrapper).
 """
 import pathlib
 
@@ -51,7 +52,7 @@ def test_map_is_complete():
     for p in BIN.glob("cctally-*"):
         if p.name.endswith("-test") or p.name in (
             "cctally-test-all", "cctally-preview", "cctally-bench",
-            "cctally-mirror-public", "cctally-release",
+            "cctally-mirror-public", "cctally-release", "cctally-test-remote",
         ):
             continue
         head = p.read_text(encoding="utf-8", errors="replace").splitlines()[0]

@@ -151,6 +151,25 @@ def stamp_all_stats_migrations_applied(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA user_version = {len(names)}")
 
 
+def stamp_all_cache_migrations_applied(conn: sqlite3.Connection) -> None:
+    """Stamp every cache migration on a fresh-schema render fixture.
+
+    ``create_cache_db`` builds the current physical schema directly, rather
+    than modelling an older installed cache.  Its seeded rows must therefore
+    be protected from data-shape migrations such as #294 S1's Codex reingest
+    rebuild.  Per-migration fixtures construct their historical marker state
+    explicitly and do not use this helper.
+    """
+    from _cctally_db import _CACHE_MIGRATIONS  # noqa: E402,PLC0415
+    names = [migration.name for migration in _CACHE_MIGRATIONS]
+    conn.executemany(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+        "VALUES (?, ?)",
+        [(name, _STATS_MIGRATION_STAMP_AT) for name in names],
+    )
+    conn.execute(f"PRAGMA user_version = {len(names)}")
+
+
 def create_stats_db(path: Path) -> None:
     """Create (overwriting any existing file) a stats.db with the full
     current production schema. Every column that `open_db()` would add
@@ -459,6 +478,11 @@ def create_stats_db(path: Path) -> None:
                 UNIQUE(week_start_date, effective_at_utc)
             );
         """)
+        # Keep fixture fresh-schema parity with open_db() and migration 013.
+        # The helper contains no path/config side effects and is the canonical
+        # DDL source for these provider-neutral interpreted-state tables.
+        from _cctally_core import _apply_quota_projection_schema
+        _apply_quota_projection_schema(conn)
 
 
 def _self_test_create_stats_db() -> None:
@@ -486,6 +510,9 @@ def _self_test_create_stats_db() -> None:
             "project_budget_milestones", "weekly_credit_floors",
             "five_hour_reset_events",
             "five_hour_block_models", "five_hour_block_projects",
+            "quota_window_blocks", "quota_percent_milestones",
+            "quota_threshold_events", "quota_projection_state",
+            "quota_alert_arming",
             "schema_migrations", "schema_migrations_skipped",
         }
         missing = expected - tables
@@ -519,8 +546,8 @@ def create_cache_db(path: Path) -> None:
         side-effect (irrelevant on a fresh empty table); replayed here via
         ``add_column_if_missing``.
       * the migration-framework tables (``schema_migrations`` /
-        ``schema_migrations_skipped``) with ``001_dedup_highest_wins``
-        pre-stamped applied + ``user_version = 1`` — see the inline comment.
+        ``schema_migrations_skipped``) stamped at the current cache-registry
+        head, so read-command fixture runs cannot replay data migrations.
 
     ``_apply_cache_schema`` also creates the ``cache_meta`` sentinel table.
     It is left EMPTY here, so the upgrade-gate's walk-complete probe reads
@@ -554,14 +581,9 @@ def create_cache_db(path: Path) -> None:
         # fixtures match the post-migration state. The purge is a no-op on a
         # fresh empty Codex table.
         add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER")
-        # Migration framework tables. Fixture DBs represent the
-        # post-migration state, so we pre-stamp every shipped cache
-        # migration as applied and advance user_version. Without
-        # this, the dispatcher's data-emptiness check (D1) would
-        # see populated session_entries (added by callers via
-        # seed_session_entry) + missing markers and trigger the
-        # 001_dedup_highest_wins handler — wiping the seeded data
-        # before the test could exercise it.
+        # Migration framework tables. Fixture DBs represent the current
+        # post-migration state, so cache data migrations must never replay
+        # against their seeded rows during a render command.
         conn.executescript("""
             CREATE TABLE schema_migrations (
                 name           TEXT PRIMARY KEY,
@@ -572,10 +594,8 @@ def create_cache_db(path: Path) -> None:
                 skipped_at_utc TEXT NOT NULL,
                 reason         TEXT
             );
-            INSERT INTO schema_migrations (name, applied_at_utc)
-            VALUES ('001_dedup_highest_wins', '2026-05-22T00:00:00Z');
-            PRAGMA user_version = 1;
         """)
+        stamp_all_cache_migrations_applied(conn)
 
 
 def _self_test_stamp_all_stats_migrations_applied() -> None:
@@ -627,16 +647,20 @@ def _self_test_create_cache_db() -> None:
             ).fetchone()
             assert walk_row is None, "cache_meta walk-complete marker must be absent in fixtures"
 
-            # 001_dedup_highest_wins is pre-stamped so the dispatcher's
-            # D1 data-emptiness check doesn't fire 001 against seeded
-            # session_entries rows.
-            marker = conn.execute(
-                "SELECT applied_at_utc FROM schema_migrations "
-                "WHERE name = '001_dedup_highest_wins'"
-            ).fetchone()
-            assert marker is not None, "001_dedup_highest_wins marker not pre-stamped"
+            from _cctally_db import _CACHE_MIGRATIONS
+            expected_markers = {migration.name for migration in _CACHE_MIGRATIONS}
+            markers = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM schema_migrations"
+                )
+            }
+            assert markers == expected_markers, (
+                f"cache migration markers drifted: expected={expected_markers} got={markers}"
+            )
             uv = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert uv == 1, f"user_version not advanced to 1: {uv}"
+            assert uv == len(expected_markers), (
+                f"user_version not advanced to cache head: {uv}"
+            )
 
             # Column-presence checks — catch a later edit that accidentally
             # drops an ALTER-added column (e.g., codex_session_files.last_total_tokens

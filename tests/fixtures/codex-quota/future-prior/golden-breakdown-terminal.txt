@@ -1,0 +1,7 @@
+Codex quota breakdown · primary · 1h · root=prior-future-root · limit=limit-prior-future
+reset 2026-07-15T15:00:00Z · speed standard
+ 21%         0 tokens  $0.000000  Δ$0.000000
+ 22%         0 tokens  $0.000000  Δ$0.000000
+ 23%         0 tokens  $0.000000  Δ$0.000000
+ 24%         0 tokens  $0.000000  Δ$0.000000
+ 25%         0 tokens  $0.000000  Δ$0.000000

@@ -37,8 +37,12 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import timezone
 
 from _cctally_core import WEEKDAY_MAP, _command_as_of, eprint, get_week_start_name
+
+
+UTC = timezone.utc
 
 
 def _cctally():
@@ -279,10 +283,84 @@ def _resolve_codex_speed(requested: str) -> str:
     return requested
 
 
+def _build_codex_share_snapshot(command: str, view, rows):
+    """Build the four established Codex report artifacts without path fields."""
+    c = _cctally()
+    lib = c._share_load_lib()
+    end = getattr(view, "period_end", None) or _command_as_of()
+    start = getattr(view, "period_start", None) or end
+    if end < start:
+        start = end
+    display_tz = getattr(view, "display_tz_label", "UTC") or "UTC"
+    period_label = f"{start.date().isoformat()} → {end.date().isoformat()} ({display_tz})"
+    titles = {
+        "codex-daily": "Codex Token Usage — Daily",
+        "codex-monthly": "Codex Token Usage — Monthly",
+        "codex-weekly": "Codex Token Usage — Weekly",
+        "codex-session": "Codex Token Usage — Sessions",
+    }
+    if command not in titles:
+        raise ValueError(f"unknown Codex share command: {command}")
+    if command == "codex-session":
+        columns = (
+            lib.ColumnSpec(key="session", label="Session"),
+            lib.ColumnSpec(key="last", label="Last Activity"),
+            lib.ColumnSpec(key="tokens", label="Tokens", align="right"),
+            lib.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        )
+        table_rows = tuple(
+            lib.Row(cells={
+                "session": lib.TextCell(f"Session {index + 1}"),
+                "last": lib.TextCell(getattr(row, "last_activity").astimezone(UTC).date().isoformat()),
+                "tokens": lib.TextCell(f"{int(getattr(row, 'total_tokens', 0)):,}"),
+                "cost": lib.MoneyCell(float(getattr(row, "cost_usd", 0.0))),
+            })
+            for index, row in enumerate(rows)
+        )
+    else:
+        first_label = {
+            "codex-daily": "Date",
+            "codex-monthly": "Month",
+            "codex-weekly": "Week",
+        }[command]
+        columns = (
+            lib.ColumnSpec(key="bucket", label=first_label),
+            lib.ColumnSpec(key="tokens", label="Tokens", align="right"),
+            lib.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        )
+        table_rows = tuple(
+            lib.Row(cells={
+                "bucket": lib.TextCell(str(getattr(row, "bucket", "—"))),
+                "tokens": lib.TextCell(f"{int(getattr(row, 'total_tokens', 0)):,}"),
+                "cost": lib.MoneyCell(float(getattr(row, "cost_usd", 0.0))),
+            })
+            for row in rows
+        )
+    return lib.ShareSnapshot(
+        cmd=command,
+        title=titles[command],
+        subtitle=period_label,
+        period=lib.PeriodSpec(start=start, end=end, display_tz=display_tz, label=period_label),
+        columns=columns,
+        rows=table_rows,
+        chart=None,
+        totals=(
+            lib.Totalled(label="Total", value=f"${float(getattr(view, 'total_cost_usd', 0.0)):,.2f}"),
+        ),
+        notes=(),
+        generated_at=end,
+        version=c._share_resolve_version(),
+        source="codex",
+        source_label="Codex",
+        availability="empty" if not rows else "ok",
+    )
+
+
 def cmd_codex_daily(args: argparse.Namespace) -> int:
     """Show Codex usage report grouped by date (display tz, --tz, or --timezone)."""
     c = _cctally()
-    config = c.load_config()
+    c._share_validate_args(args)
+    config = c.load_config(getattr(args, "config", None))
     tz_obj = c.resolve_display_tz(args, config)
     args._resolved_tz = tz_obj
     # Codex aggregators take a tz_name string. F2 fix: precedence is
@@ -311,6 +389,12 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
     days = list(view.rows)                  # asc — matches aggregator default
     if args.order == "desc":
         days = list(reversed(days))
+
+    if getattr(args, "format", None):
+        c._share_render_and_emit(
+            _build_codex_share_snapshot("codex-daily", view, days), args,
+        )
+        return 0
 
     if not days:
         # Match upstream's no-data sentinel (see _emit_codex_no_data docstring).
@@ -347,7 +431,8 @@ def cmd_codex_daily(args: argparse.Namespace) -> int:
 def cmd_codex_monthly(args: argparse.Namespace) -> int:
     """Show Codex usage report grouped by calendar month (display tz, --tz, or --timezone)."""
     c = _cctally()
-    config = c.load_config()
+    c._share_validate_args(args)
+    config = c.load_config(getattr(args, "config", None))
     tz_obj = c.resolve_display_tz(args, config)
     args._resolved_tz = tz_obj
     # F2 fix: see cmd_codex_daily.
@@ -370,6 +455,12 @@ def cmd_codex_monthly(args: argparse.Namespace) -> int:
     months = list(view.rows)
     if args.order == "desc":
         months = list(reversed(months))
+
+    if getattr(args, "format", None):
+        c._share_render_and_emit(
+            _build_codex_share_snapshot("codex-monthly", view, months), args,
+        )
+        return 0
 
     if not months:
         # Match upstream's no-data sentinel (see _emit_codex_no_data docstring).
@@ -407,7 +498,8 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
     """Show Codex usage grouped by week (display tz, --tz, or --timezone)."""
     c = _cctally()
     now_utc = _command_as_of()
-    config = c.load_config()
+    c._share_validate_args(args)
+    config = c.load_config(getattr(args, "config", None))
     tz_obj = c.resolve_display_tz(args, config)
     args._resolved_tz = tz_obj
     # F2 fix: see cmd_codex_daily.
@@ -433,6 +525,12 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
     weeks = list(view.rows)
     if args.order == "desc":
         weeks = list(reversed(weeks))
+
+    if getattr(args, "format", None):
+        c._share_render_and_emit(
+            _build_codex_share_snapshot("codex-weekly", view, weeks), args,
+        )
+        return 0
 
     if not weeks:
         # Match upstream's no-data sentinel (same string daily/monthly use).
@@ -472,7 +570,8 @@ def cmd_codex_weekly(args: argparse.Namespace) -> int:
 def cmd_codex_session(args: argparse.Namespace) -> int:
     """Show Codex usage report grouped by session (sorted by last activity)."""
     c = _cctally()
-    config = c.load_config()
+    c._share_validate_args(args)
+    config = c.load_config(getattr(args, "config", None))
     tz_obj = c.resolve_display_tz(args, config)
     args._resolved_tz = tz_obj
     # F2 fix: see cmd_codex_daily.
@@ -497,6 +596,12 @@ def cmd_codex_session(args: argparse.Namespace) -> int:
     sessions = list(view.rows)
     if args.order == "asc":
         sessions = list(reversed(sessions))
+
+    if getattr(args, "format", None):
+        c._share_render_and_emit(
+            _build_codex_share_snapshot("codex-session", view, sessions), args,
+        )
+        return 0
 
     if not sessions:
         # Match upstream's no-data sentinel (plural "sessions" matches upstream

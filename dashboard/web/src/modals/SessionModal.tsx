@@ -6,14 +6,18 @@ import { Modal } from './Modal';
 import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
+import { revalToken } from '../lib/revalToken';
 import { modelChipClass } from '../lib/model';
 import { abbreviateModel } from '../lib/modelName';
 import { ModelCostBars } from './ModelCostBars';
 import { isSingleModel } from '../lib/sessionModel';
 import type { SessionDetail } from '../types/envelope';
 
-// SSE-driven live updates: the modal subscribes to snapshot.generated_at and
-// refetches /api/session/:id on each new tick. Refetches keep the prior
+// SSE-driven live updates: the modal subscribes to the snapshot's change
+// signal (#300 — `revalToken`: the all-inputs `data_version`, falling back to
+// `generated_at`) and refetches /api/session/:id when it changes — i.e. on a
+// genuine data change, NOT on every 5s heartbeat tick, so a finished session
+// fetches once while open. Refetches keep the prior
 // `data` mounted (stale-while-revalidate); the spinner only renders when no
 // content is showing (data == null). Refetch network errors are silently
 // swallowed so a transient blip does not yank good content. The
@@ -38,16 +42,20 @@ import type { SessionDetail } from '../types/envelope';
 
 const SUBAGENT_RE = /(^|\/)(subagents\/|agent-)/;
 
-function useGeneratedAt(): string {
+function useRevalToken(): string {
+  // #300 — the change-signal token (data_version, falling back to generated_at).
+  // A stable string per state, so useSyncExternalStore's Object.is check does not
+  // loop; it only changes when a real data change advances data_version (or, in
+  // the fallback, on each generated_at heartbeat).
   return useSyncExternalStore(
     subscribeStore,
-    () => getState().snapshot?.generated_at ?? '',
+    () => revalToken(getState().snapshot),
   );
 }
 
 export function SessionModal() {
   const sessionId = useSyncExternalStore(subscribeStore, () => getState().openSessionId);
-  const generatedAt = useGeneratedAt();
+  const revalTokenValue = useRevalToken();
   const display = useDisplayTz();
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const [data, setData] = useState<SessionDetail | null>(null);
@@ -135,7 +143,7 @@ export function SessionModal() {
         // Refetch failures (non-404) → silently keep stale data.
       });
     return () => ctl.abort();
-  }, [sessionId, generatedAt]);
+  }, [sessionId, revalTokenValue]);
 
   return (
     <Modal

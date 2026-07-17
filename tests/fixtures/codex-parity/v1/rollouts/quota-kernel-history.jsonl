@@ -1,0 +1,2 @@
+{"payload":{"limit_id":"quota-kernel-fixture","limit_name":"Sanitized quota kernel fixture","rate_limits":{"primary":{"resets_at":1784106000,"used_percent":10.0,"window_minutes":120},"secondary":{"resets_at":1784102400,"used_percent":30.0,"window_minutes":60}}},"timestamp":"2026-07-15T08:00:00Z","type":"event_msg"}
+{"payload":{"limit_id":"quota-kernel-fixture","limit_name":"Sanitized quota kernel fixture","rate_limits":{"primary":{"resets_at":1784106000,"used_percent":30.0,"window_minutes":120}}},"timestamp":"2026-07-15T08:15:00Z","type":"event_msg"}

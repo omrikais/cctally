@@ -695,6 +695,23 @@ print(str(check.get("enabled")) + "," + str(check.get("ttl_hours")))
 ')
 assert_eq "update.check.* --json (get-all) nested shape" "False,168" "$shape"
 
+# A bulk JSON read must also represent the additive nested Codex budget
+# leaves.  `budget.codex` itself is null when unconfigured, but it cannot
+# overwrite the object required by the more-specific `budget.codex.*` keys.
+codex_shape=$(printf "%s" "$out" | python3 -c '
+import json, sys
+codex = json.load(sys.stdin).get("budget", {}).get("codex", {})
+print(",".join((
+    str(codex.get("amount_usd")),
+    str(codex.get("period")),
+    str(codex.get("alerts_enabled")),
+    "/".join(str(value) for value in codex.get("alert_thresholds", [])),
+    str(codex.get("projected_enabled")),
+)))
+')
+assert_eq "budget.codex.* --json (get-all) nested shape" \
+    "None,calendar-month,False,90/100,False" "$codex_shape"
+
 rm -rf "$home"
 
 # ---------------------------------------------------------------------------

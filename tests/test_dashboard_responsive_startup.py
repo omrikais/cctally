@@ -75,6 +75,9 @@ def test_cheap_seed_normal_launch_shape(monkeypatch, tmp_path):
     assert seed.forecast is not None
     assert seed.sessions == []
     assert seed.weekly_periods == []
+    assert seed.source_bundle is not None
+    assert seed.source_bundle.sources["claude"].availability == "partial"
+    assert seed.source_bundle.sources["codex"].data is None
     assert seed.monthly_periods == []
     assert seed.daily_panel == []
     assert seed.blocks_panel == []
@@ -100,6 +103,7 @@ def test_cheap_seed_empty_data(monkeypatch, tmp_path):
     assert seed.hydrating is True
     assert seed.sessions == []
     assert seed.weekly_periods == []
+    assert seed.source_bundle is not None
     # Even with no data, the real doctor + envelope precompute run so the
     # envelope serializes without the inline-doctor fork / KeyError.
     assert seed.doctor_payload is not None

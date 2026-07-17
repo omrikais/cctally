@@ -96,4 +96,20 @@ describe('<WeeklyModal /> (#264 S2)', () => {
     fireEvent.click(screen.getByRole('button', { name: /Share Weekly report/i }));
     expect(getState().shareModal?.panel).toBe('weekly');
   });
+
+  // #293 S3 — the panel slices to CAP=3 in stack mode, but the MODAL must always
+  // render EVERY envelope row (row count === envelope). Locks a slice from ever
+  // leaking into the full-table modal path.
+  it('renders ALL envelope rows (never the S3 slice) — row count === envelope', () => {
+    const WEEKLY4: PeriodRow[] = [
+      periodRow({ label: '2026-W27', week_start_at: '2026-06-29T00:00:00Z', is_current: true }),
+      periodRow({ label: '2026-W26', week_start_at: '2026-06-22T00:00:00Z' }),
+      periodRow({ label: '2026-W25', week_start_at: '2026-06-15T00:00:00Z' }),
+      periodRow({ label: '2026-W24', week_start_at: '2026-06-08T00:00:00Z' }),
+    ];
+    updateSnapshot(baseEnvelope({ weekly: WEEKLY4 }));
+    dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+    render(<WeeklyModal />);
+    expect(document.querySelectorAll('.history-table--weekly tbody tr').length).toBe(4);
+  });
 });

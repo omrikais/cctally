@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "daily": [
+    {
+      "date": "Jul 01, 2026",
+      "inputTokens": 900,
+      "cachedInputTokens": 400,
+      "outputTokens": 334,
+      "reasoningOutputTokens": 34,
+      "totalTokens": 1234,
+      "costUSD": 4.25,
+      "models": {}
+    }
+  ],
+  "totals": {
+    "inputTokens": 900,
+    "cachedInputTokens": 400,
+    "outputTokens": 334,
+    "reasoningOutputTokens": 34,
+    "totalTokens": 1234,
+    "costUSD": 4.25
+  }
+}

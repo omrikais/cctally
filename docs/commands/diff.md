@@ -133,7 +133,7 @@ explicitly per window in `windows.{a,b}.used_pct_mode`.
 | `--a TOKEN` | required | Window A token (see grammar above). |
 | `--b TOKEN` | required | Window B token. |
 | `--allow-mismatch` | off | Permit mismatched window lengths; deltas normalized per-day. |
-| `--only LIST` | all sections | Comma-separated subset of `overall,models,projects,cache`. |
+| `--only LIST` | all sections | Comma-separated subset of `overall,models,projects,cache,token-reuse`. `cache` is Claude-only; `token-reuse` is Codex-only. |
 | `--with LIST` | none | Opt-in sections (`trend,time`). Deferred — currently errors. |
 | `--all` | off | Show all rows (bypass noise filter). |
 | `--min-delta USD` | `0.10` | Override the `|Δ$|` noise threshold. |
@@ -144,6 +144,41 @@ explicitly per window in `windows.{a,b}.used_pct_mode`.
 | `--tz TZ` | config | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | off | Emit structured JSON envelope. |
 | `--no-color` | off | Disable ANSI color. |
+| `--source {claude,codex,all}` | `claude` | Analytics provider. The fixed forms are `cctally claude diff` and `cctally codex diff`; they omit `--source`. |
+| `--speed {auto,standard,fast}` | `auto` | Codex pricing tier. A non-`auto` value is rejected for Claude-only requests and applies only to the Codex leg of `all`. |
+
+## Provider-aware sections
+
+The flat default and explicit `--source claude` preserve the existing Claude
+output. `--source codex` reports source-qualified overall, model, project, and
+**Token reuse** sections. Token reuse is Codex inclusive-input accounting:
+cached-input tokens, non-cached input, cached-input percent, output,
+reasoning-output, and native cost. It is not the Claude Cache section and never
+uses a `cacheHitPercent` field.
+
+For Codex and all-source requests, `this-week`, `last-week`, and `Nw-ago`
+resolve configured calendar weeks; an all-source request resolves one absolute
+interval for both providers. The source-leg rules for `--only` are explicit:
+
+- `cache` is accepted only when the request has a Claude leg.
+- `token-reuse` is accepted only when the request has a Codex leg.
+- `overall`, `models`, and `projects` are shared sections and apply to every
+  selected provider leg.
+
+With --source all, cache routes only to Claude and token-reuse only to Codex;
+shared overall, models, and projects route to both. Mixed comma lists retain
+every valid source-specific sibling, so `--source all --only
+cache,token-reuse` includes the independent Claude Cache and Codex Token reuse
+sections. cache with --source codex and token-reuse with --source claude are
+usage errors (exit 2). Overall USD and compatible total tokens may be summed
+once, but model/project rows, quota concepts, and provider-native sections are
+never blended.
+
+Direct Codex JSON retains the frozen `schema_version` spelling and adds the
+source/status envelope. A qualified project join can leave only the Codex
+Projects section `unavailable` while its overall/models/token-reuse sections
+remain truthful (`partial`); the all-source envelope keeps that Codex block
+beside the Claude block.
 
 ## Exit codes
 

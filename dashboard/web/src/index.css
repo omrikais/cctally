@@ -80,6 +80,7 @@
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
+  --tap-target: 44px;   /* #293 S1 — Apple-HIG coarse-pointer touch floor */
 
   /* Shared focus ring (box-shadow idiom — the dominant existing pattern).
      --focus-ring is the default (outer); --focus-ring-inset is the SAME ring identity
@@ -246,6 +247,135 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
     outline: 2px solid var(--accent-purple);
     outline-offset: 2px;
   }
+}
+
+/* #293 S1 — width-independent coarse-pointer touch floor for BOARD chrome
+   only (.dash-grid-scoped + topbar). Modal share-icons / modal sort headers /
+   Share / Composer / Basket are S4 — intentionally excluded here. Placed AFTER
+   the @media (min-width:641px) desktop block so at equal specificity it wins by
+   source order on a coarse tablet that matches both. */
+@media (pointer: coarse) {
+  /* Icon-only topbar buttons → full square target. */
+  .topbar-actions > .topbar-icon-btn {
+    width: var(--tap-target);
+    height: var(--tap-target);
+  }
+  /* Sync wraps a VISIBLE label at >=641px — grow the hit box but keep width
+     auto so a forced square never squeezes/overflows the SyncChip text. */
+  .topbar-sync {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+  }
+  /* Board sort headers — real min-height on the inner button (the true target
+     is the containing <th>); NEVER a ::before pseudo (its overhang would
+     intercept the first data row). */
+  .dash-grid .th-sortable .th-sort-btn { min-height: var(--tap-target); }
+  /* Board card actions. */
+  .dash-grid .panel-expand,
+  .dash-grid .panel-collapse-toggle,
+  .dash-grid .ctrl-btn {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+  }
+  /* Interactive board model-chip — inset ::before hit-expansion so the compact
+     glyph is unchanged (bare .chip is often a non-interactive <span>, so it is
+     NOT targeted). */
+  .dash-grid button.chip.model-chip { position: relative; }
+  .dash-grid button.chip.model-chip::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 100%;
+    height: var(--tap-target);
+    min-width: var(--tap-target);
+  }
+  /* Drag grip — a REAL centered hit box (not an overlapping pseudo: adjacent
+     header actions sit ~4px away). The 24px glyph stays centered inside via the
+     base .panel-grip display:inline-flex + centering (kept as-is). */
+  .panel-grip {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+  }
+}
+
+/* #293 S4 — off-board / modal / Share / Composer coarse-pointer floor. S1's
+   coarse block above is board-scoped and deliberately excluded these surfaces;
+   this sibling block (also @media (pointer: coarse), placed right after it so at
+   equal specificity it wins by source order on a coarse tablet) extends the 44px
+   floor to the modal / Share / Composer chrome. Three idioms: real box-grow for
+   isolated buttons, real min-height for rows a ::before overhang would steal a
+   tap from, and label-expansion for native checkbox/radio boxes. There is NO
+   interactive modal model-chip, so none is targeted (the board chip stays S1's
+   `.dash-grid button.chip.model-chip`). The pre-existing @media (max-width:640)
+   overrides stay (a harmless duplicate at ≤640). */
+@media (pointer: coarse) {
+  /* Isolated corner close buttons — real box grow. */
+  .modal-close,
+  .share-modal-close,
+  .composer-modal-close,
+  .share-manage-close {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+  }
+  /* MODAL sort headers only (board sort headers already covered by S1's
+     .dash-grid rule). A ::before overhang here would steal the first data row's
+     tap, so grow the inner button's real min-height. */
+  .modal-card .th-sortable .th-sort-btn { min-height: var(--tap-target); }
+  /* Composer real-box controls: kebab trigger, the opened kebab-menu actions,
+     Clear all, and the "Anonymize all" banner action. */
+  .composer-section-actions > button,
+  .composer-section-menu button,
+  .composer-clear-all,
+  .composer-anon-banner button {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+  }
+  /* Composer drag handle = a REAL 44px box; the ≡ glyph stays small (centered).
+     A ::before overhang would anchor to the row (no positioned ancestor) and,
+     at the ~8px sibling gap, overlap the neighbour and steal the mobile
+     section-strip's horizontal-scroll starts. touch-action:none stays (declared
+     on the base .composer-drag-handle rule) so dnd-kit's press isn't preempted
+     as a page-pan. */
+  .composer-drag-handle {
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* Checkbox/radio LABELS become the 44px tap band (the native box stays small);
+     the whole label row is tappable and focuses its nested control. */
+  .composer-knobs label,
+  .share-knob-radio,
+  .share-knob-checkbox,
+  .share-format-radio {
+    min-height: var(--tap-target);
+    display: inline-flex;
+    align-items: center;
+  }
+  /* #293 S4 ui-qa follow-up (P1-5): the Composer Title <input> (~174×24) and the
+     Theme/Format <select>s (~54×21 / ~53×21) are real native controls INSIDE the
+     44px label band above, but their own box stayed sub-floor — grow the control
+     itself. Scoped to type so the two checkboxes keep their native box (their
+     label supplies the tap band). Font size is handled in @media (max-width:640)
+     (16px) to also kill iOS focus-zoom. */
+  .composer-knobs input[type="text"],
+  .composer-knobs select {
+    min-height: var(--tap-target);
+  }
+  /* #293 S4 §4b — topbar chips (doctor / basket): a RESERVED, non-overlapping
+     vertical 44px hit box via a ::before that grows tall but NOT horizontally
+     into the neighbour (a horizontal overhang at the 4px is-scrolled gap would
+     overlap and mis-dispatch). Keeps --topbar-h intact — the box never grows the
+     row. Covers the 641–899 coarse-tablet band; the ≤640 rules below use the
+     same non-overlapping geometry (source order lets ≤640 win where both match).
+     A display:none chip (is-scrolled) paints no ::before, so no phantom leaks. */
+  .doctor-chip { position: relative; }
+  .doctor-chip::before { content: ""; position: absolute; inset: -12px 0; }
+  .basket-chip { position: relative; }
+  .basket-chip::before { content: ""; position: absolute; inset: -10px 0; }
 }
 
 /* #248 §6 — the mobile-only condensed hero readout. Desktop-hidden by default
@@ -453,6 +583,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   .dash-grid .panel-collapse-toggle { display: none; }
 }
 
+/* #293 S1 — intermediate band (900–1199) tall-row determinism. Sessions is
+   span-12 (own full-width implicit row) and Trend/Projects are span-6; dense
+   auto-flow guarantees the two span-6 cards pair and Sessions takes its own
+   row for ANY stored order (the tall cards are user-reorderable). Both implicit
+   rows inherit grid-auto-rows:296px from .row-tall, so no height override is
+   needed. Bento (≥1200) and stack (<900) are unaffected (attribute differs). */
+.dash-grid[data-board-mode="intermediate"] .row-tall { grid-auto-flow: dense; }
+
 /* #264 S1 (S2 rename History→Daily): the Daily heatmap card re-homes into the
    bento medium row as a
    COMPACT color-glance (the mockup's treatment). The full card renders 64px-tall
@@ -585,8 +723,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   outline: 2px solid currentColor;
   outline-offset: 2px;
 }
-.doctor-chip__dot { font-size: 10px; line-height: 1; }
-.doctor-chip__label { display: inline-block; }
+/* #293 S4 (§4c) — the label is a plain "Doctor" word; the status token
+   (OK / N warn / N fail) sits beside it and stays visible when the word hides
+   at ≤360px. */
+.doctor-chip-label { display: inline-block; }
+.doctor-chip-status { display: inline-block; font-weight: 700; }
 .doctor-chip--ok   { color: var(--accent-green); }
 .doctor-chip--warn { color: var(--accent-amber); }
 .doctor-chip--fail { color: var(--accent-red); }
@@ -1214,6 +1355,11 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .sess-table tbody td.session { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 .sess-title-empty { color: var(--text-faint); }
 
+/* #293 S2 SESS-1 — the folded duration ("· 5m") shown inside the Started cell
+   only at the tight container tier (default hidden; the standalone .dur column
+   carries it at the full tier). Dim to read as secondary, like the .dur cell. */
+.dur-fold { display: none; color: var(--text-dim); }
+
 /* #208: the Sessions columns (Started · Dur · Model · Session · Project ·
    Cache · Cost, all white-space:nowrap) sum past the panel card at narrow
    2-col widths (1100–1600px) — the panel has no overflow:hidden, so the
@@ -1222,20 +1368,76 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    column stays full-width; the scrollbar shows only when the table can't
    fit). The mobile @media reflows the table into per-row cards (width:100%)
    and hides Session/Cache, so this never triggers there. */
-#panel-sessions .panel-body { overflow-x: auto; }
-/* S3 (#264) ui-qa P2: at the common 1440 laptop width the Sessions card is a
-   half-width bento cell (~650px body), and the 6 nowrap columns sum to ~825px
-   with the generous 280/220 Session/Project caps — so the NEW Cache + Cost
-   columns fell off the right edge behind the overflow-x valve by default,
-   undercutting SESS-2. Tighten the two flexible text columns below ~1728px so
-   all six fit without scrolling at 1440 (Session keeps its native title=
-   tooltip for the full text); the generous caps stay at ≥1729 where the
-   ~890px body already fits them (verified fitting at 1920). Floored at
-   min-width:641px so this never leaks into the mobile ≤640 block (which hides
-   Session/Cache and sets project max-width:none). */
-@media (min-width: 641px) and (max-width: 1728px) {
-  .sess-table tbody td.session { max-width: 165px; }
-  .sess-table tbody td.project { max-width: 150px; }
+#panel-sessions .panel-body {
+  overflow-x: auto;             /* existing — final safety net, never the path to Cost */
+  container-type: inline-size;  /* #293 S2 — the card's own width is the query axis */
+  container-name: sessions;
+}
+/* #293 S2 SESS-1 — container-query column priority, keyed to the Sessions
+   card's OWN width (not the viewport). Guarantees the priority set
+   (Started+Dur · Session · [Model] · Cost) fits with Cost visible, without the
+   bottom scrollbar. Scoped `width > 640px` so the ≤640 mobile reflow is
+   untouched (meets its `max-width:640` boundary exactly — no fractional seam).
+   Columns targeted by class + data-col, never nth-child. This REPLACES the
+   brittle viewport `@media (641–1728px)` cap block that only tightened the
+   flexible caps and still let Cost fall off the right at 1440/1920 span-6.
+
+   The card's fixed priority overhead — Started (with the open-conv icon +
+   folded duration) + the Model chip + Cost — measures ~409px, so the two
+   flexible text columns (Session, Project) must be capped tightly at narrow
+   span-6 bodies (measured ~530px at 1200) for the priority set to fit. A
+   single cap can't serve the whole 530→900px span-6 body range (too tight at
+   the wide end, overflowing at the narrow end), so the caps step up across
+   DISJOINT container-width tiers — each tier's cap is sized to fit the WORST
+   case (Session/Project at cap) at its own lower bound, then relaxes as the
+   card widens. Thresholds/caps are ui-qa-gate-tuned starting values; the
+   normative invariant is "Cost never clips at span-6 across 1200→1920." */
+@media (width > 640px) {
+  /* Fold Dur into Started + shed Cache once the card is tight (≤720px). */
+  @container sessions (max-width: 720px) {
+    #panel-sessions .sess-table td.dur,
+    #panel-sessions .sess-table th[data-col="duration"] { display: none; }
+    #panel-sessions .sess-table .dur-fold { display: inline; }
+    #panel-sessions .sess-table td.cache,
+    #panel-sessions .sess-table th[data-col="cache"] { display: none; }
+  }
+  /* Tightest (≤600px): additionally shed Project. */
+  @container sessions (max-width: 600px) {
+    #panel-sessions .sess-table td.project,
+    #panel-sessions .sess-table th[data-col="project"] { display: none; }
+  }
+
+  /* Flexible-column caps, stepping up across disjoint container tiers. */
+  /* Tightest — Project shed, only Session flexes. */
+  @container sessions (max-width: 600px) {
+    #panel-sessions .sess-table tbody td.session { max-width: 95px; }
+  }
+  /* Tight — Cache shed, Dur folded, Project back. */
+  @container sessions (600px < width <= 720px) {
+    #panel-sessions .sess-table tbody td.session { max-width: 115px; }
+    #panel-sessions .sess-table tbody td.project { max-width: 55px; }
+  }
+  /* Medium — all columns, modest caps. */
+  @container sessions (720px < width <= 840px) {
+    #panel-sessions .sess-table tbody td.session { max-width: 150px; }
+    #panel-sessions .sess-table tbody td.project { max-width: 80px; }
+  }
+  /* Wide — the widest span-6 bento cell (≈840–904px body); generous caps. */
+  @container sessions (840px < width <= 980px) {
+    #panel-sessions .sess-table tbody td.session { max-width: 220px; }
+    #panel-sessions .sess-table tbody td.project { max-width: 130px; }
+  }
+  /* > 980px (full-width intermediate/stack cards): the base 280/220 caps
+     apply — those bodies have ample room for the full un-shed table. */
+}
+
+/* #293 S2 A11Y-2 (touch) — the row-open tap target (row onClick / title button)
+   is only ~28px tall in table-mode (5px cell padding). On coarse pointers above
+   the mobile reflow, grow the row so it clears the --tap-target (44px) floor.
+   13px block padding lands the row at ~45.5px (ui-qa-tuned: 12px measured 43.5px,
+   0.5px short of the floor). */
+@media (pointer: coarse) and (width > 640px) {
+  #panel-sessions .sess-table tbody td { padding-top: 13px; padding-bottom: 13px; }
 }
 
 .chip {
@@ -1434,8 +1636,6 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
     min-height: 0; overflow: auto;
   }
 }
-/* Decorative drag-handle — shown only at the mobile breakpoint. */
-.modal-handle { display: none; }
 .modal-header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 18px; border-bottom: 1px solid var(--border-soft);
@@ -2226,6 +2426,14 @@ mark.current {
    cache-catching-up edge cases) stay visually passive. */
 .session-row[data-session-id] { cursor: pointer; }
 .session-row:hover { background: rgba(255,255,255,0.03); }
+/* #299 — roving-tabindex active row. The <tr> is the grid's single body tab
+   stop; a keyboard-only inset ring (blue = the shared #247 S1 focus identity),
+   negative offset so it reads inside the border-collapsed table (same shape as
+   .history-table tbody tr:focus-visible). */
+.session-row:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+}
 /* Scope the clickable cursor to panel chips only; the Sessions modal
    reuses the .model-chip class for its own (non-interactive) chips. */
 #sess-rows .model-chip { cursor: pointer; }
@@ -2779,6 +2987,41 @@ mark.current {
   font-variant-numeric: tabular-nums;
 }
 
+/* #293 S3 — the "+N more" reach button in the stacked Weekly/Monthly footer.
+   No-chrome, link-styled, opens the full-table modal. Coarse pointers get the
+   44px --tap-target via invisible hit expansion so the footer height doesn't
+   grow on desktop. */
+.panel-foot.period-foot .period-foot-more {
+  appearance: none;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--text-dim);
+  cursor: pointer;
+  position: relative;
+}
+.panel-foot.period-foot .period-foot-more:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+.panel-foot.period-foot .period-foot-more:focus-visible {
+  outline: 2px solid var(--accent-orange);
+  outline-offset: 2px;
+}
+@media (pointer: coarse) {
+  .panel-foot.period-foot .period-foot-more::before {
+    content: "";
+    position: absolute;
+    left: -10px;
+    right: -10px;
+    top: 50%;
+    transform: translateY(-50%);
+    min-height: var(--tap-target);
+  }
+}
+
 /* Per-period row layout. */
 .period { padding: 8px 0; }
 .period + .period { border-top: 1px solid rgba(255,255,255,0.04); }
@@ -2879,6 +3122,30 @@ mark.current {
 .panel.blocks-collapsed { max-height: 480px; }
 .panel.blocks-collapsed .panel-body { overflow-y: auto; overflow-x: hidden; }
 
+/* #293 S3 — stacked Blocks: bounded + glanceable, so a phone dashboard doesn't
+   render every 5h block into page height. .panel-foot is a sibling of
+   .panel-body, so the "N blocks · $total" footer stays pinned + visible. Keyed
+   on the S1 data-board-mode attribute so it engages ONLY <900 (at >=900 the
+   bento containment governs — no overlap).
+
+   blocksCollapsed defaults TRUE (store.ts:512, paired with dailyCollapsed as a
+   deliberate + tested mobile-density decision), so the DEFAULT stacked view is
+   the COLLAPSED one — that is why collapsed carries the ~280px glanceable
+   summary and expanding shows MORE within a taller bound. Both states are
+   bounded (all rows reachable by in-card scroll) and collapse still means
+   "smaller" (280 < 480). The two selectors are mutually exclusive
+   (.blocks-collapsed vs :not(.blocks-collapsed)), equal specificity. */
+.dash-grid[data-board-mode="stack"] #panel-blocks.blocks-collapsed .panel-body {
+  max-height: 280px;   /* default (collapsed) = the glance; ui-qa-finalized */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.dash-grid[data-board-mode="stack"] #panel-blocks:not(.blocks-collapsed) .panel-body {
+  max-height: 480px;   /* expanded = show more, still bounded; ui-qa-finalized */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .blocks-row {
   padding: 8px 0;
   border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
@@ -2913,11 +3180,17 @@ mark.current {
   transition: width 280ms ease-out;
 }
 .blocks-row .gauge-fill > span { display: block; height: 100%; }
-.blocks-row .gauge-fill .seg-opus   { background: var(--accent-purple); }
-.blocks-row .gauge-fill .seg-sonnet { background: var(--accent-blue); }
-.blocks-row .gauge-fill .seg-haiku  { background: var(--accent-green); }
+/* Paint each family from the SAME `--chip-*` token the legend dot
+   (`.ms-dot.<fam>`) and every other model surface use, so the gauge segment
+   and its legend dot below can't show different colours for one model. These
+   were wired to the generic `--accent-*` / `--text-dim` palette, which for
+   sonnet/haiku was a full hue swap vs the chip colour (bar blue/green vs chip
+   green/blue). `other` uses the grey surface fill (no --chip-other exists). */
+.blocks-row .gauge-fill .seg-opus   { background: var(--chip-opus); }
+.blocks-row .gauge-fill .seg-sonnet { background: var(--chip-sonnet); }
+.blocks-row .gauge-fill .seg-haiku  { background: var(--chip-haiku); }
 .blocks-row .gauge-fill .seg-fable  { background: var(--chip-fable); }
-.blocks-row .gauge-fill .seg-other  { background: var(--text-dim); }
+.blocks-row .gauge-fill .seg-other  { background: var(--surface-faint); }
 
 .blocks-row .pill-active {
   display: inline-block; margin-left: 6px; padding: 1px 6px;
@@ -4098,16 +4371,32 @@ mark.current {
     grid-template-areas:
       "usage spent"
       "support support";
+    /* #293 S1 (MOBILE-2) — tighter gap to the board than the base space-4. */
+    margin-bottom: var(--space-3);
   }
   .hero-usage   { grid-area: usage; border-right: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
   .hero-spent   { grid-area: spent; border-right: 0; border-bottom: 1px solid var(--border-soft); }
   .hero-support { grid-area: support; }
-  .hero-zone { padding: var(--space-3) var(--space-4); }
+  /* #293 S1 (MOBILE-2) — tighten the unscrolled phone hero so the first board
+     card is visible above the fold on short phones. Two dominant numbers
+     (34px) are kept; only spacing shrinks. Dashboard-only (the hero mounts
+     only on the dashboard branch), so the conversations view is unaffected. */
+  .hero-zone { padding: var(--space-2) var(--space-3); }   /* was space-3 space-4 */
   .hu-num, .hs-big { font-size: 34px; }
   .hu-num--sm { font-size: var(--fs-kpi); }
-  /* support zone → a horizontal wrapped meta strip on mobile (was 3 stacked rows) */
-  .hero-support { flex-direction: row; flex-wrap: wrap; gap: var(--space-2) var(--space-4); align-items: baseline; }
+  /* support zone → a horizontal wrapped meta strip on mobile (was 3 stacked rows).
+     #293 S1 (MOBILE-2) — tighter row/column gap so on the narrowest phones the
+     strip packs into fewer wrapped rows (the wrap growth is what pushed the 320px
+     hero ~86px taller than the 390px hero). Harmless at 390 (ample headroom). */
+  .hero-support { flex-direction: row; flex-wrap: wrap; gap: 2px var(--space-2); align-items: baseline; }
   .hero-support .sup-row { justify-content: flex-start; gap: var(--space-1); }
+
+  /* #293 S1 (MOBILE-2) — sanctioned secondary lever (spec §3c): tighten ONLY the
+     dashboard, unscrolled topbar's inter-row gap so the first board card clears
+     the fold on the narrowest phones. Scoped to [data-view="dashboard"]:not(
+     .is-scrolled) so the shared conversations header and the condensed/scrolled
+     header stay pixel-unchanged (specificity 0,3,0 beats the base .topbar gap). */
+  .topbar[data-view="dashboard"]:not(.is-scrolled) { gap: 6px; }
 
   /* #214 M3-1: sparse single-column panels shouldn't reserve the desktop
      320px floor — collapse to content height (kills the dead-space scroll).
@@ -4204,9 +4493,12 @@ mark.current {
   /* Scrolled: collapse to one ≤64px row by dropping the wide secondary chrome
      so the condensed readout + action icons fit without sideways overflow. */
   .topbar.is-scrolled { flex-wrap: nowrap; }
+  /* #293 S4 BASKET-1 — keep the basket-chip OUT of the scrolled hide list so a
+     non-empty basket stays reachable in the condensed mobile header (the chip
+     self-removes when the basket is empty, so it shows exactly when non-empty).
+     view-switcher + doctor-chip stay hidden to keep the bar ≤64px. */
   .topbar.is-scrolled .view-switcher,
-  .topbar.is-scrolled .doctor-chip,
-  .topbar.is-scrolled .basket-chip { display: none; }
+  .topbar.is-scrolled .doctor-chip { display: none; }
   /* Row 2 = the action band: doctor pill at the start, basket chip +
      icon trio clustered at the end. Width:100% claims the full row;
      `margin-left:0` overrides the desktop `margin-left:auto` (which
@@ -4259,7 +4551,7 @@ mark.current {
      margin-left: auto, etc.) is set unconditionally at desktop scope. */
   .topbar-actions > .topbar-icon-btn { display: inline-flex; }
   .topbar-icon-btn {
-    width: 44px; height: 44px;
+    width: var(--tap-target); height: var(--tap-target);
     display: inline-flex; align-items: center; justify-content: center;
     background: var(--panel-bg-2);
     border: 1px solid var(--border-soft);
@@ -4276,8 +4568,8 @@ mark.current {
      of wrapping into a third row. The icon alone reads "sync"; the
      freshness pill on the Current Week panel still surfaces age. */
   .topbar-sync {
-    width: 44px; min-width: 44px;
-    height: 44px; min-height: 44px;
+    width: var(--tap-target); min-width: var(--tap-target);
+    height: var(--tap-target); min-height: var(--tap-target);
     padding: 0;
     justify-content: center;
     border: 1px solid var(--border-soft);
@@ -4352,13 +4644,6 @@ mark.current {
   }
   @media (prefers-reduced-motion: reduce) {
     .modal-card { animation: none; }
-  }
-  .modal-handle {
-    width: 36px; height: 4px;
-    background: var(--surface-faint);
-    border-radius: 2px; /* lint-allow: border-radius bespoke chrome (no exact token) */
-    margin: 8px auto 4px;
-    flex-shrink: 0;
   }
   .modal-header {
     padding: 8px 14px 10px;
@@ -4684,14 +4969,14 @@ mark.current {
     width: auto;
   }
   #panel-sessions > .sessions-ctrls .search-container .ctrl-btn {
-    width: 44px; min-width: 44px;
-    height: 44px; min-height: 44px;
+    width: var(--tap-target); min-width: var(--tap-target);
+    height: var(--tap-target); min-height: var(--tap-target);
     padding: 0;
   }
   #panel-sessions > .sessions-ctrls > .ctrl-btn {
     flex: 0 0 auto;
-    width: 44px; min-width: 44px;
-    height: 44px; min-height: 44px;
+    width: var(--tap-target); min-width: var(--tap-target);
+    height: var(--tap-target); min-height: var(--tap-target);
     padding: 0;
     display: inline-flex; align-items: center; justify-content: center;
   }
@@ -4701,7 +4986,7 @@ mark.current {
      just flooring its height to 44px. */
   #panel-sessions > .sessions-ctrls > .ctrl-btn.as-chip {
     width: auto; min-width: 0;
-    height: auto; min-height: 44px;
+    height: auto; min-height: var(--tap-target);
     padding: 4px 10px;
   }
   /* Sort pill is icon-only on mobile — drop the verbose
@@ -4907,8 +5192,8 @@ mark.current {
   .chip, kbd { min-height: 24px; padding: 2px 8px; }
   .model-chip { min-height: 28px; padding: 4px 10px; }
   .ctrl-btn, .panel-collapse-toggle, .share-icon, .panel-expand {
-    min-width: 44px;
-    min-height: 44px;
+    min-width: var(--tap-target);
+    min-height: var(--tap-target);
   }
 
   /* Real two-row mobile topbar = ~142px of fixed chrome (content +
@@ -4986,6 +5271,64 @@ mark.current {
     margin-left: 0;
   }
 
+  /* #293 S4 SHARE-1 — phone Share form. The coarse-pointer block up top already
+     sizes the modal closes + checkbox/radio label bands; these are the
+     phone-only text-size rules (kill iOS focus-zoom) + the Share-specific preset
+     / save / manage controls, plus the bounded lead preview slice that
+     ShareModal's useIsMobile() branch renders first (above the gallery + knobs)
+     so editing a top-of-stack knob gives immediate feedback. */
+  /* #293 S4 gate fallback (§3c): a static leading preview scrolled fully off
+     (~654px of gallery + knobs) so the visible edit→preview loop was only
+     partial. Pin it as a slim `position:sticky; top:0` strip inside the
+     .share-modal-body scroll container so a live preview SLICE stays visible
+     while the gallery/knobs scroll UNDER it. Bounded to ~128px so it never eats
+     the viewport; opaque --panel-bg + a low z-index + a hairline separator make
+     the scrolling content pass beneath. Mobile-only (this element is rendered
+     only by useIsMobile() AND this rule lives in @media (max-width:640px)), so
+     desktop Share's two-pane layout is byte-unchanged. The base .share-preview-col
+     min-height:320px must be zeroed here, else max-height clamps UP to it. */
+  .share-preview-col--lead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    flex: 0 0 auto;
+    min-height: 0;
+    max-height: 128px;
+    overflow: hidden;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  /* iOS auto-zooms any focused input/select rendered below 16px. */
+  .share-knob input[type="number"],
+  .share-knob input[type="date"],
+  .share-knob select,
+  .share-save-input,
+  .share-manage-name-input {
+    font-size: 16px;
+    min-height: var(--tap-target);
+  }
+  /* Radio / checkbox / format label TEXT to 16px (the 44px tap band is in the
+     coarse-pointer block). */
+  .share-knob-radio,
+  .share-knob-checkbox,
+  .share-format-radio {
+    font-size: 16px;
+  }
+  /* Every Share preset / save-popover / manage control clears the 44px floor
+     (all real <button>s / inputs — real box grow, not a label band).
+     #293 S4 ui-qa follow-up: the "Save preset…" TRIGGER (.share-save-preset) was
+     measured at 109×24 — it is the preset trigger §3b intended but the selector
+     list missed it, so it is added here alongside its preset-control siblings. */
+  .share-save-preset,
+  .share-presets-trigger,
+  .share-presets-item,
+  .share-presets-history-item,
+  .share-presets-manage,
+  .share-save-actions button,
+  .share-manage-actions button {
+    min-height: var(--tap-target);
+  }
+
   /* Composer modal (spec §8.10). Below 640px the composer stacks:
      composite knobs top, horizontal-scroll section pill strip middle,
      preview bottom, export bar pinned via position:sticky;bottom:0.
@@ -5002,6 +5345,14 @@ mark.current {
   }
   .composer-modal-mobile .composer-knobs > label:first-child {
     flex: 1 0 100%;   /* Title input on its own full-width row */
+  }
+  /* #293 S4 ui-qa follow-up: iOS auto-zooms a focused control rendered below
+     16px. The Composer Title / Theme / Format controls inherit the 13px
+     .composer-knobs font, so bump them to 16px on the phone (the 44px height is
+     in the coarse-pointer block). */
+  .composer-modal-mobile .composer-knobs input[type="text"],
+  .composer-modal-mobile .composer-knobs select {
+    font-size: 16px;
   }
   .composer-modal-mobile .composer-body {
     grid-template-columns: 1fr;
@@ -5082,7 +5433,7 @@ mark.current {
      button a real 44px height so the <th> grows downward into its own row
      (no pseudo overhang stealing taps from the first data row). Confirmed
      rendered at phone width in the Trend panel. */
-  .th-sortable .th-sort-btn { min-height: 44px; }
+  .th-sortable .th-sort-btn { min-height: var(--tap-target); }
 
   /* .doctor-chip (topbar pill): vertical-only invisible 44px so the #206
      topbar height budget stays intact (a real 44px box would grow the
@@ -5092,10 +5443,14 @@ mark.current {
      clears 44px wide, and extend the same idiom to .basket-chip. The
      .topbar.is-scrolled rule sets both chips display:none — a display:none
      element paints no ::before, so no phantom hit-area leaks. */
+  /* #293 S4 P2-13 — vertical-only, NON-overlapping (was inset -12px/-10px `-8px`
+     horizontal, which at the 4px is-scrolled gap overlapped the neighbour and
+     mis-dispatched). The box grows to 44px tall but never crosses into the
+     sibling; --topbar-h is untouched. */
   .doctor-chip { position: relative; }
-  .doctor-chip::before { content: ""; position: absolute; inset: -12px -8px; }
+  .doctor-chip::before { content: ""; position: absolute; inset: -12px 0; }
   .basket-chip { position: relative; }
-  .basket-chip::before { content: ""; position: absolute; inset: -10px -8px; }
+  .basket-chip::before { content: ""; position: absolute; inset: -10px 0; }
 
   /* Settings checkbox/radio rows: a 44px flex label row + an 18px box.
      Scoped via :has() to labels that wrap a checkbox/radio. This INCLUDES
@@ -5141,6 +5496,16 @@ mark.current {
   /* #249 C6 — the inline model-split legend clears the 14px mobile data floor
      (desktop renders it at 11px). #root outranks the bare-class rule above. */
   #root .model-legend { font-size: var(--fs-data); }
+}
+
+/* #293 S4 §4c — sub-360px topbar compaction. Hide the "Doctor" WORD (the status
+   token — OK / N warn / N fail — stays, keeping a color-coded glyph) so the
+   topbar doesn't x-overflow in the FAIL + non-empty-basket state at 320px. Only
+   the label is dropped: --topbar-h and the single-row layout are untouched, and
+   the full doctor detail stays one tap away in the modal. Placed after the ≤640
+   block so it wins by source order at ≤360. */
+@media (max-width: 360px) {
+  .doctor-chip-label { display: none; }
 }
 
 /* ---- Projects panel leaderboard (spec §5.2) -------------------------
@@ -5220,6 +5585,21 @@ mark.current {
 .project-cell-link:hover { color: var(--accent-magenta); }
 .project-cell-link:focus-visible {
   outline: 2px solid var(--accent-magenta);
+  outline-offset: 2px;
+}
+
+/* #293 S2 A11Y-2 — the Session title is a no-chrome button (the accessible,
+   keyboard+touch "open session" activator). Styled to look identical to the
+   prior title text; ellipsizes like the cell did. */
+.sess-open-title {
+  display: block; max-width: 100%;
+  background: none; border: 0; margin: 0; padding: 0;
+  font: inherit; color: inherit; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: pointer;
+}
+.sess-open-title:focus-visible {
+  outline: 2px solid var(--accent-orange);
   outline-offset: 2px;
 }
 
@@ -6211,6 +6591,12 @@ mark.current {
   --reader-ink: #ece9e3;    /* warm prose ink */
   --reader-faint: #a0a7b8;  /* reader faint text — ≥4.5:1 on panel bg (verify in §5) */
 }
+/* #304 S3 §3 — viewer-scoped chip floor: (0,2,0) beats BOTH bare .chip base
+   rules (0,1,0), source-order-independent, so the reader assistant-turn chip AND
+   the rail chips render at the 11px eyebrow floor without touching the
+   dashboard-wide .chip base rules or the design-system card. The rail's own
+   9.5px chip override is deleted (below) so it inherits this. */
+.conv-view .chip { font-size: var(--fs-eyebrow); }
 
 /* ---- Two-pane workspace shell ------------------------------------- */
 .conv-view {
@@ -6226,6 +6612,16 @@ mark.current {
   height: calc(100vh - var(--topbar-h) - 28px);
   overflow: hidden;
   margin-bottom: var(--space-4);
+}
+/* #304 S1 — the single-pane grid is class-driven (the modifier is added only by
+   the two single-pane branches in ConversationsView, so it self-gates to the
+   useCompactWorkspace 880 resolver). Do NOT re-add the bare `.conv-view`
+   selector here — it matches the desktop two-pane shell and would collapse it.
+   #root-prefixed (id-selector specificity floor) so it wins over the base grid;
+   the phone-only height/overflow/margin stay in the ≤640 block below. */
+#root .conv-view--mobile {
+  grid-template-columns: 1fr;
+  gap: 0;
 }
 /* #177 S5 §3 — when the outline panel is open, the two-column grid grows a
    resize divider + a third column on the reader's right. Closed → back to two
@@ -6806,7 +7202,7 @@ mark.current {
 /* The in-menu "Anonymized …" note above the scope rows (mode ON only). */
 .conv-export-anon-note {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--fs-eyebrow); /* #304 S3 §3 — was 10px */
   color: var(--text-faint);
   padding: 2px var(--space-2) var(--space-1);
   border-bottom: 1px solid var(--border-soft);
@@ -7244,16 +7640,12 @@ mark.current {
   align-items: baseline;
 }
 .conv-rail-row-metaleft > span { overflow: hidden; text-overflow: ellipsis; }
-/* #238 S2 / #243 — the model chip is its OWN meta item (NOT inside the stats
-   cluster) so it never inflates the cluster's min-content and forces the cost/
-   msg numbers off the fixed ~338px rail. #238 S2 made it the shrink valve
-   (flex 0 1 auto + overflow:hidden), but that clipped the atomic chip pill
-   mid-glyph ("opus" → "opu" → "op") under width pressure (#243). #243 caps the
-   rail to ONE chip (+ optional "+N"), small enough to stay RIGID (flex:0 0 auto,
-   no overflow) — so it is never truncated — while metaleft (project/branch)
-   becomes the sole shrink valve. Hard floor (when + 1 chip + "+N" + cost + msgs
-   + gaps ≈ 280px) sits well inside the rail, so numbers never spill; metaleft
-   ellipsizes first. Search rows carry neither model nor cluster. */
+/* #304 S3 §2 — the model chip now lives on line 2 (.conv-rail-row-stats), not on
+   the identity line, so it no longer competes with project/branch for width. It
+   keeps the #243 cap=1 single RIGID pill (flex:0 0 auto, no overflow) — never
+   truncated mid-glyph — with an optional "+N". Long unknown-model ids are bounded
+   in the label TEXT itself (Codex F4), not by CSS clipping, so #243 holds. Search
+   rows carry neither model nor cluster. */
 .conv-rail-row-model {
   flex: 0 0 auto;
   display: inline-flex;
@@ -7261,7 +7653,9 @@ mark.current {
   gap: 3px;
   white-space: nowrap;
 }
-.conv-rail-row-model .chip { font-size: 9.5px; padding: 1px 5px; }
+/* #304 S3 §3 — font-size now inherited from the `.conv-view .chip` floor override
+   (11px); only the tight rail padding remains. */
+.conv-rail-row-model .chip { padding: 1px 5px; }
 .conv-rail-row-model-more { color: var(--text-faint); font-size: var(--fs-eyebrow); }
 .conv-rail-row-cluster {
   flex: 0 0 auto;
@@ -7270,6 +7664,21 @@ mark.current {
   gap: var(--space-2);
 }
 .conv-rail-row-cost { color: var(--accent-green); }
+/* #304 S3 §2 — line 2 of the two-line meta contract: stats (model chip · $cost ·
+   msgs), ALL rigid (no shrink valve needed — min-content ≈130px vs the 280px
+   worst-case rail). Line 1 (identity) keeps the ellipsis contract. */
+.conv-rail-row-stats {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  margin-top: 2px;
+}
+.conv-rail-row-stats > * { flex: 0 0 auto; }
 .conv-rail-row-snippet {
   margin-top: var(--space-1);
   font-size: 11.5px;
@@ -7926,6 +8335,39 @@ mark.current {
   flex-wrap: wrap;
   justify-content: flex-start;
 }
+/* #304 S3 §1 — intent clusters. Groups are ATOMIC wrap units (internally
+   nowrap; the outer .conv-reader-controls keeps #238 R1's flex-wrap so whole
+   GROUPS reflow). Divider = border-left on every group after the first;
+   group-level wrap in the 720–1120 reader band is the accepted design. */
+.conv-hdr-group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: nowrap;
+}
+.conv-hdr-group + .conv-hdr-group {
+  border-left: 1px solid var(--border-soft);
+  padding-left: var(--space-2);
+}
+/* #304 S3 §1 (Q2) — quiet right-aligned status cluster (non-action). */
+.conv-hdr-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+/* Demoted ✓ Complete inside the status cluster: keeps its jump affordance and
+   its accent TEXT colour, drops the accent-button border/background chrome. */
+.conv-hdr-status .conv-complete-chip {
+  border-color: transparent;
+  background: transparent;
+}
+/* #304 S3 §1 (Codex F9) — Compare's #228 S5 E4 leading ::before divider + margin
+   were built for the old flat strip; inside the sharing cluster the group border
+   IS the divider, so a second one would be visual noise. Specificity (0,2,0) /
+   (0,2,1) beats the base rules, source-order-independent. */
+.conv-hdr-group .conv-compare-with { margin-left: 0; }
+.conv-hdr-group .conv-compare-with::before { content: none; }
 /* The mobile back button is a full-width row above the title/controls. */
 .conv-reader-head .conv-back { flex: 1 0 100%; }
 /* #228 S2 — bulk expand/collapse pair in the reader controls. */
@@ -9417,14 +9859,303 @@ mark.current {
   #root .conv-outline-close:hover { color: var(--text); border-color: var(--accent-blue); }
 }
 
+/* #304 S1 — the compact reader header (two-row .conv-reader-head--mobile)
+   now applies across the whole constrained band (≤1100px), not only phones.
+   The reader renders this DOM when !isWide (≤1100), so these STRUCTURAL rules
+   mirror that self-gating (moved up from the ≤640px block; same precedent as
+   the #228 S3 F1 outline-sheet relocation above). The base-class rules
+   (.conv-reader-head padding / .conv-reader-title clamp / .conv-reader-meta
+   ellipsis) are width-gated here so the full desktop header ≥1101px is
+   untouched; the class-scoped --mobile/row/overflow/focus-compact rules would
+   self-gate anyway. The 44px touch floors are split OUT into the phone +
+   coarse-pointer blocks below so fine-pointer desktop 641–1100 gets normal
+   control sizing. #root-prefixed + every property respelled per the
+   id-selector specificity floor. */
+@media (max-width: 1100px) {
+  /* #205 S3 (F6) — condense the sticky reader header: trim its padding, cap a
+     long title at 2 lines, and keep the meta to a single ellipsized line (with
+     the abbreviated model list it fits; the ellipsis is the tail backstop).
+     #root-prefixed + every property respelled per the specificity-floor. */
+  #root .conv-reader-head { padding: var(--space-2) var(--space-3); }
+  #root .conv-reader-title {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  #root .conv-reader-meta {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* #228 S3 C2 — two-row mobile reader header. Row 1: ← Back · title · ⋯ (the
+     overflow menu). Row 2 (slim): the compact Focus dropdown · Find · Outline.
+     Reclaims the ~347px desktop toolbar height so reading starts in the top ~40%
+     of the screen. #304 S1 — this now applies across ≤1100px (not only phones);
+     ≥1101px keeps the full inline header. #root-prefixed + every property
+     respelled per the id-selector specificity floor. The 44px tap-target floors
+     are split into the phone + coarse-pointer blocks below the media query. */
+  #root .conv-reader-head--mobile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    align-items: stretch;
+  }
+  /* The rows are flex items in the column-direction header; align-items:stretch
+     does NOT clamp their cross-axis (horizontal) width when a row is itself a
+     flex container — it sizes to its children's ~464px min-content and spills ⋯
+     off-screen. A definite width:100% forces the row to the header content box
+     (~348px at 390); min-width:0 then lets the headmain child ellipsize within
+     it. (overflow:hidden is avoided — it would clip the ⋯/Focus dropdowns.) */
+  #root .conv-reader-row1 {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    width: 100%;
+    min-width: 0;
+  }
+  /* The Back button shrinks to its content (not a full-width row) so it sits
+     inline with the title + ⋯ on row 1. Overrides the desktop full-row rule. */
+  #root .conv-reader-head--mobile .conv-back {
+    flex: 0 0 auto;
+  }
+  /* The title/meta block grows to fill the gap between Back and ⋯. */
+  #root .conv-reader-head--mobile .conv-reader-headmain {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  /* Row 2: the compact Focus dropdown grows; Find + Outline sit beside it. */
+  /* Same definite-width clamp as row1 — keeps Focus · Find · Outline on-screen. */
+  #root .conv-reader-row2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-width: 0;
+  }
+  /* Row 2's Find + Outline share the remaining width (44px floor split out below). */
+  #root .conv-reader-row2 .conv-find-toggle,
+  #root .conv-reader-row2 .conv-outline-toggle {
+    flex: 0 0 auto;
+  }
+}
+
+/* #304 S3 (Codex F1) — compact-primitive structural rules un-gated from ≤1100:
+   they key on classes only the compact (≤1100) and folded (≥1101, reader <720px)
+   headers render, so they self-gate via DOM presence (the S1 comment already
+   noted this). The base-class restyles (head padding / title clamp / meta
+   ellipsis) and the .conv-reader-row2 / .conv-reader-head--mobile row layout stay
+   width-gated above — folded desktop keeps the roomier desktop title/meta. */
+/* The ⋯ overflow trigger pins to the right; the menu drops below it. */
+#root .conv-overflow { flex: 0 0 auto; position: relative; }
+#root .conv-overflow-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+#root .conv-overflow-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+#root .conv-overflow-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+/* The ⋯ dropdown: a right-aligned popover under the trigger. */
+#root .conv-overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: min(260px, 86vw);
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+/* Read-only summary rows (completion / cost) at the top of the ⋯ menu. */
+#root .conv-overflow-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-1) var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: var(--space-1);
+}
+#root .conv-overflow-summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+#root .conv-overflow-summary-label { color: var(--text-faint); }
+#root .conv-overflow-summary-value { color: var(--text); }
+/* The embedded Export popover sits as a full-width row in the menu. */
+#root .conv-overflow-export { padding: 0; }
+#root .conv-overflow-export .conv-export { width: 100%; }
+#root .conv-overflow-export .conv-export-toggle {
+  width: 100%;
+  justify-content: flex-start;
+}
+/* The flat action menuitems. */
+#root .conv-overflow-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: var(--space-2) var(--space-2);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+#root .conv-overflow-item:hover { background: var(--panel-bg); }
+#root .conv-overflow-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+#root .conv-overflow-item:disabled { opacity: 0.5; cursor: not-allowed; }
+/* #281 S4 — the Anonymize toggle row: label left, an On/Off state chip right. */
+#root .conv-overflow-item--toggle { justify-content: space-between; gap: var(--space-3); }
+#root .conv-overflow-item-state {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+/* #304 S2 — the toggle is a menuitemcheckbox now; state attribute is aria-checked. */
+#root .conv-overflow-item--toggle[aria-checked='true'] .conv-overflow-item-state {
+  color: var(--accent-blue);
+}
+#root .conv-focus-compact { flex: 1 1 auto; position: relative; min-width: 0; }
+#root .conv-focus-compact-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#root .conv-focus-compact-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
+#root .conv-focus-compact-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+#root .conv-focus-compact-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 40;
+  min-width: min(220px, 80vw);
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+#root .conv-focus-compact-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+#root .conv-focus-compact-item:hover { background: var(--panel-bg); }
+#root .conv-focus-compact-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+#root .conv-focus-compact-item--on { color: var(--accent-blue); font-weight: 600; }
+#root .conv-focus-compact-badge {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--accent-red);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* #304 S1 — the 44px touch floor for the compact-header controls, split out
+   of the structural rules above (Codex F5). Phones (≤640, preserved exactly
+   — no regression) PLUS coarse-pointer tablets across the compact band
+   (≤1100), so a coarse tablet at 900px still clears 44×44px while a
+   fine-pointer desktop 641–1100 keeps normal control sizing. Precedent:
+   `@media (pointer: coarse) and (width > 640px)` (index.css ~1439). Scope
+   guard: ONLY the compact-header controls this session newly renders at
+   641–1100 are promoted; the broader phone touch sweep (rail rows, outline,
+   transcript controls, find BAR) stays trapped at ≤640 unchanged. */
+@media (max-width: 640px) {
+  #root .conv-reader-head--mobile .conv-back,
+  #root .conv-overflow-toggle,
+  #root .conv-overflow-export .conv-export-toggle,
+  #root .conv-overflow-item,
+  #root .conv-focus-compact-toggle,
+  #root .conv-focus-compact-item,
+  #root .conv-reader-row2 .conv-find-toggle,
+  #root .conv-reader-row2 .conv-outline-toggle { min-height: 44px; }
+  #root .conv-overflow-toggle { min-width: 44px; }
+}
+@media (pointer: coarse) and (max-width: 1100px) {
+  #root .conv-reader-head--mobile .conv-back,
+  #root .conv-overflow-toggle,
+  #root .conv-overflow-export .conv-export-toggle,
+  #root .conv-overflow-item,
+  #root .conv-focus-compact-toggle,
+  #root .conv-focus-compact-item,
+  #root .conv-reader-row2 .conv-find-toggle,
+  #root .conv-reader-row2 .conv-outline-toggle { min-height: 44px; }
+  #root .conv-overflow-toggle { min-width: 44px; }
+}
+/* #304 S3 — 44px floor for the FOLDED desktop header (≥1101 + reader <720px) on
+   coarse pointers. Mirrors the S1 compact-band list; scoped under --folded so the
+   wide desktop strip and S1's two width-capped blocks above are untouched (scope
+   guard: no broadening of the phone sweep). The folded Find/Outline are direct
+   controls (not inside .conv-reader-row2), so they are listed by their own class. */
+@media (pointer: coarse) {
+  #root .conv-reader-head--folded .conv-overflow-toggle,
+  #root .conv-reader-head--folded .conv-overflow-export .conv-export-toggle,
+  #root .conv-reader-head--folded .conv-overflow-item,
+  #root .conv-reader-head--folded .conv-focus-compact-toggle,
+  #root .conv-reader-head--folded .conv-focus-compact-item,
+  #root .conv-reader-head--folded .conv-find-toggle,
+  #root .conv-reader-head--folded .conv-outline-toggle { min-height: 44px; }
+  #root .conv-reader-head--folded .conv-overflow-toggle { min-width: 44px; }
+}
+
 /* ---- Mobile: single column, rail-OR-reader (DOM-swapped by the view
    shell). Every rule re-prefixed with `#root` to beat the desktop
    class-chain specificity floor (id-selector-specificity-floor gotcha);
    each property is respelled (not inherited) so the override is total. */
 @media (max-width: 640px) {
+  /* #304 S1 — the single-pane grid-template-columns:1fr + gap:0 moved OUT to the
+     class-scoped `#root .conv-view--mobile` rule near the base grid (self-gating
+     on the 880 resolver's modifier class). Only the phone-only height/overflow/
+     margin stay here — the bare `.conv-view` selector is kept for those so it
+     applies to every workspace ≤640, but NOT the grid collapse. */
   #root .conv-view,
   #root .conv-view--mobile {
-    grid-template-columns: 1fr;
     /* #206 — --topbar-h is now safe-area-aware (it tracks the real ~148px two-row
        bar incl. env(safe-area-inset-top)), so this calc only has to subtract the
        surrounding chrome: body top+bottom padding (8+8) + topbar margin-bottom (8)
@@ -9435,7 +10166,6 @@ mark.current {
        the no-inset headless case only and regained ~30px overflow on notched
        devices. */
     height: calc(var(--mobile-vh) - var(--topbar-h) - 40px);
-    gap: 0;
     overflow: hidden;
     margin-bottom: var(--space-3);
   }
@@ -9462,228 +10192,12 @@ mark.current {
        scrollWidth; the per-child clamp below is what makes scrollWidth fit. */
     overflow-x: hidden;
   }
-  /* #205 S3 (F6) — condense the sticky reader header: trim its padding, cap a
-     long title at 2 lines, and keep the meta to a single ellipsized line (with
-     the abbreviated model list it fits; the ellipsis is the tail backstop).
-     #root-prefixed + every property respelled per the specificity-floor. */
-  #root .conv-reader-head { padding: var(--space-2) var(--space-3); }
-  #root .conv-reader-title {
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-  #root .conv-reader-meta {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  /* #228 S3 C2 — two-row mobile reader header. Row 1: ← Back · title · ⋯ (the
-     overflow menu). Row 2 (slim): the compact Focus dropdown · Find · Outline.
-     Reclaims the ~347px desktop toolbar height so reading starts in the top ~40%
-     of a phone screen. Desktop/tablet keep the full inline header (unchanged).
-     #root-prefixed + every property respelled per the id-selector specificity
-     floor. The 44px tap-target floors below still apply to row-2's controls. */
-  #root .conv-reader-head--mobile {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    align-items: stretch;
-  }
-  /* The rows are flex items in the column-direction header; align-items:stretch
-     does NOT clamp their cross-axis (horizontal) width when a row is itself a
-     flex container — it sizes to its children's ~464px min-content and spills ⋯
-     off-screen. A definite width:100% forces the row to the header content box
-     (~348px at 390); min-width:0 then lets the headmain child ellipsize within
-     it. (overflow:hidden is avoided — it would clip the ⋯/Focus dropdowns.) */
-  #root .conv-reader-row1 {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-2);
-    width: 100%;
-    min-width: 0;
-  }
-  /* The Back button shrinks to its content (not a full-width row) so it sits
-     inline with the title + ⋯ on row 1. Overrides the desktop full-row rule. */
-  #root .conv-reader-head--mobile .conv-back {
-    flex: 0 0 auto;
-    min-height: 44px;
-  }
-  /* The title/meta block grows to fill the gap between Back and ⋯. */
-  #root .conv-reader-head--mobile .conv-reader-headmain {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-  /* The ⋯ overflow trigger pins to the right; the menu drops below it. */
-  #root .conv-overflow { flex: 0 0 auto; position: relative; }
-  #root .conv-overflow-toggle {
-    appearance: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 44px;
-    min-height: 44px;
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    background: var(--panel-bg);
-    color: var(--text-dim);
-    font-size: 18px;
-    line-height: 1;
-    cursor: pointer;
-  }
-  #root .conv-overflow-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
-  #root .conv-overflow-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-  /* The ⋯ dropdown: a right-aligned popover under the trigger. */
-  #root .conv-overflow-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 0;
-    z-index: 40;
-    min-width: min(260px, 86vw);
-    display: flex;
-    flex-direction: column;
-    padding: var(--space-1);
-    background: var(--panel-bg-2);
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  }
-  /* Read-only summary rows (completion / cost) at the top of the ⋯ menu. */
-  #root .conv-overflow-summary {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: var(--space-1) var(--space-2) var(--space-2);
-    border-bottom: 1px solid var(--border-soft);
-    margin-bottom: var(--space-1);
-  }
-  #root .conv-overflow-summary-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-3);
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-  #root .conv-overflow-summary-label { color: var(--text-faint); }
-  #root .conv-overflow-summary-value { color: var(--text); }
-  /* The embedded Export popover sits as a full-width row in the menu. */
-  #root .conv-overflow-export { padding: 0; }
-  #root .conv-overflow-export .conv-export { width: 100%; }
-  #root .conv-overflow-export .conv-export-toggle {
-    width: 100%;
-    justify-content: flex-start;
-    min-height: 44px;
-  }
-  /* The flat action menuitems. */
-  #root .conv-overflow-item {
-    appearance: none;
-    display: flex;
-    align-items: center;
-    width: 100%;
-    min-height: 44px;
-    padding: var(--space-2) var(--space-2);
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text);
-    font-size: 13px;
-    text-align: left;
-    cursor: pointer;
-  }
-  #root .conv-overflow-item:hover { background: var(--panel-bg); }
-  #root .conv-overflow-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-  #root .conv-overflow-item:disabled { opacity: 0.5; cursor: not-allowed; }
-  /* #281 S4 — the Anonymize toggle row: label left, an On/Off state chip right. */
-  #root .conv-overflow-item--toggle { justify-content: space-between; gap: var(--space-3); }
-  #root .conv-overflow-item-state {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-  }
-  #root .conv-overflow-item--toggle[aria-pressed='true'] .conv-overflow-item-state {
-    color: var(--accent-blue);
-  }
-  /* Row 2: the compact Focus dropdown grows; Find + Outline sit beside it. */
-  /* Same definite-width clamp as row1 — keeps Focus · Find · Outline on-screen. */
-  #root .conv-reader-row2 {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    width: 100%;
-    min-width: 0;
-  }
-  #root .conv-focus-compact { flex: 1 1 auto; position: relative; min-width: 0; }
-  #root .conv-focus-compact-toggle {
-    appearance: none;
-    display: inline-flex;
-    align-items: center;
-    width: 100%;
-    min-height: 44px;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    background: var(--panel-bg);
-    color: var(--text-dim);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    cursor: pointer;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  #root .conv-focus-compact-toggle:hover { color: var(--text); border-color: var(--accent-blue); }
-  #root .conv-focus-compact-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-  #root .conv-focus-compact-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    z-index: 40;
-    min-width: min(220px, 80vw);
-    display: flex;
-    flex-direction: column;
-    padding: var(--space-1);
-    background: var(--panel-bg-2);
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  }
-  #root .conv-focus-compact-item {
-    appearance: none;
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    width: 100%;
-    min-height: 44px;
-    padding: var(--space-2);
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text);
-    font-size: 13px;
-    text-align: left;
-    cursor: pointer;
-  }
-  #root .conv-focus-compact-item:hover { background: var(--panel-bg); }
-  #root .conv-focus-compact-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-  #root .conv-focus-compact-item--on { color: var(--accent-blue); font-weight: 600; }
-  #root .conv-focus-compact-badge {
-    margin-left: auto;
-    padding: 0 6px;
-    border-radius: 8px;
-    background: var(--accent-red);
-    color: #fff;
-    font-size: 11px;
-    font-weight: 700;
-  }
-  /* Row 2's Find + Outline share the remaining width as equal 44px controls. */
-  #root .conv-reader-row2 .conv-find-toggle,
-  #root .conv-reader-row2 .conv-outline-toggle {
-    flex: 0 0 auto;
-    min-height: 44px;
-  }
+  /* #304 S1 — the compact-header structural rules moved UP to the
+     `@media (max-width: 1100px)` block above (they self-gate on the
+     .conv-reader-head--mobile class, which the reader renders when !isWide);
+     their 44px touch floors moved into the phone + coarse-pointer blocks
+     above. The .conv-reader-body phone padding + the thread/spine/item rules
+     below stay phone-only (≤640). */
   #root .conv-reader-thread {
     /* #232 — the horizontal reading inset (was the scroller's mobile
        `var(--space-3)` = 12px) lives here now so Virtuoso's absolute width:100%
@@ -10066,7 +10580,7 @@ mark.current {
 .conv-codex--error .conv-codex-brand { color: var(--accent-red); }
 .conv-codex-model,
 .conv-codex-thread {
-  font-size: 10.5px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border-soft);
+  font-size: var(--fs-eyebrow); /* #304 S3 §3 — was 10.5px */ padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border-soft);
   flex: 0 0 auto;   /* rigid pills — let .conv-chip-preview absorb the shrink (#243) */
 }
 .conv-codex-model { color: #bdf3e6; border-color: rgba(16,163,127,.5); background: rgba(16,163,127,.14); }
@@ -10085,7 +10599,7 @@ mark.current {
 .conv-codex-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-codex); box-shadow: 0 0 0 3px rgba(16,163,127,.18); flex: 0 0 auto; }
 .conv-codex--error .conv-codex-dot { background: var(--accent-red); box-shadow: 0 0 0 3px rgba(239,68,68,.16); }
 .conv-codex-bar-model { color: #bdf3e6; }
-.conv-codex-bar-cwd { margin-left: auto; color: var(--text-faint); font-size: 10.5px; }
+.conv-codex-bar-cwd { margin-left: auto; color: var(--text-faint); font-size: var(--fs-eyebrow); /* #304 S3 §3 — was 10.5px */ }
 
 .conv-codex-prompt { border-bottom: 1px solid var(--border-soft); background: var(--panel-bg-2); }
 .conv-codex-prompt-toggle {
@@ -10093,11 +10607,11 @@ mark.current {
   padding: 8px 12px; background: none; border: 0; cursor: pointer;
   font: inherit; color: var(--text-dim); text-align: left;
 }
-.conv-codex-prompt-tag { color: var(--accent-codex); font-size: 10.5px; flex: 0 0 auto; }
+.conv-codex-prompt-tag { color: var(--accent-codex); font-size: var(--fs-eyebrow); /* #304 S3 §3 — was 10.5px */ flex: 0 0 auto; }
 .conv-codex-prompt-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv-codex-prompt-md { padding: 0 12px 10px; }
 
-.conv-codex-reslabel { display: flex; align-items: center; gap: 6px; padding: 10px 12px 0; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); }
+.conv-codex-reslabel { display: flex; align-items: center; gap: 6px; padding: 10px 12px 0; font-size: var(--fs-eyebrow); /* #304 S3 §3 — was 10.5px */ letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); }
 .conv-codex-md { padding: 6px 12px 12px; }
 .conv-codex-md--clamp { max-height: 320px; overflow: hidden; -webkit-mask-image: linear-gradient(#000 78%, transparent); mask-image: linear-gradient(#000 78%, transparent); }
 .conv-codex-more { padding: 0 12px 10px; }
@@ -10642,4 +11156,16 @@ mark.current {
   #root .conv-rail-pickcancel { min-height: 44px; }
   #root .conv-cmp-row,
   #root .conv-cmp-urow { min-height: 44px; }
+}
+
+/* #293 S1 (MOBILE-2) — narrowest phones (<=360px, e.g. 320px). The support
+   meta strip wraps into more rows here than at 390px, so the hero runs taller
+   and the first board card slips below the ~65%-of-viewport target. Trim only
+   the big-number zones' vertical padding on these widths (keep the horizontal
+   space-3 and the 34px numbers); 390px is untouched (it already clears the
+   fold comfortably). Appended last so it wins the same-selector source-order
+   tie against the max-width:640px hero rules. Dashboard-only (the hero mounts
+   only on the dashboard branch), so the conversations view is unaffected. */
+@media (max-width: 360px) {
+  .hero-zone { padding-block: var(--space-1); }
 }

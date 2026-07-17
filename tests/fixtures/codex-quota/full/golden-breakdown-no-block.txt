@@ -1,0 +1,2 @@
+cctally codex quota: --reset-at matches no unique native quota block; candidates:
+  root-key=root-a limit-key=limit-primary

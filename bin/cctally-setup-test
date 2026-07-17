@@ -125,10 +125,14 @@ STUB
     # Per-scenario knobs.
     local INCLUDE_LOCAL_BIN=""
     local INCLUDE_BREW_PREFIX_BIN=""
+    # Fixture command processes must never see the maintainer's live
+    # CODEX_HOME. A scenario may explicitly export its own fake-home list.
+    unset CODEX_HOME
     if [ -f "$dir/input.env" ]; then
         # shellcheck disable=SC1091
         . "$dir/input.env"
     fi
+    local codex_home_env="${CODEX_HOME:-}"
     local path_pre=""
     if [ "$INCLUDE_LOCAL_BIN" = "1" ]; then
         path_pre="$fake/.local/bin:"
@@ -141,17 +145,15 @@ STUB
         path_pre="${path_pre}$fake/opt/homebrew/bin:"
     fi
 
-    # Template-expand /REPO -> actual REPO_ROOT in any copied input
-    # files (settings.json variants reference symlink targets that we
-    # can't hardcode at fixture-creation time).
-    if [ -d "$fake/.claude" ]; then
-        find "$fake/.claude" -type f -name '*.json' 2>/dev/null \
-            | while read -r f; do
-                python3 -c "import sys; p=sys.argv[1]; r=sys.argv[2]; \
+    # Template-expand /REPO -> actual REPO_ROOT in copied provider JSON.
+    # Both Claude settings and Codex hooks pin the exact current binary path,
+    # which cannot be hardcoded at fixture-creation time.
+    find "$fake" -type f -name '*.json' 2>/dev/null \
+        | while read -r f; do
+            python3 -c "import sys; p=sys.argv[1]; r=sys.argv[2]; \
 import pathlib; t=pathlib.Path(p).read_text(); \
 pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
-            done
-    fi
+        done
 
     # The cctally shebang is `/usr/bin/env python3`; we want the harness's
     # ambient `python3` (tied to the test runner / Python 3.11+ on CI),
@@ -213,7 +215,7 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # "data dir gone" post-check flaked ~50-75% on Linux 3.12/3.13 from
         # exactly this). The seam keeps every scenario deterministic.
         # shellcheck disable=SC2086
-        HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_DISABLE_UPDATE_CHECK=1 \
+        HOME="$fake" CODEX_HOME="$codex_home_env" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_DISABLE_UPDATE_CHECK=1 \
             PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
             "$launcher" $pre >/dev/null 2>&1 || true
     fi
@@ -232,13 +234,13 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
         # behavior change — backward-compatible for every existing
         # scenario.
         # shellcheck disable=SC2086
-        raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+        raw=$(HOME="$fake" CODEX_HOME="$codex_home_env" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
               CCTALLY_DISABLE_UPDATE_CHECK=1 CCTALLY_SETUP_PROGRESS=0 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd < "$dir/stdin.txt" 2>&1; echo "EXIT=$?")
     else
         # shellcheck disable=SC2086
-        raw=$(HOME="$fake" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
+        raw=$(HOME="$fake" CODEX_HOME="$codex_home_env" TZ=Etc/UTC SHELL=/bin/zsh CCTALLY_AS_OF="${CCTALLY_AS_OF:-}" \
               CCTALLY_DISABLE_UPDATE_CHECK=1 CCTALLY_SETUP_PROGRESS=0 \
               PATH="${path_pre}$fake/.fake-bin:/usr/bin:/bin" \
               "$launcher" $cmd 2>&1; echo "EXIT=$?")
@@ -282,6 +284,21 @@ pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
             -e 's/\(([0-9]+) new entries\)/(N new entries)/g' \
             -e 's/Last fetch     [0-9]+s ago/Last fetch     Ns ago/g' \
             -e 's/cctally-legacy-hook-backup-[0-9]{8}-[0-9]{6}/cctally-legacy-hook-backup-TIMESTAMP/g')
+
+    # Per-root identity keys are deliberately hashes of the random fixture
+    # home. For the Codex-hook JSON fixtures, pin the state contract rather
+    # than incidental hashes, and make a mixed-root golden deterministic
+    # without changing the CLI's required source-root-key sort order.
+    if [ -f "$dir/normalize-codex-hooks-json" ]; then
+        norm=$(printf '%s' "$norm" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+for row in payload.get("codex_hooks", {}).get("roots", []):
+    row["source_root_key"] = "ROOT_KEY"
+payload.get("codex_hooks", {}).get("roots", []).sort(key=lambda row: row["codex_home"])
+print(json.dumps(payload, indent=2))
+')
+    fi
 
     local fail_local=0
 

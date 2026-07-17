@@ -109,6 +109,18 @@ normalize_json () {
 import json, sys
 env = json.load(sys.stdin)
 env["generated_at"] = "__NOW__"
+# #300: data_version is the all-inputs DB signature string at build time — its
+# value is ingest-order/fixture-build dependent (not a wire contract), so
+# sentinelize it like generated_at. Presence (key always emitted) is what the
+# golden asserts; the client behavior it drives is covered by the Vitest suite.
+if "data_version" in env:
+    env["data_version"] = "__VER__"
+# S4 adds the same opaque mutation/config signatures per provider.  Their
+# exact hashes are equally fixture-build dependent; the contract is their
+# presence and source-specific change behavior, covered by source tests.
+for source_state in (env.get("sources") or {}).values():
+    if isinstance(source_state, dict) and "data_version" in source_state:
+        source_state["data_version"] = "__VER__"
 # Doctor block sentinel mirrors the `update` block treatment below:
 # the _DashboardUpdateCheckThread runs concurrently with the HTTP
 # fetch, so update-state.json may or may not exist when the doctor

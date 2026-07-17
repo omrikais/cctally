@@ -1,0 +1,3 @@
+primary · 5h 30m · root=root-a · limit=limit-primary · 16.1% · resets 2026-07-15T15:00:00Z · STALE
+secondary · 1h · root=root-a · limit=limit-secondary · 41.0% · resets 2026-07-15T15:00:00Z · STALE
+primary · 5h 30m · root=root-b · limit=limit-primary · 12.4% · resets 2026-07-15T15:00:00Z · STALE

@@ -199,6 +199,11 @@ class DoctorState:
     # DOCTOR_WAL_WARN_BYTES (2x the WAL cap) — only when the journal_size_limit
     # + forced-checkpoint machinery has genuinely failed to contain the WAL.
     cache_db_wal_bytes: Optional[int] = None
+    # #294 S2: root-qualified physical Codex quota freshness, per-root native
+    # hook state, and lifecycle activity are gathered by _cctally_doctor.
+    codex_quota_windows: Optional[list[dict]] = None
+    codex_hook_roots: Optional[list[dict]] = None
+    codex_lifecycle_activity_24h: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -760,6 +765,200 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
                 else f"{count:,} entries",
         remediation=None,
         details={"entries": count, "codex_last_entry_age_s": age_s},
+    )
+
+
+def _check_data_codex_quota(s: DoctorState) -> CheckResult:
+    """Report local physical Codex quota evidence without fabricating a window."""
+    raw_windows = s.codex_quota_windows or []
+    if not raw_windows:
+        has_unsafe_corpus = bool(s.codex_jsonl_present)
+        return CheckResult(
+            id="data.codex_quota", title="Codex quota",
+            severity="warn" if has_unsafe_corpus else "ok",
+            summary=("no safely interpreted windows" if has_unsafe_corpus
+                     else "not applicable"),
+            remediation=("Run `cctally cache-sync --source codex --rebuild`"
+                         if has_unsafe_corpus else None),
+            details={
+                "window_count": 0,
+                "latest_capture_at": None,
+                "freshness_state": "unavailable",
+                "age_seconds": None,
+                "stale_after_seconds": None,
+                "responsible_identity": None,
+                "windows": [],
+            },
+        )
+
+    def identity_key(row: dict) -> tuple[str, str, str, str, int]:
+        identity = row.get("identity") or {}
+        return (
+            str(identity.get("source") or ""),
+            str(identity.get("source_root_key") or ""),
+            str(identity.get("logical_limit_key") or ""),
+            str(identity.get("observed_slot") or ""),
+            int(identity.get("window_minutes") or 0),
+        )
+
+    freshness_order = {"future": 0, "stale": 1, "unavailable": 2, "fresh": 3}
+    windows: list[dict] = []
+    for row in sorted(raw_windows, key=identity_key):
+        captured_at = row.get("latest_capture_at")
+        windows.append({
+            "identity": row.get("identity"),
+            "latest_capture_at": (_iso_z(captured_at)
+                                  if isinstance(captured_at, dt.datetime)
+                                  else captured_at),
+            "freshness_state": row.get("freshness_state") or "unavailable",
+            "age_seconds": row.get("age_seconds"),
+            "stale_after_seconds": row.get("stale_after_seconds"),
+        })
+    worst_rank = min(freshness_order.get(row["freshness_state"], 2) for row in windows)
+    responsible = next(
+        row for row in windows
+        if freshness_order.get(row["freshness_state"], 2) == worst_rank
+    )
+    captures = [
+        row.get("latest_capture_at") for row in raw_windows
+        if isinstance(row.get("latest_capture_at"), dt.datetime)
+    ]
+    latest_capture_at = _iso_z(max(captures)) if captures else None
+    state = responsible["freshness_state"]
+    return CheckResult(
+        id="data.codex_quota", title="Codex quota",
+        severity="ok" if state == "fresh" else "warn",
+        summary=f"{len(windows)} window(s); {state}",
+        remediation=(None if state == "fresh"
+                     else "Run `cctally cache-sync --source codex` after Codex activity."),
+        details={
+            "window_count": len(windows),
+            "latest_capture_at": latest_capture_at,
+            "freshness_state": state,
+            "age_seconds": responsible["age_seconds"],
+            "stale_after_seconds": responsible["stale_after_seconds"],
+            "responsible_identity": responsible["identity"],
+            "windows": windows,
+        },
+    )
+
+
+def _check_hooks_codex_installed(s: DoctorState) -> CheckResult:
+    """Summarize every configured Codex root without masking a bad sibling."""
+    rows = sorted(
+        (row for row in (s.codex_hook_roots or []) if isinstance(row, dict)),
+        key=lambda row: str(row.get("source_root_key") or ""),
+    )
+    states = [
+        {"source_root_key": row.get("source_root_key"), "state": row.get("state")}
+        for row in rows
+    ]
+    installed_states = {
+        "installed_review_required", "installed_trust_unobservable",
+    }
+    installed = [row for row in rows if row.get("state") in installed_states]
+    requires_review = (
+        True if any(row.get("state") == "installed_review_required" for row in rows)
+        else None if installed
+        else False
+    )
+    trust_state = (
+        "not-applicable" if not rows
+        else "review-required" if requires_review is True
+        else "unobservable" if installed
+        else "not-installed"
+    )
+    unhealthy = any(row.get("state") not in installed_states for row in rows)
+    return CheckResult(
+        id="hooks.codex_installed", title="Codex hooks installed",
+        severity="warn" if unhealthy else "ok",
+        summary=("not applicable" if not rows
+                 else f"{len(installed)}/{len(rows)} root(s) installed"),
+        remediation=("Run `cctally setup`, then review the handler in Codex /hooks."
+                     if unhealthy else None),
+        details={
+            "root_count": len(rows),
+            "installed_root_count": len(installed),
+            "states": states,
+            "requires_review": requires_review,
+            "trust_state": trust_state,
+        },
+    )
+
+
+def _check_hooks_codex_recent_activity(s: DoctorState) -> CheckResult:
+    """Aggregate 24-hour lifecycle records only for installed root handlers."""
+    installed_states = {
+        "installed_review_required", "installed_trust_unobservable",
+    }
+    installed_keys = sorted(
+        str(row.get("source_root_key"))
+        for row in (s.codex_hook_roots or [])
+        if isinstance(row, dict) and row.get("state") in installed_states
+        and row.get("source_root_key")
+    )
+    if not installed_keys:
+        return CheckResult(
+            id="hooks.codex_recent_activity", title="Codex recent activity",
+            severity="ok", summary="not applicable",
+            remediation=None,
+            details={
+                "activity_state": "not-applicable",
+                "last_tick_at": None,
+                "age_seconds": None,
+                "success_count_24h": 0,
+                "error_count_24h": 0,
+                "responsible_root_key": None,
+                "roots": [],
+            },
+        )
+
+    activity = s.codex_lifecycle_activity_24h or {}
+    roots: list[dict] = []
+    for key in installed_keys:
+        row = activity.get(key) if isinstance(activity, dict) else None
+        row = row if isinstance(row, dict) else {}
+        last_tick_at = row.get("last_tick_at")
+        if isinstance(last_tick_at, dt.datetime):
+            age_seconds = max(0, int((s.now_utc - last_tick_at).total_seconds()))
+            tick_wire = _iso_z(last_tick_at)
+        else:
+            age_seconds = None
+            tick_wire = None
+        if tick_wire is None:
+            state = "never"
+        elif age_seconds is not None and age_seconds > 24 * 3600:
+            state = "stale"
+        else:
+            state = "recent"
+        roots.append({
+            "source_root_key": key,
+            "activity_state": state,
+            "last_tick_at": tick_wire,
+            "age_seconds": age_seconds,
+            "success_count_24h": int(row.get("success_count_24h") or 0),
+            "error_count_24h": int(row.get("error_count_24h") or 0),
+        })
+    worst_order = {"never": 0, "stale": 1, "recent": 2}
+    worst_rank = min(worst_order[row["activity_state"]] for row in roots)
+    responsible = next(
+        row for row in roots if worst_order[row["activity_state"]] == worst_rank
+    )
+    return CheckResult(
+        id="hooks.codex_recent_activity", title="Codex recent activity",
+        severity="ok" if responsible["activity_state"] == "recent" else "warn",
+        summary=f"{len(roots)} installed root(s); {responsible['activity_state']}",
+        remediation=(None if responsible["activity_state"] == "recent"
+                     else "Trigger Codex activity, then verify `cctally setup` hooks."),
+        details={
+            "activity_state": responsible["activity_state"],
+            "last_tick_at": responsible["last_tick_at"],
+            "age_seconds": responsible["age_seconds"],
+            "success_count_24h": responsible["success_count_24h"],
+            "error_count_24h": responsible["error_count_24h"],
+            "responsible_root_key": responsible["source_root_key"],
+            "roots": roots,
+        },
     )
 
 
@@ -1393,6 +1592,8 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("hooks.installed", "_check_hooks_installed"),
         ("hooks.recent_activity_24h", "_check_hooks_recent_activity_24h"),
         ("hooks.last_fire_age", "_check_hooks_last_fire_age"),
+        ("hooks.codex_installed", "_check_hooks_codex_installed"),
+        ("hooks.codex_recent_activity", "_check_hooks_codex_recent_activity"),
     )),
     ("auth", "Auth", (
         ("oauth.token_present", "_check_oauth_token_present"),
@@ -1411,6 +1612,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
+        ("data.codex_quota", "_check_data_codex_quota"),
         ("data.parse_health", "_check_data_parse_health"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),

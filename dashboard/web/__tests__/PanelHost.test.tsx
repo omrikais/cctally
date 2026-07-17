@@ -32,12 +32,12 @@ function renderInDnd(items: GridPanelId[], ui: ReactNode): RenderResult {
 
 describe('<PanelHost />', () => {
   it('renders the registered component for the given id', () => {
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
     expect(document.querySelector('[data-panel-kind="forecast"]')).toBeTruthy();
   });
 
   it('attaches data-panel-host + data-panel-index + data-span for hit-testing', () => {
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={3} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={3} mode="bento" />);
     const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     expect(host).toBeTruthy();
     expect(host.dataset.panelIndex).toBe('3');
@@ -50,11 +50,14 @@ describe('<PanelHost />', () => {
     const user = userEvent.setup();
     // blocks sits at panelOrder index 7 (a medium-row card) in the #266 bento
     // order (medium is now a 6-card 3×2); pass that global index.
-    renderInDnd(['blocks'], <PanelHost id="blocks" index={7} />);
-    // The wrapper carries the onKeyDown handler; focus the inner panel — the
-    // keydown bubbles up to the wrapper.
-    const inner = document.querySelector('[data-panel-kind="blocks"]') as HTMLElement;
-    inner.focus();
+    renderInDnd(['blocks'], <PanelHost id="blocks" index={7} mode="bento" />);
+    // The wrapper carries the Shift+Arrow onKeyDown handler; the keydown bubbles
+    // up to it from any focused descendant. #293 S4 made the card region
+    // describe-only (no tabIndex), so the focus target is now a real panel
+    // control (here the Share icon) rather than the section body — the reorder
+    // is still reachable, just from a control the user can actually Tab to.
+    const control = document.querySelector('[data-panel-kind="blocks"] .share-icon') as HTMLElement;
+    control.focus();
     await user.keyboard('{Shift>}{ArrowDown}{/Shift}');
     // #266 — blocks (index 7, medium) swaps with the NEXT MEDIUM card
     // (forecast at index 8). So blocks lands at index 8 and forecast at index 7.
@@ -64,14 +67,14 @@ describe('<PanelHost />', () => {
 
   it('a quick click on the inner panel still opens its modal', async () => {
     const user = userEvent.setup();
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
     const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
     await user.click(inner);
     expect(getState().openModal).toBe('forecast');
   });
 
   it('a click is suppressed while the post-drag flag is armed', () => {
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
     const inner = document.querySelector('[data-panel-kind="forecast"]') as HTMLElement;
 
     // Simulate the dnd-kit drag-end path arming click suppression. The flag
@@ -88,7 +91,7 @@ describe('<PanelHost />', () => {
   });
 
   it('does not introduce an extra tab stop alongside the inner panel', () => {
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
     const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     // The wrapper must NOT be focusable — the inner panel section owns the
     // tab stop and Enter/Space modal-open behavior. Without this guard,
@@ -110,7 +113,7 @@ describe('<PanelHost />', () => {
       onchange: null,
     } as unknown as MediaQueryList));
     try {
-      renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+      renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
       const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
       // The wrapper's inline style.transition must be empty; otherwise the
       // sortable transform would still animate even with reduced-motion on.
@@ -122,7 +125,7 @@ describe('<PanelHost />', () => {
 
   it('Shift+Arrow inside an editable descendant does not reorder', async () => {
     const user = userEvent.setup();
-    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} />);
+    renderInDnd(['forecast'], <PanelHost id="forecast" index={0} mode="bento" />);
     const host = document.querySelector('[data-panel-host="forecast"]') as HTMLElement;
     // Inject a text input and dispatch Shift+Arrow from there. The wrapper's
     // onKeyDown must skip the swap so the user's text-selection gesture

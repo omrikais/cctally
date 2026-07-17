@@ -46,3 +46,24 @@ describe('SortableHeader rest-state glyph (SESS-4)', () => {
     });
   });
 });
+
+describe('SortableHeader grid roles (#299)', () => {
+  it('emits thead/row grid roles only when grid is set', () => {
+    const { container } = render(
+      <table role="grid">
+        <SortableHeader columns={COLUMNS} override={null} onChange={vi.fn()} grid />
+      </table>,
+    );
+    expect(container.querySelector('thead')?.getAttribute('role')).toBe('rowgroup');
+    expect(container.querySelector('thead tr')?.getAttribute('role')).toBe('row');
+    // columnheader is present regardless (already shipped):
+    expect(container.querySelector('th')?.getAttribute('role')).toBe('columnheader');
+  });
+  it('omits the grid roles for the default (native-table) consumers', () => {
+    const { container } = render(
+      <table><SortableHeader columns={COLUMNS} override={null} onChange={vi.fn()} /></table>,
+    );
+    expect(container.querySelector('thead')?.getAttribute('role')).toBeNull();
+    expect(container.querySelector('thead tr')?.getAttribute('role')).toBeNull();
+  });
+});

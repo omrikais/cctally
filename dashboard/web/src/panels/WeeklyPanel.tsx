@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useContext, useLayoutEffect, useRef, useState } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
@@ -8,16 +8,25 @@ import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { dispatch } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { keyOf } from '../modals/periodNav';
+import { useReducedMotion } from '../hooks/useReducedMotion';
+import { BoardModeContext } from '../lib/boardModeContext';
+import { summarize } from '../lib/summaryWindow';
+import { cardRegionClick } from '../lib/cardRegion';
 import type { PeriodRow } from '../types/envelope';
 
 // #264 S2 / #265 — the Weekly summary TILE (restored from the S8 collapse).
-// Renders ALL weeks; the bento card scrolls internally (the #264 S4 A1 inner
-// scroll — mirrors the Blocks A2 uncap) so every week is reachable rather than
-// stranding the older ones behind a scrollbar that had nothing to reveal. The
-// footer summarizes the whole window. S1 card chrome: the header right-side
-// leaves live in a `.panel-header-actions` cluster with a ⤢ ExpandButton.
+// #293 S3 — below 900px (stack mode) the card previews the newest
+// SUMMARY_WINDOW_CAP weeks and defers the rest to the full-table weekly modal
+// via an explicit "+N more" footer button; at >=900 it renders ALL weeks and
+// the bento card scrolls internally (the #264 S4 A1 inner scroll) so every
+// week stays reachable. The footer always summarizes the WHOLE window ($total
+// is the envelope scalar, never the visible slice). S1 card chrome: the header
+// right-side leaves live in a `.panel-header-actions` cluster with a ⤢
+// ExpandButton.
 
-function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
+function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean; reduced: boolean }) {
+  const animate = isFirstMount && !reduced;
   const deltaCls =
     r.delta_cost_pct == null ? 'flat' :
     r.delta_cost_pct > 0 ? 'up' : r.delta_cost_pct < 0 ? 'down' : 'flat';
@@ -38,7 +47,7 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
           <span
             key={m.model}
             className={m.chip}
-            style={{ width: isFirstMount ? '0%' : `${m.cost_pct}%` }}
+            style={{ width: animate ? '0%' : `${m.cost_pct}%` }}
             title={`${m.display} ${fmt.usd2(m.cost_usd)} (${m.cost_pct.toFixed(0)}%)`}
           />
         ))}
@@ -51,34 +60,29 @@ function Row({ r, isFirstMount }: { r: PeriodRow; isFirstMount: boolean }) {
 export function WeeklyPanel() {
   const env = useSnapshot();
   const allRows = env?.weekly?.rows ?? [];
-  const rows = allRows;
+  const mode = useContext(BoardModeContext);
+  const { visible, hiddenCount } = summarize(allRows, mode);
   const total = env?.weekly?.total_cost_usd ?? 0;
+  const reduced = useReducedMotion();
 
-  const seenLabels = useRef<Set<string>>(new Set());
+  const seen = useRef<Set<string>>(new Set());
   const [, forceRender] = useState(0);
   useLayoutEffect(() => {
-    const newLabels = rows.filter((r) => !seenLabels.current.has(r.label));
-    if (newLabels.length === 0) return;
-    newLabels.forEach((r) => seenLabels.current.add(r.label));
+    const fresh = visible.filter((r) => !seen.current.has(keyOf(r, 'week')));
+    if (fresh.length === 0) return;
+    fresh.forEach((r) => seen.current.add(keyOf(r, 'week')));
     const id = requestAnimationFrame(() => forceRender((n) => n + 1));
     return () => cancelAnimationFrame(id);
-  }, [rows]);
+  }, [visible]);
 
   return (
     <section
       className="panel accent-cyan"
       id="panel-weekly"
-      tabIndex={0}
       role="region"
       aria-label="Weekly usage panel"
       data-panel-kind="weekly"
-      onClick={() => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' })}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
-        }
-      }}
+      onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' }))}
     >
       <div className="panel-header">
         <svg className="icon" aria-hidden="true">
@@ -102,25 +106,55 @@ export function WeeklyPanel() {
         </div>
       </div>
       <div className="panel-body">
-        {rows.length === 0 ? (
+        {allRows.length === 0 ? (
           env?.hydrating ? (
             <PanelSkeleton />
           ) : (
             <div className="panel-empty">No usage history yet.</div>
           )
         ) : (
-          rows.map((r) => (
-            <Row key={r.label} r={r} isFirstMount={!seenLabels.current.has(r.label)} />
+          visible.map((r) => (
+            <Row
+              key={keyOf(r, 'week')}
+              r={r}
+              isFirstMount={!seen.current.has(keyOf(r, 'week'))}
+              reduced={reduced}
+            />
           ))
         )}
       </div>
       {allRows.length > 0 && (
         <div className="panel-foot period-foot">
-          <span>
-            {allRows.length}w total
-            <span className="sep" aria-hidden="true"> · </span>
-            <span className="total">{fmt.usd2(total)}</span>
-          </span>
+          {hiddenCount > 0 ? (
+            <span>
+              <button
+                type="button"
+                className="period-foot-more"
+                aria-label={`Show all ${allRows.length} weeks`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
+                }}
+                onKeyDown={(e) => {
+                  // Enter/Space-scoped guard: block ONLY the region's Enter/Space
+                  // handler from also opening; the native button click does the
+                  // single dispatch. A blanket stopPropagation would swallow
+                  // PanelHost's Shift+Arrow reorder (#293 S3, Codex F6).
+                  if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+                }}
+              >
+                +{hiddenCount} more
+              </button>
+              <span className="sep" aria-hidden="true"> · </span>
+              <span className="total">{fmt.usd2(total)}</span>
+            </span>
+          ) : (
+            <span>
+              {allRows.length}w total
+              <span className="sep" aria-hidden="true"> · </span>
+              <span className="total">{fmt.usd2(total)}</span>
+            </span>
+          )}
         </div>
       )}
     </section>

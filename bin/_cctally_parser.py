@@ -281,7 +281,30 @@ def _add_codex_shared_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_share_args(parser, *, has_status_line: bool = False) -> None:
+def _add_source_args(
+    parser: argparse.ArgumentParser, *, fixed_source: str | None = None,
+    speed: bool = False,
+) -> None:
+    """Attach the source selector or pin a nested provider alias."""
+    if fixed_source is None:
+        parser.add_argument(
+            "--source", choices=("claude", "codex", "all"), default="claude",
+            help="Analytics provider: claude (default), codex, or all.",
+        )
+    else:
+        if fixed_source not in {"claude", "codex"}:
+            raise ValueError(f"unsupported fixed source {fixed_source!r}")
+        parser.set_defaults(source=fixed_source)
+    if speed:
+        parser.add_argument(
+            "--speed", choices=("auto", "standard", "fast"), default="auto",
+            help="Codex pricing tier for Codex and all-source requests.",
+        )
+
+
+def _add_share_args(
+    parser, *, has_status_line: bool = False, json_dest: str = "json",
+) -> None:
     """Attach shareable-reports flags + format/json mutex to a subparser.
 
     Idempotent — call exactly once per subparser. Caller MUST remove any
@@ -310,7 +333,7 @@ def _add_share_args(parser, *, has_status_line: bool = False) -> None:
         help="Render output as shareable markdown, self-contained HTML, or SVG. "
              "Default destination: md->stdout, html/svg->~/Downloads file.")
     output_group.add_argument(
-        "--json", action="store_true",
+        "--json", action="store_true", dest=json_dest,
         help="Emit machine-readable JSON; suppresses terminal render.")
     if has_status_line:
         output_group.add_argument(
@@ -926,9 +949,10 @@ def _build_codex_daily_parser(subparsers, name, *, help_text, xref):
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
                    help="Sort direction by date (default: asc).")
-    p.add_argument("--json", action="store_true", dest="json",
-                   help="Output JSON matching upstream ccusage-codex daily format.")
     _add_codex_shared_args(p)
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Read configuration from PATH without writing it.")
+    _add_share_args(p)
     p.set_defaults(func=c.cmd_codex_daily)
     return p
 
@@ -957,9 +981,10 @@ def _build_codex_monthly_parser(subparsers, name, *, help_text, xref):
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
                    help="Sort direction by month (default: asc).")
-    p.add_argument("--json", action="store_true", dest="json",
-                   help="Output JSON matching upstream ccusage-codex monthly format.")
     _add_codex_shared_args(p)
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Read configuration from PATH without writing it.")
+    _add_share_args(p)
     p.set_defaults(func=c.cmd_codex_monthly)
     return p
 
@@ -992,9 +1017,10 @@ def _build_codex_weekly_parser(subparsers, name, *, help_text, xref):
                    help="Show per-model cost breakdown sub-rows.")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
                    help="Sort direction by week (default: asc).")
-    p.add_argument("--json", action="store_true", dest="json",
-                   help="Output JSON.")
     _add_codex_shared_args(p)
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Read configuration from PATH without writing it.")
+    _add_share_args(p)
     p.set_defaults(func=c.cmd_codex_weekly)
     return p
 
@@ -1021,18 +1047,109 @@ def _build_codex_session_parser(subparsers, name, *, help_text, xref):
         help_until="Filter until date (inclusive; accepts YYYY-MM-DD or YYYYMMDD).")
     p.add_argument("-o", "--order", choices=("asc", "desc"), default="asc",
                    help="Sort direction by last activity (default: asc — earliest first).")
-    p.add_argument("--json", action="store_true", dest="json",
-                   help="Output JSON matching upstream ccusage-codex session format.")
     _add_codex_shared_args(p)
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="Read configuration from PATH without writing it.")
+    _add_share_args(p)
     p.set_defaults(func=c.cmd_codex_session)
     return p
+
+
+def _add_codex_quota_common_args(parser) -> None:
+    """Attach the shared exact-selector/reporting surface for native quotas."""
+    parser.add_argument(
+        "--root-key", dest="root_key", metavar="FULL_SOURCE_ROOT_KEY",
+        help="Exact case-sensitive sourceRootKey selector (no prefix matching).",
+    )
+    parser.add_argument(
+        "--limit-key", dest="limit_key", metavar="FULL_LOGICAL_LIMIT_KEY",
+        help="Exact case-sensitive logicalLimitKey selector (no prefix matching).",
+    )
+    parser.add_argument(
+        "--no-sync", action="store_true",
+        help="Read retained local-rollout quota evidence without a Codex cache sync.",
+    )
+    parser.add_argument(
+        "--config", default=None, metavar="PATH",
+        help="Read display settings from PATH for this invocation only.",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit stamped schemaVersion:1 JSON.",
+    )
+
+
+def _build_codex_quota_parser(subparsers, name, *, help_text, xref=None):
+    """Build canonical `cctally codex quota …` leaves (issue #294 S2)."""
+    c = _cctally()
+    quota = subparsers.add_parser(
+        name, help=help_text, formatter_class=CLIHelpFormatter,
+        description=(
+            "Native Codex quota history, current status, forecast, reset blocks, "
+            "and percent-crossing breakdowns. Each window remains root-qualified; "
+            "independent percentages are never combined."
+        ),
+    )
+    leaves = quota.add_subparsers(dest="quota_command", required=True, metavar="<command>")
+
+    history = leaves.add_parser("history", help="Show physical local-rollout quota history",
+                               formatter_class=CLIHelpFormatter)
+    _add_since_until_args(
+        history, metavar_since="DATE_OR_ISO", metavar_until="DATE_OR_ISO",
+        help_since="Inclusive start; date-only is interpreted in display.tz.",
+        help_until="Exclusive end; date-only is interpreted in display.tz.",
+    )
+    _add_codex_quota_common_args(history)
+    history.set_defaults(func=c.cmd_codex_quota_history)
+
+    statusline = leaves.add_parser("statusline", help="Show one native status segment per quota identity",
+                                  formatter_class=CLIHelpFormatter)
+    statusline.add_argument(
+        "--as-of", default=None, metavar="ISO-8601",
+        help="Interpret retained local evidence at this instant (naive means UTC).",
+    )
+    _add_codex_quota_common_args(statusline)
+    statusline.set_defaults(func=c.cmd_codex_quota_statusline)
+
+    forecast = leaves.add_parser("forecast", help="Forecast each native quota reset window",
+                                formatter_class=CLIHelpFormatter)
+    forecast.add_argument(
+        "--as-of", default=None, metavar="ISO-8601",
+        help="Forecast at this instant (naive means UTC).",
+    )
+    _add_codex_quota_common_args(forecast)
+    forecast.set_defaults(func=c.cmd_codex_quota_forecast)
+
+    blocks = leaves.add_parser("blocks", help="Show native reset blocks",
+                               formatter_class=CLIHelpFormatter)
+    _add_since_until_args(
+        blocks, metavar_since="DATE_OR_ISO", metavar_until="DATE_OR_ISO",
+        help_since="Inclusive start; date-only is interpreted in display.tz.",
+        help_until="Exclusive end; date-only is interpreted in display.tz.",
+    )
+    _add_codex_quota_common_args(blocks)
+    blocks.set_defaults(func=c.cmd_codex_quota_blocks)
+
+    breakdown = leaves.add_parser("breakdown", help="Correlate one native block's percent crossings",
+                                  formatter_class=CLIHelpFormatter)
+    breakdown.add_argument(
+        "--reset-at", required=True, metavar="ISO-8601",
+        help="Exact block reset timestamp; date-only is rejected and naive means UTC.",
+    )
+    breakdown.add_argument(
+        "--speed", choices=("auto", "standard", "fast"), default="auto",
+        help="Codex pricing tier for query-time cost correlation (default: auto).",
+    )
+    _add_codex_quota_common_args(breakdown)
+    breakdown.set_defaults(func=c.cmd_codex_quota_breakdown)
+    return quota
 
 
 def _build_sync_week_parser(subparsers, name, *, help_text, xref=None):
     """Build the `sync-week` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    Move-only extraction of the former inline build_parser() block;
-    call-time `c = _cctally()` binding, --help bytes unchanged.
+    Move-only extraction of the former inline build_parser() block with
+    call-time `c = _cctally()` binding.
     """
     c = _cctally()
     py = subparsers.add_parser(
@@ -1104,11 +1221,11 @@ def _build_sync_week_parser(subparsers, name, *, help_text, xref=None):
     )
     py.set_defaults(func=c.cmd_sync_week)
 
-def _build_report_parser(subparsers, name, *, help_text, xref=None):
+def _build_report_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
     """Build the `report` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    Move-only extraction of the former inline build_parser() block;
-    call-time `c = _cctally()` binding, --help bytes unchanged.
+    Move-only extraction of the former inline build_parser() block with
+    call-time `c = _cctally()` binding.
     """
     c = _cctally()
     pr = subparsers.add_parser(
@@ -1116,6 +1233,14 @@ def _build_report_parser(subparsers, name, *, help_text, xref=None):
         help=help_text,
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
+            (
+                """\
+                Report Codex quota-window dollars per percent.
+
+                Each native quota window retains its own reset identity; the
+                report never invents Claude subscription weeks.
+                """
+                if fixed_source == "codex" else
                     """\
                     Report current and historical dollars per 1% weekly usage.
 
@@ -1124,49 +1249,64 @@ def _build_report_parser(subparsers, name, *, help_text, xref=None):
                       - latest cost snapshot (USD)
                     then computes USD / percent.
                     """
-                ),
+            )
+        ),
         epilog=textwrap.dedent(
+            (
+                """\
+                Examples:
+                  cctally codex report
+                  cctally codex report --sync-current
+                  cctally codex report --weeks 12 --json
+                """
+                if fixed_source == "codex" else
                     """\
                     Examples:
                       cctally report
                       cctally report --sync-current
                       cctally report --weeks 12 --json
                     """
-                ),
+            )
+        ),
     )
     pr.add_argument(
         "--weeks",
         type=int,
         default=8,
-        help="How many recent week windows to include in the trend.",
+        help=("How many recent native Codex quota windows to include in the trend."
+              if fixed_source == "codex" else
+              "How many recent week windows to include in the trend."),
     )
     pr.add_argument(
         "--sync-current",
         action="store_true",
-        help="Run sync-week first, then generate the report.",
+        help=("Sync Codex accounting and reconcile native quota state first, then "
+              "generate the report." if fixed_source == "codex" else
+              "Run sync-week first, then generate the report."),
     )
-    pr.add_argument(
-        "--week-start-name",
-        default=None,
-        choices=list(WEEKDAY_MAP.keys()),
-        help="Week-start day used if report falls back to date-only week logic.",
-    )
-    pr.add_argument(
-        "--mode",
-        default="auto",
-        choices=["auto", "calculate", "display"],
-        help="Mode passed to sync-week when --sync-current is used.",
-    )
-    pr.add_argument(
-        "--offline",
-        action="store_true",
-        help="Pass --offline to sync-week when --sync-current is used.",
-    )
-    pr.add_argument(
-        "--project",
-        default=None,
-        help="Project filter passed to sync-week when --sync-current is used.",
-    )
+    if fixed_source != "codex":
+        pr.add_argument(
+            "--week-start-name",
+            default=None,
+            choices=list(WEEKDAY_MAP.keys()),
+            help="Week-start day used if report falls back to date-only week logic.",
+        )
+        pr.add_argument(
+            "--mode",
+            default="auto",
+            choices=["auto", "calculate", "display"],
+            help="Mode passed to sync-week when --sync-current is used.",
+        )
+        pr.add_argument(
+            "--offline",
+            action="store_true",
+            help="Pass --offline to sync-week when --sync-current is used.",
+        )
+        pr.add_argument(
+            "--project",
+            default=None,
+            help="Project filter passed to sync-week when --sync-current is used.",
+        )
     pr.add_argument(
         "--reveal-projects",
         action="store_true",
@@ -1177,21 +1317,24 @@ def _build_report_parser(subparsers, name, *, help_text, xref=None):
     pr.add_argument(
         "--detail",
         action="store_true",
-        help="Include per-percent cost milestones for the current week.",
+        help=("Include native quota-window attribution detail."
+              if fixed_source == "codex" else
+              "Include per-percent cost milestones for the current week."),
     )
     pr.add_argument(
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_source_args(pr, fixed_source=fixed_source, speed=True)
     _add_share_args(pr)
     pr.set_defaults(func=c.cmd_report)
 
 def _build_forecast_parser(subparsers, name, *, help_text, xref=None):
     """Build the `forecast` parser (registered via _REGISTRATION; #279 S6 W3).
 
-    Move-only extraction of the former inline build_parser() block;
-    call-time `c = _cctally()` binding, --help bytes unchanged.
+    Move-only extraction of the former inline build_parser() block with
+    call-time `c = _cctally()` binding.
     """
     c = _cctally()
     fc = subparsers.add_parser(
@@ -1727,26 +1870,23 @@ def _build_refresh_usage_parser(subparsers, name, *, help_text, xref=None):
                      help="HTTP timeout in seconds (default: 5.0).")
     rfu.set_defaults(func=c.cmd_refresh_usage)
 
-def _build_cache_report_parser(subparsers, name, *, help_text, xref=None):
+def _build_cache_report_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
     """Build the `cache-report` parser (registered via _REGISTRATION; #279 S6 W3).
 
     Move-only extraction of the former inline build_parser() block;
     call-time `c = _cctally()` binding, --help bytes unchanged.
     """
     c = _cctally()
+    cache_description = {
+        None: "Report Claude cache diagnostics or Codex cached-input/token reuse.",
+        "claude": "Report Claude cache diagnostics.",
+        "codex": "Report Codex cached-input/token reuse.",
+    }[fixed_source]
     pc = subparsers.add_parser(
         name,
         help=help_text,
         formatter_class=CLIHelpFormatter,
-        description=textwrap.dedent(
-                    """\
-                    Query ccusage for daily token breakdown and display cache hit
-                    percentages per model. Useful for spotting caching regressions
-                    after Claude Code updates.
-
-                    Cache hit % = cacheReadTokens / (input + cacheCreate + cacheRead)
-                    """
-                ),
+        description=cache_description,
         epilog=textwrap.dedent(
                     """\
                     Examples:
@@ -1780,8 +1920,8 @@ def _build_cache_report_parser(subparsers, name, *, help_text, xref=None):
         "--by-session",
         action="store_true",
         dest="by_session",
-        help="Group by Claude sessionId (resumed-merged) instead of by date. "
-             "Adds SessionId, Last Activity, and Project identity columns.",
+        help="Group by source-native session identity instead of by date. "
+             "Adds identity, Last Activity, and Project columns.",
     )
     pc.add_argument(
         "-O", "--offline",
@@ -1799,17 +1939,12 @@ def _build_cache_report_parser(subparsers, name, *, help_text, xref=None):
         help="Filter to a specific project.",
     )
     pc.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON output.",
-    )
-    pc.add_argument(
         "--anomaly-threshold-pp",
         type=int,
         default=15,
         dest="anomaly_threshold_pp",
-        help="Cache%% drop threshold (percentage points) vs. trailing-median "
-             "baseline for the cache_drop anomaly trigger. Default: 15.",
+        help="Claude cache %% drop threshold (percentage points) vs. a trailing "
+             "median. Default: 15.",
     )
     pc.add_argument(
         "--anomaly-window-days",
@@ -1823,36 +1958,47 @@ def _build_cache_report_parser(subparsers, name, *, help_text, xref=None):
         "--no-anomaly",
         action="store_true",
         dest="no_anomaly",
-        help="Disable all anomaly triggers (both cache_drop and net_negative).",
+        help="Disable Claude cache anomaly triggers.",
     )
     pc.add_argument(
         "--sort",
-        choices=["date", "net", "cache", "recent", "cost", "anomaly"],
+        choices=["date", "net", "cache", "recent", "cost", "anomaly", "reuse"],
         default=None,
         dest="sort",
-        help="Override sort order. Defaults: 'date' in daily mode, 'net' in "
-             "--by-session mode.",
+        help="Override sort order; valid values depend on the selected source.",
     )
     pc.add_argument(
         "--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    pc.add_argument(
+        "--reveal-projects", action="store_true", dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
     _add_ccusage_alias_args(pc, ansi_emit=False)
+    _add_source_args(pc, fixed_source=fixed_source, speed=True)
+    _add_share_args(pc)
     pc.set_defaults(func=c.cmd_cache_report)
 
-def _build_range_cost_parser(subparsers, name, *, help_text, xref=None):
+def _build_range_cost_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
     """Build the `range-cost` parser (registered via _REGISTRATION; #279 S6 W3).
 
     Move-only extraction of the former inline build_parser() block;
     call-time `c = _cctally()` binding, --help bytes unchanged.
     """
     c = _cctally()
+    range_description = {
+        None: "Compute USD cost for an absolute time range from Claude, Codex, or both providers.",
+        "claude": "Compute USD cost for a Claude absolute time range.",
+        "codex": "Compute USD cost for a Codex absolute time range.",
+    }[fixed_source]
     rc = subparsers.add_parser(
         name,
         help=help_text,
         formatter_class=CLIHelpFormatter,
-        description="Compute USD cost for Claude Code usage between start/end timestamps.",
+        description=range_description,
         epilog=textwrap.dedent("""\
                     Examples:
                       cctally range-cost -s "2026-04-10T10:00:00+03:00"
@@ -1888,18 +2034,19 @@ def _build_range_cost_parser(subparsers, name, *, help_text, xref=None):
         help="Show per-model usage and cost breakdown.",
     )
     rc.add_argument(
-        "--json",
-        action="store_true",
-        dest="json",
-        help="Output JSON.",
-    )
-    rc.add_argument(
         "--total-only",
         action="store_true",
         dest="total_only",
         help="Print numeric USD total only.",
     )
+    rc.add_argument(
+        "--reveal-projects", action="store_true", dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
     _add_ccusage_alias_args(rc, ansi_emit=False)
+    _add_source_args(rc, fixed_source=fixed_source, speed=True)
+    _add_share_args(rc)
     rc.set_defaults(func=c.cmd_range_cost)
 
 def _build_five_hour_blocks_parser(subparsers, name, *, help_text, xref=None):
@@ -1989,20 +2136,34 @@ def _build_cache_sync_parser(subparsers, name, *, help_text, xref=None):
     )
     p_cache_sync.set_defaults(func=c.cmd_cache_sync)
 
-def _build_project_parser(subparsers, name, *, help_text, xref=None):
+def _build_project_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
     """Build the `project` parser (registered via _REGISTRATION; #279 S6 W3).
 
     Move-only extraction of the former inline build_parser() block;
     call-time `c = _cctally()` binding, --help bytes unchanged.
     """
     c = _cctally()
+    project_description = {
+        None: (
+            "Aggregate project usage. Claude uses subscription weeks; Codex uses "
+            "calendar weeks; --source all uses an absolute calendar range."
+        ),
+        "claude": "Aggregate Claude project usage for subscription weeks.",
+        "codex": "Aggregate Codex project usage for calendar weeks.",
+    }[fixed_source]
     p_project = subparsers.add_parser(
         name,
         help=help_text,
         formatter_class=CLIHelpFormatter,
-        description="Aggregate Claude usage by project (git-root resolved). Default range is "
-                    "the current subscription week; use --since/--until or --weeks N to extend.",
-        epilog=textwrap.dedent("""\
+        description=project_description,
+        epilog=textwrap.dedent(("""\
+                    Examples:
+                      cctally codex project
+                      cctally codex project --weeks 4
+                      cctally codex project --project project:0123456789abcdef01234567
+                      cctally codex project --breakdown --sort cost --order desc
+                      cctally codex project --group full-path --json
+                """ if fixed_source == "codex" else """\
                     Examples:
                       cctally project
                       cctally project --weeks 4
@@ -2010,25 +2171,34 @@ def _build_project_parser(subparsers, name, *, help_text, xref=None):
                       cctally project --project ccusage --model sonnet
                       cctally project --breakdown --sort used --order desc
                       cctally project --group full-path --json
-                """),
+                """)),
     )
     _add_since_until_args(
         p_project, metavar_since="YYYYMMDD", metavar_until="YYYYMMDD",
         help_since="Inclusive start date (YYYY-MM-DD or YYYYMMDD).",
         help_until="Inclusive end date (YYYY-MM-DD or YYYYMMDD).")
     p_project.add_argument("--weeks", type=int, default=None,
-                           help="Last N subscription weeks ending now.")
+                           help=("Last N Codex calendar weeks ending now."
+                                 if fixed_source == "codex" else
+                                 "Last N weeks ending now: Claude subscription, Codex calendar; "
+                                 "all uses an absolute calendar range."))
     p_project.add_argument("--project", action="append", default=[], metavar="PATTERN",
-                           help="Substring filter on project display key (repeatable, OR).")
+                           help=("Filter by an exact opaque project key or collision-safe display "
+                                 "label (repeatable, OR)." if fixed_source == "codex" else
+                                 "Substring filter on project display key (repeatable, OR)."))
     p_project.add_argument("--model", action="append", default=[], metavar="PATTERN",
                            help="Substring filter on model name (repeatable, OR).")
     p_project.add_argument("-b", "--breakdown", action="store_true",
                            help="Add per-model child rows under each project.")
     p_project.add_argument("-o", "--order", choices=("asc", "desc"), default="desc",
                            help="Sort direction (default: desc).")
-    p_project.add_argument("--sort", choices=("cost", "used", "name", "last-seen"),
+    p_project.add_argument("--sort", choices=(("cost", "name", "last-seen")
+                                                if fixed_source == "codex"
+                                                else ("cost", "used", "name", "last-seen")),
                            default="cost",
-                           help="Sort key (default: cost).")
+                           help=("Sort key (default: cost; Claude-only used-percent ordering is "
+                                 "unavailable)." if fixed_source == "codex" else
+                                 "Sort key (default: cost)."))
     p_project.add_argument("--group", choices=("git-root", "full-path"), default="git-root",
                            help="Bucket by resolved git-root (default) or raw project_path.")
     p_project.add_argument("--reveal-projects", action="store_true", dest="reveal_projects",
@@ -2040,10 +2210,11 @@ def _build_project_parser(subparsers, name, *, help_text, xref=None):
                            help="Display timezone: local, utc, or IANA name. "
                                 "Overrides config display.tz for this call.")
     _add_ccusage_alias_args(p_project, ansi_emit=True)
+    _add_source_args(p_project, fixed_source=fixed_source, speed=True)
     _add_share_args(p_project)
     p_project.set_defaults(func=c.cmd_project)
 
-def _build_diff_parser(subparsers, name, *, help_text, xref=None):
+def _build_diff_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
     """Build the `diff` parser (registered via _REGISTRATION; #279 S6 W3).
 
     Move-only extraction of the former inline build_parser() block;
@@ -2059,7 +2230,11 @@ def _build_diff_parser(subparsers, name, *, help_text, xref=None):
     diff_p.add_argument("--b", required=True, help="Window B token (same grammar as --a)")
     diff_p.add_argument("--allow-mismatch", action="store_true",
         help="Permit mismatched window lengths (deltas normalized per-day)")
-    diff_p.add_argument("--only", help="Comma-separated section list (overall,models,projects,cache)")
+    diff_p.add_argument(
+        "--only",
+        help=("Comma-separated section list: overall,models,projects; "
+              "cache (Claude only); token-reuse (Codex only)"),
+    )
     diff_p.add_argument("--with", dest="with_extra",
         help="Comma-separated opt-in sections (trend,time)")
     diff_p.add_argument("--all", dest="show_all", action="store_true",
@@ -2077,10 +2252,16 @@ def _build_diff_parser(subparsers, name, *, help_text, xref=None):
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.")
     diff_p.add_argument("--no-color", action="store_true")
-    diff_p.add_argument("--json", dest="emit_json", action="store_true")
     diff_p.add_argument("--width", type=int, help=argparse.SUPPRESS)
     diff_p.add_argument("--debug-now", action="store_true", help=argparse.SUPPRESS)
+    diff_p.add_argument(
+        "--reveal-projects", action="store_true", dest="reveal_projects",
+        help="In --format output, show real project basenames instead of "
+             "the default project-1, project-2, ... anonymization.",
+    )
     _add_ccusage_alias_args(diff_p, ansi_emit=True)
+    _add_source_args(diff_p, fixed_source=fixed_source, speed=True)
+    _add_share_args(diff_p, json_dest="emit_json")
     diff_p.set_defaults(func=c.cmd_diff)
 
 def _build_claude_parser(subparsers, name, *, help_text, xref=None):
@@ -2128,6 +2309,16 @@ def _build_claude_parser(subparsers, name, *, help_text, xref=None):
         help_text="Compact one-line status for Claude Code hooks",
         xref="Canonical `cctally claude statusline` (flat alias: `cctally statusline`). "
              "Drop-in for `ccusage statusline` plus cctally extension segments.")
+    _build_project_parser(claude_sub, "project",
+        help_text="Roll usage up by project", fixed_source="claude")
+    _build_diff_parser(claude_sub, "diff",
+        help_text="Compare usage between two windows", fixed_source="claude")
+    _build_range_cost_parser(claude_sub, "range-cost",
+        help_text="Compute USD cost for a time range", fixed_source="claude")
+    _build_cache_report_parser(claude_sub, "cache-report",
+        help_text="Show cache analytics", fixed_source="claude")
+    _build_report_parser(claude_sub, "report",
+        help_text="Show dollars-per-percent report", fixed_source="claude")
 
 def _build_codex_parser(subparsers, name, *, help_text, xref=None):
     """Build the `codex` parser (registered via _REGISTRATION; #279 S6 W3).
@@ -2163,6 +2354,18 @@ def _build_codex_parser(subparsers, name, *, help_text, xref=None):
         help_text="Show Codex usage grouped by week",
         xref="cctally extension (no upstream `ccusage codex weekly`). Same engine as "
              "`cctally codex-weekly`.")
+    _build_project_parser(codex_sub, "project",
+        help_text="Roll Codex usage up by qualified project", fixed_source="codex")
+    _build_diff_parser(codex_sub, "diff",
+        help_text="Compare Codex usage between two windows", fixed_source="codex")
+    _build_range_cost_parser(codex_sub, "range-cost",
+        help_text="Compute Codex USD cost for a time range", fixed_source="codex")
+    _build_cache_report_parser(codex_sub, "cache-report",
+        help_text="Show Codex token-reuse analytics", fixed_source="codex")
+    _build_report_parser(codex_sub, "report",
+        help_text="Show Codex quota-window report", fixed_source="codex")
+    _build_codex_quota_parser(codex_sub, "quota",
+        help_text="Native root-qualified Codex quota reports")
 
 def _build_config_parser(subparsers, name, *, help_text, xref=None):
     """Build the `config` parser (registered via _REGISTRATION; #279 S6 W3).
@@ -2726,6 +2929,10 @@ def _build_hook_tick_parser(subparsers, name, *, help_text, xref=None):
                          "(used by --explain and tests)")
     ht.add_argument("--mock-oauth-response", type=str, default=None,
                     help=argparse.SUPPRESS)  # JSON string fed to mock fetch (tests only)
+    ht.add_argument("--foreground", action="store_true",
+                    help=argparse.SUPPRESS)  # Codex native hook wrapper
+    ht.add_argument("--source", choices=("claude", "codex"), default="claude",
+                    help=argparse.SUPPRESS)  # setup-managed native Codex hook
     ht.set_defaults(func=c.cmd_hook_tick)
 
 def _build_preview_parser(subparsers, name, *, help_text, xref=None):
@@ -2905,8 +3112,8 @@ _REGISTRATION = (
     _Reg('record-usage', _build_record_usage_parser, "Record usage data from Claude Code status line", None, None),
     _Reg('record-credit', _build_record_credit_parser, "Record an in-place weekly credit the auto-detector misses", None, None),
     _Reg('refresh-usage', _build_refresh_usage_parser, "Force-fetch 7d/5h percent from OAuth API and record it", None, None),
-    _Reg('cache-report', _build_cache_report_parser, "Show daily cache hit rates per model from ccusage data", None, None),
-    _Reg('range-cost', _build_range_cost_parser, "Compute USD cost for a time range from session data", None, None),
+    _Reg('cache-report', _build_cache_report_parser, "Show Claude cache diagnostics or Codex token reuse", None, None),
+    _Reg('range-cost', _build_range_cost_parser, "Compute USD cost for a provider-aware time range", None, None),
     _Reg('blocks', _build_blocks_parser, "Show usage report grouped by 5-hour session blocks", "Alias of `cctally claude blocks` (the canonical form).", None),
     _Reg('statusline', _build_statusline_parser, "Compact one-line status for Claude Code hooks", "Alias of `cctally claude statusline` (the canonical form).", None),
     _Reg('five-hour-blocks', _build_five_hour_blocks_parser, "List API-anchored 5h blocks with rollup totals + 7d-drift columns", None, None),
@@ -2918,7 +3125,7 @@ _REGISTRATION = (
     _Reg('codex-monthly', _build_codex_monthly_parser, "Show Codex usage grouped by month (drop-in for `ccusage-codex monthly`)", "Alias of `cctally codex monthly` (the canonical form).", None),
     _Reg('codex-weekly', _build_codex_weekly_parser, "Show Codex usage grouped by week (week-start from config.json)", "Alias of `cctally codex weekly` (the canonical form).", None),
     _Reg('codex-session', _build_codex_session_parser, "Show Codex usage grouped by session (drop-in for `ccusage-codex session`)", "Alias of `cctally codex session` (the canonical form).", None),
-    _Reg('project', _build_project_parser, "Roll usage up by project (git-root), with per-project Used %% attribution", None, None),
+    _Reg('project', _build_project_parser, "Roll Claude/Codex usage up by project", None, None),
     _Reg('diff', _build_diff_parser, "Compare Claude usage between two windows.", None, None),
     _Reg('session', _build_session_parser, "Show Claude usage grouped by sessionId (merges resumed-across-files sessions)", "Alias of `cctally claude session` (the canonical form).", None),
     _Reg('transcript', _build_transcript_parser, "Export or search conversation transcripts (anonymized export by default)", None, None),
@@ -2989,4 +3196,3 @@ def build_parser() -> argparse.ArgumentParser:
         if getattr(a, "help", None) is not argparse.SUPPRESS
     ]
     return p
-

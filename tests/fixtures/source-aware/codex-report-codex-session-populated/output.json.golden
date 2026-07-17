@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "sessions": [
+    {
+      "sessionId": "safe-session",
+      "lastActivity": "2026-07-01T00:00:00.000Z",
+      "sessionFile": "safe-session",
+      "directory": "safe",
+      "inputTokens": 900,
+      "cachedInputTokens": 400,
+      "outputTokens": 334,
+      "reasoningOutputTokens": 34,
+      "totalTokens": 1234,
+      "costUSD": 4.25,
+      "models": {}
+    }
+  ],
+  "totals": {
+    "inputTokens": 900,
+    "cachedInputTokens": 400,
+    "outputTokens": 334,
+    "reasoningOutputTokens": 34,
+    "totalTokens": 1234,
+    "costUSD": 4.25
+  }
+}

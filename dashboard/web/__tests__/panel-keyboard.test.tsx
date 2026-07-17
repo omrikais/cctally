@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { ForecastPanel } from '../src/panels/ForecastPanel';
 import { TrendPanel } from '../src/panels/TrendPanel';
 import { SessionsPanel } from '../src/panels/SessionsPanel';
@@ -11,10 +12,11 @@ import {
 import fixture from './fixtures/envelope.json';
 import type { Envelope } from '../src/types/envelope';
 
-// Enter / Space on a focused panel must open the matching modal.
-// <section> does NOT synthesize click from Enter the way <button> does,
-// so we add explicit onKeyDown handlers. Legacy parity: focus.js did
-// the same via a document-level delegated keydown.
+// #293 S4 (A11Y-1 / ACTION-1): the bento card regions are DESCRIBE-only now —
+// no tab stop, no region Enter/Space activation. The explicit Expand button is
+// the sole keyboard path into each card's modal; a keydown that bubbles from the
+// (now non-focusable) region body opens nothing. This file previously asserted
+// the OPPOSITE (Enter/Space on the section opened the modal) — inverted for S4.
 function firePanelKey(el: HTMLElement, key: 'Enter' | ' ') {
   el.focus();
   act(() => {
@@ -27,26 +29,38 @@ beforeEach(() => {
   updateSnapshot(fixture as unknown as Envelope);
 });
 
-describe('Enter / Space on focused panel opens the matching modal', () => {
-  // #248 — the Current Week grid card was removed (it is now the HeroStrip,
-  // covered by HeroStrip.test.tsx). The remaining grid panels keep the
-  // Enter/Space → open-modal contract.
-  it('ForecastPanel → forecast (Space also works)', () => {
-    render(<ForecastPanel />);
+describe('#293 S4 — bento regions describe; Expand is the keyboard path', () => {
+  it('ForecastPanel: region Enter/Space opens nothing; Expand opens forecast', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ForecastPanel />);
     const panel = document.querySelector<HTMLElement>('[data-panel-kind="forecast"]')!;
     firePanelKey(panel, ' ');
+    firePanelKey(panel, 'Enter');
+    expect(getState().openModal).toBeNull();
+    (container.querySelector('.panel-expand') as HTMLButtonElement).focus();
+    await user.keyboard('{Enter}');
     expect(getState().openModal).toBe('forecast');
   });
-  it('TrendPanel → trend', () => {
-    render(<TrendPanel />);
+
+  it('TrendPanel: region Enter opens nothing; Expand opens trend', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<TrendPanel />);
     const panel = document.querySelector<HTMLElement>('[data-panel-kind="trend"]')!;
     firePanelKey(panel, 'Enter');
+    expect(getState().openModal).toBeNull();
+    (container.querySelector('.panel-expand') as HTMLButtonElement).focus();
+    await user.keyboard('{Enter}');
     expect(getState().openModal).toBe('trend');
   });
-  it('SessionsPanel → session', () => {
-    render(<SessionsPanel />);
+
+  it('SessionsPanel: region Enter opens nothing; Expand opens the session modal', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<SessionsPanel />);
     const panel = document.querySelector<HTMLElement>('[data-panel-kind="sessions"]')!;
     firePanelKey(panel, 'Enter');
+    expect(getState().openModal).toBeNull();
+    (container.querySelector('.panel-expand') as HTMLButtonElement).focus();
+    await user.keyboard('{Enter}');
     expect(getState().openModal).toBe('session');
   });
 });

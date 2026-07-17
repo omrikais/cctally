@@ -10,6 +10,9 @@ interface SortableHeaderProps<T> {
   override: SortOverride | null;
   onChange: (next: SortOverride | null) => void;
   accentVar?: string;
+  // #299 — Sessions renders its table as role="grid"; emit the matching
+  // thead/header-row roles only then. The other 4 consumers stay native tables.
+  grid?: boolean;
 }
 
 function caret(active: boolean, dir: 'asc' | 'desc' | null): string {
@@ -22,7 +25,7 @@ function ariaSort(active: boolean, dir: 'asc' | 'desc' | null): 'ascending' | 'd
   return dir === 'asc' ? 'ascending' : 'descending';
 }
 
-export function SortableHeader<T>({ columns, override, onChange, accentVar }: SortableHeaderProps<T>) {
+export function SortableHeader<T>({ columns, override, onChange, accentVar, grid }: SortableHeaderProps<T>) {
   const fire = (col: TableColumn<T>) => onChange(nextSortOverride(override, col));
 
   const onClick = (col: TableColumn<T>) => (e: MouseEvent<HTMLTableCellElement>) => {
@@ -39,8 +42,8 @@ export function SortableHeader<T>({ columns, override, onChange, accentVar }: So
   };
 
   return (
-    <thead>
-      <tr>
+    <thead role={grid ? 'rowgroup' : undefined}>
+      <tr role={grid ? 'row' : undefined}>
         {columns.map((col) => {
           const active = override?.column === col.id;
           const dir = active ? override!.direction : null;

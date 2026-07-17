@@ -194,7 +194,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 
 def _cctally():
@@ -258,6 +258,27 @@ def _ensure_sibling_loaded(name: str) -> None:
 
 _ensure_sibling_loaded("_lib_forecast")
 from _lib_forecast import _compute_forecast, ForecastInputs, ForecastOutput, BudgetRow
+_ensure_sibling_loaded("_lib_dashboard_sources")
+_ensure_sibling_loaded("_cctally_dashboard_sources")
+from _cctally_dashboard_sources import (
+    CodexProjectionIncoherent,
+    DashboardReadContext,
+    build_codex_source_state,
+    refresh_codex_source_clock,
+    resolve_dashboard_source_semantics,
+)
+from _lib_dashboard_sources import (
+    CapabilityRecord,
+    SourceDashboardBundle,
+    SourceDashboardState,
+    SourceDashboardWarning,
+    codex_stats_digest,
+    compose_all_state,
+    dashboard_resource_key,
+    degrade_source_state,
+    reuse_coherent_source_state,
+    unavailable_source_state,
+)
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -338,6 +359,10 @@ def get_recent_weeks(*args, **kwargs):
 
 def sync_cache(*args, **kwargs):
     return sys.modules["cctally"].sync_cache(*args, **kwargs)
+
+
+def sync_codex_cache(*args, **kwargs):
+    return sys.modules["cctally"].sync_codex_cache(*args, **kwargs)
 
 
 # ``_compute_forecast`` + the forecast dataclasses (``ForecastInputs`` /
@@ -1143,6 +1168,27 @@ class DataSnapshot:
     # Placed LAST with a default so positional fixture constructors keep
     # working.
     hydrating: bool = False
+    # ---- #300: change-signal for the dashboard's lazy detail fetchers ----
+    # A compact, deterministic string derived from the whole DB dispatch
+    # signature (``_snapshot_data_version(dispatch_sig)``): it changes iff ANY
+    # DB input the detail endpoints read changed (session entries, weekly
+    # usage/cost, reset events, codex entries, cache generation), and stays flat
+    # on an idle tick (idle ⇔ signature unchanged). Empty string when no
+    # dispatch signature was computed — the TUI / non-precompute path, which
+    # never consumes it. Serialized into the dashboard envelope by
+    # ``snapshot_to_envelope`` as ``"data_version"`` so the browser's
+    # session-modal / projects-drill / conversation-outline fetchers revalidate
+    # on an actual DATA-CHANGE signal instead of the 5s ``generated_at``
+    # heartbeat (#300). The idle short-circuit carries it forward via
+    # ``dataclasses.replace`` (idle ⇒ signature unchanged ⇒ same value).
+    # Trailing default so positional fixture constructors keep working; appears
+    # in NO ``--json``/CLI surface.
+    data_version: str = ""
+    # Dashboard-only #294 S4 provider bundle.  The terminal TUI's normal data
+    # path deliberately leaves this ``None`` and never touches Codex dashboard
+    # ingest/read-model work.  It remains trailing/defaulted for every legacy
+    # positional fixture constructor.
+    source_bundle: SourceDashboardBundle | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -2099,6 +2145,535 @@ def _tui_build_session_detail(
     )
 
 
+def _snapshot_data_version(sig) -> str:
+    """#300 — compact, deterministic change-signal string from the DB dispatch
+    signature (``_lib_snapshot_cache.SnapshotSignature``).
+
+    Changes iff any DB leg the dashboard's detail endpoints read changed
+    (session entries + their id-stable mutation counter, weekly usage/cost,
+    reset events, codex entries, cache generation); stays flat on an idle tick
+    (idle ⇔ signature unchanged). Returns ``""`` when no signature was computed
+    (the non-precompute / TUI path, which never consumes it) — the browser's
+    ``revalToken`` then falls back to ``generated_at``. Every leg is an int
+    (``reset_sig`` is a 2-int tuple), so a ``"."``-join is process-stable (no
+    hash-seed dependence, unlike ``hash()``)."""
+    if sig is None:
+        return ""
+    rs = getattr(sig, "reset_sig", None) or (0, 0)
+    numeric_legs = ".".join(str(int(x)) for x in (
+        sig.max_entry_id, sig.entry_mutation_seq, sig.max_wus_id,
+        sig.max_wcs_id, rs[0], rs[1], sig.max_codex_id, sig.generation,
+        getattr(sig, "codex_physical_mutation_seq", 0),
+    ))
+    digest = getattr(sig, "codex_stats_digest", "")
+    return numeric_legs if not digest else f"{numeric_legs}.{digest}"
+
+
+def _tui_source_copy(value: object) -> object:
+    """Copy only JSON-shaped legacy envelope values into a source state."""
+    if isinstance(value, dict):
+        return {str(key): _tui_source_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_tui_source_copy(item) for item in value]
+    return value
+
+
+def _tui_claude_resource_row(
+    row: object,
+    *,
+    resource: str,
+    identity: object,
+    remove: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Attach S4's opaque owner key while dropping legacy raw identities."""
+    raw = row if isinstance(row, dict) else {}
+    wire = {
+        str(name): _tui_source_copy(value)
+        for name, value in raw.items()
+        if name not in {"key", *remove}
+    }
+    wire["key"] = dashboard_resource_key(resource, "claude", identity)
+    wire["source"] = "claude"
+    return wire
+
+
+def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object]:
+    """Project one completed Claude legacy envelope without further DB reads.
+
+    The legacy dashboard snapshot is still the authoritative Claude model.
+    This adapter only places its already-rendered values under the S4 source
+    contract, replacing native route identities with opaque provider-qualified
+    resource keys.  It deliberately never opens a connection or invokes a
+    loader, so the source bundle remains part of the one coordinated read.
+    """
+    legacy = legacy_envelope if isinstance(legacy_envelope, dict) else {}
+    daily = legacy.get("daily") if isinstance(legacy.get("daily"), dict) else {}
+    monthly = legacy.get("monthly") if isinstance(legacy.get("monthly"), dict) else {}
+    weekly = legacy.get("weekly") if isinstance(legacy.get("weekly"), dict) else {}
+    sessions = legacy.get("sessions") if isinstance(legacy.get("sessions"), dict) else {}
+    projects = legacy.get("projects") if isinstance(legacy.get("projects"), dict) else {}
+    blocks = legacy.get("blocks") if isinstance(legacy.get("blocks"), dict) else {}
+    current_week = legacy.get("current_week") if isinstance(legacy.get("current_week"), dict) else {}
+
+    session_rows: list[dict[str, object]] = []
+    for ordinal, row in enumerate(sessions.get("rows", ()) or ()):
+        raw = row if isinstance(row, dict) else {}
+        native_id = raw.get("session_id")
+        identity = native_id if isinstance(native_id, str) and native_id else (
+            ordinal, raw.get("started_utc"),
+        )
+        session_rows.append(_tui_claude_resource_row(
+            raw,
+            resource="session",
+            identity=identity,
+            remove=("session_id", "project_key"),
+        ))
+
+    current_project = projects.get("current_week")
+    current_project = current_project if isinstance(current_project, dict) else {}
+    trend_project = projects.get("trend")
+    trend_project = trend_project if isinstance(trend_project, dict) else {}
+
+    def project_rows(rows: object) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        for ordinal, row in enumerate(rows if isinstance(rows, (list, tuple)) else ()):
+            raw = row if isinstance(row, dict) else {}
+            legacy_key = raw.get("key")
+            identity = legacy_key if isinstance(legacy_key, str) and legacy_key else ordinal
+            result.append(_tui_claude_resource_row(
+                raw,
+                resource="project",
+                identity=identity,
+                remove=("bucket_path",),
+            ))
+        return result
+
+    current_project_rows = project_rows(current_project.get("rows", ()))
+    trend_project_rows = project_rows(trend_project.get("projects", ()))
+    project_source = {
+        "current_week": {
+            str(name): _tui_source_copy(value)
+            for name, value in current_project.items() if name != "rows"
+        } | {"rows": current_project_rows},
+        "trend": {
+            str(name): _tui_source_copy(value)
+            for name, value in trend_project.items() if name != "projects"
+        } | {"projects": trend_project_rows},
+        # Route lookup is a flat source resource collection; the existing
+        # dashboard panel shapes remain above unchanged except for identity.
+        "rows": current_project_rows or trend_project_rows,
+    }
+
+    block_rows: list[dict[str, object]] = []
+    for ordinal, row in enumerate(blocks.get("rows", ()) or ()):
+        raw = row if isinstance(row, dict) else {}
+        start_at = raw.get("start_at")
+        identity = start_at if isinstance(start_at, str) and start_at else ordinal
+        block_rows.append(_tui_claude_resource_row(
+            raw, resource="block", identity=identity,
+        ))
+
+    def milestone_rows(rows: object, kind: str) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        for ordinal, row in enumerate(rows if isinstance(rows, (list, tuple)) else ()):
+            raw = row if isinstance(row, dict) else {}
+            result.append(_tui_claude_resource_row(
+                raw,
+                resource=kind,
+                identity=(ordinal, raw.get("percent"), raw.get("crossed_at_utc")),
+            ))
+        return result
+
+    weekly_milestones = milestone_rows(current_week.get("milestones", ()), "quota_milestone")
+    five_hour_milestones = milestone_rows(
+        current_week.get("five_hour_milestones", ()), "quota_milestone",
+    )
+    quota_current = {
+        str(name): _tui_source_copy(value)
+        for name, value in current_week.items()
+        if name not in {"milestones", "five_hour_milestones"}
+    }
+
+    alert_rows: list[dict[str, object]] = []
+    for ordinal, row in enumerate(legacy.get("alerts", ()) or ()):
+        raw = row if isinstance(row, dict) else {}
+        axis = raw.get("axis")
+        vendor = raw.get("vendor")
+        metric = raw.get("metric")
+        owns_alert = (
+            (axis in {"weekly", "five_hour"} and vendor in {None, "claude"})
+            # Legacy top-level Claude budget rows predate the additive vendor
+            # field; the distinct Codex axis is ``codex_budget``.  Treat an
+            # absent vendor as that established Claude meaning, while an
+            # explicit non-Claude vendor must never be relabeled.
+            or (axis == "budget" and vendor in {None, "claude"})
+            or axis == "project_budget"
+            or (axis == "projected" and metric in {"weekly_pct", "budget_usd"})
+        )
+        if not owns_alert:
+            continue
+        alert_rows.append(_tui_claude_resource_row(
+            raw,
+            resource="alert",
+            identity=(ordinal, raw.get("axis"), raw.get("threshold"), raw.get("alerted_at")),
+        ))
+
+    daily_total = daily.get("total_cost_usd", 0.0)
+    daily_tokens = daily.get("total_tokens", 0)
+    budget_settings = _tui_source_copy(legacy.get("alerts_settings"))
+    if isinstance(budget_settings, dict):
+        # The legacy top-level settings mirror contains Codex capability flags
+        # for its combined/dashboard compatibility surface.  They are not
+        # Claude-provider facts and would make a reused Claude state stale
+        # after a Codex-only budget/config change.
+        for key in (
+            "codex_budget_configured",
+            "codex_budget_alerts_enabled",
+            "codex_projected_enabled",
+        ):
+            budget_settings.pop(key, None)
+    return {
+        "hero": {
+            "cost_usd": daily_total,
+            "total_tokens": daily_tokens,
+            "header": _tui_source_copy(legacy.get("header")),
+            "current_week": _tui_source_copy(current_week),
+            "forecast": _tui_source_copy(legacy.get("forecast")),
+            "trend": _tui_source_copy(legacy.get("trend")),
+        },
+        "periods": {
+            "daily": _tui_source_copy(daily),
+            "monthly": _tui_source_copy(monthly),
+            "weekly": _tui_source_copy(weekly),
+        },
+        "sessions": {
+            **{
+                str(name): _tui_source_copy(value)
+                for name, value in sessions.items() if name != "rows"
+            },
+            "rows": session_rows,
+        },
+        "projects": project_source,
+        "quota": {
+            "current_week": quota_current,
+            "blocks": block_rows,
+            "milestones": weekly_milestones,
+            "five_hour_milestones": five_hour_milestones,
+        },
+        "budget": {
+            "forecast": _tui_source_copy(legacy.get("forecast")),
+            "settings": budget_settings,
+        },
+        "alerts": {"rows": alert_rows},
+    }
+
+
+def _tui_build_source_bundle(
+    *,
+    stats_conn,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    codex_ingest_contended: bool,
+    codex_ingest_failed: bool = False,
+    claude_ingest_contended: bool = False,
+    claude_ingest_failed: bool = False,
+    claude_cost_usd: float,
+    claude_total_tokens: int,
+    claude_data: dict[str, object] | None = None,
+    common_range_start: dt.datetime | None = None,
+    prior_bundle: SourceDashboardBundle | None = None,
+    raw_config: dict[str, object] | None = None,
+) -> SourceDashboardBundle:
+    """Build one frozen source bundle after the dashboard's coordinated ingest.
+
+    This helper is reachable only from ``precompute_envelope=True``.  It opens
+    a fresh cache handle after the ingest handle has closed, then performs
+    read-only provider adaptation with no implicit sync or rollout fallback.
+    """
+    c = _cctally()
+    cache_conn = c.open_cache_db()
+    cache_read_tx = False
+    stats_read_tx = False
+    try:
+        # Read both databases through stable snapshots.  cache.db and stats.db
+        # cannot share one SQLite transaction, so a post-build signature check
+        # below rejects a generation that moves while the two snapshots are
+        # being assembled.
+        if not cache_conn.in_transaction:
+            cache_conn.execute("BEGIN")
+            cache_read_tx = True
+        if not stats_conn.in_transaction:
+            stats_conn.execute("BEGIN")
+            stats_read_tx = True
+        if common_range_start is None:
+            common_range_start = now_utc - dt.timedelta(days=30)
+        if common_range_start.tzinfo is None or common_range_start.utcoffset() is None:
+            raise ValueError("common_range_start must be timezone-aware")
+        common_range_start = common_range_start.astimezone(dt.timezone.utc)
+        semantics = resolve_dashboard_source_semantics(
+            raw_config if raw_config is not None else c.load_config(),
+            display_tz_name=display_tz_name,
+        )
+        stats_digest = codex_stats_digest(stats_conn)
+        signature = c.compute_signature(
+            cache_conn,
+            stats_conn,
+            generation=c.current_generation(),
+            codex_stats_digest=stats_digest,
+        )
+        codex_version = (
+            f"codex:{signature.max_codex_id}:"
+            f"{signature.codex_physical_mutation_seq}:{stats_digest}:"
+            f"{semantics.codex_identity}"
+        )
+        claude_version = (
+            f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"
+            f"{signature.max_wus_id}:{signature.max_wcs_id}:"
+            f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
+            f"{signature.generation}:{semantics.claude_identity}"
+        )
+        prior_claude = (
+            prior_bundle.sources.get("claude")
+            if prior_bundle is not None else None
+        )
+        prior_codex = (
+            prior_bundle.sources.get("codex")
+            if prior_bundle is not None else None
+        )
+        if claude_ingest_failed:
+            warning = SourceDashboardWarning(
+                "source_ingest_failed", "Source ingest failed.", "ingest",
+            )
+            claude = (
+                degrade_source_state(prior_claude, warning)
+                if prior_claude is not None
+                else unavailable_source_state("claude", warning)
+            )
+        elif claude_ingest_contended:
+            warning = SourceDashboardWarning(
+                "source_ingest_contended", "Source ingest is in progress.", "ingest",
+            )
+            claude = (
+                degrade_source_state(prior_claude, warning)
+                if prior_claude is not None
+                else unavailable_source_state("claude", warning)
+            )
+        else:
+            claude = reuse_coherent_source_state(
+                prior_claude, data_version=claude_version,
+            )
+        if claude is None:
+            claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
+            claude = SourceDashboardState(
+                source="claude",
+                availability=claude_available,
+                freshness="fresh",
+                warnings=(),
+                data_version=claude_version,
+                last_success_at=now_utc,
+                capabilities={
+                    "hero": CapabilityRecord("supported", "subscription-week"),
+                    "daily": CapabilityRecord("supported", "calendar-day"),
+                    "monthly": CapabilityRecord("supported", "calendar-month"),
+                    "weekly": CapabilityRecord("supported", "subscription-week"),
+                    "sessions": CapabilityRecord("supported", "legacy-session-rollup"),
+                    "forensics": CapabilityRecord("supported", "legacy-projection"),
+                    "quota": CapabilityRecord("supported", "subscription-week"),
+                    "budget": CapabilityRecord("supported", "subscription-week"),
+                    "projects": CapabilityRecord("supported", "legacy-projection"),
+                    "alerts": CapabilityRecord("supported", "provider-native"),
+                },
+                data={
+                    **(
+                        claude_data
+                        if claude_data is not None else {
+                            "hero": {
+                                "cost_usd": claude_cost_usd,
+                                "total_tokens": claude_total_tokens,
+                            },
+                            "periods": {"daily": {"total_cost_usd": claude_cost_usd, "total_tokens": claude_total_tokens}},
+                            "sessions": {"rows": ()},
+                            "projects": {"rows": ()},
+                            "quota": {"blocks": (), "milestones": ()},
+                            "budget": {"label": "Claude subscription budget"},
+                            "alerts": {"rows": ()},
+                        }
+                    ),
+                },
+            )
+        if codex_ingest_failed:
+            warning = SourceDashboardWarning(
+                "source_ingest_failed", "Source ingest failed.", "ingest",
+            )
+            codex = (
+                degrade_source_state(prior_codex, warning)
+                if prior_codex is not None
+                else unavailable_source_state("codex", warning)
+            )
+        elif codex_ingest_contended:
+            warning = SourceDashboardWarning(
+                "source_ingest_contended", "Source ingest is in progress.", "ingest",
+            )
+            codex = (
+                degrade_source_state(prior_codex, warning)
+                if prior_codex is not None
+                else unavailable_source_state("codex", warning)
+            )
+        else:
+            codex = reuse_coherent_source_state(
+                prior_codex, data_version=codex_version,
+            )
+        if codex is None:
+            try:
+                codex = build_codex_source_state(
+                    DashboardReadContext(
+                        cache_conn=cache_conn,
+                        stats_conn=stats_conn,
+                        range_start=common_range_start,
+                        now_utc=now_utc,
+                        display_tz_name=semantics.display_tz_name,
+                        week_start_idx=semantics.week_start_idx,
+                        week_start_name=semantics.week_start_name,
+                        speed=semantics.speed,
+                        codex_budget=semantics.codex_budget,
+                    ),
+                    data_version=codex_version,
+                )
+            except CodexProjectionIncoherent:
+                warning = SourceDashboardWarning(
+                    "codex_projection_incoherent",
+                    "Codex quota projection is unavailable.",
+                    "quota",
+                )
+                codex = (
+                    degrade_source_state(prior_codex, warning)
+                    if prior_codex is not None
+                    else unavailable_source_state("codex", warning)
+                )
+            except Exception:
+                warning = SourceDashboardWarning(
+                    "source_build_failed", "Source data could not be built.", "read_model",
+                )
+                codex = (
+                    degrade_source_state(prior_codex, warning)
+                    if prior_codex is not None
+                    else unavailable_source_state("codex", warning)
+                )
+        combined = compose_all_state(claude, codex)
+        bundle = SourceDashboardBundle(
+            source_schema_version=1,
+            default_source="claude",
+            source_order=("claude", "codex", "all"),
+            sources={"claude": claude, "codex": codex, "all": combined},
+        )
+        # End our snapshots before re-reading the cheap signatures.  Seeing a
+        # different physical state means the build may have mixed independent
+        # database generations; retain only the prior complete bundle.
+        if cache_read_tx:
+            cache_conn.rollback()
+            cache_read_tx = False
+        if stats_read_tx:
+            stats_conn.rollback()
+            stats_read_tx = False
+        post_stats_digest = codex_stats_digest(stats_conn)
+        post_signature = c.compute_signature(
+            cache_conn,
+            stats_conn,
+            generation=c.current_generation(),
+            codex_stats_digest=post_stats_digest,
+        )
+        if post_signature != signature:
+            if prior_bundle is not None:
+                return prior_bundle
+            raise RuntimeError("source read generation moved during build")
+        return bundle
+    finally:
+        if cache_read_tx:
+            cache_conn.rollback()
+        if stats_read_tx:
+            stats_conn.rollback()
+        cache_conn.close()
+
+
+def _tui_hydrating_source_bundle() -> SourceDashboardBundle:
+    """Return the honest no-ingest source state used by the cheap dashboard seed.
+
+    The seed has not coordinated either provider ingest or derived projection,
+    so it must not present those partial headline fields as a coherent provider
+    generation.  The dashboard's existing ``hydrating`` flag identifies this
+    short-lived state; the first background rebuild replaces the whole frozen
+    bundle atomically.
+    """
+    claude = SourceDashboardState(
+        source="claude",
+        availability="partial",
+        freshness="stale",
+        warnings=(),
+        data_version="hydrating:claude",
+        last_success_at=None,
+        capabilities={},
+        data=None,
+    )
+    codex = SourceDashboardState(
+        source="codex",
+        availability="partial",
+        freshness="stale",
+        warnings=(),
+        data_version="hydrating:codex",
+        last_success_at=None,
+        capabilities={},
+        data=None,
+    )
+    return SourceDashboardBundle(
+        source_schema_version=1,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
+    )
+
+
+def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
+    """Return whether both physical provider generations are safe to retain.
+
+    A stable dispatch key alone cannot prove that a previously unavailable or
+    degraded provider remains unavailable: a projection certificate can be
+    repaired without changing accounting facts.  Such a source must take the
+    full source-bundle path again; that path still independently reuses the
+    healthy provider by its own data version.
+    """
+    if not isinstance(bundle, SourceDashboardBundle):
+        return False
+    for source in ("claude", "codex"):
+        state = bundle.sources.get(source)
+        if not isinstance(state, SourceDashboardState):
+            return False
+        if (state.availability not in ("ok", "empty")
+                or state.freshness != "fresh"
+                or state.data is None):
+            return False
+    return True
+
+
+def _tui_common_source_range_start(
+    daily_panel: Sequence[TuiDailyPanelRow],
+    *,
+    now_utc: dt.datetime,
+    display_tz: dt.tzinfo | None,
+) -> dt.datetime:
+    """Return the shared provider interval from the already-built daily rows."""
+    if daily_panel:
+        earliest_day = dt.date.fromisoformat(daily_panel[-1].date)
+        if display_tz is not None:
+            return dt.datetime.combine(
+                earliest_day, dt.time.min, tzinfo=display_tz,
+            ).astimezone(dt.timezone.utc)
+        # internal fallback: host-local intentional
+        return dt.datetime.combine(
+            earliest_day, dt.time.min,
+        ).astimezone(dt.timezone.utc)
+    return now_utc - dt.timedelta(days=30)
+
+
 def _tui_build_snapshot(
     *,
     now_utc: dt.datetime | None = None,
@@ -2180,17 +2755,40 @@ def _tui_build_snapshot(
         # builders always read pure regardless (skip_sync is reassigned to
         # True below), so --no-sync means "no ingest, still read".
         do_ingest = not skip_sync
+        claude_ingest_contended = False
+        claude_ingest_failed = False
+        codex_ingest_contended = False
+        codex_ingest_failed = False
         with _perf.phase("sync") as _p_sync:
             _p_sync.set_meta(ingest=do_ingest)
             if do_ingest:
                 try:
                     cache_conn = _cctally().open_cache_db()
                     try:
-                        sync_cache(cache_conn)
+                        try:
+                            claude_ingest = sync_cache(cache_conn)
+                            claude_ingest_contended = bool(
+                                getattr(claude_ingest, "lock_contended", False)
+                            )
+                        except Exception as exc:
+                            claude_ingest_failed = True
+                            errors.append(f"sync-cache: {exc}")
+                        if precompute_envelope:
+                            try:
+                                codex_ingest = sync_codex_cache(cache_conn)
+                                codex_ingest_contended = bool(
+                                    getattr(codex_ingest, "lock_contended", False)
+                                )
+                            except Exception as exc:
+                                codex_ingest_failed = True
+                                errors.append(f"sync-codex-cache: {exc}")
                     finally:
                         cache_conn.close()
                 except Exception as exc:
-                    errors.append(f"sync-cache: {exc}")
+                    claude_ingest_failed = True
+                    if precompute_envelope:
+                        codex_ingest_failed = True
+                    errors.append(f"sync-cache-open: {exc}")
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
@@ -2239,7 +2837,27 @@ def _tui_build_snapshot(
         # The signature is computed AFTER the top-of-rebuild ingest so a fresh
         # tail-ingested row is reflected before the idle decision is made.
         dispatch_key = None
+        # #300: the change signal surfaced on the dashboard envelope. Empty
+        # unless a dispatch signature is computed below (the non-precompute /
+        # TUI path never consumes it). The idle short-circuit carries the prior
+        # value forward via ``dataclasses.replace`` (idle ⇒ signature unchanged).
+        data_version = ""
+        prior_source_bundle: SourceDashboardBundle | None = None
+        _sc = None
+        prior_key = None
+        prior_snap = None
         if precompute_envelope:
+            # The last published provider generation is independently useful
+            # when calculating today's signature fails.  Read it before the
+            # new digest so an identity/build failure can retain the complete
+            # old bundle rather than publishing a missing replacement.
+            try:
+                _sc = _cctally()._load_sibling("_lib_snapshot_cache")
+                prior_key, prior_snap = _sc.dispatch_state()
+                if prior_snap is not None:
+                    prior_source_bundle = getattr(prior_snap, "source_bundle", None)
+            except Exception as exc:
+                errors.append(f"prior-source-bundle: {exc}")
             dispatch_sig = None
             with _perf.phase("signature"):
                 try:
@@ -2263,8 +2881,10 @@ def _tui_build_snapshot(
                     json.dumps(raw_config, sort_keys=True, default=str),
                 )
                 dispatch_key = (dispatch_sig, render_key)
-                _sc = _cctally()._load_sibling("_lib_snapshot_cache")
-                prior_key, prior_snap = _sc.dispatch_state()
+                # #300: carry the change signal onto the non-idle snapshot built
+                # below. (The idle path returns `idle_snap`, which inherits the
+                # prior — equal, since idle ⇒ signature unchanged — value.)
+                data_version = _snapshot_data_version(dispatch_sig)
                 if (prior_snap is not None and prior_key is not None
                         and dispatch_key == prior_key
                         and not _snapshot_period_rolled_over(
@@ -2274,8 +2894,20 @@ def _tui_build_snapshot(
                             prior_snap, now_utc=now_utc,
                             precompute_envelope=precompute_envelope,
                             runtime_bind=runtime_bind, raw_config=raw_config,
+                            display_tz_pref_override=display_tz_pref_override,
+                            source_stats_conn=conn,
+                            source_display_tz_name=(
+                                getattr(_build_display_tz, "key", None)
+                                if _build_display_tz is not None else None
+                            ),
+                            source_display_tz=_build_display_tz,
+                            codex_ingest_contended=codex_ingest_contended,
+                            codex_ingest_failed=codex_ingest_failed,
+                            claude_ingest_contended=claude_ingest_contended,
+                            claude_ingest_failed=claude_ingest_failed,
                             errors=errors,
                         )
+                        assert _sc is not None
                         _sc.store_dispatch_state(dispatch_key, idle_snap)
                     _p_snapshot.__exit__(None, None, None)
                     if _perf.enabled():
@@ -2741,6 +3373,15 @@ def _tui_build_snapshot(
                 except Exception as exc:
                     errors.append(f"envelope-precompute: {exc}")
 
+        # Determine the shared visible interval before publishing either source.
+        # The actual source bundle is built after ``snap`` exists, so Claude's
+        # entry can be projected from this exact completed legacy snapshot.
+        common_range_start: dt.datetime | None = None
+        if precompute_envelope:
+            common_range_start = _tui_common_source_range_start(
+                daily_panel, now_utc=now_utc, display_tz=_build_display_tz,
+            )
+
         snap = DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -2772,7 +3413,65 @@ def _tui_build_snapshot(
             cache_report=cache_report_block,
             doctor_payload=doctor_payload_block,
             envelope_precompute=envelope_precompute_block,
+            data_version=data_version,
+            source_bundle=None,
         )
+        if precompute_envelope:
+            source_bundle: SourceDashboardBundle | None = None
+            try:
+                # ``snapshot_to_envelope`` is a pure snapshot projection when
+                # its precomputed doctor/config blocks are present. If the
+                # optional doctor precompute failed, use a local sentinel for
+                # this source-only projection so it cannot recover by opening
+                # another database connection; the Claude adapter ignores the
+                # doctor field entirely.
+                source_snapshot = snap
+                if source_snapshot.doctor_payload is None:
+                    source_snapshot = dataclasses.replace(
+                        source_snapshot,
+                        doctor_payload={
+                            "severity": "fail",
+                            "counts": {"ok": 0, "warn": 0, "fail": 1},
+                            "generated_at": now_utc.isoformat(),
+                            "fingerprint": "source-projection",
+                        },
+                    )
+                legacy_envelope = _cctally().snapshot_to_envelope(
+                    source_snapshot,
+                    now_utc=now_utc,
+                    display_tz_pref_override=display_tz_pref_override,
+                    runtime_bind=runtime_bind,
+                )
+                source_bundle = _tui_build_source_bundle(
+                    stats_conn=conn,
+                    now_utc=now_utc,
+                    display_tz_name=(
+                        getattr(_build_display_tz, "key", None)
+                        if _build_display_tz is not None else None
+                    ),
+                    codex_ingest_contended=codex_ingest_contended,
+                    codex_ingest_failed=codex_ingest_failed,
+                    claude_ingest_contended=claude_ingest_contended,
+                    claude_ingest_failed=claude_ingest_failed,
+                    claude_cost_usd=daily_total_cost_usd,
+                    claude_total_tokens=daily_total_tokens,
+                    claude_data=_tui_project_claude_source_data(legacy_envelope),
+                    common_range_start=common_range_start,
+                    prior_bundle=prior_source_bundle,
+                    raw_config=raw_config,
+                )
+                if source_bundle is None:
+                    raise RuntimeError("source bundle builder returned no bundle")
+            except Exception as exc:
+                # Public source warnings are stable/sanitized; the detailed
+                # exception remains only on the internal rebuild-error string.
+                errors.append(f"source-bundle: {exc}")
+                source_bundle = prior_source_bundle
+            snap = dataclasses.replace(
+                snap,
+                last_sync_error=("; ".join(errors) if errors else None),
+                source_bundle=source_bundle,
+            )
         # #268 M5.1: record the (signature+render key, snapshot) so the next
         # dashboard tick can idle-short-circuit when nothing changed. Full-build
         # path only sets it when the key was computed (precompute_envelope); the
@@ -2888,7 +3587,10 @@ def _tui_compute_dispatch_signature(stats_conn):
     cache_conn = c.open_cache_db()
     try:
         return sc.compute_signature(
-            cache_conn, stats_conn, generation=sc.current_generation(),
+            cache_conn,
+            stats_conn,
+            generation=sc.current_generation(),
+            codex_stats_digest=codex_stats_digest(stats_conn),
         )
     finally:
         cache_conn.close()
@@ -2946,7 +3648,15 @@ def _snapshot_period_rolled_over(prior, now_utc, display_tz):
 
 
 def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
-                             runtime_bind, raw_config, errors):
+                             runtime_bind, raw_config, errors,
+                             display_tz_pref_override=None,
+                             source_stats_conn=None,
+                             source_display_tz_name=None,
+                             source_display_tz: dt.tzinfo | None = None,
+                             codex_ingest_contended=False,
+                             codex_ingest_failed=False,
+                             claude_ingest_contended=False,
+                             claude_ingest_failed=False):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
     time-derived fields + the doctor payload / envelope precompute on each idle
     tick (spec §3 idle path).
@@ -2986,6 +3696,68 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             envelope_precompute = _tui_precompute_envelope_config(raw_config)
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
             errors.append(f"envelope-precompute: {exc}")
+    source_bundle = prior.source_bundle
+    if source_bundle is not None:
+        try:
+            prior_claude = source_bundle.sources["claude"]
+            prior_codex = source_bundle.sources["codex"]
+            if _tui_source_bundle_can_idle(source_bundle):
+                codex = refresh_codex_source_clock(prior_codex, now_utc=now_utc)
+                if codex is not prior_codex:
+                    source_bundle = SourceDashboardBundle(
+                        source_schema_version=source_bundle.source_schema_version,
+                        default_source=source_bundle.default_source,
+                        source_order=source_bundle.source_order,
+                        sources={
+                            "claude": prior_claude,
+                            "codex": codex,
+                            "all": compose_all_state(prior_claude, codex),
+                        },
+                    )
+            elif source_stats_conn is not None:
+                # A provider can become coherent without changing the global
+                # data signature (notably after its post-projection certificate
+                # is written). Re-run only the bounded source adapter while
+                # preserving the already-idle legacy snapshot rows.
+                source_snapshot = prior
+                if source_snapshot.doctor_payload is None:
+                    source_snapshot = dataclasses.replace(
+                        source_snapshot,
+                        doctor_payload={
+                            "severity": "fail",
+                            "counts": {"ok": 0, "warn": 0, "fail": 1},
+                            "generated_at": now_utc.isoformat(),
+                            "fingerprint": "source-projection",
+                        },
+                    )
+                legacy_envelope = _cctally().snapshot_to_envelope(
+                    source_snapshot,
+                    now_utc=now_utc,
+                    display_tz_pref_override=display_tz_pref_override,
+                    runtime_bind=runtime_bind,
+                )
+                source_bundle = _tui_build_source_bundle(
+                    stats_conn=source_stats_conn,
+                    now_utc=now_utc,
+                    display_tz_name=source_display_tz_name,
+                    codex_ingest_contended=codex_ingest_contended,
+                    codex_ingest_failed=codex_ingest_failed,
+                    claude_ingest_contended=claude_ingest_contended,
+                    claude_ingest_failed=claude_ingest_failed,
+                    claude_cost_usd=prior.daily_total_cost_usd,
+                    claude_total_tokens=prior.daily_total_tokens,
+                    claude_data=_tui_project_claude_source_data(legacy_envelope),
+                    common_range_start=_tui_common_source_range_start(
+                        prior.daily_panel,
+                        now_utc=now_utc,
+                        display_tz=source_display_tz,
+                    ),
+                    prior_bundle=source_bundle,
+                    raw_config=raw_config,
+                )
+        except Exception as exc:  # noqa: BLE001 — retain prior complete bundle
+            errors.append(f"source-clock-refresh: {exc}")
+            source_bundle = prior.source_bundle
     return dataclasses.replace(
         prior,
         generated_at=now_utc,
@@ -2993,6 +3765,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         last_sync_error=("; ".join(errors) if errors else None),
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
+        source_bundle=source_bundle,
         # #278 §1.4.1: an idle snapshot means the data-version signature is
         # unchanged (data stable) → force the hydration latch clear even if
         # ``prior`` was a hydrating seed/partial.
@@ -3437,6 +4210,7 @@ class _TuiSyncThread:
                     # dataclass defaults and re-forking `security` per client.
                     doctor_payload=prev.doctor_payload,
                     envelope_precompute=prev.envelope_precompute,
+                    source_bundle=prev.source_bundle,
                 ))
             # Wait up to interval, or until forced.
             for _ in range(int(max(1, self._interval * 10))):
@@ -5326,6 +6100,12 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     # target is `cctally-bench --trace`, which builds directly
                     # (no decoupled standalone ingest) and keeps its phase tree.
                     sync_cache(cache_conn, progress=cb)
+                    # Dashboard S4's physical identity includes Codex.  Keep
+                    # the decoupled path's ingest set identical to the direct
+                    # dashboard snapshot path before its final pure read, or
+                    # it can publish a legacy data version from a different
+                    # provider generation.
+                    sync_codex_cache(cache_conn)
                 except Exception as exc:  # noqa: BLE001 — surfaced on the snap
                     sync_error = f"sync-cache: {exc}"
                 finally:

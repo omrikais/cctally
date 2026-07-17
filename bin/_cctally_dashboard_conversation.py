@@ -280,10 +280,15 @@ def _handle_get_conversations_impl(handler) -> None:
 
 def _handle_get_conversations_facets_impl(handler) -> None:
     """``GET /api/conversations/facets`` — distinct project labels + their
-    conversation counts, for the browse filter's project multi-select (spec
-    §2). Behind the SAME loopback/Host privacy gate as the list route; a
-    cheap indexed GROUP BY over the rollup. The popover loads its options
-    once from here (deriving from a paginated page would be incomplete).
+    conversation counts AND per-model-family session counts, for the browse
+    filter's project + model multi-selects (spec §2 + #278 Theme C). Behind the
+    SAME loopback/Host privacy gate as the list route. The projects half is a
+    cheap GROUP BY over the ``conversation_sessions`` rollup; the model-family
+    half is an index-only scan of ``conversation_messages(model, session_id)``
+    via the partial covering index ``idx_conversation_messages_model_session``
+    (#301 — a full heap-walk of the whole table before that index). The popover
+    loads its options once from here (deriving from a paginated page would be
+    incomplete).
     """
     if not handler._require_transcripts_allowed():
         return

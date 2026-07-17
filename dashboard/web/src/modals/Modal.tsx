@@ -62,11 +62,6 @@ export function Modal({ title, accentClass, children, headerExtras, wide }: Moda
         aria-modal="true"
         aria-labelledby="modal-title"
       >
-        {/* Decorative drag-handle. Visible only at the mobile breakpoint
-            via CSS. There is no swipe-to-dismiss gesture wired up; the
-            handle sets the visual expectation only. Dismissal paths
-            remain X-button, backdrop tap, and Esc. */}
-        <div className="modal-handle" aria-hidden="true" />
         <ModalHeader
           title={title}
           titleId="modal-title"

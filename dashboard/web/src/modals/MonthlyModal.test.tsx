@@ -94,4 +94,20 @@ describe('<MonthlyModal /> (#264 S2)', () => {
     fireEvent.click(screen.getByRole('button', { name: /Share Monthly report/i }));
     expect(getState().shareModal?.panel).toBe('monthly');
   });
+
+  // #293 S3 — the panel slices to CAP=3 in stack mode, but the MODAL must always
+  // render EVERY envelope row (row count === envelope). Locks a slice from ever
+  // leaking into the full-table modal path.
+  it('renders ALL envelope rows (never the S3 slice) — row count === envelope', () => {
+    const MONTHLY4: PeriodRow[] = [
+      periodRow({ label: '2026-07', is_current: true }),
+      periodRow({ label: '2026-06' }),
+      periodRow({ label: '2026-05' }),
+      periodRow({ label: '2026-04' }),
+    ];
+    updateSnapshot(baseEnvelope({ monthly: MONTHLY4 }));
+    dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
+    render(<MonthlyModal />);
+    expect(document.querySelectorAll('.history-table--monthly tbody tr').length).toBe(4);
+  });
 });

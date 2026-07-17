@@ -1,0 +1,16 @@
+Claude Diff Report
+Overall: A $1.250000 / 190 tokens; B $2.500000 / 380 tokens; Δ +$1.250000 / +190 tokens
+- Overall: ok
+  - Overall [changed]: A $1.250000 / 190 tokens; B $2.500000 / 380 tokens; Δ +$1.250000 / +190 tokens
+- Models: ok
+  - claude-sonnet-4-20250514 [changed]: A $1.250000 / 190 tokens; B $2.500000 / 380 tokens; Δ +$1.250000 / +190 tokens
+- Projects: ok
+  - claude-project [changed]: A $1.250000 / 190 tokens; B $2.500000 / 380 tokens; Δ +$1.250000 / +190 tokens
+- Cache: ok
+  - cache:claude [changed]: A $1.250000 / 170 tokens; B $2.500000 / 340 tokens; Δ +$1.250000 / +170 tokens
+  - cache:overall [changed]: A $1.250000 / 170 tokens; B $2.500000 / 340 tokens; Δ +$1.250000 / +170 tokens
+
+Codex Diff Report
+Unavailable: Codex qualified project metadata is unavailable.
+
+Combined physical accounting: A $1.250000; B $2.500000; Δ +$1.250000; A 190 tokens; B 380 tokens; Δ +190 tokens

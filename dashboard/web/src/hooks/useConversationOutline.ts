@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
+import { revalToken } from '../lib/revalToken';
 import type { ConversationOutline } from '../types/conversation';
 
 // #177 S5 — full-session outline + stats. Owns its OWN SSE tick subscription
@@ -18,7 +19,11 @@ import type { ConversationOutline } from '../types/conversation';
 // useConversationLiveTail via ConversationsView). When `live` (server actively
 // live-tailing), the per-tick revalidation is skipped and the outline refetches
 // only on a genuine growth push (`growthNonce`); when live-tail is off/passive,
-// the global tick stays as the fallback. Defaults keep pre-#278 behavior.
+// the change signal stays as the fallback. Defaults keep pre-#278 behavior.
+// #300 — that non-live fallback now keys on the change signal `revalToken(env)`
+// (the all-inputs `data_version`, falling back to `generated_at`) rather than
+// the raw 5s `generated_at` heartbeat, so a finished/static conversation
+// fetches its outline once instead of re-GET every tick while open.
 export function useConversationOutline(
   sessionId: string | null,
   opts?: { revalidateOnTick?: boolean; growthNonce?: number; live?: boolean },
@@ -79,7 +84,11 @@ export function useConversationOutline(
   }, [sessionId, refetch]);
 
   const env = useSnapshot();
-  const generatedAt = env?.generated_at ?? '';
+  // #300 — gate the non-live fallback on the change signal (`data_version`), not
+  // the 5s `generated_at` heartbeat, so a finished/static conversation open in
+  // the reader fetches its outline once instead of re-GET every tick. Falls back
+  // to `generated_at` when data_version is absent/empty. See `lib/revalToken.ts`.
+  const token = revalToken(env);
   useEffect(() => {
     // #227 — skip the SSE-tick revalidation entirely when the caller opted out
     // (ComparisonView's static two-run snapshot). The initial-load effect above
@@ -89,7 +98,7 @@ export function useConversationOutline(
     // when live-tail is off/passive.
     if (revalidateOnTick && !live && outlineRef.current) void refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generatedAt, revalidateOnTick, live]);
+  }, [token, revalidateOnTick, live]);
 
   // #278 — genuine per-conversation growth push → refetch the whole-session
   // outline. (ComparisonView passes revalidateOnTick:false and no live-tail, so

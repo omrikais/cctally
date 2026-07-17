@@ -42,6 +42,7 @@ import datetime as dt
 import importlib.util as _ilu
 import os
 import sys
+from collections.abc import Mapping
 from zoneinfo import ZoneInfo
 
 from _cctally_core import (
@@ -626,6 +627,103 @@ _ENVELOPE_AXIS_MAPPERS = {
     "project_budget": _envelope_rows_project_budget,
     "codex_budget": _envelope_rows_budget_family,
 }
+
+
+def _source_wire_value(value: object) -> object:
+    """Copy one published source value into JSON-compatible wire material.
+
+    Source state is frozen with mapping proxies and tuples so request threads
+    cannot mutate it.  The envelope must return fresh ordinary containers
+    without consulting the cache or stats databases.
+    """
+    if isinstance(value, Mapping):
+        return {str(key): _source_wire_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_source_wire_value(item) for item in value]
+    if isinstance(value, dt.datetime):
+        return _iso_z(value)
+    return value
+
+
+def _unavailable_source_wire() -> dict:
+    return {
+        "availability": "unavailable",
+        "freshness": "stale",
+        "warnings": [{
+            "code": "source_build_failed",
+            "message": "Source data could not be built.",
+            "domain": "read_model",
+        }],
+        "data_version": "",
+        "last_success_at": None,
+        "capabilities": {},
+        "data": None,
+    }
+
+
+def _source_state_to_wire(state: object) -> dict:
+    """Serialize one immutable source state without exposing its storage ID."""
+    warnings = getattr(state, "warnings", ())
+    capabilities = getattr(state, "capabilities", {})
+    last_success_at = getattr(state, "last_success_at", None)
+    return {
+        "availability": getattr(state, "availability"),
+        "freshness": getattr(state, "freshness"),
+        "warnings": [
+            {
+                "code": warning.code,
+                "message": warning.message,
+                **({"domain": warning.domain} if warning.domain is not None else {}),
+            }
+            for warning in warnings
+        ],
+        "data_version": getattr(state, "data_version"),
+        "last_success_at": (
+            _iso_z(last_success_at) if isinstance(last_success_at, dt.datetime) else None
+        ),
+        "capabilities": {
+            str(name): {
+                "status": capability.status,
+                **({"semantics": capability.semantics}
+                   if capability.semantics is not None else {}),
+            }
+            for name, capability in capabilities.items()
+        },
+        "data": _source_wire_value(getattr(state, "data", None)),
+    }
+
+
+def _source_bundle_to_envelope(bundle: object | None) -> dict:
+    """Return S4's additive source contract from a published bundle only."""
+    unavailable = {source: _unavailable_source_wire() for source in ("claude", "codex", "all")}
+    if bundle is None:
+        return {
+            "source_schema_version": 1,
+            "default_source": "claude",
+            "source_order": ["claude", "codex", "all"],
+            "sources": unavailable,
+        }
+    try:
+        order = tuple(bundle.source_order)
+        sources = bundle.sources
+        if order != ("claude", "codex", "all") or set(sources) != set(order):
+            raise ValueError("invalid published source bundle")
+        return {
+            "source_schema_version": bundle.source_schema_version,
+            "default_source": bundle.default_source,
+            "source_order": list(order),
+            "sources": {
+                source: _source_state_to_wire(sources[source])
+                for source in order
+            },
+        }
+    except Exception:  # Never turn an unexpected snapshot shape into request-thread I/O.
+        return {
+            "source_schema_version": 1,
+            "default_source": "claude",
+            "source_order": ["claude", "codex", "all"],
+            "sources": unavailable,
+        }
 
 
 def _build_alerts_envelope_array(
@@ -1242,7 +1340,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         (r for r in reversed(snap.trend) if r.is_current), None
     ) if snap.trend else None
 
-    return {
+    envelope = {
         "envelope_version": 2,
         # #278 Theme A: single additive first-paint hydration latch. True only
         # on the cheap seed + A2's partial republishes (data still being
@@ -1250,6 +1348,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # default keeps positionally-constructed fixture snapshots serializing.
         "hydrating":        bool(getattr(snap, "hydrating", False)),
         "generated_at":     _iso_z(snap.generated_at),
+        # #300: the all-inputs data-version string at build time (changes iff any
+        # DB leg the detail endpoints read changed; flat on an idle tick). The
+        # browser's lazy detail fetchers revalidate on THIS (an actual
+        # data-change signal) instead of the 5s ``generated_at`` heartbeat, so a
+        # finished/static session/project/conversation is not re-GET every tick.
+        # ``getattr`` default keeps positionally-constructed fixture snapshots
+        # serializing; "" is the client's "no signal" sentinel (falls back to
+        # ``generated_at``).
+        "data_version":     str(getattr(snap, "data_version", "") or ""),
         # last_sync_at in DataSnapshot is a monotonic float, not a wall
         # clock — the envelope's wall-clock moment is unknowable from
         # here, so expose it as None and rely on sync_age_s for the UI.
@@ -1478,6 +1585,8 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # PREVIEW badge when set.
         **sys.modules["_cctally_dashboard"]._channel_env_fragment(),
     }
+    envelope.update(_source_bundle_to_envelope(getattr(snap, "source_bundle", None)))
+    return envelope
 
 
 def _session_detail_to_envelope(detail: "TuiSessionDetail") -> dict:

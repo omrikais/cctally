@@ -5,6 +5,15 @@ Codex (OpenAI) usage grouped by session. Drop-in replacement for
 
 > Canonical form: [`cctally codex session`](codex.md) (this flat form remains as an alias).
 
+## Config and sharing
+
+`codex-session` keeps its established session accounting and inclusive
+Codex-token semantics. `--config PATH` is a read-only alternate configuration
+path. The common share flags (`--format`, `--theme`, `--no-branding`,
+`--output`, `--copy`, `--open`) produce a visibly Codex-labelled artifact;
+without `--format`, terminal, JSON, and empty output are unchanged. Review
+share output before it leaves the machine; see [share.md](share.md).
+
 ## Synopsis
 
 ```

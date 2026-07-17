@@ -1,0 +1,51 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+  ✓ Mode                     installed
+  ✓ Symlinks                 15/15 available
+  ✓ PATH                     cctally reachable on $PATH
+  ✓ Legacy status-line snippet not detected
+  ✓ Legacy bespoke hooks     not detected
+Hooks
+  ✓ Hook entries installed   PostToolBatch, Stop, SubagentStop
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+  ✓ Codex hooks installed    2/2 root(s) installed
+  ✓ Codex recent activity    2 installed root(s); recent
+Auth
+  ✓ OAuth token              present
+Database
+  ✓ stats.db                 version 0 / 13 known
+  ✓ cache.db                 version 0 / 24 known
+  ✓ Integrity                quick_check ok
+  ✓ Version ahead            none ahead
+  ✓ Migrations               0/37 applied
+  ⚠ Pending migrations       37 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+  ✓ Locks                    free
+  ✓ cache.db WAL size        within limit
+Data
+  ✓ Latest snapshot          2s ago
+  ✓ Claude cache             0 entries (no JSONL corpus)
+  ✓ Codex cache              none (no Codex session JSONL found)
+  ⚠ Codex quota              2 window(s); stale
+      → Run `cctally cache-sync --source codex` after Codex activity.
+  ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
+  ✓ Forked week buckets      none
+  ✓ Post-credit milestones   no credited weeks
+  ✓ Conversation rollup      no data
+Pricing
+  ✓ Coverage                 all observed models priced
+Safety
+  ✓ Dashboard bind           config: loopback
+  ✓ config.json              absent or parses cleanly
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+  ✓ update-suppress.json     parses cleanly
+  ✓ Update available         no
+Telemetry
+  ✓ State                    enabled (enabled)
+
+Summary: 29 OK · 5 WARN · 0 FAIL

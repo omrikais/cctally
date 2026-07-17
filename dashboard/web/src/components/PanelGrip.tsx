@@ -7,6 +7,6 @@
 // up to that listener and start the drag.
 export function PanelGrip() {
   return (
-    <span className="panel-grip" aria-hidden="true">⋮⋮</span>
+    <span className="panel-grip" aria-hidden="true" data-card-region-ignore>⋮⋮</span>
   );
 }

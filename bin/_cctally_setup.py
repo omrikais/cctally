@@ -56,6 +56,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import json
@@ -84,6 +85,17 @@ import _cctally_core
 from _cctally_core import (
     eprint,
     _command_as_of,
+)
+from _lib_codex_hooks import (
+    CODEX_HOOK_EVENTS,
+    CodexHooksError,
+    _plan_install as _codex_hooks_plan_install,
+    _plan_uninstall as _codex_hooks_plan_uninstall,
+    _read_hooks_document as _read_codex_hooks_document,
+    _write_hooks_document_atomic as _write_codex_hooks_atomic,
+    codex_hook_roots,
+    is_canonical_owned_codex_hook_handler,
+    is_owned_codex_hook_command,
 )
 
 
@@ -1312,6 +1324,159 @@ def _setup_detect_stale_symlinks(dst_dir: pathlib.Path) -> list[str]:
     return found
 
 
+# ── Codex native hooks.json management (#294 S2) ─────────────────────────
+
+
+def _setup_codex_hook_roots():
+    """Configured, usable Codex homes in sorted opaque-root-key order.
+
+    The existing `$CODEX_HOME` resolver deliberately returns no default root
+    for an explicit all-invalid override; preserve that privacy boundary here.
+    """
+    return codex_hook_roots(_cctally()._codex_home_roots())
+
+
+def _codex_hooks_feature_enabled() -> bool:
+    return not _cctally_core._truthy_env("CCTALLY_DISABLE_CODEX_HOOKS")
+
+
+def _setup_claude_available() -> bool:
+    """Whether setup may truthfully plan or mutate Claude-owned surfaces."""
+    return (pathlib.Path.home() / ".claude").is_dir()
+
+
+def _codex_hooks_count(document: dict, binary: str) -> dict[str, dict[str, int]]:
+    hooks = document.get("hooks", {})
+    counts = {
+        event: {"owned": 0, "canonical": 0}
+        for event in CODEX_HOOK_EVENTS
+    }
+    for event in CODEX_HOOK_EVENTS:
+        for group in hooks.get(event, []):
+            for handler in group["hooks"]:
+                if is_owned_codex_hook_command(handler.get("command"), binary):
+                    counts[event]["owned"] += 1
+                if is_canonical_owned_codex_hook_handler(handler, binary):
+                    counts[event]["canonical"] += 1
+    return counts
+
+
+def _codex_hook_remediation(state: str) -> str | None:
+    messages = {
+        "absent": "Run `cctally setup` to install the native Codex handler.",
+        "malformed": "Fix the malformed hooks.json before cctally can manage it.",
+        "feature_disabled": "Unset CCTALLY_DISABLE_CODEX_HOOKS to enable native Codex hooks.",
+        "installed_review_required": "Review and trust the exact cctally handler in Codex /hooks.",
+        "installed_trust_unobservable": "Verify the exact cctally handler in Codex /hooks.",
+        "unavailable": "Ensure this configured Codex home is available, then re-run setup.",
+    }
+    return messages.get(state)
+
+
+def _codex_hook_row(root, binary: str, *, changed: bool = False) -> dict:
+    base = {
+        "source_root_key": root.source_root_key,
+        "codex_home": str(root.codex_home),
+        "hooks_path": str(root.hooks_path),
+        "stop_count": 0,
+        "subagent_stop_count": 0,
+        "feature_enabled": _codex_hooks_feature_enabled(),
+        "requires_review": False,
+        "remediation": None,
+        "error": None,
+    }
+    if not base["feature_enabled"]:
+        state = "feature_disabled"
+    else:
+        try:
+            document = _read_codex_hooks_document(root.hooks_path)
+        except CodexHooksError as exc:
+            state = "malformed"
+            base["error"] = str(exc)
+        else:
+            counts = _codex_hooks_count(document, binary)
+            base["stop_count"] = counts["Stop"]["owned"]
+            base["subagent_stop_count"] = counts["SubagentStop"]["owned"]
+            if all(
+                counts[event] == {"owned": 1, "canonical": 1}
+                for event in CODEX_HOOK_EVENTS
+            ):
+                state = "installed_review_required" if changed else "installed_trust_unobservable"
+                base["requires_review"] = True if changed else None
+            else:
+                state = "absent"
+    base["state"] = state
+    base["remediation"] = _codex_hook_remediation(state)
+    return base
+
+
+def _setup_codex_hooks_preflight(
+    binary: str, *, validate_feature_disabled: bool = False,
+) -> list[dict]:
+    """Read/validate every managed file before any setup mutation.
+
+    Feature-disabled status and preview normally avoid reading Codex
+    configuration because installation is inactive. Mutating install and
+    uninstall pass ``validate_feature_disabled=True`` so both fail closed on
+    every malformed managed file before changing any provider-owned surface.
+    """
+    rows: list[dict] = []
+    for root in _setup_codex_hook_roots():
+        row = _codex_hook_row(root, binary)
+        if validate_feature_disabled and row["state"] == "feature_disabled":
+            try:
+                _read_codex_hooks_document(root.hooks_path)
+            except CodexHooksError as exc:
+                row["state"] = "malformed"
+                row["error"] = str(exc)
+                row["remediation"] = _codex_hook_remediation("malformed")
+        rows.append(row)
+    return rows
+
+
+def _setup_manage_codex_hooks(mode: str, binary: str) -> dict:
+    """Apply owned-only install/uninstall surgery to every detected home."""
+    rows: list[dict] = []
+    for root in _setup_codex_hook_roots():
+        # The feature switch prevents new native-hook installation, but must
+        # never strand handlers that an operator explicitly asks setup to
+        # uninstall.  Malformed documents still remain fail-closed.
+        if mode == "install" and not _codex_hooks_feature_enabled():
+            rows.append(_codex_hook_row(root, binary))
+            continue
+        try:
+            if mode == "install":
+                planner = lambda document: _codex_hooks_plan_install(document, binary)
+            elif mode == "uninstall":
+                planner = lambda document: _codex_hooks_plan_uninstall(document, binary)
+            else:
+                raise ValueError(f"unsupported Codex hooks mode: {mode}")
+            _planned, changes, changed, _backup = _write_codex_hooks_atomic(
+                root.hooks_path, transform=planner,
+                harden_unchanged=(mode == "install"),
+            )
+            row = _codex_hook_row(root, binary, changed=(mode == "install" and changed))
+            row["changes"] = changes
+            rows.append(row)
+        except CodexHooksError as exc:
+            initial = _codex_hook_row(root, binary)
+            initial["state"] = "malformed"
+            initial["requires_review"] = False
+            initial["remediation"] = _codex_hook_remediation("malformed")
+            initial["error"] = str(exc)
+            rows.append(initial)
+    return _codex_hooks_summary(rows)
+
+
+def _codex_hooks_summary(rows: list[dict]) -> dict:
+    installed_states = {"installed_review_required", "installed_trust_unobservable"}
+    return {
+        "roots": rows,
+        "installed_count": sum(1 for row in rows if row["state"] in installed_states),
+        "error_count": sum(1 for row in rows if row["state"] in {"malformed", "unavailable"}),
+    }
+
+
 def _setup_status(args: argparse.Namespace) -> int:
     c = _cctally()
     repo_root = _setup_resolve_repo_root()
@@ -1335,6 +1500,9 @@ def _setup_status(args: argparse.Namespace) -> int:
     legacy = _setup_detect_legacy_snippet()
     bespoke = _setup_detect_legacy_bespoke_hooks(settings)
     data_bytes = _setup_data_dir_size_bytes()
+    codex_hooks = _codex_hooks_summary(
+        _setup_codex_hooks_preflight(str(_setup_resolve_hook_target(repo_root)))
+    )
 
     if getattr(args, "json", False):
         envelope = {
@@ -1353,6 +1521,7 @@ def _setup_status(args: argparse.Namespace) -> int:
                 ),
             },
             "activity_24h": activity,
+            "codex_hooks": codex_hooks,
             "legacy": {
                 "statusline_snippet": str(legacy[0]) if legacy else None,
                 "bespoke_hooks": {
@@ -1386,6 +1555,13 @@ def _setup_status(args: argparse.Namespace) -> int:
         marker = "✓" if hook_counts[ev] >= 1 else "✗"
         word = "installed" if hook_counts[ev] >= 1 else "missing"
         out.append(f"  {ev:14s} {word:24s} {marker}")
+    if codex_hooks["roots"]:
+        out.append("Codex hooks")
+        for row in codex_hooks["roots"]:
+            out.append(
+                f"  {row['source_root_key']}  {row['state']} "
+                f"(Stop {row['stop_count']}, SubagentStop {row['subagent_stop_count']})"
+            )
     out.append("Auth")
     out.append(f"  OAuth token    {'present' if oauth else 'missing'}                              "
                f"{'✓' if oauth else '⚠'}")
@@ -1429,21 +1605,39 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
     is_json = bool(getattr(args, "json", False))
 
     out: list[str] = []
-    try:
-        settings = c._load_claude_settings()
-    except c.SetupError as exc:
-        eprint(f"setup: {exc}")
-        return 1
-    settings, removed = _settings_merge_uninstall(settings)
-    if removed:
-        try:
-            c._write_claude_settings_atomic(settings)
-        except OSError as exc:
-            eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
-            return 2
-    out.append(f"Removed {removed} hook entries from {_cctally_core.CLAUDE_SETTINGS_PATH}")
-
     repo_root = _setup_resolve_repo_root()
+    codex_binary = str(_setup_resolve_hook_target(repo_root))
+    codex_preflight = _setup_codex_hooks_preflight(
+        codex_binary, validate_feature_disabled=True,
+    )
+    bad_codex = next((row for row in codex_preflight if row["state"] == "malformed"), None)
+    if bad_codex is not None:
+        eprint(f"setup: {bad_codex['error']}")
+        return 1
+    claude_available = _setup_claude_available()
+    removed = 0
+    if claude_available:
+        try:
+            settings = c._load_claude_settings()
+        except c.SetupError as exc:
+            eprint(f"setup: {exc}")
+            return 1
+        settings, removed = _settings_merge_uninstall(settings)
+        if removed:
+            try:
+                c._write_claude_settings_atomic(settings)
+            except OSError as exc:
+                eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
+                return 2
+        out.append(f"Removed {removed} hook entries from {_cctally_core.CLAUDE_SETTINGS_PATH}")
+
+    codex_hooks = _setup_manage_codex_hooks("uninstall", codex_binary)
+    for row in codex_hooks["roots"]:
+        changes = row.get("changes", {})
+        count = sum(changes.values()) if isinstance(changes, dict) else 0
+        if count:
+            out.append(f"Removed {count} Codex hook entries from {row['hooks_path']}")
+
     dst_dir = _setup_local_bin_dir()
     sym_removed = 0
     for name in c.SETUP_SYMLINK_NAMES:
@@ -1523,6 +1717,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                     "result": "purge_declined",
                     "reason": "json_without_yes",
                     "hooks_removed": removed,
+                    "codex_hooks": codex_hooks,
                     "symlinks_removed": sym_removed,
                     "purged": False,
                     "data_path": str(_cctally_core.APP_DIR),
@@ -1578,6 +1773,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
             "mode": "uninstall",
             "result": "ok",
             "hooks_removed": removed,
+            "codex_hooks": codex_hooks,
             "symlinks_removed": sym_removed,
             "purged": purge,
             "data_path": str(_cctally_core.APP_DIR),
@@ -1597,15 +1793,16 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
     c = _cctally()
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
-    try:
-        settings = c._load_claude_settings()
-    except c.SetupError as exc:
-        # Malformed settings.json — preview still proceeds; legacy detection
-        # against an empty dict simply yields detected=False for entries (files
-        # detection is independent of settings). Mirror _setup_status's pattern
-        # so the user sees the same condition that would fail _setup_install.
-        eprint(f"setup: warning: {exc}")
-        settings = {}
+    claude_available = _setup_claude_available()
+    settings: dict = {}
+    if claude_available:
+        try:
+            settings = c._load_claude_settings()
+        except c.SetupError as exc:
+            # Malformed settings.json — preview still proceeds; legacy detection
+            # against an empty dict simply yields detected=False for entries.
+            # Mirror _setup_status's non-mutating warning behavior.
+            eprint(f"setup: warning: {exc}")
     detection = _setup_detect_legacy_bespoke_hooks(settings)
     sym_results = []
     for name in c.SETUP_SYMLINK_NAMES:
@@ -1635,16 +1832,29 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             out.append(f"⚠ Blocked (non-symlink files exist): {', '.join(blocked)}")
             out.append("  Remove them manually then re-run.")
 
-    out.append(f"Would add {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}:")
     abs_path = str(_setup_resolve_hook_target(repo_root))
+    codex_hooks = _codex_hooks_summary(_setup_codex_hooks_preflight(abs_path))
     import shlex
     quoted = shlex.quote(abs_path)
-    for ev in c.SETUP_HOOK_EVENTS:
-        matcher = '"*"' if ev == "PostToolBatch" else '""'
-        out.append(
-            f"  hooks.{ev}[*] += {{ matcher: {matcher}, "
-            f"command: \"{quoted} hook-tick\" }}"
-        )
+    if claude_available:
+        out.append(f"Would add {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}:")
+        for ev in c.SETUP_HOOK_EVENTS:
+            matcher = '"*"' if ev == "PostToolBatch" else '""'
+            out.append(
+                f"  hooks.{ev}[*] += {{ matcher: {matcher}, "
+                f"command: \"{quoted} hook-tick\" }}"
+            )
+    else:
+        out.append("Claude Code home not present — would skip Claude hooks")
+    for row in codex_hooks["roots"]:
+        if row["state"] == "malformed":
+            out.append(f"Codex hooks malformed at {row['hooks_path']}: {row['error']}")
+        elif row["state"] == "feature_disabled":
+            out.append(f"Codex hooks disabled for {row['codex_home']}")
+        else:
+            out.append(
+                f"Would add native Codex Stop/SubagentStop handlers to {row['hooks_path']}"
+            )
     # Spec §2 mode×flag matrix — three distinct dry-run rendering paths
     # when legacy is detected:
     #   --dry-run --no-migrate-legacy-hooks → migration block omitted entirely
@@ -1724,10 +1934,11 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
                         "matcher": "*" if ev == "PostToolBatch" else "",
                         "command": f"{quoted} hook-tick",
                     }
-                    for ev in c.SETUP_HOOK_EVENTS
+                    for ev in (c.SETUP_HOOK_EVENTS if claude_available else ())
                 ],
                 "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
             },
+            "codex_hooks": codex_hooks,
             # Sibling parity with `_setup_status` and `_setup_install`
             # JSON envelopes (`legacy.bespoke_hooks` shape). Lets the same
             # consumer query bespoke-hook state from any of the three
@@ -1891,29 +2102,42 @@ def _setup_install(args: argparse.Namespace) -> int:
     warnings = 0
 
     claude_dir = pathlib.Path.home() / ".claude"
-    if not claude_dir.exists():
-        eprint(
-            f"~/.claude/ does not exist. If Claude Code isn't installed yet, "
-            f"install it first. If it is installed, run `claude` once to "
-            f"initialize, then re-run cctally setup."
-        )
-        return 1
-
-    out.append(f"✓ Detected Claude Code at {claude_dir}")
-
+    claude_available = _setup_claude_available()
     repo_root = _setup_resolve_repo_root()
     dst_dir = _setup_local_bin_dir()
     abs_path = str(_setup_resolve_hook_target(repo_root))
+    codex_roots = _setup_codex_hook_roots()
+    if not claude_available and not codex_roots:
+        eprint(
+            "Neither an initialized Claude Code home nor a usable Codex home "
+            "was found. Run the provider once, then re-run cctally setup."
+        )
+        return 1
+
+    if claude_available:
+        out.append(f"✓ Detected Claude Code at {claude_dir}")
+    else:
+        out.append("✓ Claude Code home not present — skipping Claude hooks")
 
     # Validate settings.json BEFORE creating symlinks so a malformed
     # settings file leaves the filesystem untouched (spec §2.2 — exit
     # code 1 for "settings.json malformed"). Both calls are pure: load
     # only reads, merge mutates the in-memory dict only. The actual
     # backup + atomic write still happen after symlinks succeed.
-    try:
-        settings = c._load_claude_settings()
-    except c.SetupError as exc:
-        eprint(f"setup: {exc}")
+    settings: dict = {}
+    if claude_available:
+        try:
+            settings = c._load_claude_settings()
+        except c.SetupError as exc:
+            eprint(f"setup: {exc}")
+            return 1
+
+    codex_preflight = _setup_codex_hooks_preflight(
+        abs_path, validate_feature_disabled=True,
+    )
+    bad_codex = next((row for row in codex_preflight if row["state"] == "malformed"), None)
+    if bad_codex is not None:
+        eprint(f"setup: {bad_codex['error']}")
         return 1
 
     # ── Legacy bespoke hook detection + migration decision (spec §1, §2) ──
@@ -1973,11 +2197,12 @@ def _setup_install(args: argparse.Namespace) -> int:
             "tmp_files_unlinked": [],
         }
 
-    try:
-        _settings_merge_install(settings, abs_path)
-    except c.SetupError as exc:
-        eprint(f"setup: {exc}")
-        return 1
+    if claude_available:
+        try:
+            _settings_merge_install(settings, abs_path)
+        except c.SetupError as exc:
+            eprint(f"setup: {exc}")
+            return 1
 
     # Clean up symlinks left behind by prior cctally versions whose
     # subcommand surface has changed (e.g. v1.9.0 retired
@@ -2058,12 +2283,26 @@ def _setup_install(args: argparse.Namespace) -> int:
         )
         warnings += 1
 
-    c._backup_claude_settings()
-    try:
-        c._write_claude_settings_atomic(settings)
-    except OSError as exc:
-        eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
-        return 2
+    if claude_available:
+        c._backup_claude_settings()
+        try:
+            c._write_claude_settings_atomic(settings)
+        except OSError as exc:
+            eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
+            return 2
+
+    codex_hooks = _setup_manage_codex_hooks("install", abs_path)
+    for row in codex_hooks["roots"]:
+        changes = row.get("changes", {})
+        count = sum(changes.values()) if isinstance(changes, dict) else 0
+        if count:
+            out.append(f"✓ Wrote {count} Codex hook entries to {row['hooks_path']}")
+        if row["state"] == "installed_review_required":
+            out.append("⚠ Codex hook trust needs review in Codex /hooks.")
+            warnings += 1
+        elif row["state"] == "malformed":
+            out.append(f"⚠ Codex hooks unavailable: {row['error']}")
+            warnings += 1
 
     # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
     # Settings.json is now durable. File moves, poller stop, and tmp
@@ -2122,7 +2361,8 @@ def _setup_install(args: argparse.Namespace) -> int:
     # The "✓ Wrote …" line follows any migrate-summary line so the
     # narrative reads "we did the migration, then wrote the new entries"
     # — matches the spec's success-path sample (Section 2).
-    out.append(f"✓ Wrote {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}")
+    if claude_available:
+        out.append(f"✓ Wrote {len(c.SETUP_HOOK_EVENTS)} hook entries to {_cctally_core.CLAUDE_SETTINGS_PATH}")
 
     if decision == "skip" and reason in {"user_declined", "no_migrate_flag"}:
         files_str = "{record-usage-stop,usage-poller{,-start,-stop}}.py"
@@ -2134,17 +2374,17 @@ def _setup_install(args: argparse.Namespace) -> int:
         )
         warnings += 1
 
-    oauth = _setup_oauth_token_present()
-    if oauth:
+    oauth = claude_available and _setup_oauth_token_present()
+    if claude_available and oauth:
         out.append("✓ Detected OAuth token")
-    else:
+    elif claude_available:
         warnings += 1
         out.append("⚠ No Claude OAuth token detected.")
         out.append("  Run `claude` once to authenticate. After that, the next assistant")
         out.append("  message in any Claude Code session will start collecting data")
         out.append("  automatically — no need to re-run `cctally setup`.")
 
-    legacy = _setup_detect_legacy_snippet()
+    legacy = _setup_detect_legacy_snippet() if claude_available else None
     if legacy is not None:
         warnings += 1
         path, hits = legacy
@@ -2165,61 +2405,49 @@ def _setup_install(args: argparse.Namespace) -> int:
     progress = _SetupProgressReporter(
         _setup_progress_enabled(json_mode=getattr(args, "json", False))
     )
-    with progress:
-        progress.emit(
-            "⏳ Syncing session history (first run can take a moment on a large history)…",
-            force=True,
-        )
-        try:
-            cache_conn = c.open_cache_db()
+    with progress if claude_available else contextlib.nullcontext():
+        if not claude_available:
+            bootstrap_rows = None
+        else:
+            progress.emit(
+                "⏳ Syncing session history (first run can take a moment on a large history)…",
+                force=True,
+            )
             try:
-                stats = c.sync_cache(cache_conn, progress=progress.sync_callback)
-            finally:
+                cache_conn = c.open_cache_db()
                 try:
-                    cache_conn.close()
-                except Exception:
-                    pass
-            if stats.lock_contended:
-                # Another process holds the cache flock — nothing was
-                # ingested (sync_cache short-circuits with rows_changed=0).
-                # Report honestly rather than a false "Synced (0 new
-                # entries)"; leave bootstrap_rows None for the envelope.
-                out.append("⚠ Another cache sync is in progress; using existing cache.")
-                warnings += 1
-                bootstrap_rows = None
-            else:
-                rows = int(stats.rows_changed)
-                bootstrap_rows = rows
-                # `rows` counts both genuine INSERTs and ccusage-parity DO
-                # UPDATE replacements (see IngestStats.rows_changed). On
-                # first install this is always 0-vs-N pure inserts (cache is
-                # empty), so "N new entries" is exactly accurate. On a
-                # re-install / upgrade path with active sessions, `rows` also
-                # counts UPSERT replacements (streaming-vs-final tiebreaker
-                # swaps), so the count is more accurately "ingest activity"
-                # than "rows newly added" — but we keep "new entries" because
-                # (a) it's still a useful signal to the operator that the
-                # cache is alive, and (b) the dominant case (first install)
-                # reads literally.
-                out.append(f"✓ Synced session cache ({rows} new entries)")
-        except Exception as exc:
-            out.append(f"⚠ sync_cache during bootstrap failed: {exc}")
-            warnings += 1
-        if oauth:
-            progress.emit("⏳ Fetching current usage…", force=True)
-            try:
-                status, _ = c._hook_tick_oauth_refresh()
-                bootstrap_oauth_status = status
-                if status.startswith("ok"):
-                    c._hook_tick_throttle_touch()
-                    out.append(f"✓ Bootstrapped weekly usage ({status})")
-                else:
-                    out.append(f"⚠ Bootstrap OAuth fetch: {status}")
+                    stats = c.sync_cache(cache_conn, progress=progress.sync_callback)
+                finally:
+                    try:
+                        cache_conn.close()
+                    except Exception:
+                        pass
+                if stats.lock_contended:
+                    out.append("⚠ Another cache sync is in progress; using existing cache.")
                     warnings += 1
+                    bootstrap_rows = None
+                else:
+                    rows = int(stats.rows_changed)
+                    bootstrap_rows = rows
+                    out.append(f"✓ Synced session cache ({rows} new entries)")
             except Exception as exc:
-                bootstrap_oauth_status = f"err({type(exc).__name__})"
-                out.append(f"⚠ Bootstrap OAuth failed: {exc}")
+                out.append(f"⚠ sync_cache during bootstrap failed: {exc}")
                 warnings += 1
+            if oauth:
+                progress.emit("⏳ Fetching current usage…", force=True)
+                try:
+                    status, _ = c._hook_tick_oauth_refresh()
+                    bootstrap_oauth_status = status
+                    if status.startswith("ok"):
+                        c._hook_tick_throttle_touch()
+                        out.append(f"✓ Bootstrapped weekly usage ({status})")
+                    else:
+                        out.append(f"⚠ Bootstrap OAuth fetch: {status}")
+                        warnings += 1
+                except Exception as exc:
+                    bootstrap_oauth_status = f"err({type(exc).__name__})"
+                    out.append(f"⚠ Bootstrap OAuth failed: {exc}")
+                    warnings += 1
 
     out.append("")
     if warnings:
@@ -2253,10 +2481,11 @@ def _setup_install(args: argparse.Namespace) -> int:
     # `warnings` count. settings.json is cached at session start, so open
     # sessions need a restart; `_setup_install` always rewrites settings.json
     # (legacy migration, fresh install, repair), so this always applies.
-    out.append("")
-    out.append("▶ Next step: restart Claude Code to activate the new hooks.")
-    out.append("  Open sessions won't record until you restart (settings.json is cached at")
-    out.append("  session start). New sessions started after this pick them up automatically.")
+    if claude_available:
+        out.append("")
+        out.append("▶ Next step: restart Claude Code to activate the new hooks.")
+        out.append("  Open sessions won't record until you restart (settings.json is cached at")
+        out.append("  session start). New sessions started after this pick them up automatically.")
 
     if getattr(args, "json", False):
         # JSON-safe telemetry disclosure (spec 2026-07-07 §4): a structured
@@ -2279,9 +2508,10 @@ def _setup_install(args: argparse.Namespace) -> int:
                    if is_brew else {}),
             },
             "hooks": {
-                "events_added": list(c.SETUP_HOOK_EVENTS),
+                "events_added": list(c.SETUP_HOOK_EVENTS) if claude_available else [],
                 "settings_path": str(_cctally_core.CLAUDE_SETTINGS_PATH),
             },
+            "codex_hooks": codex_hooks,
             "auth": {
                 "oauth_token_present": oauth,
             },

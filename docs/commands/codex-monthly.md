@@ -6,6 +6,15 @@ offline.
 
 > Canonical form: [`cctally codex monthly`](codex.md) (this flat form remains as an alias).
 
+## Config and sharing
+
+`codex-monthly` retains its established calendar-month accounting semantics.
+`--config PATH` reads an alternate config without writing it, and the standard
+share flags (`--format`, `--theme`, `--no-branding`, `--output`, `--copy`, and
+`--open`) create a visibly Codex-labelled artifact. The no-`--format` terminal,
+JSON, and empty bytes remain the compatibility surface. Review every artifact
+before sharing; details are in [share.md](share.md).
+
 ## Synopsis
 
 ```

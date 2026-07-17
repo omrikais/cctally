@@ -49,10 +49,66 @@ describe('compare slice', () => {
   });
 
   it('CANCEL_COMPARE_PICK clears the pick anchor', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });   // NEW: satisfy the F2 precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     expect(getState().comparePick).toEqual({ anchor: 'A' });
     dispatch({ type: 'CANCEL_COMPARE_PICK' });
     expect(getState().comparePick).toBeNull();
+  });
+
+  // #304 S2 (Codex F2) — the reducer enforces the caller invariant
+  // `comparePick ⇒ selectedConversationId === anchor`: both real entries
+  // dispatch from the open reader, and the compact view-layer gate relies on
+  // the anchor selection surviving pick-mode.
+  it('START_COMPARE_PICK is a no-op when the anchor is not the current selection', () => {
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });        // nothing selected
+    expect(getState().comparePick).toBeNull();
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'B' });
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });        // wrong anchor
+    expect(getState().comparePick).toBeNull();
+  });
+
+  // #304 S2 (Codex F7) — entering pick closes the ephemeral outline sheet so a
+  // restored sheet can't bury the reader / obscure the focus target on cancel.
+  it('START_COMPARE_PICK closes the mobile outline sheet', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });
+    dispatch({ type: 'TOGGLE_CONV_OUTLINE_MOBILE' });
+    expect(getState().convOutlineMobileOpen).toBe(true);
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    expect(getState().convOutlineMobileOpen).toBe(false);
+  });
+
+  // #304 S2 — cancel returns to the anchor reader and requests the same focus
+  // return CLOSE_COMPARE does (the flag generalizes to "compare-flow focus
+  // return pending").
+  it('CANCEL_COMPARE_PICK arms the compare focus-return flag', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    dispatch({ type: 'CANCEL_COMPARE_PICK' });
+    expect(getState().compareCloseFocusPending).toBe(true);
+  });
+
+  // #304 S2 (Codex F1 belt-and-suspenders) — a banner-Cancel click with the
+  // filters popover open must not strand convFiltersOpen through the compact
+  // rail unmount (inView would deaden the view keymap).
+  it('CANCEL_COMPARE_PICK clears convFiltersOpen', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: true });
+    dispatch({ type: 'CANCEL_COMPARE_PICK' });
+    expect(getState().convFiltersOpen).toBe(false);
+  });
+
+  // #304 S2 (Codex F8) — OPEN_CONVERSATION reverse-clears comparison state but
+  // previously left the focus flag; now that cancel arms it more often, a
+  // direct open (URL boot / search-hit nav) before consumption must clear it.
+  it('OPEN_CONVERSATION clears a pending compare focus return', () => {
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });
+    dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
+    dispatch({ type: 'CANCEL_COMPARE_PICK' });
+    expect(getState().compareCloseFocusPending).toBe(true);
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'C' });
+    expect(getState().compareCloseFocusPending).toBe(false);
   });
 
   // #289 (Codex P2-D) — the new Escape peel adds a reader-deselect step, so the

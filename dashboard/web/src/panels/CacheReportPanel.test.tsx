@@ -2,6 +2,7 @@
 // Spec 2026-05-21 §2. State coverage: healthy, anomalous,
 // insufficient-baseline, empty, click-to-open dispatch.
 import { fireEvent, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { CacheReportPanel } from './CacheReportPanel';
 import {
@@ -299,64 +300,48 @@ describe('<CacheReportPanel /> mini net-bars (issue #77 P2-4)', () => {
   });
 });
 
-// Regression for M2 (/check-review round 4): the empty and loading
-// branches had ``tabIndex={0}`` + ``onClick={openModal}`` but omitted
-// the keyboard handler the healthy branch carries, leaving keyboard
-// users unable to open the modal in those states. The handler is now
-// shared across all three branches.
-describe('<CacheReportPanel /> keyboard access in every state (M2)', () => {
-  it('healthy state opens the modal on Enter key', () => {
+// #293 S4 (A11Y-1/ACTION-1): the card region is now DESCRIBE-only — no tab
+// stop, no region keydown. The M2 regression's intent (every state must be
+// keyboard-openable) now rides the unconditional Expand button, which is a real
+// <button> present in every branch (loading / empty / healthy). The region
+// itself no longer activates on Enter/Space.
+describe('<CacheReportPanel /> keyboard access via Expand in every state (M2 → #293 S4)', () => {
+  function expandBtn() {
+    return screen.getByRole('button', { name: /open cache report/i });
+  }
+
+  it('healthy state: Expand opens the modal on keyboard activation', async () => {
+    const user = userEvent.setup();
     updateSnapshot(envelopeWith(healthyCacheReport()));
     render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: 'Enter' });
+    expandBtn().focus();
+    await user.keyboard('{Enter}');
     expect(getState().openModal).toBe('cache-report');
   });
 
-  it('healthy state opens the modal on Space key', () => {
-    updateSnapshot(envelopeWith(healthyCacheReport()));
-    render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: ' ' });
-    expect(getState().openModal).toBe('cache-report');
-  });
-
-  it('loading state opens the modal on Enter key', () => {
+  it('loading state: Expand opens the modal on keyboard activation', async () => {
     // No snapshot → env.cache_report undefined → no-data branch.
+    const user = userEvent.setup();
     render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: 'Enter' });
+    expandBtn().focus();
+    await user.keyboard(' ');
     expect(getState().openModal).toBe('cache-report');
   });
 
-  it('loading state opens the modal on Space key', () => {
-    render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: ' ' });
-    expect(getState().openModal).toBe('cache-report');
-  });
-
-  it('empty state opens the modal on Enter key', () => {
+  it('empty state: Expand opens the modal on keyboard activation', async () => {
+    const user = userEvent.setup();
     updateSnapshot(envelopeWith(emptyCacheReport()));
     render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: 'Enter' });
+    expandBtn().focus();
+    await user.keyboard('{Enter}');
     expect(getState().openModal).toBe('cache-report');
   });
 
-  it('empty state opens the modal on Space key', () => {
-    updateSnapshot(envelopeWith(emptyCacheReport()));
-    render(<CacheReportPanel />);
-    const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: ' ' });
-    expect(getState().openModal).toBe('cache-report');
-  });
-
-  it('ignores non-Enter/Space keys (no spurious dispatch)', () => {
+  it('the region is describe-only: Enter on the section does NOT open (no double-fire)', () => {
     updateSnapshot(envelopeWith(healthyCacheReport()));
     render(<CacheReportPanel />);
     const panel = screen.getByRole('region', { name: /cache report/i });
-    fireEvent.keyDown(panel, { key: 'a' });
+    fireEvent.keyDown(panel, { key: 'Enter' });
     expect(getState().openModal).toBeNull();
   });
 });

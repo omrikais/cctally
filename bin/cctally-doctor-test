@@ -92,6 +92,18 @@ compute_fake_path () {
     printf '%s' "${p}$PY_CLEAN_BIN:/usr/bin:/bin"
 }
 
+compute_fake_codex_home () {
+    local scratch="$1" dir="$2"
+    local homes_file="$dir/.codex-homes"
+    [ -f "$homes_file" ] || return 0
+    local homes=() relative
+    while IFS= read -r relative; do
+        [ -n "$relative" ] && homes+=("$scratch/$relative")
+    done < "$homes_file"
+    local IFS=,
+    printf '%s' "${homes[*]}"
+}
+
 # Refresh setup.sh + .gitignore from the builder so harness output
 # reflects current scaffold (parallels build-forecast-fixtures.py
 # invocation in cctally-forecast-test).
@@ -140,6 +152,7 @@ run_mode () {
     # keeps security/osascript reachable for the OAuth/alert checks.
     # Per-scenario shaping (issue #119) via optional input.env knobs.
     local fake_path; fake_path=$(compute_fake_path "$scratch" "$dir")
+    local fake_codex_home; fake_codex_home=$(compute_fake_codex_home "$scratch" "$dir")
 
     # Capture stdout only. The post-command hook (which fires AFTER
     # cmd_doctor returns) calls load_config(); for the corrupt-config
@@ -152,6 +165,7 @@ run_mode () {
     # shellcheck disable=SC2086
     raw=$(HOME="$scratch" TZ=Etc/UTC \
           PATH="$fake_path" \
+          CODEX_HOME="$fake_codex_home" \
           CCTALLY_AS_OF="$AS_OF" \
           NO_COLOR=1 \
           "$CCTALLY" doctor $flags 2>/dev/null) || true
@@ -208,10 +222,11 @@ run_exit_code () {
     # Scrubbed PATH (issue #114): see run_mode for rationale.
     # Per-scenario shaping (issue #119) via optional input.env knobs.
     local fake_path; fake_path=$(compute_fake_path "$scratch" "$dir")
+    local fake_codex_home; fake_codex_home=$(compute_fake_codex_home "$scratch" "$dir")
     local exit_file="$dir/expected.exit"
     local actual_exit
 
-    HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" \
+    HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" CODEX_HOME="$fake_codex_home" \
         CCTALLY_AS_OF="$AS_OF" NO_COLOR=1 \
         "$CCTALLY" doctor --json >/dev/null 2>&1
     actual_exit=$?

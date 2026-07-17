@@ -4,9 +4,13 @@ import { useConversationOutline } from './useConversationOutline';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick signal
 // the refetch effect keys on) deterministically. Mirrors useConversation.test.
+// #300 — also expose `data_version` (the real change signal). `undefined` (the
+// default) makes the hook fall back to `generated_at`, so the pre-#300 tests
+// below keep exercising the every-tick fallback path unchanged.
 let mockGeneratedAt = 't0';
+let mockDataVersion: string | undefined = undefined;
 vi.mock('./useSnapshot', () => ({
-  useSnapshot: () => ({ generated_at: mockGeneratedAt }),
+  useSnapshot: () => ({ generated_at: mockGeneratedAt, data_version: mockDataVersion }),
 }));
 
 function outline(session_id: string, over: Record<string, unknown> = {}) {
@@ -25,7 +29,7 @@ function outline(session_id: string, over: Record<string, unknown> = {}) {
 function mockOnce(body: unknown, status = 200) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: status < 400, status, json: async () => body } as Response);
 }
-beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; });
+beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; mockDataVersion = undefined; });
 afterEach(() => vi.restoreAllMocks());
 
 function bumpTick(rerender: () => void, tag: string) {
@@ -188,5 +192,32 @@ describe('useConversationOutline', () => {
     // Now resolve the stale s1 fetch — it must be dropped.
     await act(async () => { resolveS1(outline('s1')); for (let i = 0; i < 4; i++) await Promise.resolve(); });
     expect(result.current.outline?.session_id).toBe('s2');
+  });
+
+  // #300 — the non-live fallback must gate on the change signal (data_version),
+  // not the 5s `generated_at` heartbeat: a finished/static conversation open in
+  // the reader fetches its outline once and is not re-GET every tick.
+  it('with data_version present, a generated_at-only tick does NOT refetch (#300)', async () => {
+    mockDataVersion = 'v1';
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { ok: true, status: 200, json: async () => outline('s') } as Response);
+    const { result, rerender } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.outline?.session_id).toBe('s'));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    // generated_at advances twice, data_version stays flat → no refetch.
+    await act(async () => { mockGeneratedAt = 't1'; rerender(); await Promise.resolve(); });
+    await act(async () => { mockGeneratedAt = 't2'; rerender(); await Promise.resolve(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
+  it('a data_version change refetches even when generated_at is unchanged (#300)', async () => {
+    mockDataVersion = 'v1';
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 1 } }));
+    const { result, rerender } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(1));
+    // generated_at is left at 't0'; only the change signal advances → refetch.
+    mockOnce(outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } }));
+    await act(async () => { mockDataVersion = 'v2'; rerender(); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
   });
 });
