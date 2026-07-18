@@ -433,6 +433,34 @@ def _claude_outline(
 # ── Claude adapter: search (§5.6 / §6.2) ──────────────────────────────────────
 
 
+def _claude_search_hit_fields(conn: sqlite3.Connection, session_ids: list) -> dict:
+    """``{session_id: (last_activity_utc, project_label)}`` for the search hits'
+    conversations (§3.7). ``last_activity_utc`` is the conversation's
+    ``MAX(timestamp_utc)`` (conversation-level, explicitly NOT the matched row's
+    own time); ``project_label`` is the session's display-only project attribution.
+    Resolved once per distinct non-empty session id."""
+    sids = [s for s in dict.fromkeys(session_ids) if s]
+    if not sids:
+        return {}
+    last_map: dict = {}
+    placeholders = ",".join("?" for _ in sids)
+    try:
+        for sid, last in conn.execute(
+                f"SELECT session_id, MAX(timestamp_utc) FROM conversation_messages "
+                f"WHERE session_id IN ({placeholders}) GROUP BY session_id", sids):
+            last_map[sid] = last
+    except sqlite3.OperationalError:
+        pass
+    meta = lcq._session_latest_meta_map(conn, sids)
+    attribution_cache: dict = {}
+    out: dict = {}
+    for sid in sids:
+        cwd = meta.get(sid, (None, None))[0]
+        _pk, project_label = _claude_project_attribution(cwd, attribution_cache)
+        out[sid] = (last_map.get(sid), project_label)
+    return out
+
+
 def _claude_search(
     conn: sqlite3.Connection,
     query: str,
@@ -451,16 +479,23 @@ def _claude_search(
         offset = 0
     res = lcq.search_conversations(
         conn, query, kind=kind, limit=limit, offset=max(0, offset))
+    raw_hits = res.get("hits", [])
+    # §3.7 conversation-level fields, resolved once per distinct session.
+    fields = _claude_search_hit_fields(
+        conn, [h.get("session_id") for h in raw_hits])
     hits = []
-    for h in res.get("hits", []):
+    for h in raw_hits:
         sid = h.get("session_id")
         uuid = h.get("uuid")
+        last_act, project_label = fields.get(sid, (None, None))
         hits.append({
             "conversation_key": _mint_claude_conversation_key(sid) if sid else None,
             "item_key": _claude_item_key(sid, uuid) if (sid and uuid) else None,
             "title": h.get("title"),
             "snippet": h.get("snippet"),
             "badges": list(h.get("match_kinds") or []),
+            "last_activity_utc": last_act,
+            "project_label": project_label,
         })
     total = res.get("total", len(hits))
     returned = len(hits)
@@ -536,12 +571,239 @@ def neutral_search(
     effective_speed: str | None = None, limit: int = 20, cursor: str | None = None,
 ) -> dict:
     """Search envelope for one source (§5.6). Search is per-source by
-    construction — the kernels never merge providers."""
+    construction — the kernels never merge providers.
+
+    §4.3 external cursor codec: the ``cursor`` argument is the EXTERNAL
+    (base64url) form and the returned ``page.cursor`` is likewise external — the
+    kernel's raw cursor (a NUL-separated ``conversation_key\\x00item_key`` for
+    Codex; an offset for Claude) never leaves the process. An undecodable incoming
+    cursor raises :class:`InvalidSearchCursor` (the route/CLI maps it to 400 /
+    exit 2)."""
     speed = effective_speed or _DEFAULT_SPEED
+    raw_cursor = decode_search_cursor(cursor) if cursor is not None else None
     if source == "codex":
-        return q.search_codex_conversations(
+        env = q.search_codex_conversations(
             conn, query, kind=kind, effective_speed=speed,
-            limit=limit, cursor=cursor)
-    if source == "claude":
-        return _claude_search(conn, query, kind=kind, limit=limit, cursor=cursor)
-    raise ValueError(f"unknown source: {source!r}")
+            limit=limit, cursor=raw_cursor)
+    elif source == "claude":
+        env = _claude_search(conn, query, kind=kind, limit=limit, cursor=raw_cursor)
+    else:
+        raise ValueError(f"unknown source: {source!r}")
+    page = env.get("page")
+    if isinstance(page, dict) and page.get("cursor") is not None:
+        page["cursor"] = encode_search_cursor(page["cursor"])
+    return env
+
+
+def neutral_events_preflight(conn: sqlite3.Connection, ref: str) -> dict:
+    """Live-tail SSE preflight for a ``v1.`` key (spec §5.2): resolve →
+    normalization authority (Codex) → conversation existence. The ``/events``
+    route answers a non-``ok`` result as plain JSON per §2.3 BEFORE committing
+    any SSE bytes — never a 200-SSE stream with nothing to say.
+
+    Returns a status dict:
+    - ``ok`` — carries ``source`` (``"claude"``/``"codex"``) and ``native_key``
+      for the watch loop's provider-specific mechanics;
+    - ``normalization_pending`` — Codex only, migration 025 not yet stamped (a
+      legitimate empty state → HTTP 200 JSON);
+    - ``not_found`` — an unresolvable/garbage ref, or a resolved ref whose
+      conversation has no rows (→ HTTP 404 JSON).
+
+    Cheap: a resolve + one authority probe + one existence probe — never a full
+    detail assembly. Uniform for both providers (a ``v1.`` Claude key preflights
+    the same way, then reuses the existing Claude mechanics internally)."""
+    cref = resolve_conversation_ref(ref)
+    if cref is None:
+        return {"status": "not_found", "conversation_key": ref}
+    if cref.source == "codex":
+        if not q.codex_normalization_authoritative(conn):
+            return {"status": "normalization_pending",
+                    "conversation_key": cref.conversation_key}
+        if not q.codex_conversation_exists(conn, cref.conversation_key):
+            return {"status": "not_found",
+                    "conversation_key": cref.conversation_key}
+        return {"status": "ok", "conversation_key": cref.conversation_key,
+                "source": "codex", "native_key": cref.native_key}
+    # claude — the bare-session path reached via a v1.claude key.
+    if not lcq.conversation_exists(conn, cref.native_key):
+        return {"status": "not_found", "conversation_key": cref.conversation_key}
+    return {"status": "ok", "conversation_key": cref.conversation_key,
+            "source": "claude", "native_key": cref.native_key}
+
+
+# ── external search-cursor codec (§4.3) ───────────────────────────────────────
+
+
+class InvalidSearchCursor(ValueError):
+    """An external search cursor that is not well-formed unpadded base64url over a
+    UTF-8 kernel cursor (§4.3). The route/CLI maps it to 400 / exit 2."""
+
+
+def encode_search_cursor(raw: str | None) -> str | None:
+    """Encode a raw kernel search cursor to its external unpadded-base64url form
+    (§4.3). ``None`` (no next page) stays ``None``. The kernel cursor embeds a NUL
+    separator for Codex, so the raw value never leaves the process."""
+    if raw is None:
+        return None
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_search_cursor(external: str | None) -> str | None:
+    """Decode an external unpadded-base64url search cursor back to the raw kernel
+    cursor (§4.3). ``None`` stays ``None``; an undecodable value raises
+    :class:`InvalidSearchCursor`."""
+    if external is None:
+        return None
+    if not isinstance(external, str):
+        raise InvalidSearchCursor(external)
+    padded = external + "=" * (-len(external) % 4)
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, TypeError):
+        raise InvalidSearchCursor(external)
+
+
+# ── S7 entity operations: find / prompts / export / payload (§3) ──────────────
+
+# Shared in-conversation find taxonomy (both providers; byte-equal tuples).
+_FIND_KINDS = lcq._FIND_KINDS
+# The whole-conversation export scope (the only scope a Codex ref accepts, §3.3).
+_EXPORT_DEFAULT_SCOPE = "all"
+
+
+def _claude_find(
+    conn: sqlite3.Connection, session_id: str, conversation_key: str, query: str,
+    *, kind: str, regex: bool, case: bool,
+) -> dict:
+    """Claude ``neutral_find`` adapter (§3.1): wraps ``find_in_conversation`` and
+    re-anchors each uuid anchor to its neutral ``item_key`` — byte-equal to the
+    ones detail serves — so S8's FindBar navigates both providers with one
+    contract. Never emits ``normalization_pending`` (Claude is authoritative)."""
+    res = lcq.find_in_conversation(
+        conn, session_id, query, kind=kind, regex=regex, case=case)
+    if res is None:
+        return {"status": "not_found", "conversation_key": conversation_key}
+    anchors = [
+        {"item_key": _claude_item_key(session_id, a["uuid"]),
+         "match_kinds": a["match_kinds"]}
+        for a in res["anchors"]
+    ]
+    return {
+        "status": "ok", "conversation_key": conversation_key,
+        "total": res["total"], "anchors": anchors,
+        "anchors_truncated": res["anchors_truncated"],
+        "search_depth": res["search_depth"], "kind": res["kind"], "mode": res["mode"],
+    }
+
+
+def _claude_prompts(
+    conn: sqlite3.Connection, session_id: str, conversation_key: str
+) -> dict:
+    """Claude ``neutral_prompts`` adapter (§3.2): wraps ``get_conversation_prompts``
+    and re-anchors each uuid to its neutral ``item_key``."""
+    res = lcq.get_conversation_prompts(conn, session_id)
+    if res is None:
+        return {"status": "not_found", "conversation_key": conversation_key}
+    prompts = [
+        {"item_key": _claude_item_key(session_id, p["uuid"]), "text": p["text"]}
+        for p in res["prompts"]
+    ]
+    return {"status": "ok", "conversation_key": conversation_key, "prompts": prompts}
+
+
+def _claude_export(
+    conn: sqlite3.Connection, session_id: str, conversation_key: str, scope: str
+) -> dict:
+    """Claude ``neutral_export`` adapter (§3.3): wraps ``get_conversation_export``,
+    passing ``scope`` through — all existing Claude scopes keep working unchanged."""
+    md = lcq.get_conversation_export(conn, session_id, scope)
+    if md is None:
+        return {"status": "not_found", "conversation_key": conversation_key}
+    return {"status": "ok", "conversation_key": conversation_key, "markdown": md}
+
+
+def neutral_find(
+    conn: sqlite3.Connection, ref: str, query: str, *, kind: str = "all",
+    regex: bool = False, case: bool = False, effective_speed: str | None = None,
+) -> dict:
+    """In-conversation find for a neutral reference (§3.1). An unknown ``kind``
+    raises ``ValueError`` (route → 400); an unknown/garbage ref → ``not_found``.
+    Find never prices (``effective_speed`` accepted for signature symmetry)."""
+    del effective_speed  # find never prices
+    if kind not in _FIND_KINDS:
+        raise ValueError(f"unknown kind: {kind}")
+    cref = resolve_conversation_ref(ref)
+    if cref is None:
+        return {"status": "not_found", "conversation_key": ref}
+    if cref.source == "codex":
+        return q.find_in_codex_conversation(
+            conn, cref.conversation_key, query, kind=kind, regex=regex, case=case)
+    return _claude_find(
+        conn, cref.native_key, cref.conversation_key, query,
+        kind=kind, regex=regex, case=case)
+
+
+def neutral_prompts(conn: sqlite3.Connection, ref: str) -> dict:
+    """Prompt spine for a neutral reference (§3.2)."""
+    cref = resolve_conversation_ref(ref)
+    if cref is None:
+        return {"status": "not_found", "conversation_key": ref}
+    if cref.source == "codex":
+        return q.codex_conversation_prompts(conn, cref.conversation_key)
+    return _claude_prompts(conn, cref.native_key, cref.conversation_key)
+
+
+def neutral_export(
+    conn: sqlite3.Connection, ref: str, *, scope: str = _EXPORT_DEFAULT_SCOPE,
+    effective_speed: str | None = None,
+) -> dict:
+    """Whole-conversation Markdown export for a neutral reference (§3.3).
+
+    Claude passes ``scope`` through unchanged. The Codex adapter accepts ONLY the
+    default whole-conversation scope; any other scope value for a Codex ref is a
+    ``validation_error`` status (the route/CLI maps it to 400 / exit 2), never a
+    silent fallback."""
+    cref = resolve_conversation_ref(ref)
+    if cref is None:
+        return {"status": "not_found", "conversation_key": ref}
+    if cref.source == "codex":
+        if scope not in (None, _EXPORT_DEFAULT_SCOPE):
+            return {"status": "validation_error",
+                    "conversation_key": cref.conversation_key,
+                    "reason": "scope", "detail": scope}
+        speed = effective_speed or _DEFAULT_SPEED
+        return q.get_codex_conversation_export(
+            conn, cref.conversation_key, effective_speed=speed)
+    return _claude_export(
+        conn, cref.native_key, cref.conversation_key,
+        scope if scope is not None else _EXPORT_DEFAULT_SCOPE)
+
+
+def neutral_payload(
+    conn: sqlite3.Connection, ref: str, *, which: str,
+    tool_use_id: str | None = None, block_key: str | None = None,
+) -> dict:
+    """Full-payload readback for a neutral reference (§3.4).
+
+    Provider-specific selectors: Claude keeps its existing contract (``tool_use_id``
+    + ``which ∈ {input, result}``), Codex uses ``block_key`` + ``which ∈ {call,
+    output}``. Statuses: ``ok`` | ``not_found`` (404) | ``gone`` (410 — the physical
+    record moved/mutated)."""
+    cref = resolve_conversation_ref(ref)
+    if cref is None:
+        return {"status": "not_found", "conversation_key": ref}
+    if cref.source == "codex":
+        if not block_key or which not in ("call", "output"):
+            return {"status": "not_found", "block_key": block_key, "which": which}
+        return q.read_codex_payload(conn, cref.conversation_key, block_key, which)
+    # Claude: tool_use_id + which={input,result}, contract unchanged.
+    if not tool_use_id or which not in ("input", "result"):
+        return {"status": "not_found", "tool_use_id": tool_use_id, "which": which}
+    loc = lcq.locate_tool_payload(conn, cref.native_key, tool_use_id, which)
+    if loc is None:
+        return {"status": "not_found", "tool_use_id": tool_use_id, "which": which}
+    source_path, byte_offset = loc
+    payload = lcq.read_full_payload(source_path, byte_offset, tool_use_id, which)
+    if payload is None:
+        return {"status": "gone", "tool_use_id": tool_use_id, "which": which}
+    return {"status": "ok", **payload}

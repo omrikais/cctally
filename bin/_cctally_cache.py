@@ -692,6 +692,78 @@ def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
     return discovered
 
 
+def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
+    """Resolve each requested path through the ordered configured roots exactly
+    as full discovery would (spec §5.1) — producing the same per-file facts a
+    ``CodexDiscoveredFile`` carries (configured spelling, physical path, provider
+    root, walk root, source-root key) with first-match containment + physical
+    dedup. A path resolving under no configured root, not a ``*.jsonl`` file, or
+    an alias of an already-resolved physical file is DROPPED (clean, not
+    ingested). Targeted mode's analogue of ``_discover_codex_files_with_roots``:
+    it does NOT walk any tree — it qualifies only the caller's exact paths."""
+    roots = _codex_provider_roots()
+    resolved: list[CodexDiscoveredFile] = []
+    seen_physical: set[pathlib.Path] = set()
+    # Deterministic order so first-match physical dedup is stable across a set.
+    for p in sorted(only_paths):
+        candidate = pathlib.Path(p)
+        for root in roots:
+            try:
+                inside = candidate.is_relative_to(root.walk_root)
+            except (ValueError, TypeError):
+                inside = False
+            if not inside:
+                continue
+            # Under this root's walk boundary: it is qualified here (first match)
+            # or dropped — a different-spelled alias never re-qualifies under a
+            # later root, matching full discovery's yielded-source-path identity.
+            if candidate.suffix != ".jsonl" or not candidate.is_file():
+                break  # vanished / non-rollout under this root → drop (clean)
+            physical = _canonical_codex_path(candidate)
+            if physical in seen_physical:
+                break  # first-match physical dedup → drop the alias
+            seen_physical.add(physical)
+            resolved.append(CodexDiscoveredFile(
+                source_path=candidate,
+                physical_path=physical,
+                provider_root=root.provider_root,
+                walk_root=root.walk_root,
+                source_root_key=root.source_root_key,
+            ))
+            break
+    return resolved
+
+
+def _load_codex_session_files_rows(
+    conn: sqlite3.Connection, paths: "list[str]"
+) -> dict:
+    """Cursor rows from ``codex_session_files`` for ONLY the given paths (spec
+    §5.1 — the targeted preload must never load every row like the full-sync
+    path). Same 12-tuple value shape as ``sync_codex_cache``'s full ``existing``
+    map, so the per-file delta logic is byte-identical between the two modes."""
+    out: dict = {}
+    if not paths:
+        return out
+    cols = (
+        "path, size_bytes, mtime_ns, last_byte_offset, "
+        "last_session_id, last_model, last_total_tokens, source_root_key, "
+        "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
+        "last_conversation_key, last_turn_id"
+    )
+    for i in range(0, len(paths), 400):
+        chunk = paths[i:i + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT {cols} FROM codex_session_files WHERE path IN ({placeholders})",
+            chunk,
+        ):
+            out[row[0]] = (
+                row[1], row[2], row[3], row[4], row[5], row[6], row[7],
+                row[8], row[9], row[10], row[11], row[12],
+            )
+    return out
+
+
 def _delete_codex_file_derived_rows(
     conn: sqlite3.Connection,
     path_str: str,
@@ -1075,8 +1147,14 @@ def _write_codex_file_batch(
     normalized_rows: list,
     normalized_touches: list,
     active_root_keys: set[str],
+    prune_roots: bool = True,
 ) -> int:
-    """Write one fully-buffered Codex file atomically and return entry changes."""
+    """Write one fully-buffered Codex file atomically and return entry changes.
+
+    ``prune_roots`` gates the whole-tree ``_prune_inactive_codex_source_roots``
+    call: a targeted (only_paths) ingest passes ``False`` so it never deletes a
+    ``codex_source_roots`` row for a root it wasn't asked about (spec §5.1
+    whole-tree bypass — ``active_root_keys`` then covers only the targets)."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     # #294 S6: rollups are recomputed-affected-or-deleted (§3.2), so capture the
     # conversation keys this file's normalized rows touch BEFORE a reset delete
@@ -1174,7 +1252,8 @@ def _write_codex_file_batch(
             last_conversation_key, last_turn_id,
         ),
     )
-    _prune_inactive_codex_source_roots(conn, active_root_keys)
+    if prune_roots:
+        _prune_inactive_codex_source_roots(conn, active_root_keys)
     # A file batch owns accounting, quota, thread, event, root, and cursor
     # facts as one physical unit. Keep the version bump in that same commit so
     # a rolled-back batch never appears newer to the dashboard signature.
@@ -3719,6 +3798,25 @@ class CodexIngestStats:
     lines_malformed: int = 0
     token_events_skipped: int = 0
     skip_reasons: dict = field(default_factory=dict)
+    # #294 S7 targeted (only_paths) live-tail fast-path fields. Default-clean so
+    # every existing only_paths=None caller reads targeted_clean=True and is
+    # otherwise unaffected — the exact Claude ``IngestStats`` semantics (§5.1).
+    # ``deferred_reason`` carries the whole-call preflight decline
+    # (shrink/requalification — Codex's ENTIRE pending-global condition; there is
+    # NO ``cache_meta`` decline-marker tuple, pinned §5.1). ``files_failed``
+    # counts per-file declines (post-preflight late shrink/requalification, I/O,
+    # normalization, DB exception).
+    files_failed: int = 0
+    deferred_reason: "str | None" = None
+
+    @property
+    def targeted_clean(self) -> bool:
+        """True ⇔ a targeted ingest fully applied: not contended, not deferred,
+        and no per-file failure (§5.1). The watch loop emits + advances ``seen``
+        only when this is True — byte-for-byte the Claude ``IngestStats`` rule."""
+        return (not self.lock_contended
+                and self.deferred_reason is None
+                and self.files_failed == 0)
 
 
 def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> None:
@@ -3736,8 +3834,10 @@ def sync_codex_cache(
     *,
     progress: Callable[[CodexIngestStats], None] | None = None,
     rebuild: bool = False,
+    only_paths: "set[str] | None" = None,
     lock_timeout: "float | None" = None,
     _on_first_file_rollback: Callable[[], None] | None = None,
+    _on_file_committed: Callable[[str], None] | None = None,
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
@@ -3777,6 +3877,16 @@ def sync_codex_cache(
             stats.lock_contended = True
             return stats
 
+        # #294 S7 targeted (only_paths) live-tail fast path (§5.1). Mutually
+        # exclusive with rebuild (matches the Claude rule). Targeted mode
+        # qualifies ONLY the caller's paths, scopes the cursor preload to them,
+        # and bypasses every whole-tree operation (orphan prune, root prune,
+        # global quota reconcile) — see the guards threaded through below.
+        targeted = only_paths is not None
+        if targeted and rebuild:
+            raise ValueError(
+                "sync_codex_cache: only_paths is incompatible with rebuild")
+
         # F4 (#313): the reconcile trigger gate is "did the Codex physical
         # mutation sequence advance during this sync", NOT rows_changed —
         # rows_changed counts only inserted accounting rows and misses
@@ -3801,9 +3911,13 @@ def sync_codex_cache(
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
 
         # Pure read (glob + is_file only); safe to run before the SELECT and
-        # the per-file loop, where no cache.db write lock may be held.
+        # the per-file loop, where no cache.db write lock may be held. Targeted
+        # mode qualifies ONLY the requested paths — never a tree walk (§5.1).
         with _perf.phase("discover") as _p_disc:
-            files = _discover_codex_files_with_roots()
+            if targeted:
+                files = _qualify_codex_targets(only_paths)
+            else:
+                files = _discover_codex_files_with_roots()
             stats.files_total = len(files)
             _p_disc.set_count(len(files))
 
@@ -3820,7 +3934,7 @@ def sync_codex_cache(
         # ingest (same invariant as the --rebuild clear above). Concurrent
         # processes with different $CODEX_HOME would prune each other; the
         # flock serializes them and that is a pathological configuration.
-        if not rebuild:  # --rebuild already cleared both tables above
+        if not rebuild and not targeted:  # --rebuild already cleared; targeted bypasses
             current_file_identities = {
                 (str(item.source_path), item.source_root_key) for item in files
             }
@@ -3875,19 +3989,53 @@ def sync_codex_cache(
         # delta detection consults size alone (Codex rollout JSONLs are
         # append-only, so a size change is a sufficient signal and mtime
         # is prone to clock-skew false-positives).
-        existing = {
-            row[0]: (
-                row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                row[8], row[9], row[10], row[11], row[12],
-            )
-            for row in conn.execute(
-                "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
-                "last_session_id, last_model, last_total_tokens, source_root_key, "
-                "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-                "last_conversation_key, last_turn_id "
-                "FROM codex_session_files"
-            )
-        }
+        if targeted:
+            # §5.1: the cursor preload queries codex_session_files for the
+            # REQUESTED paths only (the full-sync path loads every row; targeted
+            # must not, so its cost stays proportional to its targets).
+            existing = _load_codex_session_files_rows(
+                conn, [str(item.source_path) for item in files])
+        else:
+            existing = {
+                row[0]: (
+                    row[1], row[2], row[3], row[4], row[5], row[6], row[7],
+                    row[8], row[9], row[10], row[11], row[12],
+                )
+                for row in conn.execute(
+                    "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
+                    "last_session_id, last_model, last_total_tokens, source_root_key, "
+                    "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
+                    "last_conversation_key, last_turn_id "
+                    "FROM codex_session_files"
+                )
+            }
+
+        # §5.1 whole-call read-only shrink/requalification preflight. Because
+        # ``targeted_clean`` is CALL-wide while the Codex path commits per file,
+        # a shrink/requalification on ANY resolved target declines the whole call
+        # with ZERO mutations (no partial commit where a healthy file's cursor
+        # advances but no event can be emitted). A shrink landing AFTER this
+        # snapshot is caught per-file at its write turn (below). This is Codex's
+        # ENTIRE pending-global condition — there is NO cache_meta decline-marker
+        # tuple (pinned §5.1). A target that vanished between qualification and
+        # here is skipped, not declined — the per-file loop clean-drops it.
+        if targeted:
+            for discovered in files:
+                prev = existing.get(str(discovered.source_path))
+                if prev is None:
+                    continue  # brand-new file: nothing to shrink/requalify
+                prev_size = prev[0]
+                prev_root_key = prev[6]
+                if prev_root_key != discovered.source_root_key:
+                    stats.deferred_reason = "requalification"
+                    return stats
+                try:
+                    cur_size = discovered.source_path.stat().st_size
+                except OSError:
+                    continue  # vanished post-qualify → clean-drop in the loop
+                if cur_size < prev_size:
+                    stats.deferred_reason = "truncation"
+                    return stats
 
         # #279 S2 F4: ONE coarse `walk` phase bracketing the per-file loop
         # (count = files_processed, never per-row — §2 rule). Manual CM so
@@ -3901,6 +4049,8 @@ def sync_codex_cache(
                 st = jp.stat()
             except OSError as exc:
                 eprint(f"[codex-cache] stat failed for {jp}: {exc}")
+                if targeted:
+                    stats.files_failed += 1  # §5.1 I/O decline → call dirty
                 continue
 
             size = st.st_size
@@ -3929,6 +4079,17 @@ def sync_codex_cache(
                     int(prev_ttot) if prev_ttot is not None else None
                 )
                 requalified = prev_root_key != discovered.source_root_key
+                if targeted and (requalified or size < prev_size):
+                    # §5.1 preflight-snapshot scoped: a shrink or requalification
+                    # landing AFTER the preflight is declined HERE, per file —
+                    # earlier per-file commits in this call stand, the call still
+                    # reports dirty (files_failed → not targeted_clean), so the
+                    # watch advances no cursor and emits nothing, and recovery
+                    # rides the next full sync's per-file reset. Targeted mode
+                    # NEVER runs the full-file offset-0 reset re-ingest (below)
+                    # — that whole-cache-affecting escalation is the full sync's.
+                    stats.files_failed += 1
+                    continue
                 if not requalified and size == prev_size:
                     stats.files_skipped_unchanged += 1
                     continue
@@ -4070,6 +4231,8 @@ def sync_codex_cache(
                         stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
+                if targeted:
+                    stats.files_failed += 1  # §5.1 I/O decline → call dirty
                 continue
 
             # Pull terminal session_id/model from the iterator's tracker.
@@ -4119,11 +4282,22 @@ def sync_codex_cache(
             # seeded from the persisted resume seed. Buffered before the first DML
             # (like every other family), so the single retry re-runs the same
             # in-memory batch. The terminal sticky turn persists as last_turn_id.
-            norm_result = _lib_codex_conversation.normalize_codex_events(
-                events_list,
-                initial=_lib_codex_conversation.CodexStickyState(
-                    turn_id=initial_turn_id, model=initial_model),
-            )
+            try:
+                norm_result = _lib_codex_conversation.normalize_codex_events(
+                    events_list,
+                    initial=_lib_codex_conversation.CodexStickyState(
+                        turn_id=initial_turn_id, model=initial_model),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # §5.1: a normalization exception during a targeted ingest is a
+                # per-file decline → the call is dirty (files_failed) but earlier
+                # commits stand. A full sync keeps its historical crash-loud
+                # behavior (there the whole walk is authoritative).
+                if not targeted:
+                    raise
+                eprint(f"[codex-cache] normalization failed for {jp}: {exc}")
+                stats.files_failed += 1
+                continue
             new_last_turn_id = norm_result.terminal.turn_id
 
             # Every derived row above was buffered before the first DML. A
@@ -4155,6 +4329,9 @@ def sync_codex_cache(
                         normalized_rows=norm_result.rows,
                         normalized_touches=norm_result.touches,
                         active_root_keys={item.source_root_key for item in files},
+                        # §5.1 whole-tree bypass: targeted mode never prunes
+                        # codex_source_roots for roots outside its target set.
+                        prune_roots=not targeted,
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -4174,7 +4351,15 @@ def sync_codex_cache(
                 committed = True
                 break
             if not committed:
+                if targeted:
+                    stats.files_failed += 1  # §5.1 DB-exception decline → dirty
                 continue
+
+            # Private test seam (§5.1 post-preflight late-shrink race): fires
+            # after each file's successful commit, so a race test can shrink a
+            # not-yet-written target and assert the earlier commit stands.
+            if _on_file_committed is not None:
+                _on_file_committed(path_str)
 
             if progress is not None:
                 progress(stats)
@@ -4230,36 +4415,46 @@ def sync_codex_cache(
         # projection, so the skip decision on that branch is DEFERRED to the
         # post-flock stats-side signature check below — making the gate's
         # skip-condition identical to reconcile's own short-circuit-condition.
-        cur_seq = codex_physical_mutation_seq(conn)
-        if cur_seq != seq_before:
-            project_after_unlock = True
-        else:
-            active_roots = _cache_root_keys(conn)
-            if not active_roots:
-                project_after_unlock = False
+        #
+        # §5.1: a targeted (only_paths) ingest NEVER invokes the global quota
+        # reconciler (its observation load reconciles all roots at seconds-scale
+        # cost). Quota projection is deferred to the next full sync, which the
+        # ordinary hook cadence supplies. Skip the whole decision block so
+        # project_after_unlock / deferred_cert_* / did_from_zero_replay keep
+        # their no-op defaults — the post-flock reconcile paths below then all
+        # short-circuit for a targeted call.
+        if not targeted:
+            cur_seq = codex_physical_mutation_seq(conn)
+            if cur_seq != seq_before:
+                project_after_unlock = True
             else:
-                certificate = load_codex_quota_projection_certificate(conn)
-                certificate_current = (
-                    certificate is not None
-                    and certificate[0] == cur_seq
-                    and active_roots <= set(certificate[1])
-                )
-                if certificate_current:
-                    # The CACHE certificate is current, but that alone does NOT
-                    # prove stats.db still holds the projection (F1). Defer the
-                    # stats-side signature match until AFTER the Codex flock
-                    # releases below — only then may the reconcile be skipped.
+                active_roots = _cache_root_keys(conn)
+                if not active_roots:
                     project_after_unlock = False
-                    deferred_cert_roots = set(active_roots)
-                    assert certificate is not None
-                    deferred_cert_sigs = dict(certificate[1])
                 else:
-                    project_after_unlock = True
-        # #313 P3 (F9): a Codex rebuild or a truncation/requalification
-        # re-ingest replays from offset 0 and restores >retention-day
-        # codex_conversation_events. Force an unthrottled prune after the flock
-        # releases (below), so restored old rows don't persist for up to 24h.
-        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
+                    certificate = load_codex_quota_projection_certificate(conn)
+                    certificate_current = (
+                        certificate is not None
+                        and certificate[0] == cur_seq
+                        and active_roots <= set(certificate[1])
+                    )
+                    if certificate_current:
+                        # The CACHE certificate is current, but that alone does
+                        # NOT prove stats.db still holds the projection (F1).
+                        # Defer the stats-side signature match until AFTER the
+                        # Codex flock releases below — only then may the
+                        # reconcile be skipped.
+                        project_after_unlock = False
+                        deferred_cert_roots = set(active_roots)
+                        assert certificate is not None
+                        deferred_cert_sigs = dict(certificate[1])
+                    else:
+                        project_after_unlock = True
+            # #313 P3 (F9): a Codex rebuild or a truncation/requalification
+            # re-ingest replays from offset 0 and restores >retention-day
+            # codex_conversation_events. Force an unthrottled prune after the
+            # flock releases (below), so restored old rows don't persist for 24h.
+            did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)

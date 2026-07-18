@@ -9,8 +9,11 @@ model, S5 ships the visible React source selector and source-labelled sharing
 controls over that backend, and S6 now ships the Codex conversation
 normalization and assembly kernel layer (title, dedup, item/thread grouping,
 cost attribution, outline, browse/facets, search) behind a provider-neutral
-dispatch. The native Codex conversation routes and UI (S7–S8) and later
-certification remain deferred.
+dispatch. S7 now exposes that layer through the dual-form conversation routes,
+the source-aware transcript CLI, qualified export/anonymization, payload
+readback, and the qualified live-tail with Codex child discovery. The native
+React conversation UI and reading position (S8) and later certification remain
+deferred.
 
 ## S3 provider-aware CLI analytics
 
@@ -49,9 +52,10 @@ The S3 acceptance rows `source-derived-project-attribution`,
 `codex-token-reuse-forensics` are supported. `codex-cache-hit-rate-not-applicable`
 remains deliberately not applicable. S4's dashboard backend contract and S5's
 `source-aware-dashboard-share-identity` acceptance row are supported; S6 ships
-the Codex conversation normalization/assembly kernel layer, while the native
-conversation routes and UI (S7–S8) and later certification remain deferred, so
-issue #294 is still open.
+the Codex conversation normalization/assembly kernel layer and S7 exposes it
+through the conversation routes, transcript CLI, export/anonymization, payload
+readback, and live-tail, while the native React UI and reading position (S8) and
+later certification remain deferred, so issue #294 is still open.
 
 ## Capability states
 
@@ -115,6 +119,27 @@ mapping both into one neutral envelope family with a source-tagged token union.
 This is a kernel layer with zero user-visible surface: S7 wires the routes,
 transcript CLI, export/anonymization, and live-tail, and S8 ships the React UI
 and reading position. The Claude conversation kernels stay byte-untouched.
+
+## S7 conversation routes, transcript CLI, and live-tail
+
+S7 exposes the S6 kernel layer without changing the Claude surface. The twelve
+conversation routes qualify in place: an entity id beginning `v1.` opts into the
+neutral dispatch (`ok` → 200 JSON, `normalization_pending` → 200 JSON, `not_found`
+→ 404 JSON, payload `gone` → 410, export `ok` → 200 `text/markdown`, Codex media →
+404 `capability_unsupported`), and the three collection routes accept a strict
+`?source={claude,codex}` with a per-route parameter whitelist; absent
+qualification runs the legacy path byte-identically. The transcript CLI takes the
+dual-form export positional (Codex conversations use the `v1.` key), a Codex-only
+`--speed` (rejected on any non-Codex ref by resolved source), and a `--source`
+search flag whose Codex output is a `Key/When/Project/Kinds/Snippet` table and a
+stamped-first camelCase JSON envelope paginated by an opaque base64url cursor.
+Qualified anonymization draws from the authoritative Codex tables via
+`build_anon_plan_for_sources`, leaving the legacy plan and every bare-Claude byte
+untouched. Targeted Codex ingest (`only_paths` + `targeted_clean`) and the
+qualified live-tail SSE add new child threads mid-watch through a budgeted
+directory frontier. Codex media stays capability-gated until real renderable
+media is shown to exist. The React UI, reading position, and cross-source
+combined presentation remain S8.
 
 ## Capability matrix
 
@@ -198,14 +223,16 @@ boundary for current-week output, and derive drift digests from Codex state.
 
 | Outcome | Claude | Codex | Owner | Truthful contract |
 | --- | --- | --- | --- | --- |
-| browse, search/facets, reader | supported | deferred | S6–S8 | New routes use opaque qualified conversation keys. |
+| browse, search, and facets routes | supported | supported | S7 | The dual-form `v1.` entity routes and the strict `?source=` collection routes expose normalized conversations with opaque qualified keys; the React reader UI is S8. |
 | title and outline | supported | supported | S6 | First meaningful user prompt is the initial Codex title fallback; the normalization/assembly kernels derive the title and outline. |
 | tools, reasoning, events | supported | supported | S6 | Preserve observed provider record distinctions in the normalized message rows and neutral detail blocks. |
 | thread nesting | supported | supported | S6 | Use `thread_source`/parent metadata, never an `agent-` filename convention. |
-| find, comparison, navigation | supported | deferred | S7–S8 | Session IDs alone are insufficient identities. |
+| find | supported | supported | S7 | In-conversation find anchors both providers with one `item_key` contract and honest FTS/LIKE selection. |
+| comparison and navigation UI | supported | deferred | S8 | Session IDs alone are insufficient identities. |
 | reading position | supported | deferred | S8 | `readingPosition.ts` must store an opaque qualified key. |
-| transcript CLI and anonymized/raw export | supported | deferred | S7 | `build_anon_plan_for_db` must include Codex roots and labels. |
-| payload/media readback and live-tail | supported | deferred | S7–S8 | Feature detection degrades only affected capabilities. |
+| transcript CLI and anonymized/raw export | supported | supported | S7 | Qualified export anonymizes via `build_anon_plan_for_sources`, while `build_anon_plan_for_db` and every bare-Claude call site stay byte-frozen; CLI export byte-matches the HTTP export in both modes. |
+| payload readback and live-tail | supported | supported | S7 | The `block_key` payload selector, plus the qualified live-tail SSE with the budgeted directory-frontier child discovery, degrade only affected capabilities. |
+| media readback | supported | unavailable | S7 | Codex media returns an explicit `capability_unsupported` response until real renderable media is shown to exist in rollouts. |
 
 ### Lifecycle and governance
 

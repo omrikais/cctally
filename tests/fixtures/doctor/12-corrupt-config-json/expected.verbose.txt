@@ -89,6 +89,13 @@ Data
       details:
         latest_snapshot_at: 2026-05-13T14:22:29+00:00
         latest_snapshot_age_s: 2
+  ✓ Statusline pipeline      no recent regular-pool timer observed
+      details:
+        transport_age_seconds: inf
+        selected_age_seconds: inf
+        active_candidate_count: 0
+        control_db_agrees: None
+        tombstones: {'fiveHour': 'absent', 'sevenDay': 'absent'}
   ✓ Claude cache             0 entries (no JSONL corpus)
       details:
         entries: 0
@@ -152,4 +159,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 27 OK · 7 WARN · 1 FAIL
+Summary: 28 OK · 7 WARN · 1 FAIL

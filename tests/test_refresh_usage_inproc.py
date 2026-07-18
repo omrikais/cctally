@@ -1,4 +1,6 @@
 """Unit tests for the in-process refresh-usage helper."""
+import argparse
+import json
 import time
 
 from conftest import load_script, redirect_paths
@@ -15,6 +17,129 @@ def _newest_source(ns):
     finally:
         conn.close()
     return row["source"] if row is not None else None
+
+
+def _record_args(*, percent, resets_at, five_percent=None, five_resets_at=None):
+    """Build the exact record-usage shape used by OAuth authority tests."""
+    return argparse.Namespace(
+        percent=percent,
+        resets_at=str(resets_at),
+        five_hour_percent=five_percent,
+        five_hour_resets_at=(
+            str(five_resets_at) if five_resets_at is not None else None
+        ),
+        source="api",
+    )
+
+
+def test_authoritative_equality_crash_leaves_seven_day_fail_closed(
+        monkeypatch, tmp_path):
+    """An equal OAuth write may deduplicate in SQLite, but a crash after it
+    must leave a durable seven-day inflight tombstone.  The stale spool value
+    then remains ineligible and cannot replay over the equal authority."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    now = int(time.time())
+    resets_at = now + 3 * 86400
+    seed = _record_args(percent=20.0, resets_at=resets_at)
+    assert ns["cmd_record_usage"](seed) == 0
+
+    ns["_atomic_write_json"](
+        ns["STATUSLINE_CANDIDATE_DIR"] / ("a" * 64 + ".json"),
+        {
+            "schemaVersion": 1,
+            "receivedAt": now,
+            "sevenDay": {"percent": 21.0, "resetsAt": resets_at},
+        },
+    )
+    monkeypatch.setitem(
+        ns,
+        "_after_authoritative_record",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected crash")),
+    )
+
+    result = ns["_authoritative_record_usage"](seed, {"sevenDay"})
+
+    assert result.status == "record_failed"
+    tombstone = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    assert tombstone["state"] == "inflight"
+    ns["_statusline_reduce_and_publish"]()
+    conn = ns["open_db"]()
+    try:
+        newest = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert newest["weekly_percent"] == 20.0
+
+
+def test_authoritative_seven_day_only_does_not_tombstone_five_hour(
+        monkeypatch, tmp_path):
+    """A 7d-only OAuth payload must not invalidate unrelated 5h work."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    now = int(time.time())
+
+    result = ns["_authoritative_record_usage"](
+        _record_args(percent=20.0, resets_at=now + 3 * 86400),
+        {"sevenDay"},
+    )
+
+    assert result.status == "ok"
+    seven = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    assert seven["state"] == "committed"
+    assert not ns["STATUSLINE_AUTHORITATIVE_5H_PATH"].exists()
+    # The inclusive cutoff covers the entire accepted five-second future-skew
+    # interval; a candidate admitted at exactly completion+5 cannot replay.
+    ns["_atomic_write_json"](
+        ns["STATUSLINE_CANDIDATE_DIR"] / ("b" * 64 + ".json"),
+        {
+            "schemaVersion": 1,
+            "receivedAt": seven["blockReceivedAtThrough"],
+            "sevenDay": {"percent": 21.0, "resetsAt": now + 3 * 86400},
+        },
+    )
+    ns["_statusline_reduce_and_publish"]()
+    conn = ns["open_db"]()
+    try:
+        newest = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert newest["weekly_percent"] == 20.0
+
+
+def test_refresh_keeps_backoff_when_authoritative_record_fails(
+        monkeypatch, tmp_path):
+    """A successful fetch is not a successful authoritative observation.
+    Keep the existing 429 state until the write-ahead/final protocol commits."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda: "tok")
+    monkeypatch.setitem(
+        ns,
+        "_fetch_oauth_usage",
+        lambda token, timeout_seconds: {
+            "seven_day": {
+                "utilization": 20.0,
+                "resets_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400)
+                ),
+            }
+        },
+    )
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 7)
+    ns["_oauth_backoff_register_429"](retry_after_deadline=None, now=time.time())
+    assert ns["_oauth_backoff_count"]() == 1
+
+    result = ns["_refresh_usage_inproc"]()
+
+    assert result.status == "record_failed"
+    assert ns["_oauth_backoff_count"]() == 1
 
 
 def test_refresh_inproc_writes_source_api(monkeypatch, tmp_path):

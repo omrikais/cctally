@@ -10,27 +10,53 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
+import shutil
 
 import pytest
 from conftest import load_script, redirect_paths
 from test_conversation_endpoints import _boot, _get_ct
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+CODEX_CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
+
 
 # ---- namespace builders ----------------------------------------------------
 
-def _ns_export(session_id, *, scope="all", raw=False, output=None):
+def _ns_export(session_id, *, scope="all", raw=False, output=None, speed=None):
     return argparse.Namespace(
         transcript_action="export", session_id=session_id, scope=scope,
-        raw=raw, output=output)
+        raw=raw, output=output, speed=speed)
 
 
 def _ns_search(query, **kw):
     base = dict(
-        transcript_action="search", query=query, kind="all", limit=50, offset=0,
+        transcript_action="search", query=query, source="claude", kind="all",
+        limit=50, offset=0, cursor=None,
         project=None, model=None, date_from=None, date_to=None,
         cost_min=None, cost_max=None, rebuild_min=None, json=False)
     base.update(kw)
     return argparse.Namespace(**base)
+
+
+def _seed_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full"):
+    """Ingest one Codex corpus scenario into the redirected cache and return
+    ``(conversation_key, rollout_path)``. ``redirect_paths`` must have already run
+    (or is run here when ``needs_redirect`` — see callers)."""
+    provider = tmp_path / "provider"
+    rollout = provider / "sessions" / "2026" / "07" / "15" / f"{scenario}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(CODEX_CORPUS / f"{scenario}.jsonl", rollout)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, rebuild=True)
+        key = conn.execute(
+            "SELECT conversation_key FROM codex_conversation_threads "
+            "WHERE source_path LIKE ?", (f"%/{scenario}.jsonl",)).fetchone()[0]
+    finally:
+        conn.close()
+    return key, rollout
 
 
 def _recompute_rollup(ns):
@@ -243,3 +269,220 @@ def test_search_pagination(tmp_path, monkeypatch, capsys):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 3 and len(payload["hits"]) == 2
+
+
+# ---- #294 S7 — dual-form export + --speed (spec §4.1) ----------------------
+
+def test_export_speed_on_bare_id_exits_2(tmp_path, monkeypatch, capsys):
+    """--speed is Codex pricing behavior; an explicit value on a bare (Claude)
+    ref is a usage error, not a silent no-op (resolved-source rule)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed(ns, session_id="sx")
+    rc = ns["cmd_transcript"](_ns_export("sx", speed="fast"))
+    assert rc == 2
+    assert "--speed" in capsys.readouterr().err
+
+
+def test_export_speed_on_v1_claude_exits_2(tmp_path, monkeypatch, capsys):
+    """Explicit --speed (even 'auto') on a v1.claude key is a usage error —
+    resolved-source-based, not lexical."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    disp = ns["_load_sibling"]("_lib_conversation_dispatch")
+    key = disp._mint_claude_conversation_key("s1")
+    rc = ns["cmd_transcript"](_ns_export(key, speed="auto"))
+    assert rc == 2
+    assert "--speed" in capsys.readouterr().err
+
+
+def test_export_v1_codex_default_runs_and_emits_markdown(tmp_path, monkeypatch,
+                                                         capsysbinary):
+    """Qualified default (anonymized) export runs and emits byte-exact Markdown
+    (the anonymize/raw byte-parity vs HTTP is proven in the parity test below)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key, _r = _seed_codex(ns, tmp_path, monkeypatch, scenario="root-a-collision")
+    rc = ns["cmd_transcript"](_ns_export(key))
+    assert rc == 0
+    out = capsysbinary.readouterr().out
+    assert out.startswith(b"#")
+    assert out.endswith(b"\n") and not out.endswith(b"\n\n")
+
+
+def test_export_v1_codex_speed_fast_ok(tmp_path, monkeypatch, capsysbinary):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key, _r = _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_export(key, raw=True, speed="fast"))
+    assert rc == 0
+    assert capsysbinary.readouterr().out.startswith(b"#")
+
+
+def test_export_v1_codex_scope_chat_exits_2(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key, _r = _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_export(key, scope="chat"))
+    assert rc == 2
+    assert "transcript:" in capsys.readouterr().err
+
+
+def test_export_v1_unknown_key_exits_1(tmp_path, monkeypatch, capsys):
+    """A malformed / unresolvable v1 key resolves to not_found → the dispatch
+    export returns not_found → exit 1 (unknown conversation), never a 0-exit empty."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_export("v1.ghostkeythatdoesnotexist"))
+    assert rc == 1
+    assert "transcript:" in capsys.readouterr().err
+
+
+def test_export_v1_codex_pending_exits_1(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key, _r = _seed_codex(ns, tmp_path, monkeypatch)
+    cq = ns["_load_sibling"]("_lib_codex_conversation_query")
+    monkeypatch.setattr(cq, "codex_normalization_authoritative", lambda conn: False)
+    rc = ns["cmd_transcript"](_ns_export(key))
+    assert rc == 1
+    assert "025" in capsys.readouterr().err     # cites migration 025
+
+
+def test_export_codex_cli_http_byte_parity(tmp_path, monkeypatch, capsysbinary):
+    """§4.1: CLI export byte-matches GET /api/conversation/<v1key>/export in BOTH
+    the anonymize (CLI default) and raw modes."""
+    from test_codex_conversation_api import _boot as _boot_api, _get, _entity_path
+    ns = load_script()
+    srv, _root, keys, _r = _boot_api(ns, tmp_path, monkeypatch, claude_sids=())
+    key = keys["modern-full"]
+    try:
+        port = srv.server_address[1]
+        _s1, http_raw, _c1 = _get(port, _entity_path(key, "/export"))
+        _s2, http_anon, _c2 = _get(port, _entity_path(key, "/export") + "?anonymize=1")
+    finally:
+        srv.shutdown()
+    capsysbinary.readouterr()
+    assert ns["cmd_transcript"](_ns_export(key, raw=True)) == 0
+    assert capsysbinary.readouterr().out == http_raw
+    assert ns["cmd_transcript"](_ns_export(key)) == 0
+    assert capsysbinary.readouterr().out == http_anon
+
+
+# ---- #294 S7 — search --source codex (spec §4.3) ---------------------------
+
+def test_search_codex_table_columns(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_search("Synthetic", source="codex"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    for header in ("Key", "When", "Project", "Kinds", "Snippet"):
+        assert header in out, header
+    assert "v1." in out                          # full untruncated key
+
+
+def test_search_codex_json_envelope_pinned(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_search("Synthetic", source="codex", json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert list(payload)[:2] == ["schemaVersion", "source"]   # stamped-first
+    assert payload["schemaVersion"] == 1 and payload["source"] == "codex"
+    assert set(payload) == {"schemaVersion", "source", "query", "mode",
+                            "total", "hits", "nextCursor"}
+    if payload["hits"]:
+        h = payload["hits"][0]
+        assert set(h) == {"conversationKey", "itemKey", "title", "snippet",
+                          "badges", "lastActivityUtc", "projectLabel"}
+
+
+def test_search_codex_offset_exits_2(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_search("x", source="codex", offset=1))
+    assert rc == 2
+    assert "--offset" in capsys.readouterr().err
+
+
+def test_search_cursor_with_claude_exits_2(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    rc = ns["cmd_transcript"](_ns_search("x", source="claude", cursor="abc"))
+    assert rc == 2
+    assert "--cursor" in capsys.readouterr().err
+
+
+def test_search_codex_filter_flag_exits_2(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_search("x", source="codex", project=["a"]))
+    assert rc == 2
+    assert "--project" in capsys.readouterr().err
+
+
+def test_search_codex_bad_cursor_exits_2(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    rc = ns["cmd_transcript"](_ns_search("x", source="codex", cursor="!!!bad"))
+    assert rc == 2
+    assert "--cursor" in capsys.readouterr().err
+
+
+def test_search_codex_pending_exit_0_with_note(tmp_path, monkeypatch, capsys):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    cq = ns["_load_sibling"]("_lib_codex_conversation_query")
+    monkeypatch.setattr(cq, "codex_normalization_authoritative", lambda conn: False)
+    rc = ns["cmd_transcript"](_ns_search("Synthetic", source="codex", json=True))
+    assert rc == 0                               # navigation: "nothing yet" is truthful
+    captured = capsys.readouterr()
+    assert "025" in captured.err                 # one stderr note citing migration 025
+    payload = json.loads(captured.out)
+    assert payload["source"] == "codex" and payload["hits"] == []
+
+
+def test_search_codex_cursor_roundtrip_via_subprocess(tmp_path, monkeypatch):
+    """§4.3: the external cursor round-trips through a REAL subprocess argv."""
+    import os
+    import subprocess
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_codex(ns, tmp_path, monkeypatch)
+    binp = str(pathlib.Path(ns["__file__"]).resolve())
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["CODEX_HOME"] = str(tmp_path / "provider")
+    env["CCTALLY_DATA_DIR"] = str(tmp_path / ".local" / "share" / "cctally")
+    env["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    env["TZ"] = "Etc/UTC"
+
+    def _run(extra):
+        return subprocess.run(
+            [binp, "transcript", "search", "--source", "codex", "Synthetic",
+             "--limit", "1", "--json", *extra],
+            capture_output=True, text=True, env=env, timeout=60)
+
+    p1 = _run([])
+    assert p1.returncode == 0, p1.stderr
+    d1 = json.loads(p1.stdout)
+    assert d1["source"] == "codex"
+    cur = d1.get("nextCursor")
+    # The modern-full slice carries several 'Synthetic…' items (distinct
+    # item_keys), so 'Synthetic' at limit=1 MUST expose a second page. Fail
+    # loudly (never silently pass) if the corpus ever thins below that.
+    assert cur, "corpus must yield a second search page for the cursor round-trip"
+    p2 = _run(["--cursor", cur])
+    assert p2.returncode == 0, p2.stderr
+    d2 = json.loads(p2.stdout)
+    a = (d1["hits"][0]["conversationKey"], d1["hits"][0]["itemKey"])
+    b = (d2["hits"][0]["conversationKey"], d2["hits"][0]["itemKey"])
+    assert a != b

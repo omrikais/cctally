@@ -31,6 +31,7 @@ Database
   ✓ cache.db WAL size        within limit
 Data
   ✓ Latest snapshot          2s ago
+  ✓ Statusline pipeline      no recent regular-pool timer observed
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Codex quota              not applicable
@@ -51,4 +52,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 27 OK · 8 WARN · 0 FAIL
+Summary: 28 OK · 8 WARN · 0 FAIL

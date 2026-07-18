@@ -168,6 +168,62 @@ def test_ok_via_hook_resets_backoff_state(monkeypatch, tmp_path):
     assert ns["_oauth_backoff_count"]() == 0  # counter reset by the success
 
 
+def test_hook_record_failure_keeps_backoff_state(monkeypatch, tmp_path):
+    """Automatic OAuth must not clear a prior 429 streak until the complete
+    authoritative writer protocol succeeds, rather than merely after fetch."""
+    ns = _load(monkeypatch, tmp_path)
+    _prime_hook(ns, monkeypatch)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 7)
+    ns["_oauth_backoff_register_429"](
+        retry_after_deadline=time.time() - 10, now=time.time() - 70
+    )
+    assert ns["_oauth_backoff_count"]() == 1
+    monkeypatch.setitem(
+        ns,
+        "_fetch_oauth_usage",
+        lambda token, timeout_seconds: {
+            "seven_day": {
+                "utilization": 22.0,
+                "resets_at": "2026-05-02T12:00:00Z",
+            }
+        },
+    )
+
+    status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+
+    assert status == "err(record-usage=7)"
+    assert ns["_oauth_backoff_count"]() == 1
+
+
+def test_hook_rechecks_selected_freshness_after_lock(monkeypatch, tmp_path):
+    """A publisher that updates selected freshness while this tick waits for
+    the writer lock suppresses the OAuth request after acquisition."""
+    ns = _load(monkeypatch, tmp_path)
+    _prime_hook(ns, monkeypatch)
+
+    class _LockThatPublishes:
+        def __enter__(self):
+            ns["_statusline_observe_touch"]()
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(ns, "_selected_state_lock", _LockThatPublishes)
+    monkeypatch.setitem(
+        ns,
+        "_fetch_oauth_usage",
+        lambda token, timeout_seconds: (_ for _ in ()).throw(
+            AssertionError("must recheck freshness after the lock")
+        ),
+    )
+
+    status, payload = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+
+    assert status.startswith("skipped(statusline-fresh")
+    assert payload is None
+
+
 # --- backfill gate: observation marker + backoff (Task 5, spec §4) ---------
 
 

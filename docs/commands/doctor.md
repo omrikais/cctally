@@ -81,6 +81,14 @@ severity != `OK`.
 
 ### Data
 - `data.latest_snapshot_age` — WARN at 5min-1h, FAIL >1h or never.
+- `data.statusline_pipeline` — passive evidence for the statusline candidate
+  pipeline: timer-transport age, selected-usage age, active candidate count,
+  selected-control/database fingerprint agreement, and independent 5h/7d
+  authoritative recovery state. It WARNs when an authoritative repair is
+  needed, selected control no longer agrees with the database, or a recently
+  active timer has not produced selected usage for five minutes. A stale or
+  absent timer is informational — Claude may simply be closed — and doctor
+  never creates, prunes, repairs, or otherwise changes pipeline files.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
 - `data.codex_quota` — physical local-rollout quota freshness per qualified

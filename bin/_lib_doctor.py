@@ -15,6 +15,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import math
 import pathlib
 import sys
 from typing import Optional
@@ -213,6 +214,10 @@ class DoctorState:
     # never-WARN posture (the hooks.installed / settings warnings already
     # surface a genuinely-unreadable settings.json — no double-WARN here).
     statusline_refresh_state: str = "unavailable"
+    # #318: read-only evidence for the per-session statusline candidate
+    # arbitration pipeline.  None means the gather could not inspect it;
+    # absent transport/tombstones are normal when Claude is closed.
+    statusline_pipeline: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -734,6 +739,62 @@ def _check_data_latest_snapshot_age(s: DoctorState) -> CheckResult:
         remediation=rem,
         details={"latest_snapshot_at": s.latest_snapshot_at.isoformat(),
                  "latest_snapshot_age_s": age_s},
+    )
+
+
+def _check_statusline_pipeline(s: DoctorState) -> CheckResult:
+    """Report transport, selected, control, and authority health separately."""
+    pipeline = s.statusline_pipeline if isinstance(s.statusline_pipeline, dict) else {}
+    tombstones = pipeline.get("tombstones")
+    tombstones = tombstones if isinstance(tombstones, dict) else {}
+    details = {
+        "transport_age_seconds": pipeline.get("transport_age_seconds"),
+        "selected_age_seconds": pipeline.get("selected_age_seconds"),
+        "active_candidate_count": pipeline.get("active_candidate_count", 0),
+        "control_db_agrees": pipeline.get("control_db_agrees"),
+        "tombstones": tombstones,
+    }
+    if any(value in {"invalid", "inflight"} for value in tombstones.values()):
+        return CheckResult(
+            id="data.statusline_pipeline", title="Statusline pipeline",
+            severity="warn", summary="authoritative state needs repair",
+            remediation="Run `cctally refresh-usage`", details=details,
+        )
+    if pipeline.get("control_db_agrees") is False:
+        return CheckResult(
+            id="data.statusline_pipeline", title="Statusline pipeline",
+            severity="warn", summary="selected control disagrees with database",
+            remediation="Run `cctally refresh-usage`, then inspect active sessions",
+            details=details,
+        )
+    transport_age = pipeline.get("transport_age_seconds")
+    selected_age = pipeline.get("selected_age_seconds")
+    transport_age = (
+        float(transport_age)
+        if isinstance(transport_age, (int, float)) and not isinstance(transport_age, bool)
+        else math.inf
+    )
+    selected_age = (
+        float(selected_age)
+        if isinstance(selected_age, (int, float)) and not isinstance(selected_age, bool)
+        else math.inf
+    )
+    if transport_age < 90 and selected_age >= 300:
+        return CheckResult(
+            id="data.statusline_pipeline", title="Statusline pipeline",
+            severity="warn", summary="timer active; selected usage stale",
+            remediation="Run `cctally refresh-usage`, then inspect active sessions",
+            details=details,
+        )
+    if transport_age >= 90:
+        summary = "no recent regular-pool timer observed"
+    elif selected_age < 300:
+        summary = "timer and selected usage fresh"
+    else:
+        summary = "selected usage awaiting next active timer"
+    return CheckResult(
+        id="data.statusline_pipeline", title="Statusline pipeline",
+        severity="ok", summary=summary, remediation=None, details=details,
     )
 
 
@@ -1658,6 +1719,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),
+        ("data.statusline_pipeline", "_check_statusline_pipeline"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
         ("data.codex_quota", "_check_data_codex_quota"),

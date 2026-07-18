@@ -42,6 +42,54 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
+    """Read the #318 statusline pipeline without creating or pruning files."""
+    now_epoch = int(now_utc.timestamp())
+    result = {
+        "transport_age_seconds": None,
+        "selected_age_seconds": None,
+        "active_candidate_count": 0,
+        "control_db_agrees": None,
+        "tombstones": {"fiveHour": "absent", "sevenDay": "absent"},
+    }
+    try:
+        result["transport_age_seconds"] = c._statusline_transport_age_seconds()
+    except Exception:
+        pass
+    try:
+        result["selected_age_seconds"] = c._statusline_observe_age_seconds()
+    except Exception:
+        pass
+    try:
+        result["active_candidate_count"] = len(
+            c._scan_active_candidate_spool(now_epoch=now_epoch)
+        )
+    except Exception:
+        pass
+    try:
+        result["control_db_agrees"] = c._statusline_control_db_agreement(
+            now_epoch=now_epoch
+        )
+    except Exception:
+        pass
+    for axis, path in (
+        ("fiveHour", _cctally_core.STATUSLINE_AUTHORITATIVE_5H_PATH),
+        ("sevenDay", _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH),
+    ):
+        try:
+            if not path.exists():
+                continue
+            tombstone = c._read_tombstone(
+                axis, now_epoch=now_epoch, fail_closed=False
+            )
+            result["tombstones"][axis] = (
+                tombstone.state if tombstone is not None else "invalid"
+            )
+        except Exception:
+            result["tombstones"][axis] = "invalid"
+    return result
+
+
 def _codex_lifecycle_activity_24h(
     *, root_keys: set[str], now_utc: dt.datetime,
 ) -> dict[str, dict]:
@@ -356,6 +404,16 @@ def doctor_gather_state(
                 conn.close()
     except Exception:
         pass
+
+    # ── Statusline candidate arbitration (#318) ──────────────────────
+    # This inspection is deliberately independent of SQLite mutation: marker
+    # mtime, candidate/control files, and tombstones are all read fail-soft.
+    # In particular it uses the scan-only candidate helper, never the reducer
+    # loader that prunes expired or malformed spool files.
+    try:
+        statusline_pipeline = _gather_statusline_pipeline(c, now_utc=now_utc)
+    except Exception:
+        statusline_pipeline = None
 
     # Conversation-sessions rollup consistency (#217 S1 / U9). Two cheap COUNTs
     # (graceful None on a missing table / unreadable DB) + an in-progress signal
@@ -787,6 +845,7 @@ def doctor_gather_state(
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,
         # #311: precomputed statusLine.refreshInterval classification.
         statusline_refresh_state=statusline_refresh_state,
+        statusline_pipeline=statusline_pipeline,
     )
 
 

@@ -43,7 +43,7 @@ import socket
 import sqlite3
 import sys
 
-from _cctally_cache import sync_cache
+from _cctally_cache import sync_cache, sync_codex_cache, _codex_provider_roots
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -113,9 +113,308 @@ def _cached_file_sigs(conn, paths):
     return out
 
 
+def _codex_cached_file_sigs(conn, paths):
+    """{path: size_bytes} from ``codex_session_files`` for the given paths — the
+    Codex analogue of ``_cached_file_sigs`` (spec §5.2). Size-only, matching the
+    watch kernel's size-only signature and ``sync_codex_cache``'s size-only
+    delta. Paths with no row are absent → treated as changed. Baselines the
+    Codex live-tail watch against the cache's own committed cursor so growth
+    during an ingest is re-detected next cycle (the per-path committed-cursor
+    invariant — the S6 physical mutation sequence is at most an extra
+    certificate, never this cursor's replacement)."""
+    out = {}
+    if not paths:
+        return out
+    placeholders = ",".join("?" for _ in paths)
+    try:
+        rows = conn.execute(
+            f"SELECT path, size_bytes FROM codex_session_files "
+            f"WHERE path IN ({placeholders})", list(paths)).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for p, size in rows:
+        out[p] = size
+    return out
+
+
+def _codex_all_committed_sizes(conn):
+    """{path: size_bytes} for EVERY tracked Codex file — fed to the frontier as
+    both the ``known_paths`` diff set and the ``committed_sizes`` growth
+    baseline. A plain SELECT (no lock), so it never widens the SSE lock scope."""
+    try:
+        rows = conn.execute(
+            "SELECT path, size_bytes FROM codex_session_files").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {p: size for (p, size) in rows}
+
+
+def _codex_classified_paths(conn, paths):
+    """Of ``paths``, those whose targeted ingest now carries a conversation key
+    (``codex_session_files.last_conversation_key`` non-null) — i.e. classified
+    (child or non-child). The driver reaps these from the frontier's pending set
+    (§5.4): a child has already widened the file set; a non-child needs no
+    further attention. Paths still unclassified (incomplete session_meta / a
+    dirty first ingest) stay pending and are retried."""
+    if not paths:
+        return set()
+    placeholders = ",".join("?" for _ in paths)
+    try:
+        rows = conn.execute(
+            f"SELECT path FROM codex_session_files "
+            f"WHERE path IN ({placeholders}) AND last_conversation_key IS NOT NULL",
+            list(paths)).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {r[0] for r in rows}
+
+
+def _codex_walk_root_for_conversation(conn, conversation_key):
+    """The configured ``walk_root`` of the conversation's OWN provider root (the
+    frontier's scope — §5.4). Resolves the conversation's ``source_root_key`` via
+    its thread facts, then matches it to a currently-configured provider root.
+    ``None`` when the conversation has no thread row or its root is no longer
+    configured (the frontier is then skipped — DB re-resolve alone still runs)."""
+    cq = _conversation_query_impl_codex()
+    thread = cq._thread_facts(conn, conversation_key)
+    if thread is None:
+        return None
+    source_root_key = thread[3]
+    for root in _codex_provider_roots():
+        if root.source_root_key == source_root_key:
+            return str(root.walk_root)
+    return None
+
+
+def _conversation_query_impl_codex():
+    """Lazy-load the Codex conversation query kernel (source-path resolver +
+    existence probe + thread facts for the live-tail file set)."""
+    return sys.modules["cctally"]._load_sibling("_lib_codex_conversation_query")
+
+
+def _conversation_dispatch_impl():
+    """Lazy-load the provider-neutral dispatch kernel (the SSE preflight)."""
+    return sys.modules["cctally"]._load_sibling("_lib_conversation_dispatch")
+
+
 def _conversation_query_impl():
     """Lazy-load the pure conversation query kernel (Plan 2, §3)."""
     return sys.modules["cctally"]._load_sibling("_lib_conversation_query")
+
+
+# ── #294 S7 — dual-form conversation routes (spec §2) ─────────────────────────
+# Entity routes qualify lexically (an id beginning ``v1.`` opts into the neutral
+# envelope contract); the three collection routes qualify by an explicit strict
+# ``?source={claude,codex}``. Absence of qualification keeps today's Claude path
+# byte-identical (the legacy code never touches the resolver). This is C1/C2.
+
+# Every conversation param recognized across the three collection routes (§2.2).
+# A qualified request rejects (400) any RECOGNIZED param not in that route's
+# accepted whitelist; a GENUINELY unknown param (not in this set) is ignored,
+# matching legacy leniency. Entity-only params (after/before/tail/scope/regex/…)
+# are deliberately absent — they are meaningless on a collection route, so they
+# fall to "genuinely unknown → ignored".
+_RECOGNIZED_CONVERSATION_PARAMS = (
+    "source", "project_key", "model", "limit", "cursor", "q", "kind",
+    "sort", "offset", "date_from", "date_to", "projects",
+    "cost_min", "cost_max", "rebuild_min", "models",
+)
+_QUALIFIED_BROWSE_ACCEPTED = ("source", "project_key", "model", "limit", "cursor")
+_QUALIFIED_SEARCH_ACCEPTED = ("source", "q", "kind", "limit", "cursor")
+_QUALIFIED_FACETS_ACCEPTED = ("source",)
+# A raw browse cursor is a conversation key — printable + URL-safe by construction
+# (§2.2). Syntactic-only validation: reject whitespace/control/empty; echo raw.
+import re as _re_qs  # noqa: E402 — module-level compile for the browse-cursor check
+_BROWSE_CURSOR_RE = _re_qs.compile(r"\A[!-~]+\Z")
+
+
+def _resolve_effective_speed():
+    """§2.4: resolve ``auto`` → a concrete speed ONCE at the route I/O boundary,
+    via the SAME chokepoint the Codex reporting commands use. Search never prices;
+    detail/outline/export thread it down (Claude ignores it — cost is materialized)."""
+    return sys.modules["cctally"]._resolve_codex_speed("auto")
+
+
+def _conversation_dispatch():
+    """Lazy-load the provider-neutral dispatch kernel (the S7 entity ops)."""
+    return _conversation_dispatch_impl()
+
+
+def _parse_source_param(handler, qs_raw):
+    """Strict ``?source=`` parse (§2.2). Returns ``(qualified, source)``:
+
+    - ``(False, None)`` — the param is absent → the caller runs the legacy path
+      byte-identically;
+    - ``(True, "claude"|"codex")`` — exactly one literal value;
+
+    or ``None`` after having ALREADY sent a 400 (blank, duplicated, ``all``, or any
+    other unknown value)."""
+    import urllib.parse as _u
+    vals = _u.parse_qs(qs_raw, keep_blank_values=True).get("source")
+    if vals is None:
+        return (False, None)
+    if len(vals) != 1 or vals[0] not in ("claude", "codex"):
+        handler._respond_json(400, {"error": f"invalid source: {vals}"})
+        return None
+    return (True, vals[0])
+
+
+def _validate_qualified_params(handler, qs_raw, accepted):
+    """§2.2 strict qualified-param validation. Rejects (400) any RECOGNIZED
+    conversation param not in ``accepted``, and any accepted param that appears
+    more than once. Genuinely-unknown params (outside
+    ``_RECOGNIZED_CONVERSATION_PARAMS``) are ignored. Returns the
+    ``keep_blank_values`` parse map on success, or ``None`` after a 400."""
+    import urllib.parse as _u
+    parsed = _u.parse_qs(qs_raw, keep_blank_values=True)
+    accepted_set = set(accepted)
+    for name, vals in parsed.items():
+        if name in _RECOGNIZED_CONVERSATION_PARAMS and name not in accepted_set:
+            handler._respond_json(400, {"error": f"unexpected param: {name}"})
+            return None
+        if name in accepted_set and len(vals) != 1:
+            handler._respond_json(400, {"error": f"duplicate param: {name}"})
+            return None
+    return parsed
+
+
+def _parse_qualified_limit(handler, parsed):
+    """Strict qualified ``limit`` (§2.2): a base-10 integer 1..500. Absent → the
+    kernel default (50); malformed or out of range → 400. Returns ``(ok, limit)``
+    (``ok=False`` means a 400 was already sent)."""
+    vals = parsed.get("limit")
+    if vals is None:
+        return (True, 50)
+    raw = vals[0]
+    if not (raw.isascii() and raw.isdigit()):   # strict base-10, no sign/space
+        handler._respond_json(400, {"error": f"bad limit: {raw}"})
+        return (False, None)
+    n = int(raw)
+    if not (1 <= n <= 500):
+        handler._respond_json(400, {"error": f"limit out of range: {n}"})
+        return (False, None)
+    return (True, n)
+
+
+def _parse_qualified_browse_cursor(handler, parsed):
+    """The browse ``cursor`` is a raw conversation key — passed verbatim both
+    directions (§2.2). Syntactic-only: blank → no cursor; a non-printable /
+    whitespace value → 400. Returns ``(ok, cursor)``."""
+    vals = parsed.get("cursor")
+    if vals is None or vals[0] == "":
+        return (True, None)
+    cur = vals[0]
+    if not _BROWSE_CURSOR_RE.match(cur):
+        handler._respond_json(400, {"error": "malformed cursor"})
+        return (False, None)
+    return (True, cur)
+
+
+def _respond_qualified_json(handler, env):
+    """Map a neutral entity envelope's ``status`` → the §2.3 HTTP JSON transport:
+    ``ok`` / ``normalization_pending`` → 200; ``gone`` → 410; ``validation_error``
+    → 400; anything else (``not_found`` + unknown) → 404. Body is the envelope."""
+    status = (env or {}).get("status")
+    if status in ("ok", "normalization_pending"):
+        handler._respond_json(200, env)
+    elif status == "gone":
+        handler._respond_json(410, env)
+    elif status == "validation_error":
+        handler._respond_json(400, env)
+    else:
+        handler._respond_json(404, env)
+
+
+def _serve_qualified_entity(handler, dispatch_call, log_label):
+    """Run a neutral entity dispatch through the shared 500-envelope scaffold and
+    map its status to the §2.3 JSON transport. For the JSON entity legs (detail,
+    outline, prompts, find, payload); export/anon-map/media serve non-JSON or a
+    bespoke existence probe, so they do not route through here."""
+    ok, env = handler._run_conversation_query(dispatch_call, log_label)
+    if not ok:
+        return
+    _respond_qualified_json(handler, env)
+
+
+def _handle_qualified_browse(handler, qs_raw, source):
+    """``GET /api/conversations?source=…`` (§2.2). Strict param whitelist; the
+    neutral browse envelope served verbatim (codex ``normalization_pending`` is a
+    legitimate 200 empty state)."""
+    parsed = _validate_qualified_params(handler, qs_raw, _QUALIFIED_BROWSE_ACCEPTED)
+    if parsed is None:
+        return
+    ok, limit = _parse_qualified_limit(handler, parsed)
+    if not ok:
+        return
+    ok, cursor = _parse_qualified_browse_cursor(handler, parsed)
+    if not ok:
+        return
+    project_key = (parsed.get("project_key", [None])[0] or None)
+    model = (parsed.get("model", [None])[0] or None)
+    speed = _resolve_effective_speed()
+    disp = _conversation_dispatch()
+    ok, body = handler._run_conversation_query(
+        lambda conn: disp.neutral_browse(
+            conn, source=source, effective_speed=speed,
+            project_key=project_key, model=model, limit=limit, cursor=cursor),
+        "/api/conversations")
+    if not ok:
+        return
+    handler._respond_json(200, body)
+
+
+def _handle_qualified_facets(handler, qs_raw, source):
+    """``GET /api/conversations/facets?source=…`` (§2.2). Accepts ``source`` only;
+    serves the status-tagged facets-only envelope (pending → empty facet lists)."""
+    parsed = _validate_qualified_params(handler, qs_raw, _QUALIFIED_FACETS_ACCEPTED)
+    if parsed is None:
+        return
+    speed = _resolve_effective_speed()
+    disp = _conversation_dispatch()
+    ok, body = handler._run_conversation_query(
+        lambda conn: disp.neutral_browse(
+            conn, source=source, effective_speed=speed),
+        "/api/conversations/facets")
+    if not ok:
+        return
+    facets = (body or {}).get("facets") or {"projects": [], "models": []}
+    handler._respond_json(
+        200, {"status": (body or {}).get("status"), "facets": facets})
+
+
+def _handle_qualified_search(handler, qs_raw, source):
+    """``GET /api/conversation/search?source=…`` (§2.2). Strict whitelist; the
+    search ``cursor`` must decode as base64url (else 400); the neutral search
+    envelope (with the codec'd ``page.cursor``) is served verbatim."""
+    parsed = _validate_qualified_params(handler, qs_raw, _QUALIFIED_SEARCH_ACCEPTED)
+    if parsed is None:
+        return
+    query = (parsed.get("q", [""])[0] or "")
+    kind = (parsed.get("kind", ["all"])[0] or "all")
+    if kind not in _CONV_SEARCH_KINDS:
+        handler._respond_json(400, {"error": f"unknown kind: {kind}"})
+        return
+    ok, limit = _parse_qualified_limit(handler, parsed)
+    if not ok:
+        return
+    cursor = (parsed.get("cursor", [None])[0] or None)
+    disp = _conversation_dispatch()
+    if cursor is not None:
+        try:
+            disp.decode_search_cursor(cursor)
+        except disp.InvalidSearchCursor:
+            handler._respond_json(400, {"error": "invalid cursor"})
+            return
+    speed = _resolve_effective_speed()
+    ok, body = handler._run_conversation_query(
+        lambda conn: disp.neutral_search(
+            conn, query, source=source, kind=kind,
+            effective_speed=speed, limit=limit, cursor=cursor),
+        "/api/conversation/search")
+    if not ok:
+        return
+    handler._respond_json(200, body)
+
 
 def _parse_search_kind_impl(handler, q, valid=_CONV_SEARCH_KINDS):
     """Read + validate the ``kind`` facet for a conversation route (#177 S6 /
@@ -263,7 +562,14 @@ def _handle_get_conversations_impl(handler) -> None:
     if not handler._require_transcripts_allowed():
         return
     import urllib.parse as _u
-    q = _u.parse_qs(handler.path.partition("?")[2])
+    qs_raw = handler.path.partition("?")[2]
+    parsed_src = _parse_source_param(handler, qs_raw)
+    if parsed_src is None:
+        return  # a 400 has already been sent
+    qualified, source = parsed_src
+    if qualified:
+        return _handle_qualified_browse(handler, qs_raw, source)
+    q = _u.parse_qs(qs_raw)
     sort = _qs_str(q, "sort", "recent")
     limit = _qs_int(q, "limit", 50)
     offset = _qs_int(q, "offset", 0)
@@ -292,6 +598,13 @@ def _handle_get_conversations_facets_impl(handler) -> None:
     """
     if not handler._require_transcripts_allowed():
         return
+    qs_raw = handler.path.partition("?")[2]
+    parsed_src = _parse_source_param(handler, qs_raw)
+    if parsed_src is None:
+        return  # a 400 has already been sent
+    qualified, source = parsed_src
+    if qualified:
+        return _handle_qualified_facets(handler, qs_raw, source)
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().list_conversation_facets(conn),
         "/api/conversations/facets")
@@ -334,6 +647,17 @@ def _handle_get_conversation_detail_impl(handler, path: str) -> None:
     if sum(1 for x in (after is not None, before is not None, tail) if x) > 1:
         handler.send_error(400, "after/before/tail are mutually exclusive")
         return
+    if session_id.startswith("v1."):
+        # Qualified (v1.) → neutral detail envelope (§2.1 / §2.3).
+        speed = _resolve_effective_speed()
+        disp = _conversation_dispatch()
+        _serve_qualified_entity(
+            handler,
+            lambda conn: disp.neutral_detail(
+                conn, session_id, effective_speed=speed,
+                after=after, before=before, tail=tail, limit=limit),
+            "/api/conversation")
+        return
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().get_conversation(
             conn, session_id, after=after, before=before, tail=tail,
@@ -346,23 +670,9 @@ def _handle_get_conversation_detail_impl(handler, path: str) -> None:
         return
     handler._respond_json(200, body)
 
-def _handle_get_conversation_events_impl(handler, path: str) -> None:
-    """``GET /api/conversation/<id>/events`` — per-conversation live-tail
-    SSE (spec §2). Fail-closed behind the same transcript privacy gate as
-    the other conversation routes. Watches only this session's file(s);
-    emits ``event: tail`` on growth, ``: keep-alive`` when idle. Passive
-    (no ingest, no emit) under ``--no-sync``."""
-    if not handler._require_transcripts_allowed():
-        return
-    import time as _time
-    import urllib.parse as _u
-    watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
-    cq = handler._conversation_query()
-    session_id = _u.unquote(path[len("/api/conversation/"):-len("/events")])
-    if not session_id:
-        handler.send_error(404, "conversation not found")
-        return
-
+def _send_sse_headers(handler) -> None:
+    """The exact SSE header set both the bare and qualified live-tail streams
+    commit (kept in one place so bare stream bytes stay byte-identical)."""
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
@@ -370,8 +680,110 @@ def _handle_get_conversation_events_impl(handler, path: str) -> None:
     handler.send_header("X-Accel-Buffering", "no")
     handler.end_headers()
 
-    passive = bool(type(handler).no_sync)
 
+def _run_conversation_events_stream(
+    handler, conn, *, passive, tail_data, resolve, ingest, cached_sigs,
+    discovery_step=None,
+) -> None:
+    """Shared per-conversation live-tail SSE loop (spec §5.2), driving both the
+    bare (``sessionId``) and qualified (``conversationKey``) streams from ONE
+    body so their vocabulary — ``event: ready`` once, ``event: tail`` on
+    committed growth, ``: keep-alive`` when idle — stays in lockstep and the bare
+    stream bytes are byte-identical to today (only ``tail_data`` differs).
+
+    ``resolve()`` → the watched file list; ``ingest(changed)`` → the targeted
+    ingest (Claude ``sync_cache`` / Codex ``sync_codex_cache``) whose stats carry
+    ``targeted_clean``; ``cached_sigs(paths)`` → ``{path: committed cursor}`` (the
+    per-path committed-cursor baseline, so growth during an ingest is re-detected
+    next cycle); ``discovery_step(files, seen) → (files, emitted)`` is the
+    ~10-cycle Codex child-discovery frontier (``None`` for Claude — a bare or
+    qualified-Claude stream never runs it). The cache lock is held ONLY inside
+    ``ingest`` / ``discovery_step``, never across a sleep (the #297 WAL
+    discipline)."""
+    import time as _time
+    watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
+    tail_frame = (
+        "event: tail\ndata: " + json.dumps(tail_data) + "\n\n").encode("utf-8")
+
+    if passive:
+        # Frozen-data contract: no ingest, no emit. Keep-alive only.
+        while True:
+            _time.sleep(_LIVE_TAIL_KEEPALIVE)
+            handler.wfile.write(b": keep-alive\n\n")
+            handler.wfile.flush()
+
+    # #278 Theme B: signal that this connection is ACTIVELY live-tailing (not
+    # degraded to keep-alive). The client sets `live` only on this 'ready'.
+    handler.wfile.write(b"event: ready\ndata: {}\n\n")
+    handler.wfile.flush()
+
+    files = resolve()
+    # Best-effort connect ingest for immediacy, then baseline `seen` from the
+    # cache's own committed cursor so any pre-connect growth the connect-ingest
+    # declined is still caught on cycle 1.
+    try:
+        if files:
+            ingest(files)
+    except sqlite3.DatabaseError:
+        pass
+    seen = cached_sigs(files)
+
+    idle = 0.0
+    cycles = 0
+    while True:
+        _time.sleep(_LIVE_TAIL_POLL_INTERVAL)
+        cycles += 1
+        changed = watch.changed_paths(files, seen)
+        if changed:
+            _time.sleep(_LIVE_TAIL_DEBOUNCE)
+            new_seen, emitted = watch.watch_step(
+                files, seen, ingest_fn=ingest,
+                committed_sig_fn=lambda p: cached_sigs([p]).get(p))
+            seen = new_seen
+            if emitted:
+                handler.wfile.write(tail_frame)
+                handler.wfile.flush()
+                idle = 0.0
+                # A brand-new child file's FIRST content was just ingested, so
+                # the conversation's source-path set may have grown. Re-resolve
+                # now (vs waiting up to _LIVE_TAIL_FILE_RESET_EVERY cycles) so the
+                # new thread live-tails promptly. A new path seeds seen=None (cur
+                # lacks a row) → changed_paths flags it next cycle → it emits.
+                new_files = resolve()
+                if set(new_files) != set(files):
+                    files = new_files
+                    cur = cached_sigs(files)
+                    for p in files:
+                        seen.setdefault(p, cur.get(p))
+                continue
+        idle += _LIVE_TAIL_POLL_INTERVAL
+        if idle >= _LIVE_TAIL_KEEPALIVE:
+            handler.wfile.write(b": keep-alive\n\n")
+            handler.wfile.flush()
+            idle = 0.0
+        if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
+            # Layer 1 (both providers): DB re-resolve so a child ingested by ANY
+            # other writer joins the watch immediately.
+            files = resolve()
+            seen = {p: s for p, s in seen.items() if p in set(files)}
+            # Layer 2 (Codex only): bounded filesystem child discovery for
+            # brand-new files no table yet knows (§5.4). A widened file set emits
+            # a `tail` — the client refetches detail, whose children list
+            # surfaces the new child (no new frame type).
+            if discovery_step is not None:
+                files, disc_emitted = discovery_step(files, seen)
+                if disc_emitted:
+                    handler.wfile.write(tail_frame)
+                    handler.wfile.flush()
+                    idle = 0.0
+
+
+def _bare_conversation_events(handler, session_id: str) -> None:
+    """Bare legacy Claude live-tail — today's no-preflight, ``sessionId``-framed
+    behavior, byte-identical (spec §5.2 reserves this for bare streams)."""
+    cq = handler._conversation_query()
+    _send_sse_headers(handler)
+    passive = bool(type(handler).no_sync)
     try:
         conn = sys.modules["_cctally_dashboard"].open_cache_db()  # late-binding: patched at test_conversation_endpoints.py:674
     except (sqlite3.DatabaseError, OSError):
@@ -387,89 +799,177 @@ def _handle_get_conversation_events_impl(handler, path: str) -> None:
         return sync_cache(conn, only_paths=set(changed))
 
     try:
-        if passive:
-            # Frozen-data contract: no ingest, no emit. Keep-alive only.
-            while True:
-                _time.sleep(_LIVE_TAIL_KEEPALIVE)
-                handler.wfile.write(b": keep-alive\n\n")
-                handler.wfile.flush()
-
-        # #278 Theme B: signal that this connection is ACTIVELY live-tailing
-        # (not degraded to keep-alive). The client sets `live` only on this, so
-        # passive/cache-open-failed streams fall back to the memo-backed global
-        # tick instead of stranding updates (Codex F4). Passive branch above
-        # emits only ': keep-alive', so 'ready' is unambiguous.
-        handler.wfile.write(b"event: ready\ndata: {}\n\n")
-        handler.wfile.flush()
-
-        files = _resolve()
-        # Best-effort connect ingest for immediacy, then baseline `seen`
-        # from the cache's own offsets (session_files) so any pre-connect
-        # growth the connect-ingest declined is still caught on cycle 1.
-        try:
-            if files:
-                sync_cache(conn, only_paths=set(files))
-        except sqlite3.DatabaseError:
-            pass
-        seen = _cached_file_sigs(conn, files)
-
-        idle = 0.0
-        cycles = 0
-        while True:
-            _time.sleep(_LIVE_TAIL_POLL_INTERVAL)
-            cycles += 1
-            changed = watch.changed_paths(files, seen)
-            if changed:
-                _time.sleep(_LIVE_TAIL_DEBOUNCE)
-                new_seen, emitted = watch.watch_step(
-                    files, seen, ingest_fn=_ingest,
-                    committed_sig_fn=lambda p: _cached_file_sigs(conn, [p]).get(p))
-                seen = new_seen
-                if emitted:
-                    handler.wfile.write(
-                        ("event: tail\ndata: "
-                         + json.dumps({"sessionId": session_id})
-                         + "\n\n").encode("utf-8"))
-                    handler.wfile.flush()
-                    idle = 0.0
-                    # §6 P2-H — a brand-new subagent file's FIRST content was
-                    # just ingested by this emitting cycle, so the session's
-                    # source-path set may have grown. Re-resolve it now (vs
-                    # waiting up to _LIVE_TAIL_FILE_RESET_EVERY cycles) so the
-                    # new thread (incl. a skill invoked inside it) live-tails
-                    # promptly. A new path seeds seen=None (cur lacks a row),
-                    # so changed_paths flags it next cycle → it ingests + emits.
-                    # setdefault never disturbs an existing cursor.
-                    new_files = _resolve()
-                    if set(new_files) != set(files):
-                        files = new_files
-                        cur = _cached_file_sigs(conn, files)
-                        for p in files:
-                            seen.setdefault(p, cur.get(p))
-                    continue
-            idle += _LIVE_TAIL_POLL_INTERVAL
-            if idle >= _LIVE_TAIL_KEEPALIVE:
-                handler.wfile.write(b": keep-alive\n\n")
-                handler.wfile.flush()
-                idle = 0.0
-            if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
-                files = _resolve()
-                seen = {p: s for p, s in seen.items() if p in set(files)}
+        _run_conversation_events_stream(
+            handler, conn, passive=passive,
+            tail_data={"sessionId": session_id},
+            resolve=_resolve, ingest=_ingest,
+            cached_sigs=lambda paths: _cached_file_sigs(conn, paths))
     except (BrokenPipeError, ConnectionResetError,
             ConnectionAbortedError, socket.timeout):
         # #279 S1 F3: a stalled send past the handler timeout raises
-        # socket.timeout inside the SSE loop — treat it as a client
-        # disconnect (same as the other peer-gone classes), not an error.
-        pass            # client disconnect is normal
+        # socket.timeout — treat as a client disconnect, not an error.
+        pass
     except Exception as exc:  # noqa: BLE001
-        # #279 S5 F6.2 (spec §8): a genuine bug mid-stream used to kill the
-        # live-tail SSE silently via handle_error. Headers are already
-        # committed — route the operator signal through the _lib_log chokepoint
-        # (handler.log_error) + a deliberate clean close via the finally below.
+        # #279 S5 F6.2 (spec §8): headers are already committed, so route the
+        # operator signal through the _lib_log chokepoint + a clean close.
         handler.log_error("api/conversation/events stream failed: %r", exc)
     finally:
         if conn is not None:
             conn.close()
+
+
+def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
+    """Build the ~10-cycle Codex child-discovery frontier step (spec §5.4), or
+    ``None`` when the conversation's own root is not currently configured (the
+    frontier is then skipped — the DB re-resolve of layer 1 still runs). The
+    frontier is constructed ONCE per SSE connection so its directory index,
+    pending-candidate set, and rotation cursors accumulate across cycles."""
+    walk_root = _codex_walk_root_for_conversation(conn, conversation_key)
+    if walk_root is None:
+        return None
+    fw = sys.modules["cctally"]._load_sibling("_lib_codex_conversation_watch")
+    frontier = fw.CodexChildFrontier(walk_root)
+
+    def _discovery(files, seen):
+        # Diff brand-new *.jsonl against every tracked Codex file; the same
+        # {path: size} feeds both the frontier's known-set and its committed-size
+        # growth baseline (a plain SELECT — no lock across the sleep).
+        known = _codex_all_committed_sizes(conn)
+        to_ingest = frontier.cycle(
+            known_paths=set(known.keys()), committed_sizes=known)
+        if not to_ingest:
+            return files, False
+        try:
+            sync_codex_cache(conn, only_paths=set(to_ingest))
+        except sqlite3.DatabaseError:
+            return files, False
+        # Reap the now-classified candidates (child → already widened; non-child
+        # → done). Unclassified ones stay pending and are retried next cycle.
+        frontier.reap(_codex_classified_paths(conn, to_ingest))
+        new_files = cq_codex.codex_conversation_source_paths(conn, conversation_key)
+        if set(new_files) == set(files):
+            return files, False
+        cur = _codex_cached_file_sigs(conn, new_files)
+        for p in new_files:
+            seen.setdefault(p, cur.get(p))
+        return new_files, True
+
+    return _discovery
+
+
+def _qualified_conversation_events(handler, key: str) -> None:
+    """Qualified (``v1.``) live-tail (spec §5.2): a neutral preflight — resolve →
+    normalization authority (Codex) → existence — answered as plain JSON per
+    §2.3 BEFORE any SSE bytes; only on ``ok`` are SSE headers committed and the
+    ``conversationKey``-framed stream entered. A qualified Claude key reuses the
+    existing Claude ingestion/watch mechanics internally; a Codex key uses
+    targeted ingest + the directory-frontier child discovery."""
+    disp = _conversation_dispatch_impl()
+    try:
+        conn = sys.modules["_cctally_dashboard"].open_cache_db()  # late-binding: patched at test_conversation_endpoints.py:674
+    except (sqlite3.DatabaseError, OSError):
+        conn = None
+
+    if conn is None:
+        # Cache unavailable — existence is unknowable, so we cannot preflight.
+        # Degrade to a passive keep-alive stream (the client's backstop tick
+        # still surfaces turns), mirroring the bare path's conn-failure fallback.
+        _send_sse_headers(handler)
+        try:
+            _run_conversation_events_stream(
+                handler, None, passive=True, tail_data={"conversationKey": key},
+                resolve=lambda: [], ingest=lambda c: None,
+                cached_sigs=lambda paths: {})
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, socket.timeout):
+            pass
+        except Exception as exc:  # noqa: BLE001
+            handler.log_error("api/conversation/events stream failed: %r", exc)
+        return
+
+    try:
+        preflight = disp.neutral_events_preflight(conn, key)
+    except Exception as exc:  # noqa: BLE001
+        # A preflight failure is a pre-headers error, so a JSON 500 is still
+        # possible (unlike a mid-stream failure).
+        handler.log_error("api/conversation/events preflight failed: %r", exc)
+        handler._respond_json(500, {"error": "internal error"})
+        conn.close()
+        return
+    status = preflight.get("status")
+    if status == "normalization_pending":
+        # A legitimate empty state (migration 025 not yet stamped) — 200 JSON
+        # envelope, never a 200-SSE stream with nothing to say (§2.3).
+        handler._respond_json(200, preflight)
+        conn.close()
+        return
+    if status != "ok":
+        # not_found (unresolvable ref or no rows) → 404 JSON (§2.3).
+        handler._respond_json(404, preflight)
+        conn.close()
+        return
+    source = preflight["source"]
+    native = preflight["native_key"]
+
+    # ok → commit SSE headers and enter the qualified watch loop.
+    _send_sse_headers(handler)
+    passive = bool(type(handler).no_sync)
+    if source == "codex":
+        cq_codex = _conversation_query_impl_codex()
+
+        def _resolve():
+            return cq_codex.codex_conversation_source_paths(conn, key)
+
+        def _ingest(changed):
+            return sync_codex_cache(conn, only_paths=set(changed))
+
+        cached = lambda paths: _codex_cached_file_sigs(conn, paths)
+        discovery = _make_codex_discovery_step(handler, conn, key, cq_codex)
+    else:  # claude — reuse the Claude mechanics, speak qualified frames.
+        cq = handler._conversation_query()
+
+        def _resolve():
+            return cq.session_source_paths(conn, native)
+
+        def _ingest(changed):
+            return sync_cache(conn, only_paths=set(changed))
+
+        cached = lambda paths: _cached_file_sigs(conn, paths)
+        discovery = None
+
+    try:
+        _run_conversation_events_stream(
+            handler, conn, passive=passive,
+            tail_data={"conversationKey": key},
+            resolve=_resolve, ingest=_ingest, cached_sigs=cached,
+            discovery_step=discovery)
+    except (BrokenPipeError, ConnectionResetError,
+            ConnectionAbortedError, socket.timeout):
+        pass
+    except Exception as exc:  # noqa: BLE001
+        handler.log_error("api/conversation/events stream failed: %r", exc)
+    finally:
+        conn.close()
+
+
+def _handle_get_conversation_events_impl(handler, path: str) -> None:
+    """``GET /api/conversation/<id>/events`` — per-conversation live-tail SSE
+    (spec §5.2). The transcript privacy gate is the first act, source-
+    independent. A ``v1.`` key gets the neutral preflight + qualified
+    (``conversationKey``) frames for BOTH providers; every other id keeps
+    today's no-preflight, ``sessionId``-framed bare behavior byte-identical."""
+    if not handler._require_transcripts_allowed():
+        return
+    import urllib.parse as _u
+    key = _u.unquote(path[len("/api/conversation/"):-len("/events")])
+    if not key:
+        handler.send_error(404, "conversation not found")
+        return
+    if key.startswith("v1."):
+        _qualified_conversation_events(handler, key)
+    else:
+        _bare_conversation_events(handler, key)
+
 
 def _handle_get_conversation_search_impl(handler) -> None:
     """``GET /api/conversation/search?q=...&kind=...`` — cross-session
@@ -487,7 +987,14 @@ def _handle_get_conversation_search_impl(handler) -> None:
     if not handler._require_transcripts_allowed():
         return
     import urllib.parse as _u
-    q = _u.parse_qs(handler.path.partition("?")[2])
+    qs_raw = handler.path.partition("?")[2]
+    parsed_src = _parse_source_param(handler, qs_raw)
+    if parsed_src is None:
+        return  # a 400 has already been sent
+    qualified, source = parsed_src
+    if qualified:
+        return _handle_qualified_search(handler, qs_raw, source)
+    q = _u.parse_qs(qs_raw)
     query = _qs_str(q, "q", "")
     limit = _qs_int(q, "limit", 50)
     offset = _qs_int(q, "offset", 0)
@@ -524,6 +1031,21 @@ def _handle_get_conversation_payload_impl(handler, path: str) -> None:
     session_id = _u.unquote(
         path[len("/api/conversation/"):-len("/payload")])
     q = _u.parse_qs(handler.path.partition("?")[2])
+    if session_id.startswith("v1."):
+        # Qualified payload readback (§3.4): Codex uses block_key + which={call,
+        # output}; a v1.claude key keeps the tool_use_id + which={input,result}
+        # selector. neutral_payload picks per the resolved source; gone → 410.
+        which_q = _qs_str(q, "which", "")
+        tool_use_id_q = _qs_str(q, "tool_use_id", "") or None
+        block_key_q = _qs_str(q, "block_key", "") or None
+        disp = _conversation_dispatch()
+        _serve_qualified_entity(
+            handler,
+            lambda conn: disp.neutral_payload(
+                conn, session_id, which=which_q,
+                tool_use_id=tool_use_id_q, block_key=block_key_q),
+            "/api/conversation/payload")
+        return
     tool_use_id = _qs_str(q, "tool_use_id", "")
     which = _qs_str(q, "which", "result")
     if not session_id or which not in ("result", "input") or not tool_use_id:
@@ -556,6 +1078,15 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
     if not session_id:
         handler.send_error(404, "conversation not found")
         return
+    if session_id.startswith("v1."):
+        speed = _resolve_effective_speed()
+        disp = _conversation_dispatch()
+        _serve_qualified_entity(
+            handler,
+            lambda conn: disp.neutral_outline(
+                conn, session_id, effective_speed=speed),
+            "/api/conversation/outline")
+        return
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().get_conversation_outline(conn, session_id),
         "/api/conversation/outline")
@@ -579,6 +1110,13 @@ def _handle_get_conversation_prompts_impl(handler, path: str) -> None:
     session_id = _u.unquote(path[len("/api/conversation/"):-len("/prompts")])
     if not session_id:
         handler.send_error(404, "conversation not found")
+        return
+    if session_id.startswith("v1."):
+        disp = _conversation_dispatch()
+        _serve_qualified_entity(
+            handler,
+            lambda conn: disp.neutral_prompts(conn, session_id),
+            "/api/conversation/prompts")
         return
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().get_conversation_prompts(conn, session_id),
@@ -633,6 +1171,48 @@ def _handle_get_conversation_export_impl(handler, path: str) -> None:
         handler.send_error(404, "conversation not found")
         return
 
+    if session_id.startswith("v1."):
+        # Qualified export (§2.3 markdown leg / §3.6 provider-aware anon):
+        # neutral_export serves the raw markdown member; ``anonymize=1`` scrubs
+        # with the QUALIFIED provider-aware plan (byte-parity with the CLI export).
+        speed = _resolve_effective_speed()
+        disp = _conversation_dispatch()
+        cref = disp.resolve_conversation_ref(session_id)
+
+        def _q_kernel(conn):
+            env = disp.neutral_export(
+                conn, session_id, scope=scope, effective_speed=speed)
+            if env.get("status") != "ok" or not anonymize:
+                return env
+            cq = handler._conversation_query()
+            anon = sys.modules["cctally"]._load_sibling("_lib_conversation_anon")
+            srcs = {cref.source} if cref else set()
+            plan = cq.build_anon_plan_for_sources(
+                conn, home_dir=_os.path.expanduser("~"), sources=srcs)
+            return {**env, "markdown": anon.scrub_text(env["markdown"], plan)}
+
+        ok, env = handler._run_conversation_query(
+            _q_kernel, "/api/conversation/export")
+        if not ok:
+            return
+        status = (env or {}).get("status")
+        if status == "ok":
+            data = env["markdown"].encode("utf-8")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/markdown; charset=utf-8")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+            return
+        if status == "validation_error":
+            handler._respond_json(400, env)
+            return
+        if status == "normalization_pending":
+            handler._respond_json(200, env)
+            return
+        handler._respond_json(404, env)  # not_found
+        return
+
     def _kernel(conn):
         cq = handler._conversation_query()
         md = cq.get_conversation_export(conn, session_id, scope)
@@ -677,6 +1257,40 @@ def _handle_get_conversation_anon_map_impl(handler, path: str) -> None:
         handler.send_error(404, "conversation not found")
         return
     anon = sys.modules["cctally"]._load_sibling("_lib_conversation_anon")
+
+    if session_id.startswith("v1."):
+        # Qualified anon-map (§3.6): existence probe against the ref's OWN
+        # provider tables, then the provider-aware plan (never the legacy builder).
+        disp = _conversation_dispatch()
+        cref = disp.resolve_conversation_ref(session_id)
+        if cref is None:
+            handler._respond_json(
+                404, {"status": "not_found", "conversation_key": session_id})
+            return
+
+        def _q_kernel(conn):
+            cq = handler._conversation_query()
+            if cref.source == "codex":
+                exists = _conversation_query_impl_codex().codex_conversation_exists(
+                    conn, cref.conversation_key)
+            else:
+                exists = cq.conversation_exists(conn, cref.native_key)
+            if not exists:
+                return None
+            plan = cq.build_anon_plan_for_sources(
+                conn, home_dir=_os.path.expanduser("~"), sources={cref.source})
+            return anon.plan_to_wire(plan)
+
+        ok, body = handler._run_conversation_query(
+            _q_kernel, "/api/conversation/anon-map")
+        if not ok:
+            return
+        if body is None:
+            handler._respond_json(
+                404, {"status": "not_found", "conversation_key": session_id})
+            return
+        handler._respond_json(200, body)
+        return
 
     def _kernel(conn):
         cq = handler._conversation_query()
@@ -734,6 +1348,14 @@ def _handle_get_conversation_find_impl(handler, path: str) -> None:
         except _re.error as e:
             handler._respond_json(400, {"error": f"invalid regex: {e}"})
             return
+    if session_id.startswith("v1."):
+        disp = _conversation_dispatch()
+        _serve_qualified_entity(
+            handler,
+            lambda conn: disp.neutral_find(
+                conn, session_id, query, kind=kind, regex=regex, case=case),
+            "/api/conversation/find")
+        return
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().find_in_conversation(
             conn, session_id, query, kind=kind, regex=regex, case=case),
@@ -773,6 +1395,21 @@ def _handle_get_conversation_media_impl(handler, path: str) -> None:
         return
     import urllib.parse as _u
     session_id = _u.unquote(path[len("/api/conversation/"):-len("/media")])
+    if session_id.startswith("v1."):
+        # §3.5 / §2.3: Codex media is capability-gated (explicit 404, never a
+        # silent zero-fill). A v1.claude key serves via its native Claude session
+        # (the existing byte-serving mechanics); an unresolvable v1 → neutral 404.
+        disp = _conversation_dispatch()
+        cref = disp.resolve_conversation_ref(session_id)
+        if cref is None:
+            handler._respond_json(
+                404, {"status": "not_found", "conversation_key": session_id})
+            return
+        if cref.source == "codex":
+            handler._respond_json(
+                404, {"status": "capability_unsupported", "source": "codex"})
+            return
+        session_id = cref.native_key
     q = _u.parse_qs(handler.path.partition("?")[2])
     tool_use_id = _qs_str(q, "tool_use_id", "")
     uuid = _qs_str(q, "uuid", "")

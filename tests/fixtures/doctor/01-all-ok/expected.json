@@ -461,6 +461,22 @@
                 },
                 {
                     "details": {
+                        "active_candidate_count": 0,
+                        "control_db_agrees": null,
+                        "selected_age_seconds": Infinity,
+                        "tombstones": {
+                            "fiveHour": "absent",
+                            "sevenDay": "absent"
+                        },
+                        "transport_age_seconds": Infinity
+                    },
+                    "id": "data.statusline_pipeline",
+                    "severity": "ok",
+                    "summary": "no recent regular-pool timer observed",
+                    "title": "Statusline pipeline"
+                },
+                {
+                    "details": {
                         "claude_jsonl_present": false,
                         "entries": 0
                     },
@@ -631,7 +647,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 30,
+            "ok": 31,
             "warn": 5
         },
         "severity": "warn"

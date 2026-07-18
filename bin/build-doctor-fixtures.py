@@ -56,6 +56,9 @@ SCENARIOS = {
     # #311: a recognized cctally statusLine command with NO refreshInterval →
     # the only WARN is hooks.statusline_refresh_interval (all_ok otherwise).
     "25-statusline-refresh-missing": "statusline_refresh_missing",
+    # #318: a write-ahead authoritative tombstone survived a prior writer,
+    # so doctor must surface the bounded repair action without mutating it.
+    "26-statusline-authority-repair": "statusline_authority_repair",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -263,6 +266,15 @@ def _scenario_body(slug: str) -> str:
                 "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
             """)
         return _scenario_body("all_ok") + pricing_cache
+    if slug == "statusline_authority_repair":
+        # A valid inflight 7d tombstone is an intentional crash-recovery
+        # signal.  Keep the clean all_ok baseline so the generated golden
+        # proves the new statusline pipeline check is the only added WARN.
+        return _scenario_body("all_ok") + textwrap.dedent("""\
+            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-authoritative-7d.json" <<'JSON'
+            {"schemaVersion":1,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
+            JSON
+        """)
     if slug == "legacy_hooks_detected":
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/.claude/hooks"

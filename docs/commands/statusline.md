@@ -263,24 +263,47 @@ runs when the status line has not fed recently.
 
 Properties of the persist (all side effects — the rendered line never changes):
 
-- **Throttled.** At most one persist per short window, keyed off a dedicated
-  liveness marker (not snapshot age — the kernel dedups unchanged percentages
-  without refreshing the capture time, so an unchanged-value render still
-  refreshes the liveness marker).
-- **Concurrency-safe.** A cross-process lock plus an under-lock liveness
-  re-check mean simultaneous renders across sessions produce at most one
-  snapshot — no thundering herd of duplicate rows.
+- **Arbitrated.** Each eligible regular-pool session atomically publishes a
+  small private candidate before attempting the non-blocking reducer lock.
+  The next active reducer considers the current candidates independently for
+  5h and 7d, so a fresher reading is not lost merely because an older session
+  rendered first. A normal advance is published on that next reducer tick.
+  Equal-window decreases use a full contributor-consensus cycle to distinguish
+  a genuine credit/reset from one stale session. Reset-to-zero keeps the first
+  confirmed kernel attempt armed, then requires another revalidated tick before
+  the existing record kernel can commit its debounce.
+- **Bounded evidence.** Candidate receipt time is the only freshness signal in
+  the private spool. If every active candidate is stale, cctally cannot infer
+  the source's original capture order; it waits for a later live candidate or
+  an authoritative observation instead of manufacturing a history ordering.
+- **Concurrency-safe.** A lock loser leaves its candidate for a later active
+  timer tick rather than discarding it. The reducer serializes any database
+  publication, while statusline rendering itself remains non-blocking.
+- **Truthful freshness.** Timer transport and selected usage are separate:
+  a regular-pool statusline tick records transport liveness, but selected
+  freshness advances only when the reducer or an authoritative writer has
+  reconciled the database observation. This prevents an unchanged stale
+  renderer from indefinitely suppressing the OAuth backfill: its selected-age
+  gate never treats transport liveness alone as proof of selected usage.
 - **Detached + fail-safe.** The write runs in a detached child so the render
   stays fast, and the whole persist is guarded so it can never break rendering.
   If `rate_limits` is absent (older Claude Code, or none supplied), the persist
   is a clean no-op and the OAuth backfill covers that case.
+
+OAuth and manual credit writers use the same selected-state protocol. They
+write an independent per-axis recovery marker before the database operation,
+then reconcile the selected control only after the operation completes. A
+crash or failed write therefore stays fail-closed until the next authoritative
+refresh repairs it; an equality-deduplicated database write is still a real
+authoritative observation. The statusline candidate/control files contain no
+session id, transcript path, model id, workspace, rendered line, or raw input.
 
 Snapshots written this way are labeled `source=statusline`; OAuth-fed rows are
 labeled `source=api`.
 
 ### Keeping usage fresh during subagent waits (`statusLine.refreshInterval`)
 
-Claude Code's status-line updates are **event-driven**, so while a coordinator session waits on a long-running subagent those events go quiet: `cctally statusline` isn't invoked, and the usage snapshots stop advancing for the whole subagent run. Claude Code's documented `statusLine.refreshInterval` setting re-runs the status-line command on a fixed timer *in addition to* the event-driven updates, which is the only idle-time trigger for the persist. `cctally setup` therefore adds `"refreshInterval": 30` to a cctally-pointing `statusLine` block that doesn't already have one (see [setup.md](setup.md) for the add-when-absent / never-mutate / never-remove ownership rules), so usage keeps ticking on a 30-second cadence even during an otherwise-idle wait. The interval is deliberately larger than the internal persist throttle so a steady tick isn't beat-frequency-throttled.
+Claude Code's status-line updates are **event-driven**, so while a coordinator session waits on a long-running subagent those events go quiet: `cctally statusline` isn't invoked, and the usage snapshots stop advancing for the whole subagent run. Claude Code's documented `statusLine.refreshInterval` setting re-runs the status-line command on a fixed timer *in addition to* the event-driven updates, which is the only idle-time trigger for the persist. `cctally setup` therefore adds `"refreshInterval": 30` to a cctally-pointing `statusLine` block that doesn't already have one (see [setup.md](setup.md) for the add-when-absent / never-mutate / never-remove ownership rules), so usage keeps ticking on a 30-second cadence even during an otherwise-idle wait. Candidate arbitration removed the old internal persistence throttle, so this timer is not paired with a second cadence gate.
 
 This is a **Claude Code `settings.json` key**, not the `cctally statusline --refresh-interval N` flag — those are unrelated. The CLI `--refresh-interval` flag is a **no-op** accepted only for `ccusage` drop-in compatibility (see the flag reference above); the timer is entirely Claude Code's, driven by `statusLine.refreshInterval` in `~/.claude/settings.json`.
 

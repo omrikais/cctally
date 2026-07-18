@@ -2548,6 +2548,73 @@ def _credit_json(plan, *, applied, dry_run, forced, stale_replays, hwm_before):
     }
 
 
+def _revalidate_credit_plan(conn, args, *, now, at_dt, expected_plan):
+    """Recompute the confirmed credit plan from locked, current DB truth.
+
+    The caller has already completed every preview/refusal/confirmation path.
+    Returning ``None`` is deliberately side-effect free: it means a concurrent
+    writer changed the requested credit's basis and the user must retry rather
+    than authorizing a different mutation than the preview showed.
+    """
+    try:
+        if getattr(args, "week", None):
+            week_start_date = args.week
+            ws_at, we_at = _get_canonical_boundary_for_date(conn, week_start_date)
+            if not ws_at or not we_at:
+                return None
+        else:
+            fetched = _fetch_current_week_snapshots(conn, at_dt)
+            if fetched is None:
+                return None
+            ws_at, we_at, _samples = fetched
+            ws_at = ws_at if isinstance(ws_at, str) else ws_at.isoformat(timespec="seconds")
+            we_at = we_at if isinstance(we_at, str) else we_at.isoformat(timespec="seconds")
+            week_start_date = parse_iso_datetime(ws_at, "ws_at").date().isoformat()
+        existing = conn.execute(
+            "SELECT id, effective_at_utc, observed_pre_credit_pct "
+            "FROM weekly_credit_floors WHERE week_start_date=? "
+            "ORDER BY unixepoch(effective_at_utc) DESC, id DESC LIMIT 1",
+            (week_start_date,),
+        ).fetchone()
+        is_force = bool(getattr(args, "force", False))
+        if getattr(args, "from_pct", None) is not None:
+            from_pct, from_source = float(args.from_pct), "explicit"
+        elif existing is not None and existing[2] is not None:
+            from_pct, from_source = float(existing[2]), "prior_credit"
+        else:
+            from_pct = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+            if from_pct is None:
+                return None
+            from_source = "hwm"
+        is_completion = False
+        if existing is not None and not is_force:
+            owned = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                " WHERE week_start_date=? AND source='record-credit' "
+                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+                (week_start_date, existing[1]),
+            ).fetchone()
+            is_completion = owned is None
+        if existing is not None and not is_force and not is_completion:
+            return None
+        plan = _build_credit_plan(
+            week_start_date=week_start_date,
+            week_start_at=ws_at,
+            week_end_at=we_at,
+            from_pct=from_pct,
+            from_source=from_source,
+            to_pct=args.to,
+            at_dt=at_dt,
+            now=now,
+            effective_override=existing[1] if is_completion else None,
+        )
+    except (sqlite3.DatabaseError, ValueError, TypeError):
+        return None
+    if plan != expected_plan:
+        return None
+    return plan, existing, is_completion
+
+
 def cmd_record_credit(args) -> int:
     now = _command_as_of()
     try:
@@ -2704,23 +2771,68 @@ def cmd_record_credit(args) -> int:
                 print("aborted — nothing written")
                 return 0
 
-        # 4a. Existing-floor handling (M2; state classified at step 2a). The
-        #     fully-applied refuse was hoisted above the confirm prompt (#212
-        #     N2), so only two cases remain here: `--force` clears the prior
-        #     floor + re-records at a fresh effective; a half-applied credit
-        #     (floor row, no command-owned snapshot — a crash between
-        #     _apply_credit's floor commit and the synthetic snapshot) falls
-        #     through to a completion (the plan reuses the existing effective
-        #     and the apply steps are idempotent). `existing`/`is_completion`
-        #     were resolved up front keyed on week_start_date /
-        #     weekly_credit_floors.
-        forced = False
-        if existing is not None and is_force:
-            _force_clear_credit(conn, plan.week_start_date)
-            forced = True
+        # Every non-mutating exit is above this point.  Re-open under the
+        # selected-state writer lock, recompute from current DB truth, and
+        # refuse plan drift before any durable pipeline artifact is visible.
+        # This is intentionally after confirmation: preview/no/TTY refusal
+        # must not create an inflight tombstone merely by inspecting a credit.
+        conn.close()
+        conn = None
+        c = _cctally()
+        with c._selected_state_lock():
+            conn = open_db()
+            revalidated = c._revalidate_credit_plan(
+                conn,
+                args,
+                now=now,
+                at_dt=at_dt,
+                expected_plan=plan,
+            )
+            if revalidated is None:
+                eprint("record-credit: plan changed while awaiting confirmation; retry")
+                return 2
+            plan, existing, is_completion = revalidated
+            stale_replays = _count_stale_replays(conn, plan)
+            hwm_before = _resolve_reset_aware_hwm(
+                conn, plan.week_start_date, plan.week_start_at, plan.week_end_at
+            )
+            if hwm_before is None:
+                hwm_before = plan.from_pct
+            try:
+                handles = c._authoritative_begin(
+                    {"sevenDay"}, now_epoch=int(time.time())
+                )
+            except (OSError, ValueError) as exc:
+                eprint(f"record-credit: could not prepare authoritative state: {exc}")
+                return 3
 
-        five_hour = _resolve_prior_5h(conn, at_dt)
-        _apply_credit(conn, plan, five_hour=five_hour)
+            # Existing-floor handling remains exactly scoped to this week, but
+            # the weekly tombstone is already fail-closed immediately before
+            # either mutation kernel runs.
+            forced = False
+            if existing is not None and is_force:
+                _force_clear_credit(conn, plan.week_start_date)
+                forced = True
+            five_hour = _resolve_prior_5h(conn, at_dt)
+            _apply_credit(conn, plan, five_hour=five_hour)
+
+            # A successful credit is authoritative only after the post-credit
+            # DB state has a stable projection and all selected artifacts are
+            # atomically committed.  Leave inflight on any failure so a later
+            # authority repair remains fail-closed.
+            try:
+                projection = c._read_db_projection_stable()
+                completion_epoch = int(time.time())
+                c._authoritative_commit(
+                    handles, completion_epoch=completion_epoch
+                )
+                c._reconcile_selected_control(
+                    projection, now_epoch=completion_epoch, observed_axes={"sevenDay"}
+                )
+                c._statusline_observe_touch()
+            except Exception as exc:
+                eprint(f"record-credit: authoritative state incomplete: {exc}")
+                return 3
 
         if is_json:
             print(json.dumps(_credit_json(
@@ -3757,13 +3869,14 @@ def _hook_tick_throttle_touch() -> None:
 
 
 # =========================================================================
-# Statusline observation marker + OAuth backoff deadline (spec 2026-07-17)
+# Statusline selected/transport markers + OAuth backoff deadline (#318)
 # =========================================================================
 #
 # Two independent markers with two DIFFERENT time encodings:
-#   - The observation marker is MTIME-based (mirrors _hook_tick_throttle_*):
-#     it answers "how long since the statusline last fed?", so its age is
-#     the signal. It is touched even on a dedup no-op.
+#   - The selected-observation marker is MTIME-based and represents an actual
+#     selected DB change or authoritative OAuth confirmation.
+#   - The transport marker is also MTIME-based and represents an eligible
+#     regular-pool candidate reaching the spool; it never throttles OAuth.
 #   - The OAuth backoff marker is CONTENT-based: it stores a FUTURE absolute
 #     epoch deadline as text. Its mtime is meaningless (~now). Encoding the
 #     deadline as mtime would future-date the file and, if ever confused
@@ -3771,11 +3884,9 @@ def _hook_tick_throttle_touch() -> None:
 #     deliberate split (Codex P1-3).
 
 
-def _statusline_observe_age_seconds() -> float:
-    """Seconds since the statusline last successfully fed usage; +inf if
-    never. Mtime-based, mirroring ``_hook_tick_throttle_age_seconds``."""
+def _marker_age(path) -> float:
     try:
-        mtime = _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.stat().st_mtime
+        mtime = path.stat().st_mtime
     except FileNotFoundError:
         return float("inf")
     except OSError:
@@ -3783,18 +3894,36 @@ def _statusline_observe_age_seconds() -> float:
     return max(0.0, time.time() - mtime)
 
 
-def _statusline_observe_touch() -> None:
-    """Mark the statusline as alive (mtime := now, creating if missing).
-
-    Called after every persist attempt that fed valid 7d input through
-    ``cmd_record_usage`` successfully — INCLUDING a dedup (no-insert)
-    return, so the throttles reflect liveness rather than snapshot age."""
+def _touch_marker(path) -> None:
     try:
         _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-        _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.touch(exist_ok=True)
-        os.utime(_cctally_core.STATUSLINE_OBSERVE_MARKER_PATH, None)
+        path.touch(exist_ok=True)
+        os.utime(path, None)
     except OSError:
         pass
+
+
+def _statusline_observe_age_seconds() -> float:
+    """Seconds since selected/authoritative usage changed; +inf if never."""
+    return _marker_age(_cctally_core.STATUSLINE_OBSERVE_MARKER_PATH)
+
+
+def _statusline_observe_touch() -> None:
+    """Mark selected usage freshness after a proven selected transition.
+
+    The historical public helper names remain aliases for selected freshness.
+    """
+    _touch_marker(_cctally_core.STATUSLINE_OBSERVE_MARKER_PATH)
+
+
+def _statusline_transport_age_seconds() -> float:
+    """Seconds since an eligible regular-pool candidate reached the spool."""
+    return _marker_age(_cctally_core.STATUSLINE_TRANSPORT_MARKER_PATH)
+
+
+def _statusline_transport_touch() -> None:
+    """Mark regular-pool statusline transport after an atomic candidate write."""
+    _touch_marker(_cctally_core.STATUSLINE_TRANSPORT_MARKER_PATH)
 
 
 def _oauth_backoff_remaining_seconds() -> float:

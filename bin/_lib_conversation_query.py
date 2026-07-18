@@ -2540,6 +2540,94 @@ def build_anon_plan_for_db(conn, *, home_dir):
         home_dirs=sorted(home_dirs), usernames=sorted(usernames))
 
 
+def build_anon_plan_for_sources(conn, *, home_dir, sources):
+    """Provider-aware :class:`AnonPlan` for QUALIFIED conversation surfaces
+    (#294 S7, §3.6). A SEPARATE builder from :func:`build_anon_plan_for_db`, which
+    stays byte-untouched together with every bare-Claude call site — unioning Codex
+    roots into the legacy builder would renumber its ``project-N`` tokens and change
+    bare-Claude anonymized bytes. This builder is used ONLY by ``v1.``-qualified
+    requests (both providers), which are new and carry no byte-compat debt.
+
+    ``sources`` selects the provider legs to include (e.g. ``{"codex"}`` or
+    ``{"claude"}``). The Codex leg draws ONLY from the authoritative tables:
+    provider root dirs from ``codex_source_roots.canonical_root_path``, observed
+    project paths from validated ``codex_conversation_threads.cwd`` (absolute paths
+    only), display labels from ``codex_conversation_rollups.project_label``.
+    ``git_json`` is NOT a path source (its fields are branch/repository metadata,
+    not filesystem roots). The existing home-dir/username machinery and
+    ``SECRET_PATTERNS`` apply unchanged; coverage stays best-effort-over-known-tokens
+    and the per-token replacement stays fail-closed."""
+    from _lib_conversation_anon import build_anon_plan
+    want = set(sources or ())
+    project_roots: dict = {}
+    paths: set = set()
+    if "claude" in want:
+        cwds: set = set()
+        try:
+            for (cwd,) in conn.execute(
+                    "SELECT DISTINCT cwd FROM conversation_messages "
+                    "WHERE cwd IS NOT NULL AND cwd != ''"):
+                if cwd:
+                    cwds.add(cwd)
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for (pp,) in conn.execute(
+                    "SELECT DISTINCT project_path FROM session_files "
+                    "WHERE project_path IS NOT NULL AND project_path != ''"):
+                if pp:
+                    cwds.add(pp)
+        except sqlite3.OperationalError:
+            pass
+        for c in cwds:
+            project_roots[c] = _project_label(c)
+            paths.add(c)
+    if "codex" in want:
+        labels: dict = {}
+        try:
+            for ck, pl in conn.execute(
+                    "SELECT conversation_key, project_label FROM codex_conversation_rollups "
+                    "WHERE project_label IS NOT NULL AND project_label != ''"):
+                labels[ck] = pl
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for ck, cwd in conn.execute(
+                    "SELECT conversation_key, cwd FROM codex_conversation_threads "
+                    "WHERE cwd IS NOT NULL AND cwd != ''"):
+                if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
+                    project_roots[cwd] = labels.get(ck) or _project_label(cwd)
+                    paths.add(cwd)
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for (root_path,) in conn.execute(
+                    "SELECT canonical_root_path FROM codex_source_roots "
+                    "WHERE canonical_root_path IS NOT NULL AND canonical_root_path != ''"):
+                if isinstance(root_path, str) and root_path and os.path.isabs(root_path):
+                    project_roots.setdefault(root_path, _project_label(root_path))
+                    paths.add(root_path)
+        except sqlite3.OperationalError:
+            pass
+    home_dirs: set = set()
+    usernames: set = set()
+    if home_dir:
+        home_dirs.add(home_dir)
+        u = os.path.basename(home_dir.rstrip("/"))
+        if u:
+            usernames.add(u)
+    for p in paths:
+        for prefix in ("/Users/", "/home/"):
+            if p.startswith(prefix):
+                user = p[len(prefix):].split("/", 1)[0]
+                if user:
+                    home_dirs.add(prefix + user)
+                    usernames.add(user)
+    return build_anon_plan(
+        project_roots=project_roots,
+        home_dirs=sorted(home_dirs), usernames=sorted(usernames))
+
+
 _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")
 
 

@@ -2650,15 +2650,21 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
     t_export = t_sub.add_parser(
         "export", help="Export a whole session as Markdown (anonymized by default)",
         formatter_class=CLIHelpFormatter)
-    t_export.add_argument("session_id", metavar="SESSION_ID",
-                          help="Claude sessionId to export")
+    t_export.add_argument("session_id", metavar="ID",
+                          help="A Claude sessionId or a v1. conversation key "
+                               "(Codex conversations use the v1. key)")
     t_export.add_argument(
         "--scope", choices=("all", "prompts", "chat", "recipe"), default="all",
-        help="Which slice to export (default: all)")
+        help="Which slice to export (default: all; Codex accepts only 'all')")
     t_export.add_argument(
         "--raw", action="store_true",
         help="Disable the whole scrub (identity + secrets); byte-identical to "
              "the dashboard raw export")
+    t_export.add_argument(
+        "--speed", choices=("auto", "standard", "fast"), default=None,
+        help="Codex service tier for per-turn cost (default: auto). Applies only "
+             "to Codex (v1.) conversations; an explicit value on any other ref "
+             "is a usage error")
     t_export.add_argument(
         "-o", "--output", metavar="PATH", default=None,
         help="Write to PATH instead of stdout (same exact bytes)")
@@ -2669,6 +2675,9 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
         formatter_class=CLIHelpFormatter)
     t_search.add_argument("query", metavar="QUERY", help="Search text")
     t_search.add_argument(
+        "--source", choices=("claude", "codex"), default="claude",
+        help="Which provider's conversations to search (default: claude)")
+    t_search.add_argument(
         "--kind",
         choices=("all", "prompts", "assistant", "tools", "thinking",
                  "title", "files"),
@@ -2676,7 +2685,11 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
     t_search.add_argument("--limit", type=int, default=50,
                           help="Max results (default: 50)")
     t_search.add_argument("--offset", type=int, default=0,
-                          help="Result offset for pagination (default: 0)")
+                          help="Result offset for pagination (default: 0; "
+                               "Claude only — Codex paginates with --cursor)")
+    t_search.add_argument("--cursor", default=None, metavar="TOKEN",
+                          help="Codex pagination cursor from a prior nextCursor "
+                               "(requires --source codex)")
     t_search.add_argument("--project", action="append", default=None,
                           metavar="LABEL",
                           help="Filter by project label (repeatable)")

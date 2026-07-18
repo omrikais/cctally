@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
 
 import _lib_codex_conversation as kern
 from _lib_conversation import _strip_ansi
-from _lib_conversation_query import _first_nonblank_line
+from _lib_conversation_query import _FULL_PAYLOAD_CEILING, _first_nonblank_line
 from _lib_pricing import _calculate_codex_entry_cost
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -37,8 +39,15 @@ CODEX_NORMALIZATION_MIGRATION = "025_codex_conversation_normalization"
 # fingerprint is a domain-separated hash, NEVER a raw path (privacy-safe).
 CODEX_ITEM_KEY_DOMAIN = b"cctally-codex-item-key-v1\0"
 CODEX_ITEM_PATH_DOMAIN = b"cctally-codex-item-path-v1\0"
+# S7 §3.4: opaque payload-block anchor over a tool_call row's row-class identity.
+# Same domain-separated hash family as codex_item_key's row class, distinct domain.
+CODEX_BLOCK_KEY_DOMAIN = b"cctally-codex-block-key-v1\0"
 
 CODEX_SEARCH_KINDS = ("all", "prompts", "assistant", "tools", "thinking", "title", "files")
+
+# In-conversation find taxonomy (S7 §3.1) — byte-equal to the Claude _FIND_KINDS
+# tuple (no title/files: those are cross-conversation search axes only).
+CODEX_FIND_KINDS = ("all", "prompts", "assistant", "tools", "thinking")
 
 # Normalized-message column order — matches CodexNormalizedRow field order so a
 # SELECT row splats straight into the dataclass.
@@ -130,6 +139,36 @@ def _item_key_for_item(conversation_key: str, item: dict) -> str:
         content_digest=anchor.content_digest)
 
 
+def codex_block_key(
+    conversation_key: str,
+    *,
+    source_path: str | None,
+    line_offset: int | None,
+    content_digest: str | None,
+) -> str:
+    """Opaque, ordinal-free payload-block anchor over a tool_call row's row-class
+    identity (§3.4). Same domain-separated hash family as ``codex_item_key``'s row
+    class — ``(conversation_key, fingerprint(source_path), line_offset,
+    content_digest)`` — with a DISTINCT domain, so a block key never collides with
+    an item key. Stable per block, unique per tool_call physical row: a same-offset
+    content replacement changes it (content_digest moves), an out-of-order append
+    elsewhere leaves it (no population-relative ordinals)."""
+    parts = (
+        conversation_key or "",
+        _source_path_fingerprint(source_path),
+        "" if line_offset is None else str(line_offset),
+        content_digest or "",
+    )
+    raw = "\x00".join(parts).encode("utf-8")
+    return "cbk1_" + hashlib.sha256(CODEX_BLOCK_KEY_DOMAIN + raw).hexdigest()[:40]
+
+
+def _block_key_for_row(row) -> str:
+    return codex_block_key(
+        row.conversation_key, source_path=row.source_path,
+        line_offset=row.line_offset, content_digest=row.content_digest)
+
+
 # ── row loading + display helpers ─────────────────────────────────────────────
 
 
@@ -173,34 +212,52 @@ def _item_kind(item: dict) -> str:
     return item["anchor_row"].kind  # unturned: the row's own provider kind
 
 
-def _build_item_blocks(item: dict) -> list[dict]:
-    """Assemble an item's blocks, folding each ``tool_output`` into its
-    ``tool_call`` block via ``call_id`` when that call_id has exactly one owner
-    (§5.2). Physical order within the item is preserved."""
+def _item_blocks_with_rows(item: dict) -> list[list]:
+    """Assemble an item's blocks (the historical ``_build_item_blocks`` behaviour)
+    AND expose each block's underlying rows, so the detail renderer and the payload
+    locator (§3.4) share ONE folding rule. Each entry is a 3-list
+    ``[block_dict, primary_row, output_row_or_None]``: a ``tool_output`` folds into
+    a preceding ``tool_call`` block only when its ``call_id`` is non-empty, owned by
+    exactly one tool_call, and that call was already seen (call precedes output).
+    Physical order within the item is preserved.
+
+    Every ``tool_call`` block additionally carries an opaque ``block_key`` (§3.4) —
+    the payload-capable anchor. Non-tool blocks carry no ``block_key``."""
     rows = item["rows"]
     call_owner_count: dict[str, int] = {}
     for r in rows:
         if r.kind == "tool_call" and r.call_id:
             call_owner_count[r.call_id] = call_owner_count.get(r.call_id, 0) + 1
-    blocks: list[dict] = []
-    tool_block_by_call: dict[str, int] = {}
+    entries: list[list] = []
+    tool_entry_by_call: dict[str, int] = {}
     for r in rows:
         text = _row_display(r)
         detail = _parse_detail(r.detail_json)
         if (r.kind == "tool_output" and r.call_id
                 and call_owner_count.get(r.call_id, 0) == 1
-                and r.call_id in tool_block_by_call):
-            owner = blocks[tool_block_by_call[r.call_id]]
-            owner["output"] = {"text": text, "detail": detail}
+                and r.call_id in tool_entry_by_call):
+            owner = entries[tool_entry_by_call[r.call_id]]
+            owner[0]["output"] = {"text": text, "detail": detail}
+            owner[2] = r
             continue
         block = {
             "kind": r.kind, "text": text, "detail": detail,
             "call_id": r.call_id, "timestamp_utc": r.timestamp_utc,
         }
-        if r.kind == "tool_call" and r.call_id and call_owner_count.get(r.call_id, 0) == 1:
-            tool_block_by_call[r.call_id] = len(blocks)
-        blocks.append(block)
-    return blocks
+        if r.kind == "tool_call":
+            block["block_key"] = _block_key_for_row(r)
+            if r.call_id and call_owner_count.get(r.call_id, 0) == 1:
+                tool_entry_by_call[r.call_id] = len(entries)
+        entries.append([block, r, None])
+    return entries
+
+
+def _build_item_blocks(item: dict) -> list[dict]:
+    """Assemble an item's blocks, folding each ``tool_output`` into its
+    ``tool_call`` block via ``call_id`` when that call_id has exactly one owner
+    (§5.2). Physical order within the item is preserved. Thin projection of
+    ``_item_blocks_with_rows`` — the single source of truth for the folding rule."""
+    return [entry[0] for entry in _item_blocks_with_rows(item)]
 
 
 # ── tokens union (§5.6) ───────────────────────────────────────────────────────
@@ -406,6 +463,18 @@ def _conversation_display_title(conn: sqlite3.Connection, conversation_key: str,
     return _display_chain(fields)
 
 
+def _conversation_hit_fields(conn: sqlite3.Connection, conversation_key: str):
+    """``(title, last_activity_utc, project_label)`` for a search hit's conversation
+    (§3.7). ONE ``_rollup_fields`` resolution (stored fast path or the identical
+    live recompute), so the neutral search hit carries the conversation-level
+    last-activity time (explicitly NOT the matched row's own timestamp) and a
+    nullable project label without a per-row lookup."""
+    fields = _rollup_fields(conn, conversation_key)
+    if fields is None:
+        return "", None, None
+    return _display_chain(fields), fields.get("last"), fields.get("project_label")
+
+
 # ── threading (§5.5) ──────────────────────────────────────────────────────────
 
 
@@ -460,6 +529,65 @@ def _parent_of(conn: sqlite3.Connection, conversation_key: str):
         return None
     parent_ck = prow[0]
     return {"conversation_key": parent_ck, "title": _conversation_display_title(conn, parent_ck)}
+
+
+def codex_conversation_exists(conn: sqlite3.Connection, conversation_key: str) -> bool:
+    """Cheap existence probe (spec §5.2) — True iff any normalized
+    ``codex_conversation_messages`` row carries ``conversation_key``. Used by the
+    live-tail SSE preflight for the neutral existence decision. A missing table
+    (bare ``_apply_cache_schema`` conn) reads as absent."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM codex_conversation_messages "
+            "WHERE conversation_key = ? LIMIT 1",
+            (conversation_key,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
+
+
+def codex_conversation_source_paths(
+    conn: sqlite3.Connection, conversation_key: str
+) -> list[str]:
+    """Distinct ``source_path``s backing one Codex conversation (spec §5.3): its
+    OWN normalized rows plus its CURRENT children's (children resolved via
+    ``codex_conversation_threads`` parent links — same-root threads whose
+    ``parent_thread_id`` equals this thread's native id, never a filename
+    inference). This is the file set the live-tail watch loop polls; it widens as
+    a child thread is ingested. Empty for an unknown / not-yet-normalized
+    conversation."""
+    keys = [conversation_key]
+    thread = _thread_facts(conn, conversation_key)
+    if thread is not None:
+        native, _root, _parent, source_root_key, _cwd, _git = thread
+        if native is not None:
+            keys.extend(
+                child_ck
+                for (child_ck,) in conn.execute(
+                    "SELECT conversation_key FROM codex_conversation_threads "
+                    "WHERE source_root_key = ? AND parent_thread_id = ? "
+                    "AND conversation_key != ?",
+                    (source_root_key, native, conversation_key),
+                )
+            )
+    placeholders = ",".join("?" for _ in keys)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT source_path FROM codex_conversation_messages "
+            f"WHERE conversation_key IN ({placeholders}) "
+            "AND source_path IS NOT NULL",
+            keys,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for (sp,) in rows:
+        if sp not in seen:
+            seen.add(sp)
+            paths.append(sp)
+    return paths
 
 
 # ── detail assembly (§5.2 / §5.4 / §5.6) ──────────────────────────────────────
@@ -833,7 +961,7 @@ def _collapse_message_hits(conn: sqlite3.Connection, matched_rows: list) -> list
     collapsed: dict[tuple, dict] = {}
     for ck, mrows in by_conv.items():
         pos_map = _pos_to_item_key(conn, ck)
-        title = _conversation_display_title(conn, ck)
+        title, last_act, project_label = _conversation_hit_fields(conn, ck)
         for source_path, line_offset, kind, disp in mrows:
             item_key = pos_map.get((source_path, line_offset))
             if item_key is None:
@@ -841,13 +969,15 @@ def _collapse_message_hits(conn: sqlite3.Connection, matched_rows: list) -> list
             hit = collapsed.setdefault(
                 (ck, item_key),
                 {"conversation_key": ck, "item_key": item_key, "title": title,
-                 "snippet": None, "_badges": set()})
+                 "snippet": None, "_badges": set(),
+                 "last_activity_utc": last_act, "project_label": project_label})
             hit["_badges"].add(_badge_for_kind(kind))
             if hit["snippet"] is None:
                 hit["snippet"] = _excerpt(disp)
     return [
         {"conversation_key": h["conversation_key"], "item_key": h["item_key"],
-         "title": h["title"], "snippet": h["snippet"], "badges": sorted(h["_badges"])}
+         "title": h["title"], "snippet": h["snippet"], "badges": sorted(h["_badges"]),
+         "last_activity_utc": h["last_activity_utc"], "project_label": h["project_label"]}
         for h in collapsed.values()
     ]
 
@@ -856,13 +986,15 @@ def _search_title(conn: sqlite3.Connection, query: str) -> list[dict]:
     """Title search over the rollup table — identical LIKE semantics in both FTS
     and LIKE modes (§6.2). Conversation-level hits (no item anchor)."""
     like = f"%{query}%"
-    return [
-        {"conversation_key": ck, "item_key": None, "title": title,
-         "snippet": _excerpt(title), "badges": ["title"]}
-        for ck, title in conn.execute(
-            "SELECT conversation_key, title FROM codex_conversation_rollups "
-            "WHERE title LIKE ?", (like,))
-    ]
+    hits = []
+    for ck, title, last_act, project_label in conn.execute(
+            "SELECT conversation_key, title, last_activity_utc, project_label "
+            "FROM codex_conversation_rollups WHERE title LIKE ?", (like,)):
+        hits.append(
+            {"conversation_key": ck, "item_key": None, "title": title,
+             "snippet": _excerpt(title), "badges": ["title"],
+             "last_activity_utc": last_act, "project_label": project_label})
+    return hits
 
 
 def _search_files(conn: sqlite3.Connection, query: str) -> list[dict]:
@@ -870,7 +1002,7 @@ def _search_files(conn: sqlite3.Connection, query: str) -> list[dict]:
     canonical item_key (§6.2)."""
     like = f"%{query}%"
     pos_cache: dict[str, dict] = {}
-    title_cache: dict[str, str] = {}
+    fields_cache: dict[str, tuple] = {}
     collapsed: dict[tuple, dict] = {}
     for ck, message_id, file_path in conn.execute(
         "SELECT t.conversation_key, t.message_id, t.file_path "
@@ -883,12 +1015,14 @@ def _search_files(conn: sqlite3.Connection, query: str) -> list[dict]:
             continue
         if ck not in pos_cache:
             pos_cache[ck] = _pos_to_item_key(conn, ck)
-            title_cache[ck] = _conversation_display_title(conn, ck)
+            fields_cache[ck] = _conversation_hit_fields(conn, ck)
         item_key = pos_cache[ck].get((member[0], member[1]))
+        title, last_act, project_label = fields_cache[ck]
         hit = collapsed.setdefault(
             (ck, item_key),
-            {"conversation_key": ck, "item_key": item_key, "title": title_cache[ck],
-             "snippet": _excerpt(file_path), "badges": ["files"]})
+            {"conversation_key": ck, "item_key": item_key, "title": title,
+             "snippet": _excerpt(file_path), "badges": ["files"],
+             "last_activity_utc": last_act, "project_label": project_label})
     return list(collapsed.values())
 
 
@@ -948,3 +1082,341 @@ def search_codex_conversations(
         "status": "ok", "query": query, "hits": page_hits, "total": total,
         "mode": mode, "depth": "full", "page": page,
     }
+
+
+# ── in-conversation find (§3.1) ───────────────────────────────────────────────
+
+# Claude cap parity: the anchor list caps at 500 (bin/_lib_conversation_query.py
+# ::_FIND_ANCHOR_CAP), with anchors_truncated when more anchors exist pre-cap.
+_CODEX_FIND_ANCHOR_CAP = 500
+# Bound the regex/case Python scan (ReDoS/perf), mirroring the Claude find guard.
+_CODEX_FIND_REGEX_MAX_LEN = 1000
+_CODEX_FIND_SCAN_TEXT_CAP = 200_000
+
+# Per-kind (column, badge-label) probes over the normalized message columns, and
+# the per-kind row-kind filter. ``text`` maps to the synthetic ``prose`` label so a
+# prose-only match anchors a turn but never badges (Claude find parity).
+_CODEX_FIND_COLUMNS = {
+    "all": (("text", "prose"), ("search_tool", "tool"),
+            ("search_thinking", "thinking")),
+    "prompts": (("text", "prose"),),
+    "assistant": (("text", "prose"),),
+    "tools": (("search_tool", "tool"),),
+    "thinking": (("search_thinking", "thinking"),),
+}
+_CODEX_FIND_ROWKIND = {"prompts": "user", "assistant": "assistant"}
+
+
+def _codex_find_matched_fts(conn, conversation_key, query, cols, rowkind):
+    """``{(source_path, line_offset) -> {labels}}`` for one conversation's rows
+    matching ``query`` via the FTS path (per-column MATCH, conversation-scoped)."""
+    out: dict[tuple, set] = {}
+    for col, label in cols:
+        fts_query = _fts_query(query, col)
+        rk_pred = " AND m.kind = ?" if rowkind else ""
+        rk_args = (rowkind,) if rowkind else ()
+        rows = conn.execute(
+            "SELECT m.source_path, m.line_offset FROM codex_conversation_fts f "
+            "JOIN codex_conversation_messages m ON m.id = f.rowid "
+            "WHERE f.codex_conversation_fts MATCH ? AND m.conversation_key = ?" + rk_pred,
+            (fts_query, conversation_key, *rk_args)).fetchall()
+        for sp, lo in rows:
+            out.setdefault((sp, lo), set()).add(label)
+    return out
+
+
+def _codex_find_matched_like(conn, conversation_key, query, cols, rowkind):
+    """LIKE mirror of ``_codex_find_matched_fts`` — single contiguous substring,
+    conversation-scoped. Plain ``%query%`` (matching the Codex search kernel, which
+    does not ESCAPE), so find and search stay consistent for one provider."""
+    like = f"%{query}%"
+    out: dict[tuple, set] = {}
+    for col, label in cols:
+        rk_pred = " AND kind = ?" if rowkind else ""
+        rk_args = (rowkind,) if rowkind else ()
+        rows = conn.execute(
+            f"SELECT source_path, line_offset FROM codex_conversation_messages "
+            f"WHERE conversation_key = ? AND {col} LIKE ? AND {col} != ''" + rk_pred,
+            (conversation_key, like, *rk_args)).fetchall()
+        for sp, lo in rows:
+            out.setdefault((sp, lo), set()).add(label)
+    return out
+
+
+def _codex_find_matched_scan(conn, conversation_key, query, cols, rowkind, regex, case):
+    """Physical-row regex/case scan over one conversation's normalized columns —
+    honest parity with the Claude find scan. Each scanned value is clipped to
+    ``_CODEX_FIND_SCAN_TEXT_CAP`` before the predicate. Precondition: ``regex or
+    case`` (the FTS/LIKE path owns plain case-insensitive substring)."""
+    if regex:
+        rx = re.compile(query, 0 if case else re.IGNORECASE)
+        pred = lambda text: rx.search(text) is not None
+    else:  # case-sensitive substring
+        pred = lambda text: query in text
+    rk_pred = " AND kind = ?" if rowkind else ""
+    rk_args = (rowkind,) if rowkind else ()
+    col_list = ", ".join(c for c, _ in cols)
+    rows = conn.execute(
+        f"SELECT source_path, line_offset, {col_list} FROM codex_conversation_messages "
+        f"WHERE conversation_key = ?" + rk_pred,
+        (conversation_key, *rk_args)).fetchall()
+    out: dict[tuple, set] = {}
+    for row in rows:
+        sp, lo = row[0], row[1]
+        for idx, (_col, label) in enumerate(cols):
+            val = row[2 + idx]
+            if val and pred(val[:_CODEX_FIND_SCAN_TEXT_CAP]):
+                out.setdefault((sp, lo), set()).add(label)
+    return out
+
+
+def find_in_codex_conversation(
+    conn: sqlite3.Connection,
+    conversation_key: str,
+    query: str,
+    *,
+    kind: str = "all",
+    cap: int = _CODEX_FIND_ANCHOR_CAP,
+    regex: bool = False,
+    case: bool = False,
+) -> dict:
+    """Document-ordered rendered-item anchors for in-conversation find (§3.1).
+
+    The Codex analogue of ``find_in_conversation``: the SAME kind taxonomy
+    (``CODEX_FIND_KINDS`` == Claude ``_FIND_KINDS``), the same result-cap
+    semantics, honest FTS-vs-LIKE mode selection (``_search_mode``), and hits
+    anchored by ``item_key`` values byte-equal to the ones detail serves — so S8's
+    FindBar navigates both providers with one contract. Mirror-paired physical hits
+    collapse to their canonical item (via ``_pos_to_item_key``), so a find never
+    surfaces a suppressed duplicate detail never renders.
+
+    Status-tagged envelope: ``ok`` | ``normalization_pending`` | ``not_found``.
+    ``regex``/``case`` (parity with the Claude find) bypass FTS/LIKE for a bounded
+    physical-row scan of the normalized columns; an unknown ``kind`` raises
+    ``ValueError`` (the route maps to 400)."""
+    if kind not in CODEX_FIND_KINDS:
+        raise ValueError(f"unknown kind: {kind}")
+    scan = bool(regex or case)
+    mode = ("regex" if regex else "like") if scan else _search_mode(conn)
+    base = {"status": "ok", "conversation_key": conversation_key, "total": 0,
+            "anchors": [], "anchors_truncated": False, "search_depth": "full",
+            "kind": kind, "mode": mode}
+    if not codex_normalization_authoritative(conn):
+        return {**base, "status": "normalization_pending"}
+    rows = _load_conversation_rows(conn, conversation_key)
+    if not rows:
+        return {"status": "not_found", "conversation_key": conversation_key}
+    q = (query or "").strip()
+    if not q:
+        return base
+    cols = _CODEX_FIND_COLUMNS[kind]
+    rowkind = _CODEX_FIND_ROWKIND.get(kind)
+    if scan:
+        if len(q) > _CODEX_FIND_REGEX_MAX_LEN:
+            return base
+        matched = _codex_find_matched_scan(conn, conversation_key, q, cols, rowkind, regex, case)
+    elif mode == "fts":
+        try:
+            matched = _codex_find_matched_fts(conn, conversation_key, q, cols, rowkind)
+        except sqlite3.OperationalError:
+            mode = "like"
+            matched = _codex_find_matched_like(conn, conversation_key, q, cols, rowkind)
+    else:
+        matched = _codex_find_matched_like(conn, conversation_key, q, cols, rowkind)
+    base["mode"] = mode
+    if not matched:
+        return base
+    # Collapse matched physical positions to canonical item_key (mirror-safe), then
+    # emit anchors in detail document order.
+    pos_map = _pos_to_item_key(conn, conversation_key)
+    by_item: dict[str, set] = {}
+    for pos, labels in matched.items():
+        item_key = pos_map.get(pos)
+        if item_key is None:
+            continue
+        by_item.setdefault(item_key, set()).update(labels)
+    kept, _suppressed = kern.pair_mirrors(rows)
+    items = kern.canonical_items(kept)
+    anchors = []
+    for it in items:
+        item_key = _item_key_for_item(conversation_key, it)
+        if item_key in by_item:
+            anchors.append({
+                "item_key": item_key,
+                "match_kinds": sorted(l for l in by_item[item_key] if l != "prose")})
+    total = len(anchors)
+    return {**base, "total": total, "anchors": anchors[:cap],
+            "anchors_truncated": total > cap}
+
+
+# ── prompts spine (§3.2) ──────────────────────────────────────────────────────
+
+
+def codex_conversation_prompts(conn: sqlite3.Connection, conversation_key: str) -> dict:
+    """Prompt-class canonical items → ``{conversation_key, prompts:[{item_key,
+    text}]}`` (§3.2) — ``item_key`` where Claude has ``uuid``. Prompt class = the
+    same predicate ``derive_title`` uses (a ``prompt`` item, or an un-turned ``user``
+    item). Status-tagged: ``ok`` | ``normalization_pending`` | ``not_found``."""
+    if not codex_normalization_authoritative(conn):
+        return {"status": "normalization_pending",
+                "conversation_key": conversation_key, "prompts": []}
+    rows = _load_conversation_rows(conn, conversation_key)
+    if not rows:
+        return {"status": "not_found", "conversation_key": conversation_key}
+    kept, _suppressed = kern.pair_mirrors(rows)
+    items = kern.canonical_items(kept)
+    prompts = []
+    for it in items:
+        if it["klass"] == "prompt" or (
+                it["klass"] == "unturned" and it["anchor_row"].kind == "user"):
+            prompts.append({
+                "item_key": _item_key_for_item(conversation_key, it),
+                "text": it["anchor_row"].text or ""})
+    return {"status": "ok", "conversation_key": conversation_key, "prompts": prompts}
+
+
+# ── payload locate + full re-read (§3.4) ──────────────────────────────────────
+
+
+def _codex_source_root_path(conn: sqlite3.Connection, source_root_key: str | None):
+    """``canonical_root_path`` for a source-root key, or ``None`` when unknown."""
+    if not source_root_key:
+        return None
+    row = conn.execute(
+        "SELECT canonical_root_path FROM codex_source_roots WHERE source_root_key = ?",
+        (source_root_key,)).fetchone()
+    return row[0] if row else None
+
+
+def _within_root(source_path: str | None, root_path: str | None) -> bool:
+    """True iff the ``realpath``-resolved ``source_path`` stays strictly inside the
+    ``realpath``-resolved ``root_path`` (§3.4 containment guard). A symlink escaping
+    the canonical root resolves outside and fails; a miss is a 404, never a read."""
+    if not source_path or not root_path:
+        return False
+    try:
+        real_file = os.path.realpath(source_path)
+        real_root = os.path.realpath(root_path)
+        return os.path.commonpath([real_file, real_root]) == real_root
+    except (OSError, ValueError):
+        return False
+
+
+def _reread_codex_full_content(conn: sqlite3.Connection, row):
+    """Re-read the physical line at ``(row.source_path, row.line_offset)``, validate
+    it against the stored ``codex_conversation_events.payload_json`` for that exact
+    position (§3.4 structural gone-check — the canonical FULL record, not
+    ``content_digest``, which hashes only extracted text and misses a structural
+    mutation such as a changed ``call_id``), and return ``(full_content, truncated)``
+    for the row's normalized side, or ``None`` when gone (missing file, truncation
+    below the stored offset, or a canonical-record mismatch).
+
+    The full pre-cap content is re-derived through the SAME ``_extract`` the
+    normalizer uses — which is how payload serves content beyond the normalized
+    ``CODEX_TEXT_CAP``. Truncation/``truncated`` is against ``_FULL_PAYLOAD_CEILING``
+    (1,000,000 Python characters), the same ceiling the Claude payload path uses."""
+    stored = conn.execute(
+        "SELECT payload_json FROM codex_conversation_events "
+        "WHERE source_path = ? AND line_offset = ?",
+        (row.source_path, row.line_offset)).fetchone()
+    if stored is None:
+        return None
+    try:
+        with open(row.source_path, "rb") as fh:
+            fh.seek(row.line_offset)
+            line = fh.readline()
+    except OSError:
+        return None
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        if kern._canonical_json(obj) != stored[0]:
+            return None
+    except (TypeError, ValueError):
+        return None
+    record_type = obj.get("type") or obj.get("record_type")
+    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    extracted = kern._extract(record_type, payload)
+    if extracted is None:
+        return None
+    content = extracted.content_text or ""
+    truncated = len(content) > _FULL_PAYLOAD_CEILING
+    return content[:_FULL_PAYLOAD_CEILING], truncated
+
+
+def _locate_payload_block(conn: sqlite3.Connection, conversation_key: str, block_key: str):
+    """``(call_row, output_row_or_None)`` for the tool_call block addressed by
+    ``block_key`` (§3.4), or ``None`` when no block matches. The output partner
+    follows EXACTLY ``_item_blocks_with_rows``' folding rule (same canonical item,
+    unique nonempty ``call_id``, call precedes output)."""
+    rows = _load_conversation_rows(conn, conversation_key)
+    if not rows:
+        return None
+    kept, _suppressed = kern.pair_mirrors(rows)
+    items = kern.canonical_items(kept)
+    for item in items:
+        for _block, call_row, output_row in _item_blocks_with_rows(item):
+            if call_row.kind != "tool_call":
+                continue
+            if _block_key_for_row(call_row) == block_key:
+                return call_row, output_row
+    return None
+
+
+def read_codex_payload(
+    conn: sqlite3.Connection, conversation_key: str, block_key: str, which: str
+) -> dict:
+    """Locate + full re-read for a Codex detail payload block (§3.4).
+
+    Selector: ``block_key`` (required) + ``which ∈ {call, output}``. A call-id-less
+    (or unpaired) call is call-only — ``which=output`` for it → ``not_found`` (no
+    adjacency pairing is introduced). Success envelope (pinned):
+    ``{"status":"ok","block_key","which","content","truncated"}`` where ``content``
+    is the selected side's full text from the re-read record and ``truncated``
+    reflects ``_FULL_PAYLOAD_CEILING``. ``gone`` (→ HTTP 410) means the physical
+    record moved/mutated; ``not_found`` (→ 404) means no such block, no output
+    partner, or a containment miss (a read is never attempted outside the root)."""
+    miss = {"status": "not_found", "block_key": block_key, "which": which}
+    if which not in ("call", "output"):
+        return miss
+    located = _locate_payload_block(conn, conversation_key, block_key)
+    if located is None:
+        return miss
+    call_row, output_row = located
+    target = call_row if which == "call" else output_row
+    if target is None:  # which=output for a call-id-less / unpaired call
+        return miss
+    # Containment guard (Codex-only; the Claude path has no equivalent) BEFORE any
+    # read: a symlink/traversal escaping the canonical root is a 404, never a read.
+    root_path = _codex_source_root_path(conn, target.source_root_key)
+    if not _within_root(target.source_path, root_path):
+        return miss
+    outcome = _reread_codex_full_content(conn, target)
+    if outcome is None:
+        return {"status": "gone", "block_key": block_key, "which": which}
+    content, truncated = outcome
+    return {"status": "ok", "block_key": block_key, "which": which,
+            "content": content, "truncated": truncated}
+
+
+# ── whole-conversation export (§3.3) ──────────────────────────────────────────
+
+
+def get_codex_conversation_export(
+    conn: sqlite3.Connection, conversation_key: str, *, effective_speed: str
+) -> dict:
+    """Whole-conversation Markdown export envelope (§3.3). Assembles the full
+    detail with NO pagination (``limit=0``), then renders via the pure Codex export
+    module. Status-tagged: ``ok`` (carries ``markdown``) | ``normalization_pending``
+    | ``not_found`` — the dispatch/transport layers map those to bytes/HTTP."""
+    detail = get_codex_conversation(
+        conn, conversation_key, effective_speed=effective_speed, limit=0)
+    if detail.get("status") != "ok":
+        return {"status": detail.get("status"), "conversation_key": conversation_key}
+    from _lib_codex_conversation_export import render_codex_conversation_markdown
+    return {"status": "ok", "conversation_key": conversation_key,
+            "markdown": render_codex_conversation_markdown(detail)}

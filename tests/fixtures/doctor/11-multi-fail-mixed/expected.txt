@@ -35,6 +35,7 @@ Database
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
+  ✓ Statusline pipeline      no recent regular-pool timer observed
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Codex quota              not applicable
@@ -54,4 +55,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 24 OK · 8 WARN · 3 FAIL
+Summary: 25 OK · 8 WARN · 3 FAIL

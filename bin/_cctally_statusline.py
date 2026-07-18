@@ -27,16 +27,24 @@ Spec: docs/superpowers/specs/2026-05-30-extract-five-hour-statusline-cmd-design.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import json
+import math
 import os
 import pathlib
+import re
+import secrets
+import sqlite3
 import sys
+import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import _cctally_core
 import _lib_statusline
+import _lib_statusline_candidates as _candidates
 from _cctally_core import _command_as_of, eprint, open_db
 
 
@@ -334,6 +342,56 @@ def _release_persist_lock(fd: "int | None") -> None:
         pass
 
 
+class _AuthoritativeRecordResult:
+    """Outcome of the selected-state authoritative writer protocol.
+
+    This deliberately carries a small status surface rather than leaking a
+    SQLite result.  A non-``ok`` result means the durable tombstone remains
+    inflight, so callers must not touch selected freshness or clear OAuth
+    backoff state.
+    """
+
+    def __init__(self, status: str, reason: str | None = None):
+        self.status = status
+        self.reason = reason
+
+
+class _SelectedStateLock:
+    """Blocking owner of the one selected-state writer critical section."""
+
+    def __init__(self):
+        self._fd = -1
+
+    def __enter__(self):
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(
+            _cctally_core.STATUSLINE_PERSIST_LOCK_PATH,
+            os.O_WRONLY | os.O_CREAT,
+            0o644,
+        )
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self._fd < 0:
+            return False
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+        self._fd = -1
+        return False
+
+
+def _selected_state_lock() -> _SelectedStateLock:
+    """Return the blocking lock shared by every selected-state writer."""
+    return _SelectedStateLock()
+
+
 def _record_args(*, percent, resets_at, five_hour_percent, five_hour_resets_at,
                  source):
     """Build the cmd_record_usage Namespace the feeder passes to the kernel.
@@ -353,40 +411,752 @@ def _record_args(*, percent, resets_at, five_hour_percent, five_hour_resets_at,
     )
 
 
-def _fork_persist(args, parent_lock_fd: int) -> None:
-    """Run cmd_record_usage in a DETACHED child so the render stays fast.
+_CANDIDATE_FINAL_RE = re.compile(r"[0-9a-f]{64}\.json\Z")
 
-    Lifecycle (spec §2, Codex P2-3): single ``fork()``; **on fork() failure
-    SKIP persistence entirely** (unlike hook-tick we must NOT run inline —
-    cmd_record_usage may sync weekly cost / scan 5h totals / evaluate budget
-    axes, any of which would stall the render). In the child: ``setsid()``,
-    immediately redirect fd 0/1/2 to /dev/null (an inherited stdout pipe
-    would delay the statusline's EOF), then record and ``os._exit(0)``.
 
-    Lock contract: the PARENT releases only its OWN fd (in the caller's
-    ``finally``); the child CLOSES its inherited copy of the parent fd and
-    RE-ACQUIRES the persist lock on a fresh, INDEPENDENT fd (blocking) — so
-    the parent's release cannot race a second render into a duplicate insert.
-    The child then re-checks the observation marker UNDER that held lock and
-    records only if still stale, which is the authoritative herd guard: a
-    concurrent render's non-blocking acquire fails until this child has
-    recorded AND touched the marker."""
+class ProjectionUnstable(RuntimeError):
+    """stats.db changed while its selected projection was being read."""
+
+
+def _candidate_identity_token(parsed) -> str:
+    if isinstance(parsed.session_id, str) and parsed.session_id:
+        kind, value = "session_id", parsed.session_id
+    elif isinstance(parsed.transcript_path, str) and parsed.transcript_path:
+        kind, value = "transcript_path", parsed.transcript_path
+    else:
+        kind, value = "anonymous", ""
+    return hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()
+
+
+def _statusline_reset_is_plausible(axis: str, epoch: int, now_epoch: int) -> bool:
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        return False
+    if axis == "fiveHour":
+        return now_epoch - 600 <= epoch <= now_epoch + 6 * 3600
+    return now_epoch - 30 * 86400 <= epoch <= now_epoch + 8 * 86400
+
+
+def _candidate_from_input(parsed, *, received_at: int) -> "_candidates.Candidate | None":
+    def axis(percent, resets_at, name):
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            return None
+        if not math.isfinite(float(percent)) or not 0 <= float(percent) <= 100:
+            return None
+        if not _statusline_reset_is_plausible(name, resets_at, received_at):
+            return None
+        return _candidates.AxisValue(float(percent), int(resets_at))
+
+    five = axis(parsed.rate_limits_5h_pct, parsed.rate_limits_5h_resets_at, "fiveHour")
+    seven = axis(parsed.rate_limits_7d_pct, parsed.rate_limits_7d_resets_at, "sevenDay")
+    if five is None and seven is None:
+        return None
+    return _candidates.Candidate(
+        token=_candidate_identity_token(parsed),
+        received_at=received_at,
+        five_hour=five,
+        seven_day=seven,
+    )
+
+
+def _candidate_path(token: str) -> pathlib.Path:
+    return _cctally_core.STATUSLINE_CANDIDATE_DIR / f"{token}.json"
+
+
+def _atomic_write_json(path: pathlib.Path, document: dict) -> None:
+    """Publish compact JSON with a unique same-directory exclusive temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent == _cctally_core.STATUSLINE_CANDIDATE_DIR:
+        os.chmod(path.parent, 0o700)
+    token = secrets.token_hex(16)
+    temp = path.parent / f".{path.name}.tmp.{os.getpid()}.{token}"
+    fd = -1
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(document, handle, allow_nan=False, separators=(",", ":"))
+        os.replace(temp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _candidate_document(candidate: "_candidates.Candidate") -> dict:
+    document = {"schemaVersion": 1, "receivedAt": candidate.received_at}
+    if candidate.five_hour is not None:
+        document["fiveHour"] = {
+            "percent": candidate.five_hour.percent,
+            "resetsAt": candidate.five_hour.raw_resets_at,
+        }
+    if candidate.seven_day is not None:
+        document["sevenDay"] = {
+            "percent": candidate.seven_day.percent,
+            "resetsAt": candidate.seven_day.raw_resets_at,
+        }
+    return document
+
+
+def _write_candidate(candidate: "_candidates.Candidate") -> None:
+    _cctally_core.STATUSLINE_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(_cctally_core.STATUSLINE_CANDIDATE_DIR, 0o700)
+    _atomic_write_json(_candidate_path(candidate.token), _candidate_document(candidate))
+
+
+def _load_candidate_spool(*, now_epoch: int) -> tuple["_candidates.Candidate", ...]:
+    directory = _cctally_core.STATUSLINE_CANDIDATE_DIR
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError:
+        return ()
+    result = []
+    for path in entries:
+        # Match the complete final grammar before touching an entry.  In-flight
+        # peer temps are deliberately neither read nor pruned.
+        if not _CANDIDATE_FINAL_RE.fullmatch(path.name):
+            continue
+        try:
+            raw = path.read_bytes()
+            candidate = _candidates.load_candidate_document(
+                raw,
+                now_epoch=now_epoch,
+                reset_is_plausible=lambda axis, epoch: _statusline_reset_is_plausible(axis, epoch, now_epoch),
+                token=path.stem,
+            )
+        except (OSError, _candidates.StateValidationError):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        if not (-5 <= now_epoch - candidate.received_at < _cctally_core.STATUSLINE_CANDIDATE_TTL_SECONDS):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        result.append(candidate)
+    return tuple(result)
+
+
+def _scan_active_candidate_spool(*, now_epoch: int) -> tuple["_candidates.Candidate", ...]:
+    """Read valid active candidates without pruning or otherwise mutating.
+
+    `doctor` needs a truthful active-count signal but retains its global
+    read-only contract.  In contrast, the reducer loader above owns best-effort
+    cleanup of malformed/expired final entries.
+    """
+    try:
+        entries = tuple(_cctally_core.STATUSLINE_CANDIDATE_DIR.iterdir())
+    except OSError:
+        return ()
+    result = []
+    for path in entries:
+        if not _CANDIDATE_FINAL_RE.fullmatch(path.name):
+            continue
+        try:
+            candidate = _candidates.load_candidate_document(
+                path.read_bytes(),
+                now_epoch=now_epoch,
+                reset_is_plausible=lambda axis, epoch: _statusline_reset_is_plausible(
+                    axis, epoch, now_epoch
+                ),
+                token=path.stem,
+            )
+        except (OSError, _candidates.StateValidationError):
+            continue
+        if -5 <= now_epoch - candidate.received_at < _cctally_core.STATUSLINE_CANDIDATE_TTL_SECONDS:
+            result.append(candidate)
+    return tuple(result)
+
+
+def _fingerprint_file(path: pathlib.Path) -> "_candidates.FileFingerprint | None":
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return _candidates.FileFingerprint(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _db_file_fingerprint() -> dict[str, "_candidates.FileFingerprint | None"]:
+    db = _cctally_core.DB_PATH
+    return {
+        "main": _fingerprint_file(db),
+        "wal": _fingerprint_file(db.with_name(db.name + "-wal")),
+    }
+
+
+def _epoch_from_iso(value: object) -> int:
+    return int(_cctally_core.parse_iso_datetime(str(value), "statusline projection").timestamp())
+
+
+def _read_db_projection_once() -> "_candidates.DbProjection":
+    conn = open_db()
+    try:
+        weekly_rows = conn.execute(
+            "SELECT id, weekly_percent, week_start_date, week_start_at, week_end_at, "
+            "       captured_at_utc, source "
+            "FROM weekly_usage_snapshots "
+            "WHERE weekly_percent IS NOT NULL AND week_end_at IS NOT NULL "
+            "ORDER BY unixepoch(captured_at_utc) DESC, id DESC"
+        ).fetchall()
+        five_rows = conn.execute(
+            "SELECT id, five_hour_percent, five_hour_resets_at, five_hour_window_key, "
+            "       captured_at_utc, source "
+            "FROM weekly_usage_snapshots "
+            "WHERE five_hour_percent IS NOT NULL AND five_hour_resets_at IS NOT NULL "
+            "ORDER BY unixepoch(captured_at_utc) DESC, id DESC"
+        ).fetchall()
+
+        weekly_groups: dict[int, list] = {}
+        for row in weekly_rows:
+            try:
+                raw = _epoch_from_iso(row["week_end_at"])
+            except (TypeError, ValueError):
+                continue
+            canonical = int(_cctally_core._normalize_week_boundary_dt(
+                dt.datetime.fromtimestamp(raw, tz=dt.timezone.utc)
+            ).timestamp())
+            weekly_groups.setdefault(canonical, []).append(row)
+
+        weekly_projection = None
+        if weekly_groups:
+            canonical = max(weekly_groups)
+            rows = weekly_groups[canonical]
+            reference = max(
+                rows, key=lambda row: (_epoch_from_iso(row["captured_at_utc"]), int(row["id"]))
+            )
+            week_start_at = reference["week_start_at"]
+            if not week_start_at:
+                week_start_at = dt.datetime.fromtimestamp(
+                    canonical - 7 * 86400, tz=dt.timezone.utc
+                ).isoformat().replace("+00:00", "Z")
+            week_end_at = reference["week_end_at"]
+            floor = _cctally_core._reset_aware_floor(
+                conn,
+                str(reference["week_start_date"]),
+                str(week_start_at),
+                str(week_end_at),
+            )
+            floor_epoch = _epoch_from_iso(floor) if floor else 0
+            eligible = [
+                row for row in rows
+                if floor_epoch == 0 or _epoch_from_iso(row["captured_at_utc"]) >= floor_epoch
+            ]
+            if eligible:
+                weekly = max(
+                    eligible,
+                    key=lambda row: (_epoch_from_iso(row["captured_at_utc"]), int(row["id"])),
+                )
+                raw = _epoch_from_iso(weekly["week_end_at"])
+                weekly_projection = _candidates.AxisProjection(
+                    float(weekly["weekly_percent"]), raw, canonical,
+                    _epoch_from_iso(weekly["captured_at_utc"]),
+                    str(weekly["source"] or "statusline"), floor_epoch,
+                )
+
+        now_epoch = int(time.time())
+        five_groups: dict[int, list] = {}
+        for row in five_rows:
+            try:
+                raw = _epoch_from_iso(row["five_hour_resets_at"])
+            except (TypeError, ValueError):
+                continue
+            if not _statusline_reset_is_plausible("fiveHour", raw, now_epoch):
+                continue
+            stored_key = row["five_hour_window_key"]
+            canonical = (
+                int(stored_key)
+                if stored_key is not None
+                else _cctally()._canonical_5h_window_key(raw)
+            )
+            five_groups.setdefault(canonical, []).append(row)
+
+        five_projection = None
+        if five_groups:
+            canonical = max(five_groups)
+            reset_event_id = _cctally()._resolve_active_five_hour_reset_event_id(conn, canonical)
+            floor_epoch = 0
+            if reset_event_id:
+                event = conn.execute(
+                    "SELECT effective_reset_at_utc FROM five_hour_reset_events WHERE id = ?",
+                    (reset_event_id,),
+                ).fetchone()
+                if event is not None:
+                    floor_epoch = _epoch_from_iso(event["effective_reset_at_utc"])
+            eligible = [
+                row for row in five_groups[canonical]
+                if floor_epoch == 0 or _epoch_from_iso(row["captured_at_utc"]) >= floor_epoch
+            ]
+            if eligible:
+                five = max(
+                    eligible,
+                    key=lambda row: (_epoch_from_iso(row["captured_at_utc"]), int(row["id"])),
+                )
+                raw = _epoch_from_iso(five["five_hour_resets_at"])
+                five_projection = _candidates.AxisProjection(
+                    float(five["five_hour_percent"]), raw, canonical,
+                    _epoch_from_iso(five["captured_at_utc"]),
+                    str(five["source"] or "statusline"), int(reset_event_id),
+                )
+    finally:
+        conn.close()
+    return _candidates.DbProjection(five_projection, weekly_projection)
+
+
+def _read_db_projection_stable(*, attempts: int = 3) -> "_candidates.DbProjection":
+    for _ in range(attempts):
+        before = _db_file_fingerprint()
+        projection = _read_db_projection_once()
+        after = _db_file_fingerprint()
+        if before == after and after["main"] is not None:
+            return dataclasses.replace(projection, db_files=after)
+    raise ProjectionUnstable("stats.db changed during projection")
+
+
+def _fingerprint_document(value: "_candidates.FileFingerprint | None") -> dict | None:
+    if value is None:
+        return None
+    return {"device": value.device, "inode": value.inode, "size": value.size, "mtimeNs": value.mtime_ns}
+
+
+def _axis_projection_document(value: "_candidates.AxisProjection | None") -> dict | None:
+    if value is None:
+        return None
+    return {
+        "percent": value.percent,
+        "rawResetsAt": value.raw_resets_at,
+        "canonicalKey": value.canonical_key,
+        "capturedAt": value.captured_at,
+        "source": value.source,
+        "resetGeneration": value.reset_generation,
+    }
+
+
+def _pending_document(value: "_candidates.PendingDrop | None") -> dict | None:
+    if value is None:
+        return None
+    signature = value.retry_signature
+    return {
+        "canonicalKey": value.canonical_key,
+        "reducedPercent": value.reduced_percent,
+        "firstSeenAt": value.first_seen_at,
+        "kernelStage": value.kernel_stage,
+        "attempts": value.attempts,
+        "contributors": {
+            token: {"baselineReceivedAt": item.baseline_received_at, "satisfied": item.satisfied}
+            for token, item in value.contributors.items()
+        },
+        "retrySignature": (
+            None if signature is None else {
+                "candidateKey": signature.candidate_key,
+                "candidatePercent": signature.candidate_percent,
+                "dbKey": signature.db_key,
+                "dbPercent": signature.db_percent,
+                "dbResetGeneration": signature.db_reset_generation,
+            }
+        ),
+    }
+
+
+def _control_document(control: "_candidates.ControlState") -> dict:
+    files = control.db_projection.db_files or {"main": None, "wal": None}
+    return {
+        "schemaVersion": 1,
+        "dbProjection": {
+            "fiveHour": _axis_projection_document(control.db_projection.five_hour),
+            "sevenDay": _axis_projection_document(control.db_projection.seven_day),
+        },
+        "dbFiles": {
+            "main": _fingerprint_document(files.get("main")),
+            "wal": _fingerprint_document(files.get("wal")),
+        },
+        "pendingDrops": {
+            "fiveHour": _pending_document(control.pending_drops.get("fiveHour")),
+            "sevenDay": _pending_document(control.pending_drops.get("sevenDay")),
+        },
+    }
+
+
+def _read_control_state(*, now_epoch: int) -> "_candidates.ControlState | None":
+    try:
+        return _candidates.load_control_document(
+            _cctally_core.STATUSLINE_SELECTED_PATH.read_bytes(), now_epoch=now_epoch
+        )
+    except (OSError, _candidates.StateValidationError):
+        return None
+
+
+def _statusline_control_db_agreement(*, now_epoch: int) -> bool | None:
+    """Return control/DB-fingerprint agreement without opening SQLite.
+
+    ``None`` means the derived control document is absent; ``False`` means an
+    existing document was invalid or its stable fingerprint is stale.  This is
+    intentionally stat-only so doctor remains a read-only diagnostic.
+    """
+    control = _read_control_state(now_epoch=now_epoch)
+    if control is None:
+        try:
+            return False if _cctally_core.STATUSLINE_SELECTED_PATH.exists() else None
+        except OSError:
+            return None
+    return control.db_projection.db_files == _db_file_fingerprint()
+
+
+def _write_control_state(control: "_candidates.ControlState") -> None:
+    _atomic_write_json(_cctally_core.STATUSLINE_SELECTED_PATH, _control_document(control))
+
+
+def _reconcile_selected_control(
+    projection: "_candidates.DbProjection", *, now_epoch: int, observed_axes=()
+) -> None:
+    """Rewrite DB-derived control while retaining only reducer pending state."""
+    existing = _read_control_state(now_epoch=now_epoch)
+    pending = dict(
+        existing.pending_drops
+        if existing is not None
+        else {"fiveHour": None, "sevenDay": None}
+    )
+    for axis in observed_axes:
+        if axis in _candidates.AXES:
+            pending[axis] = None
+    _write_control_state(_candidates.ControlState(projection, pending))
+
+
+def _tombstone_path(axis: str) -> pathlib.Path:
+    return (
+        _cctally_core.STATUSLINE_AUTHORITATIVE_5H_PATH
+        if axis == "fiveHour" else _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH
+    )
+
+
+def _tombstone_document(value: "_candidates.Tombstone") -> dict:
+    document = {"schemaVersion": 1, "axis": value.axis, "state": value.state}
+    if value.state == "inflight":
+        document["startedAt"] = value.started_at
+        document["priorBlockReceivedAtThrough"] = value.prior_block_received_at_through
+    else:
+        document["blockReceivedAtThrough"] = value.block_received_at_through
+    return document
+
+
+def _read_tombstone(axis: str, *, now_epoch: int, fail_closed: bool = True) -> "_candidates.Tombstone | None":
+    try:
+        return _candidates.load_tombstone_document(
+            _tombstone_path(axis).read_bytes(), expected_axis=axis, now_epoch=now_epoch
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, _candidates.StateValidationError):
+        return _candidates.Tombstone(axis, "inflight") if fail_closed else None
+
+
+def _write_tombstone(axis: str, value: "_candidates.Tombstone") -> None:
+    _atomic_write_json(_tombstone_path(axis), _tombstone_document(value))
+
+
+def _authoritative_begin(axes, *, now_epoch: int) -> dict[str, "_candidates.Tombstone"]:
+    """Write fail-closed inflight tombstones before an authority mutation.
+
+    Each axis retains a prior committed cutoff while it is inflight.  This
+    means that a crash after an equality-deduplicated database call has the
+    same safety posture as a crash before a write: no stale spool candidate
+    can become selected until a later authoritative repair commits it.
+    """
+    requested = frozenset(axes)
+    if not requested or not requested <= set(_candidates.AXES):
+        raise ValueError("authoritative writer requires known observation axes")
+    handles = {}
+    for axis in sorted(requested):
+        previous = _read_tombstone(axis, now_epoch=now_epoch, fail_closed=True)
+        if previous is None:
+            carried = None
+        elif previous.state == "committed":
+            carried = previous.block_received_at_through
+        else:
+            carried = previous.prior_block_received_at_through
+        inflight = _candidates.Tombstone(
+            axis=axis,
+            state="inflight",
+            started_at=now_epoch,
+            prior_block_received_at_through=carried,
+        )
+        _write_tombstone(axis, inflight)
+        handles[axis] = inflight
+    return handles
+
+
+def _authoritative_commit(
+    handles: dict[str, "_candidates.Tombstone"], *, completion_epoch: int
+) -> None:
+    """Finalize every write-ahead tombstone with a monotonic cutoff."""
+    for axis, inflight in handles.items():
+        cutoff = max(
+            inflight.prior_block_received_at_through or 0,
+            completion_epoch + _cctally_core.STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS,
+        )
+        _write_tombstone(
+            axis,
+            _candidates.Tombstone(
+                axis=axis,
+                state="committed",
+                block_received_at_through=cutoff,
+            ),
+        )
+
+
+def _after_authoritative_record() -> None:
+    """Test seam immediately after the authority kernel returns success."""
+
+
+def _authoritative_repair_required(*, now_epoch: int) -> bool:
+    """Whether an inflight/invalid tombstone needs an OAuth repair attempt."""
+    for axis in _candidates.AXES:
+        value = _read_tombstone(axis, now_epoch=now_epoch, fail_closed=True)
+        if value is not None and value.state == "inflight":
+            return True
+    return False
+
+
+def _authoritative_record_usage(
+    args: argparse.Namespace,
+    observed_axes,
+    *,
+    lock_held: bool = False,
+) -> _AuthoritativeRecordResult:
+    """Record OAuth authority under write-ahead tombstones and reconcile it.
+
+    ``lock_held`` is reserved for automatic polling, which holds the selected
+    lock across its post-lock freshness/backoff recheck and network request.
+    All other callers acquire the same blocking lock here.
+    """
+    if not lock_held:
+        try:
+            with _selected_state_lock():
+                return _authoritative_record_usage(
+                    args, observed_axes, lock_held=True
+                )
+        except OSError as exc:
+            return _AuthoritativeRecordResult("record_failed", str(exc))
+
+    now_epoch = int(time.time())
+    try:
+        handles = _authoritative_begin(observed_axes, now_epoch=now_epoch)
+    except (OSError, ValueError) as exc:
+        return _AuthoritativeRecordResult("record_failed", str(exc))
+
+    try:
+        rc = _cctally().cmd_record_usage(args)
+    except Exception as exc:
+        return _AuthoritativeRecordResult("record_failed", str(exc))
+    if rc != 0:
+        return _AuthoritativeRecordResult("record_failed", f"exit {rc}")
+
+    try:
+        # Intentionally after an equality-deduplicated success: tests use this
+        # seam to prove the write-ahead tombstone still fails closed on crash.
+        _cctally()._after_authoritative_record()
+        projection = _read_db_projection_stable()
+        completion_epoch = int(time.time())
+        _authoritative_commit(handles, completion_epoch=completion_epoch)
+        _reconcile_selected_control(
+            projection, now_epoch=completion_epoch, observed_axes=observed_axes
+        )
+        _cctally()._statusline_observe_touch()
+    except Exception as exc:
+        # Do not clean up the inflight tombstone on a post-record failure.
+        # It is the durable proof that a later authoritative writer must repair
+        # this axis before any spool candidate may be selected again.
+        return _AuthoritativeRecordResult("record_failed", str(exc))
+    return _AuthoritativeRecordResult("ok")
+
+
+def _empty_control(projection: "_candidates.DbProjection") -> "_candidates.ControlState":
+    return _candidates.ControlState(projection, {"fiveHour": None, "sevenDay": None})
+
+
+def _canonicalize_candidates(
+    candidates: tuple["_candidates.Candidate", ...],
+    projection: "_candidates.DbProjection",
+) -> tuple["_candidates.Candidate", ...]:
     c = _cctally()
+    five_values = [candidate.five_hour for candidate in candidates if candidate.five_hour is not None]
+    anchor = None
+    if projection.five_hour is not None:
+        anchor = (projection.five_hour.raw_resets_at, projection.five_hour.canonical_key)
+    resolved = _candidates.canonicalize_five_hour_axes(
+        five_values,
+        db_anchor=anchor,
+        canonicalize=lambda raw, prior: c._canonical_5h_window_key(
+            raw,
+            prior_epoch=None if prior is None else prior[0],
+            prior_key=None if prior is None else prior[1],
+        ),
+    )
+    # Canonicalization establishes a physical-window key, not a selected
+    # candidate value.  Several sessions can share the exact raw reset while
+    # reporting different percentages; mapping raw -> AxisValue would let the
+    # final filesystem enumeration overwrite every session's percentage.
+    by_raw_key = {value.raw_resets_at: value.canonical_key for value in resolved}
+    result = []
+    for candidate in candidates:
+        seven = candidate.seven_day
+        if seven is not None:
+            canonical = int(_cctally_core._normalize_week_boundary_dt(
+                dt.datetime.fromtimestamp(seven.raw_resets_at, tz=dt.timezone.utc)
+            ).timestamp())
+            seven = dataclasses.replace(seven, canonical_key=canonical)
+        five = candidate.five_hour
+        if five is not None:
+            five = dataclasses.replace(five, canonical_key=by_raw_key[five.raw_resets_at])
+        result.append(dataclasses.replace(candidate, five_hour=five, seven_day=seven))
+    return tuple(result)
+
+
+def _build_publication_plan(
+    decision: "_candidates.ReductionDecision",
+    projection: "_candidates.DbProjection",
+    *,
+    now_epoch: int,
+) -> "_candidates.PublicationPlan | None":
+    if decision.plan is None:
+        return None
+    seven = decision.plan.seven_day
+    if seven is None and projection.seven_day is not None:
+        source = projection.seven_day
+        if now_epoch < source.raw_resets_at <= now_epoch + 8 * 86400:
+            seven = _candidates.AxisValue(source.percent, source.raw_resets_at, source.canonical_key)
+    if seven is None:
+        return None
+    five = decision.plan.five_hour
+    if five is None and decision.plan.seven_day is not None and projection.five_hour is not None:
+        source = projection.five_hour
+        if now_epoch < source.raw_resets_at <= now_epoch + 6 * 3600:
+            five = _candidates.AxisValue(source.percent, source.raw_resets_at, source.canonical_key)
+    if five is not None and not (now_epoch < five.raw_resets_at <= now_epoch + 6 * 3600):
+        five = None
+    return _candidates.PublicationPlan(seven_day=seven, five_hour=five)
+
+
+def _projection_changed(before: "_candidates.DbProjection", after: "_candidates.DbProjection") -> bool:
+    return before.five_hour != after.five_hour or before.seven_day != after.seven_day
+
+
+def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
+    now_epoch = int(time.time())
+    candidates = _load_candidate_spool(now_epoch=now_epoch)
+    if not candidates:
+        existing = _read_control_state(now_epoch=now_epoch)
+        if existing is not None and any(existing.pending_drops.values()):
+            projection = _read_db_projection_stable()
+            control = _empty_control(projection)
+            _write_control_state(control)
+            return _candidates.ReductionDecision("WRITE_CONTROL", control)
+        return None
+    projection = _read_db_projection_stable()
+    existing = _read_control_state(now_epoch=now_epoch)
+    control_repair_required = (
+        existing is None or existing.db_projection.db_files != projection.db_files
+    )
+    control = (
+        _candidates.ControlState(projection, existing.pending_drops)
+        if existing is not None else _empty_control(projection)
+    )
+    tombstones = {
+        axis: _read_tombstone(axis, now_epoch=now_epoch)
+        for axis in _candidates.AXES
+    }
+    candidates = _canonicalize_candidates(candidates, projection)
+    decision = _candidates.reduce_candidates(
+        candidates, db=projection, control=control, tombstones=tombstones, now_epoch=now_epoch
+    )
+    if decision.action == "NOOP":
+        if control_repair_required:
+            decision = dataclasses.replace(decision, action="WRITE_CONTROL")
+            _write_control_state(decision.control)
+        return decision
+    if decision.action == "WRITE_CONTROL":
+        _write_control_state(decision.control)
+        return decision
+    plan = _build_publication_plan(decision, projection, now_epoch=now_epoch)
+    if plan is None or plan.seven_day is None:
+        _write_control_state(decision.control)
+        return decision
+    args = _record_args(
+        percent=plan.seven_day.percent,
+        resets_at=plan.seven_day.raw_resets_at,
+        five_hour_percent=None if plan.five_hour is None else plan.five_hour.percent,
+        five_hour_resets_at=None if plan.five_hour is None else plan.five_hour.raw_resets_at,
+        source="statusline",
+    )
+    if _cctally().cmd_record_usage(args) != 0:
+        return decision
+    after = _read_db_projection_stable()
+    if _projection_changed(projection, after):
+        # A real DB change is authoritative selected truth, so re-reduce to
+        # clear any satisfied pending axis whose projection now matches it.
+        refreshed = _candidates.reduce_candidates(
+            candidates, db=after, control=decision.control,
+            tombstones=tombstones, now_epoch=int(time.time()),
+        )
+    else:
+        # The record kernel can deliberately leave the DB unchanged: the first
+        # zero arms its own debounce and unsupported small drops are HWM
+        # rejected.  Preserve the precomputed bounded attempt state so the next
+        # tick—not this post-record reconciliation—performs the required fresh
+        # contributor-consensus pass before spending another kernel call.
+        refreshed = _candidates.ReductionDecision("WRITE_CONTROL", decision.control)
+    _write_control_state(refreshed.control)
+    if _projection_changed(projection, after):
+        _cctally()._statusline_observe_touch()
+    return refreshed
+
+
+def _preliminary_decision() -> "_candidates.ReductionDecision | None":
+    now_epoch = int(time.time())
+    candidates = _load_candidate_spool(now_epoch=now_epoch)
+    if not candidates:
+        return None
+    control = _read_control_state(now_epoch=now_epoch)
+    if control is None or control.db_projection.db_files != _db_file_fingerprint():
+        return _candidates.ReductionDecision("WRITE_CONTROL", control or _empty_control(
+            _candidates.DbProjection(None, None, _db_file_fingerprint())
+        ))
+    candidates = _canonicalize_candidates(candidates, control.db_projection)
+    return _candidates.reduce_candidates(
+        candidates,
+        db=control.db_projection,
+        control=control,
+        tombstones={axis: _read_tombstone(axis, now_epoch=now_epoch) for axis in _candidates.AXES},
+        now_epoch=now_epoch,
+    )
+
+
+def _fork_persist(parent_lock_fd: int) -> None:
+    """Run the revalidated spool reducer in a detached serialized child."""
     try:
         pid = os.fork()
     except OSError:
-        # Out of pids/memory — skip persistence, render fast (spec §2).
         return
     if pid > 0:
-        # Parent: return at once; the caller's finally releases parent_lock_fd.
         return
 
     # --- child ---
     try:
-        # Drop the inherited copy of the parent's lock fd so only the parent's
-        # own fd holds the shared lock; the child owns the lock ONLY via the
-        # independent fd re-acquired below (avoids a self-block on our own
-        # inherited exclusive lock).
         try:
             os.close(parent_lock_fd)
         except OSError:
@@ -395,7 +1165,6 @@ def _fork_persist(args, parent_lock_fd: int) -> None:
             os.setsid()
         except OSError:
             pass
-        # Detach stdio immediately so nothing keeps the render's pipe open.
         try:
             devnull = os.open(os.devnull, os.O_RDWR)
             os.dup2(devnull, 0)
@@ -412,18 +1181,12 @@ def _fork_persist(args, parent_lock_fd: int) -> None:
                 _cctally_core.STATUSLINE_PERSIST_LOCK_PATH,
                 os.O_WRONLY | os.O_CREAT, 0o644,
             )
-            # BLOCKING: wait for the parent to release its copy, then hold the
-            # lock across record + marker-touch so a concurrent render can't
-            # observe a stale marker and double-insert.
             fcntl.flock(child_fd, fcntl.LOCK_EX)
         except OSError:
             child_fd = -1
         try:
-            throttle = float(_cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS)
-            if c._statusline_observe_age_seconds() >= throttle:
-                c.cmd_record_usage(args)
-                # Touch the liveness marker even on a dedup no-op return.
-                c._statusline_observe_touch()
+            if child_fd >= 0:
+                _statusline_reduce_and_publish()
         finally:
             if child_fd >= 0:
                 try:
@@ -435,70 +1198,37 @@ def _fork_persist(args, parent_lock_fd: int) -> None:
                 except OSError:
                     pass
     except BaseException:
-        # A detached child must never surface a traceback onto the render.
         pass
     finally:
         os._exit(0)
 
 
 def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
-    """Persist the parsed CC `rate_limits` (the primary automatic writer).
-
-    Fully guarded — cmd_statusline also wraps this in try/except, and every
-    step degrades to a clean no-op. ``sync_for_test=True`` runs the kernel
-    INLINE (no fork) so persistence tests are deterministic and no detached
-    child outlives fixture cleanup."""
-    c = _cctally()
-    # 0. Pool-identity guard (spec 2026-07-17 #311 D1). A bracket-variant
-    #    model id (e.g. `claude-opus-4-8[1m]`) reports a SEPARATE rate-limit
-    #    pool; persisting it poisons the default-pool DB (HWM latch + dedup
-    #    freeze). Skip BEFORE the lock/fork AND before touching the
-    #    observation marker — a foreign-pool session is not evidence the
-    #    regular-pool pipeline is alive, so the OAuth backfill must keep
-    #    aging. Render is unchanged (this is persist-only). `.model_id` is a
-    #    dataclass attr, not a dict key, so this never AttributeErrors into
-    #    cmd_statusline's silent `except`.
+    """Spool an eligible session candidate then reduce it opportunistically."""
     if _lib_statusline.is_alternate_pool_model_id(parsed.model_id):
         return
-    # 1. Require a usable 7d reading. Absence is a clean no-op (older CC / CC
-    #    not supplying rate_limits — the OAuth backfill covers that case).
-    if parsed.rate_limits_7d_pct is None or parsed.rate_limits_7d_resets_at is None:
+    candidate = _candidate_from_input(parsed, received_at=int(time.time()))
+    if candidate is None:
         return
-    # 2. 5h pair-gate: pass both or neither. An inactive 5h window arrives as
-    #    {used_percentage: 0, resets_at: null}; the parser surfaces the two
-    #    fields independently, so drop the whole pair when either is missing
-    #    (mirrors both OAuth paths).
-    five_pct = parsed.rate_limits_5h_pct
-    five_reset = parsed.rate_limits_5h_resets_at
-    if five_pct is None or five_reset is None:
-        five_pct = None
-        five_reset = None
-    # 3. Non-blocking cross-process lock — losers render without forking.
-    lock_fd = _try_acquire_persist_lock()
+    try:
+        _write_candidate(candidate)
+        _cctally()._statusline_transport_touch()
+    except OSError:
+        return
+    c = _cctally()
+    lock_fd = c._try_acquire_persist_lock()
     if lock_fd is None:
         return
     try:
-        # 4. Liveness throttle UNDER the lock (observation marker, NOT
-        #    snapshot age).
-        throttle = float(_cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS)
-        if c._statusline_observe_age_seconds() < throttle:
+        preliminary = _preliminary_decision()
+        if preliminary is None or preliminary.action == "NOOP":
             return
-        args = _record_args(
-            percent=parsed.rate_limits_7d_pct,
-            resets_at=parsed.rate_limits_7d_resets_at,
-            five_hour_percent=five_pct,
-            five_hour_resets_at=five_reset,
-            source="statusline",
-        )
-        # 5. Run the kernel — detached unless test-sync.
         if sync_for_test:
-            c.cmd_record_usage(args)
-            # Touch the liveness marker even on a dedup no-op return.
-            c._statusline_observe_touch()
+            _statusline_reduce_and_publish()
             return
-        _fork_persist(args, lock_fd)
+        _fork_persist(lock_fd)
     finally:
-        _release_persist_lock(lock_fd)
+        c._release_persist_lock(lock_fd)
 
 
 def _resolve_context_window(model_id, warn_once) -> "int | None":
@@ -881,4 +1611,3 @@ def _build_statusline_injections(warn_once):
         context_pct=_context_pct,
         warn_once=warn_once,
     )
-

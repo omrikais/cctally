@@ -8,6 +8,8 @@ classes to the same file.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -24,8 +26,10 @@ if str(BIN_DIR) not in sys.path:
 
 import _cctally_db as db  # noqa: E402
 import _lib_codex_conversation as kern  # noqa: E402
+import _lib_codex_conversation_export as cexport  # noqa: E402
 import _lib_codex_conversation_query as q  # noqa: E402
 import _lib_conversation as lc  # noqa: E402
+import _lib_conversation_anon as anon  # noqa: E402
 import _lib_conversation_dispatch as disp  # noqa: E402
 import _lib_conversation_query as lcq  # noqa: E402
 import _lib_jsonl as lj  # noqa: E402
@@ -631,6 +635,45 @@ def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
         rollouts[scenario] = rollout
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
     return ns, provider_root, rollouts
+
+
+def _codex_turn_records(tool_payloads, *, turn_id="turn-a"):
+    """session_meta + turn_context + the given response_item payloads (in order) —
+    a minimal single-turn synthetic rollout for kernel tests (§3.4 payload)."""
+    recs = [
+        {"payload": {"context_window": 272000,
+                     "cwd": "/synthetic/root-a/project-red",
+                     "git": {"branch": "b", "repository": "r"},
+                     "id": "root-thread-x", "instructions": "x",
+                     "model": "gpt-x", "model_context_window": 272000,
+                     "model_provider": "p",
+                     "session_id": "22222222-2222-4222-8222-222222222222",
+                     "source": "codex", "thread_source": "root-thread-x",
+                     "tools": [{"name": "t"}], "user": "u"},
+         "timestamp": "2026-07-14T12:00:00Z", "type": "session_meta"},
+        {"payload": {"model": "gpt-x", "model_context_window": 272000,
+                     "turn_id": turn_id},
+         "timestamp": "2026-07-14T12:01:00Z", "type": "turn_context"},
+    ]
+    for i, pl in enumerate(tool_payloads):
+        recs.append({"payload": pl,
+                     "timestamp": f"2026-07-14T12:{2 + i:02d}:00Z",
+                     "type": "response_item"})
+    return recs
+
+
+def _stage_codex_records(tmp_path, monkeypatch, records):
+    """Stage an arbitrary record list as one Codex rollout under a provider root."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider_root = tmp_path / "provider"
+    rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout-custom.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    with rollout.open("w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+    return ns, provider_root, rollout
 
 
 def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
@@ -1798,5 +1841,640 @@ def test_neutral_dispatch_claude_never_normalization_pending():
         assert disp.neutral_outline(conn, _SID_A)["status"] == "ok"
         assert disp.neutral_browse(conn, source="claude")["status"] == "ok"
         assert disp.neutral_search(conn, "Claude", source="claude")["status"] == "ok"
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #294 S7 — capability kernels + dispatch (spec §3, §3.7, §4.3-encoding)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _detail_response_item(conn, ck):
+    d = q.get_codex_conversation(conn, ck, effective_speed="standard")
+    return d, next(it for it in d["items"] if it["kind"] == "assistant")
+
+
+# ── A1: block_key on payload-capable detail blocks ────────────────────────────
+
+
+def test_block_key_on_tool_calls_distinct_and_absent_on_prose(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        d, response = _detail_response_item(conn, _single_ck(conn))
+        tool_blocks = [b for b in response["blocks"] if b["kind"] == "tool_call"]
+        assert len(tool_blocks) == 4  # fn-1, custom-1, search-1 (folded) + web_search
+        keys = [b["block_key"] for b in tool_blocks]
+        assert all(k and k.startswith("cbk1_") for k in keys)
+        assert len(keys) == len(set(keys))  # unique per tool_call physical row
+        # non-tool blocks never carry a block_key.
+        for it in d["items"]:
+            for b in it["blocks"]:
+                if b["kind"] != "tool_call":
+                    assert "block_key" not in b
+        # block keys are a DISTINCT family from item keys (different domain/prefix).
+        assert not any(k in {it["item_key"] for it in d["items"]} for k in keys)
+    finally:
+        conn.close()
+
+
+# ── A5: payload locate/read (§3.4) ────────────────────────────────────────────
+
+
+def test_payload_multi_pair_turn_disambiguated_and_call_only(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        _d, response = _detail_response_item(conn, ck)
+        by_call = {b.get("call_id"): b for b in response["blocks"]
+                   if b["kind"] == "tool_call"}
+        # THREE identified call/output pairs, disambiguated by distinct block_key.
+        for call_id in ("fn-1", "custom-1", "search-1"):
+            bk = by_call[call_id]["block_key"]
+            call = q.read_codex_payload(conn, ck, bk, "call")
+            out = q.read_codex_payload(conn, ck, bk, "output")
+            assert call["status"] == "ok" and call["content"]
+            assert out["status"] == "ok" and out["content"]
+            assert call["truncated"] is False and out["truncated"] is False
+        # fn-1 exact content, un-capped, from the re-read record.
+        fn_bk = by_call["fn-1"]["block_key"]
+        assert q.read_codex_payload(conn, ck, fn_bk, "call")["content"] == "fixture_function\n{}"
+        assert q.read_codex_payload(conn, ck, fn_bk, "output")["content"] == '{"ok":true}'
+        # the call-id-less web_search_call is CALL-ONLY: which=output -> not_found.
+        ws_bk = by_call[None]["block_key"]
+        assert q.read_codex_payload(conn, ck, ws_bk, "call")["status"] == "ok"
+        assert q.read_codex_payload(conn, ck, ws_bk, "output") == {
+            "status": "not_found", "block_key": ws_bk, "which": "output"}
+        # an unknown block_key / bad which -> not_found.
+        assert q.read_codex_payload(conn, ck, "cbk1_nope", "call")["status"] == "not_found"
+        assert q.read_codex_payload(conn, ck, fn_bk, "sideways")["status"] == "not_found"
+    finally:
+        conn.close()
+
+
+def test_payload_beyond_cap_reread(tmp_path, monkeypatch):
+    """Payload serves content beyond the normalized CODEX_TEXT_CAP (16 000)."""
+    big = "x" * (kern.CODEX_TEXT_CAP + 5000)
+    records = _codex_turn_records([
+        {"arguments": "a", "call_id": "c1", "name": "f", "type": "function_call"},
+        {"call_id": "c1", "output": big, "type": "function_call_output"},
+    ])
+    ns, _root, path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        _d, response = _detail_response_item(conn, ck)
+        bk = next(b["block_key"] for b in response["blocks"] if b["kind"] == "tool_call")
+        # the stored/rendered output is capped...
+        assert len(response["blocks"][-1].get("output", {}).get("text", "")) <= kern.CODEX_TEXT_CAP
+        # ...but payload re-read serves the FULL body.
+        out = q.read_codex_payload(conn, ck, bk, "output")
+        assert out["status"] == "ok" and out["content"] == big and out["truncated"] is False
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("length,expect_trunc", [(1_000_000, False), (1_000_001, True)])
+def test_payload_ceiling_boundary_multibyte(tmp_path, monkeypatch, length, expect_trunc):
+    """Ceiling is 1,000,000 Python CHARACTERS (not bytes): a multibyte payload at
+    exactly the ceiling is not truncated even though it is ~3× the byte size."""
+    body = "€" * length  # € = 1 char, 3 UTF-8 bytes
+    records = _codex_turn_records([
+        {"arguments": "a", "call_id": "c1", "name": "f", "type": "function_call"},
+        {"call_id": "c1", "output": body, "type": "function_call_output"},
+    ])
+    ns, _root, path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        _d, response = _detail_response_item(conn, ck)
+        bk = next(b["block_key"] for b in response["blocks"] if b["kind"] == "tool_call")
+        out = q.read_codex_payload(conn, ck, bk, "output")
+        assert out["status"] == "ok"
+        assert out["truncated"] is expect_trunc
+        assert len(out["content"]) == min(length, 1_000_000)
+    finally:
+        conn.close()
+
+
+def test_payload_gone_trio(tmp_path, monkeypatch):
+    """gone (410): missing file, truncation below offset, and a STRUCTURAL-only
+    mutation (call_id changed, extracted content identical) — validated against the
+    stored full record, never content_digest."""
+    ns, _root, rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    path = rollouts["modern-full"]
+    original = path.read_bytes()
+
+    def _bk_for(conn, call_id="fn-1"):
+        ck = _single_ck(conn)
+        _d, response = _detail_response_item(conn, ck)
+        return ck, next(b["block_key"] for b in response["blocks"]
+                        if b.get("call_id") == call_id)
+
+    # (1) missing file
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck, bk = _bk_for(conn)
+        path.unlink()
+        assert q.read_codex_payload(conn, ck, bk, "call")["status"] == "gone"
+    finally:
+        conn.close()
+
+    # (2) truncation below the stored offset
+    path.write_bytes(original)
+    conn = ns["open_cache_db"]()
+    try:
+        ck, bk = _bk_for(conn)
+        path.write_bytes(b"")  # truncate to empty
+        assert q.read_codex_payload(conn, ck, bk, "call")["status"] == "gone"
+    finally:
+        conn.close()
+
+    # (3) structural-only mutation: call_id fn-1 -> fn-9 (same length, name/args
+    # identical so content_digest + block_key are UNCHANGED and it still locates).
+    path.write_bytes(original)
+    conn = ns["open_cache_db"]()
+    try:
+        ck, bk = _bk_for(conn)
+        mutated = original.replace(b'"call_id":"fn-1"', b'"call_id":"fn-9"')
+        assert mutated != original and len(mutated) == len(original)
+        path.write_bytes(mutated)
+        assert q.read_codex_payload(conn, ck, bk, "call")["status"] == "gone"
+    finally:
+        conn.close()
+
+
+def _seed_codex_tool_call(conn, *, conversation_key, source_root_key, root_path,
+                          source_path, disk_path, call_id="c1"):
+    """Seed one tool_call row + its events record + write its file, all consistent,
+    and return the block_key. ``source_path`` is what the DB stores; ``disk_path`` is
+    where the JSON line physically lives (they differ for a symlink test)."""
+    record = {"payload": {"arguments": "AAA", "call_id": call_id, "name": "seedfn",
+                          "type": "function_call"},
+              "timestamp": "2026-07-14T12:00:00Z", "type": "response_item"}
+    ex = kern._extract("response_item", record["payload"])
+    digest = kern.content_digest(ex.content_text)
+    clen = kern.content_len(ex.content_text)
+    capped, _ = kern._cap(ex.content_text)
+    conn.execute(
+        "INSERT OR IGNORE INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?,?,?,?)",
+        (source_root_key, str(root_path), "2026-07-14T00:00:00+00:00",
+         "2026-07-14T00:00:00+00:00"))
+    conn.execute(
+        "INSERT INTO codex_conversation_messages "
+        "(conversation_key, source_root_key, source_path, line_offset, timestamp_utc, "
+        "turn_id, call_id, kind, event_type, record_family, model, text, "
+        "content_digest, content_len, detail_json, search_tool, search_thinking) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (conversation_key, source_root_key, str(source_path), 0,
+         "2026-07-14T12:00:00+00:00", "t", call_id, "tool_call", None,
+         "response_item", "gpt-x", "", digest, clen, None, capped, ""))
+    conn.execute(
+        "INSERT INTO codex_conversation_events "
+        "(source_path, line_offset, source_root_key, conversation_key, record_type, "
+        "event_type, turn_id, call_id, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+        (str(source_path), 0, source_root_key, conversation_key, "response_item",
+         "function_call", "t", call_id, kern._canonical_json(record)))
+    pathlib.Path(disk_path).write_text(json.dumps(record) + "\n", encoding="utf-8")
+    conn.commit()
+    return q.codex_block_key(conversation_key, source_path=str(source_path),
+                             line_offset=0, content_digest=digest)
+
+
+def test_payload_containment_guard_blocks_symlink_escape(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        root = tmp_path / "seed-root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        # non-escaping companion: a real file inside the root -> ok (proves the seed
+        # is consistent, so the escaping case's not_found is the guard, not a miss).
+        real = root / "real.jsonl"
+        ok_bk = _seed_codex_tool_call(
+            conn, conversation_key="conv-in", source_root_key="rk-in", root_path=root,
+            source_path=real, disk_path=real, call_id="in")
+        assert q.read_codex_payload(conn, "conv-in", ok_bk, "call")["status"] == "ok"
+        # escaping: a symlink INSIDE the root that realpath-resolves OUTSIDE it. The
+        # target file is valid + matching, so absent the guard it would read ok.
+        target = outside / "secret.jsonl"
+        link = root / "link.jsonl"
+        link.symlink_to(target)
+        bad_bk = _seed_codex_tool_call(
+            conn, conversation_key="conv-esc", source_root_key="rk-esc", root_path=root,
+            source_path=link, disk_path=target, call_id="esc")
+        assert q.read_codex_payload(conn, "conv-esc", bad_bk, "call") == {
+            "status": "not_found", "block_key": bad_bk, "which": "call"}
+    finally:
+        conn.close()
+
+
+# ── A2: find_in_codex_conversation (§3.1) ─────────────────────────────────────
+
+
+def test_find_kinds_tuple_matches_claude():
+    assert q.CODEX_FIND_KINDS == lcq._FIND_KINDS == (
+        "all", "prompts", "assistant", "tools", "thinking")
+
+
+def test_find_anchors_byte_equal_to_detail_item_keys(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        d = q.get_codex_conversation(conn, ck, effective_speed="standard")
+        detail_keys = {it["item_key"] for it in d["items"]}
+        res = q.find_in_codex_conversation(conn, ck, "Synthetic", kind="all")
+        assert res["status"] == "ok" and res["total"] > 0
+        assert res["search_depth"] == "full" and res["kind"] == "all"
+        assert all(a["item_key"] in detail_keys for a in res["anchors"])
+    finally:
+        conn.close()
+
+
+def test_find_kind_scoping_and_fts_like_equivalence(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+
+        def _anchors(query, kind, like=False):
+            if like:
+                conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                             "VALUES('codex_fts_unavailable','1')")
+            try:
+                r = q.find_in_codex_conversation(conn, ck, query, kind=kind)
+            finally:
+                conn.execute("DELETE FROM cache_meta WHERE key='codex_fts_unavailable'")
+            return r
+
+        prompts = _anchors("Synthetic", "prompts")
+        assert prompts["mode"] == "fts" and prompts["total"] >= 1
+        # thinking kind matches reasoning text only.
+        thinking = _anchors("reasoning", "thinking")
+        assert thinking["total"] >= 1
+        # prompts kind must NOT anchor the assistant turn.
+        assert prompts["total"] == len(
+            [it for it in q.get_codex_conversation(conn, ck, effective_speed="standard")["items"]
+             if it["kind"] == "user"
+             and "Synthetic" in (it["blocks"][0].get("text") or "")])
+        # FTS and LIKE resolve the same anchors for a single-term query.
+        fts = _anchors("Synthetic", "all")
+        like = _anchors("Synthetic", "all", like=True)
+        assert like["mode"] == "like"
+        assert {a["item_key"] for a in fts["anchors"]} == {a["item_key"] for a in like["anchors"]}
+    finally:
+        conn.close()
+
+
+def test_find_collapses_mirror_pair_and_caps(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["mirror-pairing"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        res = q.find_in_codex_conversation(conn, ck, "Mirror assistant reply", kind="assistant")
+        # the response_item + its suppressed event_msg mirror collapse to ONE anchor.
+        assert res["total"] == 1
+        # cap semantics: a cap below total truncates and flags.
+        capped = q.find_in_codex_conversation(conn, ck, "Repeat prompt", kind="prompts", cap=1)
+        assert capped["total"] == 2 and len(capped["anchors"]) == 1
+        assert capped["anchors_truncated"] is True
+    finally:
+        conn.close()
+
+
+def test_find_regex_case_and_unknown_kind(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        rx = q.find_in_codex_conversation(conn, ck, "Synth.tic", kind="all", regex=True)
+        assert rx["mode"] == "regex" and rx["total"] >= 1
+        # case-sensitive substring: the exact case matches, a wrong case does not.
+        assert q.find_in_codex_conversation(conn, ck, "Synthetic", kind="all", case=True)["total"] >= 1
+        assert q.find_in_codex_conversation(conn, ck, "SYNTHETIC", kind="all", case=True)["total"] == 0
+        with pytest.raises(ValueError):
+            q.find_in_codex_conversation(conn, ck, "x", kind="title")
+    finally:
+        conn.close()
+
+
+def test_find_pending_and_not_found():
+    conn = _cache_schema()  # migration 025 NOT stamped -> pending
+    try:
+        _insert_msg(conn, offset=1, text="hi", conversation_key="conv-p")
+        pend = q.find_in_codex_conversation(conn, "conv-p", "hi", kind="all")
+        assert pend["status"] == "normalization_pending"
+        assert pend["anchors"] == [] and pend["total"] == 0
+    finally:
+        conn.close()
+
+
+# ── A3: prompts (§3.2) ────────────────────────────────────────────────────────
+
+
+def test_codex_prompts_spine(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        res = q.codex_conversation_prompts(conn, ck)
+        assert res["status"] == "ok" and res["conversation_key"] == ck
+        assert [p["text"] for p in res["prompts"]][0] == "Synthetic first meaningful user prompt"
+        # item_key aligns 1:1 with the detail's user items (the S8 spine contract).
+        d = q.get_codex_conversation(conn, ck, effective_speed="standard")
+        user_keys = [it["item_key"] for it in d["items"] if it["kind"] == "user"]
+        assert [p["item_key"] for p in res["prompts"]] == user_keys
+    finally:
+        conn.close()
+
+
+def test_codex_prompts_pending_and_not_found():
+    conn = _cache_schema()
+    try:
+        _insert_msg(conn, offset=1, text="hi", conversation_key="conv-p", kind="user")
+        assert q.codex_conversation_prompts(conn, "conv-p")["status"] == "normalization_pending"
+    finally:
+        conn.close()
+
+
+# ── A4: export renderer (§3.3) ────────────────────────────────────────────────
+
+
+def test_export_deterministic_and_children_as_refs(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["nested-parent", "nested-child"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        parent_ck = conn.execute(
+            "SELECT conversation_key FROM codex_conversation_threads "
+            "WHERE native_thread_id = 'parent-thread-fixture'").fetchone()[0]
+        child_ck = conn.execute(
+            "SELECT conversation_key FROM codex_conversation_threads "
+            "WHERE parent_thread_id = 'parent-thread-fixture' "
+            "AND native_thread_id != 'parent-thread-fixture'").fetchone()[0]
+        env1 = q.get_codex_conversation_export(conn, parent_ck, effective_speed="standard")
+        env2 = q.get_codex_conversation_export(conn, parent_ck, effective_speed="standard")
+        assert env1["status"] == "ok" and env1 == env2  # deterministic
+        md = env1["markdown"]
+        assert md.startswith("# Parent thread question")
+        assert md.endswith("\n")
+        # provider-native token label vocabulary, never Claude cache vocabulary.
+        assert "reasoning_output" in md and "cache_read" not in md
+        # child appears as a v1. REFERENCE, never inlined.
+        assert child_ck in md and "## Child conversations" in md
+        child_md = q.get_codex_conversation_export(conn, child_ck, effective_speed="standard")["markdown"]
+        assert child_md not in md  # the child body is not inlined into the parent
+    finally:
+        conn.close()
+
+
+def test_export_pending_and_not_found():
+    conn = _cache_schema()
+    try:
+        assert q.get_codex_conversation_export(
+            conn, "nope", effective_speed="standard")["status"] == "normalization_pending"
+    finally:
+        conn.close()
+
+
+# ── A6: §3.7 hit extension (both providers) ───────────────────────────────────
+
+
+def test_codex_search_hits_carry_last_activity_and_project_label(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        env = q.search_codex_conversations(conn, "Synthetic", effective_speed="standard")
+        assert env["hits"]
+        for h in env["hits"]:
+            assert "last_activity_utc" in h and "project_label" in h
+            assert h["last_activity_utc"] and h["project_label"] == "project-red"
+    finally:
+        conn.close()
+
+
+def test_claude_neutral_search_hits_carry_section_3_7_fields():
+    conn = _claude_cache()
+    try:
+        _seed_claude_turn_pair(conn)
+        env = disp.neutral_search(conn, "Claude", source="claude", kind="all")
+        assert env["hits"]
+        for h in env["hits"]:
+            assert "last_activity_utc" in h and "project_label" in h
+            assert h["last_activity_utc"] == "2026-06-01T00:00:05Z"
+    finally:
+        conn.close()
+
+
+# ── A7: external search-cursor codec (§4.3) ───────────────────────────────────
+
+
+def test_search_cursor_codec_roundtrip_and_invalid():
+    raw = "v1.someconvkey\x00civ1_someitemkey"
+    ext = disp.encode_search_cursor(raw)
+    assert "=" not in ext and "\x00" not in ext  # unpadded, NUL never leaks
+    assert disp.decode_search_cursor(ext) == raw
+    assert disp.encode_search_cursor(None) is None
+    assert disp.decode_search_cursor(None) is None
+    with pytest.raises(disp.InvalidSearchCursor):
+        disp.decode_search_cursor("@@@not-base64@@@")
+
+
+def test_neutral_search_encodes_outgoing_cursor_and_decodes_incoming(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        page1 = disp.neutral_search(conn, "Synthetic", source="codex", kind="all", limit=1)
+        ext_cursor = page1["page"]["cursor"]
+        assert ext_cursor is not None
+        # the external cursor decodes to the kernel's NUL-separated raw form.
+        assert "\x00" in disp.decode_search_cursor(ext_cursor)
+        # feeding the external cursor back advances the page (decoded at the boundary).
+        raw_kernel = q.search_codex_conversations(
+            conn, "Synthetic", kind="all", effective_speed="standard", limit=1)
+        page2 = disp.neutral_search(
+            conn, "Synthetic", source="codex", kind="all", limit=1, cursor=ext_cursor)
+        assert page2["hits"] and page2["hits"] != page1["hits"]
+        with pytest.raises(disp.InvalidSearchCursor):
+            disp.neutral_search(conn, "Synthetic", source="codex", cursor="@@@bad@@@")
+        assert raw_kernel["page"]["cursor"] is not None  # kernel keeps raw form
+    finally:
+        conn.close()
+
+
+# ── A8: provider-aware anonymization builder (§3.6) ───────────────────────────
+
+
+def test_anon_plan_for_sources_covers_codex_roots_cwds_labels(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        plan = lcq.build_anon_plan_for_sources(
+            conn, home_dir="/home/fixture-user", sources={"codex"})
+        secret_text = (CORPUS / "rollouts" / "secret-canary.jsonl").read_text()
+        scrubbed = anon.scrub_text(secret_text, plan)
+        # the observed project root path + its display label are scrubbed.
+        assert "/synthetic/root-a/project-red" not in scrubbed
+        assert "project-red" not in scrubbed
+        # the caller home dir collapses to ~.
+        assert "/home/fixture-user" not in scrubbed
+        # documented secret patterns are redacted.
+        assert "sk-fixture-not-a-secret" not in scrubbed
+        assert "Bearer fixture-token" not in scrubbed
+        assert "[REDACTED:" in scrubbed
+    finally:
+        conn.close()
+
+
+def test_anon_mixed_db_leaves_legacy_builder_and_bare_claude_bytes_unchanged(tmp_path, monkeypatch):
+    """Codex rows present must NOT change legacy build_anon_plan_for_db output nor
+    bare-Claude export scrub bytes (the §3.6 byte-stability regression)."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    text = "code at /synthetic/root-a/project-red and /claude/only/proj"
+
+    # A: Claude-only cache with one Claude cwd.
+    a = _claude_cache()
+    try:
+        _cm(a, session_id=_SID_A, uuid="h1", offset=0, ts="2026-06-01T00:00:00Z",
+            entry_type="human", text="hi", cwd="/claude/only/proj")
+        plan_a = lcq.build_anon_plan_for_db(a, home_dir="/home/u")
+        scrub_a = anon.scrub_text(text, plan_a)
+    finally:
+        a.close()
+
+    # B: SAME Claude cwd, PLUS a fully-ingested Codex corpus (root-a rows present).
+    b = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](b)
+        b.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                  "VALUES('conversation_sessions_backfill_pending','1')")
+        _cm(b, session_id=_SID_A, uuid="h1", offset=0, ts="2026-06-01T00:00:00Z",
+            entry_type="human", text="hi", cwd="/claude/only/proj")
+        plan_b = lcq.build_anon_plan_for_db(b, home_dir="/home/u")
+        scrub_b = anon.scrub_text(text, plan_b)
+    finally:
+        b.close()
+
+    # legacy builder ignores Codex tables entirely -> byte-identical plan + scrub.
+    assert anon.plan_to_wire(plan_a) == anon.plan_to_wire(plan_b)
+    assert scrub_a == scrub_b
+    # and the legacy plan does NOT scrub the Codex-only root (it never saw it).
+    assert "/synthetic/root-a/project-red" in scrub_a
+
+
+# ── A9: dispatch ops + entity status matrix (§3, §5.6 parity) ─────────────────
+
+
+def test_neutral_find_dispatch_both_providers(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        via = disp.neutral_find(conn, ck, "Synthetic", kind="all")
+        assert via == q.find_in_codex_conversation(conn, ck, "Synthetic", kind="all")
+        # garbage ref -> not_found; bad kind -> ValueError (route 400).
+        assert disp.neutral_find(conn, "garbage", "x")["status"] == "not_found"
+        with pytest.raises(ValueError):
+            disp.neutral_find(conn, ck, "x", kind="title")
+    finally:
+        conn.close()
+
+
+def test_neutral_find_claude_anchors_are_neutral_item_keys():
+    conn = _claude_cache()
+    try:
+        _seed_claude_turn_pair(conn)
+        res = disp.neutral_find(conn, _SID_A, "Claude", kind="all")
+        assert res["status"] == "ok" and res["anchors"]
+        conv_key = disp.resolve_conversation_ref(_SID_A).conversation_key
+        # anchors carry neutral item_keys byte-equal to the detail's.
+        d = disp.neutral_detail(conn, _SID_A, effective_speed="standard")
+        detail_keys = {it["item_key"] for it in d["items"]}
+        assert all(a["item_key"] in detail_keys for a in res["anchors"])
+        assert res["conversation_key"] == conv_key
+    finally:
+        conn.close()
+
+
+def test_neutral_prompts_dispatch_both_providers(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        assert disp.neutral_prompts(conn, ck) == q.codex_conversation_prompts(conn, ck)
+        assert disp.neutral_prompts(conn, "garbage")["status"] == "not_found"
+    finally:
+        conn.close()
+    c = _claude_cache()
+    try:
+        _seed_claude_turn_pair(c)
+        pr = disp.neutral_prompts(c, _SID_A)
+        assert pr["status"] == "ok"
+        assert pr["prompts"][0]["text"] == "First Claude prompt"
+        assert pr["prompts"][0]["item_key"].startswith("cliv1_")
+    finally:
+        c.close()
+
+
+def test_neutral_export_scope_and_dispatch(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        ok = disp.neutral_export(conn, ck, scope="all", effective_speed="standard")
+        assert ok["status"] == "ok" and ok["markdown"].startswith("#")
+        # a non-default scope for a Codex ref is a validation error, never a fallback.
+        bad = disp.neutral_export(conn, ck, scope="chat", effective_speed="standard")
+        assert bad["status"] == "validation_error" and bad["reason"] == "scope"
+        assert disp.neutral_export(conn, "garbage")["status"] == "not_found"
+    finally:
+        conn.close()
+    c = _claude_cache()
+    try:
+        _seed_claude_turn_pair(c)
+        # Claude scopes pass through unchanged (chat is a valid Claude scope).
+        assert disp.neutral_export(c, _SID_A, scope="chat")["status"] == "ok"
+    finally:
+        c.close()
+
+
+def test_neutral_payload_dispatch_codex_and_claude(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        _d, response = _detail_response_item(conn, ck)
+        bk = next(b["block_key"] for b in response["blocks"]
+                  if b.get("call_id") == "fn-1")
+        via = disp.neutral_payload(conn, ck, which="call", block_key=bk)
+        assert via == q.read_codex_payload(conn, ck, bk, "call")
+        # Codex ref addressed by the Claude selector (tool_use_id) -> not_found.
+        assert disp.neutral_payload(conn, ck, which="call", tool_use_id="x")["status"] == "not_found"
+        assert disp.neutral_payload(conn, "garbage", which="call")["status"] == "not_found"
     finally:
         conn.close()

@@ -312,11 +312,17 @@ HOOK_TICK_LOG_ROTATED_PATH = _cctally_core.HOOK_TICK_LOG_ROTATED_PATH
 HOOK_TICK_THROTTLE_PATH = _cctally_core.HOOK_TICK_THROTTLE_PATH
 HOOK_TICK_THROTTLE_LOCK_PATH = _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH
 
-# Statusline usage-persistence markers + tunables (spec 2026-07-17).
+# Statusline candidate-arbitration paths + tunables (#318).
 STATUSLINE_OBSERVE_MARKER_PATH = _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH
 STATUSLINE_PERSIST_LOCK_PATH = _cctally_core.STATUSLINE_PERSIST_LOCK_PATH
+STATUSLINE_CANDIDATE_DIR = _cctally_core.STATUSLINE_CANDIDATE_DIR
+STATUSLINE_SELECTED_PATH = _cctally_core.STATUSLINE_SELECTED_PATH
+STATUSLINE_TRANSPORT_MARKER_PATH = _cctally_core.STATUSLINE_TRANSPORT_MARKER_PATH
+STATUSLINE_AUTHORITATIVE_7D_PATH = _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH
+STATUSLINE_AUTHORITATIVE_5H_PATH = _cctally_core.STATUSLINE_AUTHORITATIVE_5H_PATH
 OAUTH_BACKOFF_MARKER_PATH = _cctally_core.OAUTH_BACKOFF_MARKER_PATH
-STATUSLINE_PERSIST_THROTTLE_SECONDS = _cctally_core.STATUSLINE_PERSIST_THROTTLE_SECONDS
+STATUSLINE_CANDIDATE_TTL_SECONDS = _cctally_core.STATUSLINE_CANDIDATE_TTL_SECONDS
+STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS = _cctally_core.STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS
 OAUTH_BACKFILL_STALE_SECONDS = _cctally_core.OAUTH_BACKFILL_STALE_SECONDS
 OAUTH_BACKOFF_BASE_SECONDS = _cctally_core.OAUTH_BACKOFF_BASE_SECONDS
 OAUTH_BACKOFF_CAP_SECONDS = _cctally_core.OAUTH_BACKOFF_CAP_SECONDS
@@ -1037,12 +1043,14 @@ _build_credit_plan = _cctally_record._build_credit_plan
 _resolve_reset_aware_hwm = _cctally_record._resolve_reset_aware_hwm
 _insert_credit_snapshot = _cctally_record._insert_credit_snapshot
 _resolve_prior_5h = _cctally_record._resolve_prior_5h
+_resolve_active_five_hour_reset_event_id = _cctally_record._resolve_active_five_hour_reset_event_id
 _apply_credit = _cctally_record._apply_credit
 _fire_in_place_credit = _cctally_record._fire_in_place_credit
 _force_clear_credit = _cctally_record._force_clear_credit
 _count_stale_replays = _cctally_record._count_stale_replays
 _credit_preview_text = _cctally_record._credit_preview_text
 _credit_json = _cctally_record._credit_json
+_revalidate_credit_plan = _cctally_record._revalidate_credit_plan
 _arm_reset_zero_marker = _cctally_record._arm_reset_zero_marker
 _read_reset_zero_marker = _cctally_record._read_reset_zero_marker
 _clear_reset_zero_marker = _cctally_record._clear_reset_zero_marker
@@ -1055,6 +1063,8 @@ _hook_tick_throttle_touch = _cctally_record._hook_tick_throttle_touch
 # `cctally.X` (the `_cctally()` accessor + test monkeypatch surface) resolves.
 _statusline_observe_age_seconds = _cctally_record._statusline_observe_age_seconds
 _statusline_observe_touch = _cctally_record._statusline_observe_touch
+_statusline_transport_age_seconds = _cctally_record._statusline_transport_age_seconds
+_statusline_transport_touch = _cctally_record._statusline_transport_touch
 _oauth_backoff_remaining_seconds = _cctally_record._oauth_backoff_remaining_seconds
 _oauth_backoff_set = _cctally_record._oauth_backoff_set
 _oauth_backoff_clear = _cctally_record._oauth_backoff_clear
@@ -1322,6 +1332,25 @@ _fork_persist = _cctally_statusline._fork_persist
 _record_args = _cctally_statusline._record_args
 _try_acquire_persist_lock = _cctally_statusline._try_acquire_persist_lock
 _release_persist_lock = _cctally_statusline._release_persist_lock
+_atomic_write_json = _cctally_statusline._atomic_write_json
+_load_candidate_spool = _cctally_statusline._load_candidate_spool
+_scan_active_candidate_spool = _cctally_statusline._scan_active_candidate_spool
+_read_db_projection_stable = _cctally_statusline._read_db_projection_stable
+_read_db_projection_once = _cctally_statusline._read_db_projection_once
+_read_control_state = _cctally_statusline._read_control_state
+_statusline_control_db_agreement = _cctally_statusline._statusline_control_db_agreement
+_write_control_state = _cctally_statusline._write_control_state
+_reconcile_selected_control = _cctally_statusline._reconcile_selected_control
+_read_tombstone = _cctally_statusline._read_tombstone
+_write_tombstone = _cctally_statusline._write_tombstone
+_selected_state_lock = _cctally_statusline._selected_state_lock
+_authoritative_begin = _cctally_statusline._authoritative_begin
+_authoritative_commit = _cctally_statusline._authoritative_commit
+_authoritative_record_usage = _cctally_statusline._authoritative_record_usage
+_authoritative_repair_required = _cctally_statusline._authoritative_repair_required
+_after_authoritative_record = _cctally_statusline._after_authoritative_record
+_statusline_reduce_and_publish = _cctally_statusline._statusline_reduce_and_publish
+_build_publication_plan = _cctally_statusline._build_publication_plan
 
 
 # Eager re-export of bin/_cctally_codex.py — the four cmd_codex_* are the

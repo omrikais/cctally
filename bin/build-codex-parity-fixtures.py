@@ -43,6 +43,10 @@ MODEL = "gpt-synthetic-codex"
 MIRROR_SESSION = "22222222-2222-4222-8222-222222222222"
 UNTURNED_SESSION = "33333333-3333-4333-8333-333333333333"
 TITLE_SESSION = "44444444-4444-4444-8444-444444444444"
+# #294 S7 F1: the secret-canary scenario now carries a real turned conversation
+# (its own thread/session id) so a route-level export can resolve a v1 key and
+# prove the qualified anon plan scrubs the documented secret patterns end-to-end.
+SECRET_SESSION = "55555555-5555-4555-8555-555555555555"
 # The Claude-side seed reuses SHARED_ID as its sessionId so the collision proof
 # can show Codex/Claude assemblies share ZERO rows on content, not just key
 # inequality. A known-priced model keeps the sync-time cost pass warning-free.
@@ -301,6 +305,39 @@ def _content_bearing_root(root: str, record_id: str, subject: str) -> list[dict]
     ]
 
 
+def _secret_canary_records() -> list[dict]:
+    """A turned Codex conversation whose assistant reply embeds the documented
+    secret patterns (spec §3.6). Normalizes to ONE thread (its own SECRET_SESSION
+    identity) so the route-level export test can resolve a v1 conversation key,
+    GET the export with anonymization on, and prove the qualified anon plan scrubs
+    the canary tokens (secret shapes, provider root, project label) while the
+    surrounding prose survives — and that the raw leg still carries them. The
+    trailing structural ``message`` record keeps the raw file's secret/root/home
+    strings so the kernel-level scrub test stays non-vacuous."""
+    def ts(index: int) -> str:
+        return f"2026-07-14T18:{index:02d}:00Z"
+
+    return [
+        _session_meta(root=ROOT_A, session_id=SECRET_SESSION,
+                      record_id="secret-canary-thread", thread_source="secret-canary-thread",
+                      forked_from_id="secret-canary-thread"),
+        _turn_context(ts(1), "turn-canary"),
+        _response_message(ts(2), "user", "Canary widget configuration prompt"),
+        _response_message(
+            ts(3), "assistant",
+            "Configure the deployment with sk-fixture-not-a-secret and header "
+            "Authorization: Bearer fixture-token targeting /synthetic/root-a/project-red now"),
+        # Structural secret-bearing record retained verbatim: keeps the raw file's
+        # api-key / bearer / home / root strings so kernel scrub tests keep proving
+        # each redaction, and models a non-message record surviving normalization.
+        {"timestamp": ts(4), "type": "message", "payload": {
+            "api_key_shape": "sk-fixture-not-a-secret",
+            "authorization_shape": "Authorization: Bearer fixture-token",
+            "home_shape": "/home/fixture-user/project-green", "root_shape": ROOT_A}},
+        _token_event(timestamp=ts(5)),
+    ]
+
+
 def _claude_seed_records() -> list[dict]:
     """A genuine Claude-format conversation sharing SHARED_ID as its sessionId."""
     return [
@@ -380,7 +417,7 @@ def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
         "unturned-event-prose": (_unturned_event_prose_records(), None),
         "title-wrapper-window": (_title_wrapper_window_records(), None),
         "claude-collision": ([_session_meta(source="claude", record_id="claude-root", thread_source="claude-root", forked_from_id="claude-root"), {"timestamp": "2026-07-14T12:02:00Z", "type": "assistant", "payload": {"session_id": SHARED_ID}}], None),
-        "secret-canary": ([{"timestamp": "2026-07-14T12:11:00Z", "type": "message", "payload": {"api_key_shape": "sk-fixture-not-a-secret", "authorization_shape": "Authorization: Bearer fixture-token", "home_shape": "/home/fixture-user/project-green", "root_shape": ROOT_A}}], None),
+        "secret-canary": (_secret_canary_records(), None),
         "empty-source": ([], None),
         "stale-cache": ([_session_meta(source={"kind": "codex"}), {"timestamp": "2025-01-01T00:00:00Z", "type": "event_msg", "payload": {"type": "stale_cache_marker", "age_seconds": 999999}}], None),
         "claude-only": ([_session_meta(source="claude", record_id="claude-only", thread_source="claude-only", forked_from_id="claude-only")], None),
@@ -413,8 +450,14 @@ def _acceptance_matrix() -> dict:
         _row("source-aware-cli-share-identity", "S3", ["all"], "share-identity", "supported", ["mixed-source", "root-a-collision"], ["tests/test_source_aware_share.py", "bin/cctally-source-aware-test"], "CLI share artifacts and the source-bearing share kernel preserve opaque source-qualified identity."),
         _row("source-aware-dashboard-share-identity", "S5", ["all"], "share-identity", "deferred", ["mixed-source", "root-a-collision"], "tests/test_source_aware_dashboard_share.py", "Dashboard share, composer, and history preserve source identity."),
         _row("s4-dashboard-share-backend-contract", "S4", ["all"], "dashboard-share-backend", "supported", ["claude-only", "codex-only", "mixed-source", "empty-source", "stale-cache", "root-a-collision", "root-b-collision", "malformed-tail"], ["tests/test_dashboard_source_share.py", "tests/test_dashboard_source_routes.py"], "Provider-qualified dashboard detail routes resolve bounded relational native data with collision safety, while canonical source-bearing share snapshots drive render, digest identity, composition, presets, and history before S5 adds source controls."),
-        _row("native-codex-conversation-stack", "S8", ["codex"], "conversation-reader", "deferred", ["modern-full", "nested-child"], "dashboard/web/src/conversations/CodexConversationReader.test.tsx", "Native browse, search, reader, find, export, and live-tail consume normalized qualified identities."),
-        _row("codex-anonymization-privacy-gate", "S7", ["codex"], "conversation-privacy", "deferred", ["secret-canary"], "tests/test_codex_conversation_api.py", "Roots, usernames, encoded paths, and secret patterns obey the same privacy gate."),
+        _row("native-codex-conversation-stack", "S8", ["codex"], "conversation-reader-ui", "deferred", ["modern-full", "nested-child"], "dashboard/web/src/conversations/CodexConversationReader.test.tsx", "The React browse/reader/find/export/live-tail UI surfaces (plus reading position and cross-source combined presentation) consume the S7 backend's normalized qualified identities."),
+        _row("codex-anonymization-privacy-gate", "S7", ["codex"], "conversation-privacy", "supported", ["secret-canary"], "tests/test_codex_conversation_api.py", "Roots, usernames, encoded paths, and secret patterns obey the same privacy gate."),
+        _row("s7-conversation-route-exposure", "S7", ["all"], "conversation-routes", "supported", ["modern-full", "nested-parent", "claude-only"], ["tests/test_codex_conversation_api.py", "tests/test_conversation_endpoints.py"], "Dual-form entity routes (v1. lexical) and the strict ?source= collection routes (browse, facets, search) expose normalized conversations while the bare Claude surface stays byte-identical."),
+        _row("s7-conversation-find", "S7", ["codex"], "conversation-find", "supported", ["modern-full", "mirror-pairing"], ["tests/test_codex_conversation_normalization.py", "tests/test_codex_conversation_api.py"], "In-conversation find anchors both providers with one item_key contract, honest FTS/LIKE selection, and mirror-pair collapse."),
+        _row("s7-transcript-export-byte-parity", "S7", ["all"], "transcript-cli", "supported", ["modern-full", "root-a-collision"], ["tests/test_transcript_cli.py"], "The transcript CLI takes the dual-form export positional, --speed (Codex-only, resolved-source), and --source search, and its export byte-matches the HTTP export in both anonymize and raw modes."),
+        _row("s7-conversation-payload-readback", "S7", ["codex"], "conversation-payload", "supported", ["modern-full"], ["tests/test_codex_conversation_normalization.py", "tests/test_codex_conversation_api.py"], "The Codex payload readback selects by opaque block_key + which={call,output}, serves beyond-cap content from the re-read record, validates gone against the stored full record, and guards containment."),
+        _row("s7-targeted-ingest-live-tail", "S7", ["codex"], "conversation-live-tail", "supported", ["nested-parent", "nested-child", "modern-full"], ["tests/test_codex_conversation_live_tail.py", "tests/test_codex_conversation_frontier.py", "tests/test_codex_dashboard_conversation_events.py"], "Targeted Codex ingest (only_paths + targeted_clean, whole-tree-bypass) and the qualified live-tail SSE with the budgeted directory-frontier child discovery join new child threads mid-watch."),
+        _row("s7-conversation-media-capability-gated", "S7", ["codex"], "conversation-media", "unavailable", ["modern-full"], ["tests/test_codex_conversation_api.py"], "Codex media returns an explicit capability_unsupported response (degrade explicitly, never zero-fill) until real renderable media is shown to exist in rollouts."),
         _row("synthetic-source-coverage", "S0", ["all"], "synthetic-corpus", "supported", ["claude-only", "codex-only", "mixed-source", "empty-source", "stale-cache", "malformed-tail", "duplicate-token-count", "root-a-collision", "nested-child"], p, "Corpus covers source-only, mixed, empty, stale, malformed, collision, and nested cases."),
         _row("existing-codex-compatibility", "S1", ["codex"], "compatibility", "supported", ["legacy-envelope", "duplicate-token-count"], "tests/test_codex_fused_ingest.py", "Existing accounting, budget, pricing, aliases, and deliberate divergences remain compatible."),
         _row("s5-s8-ui-qa-gates", "S9", ["all"], "ui-certification", "deferred", [], "dashboard/web/src/conversations/CodexConversationReader.test.tsx", "React/CSS tests, typecheck/build, dashboard goldens, and browser QA gate S5 and S8."),
@@ -434,7 +477,7 @@ def _acceptance_matrix() -> dict:
         _row("codex-budget-existing-semantics", "S1", ["codex"], "budget", "supported", ["modern-full"], "tests/test_codex_fused_ingest.py", "Existing Codex budget calculation and actual/projected semantics remain supported."),
         _row("codex-title-first-prompt-fallback", "S6", ["codex"], "conversation-title", "supported", ["modern-full"], ["tests/test_codex_conversation_normalization.py"], "Initial title uses the first meaningful user prompt."),
         _row("codex-threading-uses-thread-metadata", "S6", ["codex"], "conversation-threading", "supported", ["nested-parent", "nested-child"], ["tests/test_codex_conversation_normalization.py"], "Nesting uses thread metadata, not filenames."),
-        _row("codex-anon-plan-includes-roots", "S7", ["codex"], "anon-plan", "deferred", ["secret-canary"], "tests/test_codex_conversation_api.py", "The anonymization plan includes provider roots and labels."),
+        _row("codex-anon-plan-includes-roots", "S7", ["codex"], "anon-plan", "supported", ["root-a-collision"], "tests/test_codex_conversation_api.py", "The anonymization plan includes provider roots and labels."),
         _row("debug-backend-source-counts", "S4", ["all"], "debug-diagnostics", "supported", ["mixed-source", "stale-cache", "root-a-collision"], ["tests/test_dashboard_debug_backend.py", "tests/test_dashboard_source_invalidation.py"], "Loopback-only backend diagnostics expose source-aware aggregate counts and opaque versions without private identities."),
         _row("reading-position-qualified-key", "S8", ["all"], "reading-position", "deferred", ["root-a-collision", "root-b-collision"], "dashboard/web/src/store/readingPosition.test.ts", "Reading positions use opaque qualified conversation keys."),
         _row("dashboard-s5-after-293-s4", "S5", ["all"], "dashboard-sequencing", "deferred", [], "tests/test_source_aware_dashboard.py", "S5 waits for issue 293 S4 or an approved ownership split."),

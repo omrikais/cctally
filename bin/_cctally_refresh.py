@@ -624,10 +624,6 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
             status="fetch_failed",
             reason=f"invalid oauth_usage config: {exc}",
         )
-    # Successful API response — clear any pending 429 backoff + counter, so a
-    # user-confirmed recovery lets automatic polling resume (spec §4).
-    c._oauth_backoff_reset()
-
     seven = api.get("seven_day") or {}
     try:
         # Normalize at the OAuth ingress so the payload JSON published
@@ -681,12 +677,21 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
         # this, cmd_record_usage would fall back to its "statusline" default.
         source="api",
     )
-    try:
-        rc = c.cmd_record_usage(record_args)
-    except Exception as exc:
-        return _RefreshUsageResult(status="record_failed", reason=str(exc))
-    if rc != 0:
-        return _RefreshUsageResult(status="record_failed", reason=f"exit {rc}")
+    authoritative = c._authoritative_record_usage(
+        record_args,
+        {
+            "sevenDay",
+            *({"fiveHour"} if five_pct is not None else set()),
+        },
+    )
+    if authoritative.status != "ok":
+        return _RefreshUsageResult(
+            status="record_failed", reason=authoritative.reason
+        )
+    # A fetched response becomes evidence of recovery only after its
+    # write-ahead tombstones, database reconciliation, selected control, and
+    # selected-freshness marker have all committed.
+    c._oauth_backoff_reset()
 
     # §5.6 Option C: route through cctally's namespace so
     # `monkeypatch.setitem(ns, "_bust_statusline_cache", …)` propagates
@@ -877,18 +882,38 @@ def _hook_tick_oauth_refresh(
             throttle_seconds = float(_get_oauth_usage_config(c.load_config())["throttle_seconds"])
         except OauthUsageConfigError:
             throttle_seconds = float(c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS)
-    # Backfill gate (spec §4). The automatic OAuth poll is now a BACKFILL
-    # behind the statusline (the primary writer). It fetches only when the
-    # statusline has NOT fed recently AND no 429 cooldown is pending — so a
-    # live statusline keeps usage fresh with zero API calls, and a 429 streak
-    # is suppressed by the shared deadline instead of re-polled every tick.
-    # Gating on the observation marker (not snapshot age) is what makes the
-    # demotion correct: cmd_record_usage dedups unchanged percentages without
-    # refreshing captured_at, so snapshot age keeps growing while the
-    # statusline is alive. Force-refresh (_refresh_usage_inproc) never routes
-    # through here, so it is exempt (user-initiated).
+    # The automatic writer takes the selected-state lock *before* rechecking
+    # its suppression conditions.  A concurrent publisher can otherwise make
+    # this tick issue an unnecessary OAuth request between the initial gate
+    # and the request itself.
+    try:
+        with c._selected_state_lock():
+            return _hook_tick_oauth_refresh_locked(
+                c,
+                token=token,
+                timeout_seconds=timeout_seconds,
+                throttle_seconds=throttle_seconds,
+            )
+    except OSError:
+        return "err(record-usage=exc)", None
+
+
+def _hook_tick_oauth_refresh_locked(
+    c,
+    *,
+    token: str,
+    timeout_seconds: float,
+    throttle_seconds: float,
+) -> tuple[str, dict | None]:
+    """Automatic OAuth path with the selected-state lock already held."""
+    # Backfill gate: an inflight/invalid tombstone bypasses only selected-age
+    # suppression so a later authoritative result can repair it.  The normal
+    # throttle and 429 deadline continue to bound OAuth traffic.
+    now_epoch = int(time.time())
+    needs_repair = c._authoritative_repair_required(now_epoch=now_epoch)
     obs_age = c._statusline_observe_age_seconds()
-    if obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS):
+    if (not needs_repair
+            and obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS)):
         return f"skipped(statusline-fresh:{int(obs_age)}s)", None
     backoff_remaining = c._oauth_backoff_remaining_seconds()
     if backoff_remaining > 0:
@@ -899,9 +924,6 @@ def _hook_tick_oauth_refresh(
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
-        # Arm the shared backoff deadline so the next tick is suppressed
-        # rather than immediately re-polling (spec §4). Honors Retry-After
-        # when present, else conservative exponential backoff.
         c._oauth_backoff_register_429(
             retry_after_deadline=getattr(exc, "retry_after_deadline", None),
             now=time.time(),
@@ -911,8 +933,6 @@ def _hook_tick_oauth_refresh(
         return "err(network)", None
     except RefreshUsageMalformedError:
         return "err(parse)", None
-    # Successful API response — clear any pending 429 backoff + counter.
-    c._oauth_backoff_reset()
     seven = api["seven_day"]
     try:
         seven_pct = c._normalize_percent(float(seven["utilization"]))
@@ -922,10 +942,6 @@ def _hook_tick_oauth_refresh(
     five = api.get("five_hour") if isinstance(api.get("five_hour"), dict) else None
     five_pct: float | None = None
     five_resets_epoch: int | None = None
-    # An inactive 5h window arrives as `resets_at: null` (key present, value
-    # null). Require a string here — mirrors the seven_day guard in
-    # _fetch_oauth_usage — so _iso_to_epoch(None) can't raise AttributeError;
-    # a malformed (non-null) string still degrades via the except below.
     if (five is not None and "utilization" in five
             and isinstance(five.get("resets_at"), str)):
         try:
@@ -939,15 +955,21 @@ def _hook_tick_oauth_refresh(
         resets_at=str(seven_resets_epoch),
         five_hour_percent=five_pct,
         five_hour_resets_at=str(five_resets_epoch) if five_resets_epoch is not None else None,
-        # OAuth feeder — label the row "api" (spec §5).
         source="api",
     )
-    try:
-        rc = c.cmd_record_usage(record_args)
-    except Exception:
+    authoritative = c._authoritative_record_usage(
+        record_args,
+        {"sevenDay", *({"fiveHour"} if five_pct is not None else set())},
+        lock_held=True,
+    )
+    if authoritative.status != "ok":
+        reason = authoritative.reason or ""
+        if reason.startswith("exit "):
+            return f"err(record-usage={reason[5:]})", None
         return "err(record-usage=exc)", None
-    if rc != 0:
-        return f"err(record-usage={rc})", None
+    # Success is acknowledged to the shared OAuth backoff only after the
+    # authoritative writer has published tombstones, control, and freshness.
+    c._oauth_backoff_reset()
     parts = [f"7d={int(round(seven_pct))}"]
     if five_pct is not None:
         parts.append(f"5h={int(round(five_pct))}")

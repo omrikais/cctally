@@ -296,7 +296,7 @@
       ]
     },
     {
-      "capability": "conversation-reader",
+      "capability": "conversation-reader-ui",
       "contractState": "deferred",
       "fixtureScenarios": [
         "modern-full",
@@ -307,14 +307,14 @@
       ],
       "id": "native-codex-conversation-stack",
       "ownerSession": "S8",
-      "requirement": "Native browse, search, reader, find, export, and live-tail consume normalized qualified identities.",
+      "requirement": "The React browse/reader/find/export/live-tail UI surfaces (plus reading position and cross-source combined presentation) consume the S7 backend's normalized qualified identities.",
       "sources": [
         "codex"
       ]
     },
     {
       "capability": "conversation-privacy",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "secret-canary"
       ],
@@ -324,6 +324,113 @@
       "id": "codex-anonymization-privacy-gate",
       "ownerSession": "S7",
       "requirement": "Roots, usernames, encoded paths, and secret patterns obey the same privacy gate.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-routes",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "nested-parent",
+        "claude-only"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_api.py",
+        "tests/test_conversation_endpoints.py"
+      ],
+      "id": "s7-conversation-route-exposure",
+      "ownerSession": "S7",
+      "requirement": "Dual-form entity routes (v1. lexical) and the strict ?source= collection routes (browse, facets, search) expose normalized conversations while the bare Claude surface stays byte-identical.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "conversation-find",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "mirror-pairing"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "s7-conversation-find",
+      "ownerSession": "S7",
+      "requirement": "In-conversation find anchors both providers with one item_key contract, honest FTS/LIKE selection, and mirror-pair collapse.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "transcript-cli",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "root-a-collision"
+      ],
+      "futureTestTargets": [
+        "tests/test_transcript_cli.py"
+      ],
+      "id": "s7-transcript-export-byte-parity",
+      "ownerSession": "S7",
+      "requirement": "The transcript CLI takes the dual-form export positional, --speed (Codex-only, resolved-source), and --source search, and its export byte-matches the HTTP export in both anonymize and raw modes.",
+      "sources": [
+        "all"
+      ]
+    },
+    {
+      "capability": "conversation-payload",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "s7-conversation-payload-readback",
+      "ownerSession": "S7",
+      "requirement": "The Codex payload readback selects by opaque block_key + which={call,output}, serves beyond-cap content from the re-read record, validates gone against the stored full record, and guards containment.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-live-tail",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "nested-parent",
+        "nested-child",
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_live_tail.py",
+        "tests/test_codex_conversation_frontier.py",
+        "tests/test_codex_dashboard_conversation_events.py"
+      ],
+      "id": "s7-targeted-ingest-live-tail",
+      "ownerSession": "S7",
+      "requirement": "Targeted Codex ingest (only_paths + targeted_clean, whole-tree-bypass) and the qualified live-tail SSE with the budgeted directory-frontier child discovery join new child threads mid-watch.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-media",
+      "contractState": "unavailable",
+      "fixtureScenarios": [
+        "modern-full"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "s7-conversation-media-capability-gated",
+      "ownerSession": "S7",
+      "requirement": "Codex media returns an explicit capability_unsupported response (degrade explicitly, never zero-fill) until real renderable media is shown to exist in rollouts.",
       "sources": [
         "codex"
       ]
@@ -651,9 +758,9 @@
     },
     {
       "capability": "anon-plan",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
-        "secret-canary"
+        "root-a-collision"
       ],
       "futureTestTargets": [
         "tests/test_codex_conversation_api.py"

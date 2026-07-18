@@ -363,6 +363,11 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         # per-test tmp APP_DIR, never the developer's real prod data dir.
         "STATUSLINE_OBSERVE_MARKER_PATH": share / "statusline-observe.last",
         "STATUSLINE_PERSIST_LOCK_PATH": share / "statusline-persist.lock",
+        "STATUSLINE_CANDIDATE_DIR": share / "statusline-candidates",
+        "STATUSLINE_SELECTED_PATH": share / "statusline-selected.json",
+        "STATUSLINE_TRANSPORT_MARKER_PATH": share / "statusline-transport.last",
+        "STATUSLINE_AUTHORITATIVE_7D_PATH": share / "statusline-authoritative-7d.json",
+        "STATUSLINE_AUTHORITATIVE_5H_PATH": share / "statusline-authoritative-5h.json",
         "OAUTH_BACKOFF_MARKER_PATH": share / "oauth-backoff.until",
         "OAUTH_BACKOFF_COUNT_PATH": share / "oauth-backoff.count",
         "UPDATE_STATE_PATH": share / "update-state.json",

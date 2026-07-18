@@ -20,12 +20,16 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 
 import pytest
+
+import _lib_statusline_candidates as candidate_lib
 
 from conftest import load_script, redirect_paths
 
@@ -43,7 +47,7 @@ def _iso(epoch):
 
 def _status_input(app, *, seven_pct, seven_resets_epoch,
                   five_pct=None, five_resets_epoch=None, with_five_key=False,
-                  model_id=None):
+                  model_id=None, session_id=None, transcript_path=None):
     """Parse a CC-shaped stdin payload into a StatuslineInput (as production
     does), so `_statusline_persist` sees exactly the real parsed object.
 
@@ -63,6 +67,10 @@ def _status_input(app, *, seven_pct, seven_resets_epoch,
             "resets_at": _iso(five_resets_epoch) if five_resets_epoch is not None else None,
         }
     payload = {"rate_limits": rl}
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if transcript_path is not None:
+        payload["transcript_path"] = transcript_path
     if model_id is not None:
         payload["model"] = {"id": model_id}
     return app._lib_statusline.parse_statusline_stdin(
@@ -129,6 +137,47 @@ def _snapshot_count(app):
         conn.close()
 
 
+def _insert_snapshot(app, *, weekly_percent, weekly_resets_epoch, captured_epoch,
+                     five_percent=None, five_resets_epoch=None, source="statusline"):
+    """Seed one real stats row without invoking record-usage's HWM policy."""
+    week_end = _iso(weekly_resets_epoch)
+    week_start = _iso(weekly_resets_epoch - 7 * 86400)
+    conn = app.open_db()
+    try:
+        five_key = (
+            app._canonical_5h_window_key(five_resets_epoch)
+            if five_resets_epoch is not None else None
+        )
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, week_end_at, "
+            " weekly_percent, page_url, source, payload_json, five_hour_percent, "
+            " five_hour_resets_at, five_hour_window_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, '{}', ?, ?, ?)",
+            (
+                _iso(captured_epoch), week_start[:10], week_end[:10], week_start, week_end,
+                weekly_percent, source, five_percent,
+                _iso(five_resets_epoch) if five_resets_epoch is not None else None,
+                five_key,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pending_drop(app, *, percent=20):
+    return candidate_lib.PendingDrop(
+        canonical_key=1,
+        reduced_percent=percent,
+        first_seen_at=int(time.time()),
+        kernel_stage="settling",
+        attempts=0,
+        contributors={},
+        retry_signature=None,
+    )
+
+
 def _record_ns(*, percent=42.0, resets_in_days=3, five_percent=None,
                five_resets_in_hours=None, **extra):
     """Build a plausible cmd_record_usage Namespace.
@@ -174,6 +223,342 @@ def test_observe_marker_absent_is_infinite(app):
 def test_observe_touch_then_age_small(app):
     app._statusline_observe_touch()
     assert app._statusline_observe_age_seconds() < 5.0
+
+
+# --- candidate spool and selected-state split (#318 Task 2) ---------------
+
+
+def _future_week():
+    return int(time.time()) + 3 * 86400
+
+
+def test_candidate_artifacts_stay_in_redirected_app_dir(app, tmp_path):
+    parsed = _status_input(
+        app,
+        session_id="secret-session",
+        transcript_path="/private/work/transcript.jsonl",
+        seven_pct=20,
+        seven_resets_epoch=_future_week(),
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+    files = list(app.STATUSLINE_CANDIDATE_DIR.iterdir())
+    assert len(files) == 1
+    assert re.fullmatch(r"[0-9a-f]{64}\.json", files[0].name)
+    assert stat.S_IMODE(app.STATUSLINE_CANDIDATE_DIR.stat().st_mode) == 0o700
+    assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+    body = files[0].read_text()
+    assert "secret-session" not in body
+    assert "/private/work" not in body
+    assert files[0].is_relative_to(tmp_path)
+    assert app.STATUSLINE_TRANSPORT_MARKER_PATH.is_relative_to(tmp_path)
+    assert app.STATUSLINE_SELECTED_PATH.is_relative_to(tmp_path)
+
+
+def test_reducer_ignores_incomplete_candidate_temp(app):
+    app.STATUSLINE_CANDIDATE_DIR.mkdir(mode=0o700)
+    temp = app.STATUSLINE_CANDIDATE_DIR / (
+        "." + "a" * 64 + ".json.tmp.1." + "b" * 32
+    )
+    temp.write_text('{"schemaVersion":')
+    assert app._load_candidate_spool(now_epoch=int(time.time())) == ()
+    assert temp.exists()
+
+
+def test_stale_first_fresh_second_is_order_independent(app):
+    stale = _status_input(
+        app, session_id="a", seven_pct=20, seven_resets_epoch=_future_week()
+    )
+    fresh = _status_input(
+        app, session_id="b", seven_pct=24, seven_resets_epoch=_future_week()
+    )
+    app._statusline_persist(stale, sync_for_test=True)
+    app._statusline_persist(fresh, sync_for_test=True)
+    assert _newest_row(app)["weekly_percent"] == 24
+
+
+def test_lock_loser_candidate_publishes_on_next_tick(app, monkeypatch):
+    fresh = _status_input(
+        app, session_id="fresh", seven_pct=24, seven_resets_epoch=_future_week()
+    )
+    real_lock = app._try_acquire_persist_lock
+    monkeypatch.setattr(app, "_try_acquire_persist_lock", lambda: None)
+    app._statusline_persist(fresh, sync_for_test=True)
+    assert _snapshot_count(app) == 0
+    monkeypatch.setattr(app, "_try_acquire_persist_lock", real_lock)
+    stale = _status_input(
+        app, session_id="stale", seven_pct=20, seven_resets_epoch=_future_week()
+    )
+    app._statusline_persist(stale, sync_for_test=True)
+    assert _newest_row(app)["weekly_percent"] == 24
+
+
+@pytest.mark.parametrize("first_five, second_five", [(20, 24), (24, 20)])
+def test_same_raw_five_hour_candidates_preserve_each_session_percent(
+        app, monkeypatch, first_five, second_five):
+    """Two candidate identities may share a raw reset but not a percentage."""
+    now = int(time.time())
+    weekly_reset = now + 3 * 86400
+    five_reset = now + 2 * 3600
+    assert app.cmd_record_usage(_record_ns(
+        percent=20, resets_in_days=3, five_percent=20, five_resets_in_hours=2,
+    )) == 0
+
+    real_lock = app._try_acquire_persist_lock
+    monkeypatch.setattr(app, "_try_acquire_persist_lock", lambda: None)
+    for session_id, five_pct in (("first", first_five), ("second", second_five)):
+        app._statusline_persist(_status_input(
+            app, session_id=session_id, seven_pct=20, seven_resets_epoch=weekly_reset,
+            five_pct=five_pct, five_resets_epoch=five_reset, with_five_key=True,
+        ), sync_for_test=True)
+    monkeypatch.setattr(app, "_try_acquire_persist_lock", real_lock)
+    app._statusline_reduce_and_publish()
+    row = _newest_row(app)
+    assert row["weekly_percent"] == 20
+    assert row["five_hour_percent"] == 24
+
+
+def test_weekly_advance_publishes_active_db_five_hour_companion(app):
+    now = int(time.time())
+    app._statusline_persist(_status_input(
+        app, session_id="seed", seven_pct=20, seven_resets_epoch=now + 3 * 86400,
+        five_pct=30, five_resets_epoch=now + 2 * 3600, with_five_key=True,
+    ), sync_for_test=True)
+    app._statusline_persist(_status_input(
+        app, session_id="weekly", seven_pct=21, seven_resets_epoch=now + 3 * 86400,
+    ), sync_for_test=True)
+    row = _newest_row(app)
+    assert row["weekly_percent"] == 21
+    assert row["five_hour_percent"] == 30
+
+
+def test_weekly_advance_drops_expired_db_five_hour_companion(app):
+    now = int(time.time())
+    app._statusline_persist(_status_input(
+        app, session_id="seed", seven_pct=20, seven_resets_epoch=now + 3 * 86400,
+        five_pct=30, five_resets_epoch=now, with_five_key=True,
+    ), sync_for_test=True)
+    app._statusline_persist(_status_input(
+        app, session_id="weekly", seven_pct=21, seven_resets_epoch=now + 3 * 86400,
+    ), sync_for_test=True)
+    row = _newest_row(app)
+    assert row["weekly_percent"] == 21
+    assert row["five_hour_percent"] is None
+
+
+def test_missing_control_reconciles_db_once_then_unchanged_tick_is_child_free(app, monkeypatch):
+    now = int(time.time())
+    assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3)) == 0
+    parsed = _status_input(
+        app, session_id="equal", seven_pct=50, seven_resets_epoch=now + 3 * 86400,
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert app.STATUSLINE_SELECTED_PATH.exists()
+    calls = []
+    real_reduce = app._cctally_statusline._statusline_reduce_and_publish
+
+    def counted_reduce():
+        calls.append(True)
+        return real_reduce()
+
+    monkeypatch.setattr(app._cctally_statusline, "_statusline_reduce_and_publish", counted_reduce)
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert calls == []
+
+
+def test_legacy_db_write_forces_one_control_only_reconciliation_child(app, monkeypatch):
+    now = int(time.time())
+    assert app.cmd_record_usage(_record_ns(
+        percent=50, resets_in_days=3, five_percent=10, five_resets_in_hours=2,
+    )) == 0
+    parsed = _status_input(
+        app, session_id="equal", seven_pct=50, seven_resets_epoch=now + 3 * 86400,
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+
+    # A legacy direct writer changes only the active 5h projection.  The
+    # candidate remains equal to its stale 7d control view, so repair must be
+    # control-only rather than calling the kernel again.
+    assert app.cmd_record_usage(_record_ns(
+        percent=50, resets_in_days=3, five_percent=11, five_resets_in_hours=2,
+    )) == 0
+    calls = []
+    real_reduce = app._cctally_statusline._statusline_reduce_and_publish
+
+    def counted_reduce():
+        calls.append(True)
+        return real_reduce()
+
+    monkeypatch.setattr(app._cctally_statusline, "_statusline_reduce_and_publish", counted_reduce)
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert calls == [True]
+    control = app._read_control_state(now_epoch=int(time.time()))
+    assert control is not None
+    assert control.db_projection.five_hour is not None
+    assert control.db_projection.five_hour.percent == 11
+
+    calls.clear()
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert calls == []
+
+
+def test_authoritative_observation_clears_only_its_axis_pending_drop(app):
+    assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3, source="api")) == 0
+    projection = app._read_db_projection_stable()
+    pending = _pending_drop(app)
+    app._write_control_state(candidate_lib.ControlState(
+        projection, {"fiveHour": pending, "sevenDay": pending},
+    ))
+    result = app._authoritative_record_usage(
+        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"}
+    )
+    assert result.status == "ok"
+    control = app._read_control_state(now_epoch=int(time.time()))
+    assert control is not None
+    assert control.pending_drops["sevenDay"] is None
+    assert control.pending_drops["fiveHour"] is not None
+
+
+def test_authoritative_equal_fifty_clears_an_actual_pending_twenty_generation(app):
+    now = int(time.time())
+    assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3, source="api")) == 0
+    lower = _status_input(
+        app, session_id="lower", seven_pct=20, seven_resets_epoch=now + 3 * 86400,
+    )
+    app._statusline_persist(lower, sync_for_test=True)
+    pending_control = app._read_control_state(now_epoch=int(time.time()))
+    assert pending_control is not None
+    pending = pending_control.pending_drops["sevenDay"]
+    assert pending is not None and pending.reduced_percent == 20
+
+    result = app._authoritative_record_usage(
+        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"}
+    )
+    assert result.status == "ok"
+    control = app._read_control_state(now_epoch=int(time.time()))
+    assert control is not None and control.pending_drops["sevenDay"] is None
+
+
+def test_empty_spool_reconciles_expired_pending_drop(app):
+    assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3)) == 0
+    projection = app._read_db_projection_stable()
+    app._write_control_state(candidate_lib.ControlState(
+        projection, {"fiveHour": None, "sevenDay": _pending_drop(app)},
+    ))
+    decision = app._statusline_reduce_and_publish()
+    assert decision is not None and decision.action == "WRITE_CONTROL"
+    control = app._read_control_state(now_epoch=int(time.time()))
+    assert control is not None and control.pending_drops["sevenDay"] is None
+
+
+def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
+        app, monkeypatch):
+    """The first zero only arms cmd_record_usage's existing debounce marker."""
+    now = int(time.time())
+    assert app.cmd_record_usage(_record_ns(percent=20, resets_in_days=3)) == 0
+    parsed = _status_input(
+        app, session_id="zero", seven_pct=0, seven_resets_epoch=now + 3 * 86400,
+    )
+    clock = {"value": now}
+    monkeypatch.setattr(app._cctally_statusline.time, "time", lambda: clock["value"])
+
+    app._statusline_persist(parsed, sync_for_test=True)  # settle baseline
+    clock["value"] += 1
+    app._statusline_persist(parsed, sync_for_test=True)  # first kernel attempt arms zero
+    assert _newest_row(app)["weekly_percent"] == 20
+    control = app._read_control_state(now_epoch=clock["value"])
+    assert control is not None
+    pending = control.pending_drops["sevenDay"]
+    assert pending is not None and pending.kernel_stage == "zero_armed"
+
+    clock["value"] += 1
+    app._statusline_persist(parsed, sync_for_test=True)  # revalidated second attempt commits
+    assert _newest_row(app)["weekly_percent"] == 0
+    control = app._read_control_state(now_epoch=clock["value"])
+    assert control is not None and control.pending_drops["sevenDay"] is None
+
+
+def test_projection_keeps_active_five_hour_when_newer_weekly_only_row_exists(app):
+    now = int(time.time())
+    reset = now + 3 * 86400
+    five_reset = now + 2 * 3600
+    _insert_snapshot(
+        app, weekly_percent=20, weekly_resets_epoch=reset, captured_epoch=now - 2,
+        five_percent=30, five_resets_epoch=five_reset,
+    )
+    _insert_snapshot(
+        app, weekly_percent=21, weekly_resets_epoch=reset, captured_epoch=now - 1,
+    )
+    projection = app._read_db_projection_once()
+    assert projection.seven_day is not None and projection.seven_day.percent == 21
+    assert projection.five_hour is not None and projection.five_hour.percent == 30
+
+
+def test_projection_normalizes_weekly_jitter_and_uses_capture_order_not_row_id(app):
+    now = int(time.time())
+    reset = now + 3 * 86400
+    # Insert the newer capture first, then an older capture with a later row id.
+    _insert_snapshot(
+        app, weekly_percent=24, weekly_resets_epoch=reset + 40, captured_epoch=now - 1,
+    )
+    _insert_snapshot(
+        app, weekly_percent=20, weekly_resets_epoch=reset + 5, captured_epoch=now - 2,
+    )
+    projection = app._read_db_projection_once()
+    assert projection.seven_day is not None
+    assert projection.seven_day.percent == 24
+    expected = int(app._normalize_week_boundary_dt(
+        dt.datetime.fromtimestamp(reset + 40, tz=dt.timezone.utc)
+    ).timestamp())
+    assert projection.seven_day.canonical_key == expected
+
+
+def test_projection_selects_latest_post_credit_weekly_and_five_hour_segments(app):
+    now = int(time.time())
+    reset = now + 3 * 86400
+    five_reset = now + 2 * 3600
+    _insert_snapshot(
+        app, weekly_percent=50, weekly_resets_epoch=reset, captured_epoch=now - 20,
+        five_percent=30, five_resets_epoch=five_reset,
+    )
+    conn = app.open_db()
+    try:
+        credit_at = _iso(now - 10)
+        conn.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc) "
+            "VALUES (?, ?, ?, ?)",
+            (_iso(reset - 7 * 86400)[:10], credit_at, 50, credit_at),
+        )
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, five_hour_window_key, prior_percent, post_percent, effective_reset_at_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (credit_at, app._canonical_5h_window_key(five_reset), 30, 5, credit_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_snapshot(
+        app, weekly_percent=20, weekly_resets_epoch=reset, captured_epoch=now - 1,
+        five_percent=5, five_resets_epoch=five_reset,
+    )
+    projection = app._read_db_projection_once()
+    assert projection.seven_day is not None and projection.seven_day.percent == 20
+    assert projection.seven_day.reset_generation > 0
+    assert projection.five_hour is not None and projection.five_hour.percent == 5
+    assert projection.five_hour.reset_generation > 0
+
+
+def test_unchanged_statusline_candidate_touches_transport_not_selected(app):
+    parsed = _status_input(
+        app, session_id="same", seven_pct=20, seven_resets_epoch=_future_week()
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+    selected = app.STATUSLINE_OBSERVE_MARKER_PATH
+    selected.unlink()
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert app._statusline_transport_age_seconds() < 5
+    assert not selected.exists()
 
 
 # --- oauth backoff deadline marker -----------------------------------------
@@ -265,97 +650,27 @@ def test_persist_writes_snapshot_and_milestone(app):
     assert n >= 1
 
 
-def test_same_value_render_touches_observe_marker_on_dedup(app, monkeypatch):
-    """P1-1 regression: an unchanged-value render is a dedup no-op in
-    cmd_record_usage (no new row), but the persist feeder MUST still touch
-    the observation marker so the throttles/backfill track liveness rather
-    than snapshot age."""
+def test_same_value_render_does_not_touch_selected_marker_on_dedup(app):
+    """Unchanged stdin stays transport-lively but does not claim selection."""
     import _cctally_core
 
-    # Neutralize the throttle so both persists run their kernel step.
-    monkeypatch.setattr(_cctally_core, "STATUSLINE_PERSIST_THROTTLE_SECONDS", 0.0)
-
     now = int(time.time())
-    parsed = _status_input(app, seven_pct=42.0, seven_resets_epoch=now + 3 * 86400)
+    parsed = _status_input(
+        app, session_id="same-value", seven_pct=42.0,
+        seven_resets_epoch=now + 3 * 86400,
+    )
 
     app._statusline_persist(parsed, sync_for_test=True)  # inserts row #1
     assert _snapshot_count(app) == 1
 
-    # Age the marker away so we can prove the SECOND persist re-touches it.
+    # Remove the selected marker; the same candidate must not recreate it.
     _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.unlink()
     assert app._statusline_observe_age_seconds() == float("inf")
 
-    app._statusline_persist(parsed, sync_for_test=True)  # dedup: no new row
-    assert _snapshot_count(app) == 1  # cmd_record_usage suppressed the insert
-    assert app._statusline_observe_age_seconds() < 5.0  # marker touched anyway
-
-
-def test_throttle_second_render_within_window_is_noop(app):
-    """Within the persist throttle window the second render is a pure no-op
-    (no kernel call, no new row) — keyed off the observation marker."""
-    now = int(time.time())
-    p1 = _status_input(app, seven_pct=10.0, seven_resets_epoch=now + 3 * 86400)
-    app._statusline_persist(p1, sync_for_test=True)
-    n = _snapshot_count(app)
-    assert n == 1
-
-    # A DIFFERENT value that WOULD insert if it ran — proves the throttle,
-    # not dedup, suppressed it.
-    p2 = _status_input(app, seven_pct=11.0, seven_resets_epoch=now + 3 * 86400)
-    app._statusline_persist(p2, sync_for_test=True)
-    assert _snapshot_count(app) == n
-
-
-def test_throttle_retuned_to_25_seconds_boundary(app):
-    """The persist throttle is 25s (retuned from 60 for #311's 30s
-    statusLine.refreshInterval timer — interval MUST exceed throttle so a
-    steady tick isn't beat-frequency-throttled). A marker aged >= 25s lets a
-    persist through; < 25s skips.
-
-    Non-vacuity: the >= 25s direction (step b) is RED by construction against
-    the pre-#311 60.0 constant — a 26s-old marker would still throttle there
-    (26 < 60) and no row would be written."""
-    now = int(time.time())
-    marker = app.STATUSLINE_OBSERVE_MARKER_PATH
-    p = _status_input(app, seven_pct=10.0, seven_resets_epoch=now + 3 * 86400)
-
-    # (a) marker aged 24s (< 25) → a would-insert reading is throttled.
-    app._statusline_observe_touch()
-    os.utime(marker, (time.time() - 24, time.time() - 24))
-    app._statusline_persist(p, sync_for_test=True)
-    assert _snapshot_count(app) == 0  # throttled
-
-    # (b) marker aged 26s (>= 25) → the same reading now persists. Would have
-    #     been throttled under the old 60.0 constant.
-    os.utime(marker, (time.time() - 26, time.time() - 26))
-    app._statusline_persist(p, sync_for_test=True)
-    assert _snapshot_count(app) == 1  # proceeded
-
-
-def test_slow_record_skips_one_tick_then_self_corrects(app):
-    """Cadence qualifier (spec D2 / Codex R1 F2): the observation marker is
-    touched at persist COMPLETION, so a tick observes marker age =
-    interval - d where d is the previous record's duration. With interval=30
-    and throttle=25, a record slower than 5s (interval - throttle) makes the
-    NEXT tick throttle (age 30-d < 25); the tick AFTER (age ~60-d) proceeds.
-    A slow record therefore degrades cadence to skip-one-tick (~60s) and
-    self-corrects — it never wedges. (Exact-30s is deliberately NOT an
-    acceptance criterion; no attempt-start marker exists.)"""
-    now = int(time.time())
-    marker = app.STATUSLINE_OBSERVE_MARKER_PATH
-    p = _status_input(app, seven_pct=15.0, seven_resets_epoch=now + 3 * 86400)
-
-    d = 6.0  # previous record took 6s (> interval - throttle = 5s)
-    # Next tick (interval=30s after the previous tick started): age 30-d=24s.
-    app._statusline_observe_touch()
-    os.utime(marker, (time.time() - (30 - d), time.time() - (30 - d)))
-    app._statusline_persist(p, sync_for_test=True)
-    assert _snapshot_count(app) == 0  # one tick skipped
-
-    # The following tick (2*interval=60s after that start): age 60-d=54s.
-    os.utime(marker, (time.time() - (60 - d), time.time() - (60 - d)))
-    app._statusline_persist(p, sync_for_test=True)
-    assert _snapshot_count(app) == 1  # self-corrected
+    app._statusline_persist(parsed, sync_for_test=True)
+    assert _snapshot_count(app) == 1
+    assert app._statusline_observe_age_seconds() == float("inf")
+    assert app._statusline_transport_age_seconds() < 5.0
 
 
 def test_no_rate_limits_is_noop(app):

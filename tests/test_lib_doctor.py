@@ -68,6 +68,8 @@ def test_doctor_state_has_required_fields():
         "codex_lifecycle_activity_24h",
         # #311: precomputed statusLine.refreshInterval classification.
         "statusline_refresh_state",
+        # #318: passive statusline candidate/selected pipeline evidence.
+        "statusline_pipeline",
     }
     assert fields == expected, fields ^ expected
 
@@ -163,9 +165,58 @@ def _state(**overrides) -> L.DoctorState:
         conv_sessions_rollup_count=10,
         conv_messages_distinct_sessions=10,
         conv_rollup_sync_in_progress=False,
+        statusline_pipeline=None,
     )
     base.update(overrides)
     return L.DoctorState(**base)
+
+
+def test_statusline_pipeline_warns_when_timer_fresh_selection_stale():
+    result = L._check_statusline_pipeline(_state(statusline_pipeline={
+        "transport_age_seconds": 10,
+        "selected_age_seconds": 301,
+        "active_candidate_count": 2,
+        "control_db_agrees": True,
+        "tombstones": {"fiveHour": "absent", "sevenDay": "committed"},
+    }))
+
+    assert result.id == "data.statusline_pipeline"
+    assert result.severity == "warn"
+    assert result.summary == "timer active; selected usage stale"
+
+
+def test_statusline_pipeline_stale_transport_is_informational():
+    result = L._check_statusline_pipeline(_state(statusline_pipeline={
+        "transport_age_seconds": 91,
+        "selected_age_seconds": 500,
+        "active_candidate_count": 0,
+        "control_db_agrees": True,
+        "tombstones": {"fiveHour": "absent", "sevenDay": "absent"},
+    }))
+
+    assert result.severity == "ok"
+    assert result.summary == "no recent regular-pool timer observed"
+
+
+def test_statusline_pipeline_warns_for_invalid_authority_or_control_drift():
+    invalid = L._check_statusline_pipeline(_state(statusline_pipeline={
+        "transport_age_seconds": None,
+        "selected_age_seconds": None,
+        "active_candidate_count": 0,
+        "control_db_agrees": True,
+        "tombstones": {"fiveHour": "invalid", "sevenDay": "absent"},
+    }))
+    divergent = L._check_statusline_pipeline(_state(statusline_pipeline={
+        "transport_age_seconds": 1,
+        "selected_age_seconds": 1,
+        "active_candidate_count": 1,
+        "control_db_agrees": False,
+        "tombstones": {"fiveHour": "absent", "sevenDay": "committed"},
+    }))
+
+    assert invalid.summary == "authoritative state needs repair"
+    assert divergent.severity == "warn"
+    assert divergent.summary == "selected control disagrees with database"
 
 
 def _codex_identity(root: str, limit: str, slot: str, minutes: int) -> dict:

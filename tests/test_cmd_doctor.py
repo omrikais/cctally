@@ -294,3 +294,24 @@ def test_gather_lock_probe_creates_no_files_on_fresh_dir(monkeypatch, tmp_path):
     assert not _cctally_core.CACHE_LOCK_CODEX_PATH.exists()
     assert state.locks_held == {"cache.db.lock": False,
                                 "cache.db.codex.lock": False}
+
+
+def test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority(
+        monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    candidate_dir = _cctally_core.STATUSLINE_CANDIDATE_DIR
+    candidate_dir.mkdir(mode=0o700)
+    malformed = candidate_dir / ("a" * 64 + ".json")
+    malformed.write_text('{"schemaVersion":')
+    _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH.write_text("not-json")
+
+    state = ns["doctor_gather_state"]()
+
+    assert malformed.exists(), "doctor must not prune candidate spool files"
+    assert state.statusline_pipeline["active_candidate_count"] == 0
+    assert state.statusline_pipeline["tombstones"] == {
+        "fiveHour": "absent", "sevenDay": "invalid",
+    }

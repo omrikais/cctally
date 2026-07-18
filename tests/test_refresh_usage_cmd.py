@@ -3,6 +3,7 @@ import argparse
 import json as _json
 import pathlib
 import subprocess
+import types
 import pytest
 
 from conftest import load_script
@@ -37,17 +38,18 @@ def _stub_fetch_raises(monkeypatch, ns, exc):
 
 
 def _stub_record_ok(monkeypatch, ns, capture=None):
-    def fake(record_args):
+    def fake(record_args, observed_axes):
         if capture is not None:
             capture["args"] = record_args
-        return 0
-    monkeypatch.setitem(ns, "cmd_record_usage", fake)
+            capture["axes"] = observed_axes
+        return types.SimpleNamespace(status="ok", reason=None)
+    monkeypatch.setitem(ns, "_authoritative_record_usage", fake)
 
 
 def _stub_record_raises(monkeypatch, ns, exc):
-    def boom(record_args):
-        raise exc
-    monkeypatch.setitem(ns, "cmd_record_usage", boom)
+    def boom(record_args, observed_axes):
+        return types.SimpleNamespace(status="record_failed", reason=str(exc))
+    monkeypatch.setitem(ns, "_authoritative_record_usage", boom)
 
 
 def _stub_cache_busted(monkeypatch, ns, state="busted"):

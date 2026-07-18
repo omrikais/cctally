@@ -213,6 +213,20 @@ def _rc_args(**over):
     return argparse.Namespace(**a)
 
 
+def _authorized_credit_args(**over):
+    """Use explicit requested facts so authority tests do not depend on the
+    unrelated current-week resolver fixture clock."""
+    args = dict(
+        dry_run=False,
+        yes=True,
+        from_pct=46.0,
+        at="2026-06-19T14:37:00Z",
+        week="2026-06-13",
+    )
+    args.update(over)
+    return _rc_args(**args)
+
+
 def test_resolves_current_week_and_hwm_from(ns, monkeypatch):
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"]()
@@ -261,6 +275,55 @@ def test_apply_happy_path_s1(ns, monkeypatch):
     conn.close()
     assert _weekly_reads(ns) == 31.0     # reset-aware HWM now reads 31
     assert (ns["_cctally_core"].APP_DIR / "hwm-7d").read_text().split()[1] == "31.0"
+
+
+def test_apply_commits_only_weekly_authoritative_tombstone(ns, monkeypatch):
+    """An authorized same-week credit invalidates stale 7d candidates but
+    must leave the independent 5h authority file untouched."""
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+
+    assert ns["cmd_record_credit"](_authorized_credit_args()) == 0
+
+    import json
+    tombstone = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    assert tombstone["axis"] == "sevenDay"
+    assert tombstone["state"] == "committed"
+    assert not ns["STATUSLINE_AUTHORITATIVE_5H_PATH"].exists()
+
+
+def test_plan_drift_after_credit_authorization_aborts_before_tombstone(
+        ns, monkeypatch):
+    """The locked revalidation must reject a changed plan before it writes an
+    inflight tombstone or mutates the credit tables."""
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    monkeypatch.setitem(ns, "_revalidate_credit_plan", lambda *args, **kwargs: None)
+
+    assert ns["cmd_record_credit"](_authorized_credit_args()) == 2
+    assert not ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].exists()
+    assert not ns["STATUSLINE_SELECTED_PATH"].exists()
+    assert not ns["STATUSLINE_OBSERVE_MARKER_PATH"].exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        _authorized_credit_args(dry_run=True, yes=False),
+        _authorized_credit_args(json=True, yes=False),
+        _authorized_credit_args(yes=False),
+    ],
+)
+def test_record_credit_non_mutating_exits_create_no_pipeline_artifacts(
+        ns, monkeypatch, args):
+    """Preview and rejection paths are entirely outside the selected writer
+    critical section: a request that did not authorize mutation cannot make
+    stale spool input fail closed or advertise selected freshness."""
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    assert ns["cmd_record_credit"](args) in (0, 2)
+    assert not ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].exists()
+    assert not ns["STATUSLINE_SELECTED_PATH"].exists()
+    assert not ns["STATUSLINE_OBSERVE_MARKER_PATH"].exists()
 
 
 def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):

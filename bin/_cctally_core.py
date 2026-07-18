@@ -67,6 +67,9 @@ def _init_paths_from_env() -> None:
     global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
     global HOOK_TICK_THROTTLE_PATH, HOOK_TICK_THROTTLE_LOCK_PATH
     global STATUSLINE_OBSERVE_MARKER_PATH, STATUSLINE_PERSIST_LOCK_PATH
+    global STATUSLINE_CANDIDATE_DIR, STATUSLINE_SELECTED_PATH
+    global STATUSLINE_TRANSPORT_MARKER_PATH
+    global STATUSLINE_AUTHORITATIVE_7D_PATH, STATUSLINE_AUTHORITATIVE_5H_PATH
     global OAUTH_BACKOFF_MARKER_PATH, OAUTH_BACKOFF_COUNT_PATH
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
@@ -126,25 +129,17 @@ def _init_paths_from_env() -> None:
     HOOK_TICK_THROTTLE_PATH = APP_DIR / "hook-tick.last-fetch"
     HOOK_TICK_THROTTLE_LOCK_PATH = APP_DIR / "hook-tick.last-fetch.lock"
 
-    # Statusline usage-persistence markers + lock (spec 2026-07-17
-    # usage-statusline-fallback). The statusline is the PRIMARY automatic
-    # writer of weekly/5h usage snapshots; these gate it.
-    #   - STATUSLINE_OBSERVE_MARKER_PATH: liveness marker (mtime-based,
-    #     like HOOK_TICK_THROTTLE_PATH) — touched after every statusline
-    #     persist that fed valid 7d input through cmd_record_usage, INCLUDING
-    #     a dedup no-op. Represents "the statusline is alive and feeding".
-    #     The statusline persist throttle AND the OAuth backfill gate both
-    #     key off this, NOT snapshot age (cmd_record_usage dedups unchanged
-    #     percentages without refreshing captured_at, so snapshot age keeps
-    #     growing while the statusline is actively feeding).
-    #   - STATUSLINE_PERSIST_LOCK_PATH: cross-process flock serializing the
-    #     detached persist feeder so a multi-session render herd yields at
-    #     most one snapshot per throttle window.
-    #   - OAUTH_BACKOFF_MARKER_PATH: shared 429 cooldown. Stores an ABSOLUTE
-    #     epoch deadline in the file CONTENT (never the mtime — future-dating
-    #     an mtime would corrupt HOOK_TICK_THROTTLE_PATH's age reading).
+    # Statusline candidate arbitration (#318). The spool and derived selected
+    # state are entirely APP_DIR-derived so dev/data-dir redirection remains
+    # complete. The observation marker now means selected/authoritative
+    # freshness; transport liveness has its own marker.
     STATUSLINE_OBSERVE_MARKER_PATH = APP_DIR / "statusline-observe.last"
     STATUSLINE_PERSIST_LOCK_PATH = APP_DIR / "statusline-persist.lock"
+    STATUSLINE_CANDIDATE_DIR = APP_DIR / "statusline-candidates"
+    STATUSLINE_SELECTED_PATH = APP_DIR / "statusline-selected.json"
+    STATUSLINE_TRANSPORT_MARKER_PATH = APP_DIR / "statusline-transport.last"
+    STATUSLINE_AUTHORITATIVE_7D_PATH = APP_DIR / "statusline-authoritative-7d.json"
+    STATUSLINE_AUTHORITATIVE_5H_PATH = APP_DIR / "statusline-authoritative-5h.json"
     OAUTH_BACKOFF_MARKER_PATH = APP_DIR / "oauth-backoff.until"
     # Consecutive-429 counter (text int) driving the headerless exponential
     # backoff (base * 2**count). Separate from the deadline marker so the
@@ -246,38 +241,23 @@ def _real_prod_data_dir() -> pathlib.Path:
 # Internal (no config UI — YAGNI, spec §Out of scope); test injection only.
 # Spec 2026-07-17-usage-statusline-fallback-design.
 #
-# STATUSLINE_PERSIST_THROTTLE_SECONDS: min seconds between statusline
-#   persist attempts (keyed off STATUSLINE_OBSERVE_MARKER_PATH liveness).
-#   Retuned 60.0 -> 25.0 for #311: the setup-managed statusLine.refreshInterval
-#   timer fires the statusline on a 30s cadence, and the throttle MUST be
-#   strictly LESS than that interval. When interval <= throttle, phase jitter
-#   produces beat-frequency skips (a tick at 59.9s of marker age is throttled;
-#   the next persist waits ~120s), so a 60/60 pairing oscillates 60<->120s.
-#   With interval 30 > throttle 25, every tick whose predecessor's record
-#   completed promptly (within interval - throttle = 5s) passes the gate.
-#   CADENCE QUALIFIER: the marker is touched at persist COMPLETION, so a tick
-#   observes marker age = 30 - d where d is the previous record's duration;
-#   if d > 5s (the record kernel can run cmd_sync_week JSONL scans) that tick
-#   throttles and the cycle degrades to skip-one-tick (~60s), self-correcting
-#   on the next tick. Exact-30s is NOT an invariant (no attempt-start marker
-#   exists — one would let a hung/failed record claim liveness and suppress
-#   the OAuth backfill). Still strictly better than the 60/60 beat's 60-120s.
 # OAUTH_BACKFILL_STALE_SECONDS: the OAuth poll only backfills once the
-#   observation marker is at least this stale (i.e. the statusline has
-#   NOT fed recently). Strictly greater than the persist throttle so the
-#   statusline is the primary writer and OAuth only covers its absence
-#   (300 > 25 still holds).
+#   selected-freshness marker is at least this stale. The 30-second statusline
+#   transport tick does not run OAuth.
 # OAUTH_BACKOFF_BASE_SECONDS / OAUTH_BACKOFF_CAP_SECONDS: the headerless
 #   exponential 429 backoff (base * 2**consecutive_429, capped).
-STATUSLINE_PERSIST_THROTTLE_SECONDS = 25.0
+STATUSLINE_CANDIDATE_TTL_SECONDS = 90
+STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS = 5
+STATUSLINE_CANDIDATE_DOCUMENT_MAX_BYTES = 4 * 1024
+STATUSLINE_SELECTED_DOCUMENT_MAX_BYTES = 1024 * 1024
+STATUSLINE_TOMBSTONE_DOCUMENT_MAX_BYTES = 1024
 # STATUSLINE_REFRESH_INTERVAL_DEFAULT (#311): the value `cctally setup`
 # writes into Claude Code's settings.json `statusLine.refreshInterval` when a
 # recognized cctally statusLine block lacks one. Claude Code re-runs the
 # statusline command on this fixed timer "in addition to the event-driven
 # updates", which keeps the usage-persistence feeder ticking while a parent
 # session waits on a long subagent (event-driven updates go quiet then). MUST
-# exceed STATUSLINE_PERSIST_THROTTLE_SECONDS (30 > 25) — see the pairing rule
-# above. Add-when-absent only; a user-set value is never mutated.
+# Add-when-absent only; a user-set value is never mutated.
 STATUSLINE_REFRESH_INTERVAL_DEFAULT = 30
 OAUTH_BACKFILL_STALE_SECONDS = 300.0
 OAUTH_BACKOFF_BASE_SECONDS = 60.0

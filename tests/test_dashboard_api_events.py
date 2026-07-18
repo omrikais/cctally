@@ -10,6 +10,7 @@ directly from the response's underlying buffered file via read1()
 blocking until the full request size is satisfied) until we have the
 first complete event frame (terminated by `\n\n`).
 """
+import datetime as dt
 import http.client
 import json
 import threading
@@ -17,7 +18,7 @@ import time
 
 import pytest
 
-from conftest import load_script
+from conftest import load_script, redirect_paths
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +94,89 @@ def test_events_headers_and_first_frame():
     finally:
         srv.shutdown()
         t.join(timeout=2)
+
+
+def test_passive_sse_reflects_statusline_reducer_without_oauth(
+        monkeypatch, tmp_path):
+    """The periodic dashboard rebuild carries reducer-selected usage.
+
+    Two statusline candidates are phase-locked at the spool boundary before
+    either can reduce.  The normal periodic rebuild closure then owns the
+    snapshot-ref update and hub publication; neither the reducer nor that
+    passive rebuild may contact an OAuth path.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", lambda *_a, **_kw: pytest.fail("OAuth called"))
+    monkeypatch.setitem(ns, "_refresh_usage_inproc", lambda *_a, **_kw: pytest.fail("OAuth refresh called"))
+
+    now = dt.datetime.now(dt.timezone.utc)
+    reset = (now + dt.timedelta(days=3)).isoformat().replace("+00:00", "Z")
+    parsed = [
+        ns["_lib_statusline"].parse_statusline_stdin(json.dumps({
+            "session_id": session_id,
+            "rate_limits": {"seven_day": {"used_percentage": percent, "resets_at": reset}},
+        }).encode())
+        for session_id, percent in (("stale", 20.0), ("fresh", 24.0))
+    ]
+    phase = threading.Barrier(2)
+    statusline = ns["_cctally_statusline"]
+    write_candidate = statusline._write_candidate
+
+    def phase_locked(candidate):
+        write_candidate(candidate)
+        phase.wait(timeout=3)
+
+    monkeypatch.setattr(statusline, "_write_candidate", phase_locked)
+    workers = [threading.Thread(
+        target=statusline._statusline_persist, args=(candidate,), kwargs={"sync_for_test": True},
+    ) for candidate in parsed]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    hub = ns["SSEHub"]()
+    initial = ns["_empty_dashboard_snapshot"]()
+    ref = ns["_SnapshotRef"](initial)
+    rebuild = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=now, display_tz_pref_override=None,
+        runtime_bind="127.0.0.1",
+    )
+    rebuild(skip_sync=True)
+    snap = ref.get()
+    assert snap.current_week is not None
+    assert snap.current_week.used_pct == 24.0
+    ns["DashboardHTTPHandler"].hub = hub
+    ns["DashboardHTTPHandler"].snapshot_ref = ref
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    srv.handle_error = lambda request, client_address: None
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        client.request("GET", "/api/events")
+        response = client.getresponse()
+        buf = b""
+        deadline = time.monotonic() + 2.0
+        while b"\n\n" not in buf and time.monotonic() < deadline:
+            try:
+                chunk = response.fp.read1(4096)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        data_line = next(
+            line for line in buf.decode("utf-8", errors="replace").splitlines()
+            if line.startswith("data: ")
+        )
+        envelope = json.loads(data_line[len("data: "):])
+        assert envelope["current_week"]["used_pct"] == 24.0
+    finally:
+        srv.shutdown()
+        thread.join(timeout=2)
 
 
 # --- U8-G5: SSEHub multi-subscriber + cleanup (#217 S1) ---------------------

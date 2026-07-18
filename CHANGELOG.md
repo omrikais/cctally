@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.73.0] - 2026-07-18
+
+### Added
+- Codex conversations (#294 S7): the S6 kernel layer is now reachable. The dashboard's twelve conversation routes qualify in place — an entity id beginning `v1.` opts into the provider-neutral envelope (`ok`/`normalization_pending` → `200` JSON, `not_found` → `404`, payload `gone` → `410`, export → `200 text/markdown`, Codex media → `404 capability_unsupported`), and the three collection routes (`/api/conversations`, `/api/conversations/facets`, `/api/conversation/search`) take a strict `?source={claude,codex}`. Absent qualification, the Claude routes stay byte-identical, and the transcript privacy gate remains the first act of every handler. (#294)
+- `cctally transcript export` now accepts a Claude `sessionId` **or** a `v1.` conversation key (Codex conversations are addressable only by their `v1.` key), anonymizes qualified exports by default via a provider-aware plan (`--raw` escapes), and adds a Codex-only `--speed {auto,standard,fast}` (rejected on any non-Codex ref); the CLI export byte-matches the dashboard `/export` download in both anonymize and raw modes. (#294)
+- `cctally transcript search --source {claude,codex}` searches either provider. The Codex output is its own `Key / When / Project / Kinds / Snippet` table and a stamped-first camelCase JSON envelope paginated by an opaque base64url `--cursor`; the default-Claude table and JSON stay byte-frozen. (#294)
+- Codex conversation live-tail: `GET /api/conversation/<v1key>/events` preflights as plain JSON before any SSE bytes and then streams `conversationKey`-framed frames, and a budgeted directory-frontier discovery joins child threads spawned mid-watch. Targeted Codex ingest keeps each tick's cost proportional to the watched conversation. (#294)
+
+### Fixed
+- Statusline usage persistence now arbitrates concurrent regular-pool Claude sessions through privacy-safe per-session candidates instead of accepting the first lock winner. A fresher 5h or 7d observation is selected independent of render arrival order; lower same-window values retain a full-cycle consensus path for credits/resets, including an extra revalidated tick for reset-to-zero. This replaces the internal 25-second persistence throttle; the existing `statusLine.refreshInterval: 30` remains the idle-time trigger. OAuth and manual credits share a fail-closed selected-state recovery protocol, the periodic dashboard remains OAuth-free and publishes accepted observations through its normal SSE path, and `cctally doctor` reports passive pipeline evidence when repair is needed. (#318)
+
 ## [1.72.0] - 2026-07-17
 
 ### Added

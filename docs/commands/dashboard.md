@@ -170,7 +170,10 @@ details.
 The periodic background sync runs every 5 seconds (configurable via
 `--sync-interval`) and only does a snapshot rebuild — it never calls
 the OAuth API, so Anthropic's rate limit is not affected by background
-ticks. Only chip clicks / `r` presses trigger OAuth fetches.
+ticks. A usage observation selected by the statusline reducer appears in the
+next normal rebuild and is sent over the existing SSE stream; no dashboard
+action or dashboard-owned OAuth request is involved. Only chip clicks / `r`
+presses trigger OAuth fetches.
 
 ## Startup sync
 
@@ -236,6 +239,12 @@ Before merging or releasing v2 changes, run through:
 Sort-pill click (top-right of Sessions panel) cycles the session sort;
 the choice persists in `localStorage`. The Settings overlay (`s`) stores
 the default sort + remembered filter term in the same `localStorage` slot.
+
+### Dual-form conversation routes (#294 S7)
+
+The conversation routes are source-qualified **in place** — no new namespace. On the entity routes (`/api/conversation/<id>` and its `…/outline`, `…/prompts`, `…/find`, `…/payload`, `…/export`, `…/anon-map`, `…/media`, `…/events` suffixes), an id beginning `v1.` opts into the provider-neutral dispatch and returns the neutral envelope: `ok` → `200` JSON, `normalization_pending` → `200` JSON (a Codex cache that predates migration `025`), `not_found` (including a malformed `v1.*`) → `404` JSON, payload `gone` → `410`, `…/export` `ok` → `200 text/markdown`, and Codex `…/media` → `404 {"status":"capability_unsupported","source":"codex"}` (Codex media is capability-gated until real media data is shown to exist). Any other id — a bare Claude `sessionId`, UUID-shaped or not — takes the legacy handler unchanged and never touches the resolver, so existing behavior and bytes are byte-identical. The three collection routes (`/api/conversations`, `/api/conversations/facets`, `/api/conversation/search`) gain a strict `?source={claude,codex}`: exactly one literal value, a per-route parameter whitelist (blank/duplicate/`all`/unknown, a legacy-only axis with `source` present, or an out-of-range `limit` is a `400`); absent `?source=`, the legacy lenient parsing is unchanged. Browse cursors are raw conversation keys (echoed verbatim); the search cursor is unpadded base64url. The transcript privacy gate stays the first act of every handler, including the `capability_unsupported` and `normalization_pending` answers.
+
+The `/api/conversation/<v1key>/events` live-tail preflights (privacy gate → resolve → Codex normalization authority → existence) and answers a non-`ok` result as plain JSON **before** any SSE bytes; only on `ok` does it commit SSE headers and stream `conversationKey`-framed `ready`/`tail`/keep-alive frames (a bare Claude stream keeps its `sessionId` frames byte-identical). The Codex stream uses targeted ingest and a budgeted directory-frontier child discovery, so a child thread spawned mid-watch joins the stream via a `tail` refetch. `--no-sync` passivity and the `dashboard.live_tail` opt-out apply to both providers.
 
 ### Source-aware backend (S4)
 
