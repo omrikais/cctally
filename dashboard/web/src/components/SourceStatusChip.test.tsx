@@ -30,7 +30,7 @@ describe('SourceStatusChip (§6.8)', () => {
     expect(chip).not.toHaveClass('is-degraded');
   });
 
-  it('shows the warning message + degraded style for a partial/stale source', () => {
+  it('shows generic concise copy + degraded style for an unscoped partial/stale warning', () => {
     updateSnapshot(
       envWith((b) => {
         b.sources.codex = {
@@ -44,9 +44,52 @@ describe('SourceStatusChip (§6.8)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     render(<SourceStatusChip />);
     const chip = screen.getByTestId('source-status-chip');
-    expect(chip).toHaveTextContent('Source ingest is in progress.');
+    expect(chip).toHaveTextContent('Source degraded');
+    expect(chip).toHaveAttribute('title', 'Source ingest is in progress.');
     expect(chip).toHaveClass('is-degraded');
     expect(chip).toHaveAttribute('aria-label', expect.stringContaining('codex source status'));
+  });
+
+  it('uses concise domain copy while retaining the full Projects warning for assistive detail', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          warnings: [{
+            code: 'codex_metadata_incomplete',
+            message: '47 Codex accounting rows lack project metadata; rebuild the cache.',
+            domain: 'projects',
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<SourceStatusChip />);
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip).toHaveTextContent('Projects partial');
+    expect(chip).toHaveAttribute('title', '47 Codex accounting rows lack project metadata; rebuild the cache.');
+    expect(chip).toHaveAttribute('aria-label', expect.stringContaining('47 Codex accounting rows'));
+  });
+
+  it('prefers a source-wide warning and uses generic visible copy for unknown domains', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          warnings: [
+            { code: 'projects', message: 'Projects only.', domain: 'projects' },
+            { code: 'ingest', message: 'The source ingest needs attention.', domain: 'ingest' },
+          ],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<SourceStatusChip />);
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip).toHaveTextContent('Source degraded');
+    expect(chip).toHaveAttribute('title', 'The source ingest needs attention.');
   });
 
   it('shows "no successful snapshot yet" when last_success_at is null', () => {

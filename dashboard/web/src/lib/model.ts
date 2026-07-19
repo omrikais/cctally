@@ -18,6 +18,22 @@ export function modelChipClass(m: string | null | undefined): ModelChipClass {
   return 'other';
 }
 
+/** Deterministic exact-model color for ids outside Claude's named families. */
+export function modelChipStyle(m: string | null | undefined): { backgroundColor: string; color: string } | undefined {
+  if (!m || modelChipClass(m) !== 'other') return undefined;
+  // FNV-1a gives stable, well-spread hues without assigning provider meaning.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < m.length; i += 1) {
+    hash ^= m.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const hue = (hash >>> 0) % 360;
+  return {
+    backgroundColor: `hsl(${hue} 58% 38%)`,
+    color: `hsl(${hue} 85% 92%)`,
+  };
+}
+
 // #304 S3 (Codex F4) — the deterministic bound on an `other` chip's DISPLAY
 // label. The rail's two-line stats line is rigid (no shrink valve), so an
 // arbitrarily long internal/future model id must not be allowed to grow the

@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { resolveSourceView } from '../store/sourceView';
+import { warningForSource } from '../lib/sourceGating';
 
 // #294 S5 — the active-source status chip (§6.8). Distinct from the global
 // `SyncChip` (which keeps its sync/disconnect/error meaning untouched): this
@@ -22,14 +23,16 @@ export function SourceStatusChip() {
 
   const noSuccessYet = entry.last_success_at == null;
   const degraded = entry.availability === 'partial' || entry.availability === 'unavailable';
-  const warning = entry.warnings != null && entry.warnings.length > 0 ? entry.warnings[0] : null;
+  const warning = warningForSource(entry.warnings);
   const stale = entry.freshness === 'stale';
 
   let label: string;
+  let detail: string;
   if (noSuccessYet) label = 'no successful snapshot yet';
-  else if (degraded && warning) label = warning.message;
+  else if (degraded && warning) label = conciseWarningLabel(warning.domain, warning.code);
   else if (degraded) label = 'degraded';
   else label = stale ? 'stale' : 'fresh';
+  detail = warning?.message ?? label;
 
   const cls =
     'source-status-chip' +
@@ -41,10 +44,28 @@ export function SourceStatusChip() {
       className={cls}
       data-testid="source-status-chip"
       data-source={active}
-      title={label}
-      aria-label={`${active} source status: ${label}`}
+      title={detail}
+      aria-label={`${active} source status: ${detail}`}
     >
       {label}
     </span>
   );
+}
+
+const WARNING_DOMAIN_LABELS: Record<string, string> = {
+  hero: 'Hero unavailable',
+  daily: 'Daily unavailable',
+  weekly: 'Weekly unavailable',
+  monthly: 'Monthly unavailable',
+  sessions: 'Sessions unavailable',
+  projects: 'Projects unavailable',
+  quota: 'Quota unavailable',
+  budget: 'Budget unavailable',
+  forensics: 'Forensics unavailable',
+  alerts: 'Alerts unavailable',
+};
+
+function conciseWarningLabel(domain: string | undefined, code?: string): string {
+  if (domain === 'projects' && code === 'codex_metadata_incomplete') return 'Projects partial';
+  return domain != null ? (WARNING_DOMAIN_LABELS[domain] ?? 'Source degraded') : 'Source degraded';
 }

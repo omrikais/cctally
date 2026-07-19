@@ -9,7 +9,8 @@ import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
+import { presentationDailyRows, presentationProviders } from '../lib/dashboardPresentation';
+import { DegradedChip } from './sourcePanel';
 import type { DailyPanelRow } from '../types/envelope';
 
 const MONTH_ABBR = [
@@ -94,19 +95,8 @@ function Cell({
 // unchanged; Codex renders the native calendar-day period table; All renders
 // provider-labeled sections.
 export function DailyPanel() {
-  return (
-    <SourcePanelShell
-      panel="daily"
-      panelKind="daily"
-      claude={<ClaudeDailyPanel />}
-      codex={(d) => <CodexPeriodTable data={d} label="Daily" />}
-      emptyLabel="No Codex daily activity yet."
-    />
-  );
-}
-
-function ClaudeDailyPanel() {
   const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const isMobile = useIsMobile();
   const isDesktopBento = useIsDesktopBento();
   // #264 S4 (A4): the compact ceil-int cost renders on mobile (narrow 7-col grid)
@@ -117,7 +107,7 @@ function ClaudeDailyPanel() {
     subscribeStore,
     () => getState().prefs.dailyCollapsed,
   );
-  const rows = env?.daily?.rows ?? [];
+  const rows = presentationDailyRows(env, activeSource);
   // Envelope rows are newest-first; the calendar grid renders oldest-first
   // (top-left → bottom-right).
   const orderedRows = [...rows].reverse();
@@ -126,8 +116,18 @@ function ClaudeDailyPanel() {
   // computed gap-free total instead of re-summing materialized rows
   // (which include zero-cost gap days). Falls back to 0 when the
   // sync hasn't published the field yet.
-  const total = env?.daily?.total_cost_usd ?? 0;
-  const peak = env?.daily?.peak ?? null;
+  const total = activeSource === 'claude'
+    ? env?.daily?.total_cost_usd ?? 0
+    : rows.reduce((sum, row) => sum + row.cost_usd, 0);
+  const peak = activeSource === 'claude'
+    ? env?.daily?.peak ?? null
+    : rows.reduce<DailyPanelRow | null>((best, row) =>
+        row.cost_usd <= 0
+          ? best
+          : best == null || row.cost_usd > best.cost_usd ? row : best, null);
+  const hydrating = presentationProviders(env, activeSource).hydrating;
+  const providerState = presentationProviders(env, activeSource);
+  const warning = providerState.warnings.find((item) => item.domain == null || item.domain === 'daily') ?? null;
 
   return (
     <section
@@ -136,6 +136,7 @@ function ClaudeDailyPanel() {
       role="region"
       aria-label="Daily heatmap panel"
       data-panel-kind="daily"
+      data-source={activeSource}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -145,6 +146,7 @@ function ClaudeDailyPanel() {
           <h2>
             Daily <span className="sub">heatmap · 30 days</span>
           </h2>
+          {warning && <DegradedChip gate={{ mode: 'degraded', warning, noSuccessYet: false }} />}
         </div>
         <div className="panel-header-actions">
           {/* The triggerId matches the S-key path
@@ -184,7 +186,7 @@ function ClaudeDailyPanel() {
       </div>
       <div className="panel-body" id="panel-daily-body">
         {rows.length === 0 ? (
-          env?.hydrating ? (
+          hydrating ? (
             <PanelSkeleton />
           ) : (
             <div className="panel-empty">No usage history yet.</div>

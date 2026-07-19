@@ -315,3 +315,50 @@ describe('providerSections / gatePanel — All mode (§5.5 Layer 2)', () => {
     expect(providerSections(viewFor('codex'), 'daily')).toEqual([]);
   });
 });
+
+describe('gatePanel — warning-domain routing (#312)', () => {
+  function partialCodex(warnings: SourceEntry<unknown>['warnings']) {
+    return makeCodexSourceEntry({
+      availability: 'partial',
+      freshness: 'fresh',
+      warnings,
+    });
+  }
+
+  it('degrades only Projects for a projects-domain metadata warning', () => {
+    const codex = partialCodex([
+      {
+        code: 'codex_metadata_incomplete',
+        message: 'Project metadata is incomplete.',
+        domain: 'projects',
+      },
+    ]);
+    const view = viewFor('codex', { codex });
+
+    expect(gatePanel(view, 'projects').mode).toBe('degraded');
+    expect(gatePanel(view, 'projects').warning?.code).toBe('codex_metadata_incomplete');
+    expect(gatePanel(view, 'daily').mode).toBe('render');
+    expect(gatePanel(view, 'blocks').mode).toBe('render');
+  });
+
+  it('treats ingest, read_model, absent, and unknown warning domains as source-wide', () => {
+    for (const domain of ['ingest', 'read_model', undefined, 'future-domain']) {
+      const codex = partialCodex([
+        { code: 'source_problem', message: 'Source problem.', ...(domain === undefined ? {} : { domain }) },
+      ]);
+      const view = viewFor('codex', { codex });
+      expect(gatePanel(view, 'daily').mode).toBe('degraded');
+      expect(gatePanel(view, 'projects').mode).toBe('degraded');
+    }
+  });
+
+  it('prefers a source-wide warning over an earlier scoped warning', () => {
+    const codex = partialCodex([
+      { code: 'projects_first', message: 'Projects only.', domain: 'projects' },
+      { code: 'ingest_second', message: 'Source-wide.', domain: 'ingest' },
+    ]);
+    const daily = gatePanel(viewFor('codex', { codex }), 'daily');
+    expect(daily.mode).toBe('degraded');
+    expect(daily.warning?.code).toBe('ingest_second');
+  });
+});

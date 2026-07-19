@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
@@ -7,8 +7,10 @@ import { fmt } from '../lib/fmt';
 import { applyTableSort, type SortOverride } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { presentationTrend } from '../lib/dashboardPresentation';
+import type { DashboardSelection } from '../types/envelope';
 
 function formatWeeksPill(n: number): string {
   const months = Math.max(1, Math.round(n / 4));
@@ -271,9 +273,13 @@ function deltaKv(delta: number | null): DeltaKv {
   return { cls: 'delta-flat', iconHref: '/static/icons.svg#minus', text: '$0.000' };
 }
 
-export function TrendModal() {
+function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
   const env = useSnapshot();
-  const rows = buildTrendHistoryData(env);
+  const isClaude = source === 'claude';
+  const presentation = presentationTrend(env, source);
+  const rows: TrendChartDatum[] = isClaude
+    ? buildTrendHistoryData(env)
+    : presentation.rows.map((row) => ({ ...row, spark_height: row.dollar_per_pct ?? 0 }));
   // TR-4: index of the week whose tooltip is showing (hover OR keyboard
   // focus). Declared before the empty-state early return to keep hook order
   // stable.
@@ -296,22 +302,6 @@ export function TrendModal() {
     />
   );
 
-  if (!rows.length) {
-    return (
-      <Modal
-        title="Trend"
-        accentClass="accent-amber"
-        headerExtras={headerExtras}
-      >
-        <section className="modal-trend">
-          <p className="empty-state" id="mtr-empty">
-            No history data yet.
-          </p>
-        </section>
-      </Modal>
-    );
-  }
-
   const curIdx = findCurrentIndex(rows);
   const cur = rows[curIdx];
   // Issue #59: prefer the envelope's pre-computed median
@@ -319,7 +309,7 @@ export function TrendModal() {
   // (Python's `build_trend_view`). Falls back to the client-side
   // implementation when the field is missing — fixture snapshots and
   // pre-v1.9 envelopes don't carry it.
-  const envMedian = env?.trend?.history_median_dpp;
+  const envMedian = isClaude ? env?.trend?.history_median_dpp : null;
   const med =
     envMedian != null && isFinite(envMedian)
       ? envMedian
@@ -352,25 +342,26 @@ export function TrendModal() {
         <div className="v" id="mtr-cur">
           {cur && cur.dollar_per_pct != null
             ? '$' + cur.dollar_per_pct.toFixed(3)
-            : '—'}
+            : <span className={!isClaude ? 'm-unavailable' : undefined}>—</span>}
         </div>
-        <div className="lbl">Current $ / 1%</div>
+        <div className="lbl">{isClaude ? 'Current $ / 1%' : 'Current weekly cost'}</div>
       </div>
     </div>
   );
 
   return (
     <Modal
-      title={`Trend — last ${N} weeks`}
+      title={N > 0 ? `Trend — last ${N} weeks` : 'Trend'}
       accentClass="accent-amber"
       headerExtras={headerExtras}
       wide
     >
-      <section className="modal-trend">
+      <section className="modal-trend" data-source={source}>
         <div className="m-chipstrip">
-          <span className="m-pill accent-amber" id="mtr-weeks-pill">
-            {formatWeeksPill(N)}
+          <span className={`m-pill accent-amber${N === 0 ? ' m-unavailable' : ''}`} id="mtr-weeks-pill">
+            {N === 0 ? 'History unavailable' : formatWeeksPill(N)}
           </span>
+          {!isClaude && <span className="m-pill accent-blue">{source === 'all' ? 'All sources' : 'Codex'}</span>}
         </div>
 
         <div className="period-two-pane">
@@ -386,7 +377,7 @@ export function TrendModal() {
                 <div className="v" id="mtr-med">
                   {'$' + med.toFixed(3)}
                 </div>
-                <div className="lbl">4-week median</div>
+                <div className="lbl">4-week median{isClaude ? '' : ' cost'}</div>
               </div>
             </div>
             <div className={`m-kv kv-delta ${dkv.cls}`} id="mtr-delta-kv">
@@ -422,12 +413,11 @@ export function TrendModal() {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#trending-down" />
           </svg>
-          {N}-week history · $/1%
+          {N > 0 ? `${N}-week` : 'Weekly'} history · {isClaude ? '$/1%' : 'cost'}
           <span className={'mtr-legend' + (hasUsed ? '' : ' legend-no-used')} aria-hidden="true">
             <span className="sw sw-dpp" />
-            <span className="sw-lbl">$/1%</span>
-            <span className="sw sw-used" />
-            <span className="sw-lbl">used %</span>
+            <span className="sw-lbl">{isClaude ? '$/1%' : 'cost'}</span>
+            {isClaude ? <><span className="sw sw-used" /><span className="sw-lbl">used %</span></> : <span className="sw-lbl m-unavailable">used % unavailable</span>}
           </span>
         </h3>
         <div className="mtr-sparkhero">
@@ -436,7 +426,7 @@ export function TrendModal() {
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
             role="group"
-            aria-label={`$ per 1% over the last ${N} week${N === 1 ? '' : 's'}, with the used % line overlaid`}
+            aria-label={`${isClaude ? '$ per 1%' : 'Weekly cost'} over the last ${N} week${N === 1 ? '' : 's'}${isClaude ? ', with the used % line overlaid' : ''}`}
           >
             {svgPrims.map((p) => {
               const { el, attrs, text, key } = p;
@@ -495,6 +485,7 @@ export function TrendModal() {
               );
             })}
           </svg>
+          {N === 0 && <div className="empty-state m-unavailable" id="mtr-empty">No history data is available for this source yet.</div>}
           {hovered != null && rows[hovered]
             ? (() => {
                 const r = rows[hovered];
@@ -571,9 +562,9 @@ export function TrendModal() {
               // relabels rows.
               const k = N - 1 - r._chronoIdx;
               const wlab = historyWlab(r, k);
-              const usedTxt = r.used_pct != null ? Math.round(r.used_pct) + '%' : '—';
+              const usedTxt = isClaude && r.used_pct != null ? Math.round(r.used_pct) + '%' : 'Unavailable';
               const dppTxt =
-                r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : '—';
+                isClaude && r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : 'Unavailable';
               const d = renderDelta(r.delta);
               return (
                 <tr
@@ -584,8 +575,8 @@ export function TrendModal() {
                     <span className="wlab">{wlab}</span>
                   </td>
                   <td className="num c-cost">{fmt.usd2(r.cost_usd)}</td>
-                  <td className="num usedpct">{usedTxt}</td>
-                  <td className="num dpp">{dppTxt}</td>
+                  <td className={`num usedpct${!isClaude ? ' m-unavailable' : ''}`}>{usedTxt}</td>
+                  <td className={`num dpp${!isClaude ? ' m-unavailable' : ''}`}>{dppTxt}</td>
                   <td className={`num delta ${d.cls}`}>{d.text}</td>
                 </tr>
               );
@@ -597,4 +588,12 @@ export function TrendModal() {
       </section>
     </Modal>
   );
+}
+
+export function TrendModal() {
+  const source = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModalSource ?? getState().activeSource,
+  );
+  return <CanonicalTrendModal source={source} />;
 }

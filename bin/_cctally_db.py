@@ -876,6 +876,10 @@ def _run_pending_migrations(
             # absent must still be treated as non-fresh so a flag-only
             # conversation migration's consumer actually runs (e.g. 011's
             # command-args promotion) instead of being stamped without it.
+            # codex_session_entries joins them (#312): an accounting-bearing
+            # cache written before conversation-key enrichment but missing
+            # schema_migrations must not be stamped fresh, or 026 would never
+            # clear it for the required byte-zero Codex replay.
             # codex_conversation_events joins them (#294 S6): a Codex-bearing
             # cache written by S1's fused ingest but missing schema_migrations
             # would otherwise be classified fresh and stamp 025 WITHOUT replaying
@@ -883,7 +887,7 @@ def _run_pending_migrations(
             # normalized corpus. Probing it forces 025's handler to run and derive
             # the normalized rows from the retained events.
             "cache.db": (
-                "session_entries", "conversation_messages",
+                "session_entries", "conversation_messages", "codex_session_entries",
                 "codex_conversation_events",
             ),
         }.get(db_label, ())
@@ -4570,6 +4574,105 @@ def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
             _codex_conversation_fts_full_clear(conn)
             import _cctally_cache
             _cctally_cache._replay_codex_normalization(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+@cache_migration("026_codex_conversation_key_backfill")
+def _026_codex_conversation_key_backfill(conn: sqlite3.Connection) -> None:
+    """Arm a byte-zero Codex replay for missing conversation-key metadata (#312).
+
+    Historical accounting rows predate the source-derived conversation-key
+    enrichment.  The cache cannot truthfully recover those keys on its own, so
+    clear exactly the existing Codex-derived families and let the next Codex
+    sync replay retained rollout data from byte zero.  This shares the runtime
+    clear helper with ``sync_codex_cache(rebuild=True)`` so new or future Codex
+    families cannot drift from the migration's destructive scope.
+
+    The Codex flock is acquired before ``BEGIN IMMEDIATE``.  Contention defers
+    through ``MigrationGateNotMet`` before any DML; after a handler/data commit
+    but before the dispatcher's central stamp, a rerun against the empty state
+    is a byte-idempotent no-op.  The physical mutation sequence advances only
+    when the shared clear actually changed persisted Codex state.  The handler
+    never self-stamps.
+    """
+    lock_path = _cache_db_codex_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
+                "deferring cache 026 conversation-key backfill (#312)"
+            )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            import _cctally_cache
+
+            if _cctally_cache._clear_codex_derived_rows(conn):
+                _cctally_cache._bump_codex_physical_mutation_seq(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+@cache_migration("027_codex_fork_preamble_rebuild")
+def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
+    """Replay Codex rollouts after suppressing copied fork-preamble accounting.
+
+    Forked/subagent JSONL can retain parent ``token_count`` records before the
+    child's first model-bearing ``turn_context``.  Older ingest projected those
+    copied records into ``codex_session_entries`` as ``model='unknown'``, double
+    counting usage already present in the parent rollout.  The source records
+    remain authoritative, so clear all re-derivable Codex families and let the
+    corrected fused parser replay them from byte zero.
+
+    The Codex flock precedes ``BEGIN IMMEDIATE``.  Contention defers before DML;
+    a markerless retry against already-cleared state is a no-op.  The shared
+    clear helper keeps this migration aligned with runtime rebuild scope and
+    advances the physical mutation sequence only when state actually changed.
+    The dispatcher owns the migration marker.
+    """
+    lock_path = _cache_db_codex_lock_path_for_conn(conn)
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
+                "deferring cache 027 fork-preamble rebuild"
+            )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            import _cctally_cache
+
+            if _cctally_cache._clear_codex_derived_rows(conn):
+                _cctally_cache._bump_codex_physical_mutation_seq(conn)
             conn.commit()
         except Exception:
             conn.rollback()

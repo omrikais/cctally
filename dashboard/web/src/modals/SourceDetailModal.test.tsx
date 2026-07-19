@@ -1,17 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { SourceDetailModal } from './SourceDetailModal';
+import { Modal } from './Modal';
 import { SessionsPanel } from '../panels/SessionsPanel';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import type { Envelope } from '../types/envelope';
+import {
+  installGlobalKeydown,
+  _resetForTests as _resetKeymap,
+} from '../store/keymap';
 
 beforeEach(() => {
   localStorage.clear();
   _resetForTests();
+  _resetKeymap();
+  installGlobalKeydown();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
+  _resetKeymap();
 });
 
 describe('Codex source rows open the qualified detail modal (§5.6)', () => {
@@ -75,10 +83,11 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     const detail = screen.getByTestId('codex-session-detail');
     expect(detail).toHaveTextContent('Reasoning');
     expect(detail).toHaveTextContent('Cached input');
-    // No conversation-reader affordance — the only button is the close (×).
+    // No conversation-reader affordance — only the canonical Share and close
+    // controls are present.
     const buttons = within(screen.getByRole('dialog')).getAllByRole('button');
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0]).toHaveAttribute('aria-label', 'Close');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[1]).toHaveAttribute('aria-label', 'Close');
   });
 
   it('renders the friendly not-found variant for a 404 envelope', async () => {
@@ -92,5 +101,44 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     render(<SourceDetailModal />);
     await waitFor(() => expect(screen.getByTestId('source-detail-error')).toBeInTheDocument());
     expect(screen.getByTestId('source-detail-error')).toHaveTextContent('no longer available');
+  });
+
+  it('uses the shared labelled modal lifecycle for focus, Escape, and return focus', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+    const trigger = document.createElement('button');
+    trigger.id = 'source-detail-trigger';
+    document.body.appendChild(trigger);
+    trigger.focus();
+
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'session', key: 'session:codex-a' });
+    render(<SourceDetailModal />);
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-labelledby', 'source-detail-title');
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Codex session' }));
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(getState().openSourceDetail).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+
+  it('closes only the topmost qualified detail before its underlying panel modal', () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'project', key: 'project:codex-a' });
+    render(
+      <>
+        <Modal title="Projects" accentClass="accent-orange"><p>Projects body</p></Modal>
+        <SourceDetailModal />
+      </>,
+    );
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().openSourceDetail).toBeNull();
+    expect(getState().openModal).toBe('projects');
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().openModal).toBeNull();
   });
 });

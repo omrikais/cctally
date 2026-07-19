@@ -1,12 +1,13 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import type { ForecastEnvelope } from '../types/envelope';
+import { presentationForecast } from '../lib/dashboardPresentation';
+import type { DashboardSelection, ForecastEnvelope } from '../types/envelope';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
 // DOM-mutating layout in a ref effect; React manages only the container
@@ -345,9 +346,40 @@ function useRangeBar(
   }, [wrapRef, trackRef, fc, nowPct]);
 }
 
-export function ForecastModal() {
+function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
   const env = useSnapshot();
-  const fc = env?.forecast ?? null;
+  const isClaude = source === 'claude';
+  const presented = presentationForecast(env, source);
+  const nativeHistory = env?.sources?.codex?.data?.quota.histories.find(
+    (row) => row.window_minutes === 10_080,
+  ) ?? env?.sources?.codex?.data?.quota.histories[0];
+  const nativeForecast = nativeHistory?.forecast;
+  const nativeRemainingHours = nativeForecast?.remaining_seconds == null
+    ? null
+    : nativeForecast.remaining_seconds / 3600;
+  const nativeElapsedHours = nativeHistory?.window_minutes == null || nativeRemainingHours == null
+    ? null
+    : Math.max(0, nativeHistory.window_minutes / 60 - nativeRemainingHours);
+  const nativeBudgetPace = env?.sources?.codex?.data?.budget.status?.pace.daily_usd ?? null;
+  const fc: ForecastEnvelope | null = isClaude
+    ? env?.forecast ?? null
+    : {
+        verdict: presented.verdict ?? 'ok',
+        week_avg_projection_pct: presented.projected,
+        recent_24h_projection_pct: presented.recent,
+        budget_100_per_day_usd: null,
+        budget_90_per_day_usd: null,
+        confidence: nativeForecast?.confidence === 'high' ? 'high' : 'unknown',
+        confidence_score: 0,
+        explain: {
+          rates: {
+            dollars_per_percent: null,
+            week_average_pct_per_hour: nativeForecast?.rate_percent_per_hour ?? null,
+            recent_24h_pct_per_hour: null,
+          },
+          week: { elapsed_hours: nativeElapsedHours, remaining_hours: nativeRemainingHours },
+        },
+      };
   const explain = (fc?.explain ?? null) as
     | { rates?: { dollars_per_percent?: number | null; week_average_pct_per_hour?: number | null; recent_24h_pct_per_hour?: number | null }; week?: ExplainWeek }
     | null;
@@ -355,7 +387,9 @@ export function ForecastModal() {
   const trackRef = useRef<HTMLDivElement>(null);
   // "now" anchor for the range bar — the current weekly used %. Prefer the
   // header value, fall back to current_week; null hides the marker.
-  const nowPct = env?.header?.used_pct ?? env?.current_week?.used_pct ?? null;
+  const nowPct = isClaude
+    ? env?.header?.used_pct ?? env?.current_week?.used_pct ?? null
+    : presented.recent;
   useRangeBar(wrapRef, trackRef, fc, nowPct);
 
   const headerExtras = (
@@ -367,34 +401,18 @@ export function ForecastModal() {
     />
   );
 
-  if (!fc) {
-    return (
-      <Modal
-        title="Forecast — explain"
-        accentClass="accent-purple"
-        headerExtras={headerExtras}
-      >
-        <section className="modal-forecast">
-          <p className="empty-state" id="mfc-empty">
-            No forecast data yet.
-          </p>
-        </section>
-      </Modal>
-    );
-  }
-
-  const vinfo = resolveVerdict(fc.verdict);
+  const vinfo = resolveVerdict(isClaude ? fc?.verdict : presented.verdict);
   const verdictCls = vinfo ? `m-pill ${vinfo.accent}` : 'm-pill';
   const verdictText = vinfo ? `${vinfo.glyph} ${vinfo.label}` : '—';
 
   let confCls = 'm-pill';
   let confText = '—';
   let confHidden = true;
-  if (fc.confidence === 'high') {
+  if (fc?.confidence === 'high') {
     confCls = 'm-pill accent-blue';
     confText = 'high confidence';
     confHidden = false;
-  } else if (fc.confidence === 'low') {
+  } else if (fc?.confidence === 'low') {
     confCls = 'm-pill accent-red';
     confText = 'low confidence';
     confHidden = false;
@@ -409,7 +427,7 @@ export function ForecastModal() {
       accentClass="accent-purple"
       headerExtras={headerExtras}
     >
-      <section className="modal-forecast">
+      <section className="modal-forecast" data-source={source}>
         <div className="m-chipstrip" id="mfc-chips">
           <span className={verdictCls} id="mfc-verdict">
             {verdictText}
@@ -417,6 +435,14 @@ export function ForecastModal() {
           <span className={confCls} id="mfc-confidence" hidden={confHidden}>
             {confText}
           </span>
+          {!isClaude && (
+            <span className="m-pill accent-blue">
+              {source === 'all' ? 'Codex quota · combined spend' : 'Codex native quota'}
+            </span>
+          )}
+          {((isClaude && !fc) || (!isClaude && nativeForecast == null)) && (
+            <span className="m-pill m-unavailable">Forecast unavailable</span>
+          )}
         </div>
 
         <div className="m-hero cols-2">
@@ -425,8 +451,8 @@ export function ForecastModal() {
               <use href="/static/icons.svg#gauge" />
             </svg>
             <div>
-              <div className="v" id="mfc-wa-pct">{fmt.pct1(fc.week_avg_projection_pct)}</div>
-              <div className="lbl">Week-avg projection</div>
+              <div className={`v${fc?.week_avg_projection_pct == null && !isClaude ? ' m-unavailable' : ''}`} id="mfc-wa-pct">{fmt.pct1(fc?.week_avg_projection_pct)}</div>
+              <div className="lbl">{isClaude ? 'Week-avg projection' : presented.primaryLabel}</div>
               <div className="sub" id="mfc-wa-sub">
                 {fmt.ratePctPerHour(rates?.week_average_pct_per_hour)}
               </div>
@@ -437,8 +463,8 @@ export function ForecastModal() {
               <use href="/static/icons.svg#zap" />
             </svg>
             <div>
-              <div className="v" id="mfc-r24-pct">{fmt.pct1(fc.recent_24h_projection_pct)}</div>
-              <div className="lbl">Recent-24h projection</div>
+              <div className={`v${fc?.recent_24h_projection_pct == null && !isClaude ? ' m-unavailable' : ''}`} id="mfc-r24-pct">{fmt.pct1(fc?.recent_24h_projection_pct)}</div>
+              <div className="lbl">{isClaude ? 'Recent-24h projection' : presented.recentLabel}</div>
               <div className="sub" id="mfc-r24-sub">
                 {fmt.ratePctPerHour(rates?.recent_24h_pct_per_hour)}
               </div>
@@ -457,11 +483,11 @@ export function ForecastModal() {
         <div className="mfc-legend" id="mfc-legend">
           <span className="mfc-leg-item">
             <span className="mfc-leg-sw wa" />
-            week-avg
+            {isClaude ? 'week-avg' : 'projected'}
           </span>
           <span className="mfc-leg-item">
             <span className="mfc-leg-sw r24" />
-            recent-24h
+            {isClaude ? 'recent-24h' : 'current'}
           </span>
           <span className="mfc-leg-item">
             <span className="mfc-leg-now">▸</span>
@@ -506,10 +532,18 @@ export function ForecastModal() {
         <div className="mfc-kvgrid">
           <div className="mfc-krow">
             <span className="l">$ / 1%</span>
-            <span className="v v-cyan" id="mfc-dpp">{fmt.usd3(rates?.dollars_per_percent)}</span>
+            <span className={`v v-cyan${!isClaude ? ' m-unavailable' : ''}`} id="mfc-dpp">
+              {isClaude ? fmt.usd3(rates?.dollars_per_percent) : 'Unavailable'}
+            </span>
           </div>
+          {!isClaude && <div className="mfc-krow">
+            <span className="l">Quota rate</span>
+            <span className={`v v-cyan${rates?.week_average_pct_per_hour == null ? ' m-unavailable' : ''}`}>
+              {fmt.ratePctPerHour(rates?.week_average_pct_per_hour)}
+            </span>
+          </div>}
           <div className="mfc-krow">
-            <span className="l">week done</span>
+            <span className="l">{isClaude ? 'week done' : 'cycle done'}</span>
             <span className="v v-green" id="mfc-wkdone">{fmtWeekDone(week)}</span>
           </div>
           <div className="mfc-krow">
@@ -526,19 +560,31 @@ export function ForecastModal() {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#dollar" />
           </svg>
-          Daily budgets to stay under
+          {isClaude ? 'Daily budgets to stay under' : 'Provider budget context'}
         </h3>
         <div className="mfc-kvgrid mfc-kvgrid-single">
           <div className="mfc-krow">
-            <span className="l">@ 100% cap</span>
-            <span className="v v-magenta" id="mfc-bud100">{fmt.usd2PerDay(fc.budget_100_per_day_usd)}</span>
+            <span className="l">{isClaude ? '@ 100% cap' : 'Budget pace'}</span>
+            <span className={`v v-magenta${!isClaude && nativeBudgetPace == null ? ' m-unavailable' : ''}`} id="mfc-bud100">
+              {isClaude ? fmt.usd2PerDay(fc?.budget_100_per_day_usd) : fmt.usd2PerDay(nativeBudgetPace)}
+            </span>
           </div>
           <div className="mfc-krow">
-            <span className="l">@ 90% cap</span>
-            <span className="v v-amber" id="mfc-bud90">{fmt.usd2PerDay(fc.budget_90_per_day_usd)}</span>
+            <span className="l">{isClaude ? '@ 90% cap' : 'Confidence'}</span>
+            <span className={`v v-amber${!isClaude && nativeForecast?.confidence == null ? ' m-unavailable' : ''}`} id="mfc-bud90">
+              {isClaude ? fmt.usd2PerDay(fc?.budget_90_per_day_usd) : nativeForecast?.confidence ?? 'Unavailable'}
+            </span>
           </div>
         </div>
       </section>
     </Modal>
   );
+}
+
+export function ForecastModal() {
+  const source = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModalSource ?? getState().activeSource,
+  );
+  return <CanonicalForecastModal source={source} />;
 }

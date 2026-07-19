@@ -4,8 +4,8 @@
 // it reads the current weekly used% from the snapshot header and the CONFIGURED
 // fire thresholds from `alertsConfig.weekly_thresholds` (fallback [90, 95]) —
 // never hardcoding 90/95. The non-vacuous assertion feeds a NON-default
-// [80, 95] config so a hardcoded-90/95 gauge would fail. When used% is unknown
-// the gauge degrades to the one-liner.
+// [80, 95] config so a hardcoded-90/95 gauge would fail. Unknown usage keeps
+// the same explanatory gauge hierarchy with an explicit unavailable hero.
 import { beforeEach, describe, expect, it } from 'vitest';
 import { act, render } from '@testing-library/react';
 import { RecentAlertsModal } from './RecentAlertsModal';
@@ -89,18 +89,21 @@ describe('RecentAlertsModal empty teaching gauge (RA-1)', () => {
     expect(container.textContent).toContain('well under the line');
   });
 
-  it('omits the reassuring header when used% is at/above the lowest threshold', () => {
+  it('replaces the reassuring header with a neutral empty-state header at/above the lowest threshold', () => {
     seed(88, [80, 95]);
     const { container } = render(<RecentAlertsModal />);
-    // still a teaching gauge (used% known), just without the "well under" header
+    // Still the canonical teaching gauge, but without the reassuring copy.
     expect(container.querySelector('.ra-gauge')).not.toBeNull();
-    expect(container.querySelector('.ra-gauge-head')).toBeNull();
+    expect(container.querySelector('.ra-gauge-head')?.textContent).toContain('No alerts yet');
+    expect(container.querySelector('.ra-gauge-head')?.textContent).not.toContain('well under');
   });
 
-  it('falls back to the one-liner when used% is unknown', () => {
+  it('keeps the canonical gauge and marks the hero unavailable when used% is unknown', () => {
     seed(null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
-    expect(container.querySelector('.ra-gauge')).toBeNull();
+    expect(container.querySelector('.ra-gauge')).not.toBeNull();
+    expect(container.querySelector('.ra-gauge-hero')?.textContent).toBe('—');
     expect(container.textContent).toContain('No alerts yet');
+    expect(container.textContent).toContain('90% / 95%');
   });
 });

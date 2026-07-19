@@ -253,13 +253,23 @@ S4 makes the dashboard server publish Claude, Codex, and presentation-only
 React control and browser interaction. The source-aware endpoints above are the
 backend contract the S5 client reads.
 
+When retained Codex accounting has incomplete project metadata, the Codex state
+is `partial` but still `fresh`: its accounting, quota, budget, sessions, and
+forensics remain current while **Projects alone** is unavailable. The public
+`codex_metadata_incomplete` warning reports the safe row count and directs you
+to run `cctally cache-sync --source codex --rebuild`; replay repairs historical
+metadata where the retained rollout permits it. A fresh partial provider still
+contributes compatible USD and total-token tiles to `All`. By contrast, a
+generic `source_build_failed` remains a generic public warning; its traceback
+is recorded only in the private `cctally.dashboard` log.
+
 ### Source selector and source-aware UX (S5)
 
 The Header hosts a three-state `Claude | Codex | All` selector (a radiogroup — Arrow keys move focus and selection, Home/End jump to the ends; the `v` shortcut cycles Claude → Codex → All). The choice persists in `localStorage` under `cctally:dashboard:source` (default `claude`) and is a pure client re-selection over the already-delivered `sources` bundle — the store never waits for or reconciles it against an envelope, and panel subtrees re-key on switch so no mixed-source frame is ever shown. The selector governs the dashboard workspace only; the Conversations workspace is unaffected.
 
-Each source renders its own vocabulary. Codex shows its native token counters (input, cached-input, output, reasoning-output, total) plus its quota windows and configured calendar-period budget — never a `$ / 1%` or subscription-week reading. `All` shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered as side-by-side provider-native chips (never a blended gauge).
+Each source renders its own vocabulary. Codex shows its native token counters (input, cached-input, output, reasoning-output, total) and cost for the active native **seven-day (10,080-minute) reset cycle**, plus its independently visible quota windows and configured calendar-period budget — never a `$ / 1%` or subscription-week reading. The five-hour (300-minute) limit is optional and remains a separate support row. If the cache has accounting but no single active seven-day boundary, the hero says that its reset cycle is unavailable instead of showing a misleading zero; quota and budget remain available. `All` shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered as side-by-side provider-native chips (never a blended gauge).
 
-Capability gating (per the S4 manifest) hides — rather than zero-fills — any panel a source does not publish: under Codex the forecast, trend, and cache-report panels are absent, and the Help overlay (`?`) lists what the active source intentionally does not show with a one-line pointer to where the equivalent lives (Codex forecast/trend → the Blocks/quota panel's native forecasts; cache-report → the hero token-reuse counters). A runtime-degraded or stale source renders an explicit warning chip in place (never hidden), and a source with no successful snapshot yet renders "no successful snapshot yet". A source-status chip beside the sync chip surfaces the active source's freshness and warnings.
+Capability gating (per the S4 manifest) hides — rather than zero-fills — any panel a source does not publish: under Codex the forecast, trend, and cache-report panels are absent, and the Help overlay (`?`) lists what the active source intentionally does not show with a one-line pointer to where the equivalent lives (Codex forecast/trend → the Blocks/quota panel's native forecasts; cache-report → the hero token-reuse counters). A runtime-degraded or stale source renders an explicit warning chip in place (never hidden), and a source with no successful snapshot yet renders "no successful snapshot yet". A fresh partial source degrades only the warning's affected domain (for example, incomplete project metadata leaves Daily and quota usable); a source-wide ingest/read-model warning degrades every applicable domain. The source-status chip uses concise visible copy while preserving its full diagnostic in its title and accessible label.
 
 The visible-panel order (digit shortcuts, drag-reorder, Help's panel list) is derived from the persisted full order filtered through the active source's gating; the persisted order is never rewritten by a source switch, and a reorder in a filtered view maps back into the full order preserving hidden panels' positions.
 

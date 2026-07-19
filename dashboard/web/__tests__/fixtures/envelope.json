@@ -739,7 +739,7 @@
       "data_version": "codex:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
       "capabilities": {
-        "hero": {"status": "supported", "semantics": "calendar-accounting"},
+        "hero": {"status": "supported", "semantics": "native-reset-cycle"},
         "daily": {"status": "supported", "semantics": "calendar-day"},
         "monthly": {"status": "supported", "semantics": "calendar-month"},
         "weekly": {"status": "supported", "semantics": "calendar-week"},
@@ -758,6 +758,7 @@
           "output_tokens": 64000,
           "reasoning_output_tokens": 8000,
           "total_tokens": 552000,
+          "cycle": {"window_minutes": 10080, "start_at": "2026-04-23T00:00:00Z", "resets_at": "2026-04-30T00:00:00Z"},
           "quota": {
             "window_count": 2,
             "active_window_count": 2,
@@ -817,7 +818,7 @@
             {"key": "quota_milestone:codex-a", "source": "codex", "block_key": "block:codex-5h", "percent": 40, "captured_at": "2026-04-24T12:45:00Z"}
           ],
           "blocks": [
-            {"key": "block:codex-5h", "source": "codex", "label": "5-hour limit", "resets_at": "2026-04-24T18:00:00Z", "current_percent": 42.0, "orphaned": false}
+            {"key": "block:codex-5h", "source": "codex", "label": "13:00 Apr 24 UTC", "window_minutes": 300, "start_at": "2026-04-24T13:00:00Z", "end_at": "2026-04-24T18:00:00Z", "resets_at": "2026-04-24T18:00:00Z", "current_percent": 42.0, "orphaned": false, "is_active": true, "cost_usd": 12.3, "model_breakdowns": [{"modelName": "gpt-5", "cost": 8.0}, {"modelName": "gpt-5-codex", "cost": 4.3}]}
           ]
         },
         "budget": {

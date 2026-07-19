@@ -1,4 +1,4 @@
-import { useContext, useLayoutEffect, useRef, useState } from 'react';
+import { useContext, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
@@ -6,15 +6,16 @@ import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { keyOf } from '../modals/periodNav';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { BoardModeContext } from '../lib/boardModeContext';
 import { summarize } from '../lib/summaryWindow';
 import { cardRegionClick } from '../lib/cardRegion';
-import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
+import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
+import { modelChipStyle } from '../lib/model';
 
 // #264 S2 / #265 — the Weekly summary TILE (restored from the S8 collapse).
 // #293 S3 — below 900px (stack mode) the card previews the newest
@@ -48,7 +49,7 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
           <span
             key={m.model}
             className={m.chip}
-            style={{ width: animate ? '0%' : `${m.cost_pct}%` }}
+            style={{ ...modelChipStyle(m.model), width: animate ? '0%' : `${m.cost_pct}%` }}
             title={`${m.display} ${fmt.usd2(m.cost_usd)} (${m.cost_pct.toFixed(0)}%)`}
           />
         ))}
@@ -58,27 +59,19 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
   );
 }
 
-// #294 S5 — source-aware wrapper. Claude = subscription-week summary tile
-// (unchanged); Codex = native calendar-week period table; All = provider
-// sections (Claude subscription weeks + Codex calendar weeks, never merged).
+// #294 S5 — source-aware wrapper. Claude = subscription-week summary tile;
+// Codex = observed native reset-cycle summaries; All uses the same shared row
+// anatomy for both providers without treating independent reset axes as one.
 export function WeeklyPanel() {
-  return (
-    <SourcePanelShell
-      panel="weekly"
-      panelKind="weekly"
-      claude={<ClaudeWeeklyPanel />}
-      codex={(d) => <CodexPeriodTable data={d} label="Weekly" />}
-      emptyLabel="No Codex weekly activity yet."
-    />
-  );
-}
-
-function ClaudeWeeklyPanel() {
   const env = useSnapshot();
-  const allRows = env?.weekly?.rows ?? [];
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const allRows = presentationPeriodRows(env, activeSource, 'weekly');
   const mode = useContext(BoardModeContext);
   const { visible, hiddenCount } = summarize(allRows, mode);
-  const total = env?.weekly?.total_cost_usd ?? 0;
+  const total = allRows.reduce((sum, row) => sum + row.cost_usd, 0);
+  const rowNoun = activeSource === 'claude' ? 'weeks' : activeSource === 'codex' ? 'cycles' : 'periods';
+  const totalLabel = activeSource === 'claude' ? `${allRows.length}w` : `${allRows.length} ${rowNoun}`;
+  const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
 
   const seen = useRef<Set<string>>(new Set());
@@ -98,6 +91,7 @@ function ClaudeWeeklyPanel() {
       role="region"
       aria-label="Weekly usage panel"
       data-panel-kind="weekly"
+      data-source={activeSource}
       onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' }))}
     >
       <div className="panel-header">
@@ -123,7 +117,7 @@ function ClaudeWeeklyPanel() {
       </div>
       <div className="panel-body">
         {allRows.length === 0 ? (
-          env?.hydrating ? (
+          hydrating ? (
             <PanelSkeleton />
           ) : (
             <div className="panel-empty">No usage history yet.</div>
@@ -146,7 +140,7 @@ function ClaudeWeeklyPanel() {
               <button
                 type="button"
                 className="period-foot-more"
-                aria-label={`Show all ${allRows.length} weeks`}
+                aria-label={`Show all ${allRows.length} ${rowNoun}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
@@ -166,7 +160,7 @@ function ClaudeWeeklyPanel() {
             </span>
           ) : (
             <span>
-              {allRows.length}w total
+              {totalLabel} total
               <span className="sep" aria-hidden="true"> · </span>
               <span className="total">{fmt.usd2(total)}</span>
             </span>

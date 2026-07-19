@@ -441,6 +441,8 @@ def _scenario_body(slug: str) -> str:
         # cache.db ahead → WARN row, but overall exit stays 0 (auto-heals on
         # next open). stats.db stays NOT ahead so the worst-of-both is WARN.
         bump = textwrap.dedent(f"""\
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-empty-codex-project-metadata \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
             python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db" <<'PY'
             import sqlite3, sys
             conn = sqlite3.connect(sys.argv[1])
@@ -532,6 +534,7 @@ def main():
     p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
     p.add_argument("--emit-codex-cache", action="store_true")
     p.add_argument("--emit-pricing-cache", action="store_true")
+    p.add_argument("--emit-empty-codex-project-metadata", action="store_true")
     p.add_argument("--emit-codex-doctor-case", choices=[
         "quota-fresh-stale", "quota-fresh-future",
         "lifecycle-recent-never", "lifecycle-recent-stale",
@@ -548,6 +551,9 @@ def main():
         return
     if args.emit_pricing_cache and args.path:
         _emit_pricing_cache(pathlib.Path(args.path))
+        return
+    if args.emit_empty_codex_project_metadata and args.path:
+        _emit_empty_codex_project_metadata(pathlib.Path(args.path))
         return
     if args.emit_codex_doctor_case:
         if not args.path or len(args.roots) != 2:
@@ -648,8 +654,47 @@ def _emit_pricing_cache(db_path: pathlib.Path) -> None:
         ("/fixture/unpriced.jsonl", now.isoformat().replace("+00:00", "Z"),
          "claude-fixture-unpriced-9000", 1000, 200, 50, 10),
     )
+    _ensure_empty_codex_project_metadata_schema(conn)
     conn.commit()
     conn.close()
+
+
+def _ensure_empty_codex_project_metadata_schema(conn) -> None:
+    """Give doctor fixtures the #312 read-only metadata contract.
+
+    The scenario builders intentionally use minimal databases.  The Doctor
+    probe must still distinguish an empty retained Codex corpus from a failed
+    query, so every fixture cache that exists provides the two empty tables.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS codex_session_entries (
+            id INTEGER PRIMARY KEY,
+            timestamp_utc TEXT NOT NULL,
+            session_id TEXT, model TEXT,
+            input_tokens INTEGER, cached_input_tokens INTEGER,
+            output_tokens INTEGER, reasoning_output_tokens INTEGER,
+            source_root_key TEXT, conversation_key TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS codex_conversation_threads (
+            conversation_key TEXT NOT NULL,
+            source_root_key TEXT NOT NULL
+        )
+    """)
+
+
+def _emit_empty_codex_project_metadata(db_path: pathlib.Path) -> None:
+    """Add the #312 health tables without changing a fixture's corpus."""
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _ensure_empty_codex_project_metadata_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _emit_codex_cache(db_path: pathlib.Path) -> None:
@@ -658,21 +703,19 @@ def _emit_codex_cache(db_path: pathlib.Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS codex_session_entries (
-            id INTEGER PRIMARY KEY,
-            timestamp_utc TEXT NOT NULL,
-            session_id TEXT, model TEXT,
-            input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, reasoning_output_tokens INTEGER
-        )
-    """)
+    _ensure_empty_codex_project_metadata_schema(conn)
     as_of = os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")
     now = dt.datetime.fromisoformat(as_of).astimezone(dt.timezone.utc) - dt.timedelta(seconds=60)
     conn.execute(
         "INSERT INTO codex_session_entries(timestamp_utc, session_id, model, "
-        "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens) "
-        "VALUES (?, 's1', 'gpt-5', 100, 50, 80, 30)",
+        "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "source_root_key, conversation_key) "
+        "VALUES (?, 's1', 'gpt-5', 100, 50, 80, 30, 'fixture-root', 'fixture-key')",
         (now.isoformat().replace("+00:00", "Z"),),
+    )
+    conn.execute(
+        "INSERT INTO codex_conversation_threads(conversation_key, source_root_key) "
+        "VALUES ('fixture-key', 'fixture-root')"
     )
     conn.commit()
     conn.close()
@@ -712,6 +755,7 @@ def _emit_codex_doctor_case(
         db_path = app_dir / "cache.db"
         conn = sqlite3.connect(str(db_path))
         try:
+            _ensure_empty_codex_project_metadata_schema(conn)
             conn.execute("""
                 CREATE TABLE quota_window_snapshots (
                     source TEXT NOT NULL, source_root_key TEXT, source_path TEXT NOT NULL,

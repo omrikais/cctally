@@ -490,6 +490,8 @@ def doctor_gather_state(
 
     codex_entries_count = None
     codex_last_entry_at = None
+    codex_project_metadata_health = None
+    codex_project_metadata_error = None
     try:
         if _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
@@ -503,12 +505,31 @@ def doctor_gather_state(
                         codex_last_entry_at = parse_iso_datetime(
                             row[1], "codex_session_entries.timestamp_utc",
                         ).astimezone(dt.timezone.utc)
-            except sqlite3.OperationalError:
-                pass
+                # Keep the health probe on the existing read-only cache
+                # connection.  A failed probe is health evidence, not an
+                # empty corpus: the kernel renders it as a distinct FAIL.
+                try:
+                    import _cctally_source_analytics
+
+                    health = _cctally_source_analytics.load_codex_project_metadata_health(
+                        cache_conn=conn,
+                    )
+                    codex_project_metadata_health = {
+                        "total_rows": health.total_rows,
+                        "qualified_rows": health.qualified_rows,
+                        "missing_conversation_key_rows": health.missing_conversation_key_rows,
+                        "missing_thread_join_rows": health.missing_thread_join_rows,
+                    }
+                except Exception as exc:
+                    codex_project_metadata_error = type(exc).__name__
+            except sqlite3.OperationalError as exc:
+                # Pre-Codex cache shapes still produce the established Codex
+                # cache result, while the new health check fails explicitly.
+                codex_project_metadata_error = type(exc).__name__
             finally:
                 conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        codex_project_metadata_error = type(exc).__name__
 
     # Issue #109: probe every $CODEX_HOME session root (not the single
     # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
@@ -802,6 +823,8 @@ def doctor_gather_state(
         codex_entries_count=codex_entries_count,
         codex_last_entry_at=codex_last_entry_at,
         codex_jsonl_present=codex_jsonl_present,
+        codex_project_metadata_health=codex_project_metadata_health,
+        codex_project_metadata_error=codex_project_metadata_error,
         dashboard_bind_stored=dashboard_bind_stored,
         runtime_bind=runtime_bind,
         # Conversation viewer (Plan 2, spec §5): only consulted on a LAN bind.

@@ -720,6 +720,14 @@ def _accounting_from_record(
         _codex_skip(state, "no-last-token-usage")
         return None, last_total_tokens, filename_session_id_warned
 
+    # Forked/subagent rollouts can begin with a copied slice of their parent's
+    # physical history before the child's first model-bearing turn_context.
+    # Those records remain in the physical event stream, but projecting them
+    # into accounting would duplicate the parent's usage under model="unknown".
+    if (state.model is None and state.thread is not None
+            and state.thread.parent_thread_id is not None):
+        return None, last_total_tokens, filename_session_id_warned
+
     total_token_usage = info.get("total_token_usage")
     if isinstance(total_token_usage, dict):
         try:
@@ -839,6 +847,9 @@ def _iter_codex_fused_records_with_offsets(
             session_id = _codex_string(payload.get("id"))
             if session_id is not None:
                 state.session_id = session_id
+            session_model = _codex_string(payload.get("model"))
+            if session_model is not None:
+                state.model = session_model.strip()
             thread_update = _thread_metadata_from_session_meta(
                 payload, path_str, source_root_key
             )

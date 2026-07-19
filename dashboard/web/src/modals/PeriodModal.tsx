@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { PeriodMiniBars, type PeriodNavRow } from './PeriodMiniBars';
 import { PeriodDetailCard } from './PeriodDetailCard';
@@ -9,9 +9,10 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { keyOf, stepPeriod, type PeriodVariant } from './periodNav';
 import { dailyToPeriodRow } from './historyData';
-import { dispatch, getState, topmostStoreFocusLayer, type ModalKind } from '../store/store';
+import { dispatch, getState, subscribeStore, topmostStoreFocusLayer, type ModalKind } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import type { Envelope, PeriodRow } from '../types/envelope';
+import { presentationDailyRows, presentationPeriodRows } from '../lib/dashboardPresentation';
+import type { DashboardSelection, Envelope, PeriodRow } from '../types/envelope';
 import type { SharePanelId } from '../share/types';
 
 /**
@@ -39,16 +40,16 @@ const DETAIL_VARIANT: Record<Variant, 'daily' | 'weekly' | 'monthly'> = { day: '
 
 interface Keyed { key: string; nav: PeriodNavRow; period: PeriodRow; }
 
-function buildKeyed(variant: Variant, env: Envelope | null): Keyed[] {
+function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSelection): Keyed[] {
   if (variant === 'day') {
-    const rows = env?.daily?.rows ?? [];
+    const rows = presentationDailyRows(env, source);
     return rows.map((r, i) => ({
       key: r.date,
       nav: { key: r.date, label: r.label, cost: r.cost_usd, isCurrent: r.is_today, isEmpty: r.cost_usd <= 0 },
       period: dailyToPeriodRow(r, rows[i + 1]),
     }));
   }
-  const rows = variant === 'week' ? (env?.weekly?.rows ?? []) : (env?.monthly?.rows ?? []);
+  const rows = presentationPeriodRows(env, source, variant === 'week' ? 'weekly' : 'monthly');
   const v: PeriodVariant = variant;
   return rows.map((r) => ({
     key: keyOf(r, v),
@@ -59,6 +60,12 @@ function buildKeyed(variant: Variant, env: Envelope | null): Keyed[] {
 
 export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panelLabel, triggerId, wide }: Props) {
   const env = useSnapshot();
+  // Bound when OPEN_MODAL fires. A source switch changes the board behind the
+  // modal, never the period rows or share target already in front of the user.
+  const source = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModalSource ?? getState().activeSource,
+  );
 
   // Day seeds from a heatmap-cell deep-link (openDailyDate); week/month seed
   // null → effectiveKey clamps to the first (current) row.
@@ -66,7 +73,7 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
     () => (variant === 'day' ? getState().openDailyDate : null),
   );
 
-  const keyed = buildKeyed(variant, env);
+  const keyed = buildKeyed(variant, env, source);
   const navRows = keyed.map((k) => k.nav);
   const periodRows = keyed.map((k) => k.period);
 
@@ -113,7 +120,7 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
   );
 
   return (
-    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras} wide={wide}>
+    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras} wide={wide} dataSource={source}>
       {navRows.length === 0 ? (
         <div className="panel-empty">No usage history yet.</div>
       ) : (

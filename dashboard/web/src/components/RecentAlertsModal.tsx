@@ -168,7 +168,7 @@ function CodexCostCell(): JSX.Element {
 
 export function RecentAlertsModal(): JSX.Element {
   const env = useSnapshot();
-  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().openModalSource ?? getState().activeSource);
   const legacyAlerts = useSyncExternalStore(subscribeStore, () => getState().alerts);
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
@@ -188,10 +188,24 @@ export function RecentAlertsModal(): JSX.Element {
 
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
-  const usedPct = env?.header?.used_pct ?? null;
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
-  const weeklyThresholds =
-    alertsConfig.weekly_thresholds?.length ? alertsConfig.weekly_thresholds : [90, 95];
+  const codexBudget = env?.sources?.codex?.data?.budget.status;
+  const claudeThresholds = alertsConfig.weekly_thresholds?.length
+    ? alertsConfig.weekly_thresholds
+    : [90, 95];
+  const codexThresholds = codexBudget?.alert_thresholds?.length
+    ? codexBudget.alert_thresholds
+    : [90, 100];
+  const usedPct = activeSource === 'claude'
+    ? env?.header?.used_pct ?? null
+    : activeSource === 'codex'
+      ? codexBudget?.consumption_pct ?? null
+      : null;
+  const weeklyThresholds = activeSource === 'claude'
+    ? claudeThresholds
+    : activeSource === 'codex'
+      ? codexThresholds
+      : [...new Set([...claudeThresholds, ...codexThresholds])].sort((a, b) => a - b);
   const rows = allRows.slice(0, ALERTS_MODAL_CAP);
   const showSourceColumn = activeSource === 'all';
 

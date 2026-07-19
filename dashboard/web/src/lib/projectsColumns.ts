@@ -6,6 +6,7 @@ import type { TableColumn } from './tableSort';
 // the same field shape.
 export interface ProjectsTableRow {
   key: string;
+  displayKey?: string;
   sessionsCount: number;
   firstSeenAt: string | null;
   lastSeenAt: string | null;
@@ -39,7 +40,7 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     id: 'project',
     label: 'Project',
     defaultDirection: 'asc',
-    compare: (a, b) => cmpStr(a.key, b.key),
+    compare: (a, b) => cmpStr(a.displayKey ?? a.key, b.displayKey ?? b.key),
     className: 'project',
   },
   {

@@ -8,20 +8,12 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { resolveSourceView } from '../store/sourceView';
 import { deriveVisiblePanelOrder } from '../lib/visiblePanelOrder';
-import { gatePanel, PANEL_GATING } from '../lib/sourceGating';
-import type { PanelId } from '../lib/panelIds';
 import { ModalHeader } from '../modals/ModalHeader';
 
 // #294 S5 §6.9 — one-line pointers for the panels a source intentionally does
 // not show, so a Codex user learns WHERE the equivalent information lives rather
 // than seeing a ghost panel. Panels without a bespoke note fall back to a
 // generic line.
-const HIDDEN_CAPABILITY_NOTES: Partial<Record<PanelId, string>> = {
-  forecast: 'Forecast — native forecasts live in the Blocks (quota) panel',
-  trend: 'Trend — native forecasts live in the Blocks (quota) panel',
-  'cache-report': 'Cache report — token-reuse counters live in the hero',
-};
-
 interface KeyTableProps {
   panelOrder: readonly GridPanelId[];
 }
@@ -156,15 +148,7 @@ export function HelpOverlay() {
   // #294 S5 §6.9 — the panels the active source intentionally hides (per §5.5),
   // each with a one-line pointer. Suppressed while hydrating (§5.2) and outside
   // the dashboard workspace (the selector doesn't apply to conversations).
-  const hiddenItems = useMemo(() => {
-    if (sourceView.hydrating || view !== 'dashboard') return [];
-    return (Object.keys(PANEL_GATING) as PanelId[])
-      .filter((p) => gatePanel(sourceView, p).mode === 'hidden')
-      .map((p) => ({
-        panel: p,
-        note: HIDDEN_CAPABILITY_NOTES[p] ?? `${PANEL_REGISTRY[p as GridPanelId]?.label ?? p} — not shown for this source`,
-      }));
-  }, [sourceView, view]);
+  const hiddenItems: Array<{ panel: string; note: string }> = [];
   useKeymap([
     // `?` is all-views chrome (#156).
     { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },

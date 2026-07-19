@@ -763,6 +763,35 @@ def _build_codex_source_detail(snapshot, *, resource: str, key: str) -> dict[str
     raise SourceResourceNotFound()
 
 
+def _codex_partial_source_detail(snapshot, row: Mapping, *, resource: str,
+                                 key: str) -> dict[str, Any]:
+    """Keep a published cache-only row usable when project metadata is partial."""
+    detail = _source_safe_native_detail(
+        row, source="codex", resource=resource, key=key,
+    )
+    detail.update({
+        "metadata_availability": "partial",
+        "metadata_reason": (
+            "Codex project metadata is incomplete; available accounting totals "
+            "are preserved."
+        ),
+    })
+    if resource == "session":
+        detail.setdefault("models", [])
+        detail["model_breakdowns"] = []
+    elif resource == "project":
+        generated_at = getattr(snapshot, "generated_at", None)
+        detail.setdefault("range_start", detail.get("first_seen"))
+        detail.setdefault(
+            "range_end",
+            generated_at.astimezone(dt.timezone.utc).isoformat()
+            if isinstance(generated_at, dt.datetime) else detail.get("last_seen"),
+        )
+        detail["models"] = []
+        detail["sessions"] = []
+    return detail
+
+
 def _source_safe_claude_session_detail(detail, *, key: str) -> dict[str, Any]:
     """Adapt the existing Claude session detail builder to S4's safe route."""
     payload = _session_detail_to_envelope(detail)
@@ -958,7 +987,12 @@ def build_source_detail(*, snapshot, source: str, resource: str,
     row = source_detail_lookup(snapshot.source_bundle, source, resource, key)
     if source == "claude":
         return _build_claude_source_detail(snapshot, resource=resource, key=key)
-    return _build_codex_source_detail(snapshot, resource=resource, key=key)
+    try:
+        return _build_codex_source_detail(snapshot, resource=resource, key=key)
+    except sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable:
+        return _codex_partial_source_detail(
+            snapshot, row, resource=resource, key=key,
+        )
 
 _ensure_sibling_loaded("_cctally_dashboard_share")
 from _cctally_dashboard_share import (

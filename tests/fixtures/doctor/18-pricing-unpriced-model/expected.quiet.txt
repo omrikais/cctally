@@ -8,7 +8,7 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       38 pending
+  ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ⚠ Claude cache             1 entries; last sync 172800s ago (>24h)
@@ -21,4 +21,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 30 OK · 6 WARN · 0 FAIL
+Summary: 31 OK · 6 WARN · 0 FAIL

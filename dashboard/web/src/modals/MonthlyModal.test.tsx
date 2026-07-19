@@ -95,10 +95,9 @@ describe('<MonthlyModal /> (#264 S2)', () => {
     expect(getState().shareModal?.panel).toBe('monthly');
   });
 
-  // #293 S3 — the panel slices to CAP=3 in stack mode, but the MODAL must always
-  // render EVERY envelope row (row count === envelope). Locks a slice from ever
-  // leaking into the full-table modal path.
-  it('renders ALL envelope rows (never the S3 slice) — row count === envelope', () => {
+  // #293 S3 — the panel slices to CAP=3 in stack mode, but the modal retains
+  // every row inside the shared 8-month detail window.
+  it('renders every envelope row inside the canonical 8-month window', () => {
     const MONTHLY4: PeriodRow[] = [
       periodRow({ label: '2026-07', is_current: true }),
       periodRow({ label: '2026-06' }),

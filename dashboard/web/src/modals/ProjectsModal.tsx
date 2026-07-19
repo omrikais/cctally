@@ -20,9 +20,10 @@
 // Drill session row click → `OPEN_MODAL { kind: 'session', sessionId }`
 // replaces the Projects modal (no modal stack); same behavior as the
 // existing per-panel modals.
-import { Fragment, useEffect, useState, useSyncExternalStore } from 'react';
+import { Fragment, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
+import { ProjectsRankedBars } from './ProjectsRankedBars';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
@@ -37,6 +38,8 @@ import { fmt } from '../lib/fmt';
 import { costClass } from '../lib/cost';
 import { applyTableSort } from '../lib/tableSort';
 import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
+import { presentationProjects } from '../lib/dashboardPresentation';
+import type { DashboardSelection, SourceName } from '../types/envelope';
 
 // Mobile sort-cycle pill (≤640w). Mirrors PROJECTS_COLUMNS ids and
 // their `defaultDirection`s (see lib/projectsColumns.ts) so:
@@ -61,8 +64,13 @@ const PROJECTS_MOBILE_SORT_CYCLE = [
 type WindowPill = 1 | 4 | 8 | 12;
 const WINDOW_PILLS: readonly WindowPill[] = [1, 4, 8, 12];
 
-export function ProjectsModal() {
+function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
   const env = useSnapshot();
+  const isClaude = source === 'claude';
+  const sourceRows = useMemo(
+    () => (isClaude ? null : presentationProjects(env, source)),
+    [env, isClaude, source],
+  );
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const projectKey = useSyncExternalStore(subscribeStore, () => getState().openProjectKey);
@@ -94,13 +102,15 @@ export function ProjectsModal() {
       return;
     }
     if (selectedKey) return;
-    const leader = env?.projects?.current_week?.rows?.[0]?.key ?? null;
+    const leader = isClaude
+      ? env?.projects?.current_week?.rows?.[0]?.key ?? null
+      : sourceRows?.[0]?.key ?? null;
     setSelectedKey(leader);
     // We intentionally depend on the rows reference rather than
     // selectedKey: re-running on every selectedKey change would clobber
     // the user's manual click-to-toggle interaction.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectKey, env?.projects?.current_week?.rows]);
+  }, [projectKey, env?.projects?.current_week?.rows, isClaude, sourceRows]);
 
   // Visible-set fallback: when the persisted `selectedKey` references a
   // project that is no longer in the current trend rows (cross-nav from
@@ -113,10 +123,13 @@ export function ProjectsModal() {
   useEffect(() => {
     if (projectKey) return;
     if (!selectedKey) return;
-    const trendRows = env?.projects?.trend?.projects ?? [];
-    const presentInTrend = trendRows.some((p) => p.key === selectedKey);
+    const presentInTrend = isClaude
+      ? (env?.projects?.trend?.projects ?? []).some((p) => p.key === selectedKey)
+      : (sourceRows ?? []).some((p) => p.key === selectedKey);
     if (presentInTrend) return;
-    const leader = env?.projects?.current_week?.rows?.[0]?.key ?? null;
+    const leader = isClaude
+      ? env?.projects?.current_week?.rows?.[0]?.key ?? null
+      : sourceRows?.[0]?.key ?? null;
     setSelectedKey(leader);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -124,9 +137,11 @@ export function ProjectsModal() {
     selectedKey,
     env?.projects?.trend?.projects,
     env?.projects?.current_week?.rows,
+    isClaude,
+    sourceRows,
   ]);
 
-  const trend = env?.projects?.trend ?? null;
+  const trend = isClaude ? env?.projects?.trend ?? null : null;
   const requested = windowWeeks;
   const actual = trend?.window_weeks ?? 0;
 
@@ -138,6 +153,11 @@ export function ProjectsModal() {
   };
 
   const onRowClick = (key: string) => {
+    if (!isClaude) {
+      const row = sourceRows?.find((candidate) => candidate.key === key);
+      if (row) dispatch({ type: 'OPEN_SOURCE_DETAIL', source: row.source, resource: 'project', key: row.key });
+      return;
+    }
     setSelectedKey((prev) => (prev === key ? null : key));
   };
 
@@ -156,7 +176,7 @@ export function ProjectsModal() {
   // applied AFTER the active-filter so they still only see the top
   // ACTIVE_COLLAPSE_LIMIT rows when collapsed.
   const ACTIVE_COLLAPSE_LIMIT = 10;
-  const baseRows: ProjectsTableRow[] = (trend?.projects ?? [])
+  const legacyRows: ProjectsTableRow[] = (trend?.projects ?? [])
     .map((p) => {
       const weeklyCost = p.weekly_cost.slice(-windowWeeks);
       const weeklyPct = p.weekly_pct.slice(-windowWeeks);
@@ -193,6 +213,19 @@ export function ProjectsModal() {
         shareOfWindow: null as number | null,
       };
     });
+  const baseRows: Array<ProjectsTableRow & { source?: SourceName }> = isClaude
+    ? legacyRows
+    : (sourceRows ?? []).map((row) => ({
+        key: row.key,
+        displayKey: row.label,
+        source: row.source,
+        sessionsCount: row.sessionsCount,
+        firstSeenAt: row.firstSeenAt,
+        lastSeenAt: row.lastSeenAt,
+        windowCost: row.cost,
+        windowPct: null,
+        shareOfWindow: row.pct,
+      }));
   // Second pass: fill shareOfWindow now that totalWindowCost is known.
   // Stored as 0–100 so `fmt.pct0` renders directly (matches `windowPct`).
   const totalWindowCost = baseRows.reduce((s, r) => s + r.windowCost, 0);
@@ -204,7 +237,7 @@ export function ProjectsModal() {
   // Apply override when set; otherwise fall back to cost-desc (spec §3.4
   // "Default sort: cost desc"). `applyTableSort` does NOT mutate its
   // input — slice() inside.
-  const tableRows: ProjectsTableRow[] = sortOverride
+  const tableRows: Array<ProjectsTableRow & { source?: SourceName }> = sortOverride
     ? applyTableSort(baseRows, PROJECTS_COLUMNS, sortOverride)
     : applyTableSort(baseRows, PROJECTS_COLUMNS, {
         column: 'cost',
@@ -328,7 +361,8 @@ export function ProjectsModal() {
       when: isProjectsTopmost,
       action: () => {
         if (selectedKey) {
-          setSelectedKey(null);
+          if (isClaude) setSelectedKey(null);
+          else onRowClick(selectedKey);
         } else if (visibleRows.length > 0) {
           setSelectedKey(visibleRows[0].key);
         }
@@ -361,6 +395,8 @@ export function ProjectsModal() {
               role="radio"
               aria-checked={windowWeeks === w}
               className={`pill ${windowWeeks === w ? 'on' : ''}`}
+              disabled={!isClaude}
+              title={!isClaude ? 'Provider-native project history is unavailable' : undefined}
               onClick={() => savePref('projectsWindowWeeks', w)}
             >
               {w}w
@@ -393,15 +429,35 @@ export function ProjectsModal() {
           </div>
         )}
 
-        {trend ? (
+        {!isClaude && (
+          <div className="projects-notice m-unavailable">
+            {sourceRows == null
+              ? 'Project metadata is unavailable; accounting remains current.'
+              : 'Provider-native project totals are available for the current source window; historical window controls are unavailable.'}
+          </div>
+        )}
+
+        {isClaude && trend ? (
           <ProjectsTrendChart
             trend={trend}
             yMode={yMode}
             windowWeeks={windowWeeks}
             onProjectSelect={(key) => setSelectedKey(key)}
           />
+        ) : !isClaude && sourceRows && sourceRows.length > 0 ? (
+          <ProjectsRankedBars
+            series={sourceRows.slice(0, 6).map((row) => ({
+              key: row.key,
+              bucket_path: row.label,
+              weekly: [row.cost],
+              cost: row.cost,
+            }))}
+            onProjectSelect={onRowClick}
+          />
         ) : (
-          <div className="panel-empty">Projects trend unavailable.</div>
+          <div className="projects-ranked panel-empty m-unavailable" data-testid="projects-ranked-bars">
+            {sourceRows == null ? 'Project attribution unavailable.' : 'No project activity in this source window.'}
+          </div>
         )}
 
         {isMobile && (
@@ -432,8 +488,8 @@ export function ProjectsModal() {
                   data-testid="projects-table-row"
                   data-cost={r.windowCost}
                   data-sessions={r.sessionsCount}
-                  aria-expanded={selectedKey === r.key}
-                  className={selectedKey === r.key ? 'selected' : ''}
+                  aria-expanded={isClaude && selectedKey === r.key}
+                  className={isClaude && selectedKey === r.key ? 'selected' : ''}
                   tabIndex={0}
                   onClick={() => onRowClick(r.key)}
                   onKeyDown={(e) => {
@@ -446,15 +502,22 @@ export function ProjectsModal() {
                     }
                   }}
                 >
-                  <td className="project">{r.key}</td>
+                  <td className="project">
+                    {r.displayKey ?? r.key}
+                    {r.source && <span className={`source-chip source-chip--${r.source}`}>{r.source === 'claude' ? 'Claude' : 'Codex'}</span>}
+                  </td>
                   <td>{r.sessionsCount}</td>
-                  <td className="started first-seen">{fmt.dateShort(r.firstSeenAt, ctx) ?? '—'}</td>
-                  <td className="started last-seen">{fmt.dateShort(r.lastSeenAt, ctx) ?? '—'}</td>
+                  <td className={`started first-seen${!isClaude && r.firstSeenAt == null ? ' m-unavailable' : ''}`}>
+                    {fmt.dateShort(r.firstSeenAt, ctx) ?? (isClaude ? '—' : 'Unavailable')}
+                  </td>
+                  <td className={`started last-seen${!isClaude && r.lastSeenAt == null ? ' m-unavailable' : ''}`}>
+                    {fmt.dateShort(r.lastSeenAt, ctx) ?? (isClaude ? '—' : 'Unavailable')}
+                  </td>
                   <td className={costClass(r.windowCost)}>{fmt.usd2(r.windowCost)}</td>
-                  <td>{r.windowPct == null ? '—' : fmt.pct0(r.windowPct)}</td>
+                  <td className={!isClaude && r.windowPct == null ? 'm-unavailable' : undefined}>{r.windowPct == null ? (isClaude ? '—' : 'Unavailable') : fmt.pct0(r.windowPct)}</td>
                   <td>{r.shareOfWindow == null ? '—' : fmt.pct0(r.shareOfWindow)}</td>
                 </tr>
-                {isMobile && selectedKey === r.key && (
+                {isClaude && isMobile && selectedKey === r.key && (
                   <tr className="projects-drill-row" aria-hidden="false">
                     <td colSpan={7}>
                       <ProjectsDrillPanel projectKey={r.key} windowWeeks={windowWeeks} />
@@ -480,7 +543,7 @@ export function ProjectsModal() {
           </button>
         )}
 
-        {!isMobile && selectedKey && (
+        {isClaude && !isMobile && selectedKey && (
           <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
         )}
 
@@ -498,4 +561,12 @@ export function ProjectsModal() {
       </div>
     </Modal>
   );
+}
+
+export function ProjectsModal() {
+  const source = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModalSource ?? getState().activeSource,
+  );
+  return <CanonicalProjectsModal source={source} />;
 }

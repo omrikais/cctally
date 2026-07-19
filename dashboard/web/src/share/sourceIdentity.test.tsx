@@ -53,6 +53,24 @@ describe('OPEN_SHARE source capture (§7)', () => {
     expect(getState().shareModal?.source).toBe('claude');
   });
 
+  it('a panel modal and share launched from it keep the source captured at open', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
+    act(() => dispatch({ type: 'OPEN_MODAL', kind: 'weekly' }));
+    expect(getState().openModalSource).toBe('codex');
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' }));
+    expect(getState().openModal).toBe('weekly');
+    expect(getState().openModalSource).toBe('codex');
+    act(() => dispatch(openShareModal('weekly', 'weekly-modal')));
+    expect(getState().shareModal?.source).toBe('codex');
+  });
+
+  it('a qualified detail remains bound to its physical source after a board switch', () => {
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
+    act(() => dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'session', key: 'v1.native' }));
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
+    expect(getState().openSourceDetail).toEqual({ source: 'codex', resource: 'session', key: 'v1.native' });
+  });
+
   it('shareReducer defaults source to claude for a bare dispatch', () => {
     const next = shareReducer(initialShareState, { type: 'OPEN_SHARE', panel: 'daily', triggerId: null });
     expect(next.shareModal?.source).toBe('claude');
@@ -106,21 +124,20 @@ describe('basket legacy-item load (§7)', () => {
 });
 
 describe('SHARE_PANEL_MATRIX (§7)', () => {
-  it('claude offers 9 panels incl. forecast/trend; codex + all offer the 7-panel intersection', () => {
+  it('all three selections expose the same nine share-capable cards', () => {
     expect(SHARE_PANEL_MATRIX.claude.size).toBe(9);
     expect(SHARE_PANEL_MATRIX.claude.has('forecast')).toBe(true);
     expect(SHARE_PANEL_MATRIX.claude.has('trend')).toBe(true);
-    expect(SHARE_PANEL_MATRIX.codex.size).toBe(7);
-    expect(SHARE_PANEL_MATRIX.codex.has('forecast')).toBe(false);
-    expect(SHARE_PANEL_MATRIX.codex.has('trend')).toBe(false);
-    // All is the intersection (same 7).
-    expect([...SHARE_PANEL_MATRIX.all].sort()).toEqual([...SHARE_PANEL_MATRIX.codex].sort());
+    expect(SHARE_PANEL_MATRIX.codex.size).toBe(9);
+    expect(SHARE_PANEL_MATRIX.codex.has('forecast')).toBe(true);
+    expect(SHARE_PANEL_MATRIX.codex.has('trend')).toBe(true);
+    expect([...SHARE_PANEL_MATRIX.all].sort()).toEqual([...SHARE_PANEL_MATRIX.claude].sort());
   });
 
-  it('isSharePanelAllowed gates forecast under codex/all', () => {
+  it('isSharePanelAllowed keeps forecast/trend source-parity', () => {
     expect(isSharePanelAllowed('claude', 'forecast')).toBe(true);
-    expect(isSharePanelAllowed('codex', 'forecast')).toBe(false);
-    expect(isSharePanelAllowed('all', 'trend')).toBe(false);
+    expect(isSharePanelAllowed('codex', 'forecast')).toBe(true);
+    expect(isSharePanelAllowed('all', 'trend')).toBe(true);
   });
 
   it('SELECTION_LABEL covers all three selections', () => {
@@ -133,14 +150,15 @@ describe('SHARE_PANEL_MATRIX (§7)', () => {
 describe('keyboardShare respects the matrix (§7)', () => {
   afterEach(() => { document.body.innerHTML = ''; });
 
-  it('S on a forecast panel under Codex does not open the share modal', () => {
+  it('S on a forecast panel under Codex opens a source-bound share modal', () => {
     // Focus a forecast panel section.
     document.body.innerHTML = '<section data-panel-kind="forecast"><button id="f">x</button></section>';
     (document.getElementById('f') as HTMLButtonElement).focus();
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     const binding = buildShareKeyBinding();
     act(() => binding.action());
-    expect(getState().shareModal).toBeNull();
+    expect(getState().shareModal?.panel).toBe('forecast');
+    expect(getState().shareModal?.source).toBe('codex');
   });
 
   it('S on a weekly panel under Codex DOES open the share modal (in the matrix)', () => {

@@ -363,7 +363,10 @@ def test_projected_claim_prevents_later_actual_and_stale_future_do_not_qualify(
     runtime, monkeypatch,
 ):
     ns, quota = runtime
-    _seed(ns, observations=[(_at(10), 10, 50.0), (_at(11), 20, 51.0)])
+    # At 70 minutes into the native 300-minute cycle, 11% remains below the
+    # 90% projected threshold.  The later 80% observation is the first
+    # qualifying projection.
+    _seed(ns, observations=[(_at(10), 10, 10.0), (_at(11), 20, 11.0)])
     _write_config(ns, actual=(90,), projected=(90,))
     captured = _capture_dispatch(ns, monkeypatch)
     _reconcile(quota, now=_at(11, 10))  # arm below both thresholds
@@ -385,7 +388,7 @@ def test_projected_claim_prevents_later_actual_and_stale_future_do_not_qualify(
     assert [row for row in _rows(ns) if row["source_root_key"] == "future"] == []
 
     # Stale local evidence may still claim actual, but can never claim projected.
-    _seed(ns, root="stale", observations=[(_at(10), 10, 50.0), (_at(11), 20, 51.0)])
+    _seed(ns, root="stale", observations=[(_at(10), 10, 10.0), (_at(11), 20, 11.0)])
     _write_config(ns, actual=(), projected=(90,))
     _reconcile(quota, roots=("stale",), eligible=("stale",), now=_at(11, 10))
     _seed(ns, root="stale", observations=[(_at(12), 30, 80.0)])

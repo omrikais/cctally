@@ -152,6 +152,65 @@ def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
         conn.close()
 
 
+def _seed_codex_project_metadata_cache(home: pathlib.Path):
+    """Seed a retained all-history partition through the real cache schema."""
+    import sqlite3
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    cdir = home / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(cdir / "cache.db"))
+    try:
+        db._apply_cache_schema(conn)
+        conn.execute(
+            "INSERT INTO codex_session_entries(source_path, line_offset, timestamp_utc, session_id, model, "
+            "total_tokens, source_root_key, conversation_key) VALUES "
+            "('/codex/a.jsonl', 1, '2026-05-12T00:00:00Z', 'native-a', 'gpt-test', 1, 'root-a', 'key-a')"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_threads(conversation_key, source_root_key, native_thread_id, "
+            "root_thread_id, source_path) VALUES ('key-a', 'root-a', 'native-a', 'root-a', '/codex/a.jsonl')"
+        )
+        conn.execute(
+            "INSERT INTO codex_session_entries(source_path, line_offset, timestamp_utc, session_id, model, "
+            "total_tokens, source_root_key, conversation_key) VALUES "
+            "('/codex/b.jsonl', 1, '2026-05-12T00:01:00Z', 'native-b', 'gpt-test', 1, 'root-a', NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_gather_codex_project_metadata_is_all_history_and_identity_safe(tmp_path):
+    _seed_codex_project_metadata_cache(tmp_path)
+    state = _run_gather(tmp_path)
+    assert state["codex_project_metadata_health"] == {
+        "total_rows": 2,
+        "qualified_rows": 1,
+        "missing_conversation_key_rows": 1,
+        "missing_thread_join_rows": 0,
+    }
+    assert state["codex_project_metadata_error"] is None
+
+
+def test_gather_codex_project_metadata_query_failure_is_explicit(tmp_path):
+    """A pre-#312 cache shape is a Doctor FAIL input, never healthy zero."""
+    import sqlite3
+
+    cache_dir = tmp_path / ".local" / "share" / "cctally"
+    cache_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(cache_dir / "cache.db"))
+    try:
+        conn.execute("CREATE TABLE codex_session_entries (timestamp_utc TEXT NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    state = _run_gather(tmp_path)
+    assert state["codex_project_metadata_health"] is None
+    assert state["codex_project_metadata_error"] == "OperationalError"
+
+
 def test_gather_rollup_consistent(tmp_path):
     """Equal rollup + distinct-message session counts, no pending flag → the
     three rollup fields populate, equal, and not in progress."""

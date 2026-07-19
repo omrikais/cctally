@@ -1,8 +1,9 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, it, expect } from 'vitest';
 import { BlocksPanel } from './BlocksPanel';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import type { BlocksPanelRow, Envelope } from '../types/envelope';
+import fixture from '../../__tests__/fixtures/envelope.json';
 
 beforeEach(() => {
   localStorage.clear();
@@ -69,5 +70,70 @@ describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
     updateSnapshot(env);
     const { container } = render(<BlocksPanel />);
     expect((container.querySelector('.panel-expand') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('keeps Codex Blocks truthfully disabled when no retained 300-minute block exists', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.quota.blocks = [];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+
+    const { container } = render(<BlocksPanel />);
+
+    expect(container.querySelector('[data-source="codex"]')).not.toBeNull();
+    expect((container.querySelector('.panel-expand') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('No 5-hour activity blocks in the current Codex cycle.')).toBeInTheDocument();
+  });
+});
+
+describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
+  it('All routes a Claude-backed row through the canonical Block modal', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'opaque:server-issued-block-key',
+      source: 'claude',
+      start_at: '2026-04-24T08:00:00Z',
+      end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded',
+      is_active: true,
+      cost_usd: 4.2,
+      models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<BlocksPanel />);
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Open detail for block starting 08:00 Apr 24 UTC',
+    }));
+
+    expect(getState().openModal).toBe('block');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T08:00:00Z');
+    expect(getState().openSourceDetail).toBeNull();
+  });
+
+  it('All expand uses the canonical Block modal for its active Claude row', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'opaque:server-issued-block-key',
+      source: 'claude',
+      start_at: '2026-04-24T08:00:00Z',
+      end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded',
+      is_active: true,
+      cost_usd: 4.2,
+      models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<BlocksPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Blocks' }));
+
+    expect(getState().openModal).toBe('block');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T08:00:00Z');
+    expect(getState().openSourceDetail).toBeNull();
   });
 });

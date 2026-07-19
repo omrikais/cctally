@@ -1,4 +1,4 @@
-import { useContext, useLayoutEffect, useRef, useState } from 'react';
+import { useContext, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
@@ -6,15 +6,16 @@ import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { keyOf } from '../modals/periodNav';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import { BoardModeContext } from '../lib/boardModeContext';
 import { summarize } from '../lib/summaryWindow';
 import { cardRegionClick } from '../lib/cardRegion';
-import { SourcePanelShell, CodexPeriodTable } from './sourcePanel';
+import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
+import { modelChipStyle } from '../lib/model';
 
 // #264 S2 / #265 — the Monthly summary TILE (restored from the S8 collapse).
 // #293 S3 — below 900px (stack mode) the card previews the newest
@@ -48,7 +49,7 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
           <span
             key={m.model}
             className={m.chip}
-            style={{ width: animate ? '0%' : `${m.cost_pct}%` }}
+            style={{ ...modelChipStyle(m.model), width: animate ? '0%' : `${m.cost_pct}%` }}
             title={`${m.display} ${fmt.usd2(m.cost_usd)} (${m.cost_pct.toFixed(0)}%)`}
           />
         ))}
@@ -61,23 +62,13 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
 // #294 S5 — source-aware wrapper. Claude = calendar-month tile (unchanged);
 // Codex = native calendar-month period table; All = provider sections.
 export function MonthlyPanel() {
-  return (
-    <SourcePanelShell
-      panel="monthly"
-      panelKind="monthly"
-      claude={<ClaudeMonthlyPanel />}
-      codex={(d) => <CodexPeriodTable data={d} label="Monthly" />}
-      emptyLabel="No Codex monthly activity yet."
-    />
-  );
-}
-
-function ClaudeMonthlyPanel() {
   const env = useSnapshot();
-  const allRows = env?.monthly?.rows ?? [];
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const allRows = presentationPeriodRows(env, activeSource, 'monthly');
   const mode = useContext(BoardModeContext);
   const { visible, hiddenCount } = summarize(allRows, mode);
-  const total = env?.monthly?.total_cost_usd ?? 0;
+  const total = allRows.reduce((sum, row) => sum + row.cost_usd, 0);
+  const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
 
   const seen = useRef<Set<string>>(new Set());
@@ -97,6 +88,7 @@ function ClaudeMonthlyPanel() {
       role="region"
       aria-label="Monthly usage panel"
       data-panel-kind="monthly"
+      data-source={activeSource}
       onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'monthly' }))}
     >
       <div className="panel-header">
@@ -122,7 +114,7 @@ function ClaudeMonthlyPanel() {
       </div>
       <div className="panel-body">
         {allRows.length === 0 ? (
-          env?.hydrating ? (
+          hydrating ? (
             <PanelSkeleton />
           ) : (
             <div className="panel-empty">No usage history yet.</div>

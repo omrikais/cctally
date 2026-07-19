@@ -122,6 +122,8 @@ describe('RecentAlertsPanel — source-aware rows (§6.7)', () => {
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     const { container } = render(<RecentAlertsPanel />);
     expect(container.textContent).toContain('No Codex alerts');
+    expect(container.querySelector('.ra-gauge')).not.toBeNull();
+    expect(container.querySelector('.ra-gauge-bar')).not.toBeNull();
     // The Claude weekly-gauge copy must not appear under Codex.
     expect(container.textContent).not.toContain('weekly usage crosses');
   });
@@ -155,5 +157,8 @@ describe('RecentAlertsPanel — All empty union copy', () => {
     const { container } = render(<RecentAlertsPanel />);
     const body = within(container.querySelector('#panel-alerts-body') as HTMLElement);
     expect(body.getByText(/No alerts yet/i)).toBeInTheDocument();
+    expect(container.querySelector('.ra-gauge')).not.toBeNull();
+    expect(container.querySelector('.ra-gauge-bar')).not.toBeNull();
+    expect(container.textContent).toContain('90% / 95% / 100%');
   });
 });

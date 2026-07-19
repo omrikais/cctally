@@ -86,6 +86,11 @@ export function makeCodexSourceData(): CodexSourceData {
       output_tokens: 64000,
       reasoning_output_tokens: 8000,
       total_tokens: 552000,
+      cycle: {
+        window_minutes: 10080,
+        start_at: '2026-04-23T00:00:00Z',
+        resets_at: '2026-04-30T00:00:00Z',
+      },
       quota: summary,
       budget: budgetStatus,
       alerts: { count: 1 },
@@ -237,10 +242,19 @@ export function makeCodexSourceData(): CodexSourceData {
         {
           key: 'block:codex-5h',
           source: 'codex',
-          label: '5-hour limit',
+          label: '13:00 Apr 24 UTC',
+          window_minutes: 300,
+          start_at: '2026-04-24T13:00:00Z',
+          end_at: '2026-04-24T18:00:00Z',
           resets_at: '2026-04-24T18:00:00Z',
           current_percent: 42.0,
           orphaned: false,
+          is_active: true,
+          cost_usd: 12.3,
+          model_breakdowns: [
+            { modelName: 'gpt-5', cost: 8.0 },
+            { modelName: 'gpt-5-codex', cost: 4.3 },
+          ],
         },
       ],
     },
@@ -313,7 +327,7 @@ export function makeCodexSourceEntry(
     data_version: 'codex:v1',
     last_success_at: '2026-04-24T13:07:00Z',
     capabilities: {
-      hero: { status: 'supported', semantics: 'calendar-accounting' },
+      hero: { status: 'supported', semantics: 'native-reset-cycle' },
       daily: { status: 'supported', semantics: 'calendar-day' },
       monthly: { status: 'supported', semantics: 'calendar-month' },
       weekly: { status: 'supported', semantics: 'calendar-week' },
@@ -435,11 +449,14 @@ export function makeAllSourceEntry(
   codex: SourceEntry<CodexSourceData> = makeCodexSourceEntry(),
   overrides?: Partial<SourceEntry<AllSourceData>>,
 ): SourceEntry<AllSourceData> {
+  const codexHero = codex.data?.hero;
   const combined =
-    claude.data && codex.data
+    claude.data && codexHero
+    && codexHero.cost_usd != null
+    && codexHero.total_tokens != null
       ? {
-          cost_usd: claude.data.hero.cost_usd + codex.data.hero.cost_usd,
-          total_tokens: claude.data.hero.total_tokens + codex.data.hero.total_tokens,
+          cost_usd: claude.data.hero.cost_usd + codexHero.cost_usd,
+          total_tokens: claude.data.hero.total_tokens + codexHero.total_tokens,
         }
       : null;
   // The `all` alert union mirrors the Python `_combined_alert_rows`: each

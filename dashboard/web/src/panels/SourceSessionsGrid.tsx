@@ -12,35 +12,33 @@ import { SessionsControls } from '../components/SessionsControls';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
+import { ShareIcon } from '../components/ShareIcon';
+import { ExpandButton } from '../components/ExpandButton';
 import { fmt } from '../lib/fmt';
-import { modelChipClass } from '../lib/model';
+import { modelChipClass, modelChipStyle } from '../lib/model';
 import { HighlightText } from '../lib/highlightText';
 import { rovingAction } from '../lib/sessionsRovingKeyboard';
 import { resolveSourceView } from '../store/sourceView';
 import { gatePanel } from '../lib/sourceGating';
 import { sourceSessionsColumns } from '../lib/sourceSessionsColumns';
+import { collectSourceSessionRows, type SessionDisplayRow } from '../lib/sourceRows';
+import { costClass } from '../lib/cost';
+import { transcriptsEnabled } from '../lib/transcripts';
 import { SourceChip, DegradedChip } from './sourcePanel';
-import type { SessionDisplayRow } from '../lib/sourceRows';
 import type { DashboardSelection } from '../types/envelope';
+import { openShareModal } from '../store/shareSlice';
 
-// #294 S5 §6.3 — the source-aware Sessions grid (Codex + All). The Claude
-// Sessions panel keeps its own byte-identical grid (ClaudeSessionsPanel in
-// SessionsPanel.tsx); this renders the provider-native display-row grid with the
-// enumerated per-source bindings: columns title=label / recency=last_activity
-// (default sort desc) / models chips / the five token cells / cost; sortable by
-// recency, cost, total tokens, label; filter `f` + search `/` over the label +
+// Provider-neutral Sessions grid for Claude, Codex, and All. It renders the
+// canonical provider-adapted display rows behind the canonical columns: Started /
+// Duration / Model / Project / Cache hit / Cost. Native token counters remain
+// available in qualified detail. Filter `f` + search `/` cover the label +
 // models haystack; collapse `c` respected; the #299 roving-tabindex grid-lite
 // interaction carries over. In All mode every row shows a source chip and the two
 // providers' rows interleave by the shared recency comparator (never merged).
 
 // The row's focusable per-row control (the detail-open title button), matching
 // the #299 CONTROL_SELECTOR contract for the roving grid.
-const SOURCE_CONTROL_SELECTOR = '.source-detail-open';
-
-function tokenCell(r: SessionDisplayRow, field: 'input' | 'cachedInput' | 'output' | 'reasoning' | 'total'): string {
-  if (r.tokens.kind !== 'codex') return '—';
-  return fmt.tokens(r.tokens[field]);
-}
+const SOURCE_CONTROL_SELECTOR = '.sess-open-conv, .source-detail-open, .model-chip, .project-cell-link';
 
 export function SourceSessionsGrid() {
   const activeSource = useSyncExternalStore(
@@ -53,8 +51,10 @@ export function SourceSessionsGrid() {
   // Re-render on the slices that feed getRenderedSourceRows so the painted rows
   // stay in sync with the store's search-match recompute.
   useSyncExternalStore(subscribeStore, () => getState().filterText);
+  useSyncExternalStore(subscribeStore, () => getState().sessionsSort);
   useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsPerPage);
   const sourceSort = useSyncExternalStore(subscribeStore, () => getState().sourceSessionsSort);
+  const claudeSort = useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsSortOverride);
   const searchMatches = useSyncExternalStore(subscribeStore, () => getState().searchMatches);
   const searchIndex = useSyncExternalStore(subscribeStore, () => getState().searchIndex);
   const searchText = useSyncExternalStore(subscribeStore, () => getState().searchText);
@@ -65,9 +65,20 @@ export function SourceSessionsGrid() {
   const view = resolveSourceView(env, activeSource);
   const gate = gatePanel(view, 'sessions');
   const rows = getRenderedSourceRows();
-  const columns = sourceSessionsColumns({ includeSource: isAll });
-  const emptyLabel = isAll ? 'No sessions yet.' : 'No Codex sessions yet.';
-  const tableTestId = isAll ? 'source-sessions-table' : 'codex-sessions-table';
+  const allRows = collectSourceSessionRows(view);
+  const models = new Set(allRows.flatMap((row) => row.models));
+  const oneModel = models.size <= 1;
+  const singleModel = models.size === 1 ? [...models][0] : null;
+  const columns = sourceSessionsColumns({ includeSource: isAll, oneModel });
+  const sortOverride = activeSource === 'claude' ? claudeSort : sourceSort;
+  const transcriptsOn = transcriptsEnabled(env);
+  const total = activeSource === 'claude'
+    ? env?.sessions?.total ?? rows.length
+    : activeSource === 'codex'
+      ? (view.entry?.data as { sessions?: { total_sessions?: number } } | null)?.sessions?.total_sessions ?? rows.length
+      : allRows.length;
+  const emptyLabel = activeSource === 'claude' ? 'No sessions yet.' : isAll ? 'No sessions yet.' : 'No Codex sessions yet.';
+  const tableTestId = activeSource === 'claude' ? 'claude-sessions-table' : isAll ? 'source-sessions-table' : 'codex-sessions-table';
 
   // #299 roving-tabindex: the single body tab stop is the ROW keyed by identity
   // (the opaque source key), surviving re-sort/re-filter; falls back to the
@@ -82,6 +93,15 @@ export function SourceSessionsGrid() {
   const matchedIdx = new Set(searchMatches);
   const currentIdx = searchCurrentIdx;
 
+  const openSession = (row: SessionDisplayRow) => {
+    if (!row.key) return;
+    if (activeSource === 'claude' && row.source === 'claude') {
+      dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: row.key });
+    } else {
+      dispatch({ type: 'OPEN_SOURCE_DETAIL', source: row.source, resource: 'session', key: row.key });
+    }
+  };
+
   const onRowsKeyDown = useCallback((e: React.KeyboardEvent<HTMLTableSectionElement>) => {
     if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
     const targetEl = e.target as HTMLElement;
@@ -92,7 +112,7 @@ export function SourceSessionsGrid() {
     const allControls = Array.from(tr.querySelectorAll<HTMLElement>(SOURCE_CONTROL_SELECTOR));
     // Confine to on-screen controls (jsdom has no layout → offsetParent is
     // always null, so fall back to the full set — the ui-qa gate covers the
-    // real display:none exclusion). Mirrors ClaudeSessionsPanel.
+    // real display:none exclusion).
     const visible = allControls.filter((el) => el.offsetParent !== null);
     const controls = visible.length > 0 ? visible : allControls;
     const cellIdx = onRow ? -1 : controls.indexOf(targetEl);
@@ -112,7 +132,11 @@ export function SourceSessionsGrid() {
       const src = tr.dataset.detailSource;
       const key = tr.dataset.detailKey;
       if ((src === 'claude' || src === 'codex') && key) {
-        dispatch({ type: 'OPEN_SOURCE_DETAIL', source: src, resource: 'session', key });
+        if (activeSource === 'claude' && src === 'claude') {
+          dispatch({ type: 'OPEN_MODAL', kind: 'session', sessionId: key });
+        } else {
+          dispatch({ type: 'OPEN_SOURCE_DETAIL', source: src, resource: 'session', key });
+        }
       }
       return;
     }
@@ -129,9 +153,10 @@ export function SourceSessionsGrid() {
     targetTr.focus();
     targetTr.scrollIntoView({ block: 'nearest' });
     setActiveRowKey(targetTr.dataset.rowKey ?? null);
-  }, []);
+  }, [activeSource]);
 
-  const showSkeleton = gate.mode === 'skeleton';
+  const showSkeleton = gate.mode === 'skeleton'
+    || (activeSource === 'claude' && !!env?.hydrating && rows.length === 0);
 
   return (
     <section
@@ -148,12 +173,36 @@ export function SourceSessionsGrid() {
             <use href="/static/icons.svg#clock" />
           </svg>
           <h2>
-            Recent Sessions <span className="sub">{showSkeleton ? '(loading)' : `(${rows.length} shown)`}</span>
+            Recent Sessions <span className="sub">{showSkeleton ? '(loading)' : activeSource === 'claude' ? `(${total} total)` : `(${rows.length} shown)`}</span>
           </h2>
+          {singleModel && (
+            <span className="sess-model-caption" title={`All sessions use ${singleModel}`}>
+              <span
+                className={`ms-dot ${modelChipClass(singleModel)}`}
+                style={modelChipStyle(singleModel)}
+                aria-hidden="true"
+              />
+              all · {singleModel}
+            </span>
+          )}
           {gate.mode === 'degraded' && <DegradedChip gate={gate} />}
         </div>
         <div className="panel-header-actions">
           {!isMobile && <SessionsControls />}
+          <ShareIcon
+            panel="sessions"
+            panelLabel="Sessions"
+            triggerId="sessions-panel"
+            onClick={() => dispatch(openShareModal('sessions', 'sessions-panel'))}
+          />
+          <ExpandButton
+            label="Sessions"
+            disabled={rows.length === 0}
+            onOpen={() => {
+              const row = rows[0];
+              if (row) openSession(row);
+            }}
+          />
           <button
             type="button"
             className="panel-collapse-toggle"
@@ -183,14 +232,17 @@ export function SourceSessionsGrid() {
           <table className="sess-table source-sess-table" role="grid" data-testid={tableTestId}>
             <SortableHeader
               columns={columns}
-              override={sourceSort}
+              override={sortOverride}
               grid
-              onChange={(next) => dispatch({ type: 'SET_SOURCE_SESSIONS_SORT', override: next })}
+              onChange={(next) => dispatch(activeSource === 'claude'
+                ? { type: 'SET_TABLE_SORT', table: 'sessions', override: next }
+                : { type: 'SET_SOURCE_SESSIONS_SORT', override: next })}
             />
             <tbody id="sess-rows" role="rowgroup" onKeyDown={onRowsKeyDown}>
               {rows.map((r, i) => {
                 const isMatch = matchedIdx.has(i);
                 const isCurrent = i === currentIdx;
+                const sessionTitle = r.title || '—';
                 const recency = r.recencyUtc
                   ? fmt.startedShort(r.recencyUtc, ctx, { noSuffix: true })
                   : '—';
@@ -207,49 +259,76 @@ export function SourceSessionsGrid() {
                     aria-current={isCurrent ? 'true' : undefined}
                     data-row-index={i}
                     data-row-key={r.key}
+                    data-session-id={activeSource === 'claude' ? r.key : undefined}
                     data-detail-source={r.source}
                     data-detail-key={r.key}
-                    onClick={() =>
-                      dispatch({ type: 'OPEN_SOURCE_DETAIL', source: r.source, resource: 'session', key: r.key })
-                    }
+                    onClick={() => openSession(r)}
                   >
-                    {isAll && (
-                      <td className="src" role="gridcell" onClick={(e) => e.stopPropagation()}>
-                        <SourceChip source={r.source} />
-                      </td>
-                    )}
-                    <td className="session" role="gridcell" title={r.title}>
-                      <button
-                        type="button"
-                        className="source-detail-open sess-open-title"
-                        tabIndex={-1}
-                        aria-label={`Open ${r.source} session details: ${r.title}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          dispatch({ type: 'OPEN_SOURCE_DETAIL', source: r.source, resource: 'session', key: r.key });
-                        }}
-                      >
-                        <HighlightText text={r.title} query={searchText} />
-                      </button>
+                    <td className="started recency" role="gridcell">
+                      {transcriptsOn && r.key && (
+                        <button
+                          type="button"
+                          className="sess-open-conv"
+                          tabIndex={-1}
+                          title="Open conversation"
+                          aria-label="Open conversation"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            dispatch({ type: 'OPEN_CONVERSATION', sessionId: r.key });
+                          }}
+                        >
+                          <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#file-text" /></svg>
+                        </button>
+                      )}
+                      <HighlightText text={recency} query={searchText} />
+                      <span className="dur-fold"> · <HighlightText text={r.durationMin == null ? '—' : `${r.durationMin}m`} query={searchText} /></span>
                     </td>
-                    <td className="recency" role="gridcell">{recency}</td>
-                    <td className="models" role="gridcell" onClick={(e) => e.stopPropagation()}>
+                    <td className="dur" role="gridcell"><HighlightText text={r.durationMin == null ? '—' : `${r.durationMin}m`} query={searchText} /></td>
+                    {!oneModel && <td className="model model-chip-cell models" role="gridcell" onClick={(e) => e.stopPropagation()}>
                       {r.models.length === 0 ? (
                         <span className="src-model-empty" aria-hidden="true">—</span>
                       ) : (
                         r.models.map((m) => (
-                          <span key={m} className={`chip model-chip ${modelChipClass(m)}`}>
+                          <button key={m} type="button" tabIndex={-1} className={`chip model-chip ${modelChipClass(m)}`}
+                            style={modelChipStyle(m)}
+                            aria-label={`Filter by ${m}`} onClick={() => dispatch({ type: 'SET_FILTER', text: m })}>
                             <HighlightText text={m} query={searchText} />
-                          </span>
+                          </button>
                         ))
                       )}
+                    </td>}
+                    <td className="session" role="gridcell" title={r.title || undefined}>
+                      {r.key ? <button
+                        type="button"
+                        className="source-detail-open sess-open-title"
+                        tabIndex={-1}
+                        aria-label={activeSource === 'claude'
+                          ? r.title ? `Open session details: ${r.title}` : `Open session details, started ${recency}`
+                          : `Open ${r.source} session details: ${sessionTitle}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openSession(r);
+                        }}
+                      >
+                        {isAll && <SourceChip source={r.source} />}
+                        {r.title ? <HighlightText text={r.title} query={searchText} /> : <span className="sess-title-empty" aria-hidden="true">—</span>}
+                      </button> : r.title ? <HighlightText text={r.title} query={searchText} /> : <span className="sess-title-empty" aria-hidden="true">—</span>}
                     </td>
-                    <td className="num tok-input" role="gridcell">{tokenCell(r, 'input')}</td>
-                    <td className="num tok-cached" role="gridcell">{tokenCell(r, 'cachedInput')}</td>
-                    <td className="num tok-output" role="gridcell">{tokenCell(r, 'output')}</td>
-                    <td className="num tok-reasoning" role="gridcell">{tokenCell(r, 'reasoning')}</td>
-                    <td className="num tok-total" role="gridcell">{tokenCell(r, 'total')}</td>
-                    <td className="num cost" role="gridcell">{fmt.usd2(r.costUsd)}</td>
+                    <td className="project" role="gridcell">
+                      {r.projectKey && r.projectKey !== '(unknown)' ? (
+                        <button type="button" className="project-cell-link" tabIndex={-1} title={r.project}
+                          aria-label={activeSource === 'claude' ? `Open Projects modal for ${r.projectKey}` : `Open ${r.source} project details: ${r.project}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (activeSource === 'claude') dispatch({ type: 'OPEN_MODAL', kind: 'projects', projectKey: r.projectKey ?? undefined });
+                            else dispatch({ type: 'OPEN_SOURCE_DETAIL', source: r.source, resource: 'project', key: r.projectKey! });
+                          }}>
+                          <HighlightText text={r.project} query={searchText} />
+                        </button>
+                      ) : <span title="Project still resolving"><HighlightText text={r.project} query={searchText} /></span>}
+                    </td>
+                    <td className="num cache" role="gridcell">{r.cacheHitPct == null ? '—' : fmt.pct0(r.cacheHitPct)}</td>
+                    <td className={`num cost ${costClass(r.costUsd)}`} role="gridcell"><HighlightText text={fmt.usd2(r.costUsd)} query={searchText} /></td>
                   </tr>
                 );
               })}

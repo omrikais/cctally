@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
 import hashlib
 import json
 import pathlib
@@ -20,6 +21,7 @@ from _cctally_core import (
 )
 from _cctally_cache import _codex_provider_roots
 from _lib_quota import build_blocks
+from _lib_pricing import _calculate_codex_entry_cost
 from _cctally_quota import load_codex_quota_observations
 from _lib_source_analytics import (
     AnalyticsWindow,
@@ -50,6 +52,37 @@ class SourceUsageError(ValueError):
     """A provider-aware request is syntactically or semantically invalid."""
 
 
+@dataclasses.dataclass(frozen=True)
+class CodexProjectMetadataHealth:
+    """A root-qualified partition of retained Codex accounting metadata."""
+
+    total_rows: int
+    qualified_rows: int
+    missing_conversation_key_rows: int
+    missing_thread_join_rows: int
+
+    @property
+    def incomplete_rows(self) -> int:
+        return self.missing_conversation_key_rows + self.missing_thread_join_rows
+
+
+@dataclasses.dataclass(frozen=True)
+class RootedCodexAccountingEntry:
+    """One cache-only Codex accounting row with authoritative root identity."""
+
+    timestamp: dt.datetime
+    session_id: str
+    source_path: str
+    source_root_key: str
+    model: str
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+
 _OPAQUE_PROJECT_KEY_RE = re.compile(r"^project:[0-9a-f]{24}$")
 
 
@@ -74,6 +107,18 @@ _QUALIFIED_CODEX_ENTRIES_SQL = """
 """
 
 
+_INHERITED_CODEX_PROJECT_METADATA_SQL = """
+    SELECT files.source_root_key, files.path, inherited.cwd, inherited.git_json
+      FROM codex_session_files AS files
+      JOIN codex_conversation_threads AS inherited
+        ON inherited.source_root_key = files.source_root_key
+       AND inherited.native_thread_id = files.last_native_thread_id
+     WHERE files.last_native_thread_id IS NOT NULL
+       AND files.last_native_thread_id != ''
+     ORDER BY inherited.last_seen_utc DESC, inherited.conversation_key DESC
+"""
+
+
 _CODEX_ACCOUNTING_ENTRIES_SQL = """
     SELECT timestamp_utc, source_root_key, conversation_key, model,
            input_tokens, cached_input_tokens, output_tokens,
@@ -84,6 +129,75 @@ _CODEX_ACCOUNTING_ENTRIES_SQL = """
        AND source_root_key IS NOT NULL
      ORDER BY timestamp_utc ASC, source_root_key ASC, conversation_key ASC, id ASC
 """
+
+
+_ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL = """
+    SELECT timestamp_utc, session_id, source_path, source_root_key, model,
+           input_tokens, cached_input_tokens, output_tokens,
+           reasoning_output_tokens, total_tokens
+      FROM codex_session_entries INDEXED BY idx_codex_entries_ts_root_conversation
+     WHERE timestamp_utc >= ?
+       AND timestamp_utc < ?
+     {root_predicate}
+     ORDER BY timestamp_utc ASC, source_root_key ASC, conversation_key ASC, id ASC
+"""
+
+
+_CODEX_PROJECT_METADATA_HEALTH_SQL = """
+    SELECT
+      COUNT(*) AS total_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NULL OR entries.conversation_key = ''
+          THEN 1 ELSE 0 END), 0) AS missing_conversation_key_rows,
+      COALESCE(SUM(CASE
+           WHEN entries.conversation_key IS NOT NULL
+           AND entries.conversation_key != ''
+           AND threads.conversation_key IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM codex_session_files AS files
+             JOIN codex_conversation_threads AS inherited
+               ON inherited.source_root_key = entries.source_root_key
+              AND inherited.native_thread_id = files.last_native_thread_id
+            WHERE files.path = entries.source_path
+              AND files.source_root_key = entries.source_root_key
+           )
+          THEN 1 ELSE 0 END), 0) AS missing_thread_join_rows
+      FROM codex_session_entries AS entries
+      LEFT JOIN codex_conversation_threads AS threads
+        ON threads.conversation_key = entries.conversation_key
+       AND threads.source_root_key = entries.source_root_key
+     WHERE (? IS NULL OR entries.timestamp_utc >= ?)
+       AND (? IS NULL OR entries.timestamp_utc < ?)
+"""
+
+
+_CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL = """
+    SELECT
+      COUNT(*) AS total_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NULL OR entries.conversation_key = ''
+          THEN 1 ELSE 0 END), 0) AS missing_conversation_key_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NOT NULL
+           AND entries.conversation_key != ''
+           AND threads.conversation_key IS NULL
+          THEN 1 ELSE 0 END), 0) AS missing_thread_join_rows
+      FROM codex_session_entries AS entries
+      LEFT JOIN codex_conversation_threads AS threads
+        ON threads.conversation_key = entries.conversation_key
+       AND threads.source_root_key = entries.source_root_key
+     WHERE (? IS NULL OR entries.timestamp_utc >= ?)
+       AND (? IS NULL OR entries.timestamp_utc < ?)
+"""
+
+
+def _supports_native_file_aliases(cache_conn: sqlite3.Connection) -> bool:
+    """Return whether this cache generation can link child files to a root task."""
+    try:
+        columns = cache_conn.execute("PRAGMA table_info(codex_session_files)").fetchall()
+    except sqlite3.Error:
+        return False
+    return any(len(row) > 1 and row[1] == "last_native_thread_id" for row in columns)
 
 
 def _cctally():
@@ -98,6 +212,160 @@ def _parse_timestamp(value: object) -> dt.datetime:
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable")
     return timestamp.astimezone(UTC)
+
+
+def _metadata_health_bound(value: dt.datetime | None, *, name: str) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    # Retain the canonical ``+00:00`` representation written by Codex ingest
+    # and consumed by the accounting readers: SQLite TEXT bounds must sort in
+    # the same encoding for the [start, end) window to remain exact.
+    return value.astimezone(UTC).isoformat()
+
+
+def load_codex_project_metadata_health(
+    *,
+    cache_conn: sqlite3.Connection,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> CodexProjectMetadataHealth:
+    """Classify retained Codex accounting in one root-qualified SQL read.
+
+    Bounds are both timezone-aware or both omitted; the omitted form serves the
+    all-history doctor check.  The output is an exhaustive, mutually-exclusive
+    count partition and contains no source or identity data.
+    """
+    if (start is None) != (end is None):
+        raise ValueError("start and end must be supplied together or both omitted")
+    bound_start = _metadata_health_bound(start, name="start")
+    bound_end = _metadata_health_bound(end, name="end")
+    if start is not None and end is not None and start > end:
+        raise ValueError("start must not be after end")
+
+    row = cache_conn.execute(
+        (_CODEX_PROJECT_METADATA_HEALTH_SQL if _supports_native_file_aliases(cache_conn)
+         else _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL),
+        (bound_start, bound_start, bound_end, bound_end),
+    ).fetchone()
+    if row is None or len(row) != 3:
+        raise RuntimeError("Codex project metadata health query returned no partition")
+    try:
+        total_rows, missing_key_rows, missing_join_rows = (int(value) for value in row)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Codex project metadata health query returned invalid counts") from exc
+    qualified_rows = total_rows - missing_key_rows - missing_join_rows
+    values = (total_rows, qualified_rows, missing_key_rows, missing_join_rows)
+    if any(value < 0 for value in values) or total_rows != sum(values[1:]):
+        raise RuntimeError("Codex project metadata health partition is invalid")
+    return CodexProjectMetadataHealth(
+        total_rows=total_rows,
+        qualified_rows=qualified_rows,
+        missing_conversation_key_rows=missing_key_rows,
+        missing_thread_join_rows=missing_join_rows,
+    )
+
+
+def load_cached_rooted_codex_accounting_entries(
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    speed: str,
+    cache_conn: sqlite3.Connection,
+    source_root_keys: Iterable[str] | None = None,
+) -> tuple[RootedCodexAccountingEntry, ...]:
+    """Read bounded accounting from one caller-owned cache snapshot only.
+
+    This reader intentionally never syncs, opens or closes a database, reads
+    rollouts, resolves projects, or discovers configured Codex roots.  The
+    cached root key plus source path are the dashboard's file identity.  A
+    caller can additionally constrain the read to roots that established one
+    native cycle; root identities remain internal to this adapter.
+    """
+    if start.tzinfo is None or start.utcoffset() is None:
+        raise ValueError("start must be timezone-aware")
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("end must be timezone-aware")
+    if end <= start:
+        raise ValueError("end must be after start")
+    root_keys = (
+        tuple(sorted({key for key in source_root_keys if isinstance(key, str) and key}))
+        if source_root_keys is not None else ()
+    )
+    if source_root_keys is not None and not root_keys:
+        return ()
+    root_predicate = (
+        "AND source_root_key IN (" + ", ".join("?" for _ in root_keys) + ")"
+        if source_root_keys is not None else ""
+    )
+    try:
+        rows = tuple(cache_conn.execute(
+            _ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL.format(root_predicate=root_predicate),
+            (
+                start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(), *root_keys,
+            ),
+        ))
+    except sqlite3.Error as exc:
+        raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable") from exc
+
+    result: list[RootedCodexAccountingEntry] = []
+    for row in rows:
+        try:
+            (
+                timestamp_raw, session_id_raw, source_path_raw, source_root_key_raw,
+                model_raw, input_raw, cached_input_raw, output_raw, reasoning_raw,
+                total_raw,
+            ) = row
+            source_path = source_path_raw if isinstance(source_path_raw, str) else ""
+            source_root_key = source_root_key_raw if isinstance(source_root_key_raw, str) else ""
+            if not source_path or not source_root_key:
+                raise ValueError("rooted accounting identity is absent")
+            model = str(model_raw)
+            input_tokens = int(input_raw)
+            cached_input_tokens = int(cached_input_raw)
+            output_tokens = int(output_raw)
+            reasoning_output_tokens = int(reasoning_raw)
+            total_tokens = int(total_raw)
+            cost_usd = _calculate_codex_entry_cost(
+                model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                speed=speed,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable") from exc
+        result.append(RootedCodexAccountingEntry(
+            timestamp=_parse_timestamp(timestamp_raw),
+            session_id=str(session_id_raw or ""),
+            source_path=source_path,
+            source_root_key=source_root_key,
+            model=model,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            reasoning_output_tokens=reasoning_output_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+        ))
+    return tuple(result)
+
+
+def has_cached_codex_accounting_entries(*, cache_conn: sqlite3.Connection) -> bool:
+    """Return whether any retained Codex accounting exists without range filtering.
+
+    This intentionally tiny caller-owned cache read lets a missing native cycle
+    fail closed even when the dashboard's visible or budget range is empty.
+    It neither resolves roots nor reads rollout files.
+    """
+    try:
+        return cache_conn.execute(
+            "SELECT 1 FROM codex_session_entries LIMIT 1"
+        ).fetchone() is not None
+    except sqlite3.Error as exc:
+        raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable") from exc
 
 
 def _project_label(value: object) -> str:
@@ -191,6 +459,12 @@ def load_qualified_codex_entries(
             _QUALIFIED_CODEX_ENTRIES_SQL,
             (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
         ))
+        inherited_metadata: dict[tuple[str, str], sqlite3.Row] = {}
+        if _supports_native_file_aliases(conn):
+            for inherited in conn.execute(_INHERITED_CODEX_PROJECT_METADATA_SQL):
+                identity = (str(inherited["source_root_key"] or ""), str(inherited["path"] or ""))
+                if all(identity):
+                    inherited_metadata.setdefault(identity, inherited)
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
     finally:
@@ -204,8 +478,19 @@ def load_qualified_codex_entries(
     resolved_by_git_json: dict[str, str | None] = {}
     result: list[QualifiedCodexEntry] = []
     for row in rows:
-        root_key, conversation_key = _require_joined_metadata(row)
-        cwd = row["cwd"]
+        root_key = row["source_root_key"]
+        conversation_key = row["conversation_key"]
+        inherited = inherited_metadata.get((str(root_key or ""), str(row["source_path"] or "")))
+        try:
+            root_key, conversation_key = _require_joined_metadata(row)
+        except QualifiedMetadataUnavailable:
+            if (
+                inherited is None
+                or not isinstance(root_key, str) or not root_key
+                or not isinstance(conversation_key, str) or not conversation_key
+            ):
+                raise
+        cwd = row["cwd"] or (inherited["cwd"] if inherited is not None else None)
         if isinstance(cwd, str) and cwd:
             project = resolved_by_cwd.get(cwd)
             if project is None:
@@ -218,7 +503,7 @@ def load_qualified_codex_entries(
                 else _project_label(project.display_key)
             )
         else:
-            git_json = row["git_json"]
+            git_json = row["git_json"] or (inherited["git_json"] if inherited is not None else None)
             if isinstance(git_json, str) and git_json not in resolved_by_git_json:
                 resolved_by_git_json[git_json] = _git_resolved_key(git_json)
             git_key = resolved_by_git_json.get(git_json) if isinstance(git_json, str) else None

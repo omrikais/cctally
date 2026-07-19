@@ -10,9 +10,9 @@
 // null `attributed_pct` renders as em-dash (— ) — the week's total cost
 // is zero so attribution is undefined; mirrors the kernel's null
 // emission.
-import type { CSSProperties, MouseEvent } from 'react';
+import { useSyncExternalStore, type CSSProperties, type MouseEvent } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
@@ -20,7 +20,8 @@ import { ExpandButton } from '../components/ExpandButton';
 import { openShareModal } from '../store/shareSlice';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
-import { SourcePanelShell, CodexProjectsTable } from './sourcePanel';
+import { presentationProjects, presentationProviders } from '../lib/dashboardPresentation';
+import { DegradedChip } from './sourcePanel';
 
 const TOP_N = 5;
 
@@ -28,26 +29,18 @@ const TOP_N = 5;
 // Codex = native qualified-attribution table; All = provider sections
 // (identical labels across providers stay distinct rows — different keys).
 export function ProjectsPanel() {
-  return (
-    <SourcePanelShell
-      panel="projects"
-      panelKind="projects"
-      claude={<ClaudeProjectsPanel />}
-      codex={(d) => <CodexProjectsTable data={d} />}
-      emptyLabel="No Codex projects yet."
-    />
-  );
-}
-
-function ClaudeProjectsPanel() {
   const env = useSnapshot();
-  const cw = env?.projects?.current_week;
-  const rows = cw?.rows ?? [];
-  const isUnavailable = env?.projects == null;
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const projectedRows = presentationProjects(env, activeSource);
+  const rows = projectedRows ?? [];
+  const isUnavailable = projectedRows == null;
   // #278 §1.4: during the cheap first-paint seed the projects envelope is
   // still null / empty; show a loading skeleton instead of the "restart the
   // dashboard" / "no activity" copy, which would wrongly imply a broken instance.
-  const hydrating = !!env?.hydrating;
+  const hydrating = presentationProviders(env, activeSource).hydrating;
+  const projectWarning = presentationProviders(env, activeSource).warnings.find(
+    (warning) => warning.domain == null || warning.domain === 'projects',
+  ) ?? null;
   // #278 Theme A (ui-qa P3): mirror CacheReportPanel's header — while hydrating
   // with no data yet, the sub-label reads "(loading)" instead of the misleading
   // final-state "(unavailable)" (which re-implies a broken instance) or
@@ -75,6 +68,7 @@ function ClaudeProjectsPanel() {
                 : `(${rows.length} this week)`}
           </span>
         </h2>
+        {projectWarning && <DegradedChip gate={{ mode: 'degraded', warning: projectWarning, noSuccessYet: false }} />}
       </div>
       <div className="panel-header-actions">
         <ShareIcon
@@ -119,21 +113,29 @@ function ClaudeProjectsPanel() {
 
   const top = rows.slice(0, TOP_N);
   const tail = rows.slice(TOP_N);
-  const tailCost = tail.reduce((s, r) => s + r.cost_usd, 0);
+  const tailCost = tail.reduce((s, r) => s + r.cost, 0);
   // tailPctRaw treats null attributed_pct as 0 — fine for "+N more"
   // rollup semantics where the sum represents the visible share of
   // attributed_pct (null rows by definition contribute no attribution).
-  const tailPctRaw = tail.reduce<number>((s, r) => s + (r.attributed_pct ?? 0), 0);
+  const tailPctRaw = tail.reduce<number>((s, r) => s + (r.pct ?? 0), 0);
   // div-by-zero guard: when the top row's cost is 0 the bar widths
   // collapse to 0% (visually empty); never divide by 0 directly.
-  const leaderCost = top[0]?.cost_usd || 1;
+  const leaderCost = top[0]?.cost || 1;
 
-  const onPanelClick = () =>
+  const onPanelClick = () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+  };
 
-  const onRowClick = (key: string) => (e: MouseEvent) => {
+  const openRow = (source: 'claude' | 'codex', key: string) => {
+    if (source === 'claude' && activeSource === 'claude') {
+      dispatch({ type: 'OPEN_MODAL', kind: 'projects', projectKey: key });
+    } else {
+      dispatch({ type: 'OPEN_SOURCE_DETAIL', source, resource: 'project', key });
+    }
+  };
+  const onRowClick = (source: 'claude' | 'codex', key: string) => (e: MouseEvent) => {
     e.stopPropagation();
-    dispatch({ type: 'OPEN_MODAL', kind: 'projects', projectKey: key });
+    openRow(source, key);
   };
 
   return (
@@ -141,6 +143,7 @@ function ClaudeProjectsPanel() {
       className="panel accent-magenta"
       id="panel-projects"
       data-panel-kind="projects"
+      data-source={activeSource}
       role="region"
       aria-label="Projects panel"
       onClick={cardRegionClick(onPanelClick)}
@@ -158,7 +161,7 @@ function ClaudeProjectsPanel() {
         ) : (
           <>
             {top.map((r) => {
-              const widthPct = (r.cost_usd / leaderCost) * 100;
+              const widthPct = (r.cost / leaderCost) * 100;
               const barStyle = { '--w': `${widthPct}%` } as CSSProperties;
               return (
                 <div
@@ -167,7 +170,7 @@ function ClaudeProjectsPanel() {
                   role="button"
                   tabIndex={0}
                   aria-label={`Open Projects modal for ${r.key}`}
-                  onClick={onRowClick(r.key)}
+                  onClick={onRowClick(r.source, r.key)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -175,25 +178,21 @@ function ClaudeProjectsPanel() {
                       // plan is unnecessary now that we accept React's
                       // KeyboardEvent here.
                       e.stopPropagation();
-                      dispatch({
-                        type: 'OPEN_MODAL',
-                        kind: 'projects',
-                        projectKey: r.key,
-                      });
+                      openRow(r.source, r.key);
                     }
                   }}
-                  title={r.key}
+                  title={r.label}
                 >
-                  <span className="name">{r.key}</span>
+                  <span className="name">{activeSource === 'all' ? `${r.source === 'claude' ? 'Claude' : 'Codex'} · ${r.label}` : r.label}</span>
                   {/* A5 — decorative cost-relative bar. The enclosing
                       role="button" row already names the project, cost,
                       and %, so the bar conveys nothing new (and its width
                       is cost-vs-leader, NOT the project's usage %, so a
                       progressbar valuenow would mislead). */}
                   <div className="lb-bar" style={barStyle} aria-hidden="true" />
-                  <span className="cost">{fmt.usd2(r.cost_usd)}</span>
+                  <span className="cost">{fmt.usd2(r.cost)}</span>
                   <span className="pct">
-                    {r.attributed_pct == null ? '—' : fmt.pct0(r.attributed_pct)}
+                    {r.pct == null ? '—' : fmt.pct0(r.pct)}
                   </span>
                 </div>
               );

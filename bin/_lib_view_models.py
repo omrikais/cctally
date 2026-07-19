@@ -1884,20 +1884,8 @@ def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
     )
 
 
-def build_codex_session_view(entries, *, now_utc, tz_name=None, speed="standard"):
-    """Build a ``CodexSessionView`` from a list of ``CodexEntry`` (issue #58).
-
-    ``rows`` order mirrors the aggregator: descending by
-    ``last_activity`` (upstream parity).
-    ``cmd_codex_session`` reverses to ASC when ``--order asc``.
-
-    ``period_start`` is set to ``min(s.last_activity)`` across emitted
-    sessions when any exist — best-available approximation since
-    ``CodexSessionUsage`` doesn't carry a ``first_activity`` field (the
-    aggregator only tracks ``last`` per session). ``None`` on empty.
-    """
-    _agg = _load_lib("_lib_aggregators")
-    sessions = _agg._aggregate_codex_sessions(entries, speed=speed)
+def _build_codex_session_view_from_rows(sessions, *, now_utc, tz_name):
+    """Wrap already-aggregated Codex sessions in the public view contract."""
     total_cost = 0.0
     total_tok = 0
     earliest = None
@@ -1914,4 +1902,52 @@ def build_codex_session_view(entries, *, now_utc, tz_name=None, speed="standard"
         period_start=earliest,
         period_end=now_utc,
         display_tz_label=_codex_tz_label(tz_name),
+    )
+
+
+def build_codex_session_view(entries, *, now_utc, tz_name=None, speed="standard"):
+    """Build a ``CodexSessionView`` from CLI ``CodexEntry`` rows (issue #58)."""
+    _agg = _load_lib("_lib_aggregators")
+    return _build_codex_session_view_from_rows(
+        _agg._aggregate_codex_sessions(entries, speed=speed),
+        now_utc=now_utc,
+        tz_name=tz_name,
+    )
+
+
+def build_rooted_codex_session_view(entries, *, now_utc, tz_name=None, speed="standard"):
+    """Build dashboard sessions from cache-rooted accounting without I/O.
+
+    The file identity is lexical: ``(source_root_key, source_path)``.  It
+    deliberately does not inspect configured roots or touch the filesystem,
+    and a native session id remains payload rather than a grouping key.
+    """
+    _agg = _load_lib("_lib_aggregators")
+    keyed = []
+    for entry in entries:
+        source_path = str(getattr(entry, "source_path"))
+        source_root_key = str(getattr(entry, "source_root_key"))
+        path = pathlib.PurePosixPath(source_path)
+        codex_entry = _agg.CodexEntry(
+            timestamp=getattr(entry, "timestamp"),
+            session_id=str(getattr(entry, "session_id") or ""),
+            model=str(getattr(entry, "model")),
+            input_tokens=int(getattr(entry, "input_tokens")),
+            cached_input_tokens=int(getattr(entry, "cached_input_tokens")),
+            output_tokens=int(getattr(entry, "output_tokens")),
+            reasoning_output_tokens=int(getattr(entry, "reasoning_output_tokens")),
+            total_tokens=int(getattr(entry, "total_tokens")),
+            source_path=source_path,
+        )
+        keyed.append((codex_entry, _agg.CodexSessionIdentity(
+            group_key=(source_root_key, source_path),
+            session_id_path=source_path,
+            session_file=path.stem,
+            directory=str(path.parent),
+            codex_root=source_root_key,
+        )))
+    return _build_codex_session_view_from_rows(
+        _agg._aggregate_codex_sessions_keyed(keyed, speed=speed),
+        now_utc=now_utc,
+        tz_name=tz_name,
     )

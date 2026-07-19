@@ -89,6 +89,33 @@ describe('<ShareModalRoot>', () => {
     ).toBeInTheDocument();
   });
 
+  it('moves focus into the topmost share dialog and traps Tab there', async () => {
+    const trigger = document.createElement('button');
+    trigger.id = 'source-detail-share';
+    trigger.textContent = 'Share';
+    document.body.appendChild(trigger);
+    trigger.focus();
+    try {
+      render(<ShareModalRoot />);
+      await act(async () => {
+        dispatch(openShareModal('weekly', 'source-detail-share'));
+      });
+
+      const dialog = screen.getByRole('dialog');
+      const heading = screen.getByRole('heading', { name: /share weekly report/i });
+      await waitFor(() => expect(document.activeElement).toBe(heading));
+      expect(dialog).toContainElement(document.activeElement as HTMLElement);
+
+      const close = screen.getByRole('button', { name: /close share modal/i });
+      close.focus();
+      fireEvent.keyDown(document, { key: 'Tab' });
+      expect(dialog).toContainElement(document.activeElement as HTMLElement);
+      expect(document.activeElement).not.toBe(trigger);
+    } finally {
+      trigger.remove();
+    }
+  });
+
   it('restores focus to the trigger element by id on close', async () => {
     // Stage a stand-in for the ShareIcon button — the share modal's
     // triggerId convention is "the element id of the ShareIcon that

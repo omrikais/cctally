@@ -218,6 +218,12 @@ class DoctorState:
     # arbitration pipeline.  None means the gather could not inspect it;
     # absent transport/tombstones are normal when Claude is closed.
     statusline_pipeline: Optional[dict] = None
+    # #312: all-history, root-qualified Codex accounting metadata partition.
+    # The I/O layer reports an explicit error instead of silently converting a
+    # failed health query into zero rows, so doctor can distinguish an empty
+    # retained corpus from unreadable metadata.
+    codex_project_metadata_health: Optional[dict] = None
+    codex_project_metadata_error: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -873,6 +879,43 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
                 else f"{count:,} entries",
         remediation=None,
         details={"entries": count, "codex_last_entry_age_s": age_s},
+    )
+
+
+def _check_data_codex_project_metadata(s: DoctorState) -> CheckResult:
+    """Report the identity-safe all-history Codex metadata partition."""
+    if s.codex_project_metadata_error is not None:
+        return CheckResult(
+            id="data.codex_project_metadata", title="Codex project metadata",
+            severity="fail", summary="metadata health could not be read",
+            remediation="Run `cctally doctor --verbose` after checking cache.db.",
+            details={"error": s.codex_project_metadata_error},
+        )
+
+    health = s.codex_project_metadata_health or {}
+    total_rows = int(health.get("total_rows", 0))
+    qualified_rows = int(health.get("qualified_rows", 0))
+    missing_key_rows = int(health.get("missing_conversation_key_rows", 0))
+    missing_join_rows = int(health.get("missing_thread_join_rows", 0))
+    incomplete_rows = missing_key_rows + missing_join_rows
+    details = {
+        "total_rows": total_rows,
+        "qualified_rows": qualified_rows,
+        "missing_conversation_key_rows": missing_key_rows,
+        "missing_thread_join_rows": missing_join_rows,
+        "incomplete_rows": incomplete_rows,
+    }
+    if incomplete_rows:
+        return CheckResult(
+            id="data.codex_project_metadata", title="Codex project metadata",
+            severity="warn",
+            summary=f"{incomplete_rows} accounting row(s) need metadata repair",
+            remediation="Run `cctally cache-sync --source codex --rebuild`.",
+            details=details,
+        )
+    return CheckResult(
+        id="data.codex_project_metadata", title="Codex project metadata",
+        severity="ok", summary="qualified", remediation=None, details=details,
     )
 
 
@@ -1722,6 +1765,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.statusline_pipeline", "_check_statusline_pipeline"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
+        ("data.codex_project_metadata", "_check_data_codex_project_metadata"),
         ("data.codex_quota", "_check_data_codex_quota"),
         ("data.parse_health", "_check_data_parse_health"),
         ("data.forked_buckets", "_check_data_forked_buckets"),

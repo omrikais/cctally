@@ -16,21 +16,18 @@ export type SharePanelId =
   | 'monthly' | 'blocks' | 'forecast' | 'sessions'
   | 'projects';
 
-// #294 S5 §7 — the per-source share panel matrix. Claude offers its full
-// nine-panel set (including forecast/trend); Codex offers seven (no
-// forecast/trend — those live in the Codex quota panel's native forecasts);
-// All offers the Claude/Codex INTERSECTION (the same seven), because the server
-// unconditionally builds both provider snapshots for source=all. This gates the
-// share picker AND the keyboard `S` binding.
+// The per-source share matrix mirrors the canonical board. All three modes use
+// the same nine share-capable panels; cache-report remains the one canonical
+// card without a share kernel. This gates the picker and keyboard `S` binding.
 export const SHARE_PANEL_MATRIX: Record<DashboardSelection, ReadonlySet<SharePanelId>> = {
   claude: new Set<SharePanelId>([
     'current-week', 'trend', 'weekly', 'daily', 'monthly', 'blocks', 'forecast', 'sessions', 'projects',
   ]),
   codex: new Set<SharePanelId>([
-    'current-week', 'daily', 'monthly', 'weekly', 'blocks', 'sessions', 'projects',
+    'current-week', 'trend', 'weekly', 'daily', 'monthly', 'blocks', 'forecast', 'sessions', 'projects',
   ]),
   all: new Set<SharePanelId>([
-    'current-week', 'daily', 'monthly', 'weekly', 'blocks', 'sessions', 'projects',
+    'current-week', 'trend', 'weekly', 'daily', 'monthly', 'blocks', 'forecast', 'sessions', 'projects',
   ]),
 };
 

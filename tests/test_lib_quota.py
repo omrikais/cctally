@@ -286,9 +286,9 @@ def test_freshness_uses_latest_physical_capture_and_native_duration_with_future_
 @pytest.mark.parametrize(
     ("captures", "expected_confidence", "expected_samples", "expected_span", "expected_projected"),
     (
-        (((0, 10), (450, 20), (900, 30), (1350, 40), (1800, 50)), "high", 4, 1800, 100),
-        (((0, 10), (480, 20), (900, 30)), "medium", 2, 900, 100),
-        (((0, 10), (1800, 20)), "low", 1, 1800, 40),
+        (((0, 10), (450, 20), (900, 30), (1350, 40), (1800, 50)), "high", 4, 3600, 100),
+        (((0, 10), (480, 20), (900, 30)), "medium", 2, 3600, 60),
+        (((0, 10), (1800, 20)), "low", 1, 3600, 40),
     ),
 )
 def test_forecast_confidence_boundaries_and_exact_rate_vectors(
@@ -309,14 +309,40 @@ def test_forecast_confidence_boundaries_and_exact_rate_vectors(
 
     assert result.status == "ok"
     assert result.current_percent == captures[-1][1]
-    assert result.rate_percent_per_hour == pytest.approx((captures[-1][1] - captures[0][1]) / (expected_span / 3600))
+    assert result.rate_percent_per_hour == pytest.approx(captures[-1][1] / (expected_span / 3600))
     assert result.projected_percent == expected_projected
     assert result.sample_count == expected_samples
     assert result.sample_span_seconds == expected_span
     assert result.confidence == expected_confidence
 
 
-def test_forecast_ignores_decreases_and_requires_a_usable_positive_interval():
+def test_forecast_uses_native_cycle_elapsed_time_instead_of_activity_burst_time():
+    identity = _identity(window_minutes=10_080)
+    cycle_start = AS_OF - dt.timedelta(hours=28)
+    reset = cycle_start + dt.timedelta(minutes=identity.window_minutes)
+    observations = tuple(
+        _observation(
+            identity=identity,
+            captured_at=AS_OF - dt.timedelta(minutes=8) + dt.timedelta(minutes=index),
+            used_percent=percent,
+            resets_at=reset,
+            line_offset=index,
+        )
+        for index, percent in enumerate((0, 0, 4, 4, 8, 8, 12, 12, 16))
+    )
+
+    result = quota.forecast_quota(observations, AS_OF)
+
+    assert result.status == "ok"
+    assert result.current_percent == 16
+    assert result.rate_percent_per_hour == pytest.approx(16 / 28)
+    assert result.projected_percent == pytest.approx(96)
+    assert result.sample_count == 4
+    assert result.sample_span_seconds == 28 * 60 * 60
+    assert result.confidence == "medium"
+
+
+def test_forecast_uses_current_cycle_pace_and_requires_a_usable_positive_interval():
     reset = AS_OF + dt.timedelta(hours=1)
     insufficient = (_observation(captured_at=AS_OF - dt.timedelta(minutes=5), used_percent=40, resets_at=reset),)
     decrease_then_recovery = (
@@ -332,8 +358,9 @@ def test_forecast_ignores_decreases_and_requires_a_usable_positive_interval():
     )
     result = quota.forecast_quota(decrease_then_recovery, AS_OF)
     assert result.sample_count == 1
-    assert result.sample_span_seconds == 600
-    assert result.rate_percent_per_hour == pytest.approx(30.0)
+    assert result.sample_span_seconds == 3600
+    assert result.rate_percent_per_hour == pytest.approx(45.0)
+    assert result.projected_percent == pytest.approx(90.0)
     assert result.confidence == "low"
 
 
@@ -358,8 +385,8 @@ def test_non_adjacent_recovery_value_remains_history_and_a_forecast_interval():
     assert block.current_percent == 45
     assert forecast.current_percent == 45
     assert forecast.sample_count == 1
-    assert forecast.sample_span_seconds == 600
-    assert forecast.rate_percent_per_hour == pytest.approx(60.0)
+    assert forecast.sample_span_seconds == 3600
+    assert forecast.rate_percent_per_hour == pytest.approx(45.0)
 
 
 def test_repeated_value_at_end_remains_the_current_observation_after_a_decrease():
@@ -385,8 +412,8 @@ def test_repeated_value_at_end_remains_the_current_observation_after_a_decrease(
     ]
     assert forecast.current_percent == 25
     assert forecast.sample_count == 2
-    assert forecast.sample_span_seconds == 1200
-    assert forecast.rate_percent_per_hour == pytest.approx(24.0)
+    assert forecast.sample_span_seconds == 3600
+    assert forecast.rate_percent_per_hour == pytest.approx(25.0)
 
 
 def test_forecast_future_and_stale_precedence_preserve_only_eligible_baselines():

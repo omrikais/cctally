@@ -506,7 +506,7 @@ def test_source_identity_round_trips_presets_history_and_legacy_records_without_
         thread.join(timeout=2)
 
 
-def test_source_compose_expands_all_and_rejects_a_unsupported_native_panel(monkeypatch, tmp_path):
+def test_source_compose_expands_all_and_supports_native_forecast(monkeypatch, tmp_path):
     ns = load_script()
     server, thread = _boot(ns, tmp_path, monkeypatch)
     try:
@@ -522,28 +522,13 @@ def test_source_compose_expands_all_and_rejects_a_unsupported_native_panel(monke
         assert composed["body"].count('<section class="share-section"') == 3
         assert "Claude" in composed["body"] and "Codex" in composed["body"]
 
-        port = server.server_address[1]
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        try:
-            conn.request(
-                "POST", "/api/share/render", body=json.dumps({
-                    "panel": "forecast", "template_id": "forecast-recap",
-                    "source": "codex", "options": {"format": "md"},
-                }),
-                headers={
-                    "Host": f"127.0.0.1:{port}",
-                    "Origin": f"http://127.0.0.1:{port}",
-                    "Content-Type": "application/json",
-                },
-            )
-            response = conn.getresponse()
-            assert response.status == 400
-            assert json.loads(response.read()) == {
-                "code": "source_capability_unavailable",
-                "error": "source capability unavailable",
-            }
-        finally:
-            conn.close()
+        status, forecast = _request(server, "POST", "/api/share/render", {
+            "panel": "forecast", "template_id": "forecast-recap",
+            "source": "codex", "options": {"format": "md"},
+        })
+        assert status == 200
+        assert forecast["snapshot"]["source"] == "codex"
+        assert "Forecast" in forecast["body"]
     finally:
         server.shutdown()
         server.server_close()

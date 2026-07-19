@@ -25,7 +25,9 @@ Three **independently-degrading** legs:
 1. **Coverage (offline, all-history)** — models in your cached session data
    (`cache.db`) that cctally cannot price exactly: Claude models priced at
    `$0` (`unpriced`) or Codex models approximated via the `gpt-5` fallback
-   (`fallback`). No network; a read-only scan over the cache.
+   (`fallback`). The Codex ingest sentinel `unknown` is excluded: it means the
+   rollout did not retain a model identifier, so it is not a model that can be
+   added to the pricing table. No network; a read-only scan over the cache.
 2. **Drift (network, LiteLLM)** — embedded price *values* vs the
    [LiteLLM](https://github.com/BerriAI/litellm) pricing snapshot.
    Direction-aware (see below) and allowlist-suppressed.
@@ -189,7 +191,7 @@ be removed — stale ignores cannot accumulate.
 
 ```bash
 # Offline coverage only — fast, no network. Exit 0 if all observed models
-# are priced; exit 1 if any unpriced/fallback model appears in your cache.
+# are priced; exit 1 if any named unpriced/fallback model appears in your cache.
 cctally pricing-check --offline
 
 # Full check, machine-readable (what the weekly CI workflow runs):

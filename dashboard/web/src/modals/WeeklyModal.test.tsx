@@ -97,10 +97,9 @@ describe('<WeeklyModal /> (#264 S2)', () => {
     expect(getState().shareModal?.panel).toBe('weekly');
   });
 
-  // #293 S3 — the panel slices to CAP=3 in stack mode, but the MODAL must always
-  // render EVERY envelope row (row count === envelope). Locks a slice from ever
-  // leaking into the full-table modal path.
-  it('renders ALL envelope rows (never the S3 slice) — row count === envelope', () => {
+  // #293 S3 — the panel slices to CAP=3 in stack mode, but the modal retains
+  // every row inside the shared 12-week detail window.
+  it('renders every envelope row inside the canonical 12-week window', () => {
     const WEEKLY4: PeriodRow[] = [
       periodRow({ label: '2026-W27', week_start_at: '2026-06-29T00:00:00Z', is_current: true }),
       periodRow({ label: '2026-W26', week_start_at: '2026-06-22T00:00:00Z' }),

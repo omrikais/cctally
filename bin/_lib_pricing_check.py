@@ -34,11 +34,17 @@ class DriftResult:
     ahead_of_litellm: list[str]   # informational; never actionable
 
 
+_CODEX_UNATTRIBUTED_MODEL = "unknown"
+
+
 def classify_coverage(observed, resolve_claude, is_codex_fallback) -> list[CoverageGap]:
     """observed: iterable of (provider, model, entry_count, token_total).
 
     Claude model with resolve_claude(model) is None -> kind="unpriced".
     Codex model with is_codex_fallback(model) True  -> kind="fallback".
+    The ingest-only Codex ``unknown`` sentinel is skipped because it records
+    missing model metadata, not a model identifier that can be added to the
+    embedded pricing table.
     Priced models produce no gap. Order preserved.
     """
     gaps: list[CoverageGap] = []
@@ -46,7 +52,7 @@ def classify_coverage(observed, resolve_claude, is_codex_fallback) -> list[Cover
         if provider == "claude":
             if resolve_claude(model) is None:
                 gaps.append(CoverageGap("claude", model, "unpriced", entry_count, token_total))
-        elif provider == "codex":
+        elif provider == "codex" and model != _CODEX_UNATTRIBUTED_MODEL:
             if is_codex_fallback(model):
                 gaps.append(CoverageGap("codex", model, "fallback", entry_count, token_total))
     return gaps

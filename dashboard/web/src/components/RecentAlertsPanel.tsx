@@ -57,10 +57,24 @@ export function RecentAlertsPanel(): JSX.Element {
   // (header) + the configured weekly fire thresholds (default [90, 95]) and
   // renders the shared <AlertsEmptyGauge> (compact) so the panel + modal empty
   // states can't drift; never hardcode 90/95. The gauge routes per active source.
-  const usedPct = env?.header?.used_pct ?? null;
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
-  const gaugeThresholds =
-    alertsConfig.weekly_thresholds?.length ? alertsConfig.weekly_thresholds : [90, 95];
+  const codexBudget = env?.sources?.codex?.data?.budget.status;
+  const claudeThresholds = alertsConfig.weekly_thresholds?.length
+    ? alertsConfig.weekly_thresholds
+    : [90, 95];
+  const codexThresholds = codexBudget?.alert_thresholds?.length
+    ? codexBudget.alert_thresholds
+    : [90, 100];
+  const usedPct = activeSource === 'claude'
+    ? env?.header?.used_pct ?? null
+    : activeSource === 'codex'
+      ? codexBudget?.consumption_pct ?? null
+      : null;
+  const gaugeThresholds = activeSource === 'claude'
+    ? claudeThresholds
+    : activeSource === 'codex'
+      ? codexThresholds
+      : [...new Set([...claudeThresholds, ...codexThresholds])].sort((a, b) => a - b);
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Slice newest-first to last 10 for the panel; the modal renders the

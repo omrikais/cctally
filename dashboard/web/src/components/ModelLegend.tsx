@@ -1,4 +1,5 @@
 import { modelLegend, type LegendInput } from '../lib/modelLegend';
+import { modelChipStyle } from '../lib/model';
 
 // C6 (#249): a compact legend rendered BENEATH each panel's existing
 // model-split bar (the bars are untouched — Blocks is a cost-scaled gauge,
@@ -12,7 +13,7 @@ export function ModelLegend({ models }: { models: LegendInput[] }) {
     <div className="model-legend" role="presentation">
       {items.map((it) => (
         <span className="ms-leg" key={it.model}>
-          <span className={`ms-dot ${it.chip}`} aria-hidden="true" />
+          <span className={`ms-dot ${it.chip}`} style={modelChipStyle(it.model)} aria-hidden="true" />
           {it.display} {Math.round(it.pct)}%
         </span>
       ))}

@@ -8,7 +8,6 @@
 // order, preserving hidden panels' relative positions.
 
 import type { GridPanelId } from './panelIds';
-import { isPanelVisible } from './sourceGating';
 import type { SourceView } from '../store/sourceView';
 
 // Filter the persisted full order down to the panels visible for the active
@@ -17,7 +16,11 @@ export function deriveVisiblePanelOrder(
   order: GridPanelId[],
   view: SourceView,
 ): GridPanelId[] {
-  return order.filter((panel) => isPanelVisible(view, panel));
+  // Visual parity contract: every source selection owns the same canonical
+  // ten-card board. Capability differences render inside the card as honest
+  // empty/unavailable states; they never remove a shell and reflow the bento.
+  void view;
+  return [...order];
 }
 
 // Map a reorder performed on the FILTERED (visible) list back into the full

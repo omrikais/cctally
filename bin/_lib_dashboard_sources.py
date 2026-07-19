@@ -272,8 +272,9 @@ def unavailable_source_state(
 
 def _coherent_provider(state: SourceDashboardState) -> bool:
     return (
-        state.availability in ("ok", "empty")
+        state.availability in ("ok", "empty", "partial")
         and state.freshness == "fresh"
+        and bool(state.data_version)
         and state.data is not None
     )
 
@@ -302,6 +303,10 @@ def _combined_metrics(
 ) -> Mapping[str, object] | None:
     if not (_coherent_provider(claude) and _coherent_provider(codex)):
         return None
+    for state in (claude, codex):
+        hero_capability = state.capabilities.get("hero")
+        if hero_capability is None or hero_capability.status not in {"supported", "derived"}:
+            return None
     try:
         claude_hero = claude.data["hero"]
         codex_hero = codex.data["hero"]
@@ -360,19 +365,27 @@ def compose_all_state(
     if claude.source != "claude" or codex.source != "codex":
         raise ValueError("all composition requires Claude and Codex provider states")
     combined = _combined_metrics(claude, codex)
-    coherent = combined is not None
-    if coherent:
+    providers_coherent = _coherent_provider(claude) and _coherent_provider(codex)
+    if providers_coherent:
         availability: Availability = (
-            "empty"
-            if claude.availability == "empty" and codex.availability == "empty"
-            else "ok"
+            "partial"
+            if combined is None or "partial" in (claude.availability, codex.availability)
+            else (
+                "empty"
+                if claude.availability == "empty" and codex.availability == "empty"
+                else "ok"
+            )
         )
         freshness: Freshness = "fresh"
     else:
         availability = "partial"
         freshness = "stale"
     version_material = json.dumps(
-        [claude.data_version, codex.data_version, coherent],
+        [
+            claude.data_version, claude.availability, claude.freshness,
+            codex.data_version, codex.availability, codex.freshness,
+            combined is not None,
+        ],
         separators=(",", ":"),
     ).encode("utf-8")
     data_version = "all:" + hashlib.sha256(version_material).hexdigest()[:24]

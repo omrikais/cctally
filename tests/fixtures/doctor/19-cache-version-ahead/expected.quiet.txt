@@ -8,9 +8,9 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Version ahead            cache.db ahead (v99 > known v25) — auto-heals
+  ⚠ Version ahead            cache.db ahead (v99 > known v27) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
-  ⚠ Pending migrations       38 pending
+  ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing
@@ -19,4 +19,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 31 OK · 5 WARN · 0 FAIL
+Summary: 32 OK · 5 WARN · 0 FAIL

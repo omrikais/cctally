@@ -96,22 +96,22 @@ describe('<ShareIcon> source-matrix gating (§7)', () => {
     _resetForTests();
   });
 
-  it('renders NO affordance for forecast under `all` (forecast is not in the All matrix)', () => {
+  it('renders forecast for `all`', () => {
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
     render(<ShareIcon panel="forecast" panelLabel="Forecast" onClick={() => {}} />);
-    expect(screen.queryByRole('button', { name: /share forecast report/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /share forecast report/i })).toBeInTheDocument();
   });
 
-  it('renders NO affordance for trend under `all` (trend is not in the All matrix)', () => {
+  it('renders trend for `all`', () => {
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
     render(<ShareIcon panel="trend" panelLabel="Trend" onClick={() => {}} />);
-    expect(screen.queryByRole('button', { name: /share trend report/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /share trend report/i })).toBeInTheDocument();
   });
 
-  it('renders NO affordance for forecast under `codex` (codex hides forecast/trend)', () => {
+  it('renders forecast for `codex`', () => {
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     render(<ShareIcon panel="forecast" panelLabel="Forecast" onClick={() => {}} />);
-    expect(screen.queryByRole('button', { name: /share forecast report/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /share forecast report/i })).toBeInTheDocument();
   });
 
   it('KEEPS the forecast/trend affordance under `claude` (full 9-panel set)', () => {

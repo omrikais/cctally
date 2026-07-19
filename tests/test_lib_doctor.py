@@ -33,6 +33,8 @@ def test_doctor_state_has_required_fields():
         "latest_snapshot_at",
         "cache_entries_count", "cache_last_entry_at", "claude_jsonl_present",
         "codex_entries_count", "codex_last_entry_at", "codex_jsonl_present",
+        # #312: safe all-history Codex project-metadata health evidence.
+        "codex_project_metadata_health", "codex_project_metadata_error",
         "dashboard_bind_stored", "runtime_bind",
         "config_json_error",
         "update_state", "update_state_error",

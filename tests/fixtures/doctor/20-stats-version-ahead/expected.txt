@@ -23,8 +23,8 @@ Database
   ✓ Integrity                quick_check ok
   ✗ Version ahead            stats.db ahead (v99 > known v13)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ✓ Migrations               0/38 applied
-  ⚠ Pending migrations       38 pending
+  ✓ Migrations               0/40 applied
+  ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -33,6 +33,7 @@ Data
   ✓ Statusline pipeline      no recent regular-pool timer observed
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Codex project metadata   qualified
   ✓ Codex quota              not applicable
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
@@ -50,4 +51,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 30 OK · 5 WARN · 1 FAIL
+Summary: 31 OK · 5 WARN · 1 FAIL

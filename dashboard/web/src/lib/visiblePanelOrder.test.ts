@@ -20,28 +20,20 @@ function viewFor(selection: DashboardSelection): SourceView {
 
 const FULL: GridPanelId[] = [...DEFAULT_PANEL_ORDER];
 
-describe('deriveVisiblePanelOrder — hidden panels excluded', () => {
+describe('deriveVisiblePanelOrder — canonical board parity', () => {
   it('Claude shows every grid panel (cache_report present)', () => {
     expect(deriveVisiblePanelOrder(FULL, viewFor('claude'))).toEqual(FULL);
   });
 
-  it('Codex excludes trend / cache-report / forecast', () => {
-    expect(deriveVisiblePanelOrder(FULL, viewFor('codex'))).toEqual([
-      'sessions',
-      'projects',
-      'daily',
-      'weekly',
-      'monthly',
-      'blocks',
-      'alerts',
-    ]);
+  it('Codex preserves all ten canonical cards', () => {
+    expect(deriveVisiblePanelOrder(FULL, viewFor('codex'))).toEqual(FULL);
   });
 
   it('All shows every grid panel (Claude-only forecast/trend still render as sections)', () => {
     expect(deriveVisiblePanelOrder(FULL, viewFor('all'))).toEqual(FULL);
   });
 
-  it('Codex wholly-unavailable STILL excludes trend / cache-report / forecast (digit renumbering)', () => {
+  it('Codex wholly-unavailable still preserves card shells and digit positions', () => {
     // The QA P0 environment: Codex availability 'unavailable', caps {}, data null.
     // Absent-path panels must hide regardless of availability; the rest degrade
     // (visible), so the visible order matches the healthy-Codex order.
@@ -57,15 +49,7 @@ describe('deriveVisiblePanelOrder — hidden panels excluded', () => {
       ...makeSourceEnvelope({ sources: { claude, codex, all: makeAllSourceEntry(claude, codex) } }),
       cache_report: { is_empty: false },
     } as unknown as Envelope;
-    expect(deriveVisiblePanelOrder(FULL, resolveSourceView(env, 'codex'))).toEqual([
-      'sessions',
-      'projects',
-      'daily',
-      'weekly',
-      'monthly',
-      'blocks',
-      'alerts',
-    ]);
+    expect(deriveVisiblePanelOrder(FULL, resolveSourceView(env, 'codex'))).toEqual(FULL);
   });
 
   it('never mutates the persisted full order (a switch returns a new array)', () => {
@@ -77,31 +61,25 @@ describe('deriveVisiblePanelOrder — hidden panels excluded', () => {
 });
 
 describe('deriveVisiblePanelOrder — digit-position semantics', () => {
-  it('digit N addresses the Nth VISIBLE panel', () => {
+  it('digit N addresses the same canonical position for every source', () => {
     const visible = deriveVisiblePanelOrder(FULL, viewFor('codex'));
-    // Codex: `2` opens the 2nd visible panel = projects (trend is hidden).
-    expect(visible[1]).toBe('projects');
-    // `5` opens the 5th visible = monthly.
-    expect(visible[4]).toBe('monthly');
+    expect(visible[1]).toBe('trend');
+    expect(visible[4]).toBe('cache-report');
   });
 });
 
-describe('mapVisibleReorderToFull — round-trips a reorder, holds hidden panels', () => {
+describe('mapVisibleReorderToFull — round-trips a canonical-board reorder', () => {
   const codexVisible = deriveVisiblePanelOrder(FULL, viewFor('codex'));
 
   it('an identity reorder is the identity on the full order', () => {
     expect(mapVisibleReorderToFull(FULL, codexVisible, codexVisible)).toEqual(FULL);
   });
 
-  it('moves visible panels among their slots while hidden panels keep their indices', () => {
+  it('moves all canonical panels without losing members', () => {
     // Move 'alerts' (last visible) to the front of the visible list.
     const after: GridPanelId[] = ['alerts', ...codexVisible.filter((p) => p !== 'alerts')];
     const full2 = mapVisibleReorderToFull(FULL, codexVisible, after);
-    // Hidden panels stay at their exact original indices.
-    expect(full2[FULL.indexOf('trend')]).toBe('trend');
-    expect(full2[FULL.indexOf('cache-report')]).toBe('cache-report');
-    expect(full2[FULL.indexOf('forecast')]).toBe('forecast');
-    // The visible subsequence of the new full order equals the reordered list.
+    expect(full2[0]).toBe('alerts');
     expect(deriveVisiblePanelOrder(full2, viewFor('codex'))).toEqual(after);
     // Same length, same members — nothing lost.
     expect([...full2].sort()).toEqual([...FULL].sort());

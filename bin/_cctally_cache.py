@@ -813,8 +813,30 @@ def _delete_codex_file_derived_rows(
     )
 
 
-def _clear_codex_derived_rows(conn: sqlite3.Connection) -> None:
-    """Clear every re-derivable Codex row family in child-before-root order."""
+def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
+    """Clear every re-derivable Codex row family and report whether state changed.
+
+    The FTS5 ``delete-all`` command can increment SQLite's cumulative change
+    counter even when the semantic Codex surface was already empty.  Callers
+    use this return value, rather than ``Connection.total_changes``, when
+    deciding whether to advance the physical-mutation sequence.
+    """
+    state_changed = any(
+        conn.execute(query).fetchone() is not None
+        for query in (
+            "SELECT 1 FROM codex_session_entries LIMIT 1",
+            "SELECT 1 FROM quota_window_snapshots WHERE source = 'codex' LIMIT 1",
+            "SELECT 1 FROM codex_conversation_threads LIMIT 1",
+            "SELECT 1 FROM codex_conversation_events LIMIT 1",
+            "SELECT 1 FROM codex_session_files LIMIT 1",
+            "SELECT 1 FROM codex_source_roots LIMIT 1",
+            "SELECT 1 FROM codex_conversation_messages LIMIT 1",
+            "SELECT 1 FROM codex_conversation_file_touches LIMIT 1",
+            "SELECT 1 FROM codex_conversation_rollups LIMIT 1",
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='codex_quota_projection_certificate' LIMIT 1",
+        )
+    )
     conn.execute("DELETE FROM codex_session_entries")
     conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
     conn.execute("DELETE FROM codex_conversation_threads")
@@ -832,6 +854,7 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> None:
     conn.execute(
         "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
     )
+    return state_changed
 
 
 def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
@@ -3903,9 +3926,7 @@ def sync_codex_cache(
             # Clear INSIDE the lock — see sync_cache() for the full
             # rationale. Done before the existing SELECT so delta
             # detection sees an empty baseline.
-            before_clear = conn.total_changes
-            _clear_codex_derived_rows(conn)
-            if conn.total_changes != before_clear:
+            if _clear_codex_derived_rows(conn):
                 _bump_codex_physical_mutation_seq(conn)
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")

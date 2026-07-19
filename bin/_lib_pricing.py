@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-07-10"
+PRICING_SNAPSHOT_DATE = "2026-07-19"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -99,7 +99,7 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-07-01 (see PRICING_SNAPSHOT_DATE)
+# - Captured: 2026-07-19 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 #   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
@@ -321,8 +321,8 @@ _unknown_model_warnings: set[str] = set()
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-05-30 (see PRICING_SNAPSHOT_DATE)
-# - As of the 2026-05-30 sync (issue #123) this carries every openai-provider
+# - Captured: 2026-07-19 (see PRICING_SNAPSHOT_DATE)
+# - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
 #   pricing with isFallback=true (matches upstream's LEGACY_FALLBACK_MODEL
@@ -332,6 +332,9 @@ _unknown_model_warnings: set[str] = set()
 #   `pricing-check` as missing_from_us (gpt-5.6-sol had real usage falling back
 #   to gpt-5). Exact model_prices_and_context_window.json values, each with the
 #   above-272k tier (max_input_tokens 1050000).
+#   2026-07-19: verified all tracked values and the complete openai-provider
+#   gpt-5* model set against the live LiteLLM snapshot; no named table entries
+#   were missing. Official OpenAI model pages were used as the vendor cross-check.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches

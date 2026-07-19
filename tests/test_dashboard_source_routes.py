@@ -92,7 +92,7 @@ def _boot_snapshot(ns, snap):
     return server, thread
 
 
-def _boot_real_codex(ns, tmp_path, monkeypatch):
+def _boot_real_codex(ns, tmp_path, monkeypatch, *, incomplete_metadata=False):
     """Publish a real two-root Codex state with colliding relative paths."""
     redirect_paths(ns, monkeypatch, tmp_path / "data")
     roots = (tmp_path / "root-a", tmp_path / "root-b")
@@ -107,6 +107,46 @@ def _boot_real_codex(ns, tmp_path, monkeypatch):
     now = dt.datetime(2026, 7, 16, 18, tzinfo=UTC)
     try:
         ns["sync_codex_cache"](cache)
+        if incomplete_metadata:
+            cache.execute(
+                "UPDATE codex_session_entries SET conversation_key=NULL "
+                "WHERE id=(SELECT id FROM codex_session_entries ORDER BY id LIMIT 1)"
+            )
+            cache.commit()
+        # The collision fixtures intentionally carry odd 330/10020-minute
+        # limits. Add coherent native 300/10080 evidence so this route suite
+        # exercises a real current-cycle activity block rather than treating a
+        # weekly quota summary as one.
+        rooted_paths = tuple(cache.execute(
+            "SELECT source_root_key, canonical_root_path FROM codex_source_roots "
+            "ORDER BY source_root_key"
+        ))
+        for index, (root_key, root_path) in enumerate(rooted_paths):
+            cache.executemany(
+                "INSERT INTO quota_window_snapshots "
+                "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+                "observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
+                "used_percent, resets_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        "codex", root_key, f"{root_path}/fixture-5h.jsonl", 300 + index,
+                        "2026-07-14T16:04:00+00:00", "fixture-5h",
+                        "fixture-5h", "fixture-5h", "Fixture 5-hour limit", 300,
+                        25.0, "2026-07-14T17:00:00+00:00",
+                    ),
+                    (
+                        "codex", root_key, f"{root_path}/fixture-weekly.jsonl", 10_080 + index,
+                        (now - dt.timedelta(minutes=1)).isoformat(), "fixture-weekly",
+                        "fixture-weekly", "fixture-weekly", "Fixture weekly limit", 10_080,
+                        25.0, (now + dt.timedelta(days=1)).isoformat(),
+                    ),
+                ),
+            )
+        ns["_cctally_cache"]._bump_codex_physical_mutation_seq(cache)
+        cache.commit()
+        ns["reconcile_codex_quota_projection"](
+            source_root_keys=tuple(str(row[0]) for row in rooted_paths), now=now,
+        )
         source_module = __import__("sys").modules["_cctally_dashboard_sources"]
         semantics = source_module.resolve_dashboard_source_semantics(
             {}, display_tz_name="UTC",
@@ -223,7 +263,7 @@ def _seed_retained_route_history(ns, *, now, block_key):
                     old_accounting_path, old_quota_path,
                     "/private/retained/active-window.jsonl",
                     "native-retained-session", thread[0], thread[1], thread[2], thread[3],
-                    raw_block[0], raw_block[1], raw_block[4],
+                    raw_block[0],
                     "retained-limit-4999", "retained-limit-id-4999",
                 ) if value
             },
@@ -403,6 +443,8 @@ def test_codex_source_routes_build_real_relational_native_details_with_collision
         assert project["total_tokens"] > 0
 
         block_row = codex.data["quota"]["blocks"][0]
+        assert block_row["window_minutes"] == 300
+        assert block_row["model_breakdowns"]
         status, payload = _get(
             server, f"/api/source/codex/block/{block_row['key']}",
         )
@@ -419,6 +461,40 @@ def test_codex_source_routes_build_real_relational_native_details_with_collision
             assert str(root) not in public
         assert "11111111-1111-4111-8111-111111111111" not in public
         assert "root-thread-a" not in public
+    finally:
+        _close(server, thread)
+
+
+def test_codex_source_routes_round_trip_published_rows_with_incomplete_project_metadata(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    server, thread, codex, roots = _boot_real_codex(
+        ns, tmp_path, monkeypatch, incomplete_metadata=True,
+    )
+    try:
+        assert codex.availability == "partial"
+        assert codex.data["sessions"]["rows"]
+        assert codex.data["projects"]["rows"]
+        details = []
+
+        for resource in ("session", "project"):
+            for row in codex.data[f"{resource}s"]["rows"]:
+                status, payload = _get(
+                    server, f"/api/source/codex/{resource}/{row['key']}",
+                )
+                assert status == 200
+                detail = payload["data"]
+                assert detail["key"] == row["key"]
+                assert detail["detail_kind"] == f"codex_{resource}"
+                assert detail["metadata_availability"] == "partial"
+                assert detail["total_tokens"] == row["total_tokens"]
+                assert detail["cost_usd"] == pytest.approx(row["cost_usd"])
+                details.append(detail)
+
+        public = json.dumps(details)
+        for root in roots:
+            assert str(root) not in public
     finally:
         _close(server, thread)
 
@@ -518,7 +594,7 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
         block = payload["data"]
         assert block["detail_kind"] == "codex_block"
         assert 0 < len(block["observations"]) <= 250
-        assert seeded["active_old_capture"] in {
+        assert "2026-07-14T16:04:00+00:00" in {
             item["captured_at"] for item in block["observations"]
         }
 

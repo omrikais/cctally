@@ -10,10 +10,10 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
-import { buildTrendSparkData, type TrendChartDatum } from '../store/selectors';
+import type { TrendChartDatum } from '../store/selectors';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { SourcePanelShell } from './sourcePanel';
+import { presentationProviders, presentationTrend } from '../lib/dashboardPresentation';
 
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
@@ -56,32 +56,30 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
 // section (no Codex trend section). Wrapping stops the legacy top-level
 // `env.trend` from leaking Claude $/1% data under a Codex label.
 export function TrendPanel() {
-  return (
-    <SourcePanelShell
-      panel="trend"
-      panelKind="trend"
-      claude={<ClaudeTrendPanel />}
-      codex={() => null}
-      emptyLabel="No Codex trend."
-    />
-  );
-}
-
-function ClaudeTrendPanel() {
   const env = useSnapshot();
-  const data = buildTrendSparkData(env);
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const presentation = presentationTrend(env, activeSource);
+  const data: TrendChartDatum[] = presentation.rows.map((row) => ({
+    ...row,
+    spark_height: row.dollar_per_pct ?? 0,
+  }));
   // #278 Theme A (ui-qa P3): header sub-label predicate — while hydrating with
   // no rows yet the sub-label reads "(loading)" instead of the misleading
   // "(0 weeks)" final-state copy (mirrors CacheReportPanel's header). Same
   // hydrating+empty condition the body's skeleton branch uses below.
-  const hydratingEmpty = !!env?.hydrating && data.length === 0;
+  const hydratingEmpty = presentationProviders(env, activeSource).hydrating && data.length === 0;
   const trendOverride = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.trendSortOverride,
   );
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));
+  const columns = activeSource === 'claude'
+    ? PANEL_TREND_COLUMNS
+    : PANEL_TREND_COLUMNS
+        .filter((column) => column.id !== 'used_pct')
+        .map((column) => column.id === 'dollar_per_pct' ? { ...column, label: 'Cost' } : column);
   const tableData = trendOverride
-    ? applyTableSort(decorated, PANEL_TREND_COLUMNS, trendOverride)
+    ? applyTableSort(decorated, columns, trendOverride)
     : decorated;
   // A5 — text summary for the sparkline (a multi-point series, so role="img"
   // on the grid wrapper, not progressbar). Covers the weeks span + the
@@ -94,6 +92,7 @@ function ClaudeTrendPanel() {
       role="region"
       aria-label="$/1% Trend panel"
       data-panel-kind="trend"
+      data-source={activeSource}
       onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' }))}
     >
       <div className="panel-header">
@@ -101,7 +100,7 @@ function ClaudeTrendPanel() {
           <use href="/static/icons.svg#bar-chart" />
         </svg>
         <h2>
-          $/1% Trend <span className="sub">{hydratingEmpty ? '(loading)' : `(${data.length} week${data.length === 1 ? '' : 's'})`}</span>
+          {presentation.title} <span className="sub">{hydratingEmpty ? '(loading)' : `(${data.length} week${data.length === 1 ? '' : 's'})`}</span>
         </h2>
         <div className="panel-header-actions">
           <ShareIcon
@@ -128,7 +127,7 @@ function ClaudeTrendPanel() {
             it (`.trend-table-wrap`), so a thin history no longer pushes the
             sparkline + legend below the S4 in-card fold. */}
         <div className="trend-chart">
-          <div className="trend-spark-title">$/1% trend:</div>
+            <div className="trend-spark-title">{presentation.chartLabel}</div>
           <div
             className="trend-spark"
             id="trend-spark"
@@ -147,7 +146,7 @@ function ClaudeTrendPanel() {
         <div className="trend-table-wrap">
           <table className="trend-table">
             <SortableHeader
-              columns={PANEL_TREND_COLUMNS}
+              columns={columns}
               override={trendOverride}
               onChange={(next) =>
                 dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: next })
@@ -158,7 +157,7 @@ function ClaudeTrendPanel() {
               {tableData.map((w) => (
                 <tr key={w.label} className={w.is_current ? 'current' : undefined}>
                   <td>{w.label}</td>
-                  <td className="num">{fmt.pct0(w.used_pct)}</td>
+                  {activeSource === 'claude' && <td className="num">{fmt.pct0(w.used_pct)}</td>}
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
                     {fmt.usd2(w.dollar_per_pct)}
                   </td>

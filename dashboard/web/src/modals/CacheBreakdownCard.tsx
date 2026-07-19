@@ -23,6 +23,7 @@ import { fmt } from '../lib/fmt';
 export interface CacheBreakdownCardProps {
   kind: 'projects' | 'models';
   rows: CacheReportBreakdownRow[];
+  unavailableReason?: string;
 }
 
 // Basename of a filesystem path — the last non-empty segment. CR-4:
@@ -35,7 +36,7 @@ function basename(path: string): string {
   return parts.length ? parts[parts.length - 1] : path;
 }
 
-export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
+export function CacheBreakdownCard({ kind, rows, unavailableReason }: CacheBreakdownCardProps) {
   const cls = kind === 'projects' ? 'bd-projects' : 'bd-models';
   const label = kind === 'projects' ? 'By project' : 'By model';
   const emptyText =
@@ -47,7 +48,9 @@ export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
   return (
     <div className={`crm-bd-card ${cls}`} data-bd-kind={kind}>
       <div className="crm-bd-head">{label}</div>
-      {rows.length === 0 ? (
+      {unavailableReason ? (
+        <div className="empty m-unavailable">{unavailableReason}</div>
+      ) : rows.length === 0 ? (
         <div className="empty">{emptyText}</div>
       ) : (
         <table>

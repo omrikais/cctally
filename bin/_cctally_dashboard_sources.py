@@ -4,10 +4,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import pathlib
 import sqlite3
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -18,11 +19,19 @@ from _cctally_quota import (
     load_codex_quota_observations,
     load_codex_quota_projection_certificate,
 )
-from _cctally_source_analytics import load_qualified_codex_entries
+from _cctally_source_analytics import (
+    QualifiedMetadataUnavailable,
+    has_cached_codex_accounting_entries,
+    load_cached_rooted_codex_accounting_entries,
+    load_codex_project_metadata_health,
+    load_qualified_codex_entries,
+)
+import _lib_log
 from _lib_dashboard_sources import (
     CapabilityRecord,
     ProjectionCoherence,
     SourceDashboardState,
+    SourceDashboardWarning,
     assess_codex_projection_coherence,
     dashboard_resource_key,
 )
@@ -35,12 +44,16 @@ from _lib_quota import (
     select_baseline,
 )
 from _lib_jsonl import CodexEntry
+from _lib_fmt import stable_sum
+from _lib_aggregators import _aggregate_codex_buckets
+from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
 from _lib_source_analytics import build_codex_project_result
 from _lib_view_models import (
+    CodexWeeklyView,
     build_codex_daily_view,
     build_codex_monthly_view,
+    build_rooted_codex_session_view,
     build_codex_session_view,
-    build_codex_weekly_view,
 )
 
 
@@ -50,12 +63,12 @@ DASHBOARD_QUOTA_OBSERVATION_LIMIT = 1000
 DASHBOARD_QUOTA_RECENT_DAYS = 35
 
 
-class CodexProjectionIncoherent(RuntimeError):
-    """Physical cache and S2 interpreted quota state cannot be mixed."""
+class CodexCycleUnavailable(RuntimeError):
+    """No single active native seven-day boundary can bound hero accounting."""
 
-    def __init__(self, reason: str | None) -> None:
+    def __init__(self, reason: str) -> None:
         self.reason = reason
-        super().__init__("Codex quota projection is incoherent")
+        super().__init__(reason)
 
 
 class SourceCapabilityUnavailable(ValueError):
@@ -64,6 +77,157 @@ class SourceCapabilityUnavailable(ValueError):
 
 class SourceResourceNotFound(LookupError):
     """A valid opaque resource key has no row in its provider state."""
+
+
+@dataclass(frozen=True)
+class CodexCycleBoundary:
+    """The one active native subscription cycle usable for hero accounting."""
+
+    window_minutes: int
+    start_at: dt.datetime
+    resets_at: dt.datetime
+    # Root provenance is server-only accounting input, never public wire data.
+    source_root_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexWeeklyPeriod:
+    """One non-overlapping observed native seven-day quota cycle segment."""
+
+    start_at: dt.datetime
+    end_at: dt.datetime
+    source_root_keys: tuple[str, ...]
+
+
+def _resolve_codex_weekly_cycle(
+    observations: Iterable[object],
+    now_utc: dt.datetime,
+) -> CodexCycleBoundary:
+    """Select exactly one active account-level 10,080-minute native cycle."""
+    boundaries: dict[tuple[int, dt.datetime], set[str]] = {}
+    stale_weekly_evidence = False
+    for history in build_history(tuple(observations)):
+        if history.identity.window_minutes != 10_080:
+            continue
+        baseline = select_baseline(history.observations, now_utc)
+        if baseline is None or baseline.resets_at <= now_utc:
+            continue
+        if quota_freshness(history.physical_observations, now_utc).state != "fresh":
+            stale_weekly_evidence = True
+            continue
+        boundary = (history.identity.window_minutes, baseline.resets_at)
+        boundaries.setdefault(boundary, set()).add(history.identity.source_root_key)
+    if len(boundaries) != 1:
+        if not boundaries:
+            raise CodexCycleUnavailable("stale" if stale_weekly_evidence else "missing")
+        raise CodexCycleUnavailable("conflicting")
+    (window_minutes, resets_at), root_keys = next(iter(boundaries.items()))
+    return CodexCycleBoundary(
+        window_minutes=window_minutes,
+        start_at=resets_at - dt.timedelta(minutes=window_minutes),
+        resets_at=resets_at,
+        source_root_keys=tuple(sorted(root_keys)),
+    )
+
+
+def _codex_weekly_periods(
+    stats_conn: sqlite3.Connection,
+    *,
+    source_root_keys: Iterable[str],
+    active_cycle: CodexCycleBoundary | None,
+) -> tuple[CodexWeeklyPeriod, ...]:
+    """Read durable 10,080-minute boundaries and clip early re-anchors.
+
+    A provider-granted reset changes the native window's nominal start before
+    the prior seven-day deadline.  Sorting those nominal starts and ending the
+    prior segment at the next start preserves the actual quota-cycle boundary
+    without double-counting the overlapping nominal windows.
+    """
+    roots = tuple(sorted({
+        root for root in source_root_keys if isinstance(root, str) and root
+    }))
+    if not roots:
+        return ()
+    placeholders = ",".join("?" for _ in roots)
+    try:
+        rows = stats_conn.execute(
+            "SELECT source_root_key, resets_at_utc, nominal_start_at_utc "
+            "FROM quota_window_blocks "
+            "WHERE source='codex' AND window_minutes=10080 "
+            f"AND source_root_key IN ({placeholders}) AND orphaned_at IS NULL "
+            "ORDER BY nominal_start_at_utc DESC, resets_at_utc DESC, source_root_key "
+            "LIMIT ?",
+            (*roots, SOURCE_HISTORY_LIMIT),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = ()
+
+    raw_boundaries: list[tuple[dt.datetime, dt.datetime, set[str]]] = []
+
+    for root_key, resets_at_raw, start_at_raw in rows:
+        try:
+            start_at = dt.datetime.fromisoformat(str(start_at_raw).replace("Z", "+00:00"))
+            resets_at = dt.datetime.fromisoformat(str(resets_at_raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if start_at.tzinfo is None or resets_at.tzinfo is None:
+            continue
+        start_at = start_at.astimezone(UTC)
+        resets_at = resets_at.astimezone(UTC)
+        if resets_at <= start_at:
+            continue
+        raw_boundaries.append((start_at, resets_at, {str(root_key)}))
+
+    if active_cycle is not None:
+        raw_boundaries.append((
+            active_cycle.start_at.astimezone(UTC),
+            active_cycle.resets_at.astimezone(UTC),
+            set(active_cycle.source_root_keys),
+        ))
+
+    ordered: list[tuple[dt.datetime, dt.datetime, set[str]]] = []
+    for start_at, resets_at, period_roots in sorted(
+        raw_boundaries, key=lambda item: (item[0], item[1]),
+    ):
+        if (
+            ordered
+            and (start_at - ordered[-1][0]).total_seconds()
+            < _FIVE_HOUR_JITTER_FLOOR_SECONDS
+        ):
+            first_start, latest_reset, existing_roots = ordered[-1]
+            existing_roots.update(period_roots)
+            ordered[-1] = (first_start, max(latest_reset, resets_at), existing_roots)
+        else:
+            ordered.append((start_at, resets_at, set(period_roots)))
+    periods: list[CodexWeeklyPeriod] = []
+    for index, (start_at, resets_at, period_roots) in enumerate(ordered):
+        next_start = ordered[index + 1][0] if index + 1 < len(ordered) else None
+        end_at = min(resets_at, next_start) if next_start is not None else resets_at
+        if end_at <= start_at:
+            continue
+        periods.append(CodexWeeklyPeriod(
+            start_at=start_at,
+            end_at=end_at,
+            source_root_keys=tuple(sorted(period_roots)),
+        ))
+    return tuple(periods)
+
+
+def _native_limit_label(limit_name: object, window_minutes: object) -> str:
+    """Prefer provider label text, deriving duration copy only when absent."""
+    if isinstance(limit_name, str) and limit_name.strip():
+        return limit_name.strip()
+    if window_minutes == 300:
+        return "5-hour limit"
+    if window_minutes == 10_080:
+        return "7-day limit"
+    if not isinstance(window_minutes, int) or isinstance(window_minutes, bool) or window_minutes <= 0:
+        return "Codex quota"
+    if window_minutes % 1_440 == 0:
+        return f"{window_minutes // 1_440}-day limit"
+    if window_minutes % 60 == 0:
+        return f"{window_minutes // 60}-hour limit"
+    return f"{window_minutes}-minute limit"
 
 
 @dataclass(frozen=True)
@@ -298,6 +462,7 @@ def _bucket_wire(bucket: Any) -> dict[str, object]:
         "reasoning_output_tokens": bucket.reasoning_output_tokens,
         "total_tokens": bucket.total_tokens,
         "models": tuple(bucket.models),
+        "model_breakdowns": tuple(dict(row) for row in bucket.model_breakdowns),
     }
 
 
@@ -310,20 +475,179 @@ def _period_wire(view: Any) -> dict[str, object]:
     }
 
 
-def _session_wire(view: Any) -> dict[str, object]:
+def _codex_conversation_metadata(
+    cache_conn: sqlite3.Connection,
+) -> dict[tuple[str, str], dict[str, object]]:
+    """Read task short names and cached project metadata by rooted rollout.
+
+    ``state_5.sqlite.threads.title`` is Codex's persisted user-facing task name.
+    Conversation rollup titles are derived from prompt text and therefore must
+    never be substituted for that name on the dashboard. Accounting remains
+    authoritative for totals; conversation rollups only decorate projects.
+    """
+    metadata: dict[tuple[str, str], dict[str, object]] = {}
+    try:
+        rows = tuple(cache_conn.execute(
+            "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
+            "(SELECT e.session_id FROM codex_session_entries AS e "
+            " WHERE e.source_root_key=t.source_root_key AND e.source_path=t.source_path "
+            " ORDER BY e.id LIMIT 1) AS accounting_session_id, "
+            "r.project_key, r.project_label, r.started_utc "
+            "FROM codex_conversation_threads AS t "
+            "LEFT JOIN codex_conversation_rollups AS r "
+            "ON r.conversation_key=t.conversation_key "
+            "ORDER BY r.last_activity_utc DESC, t.conversation_key DESC"
+        ))
+        file_aliases = tuple(cache_conn.execute(
+            "SELECT source_root_key, path, last_native_thread_id, last_session_id "
+            "FROM codex_session_files "
+            "WHERE last_native_thread_id IS NOT NULL AND last_native_thread_id != '' "
+            "ORDER BY last_ingested_at DESC, path DESC"
+        ))
+        native_ids = tuple(sorted({
+            str(native_thread_id) for _, _, native_thread_id, *_ in rows
+            if isinstance(native_thread_id, str) and native_thread_id
+        } | {
+            str(native_thread_id) for _, _, native_thread_id, _ in file_aliases
+            if isinstance(native_thread_id, str) and native_thread_id
+        }))
+        provider_roots = {
+            str(root_key): pathlib.Path(root_path)
+            for root_key, root_path in cache_conn.execute(
+                "SELECT source_root_key, canonical_root_path FROM codex_source_roots "
+                "ORDER BY source_root_key"
+            )
+            if isinstance(root_key, str) and root_key
+            and isinstance(root_path, str) and root_path
+        }
+        short_names: dict[str, str] = {}
+        for provider_root in provider_roots.values():
+            state_path = provider_root / "state_5.sqlite"
+            if not state_path.is_file():
+                continue
+            state_conn: sqlite3.Connection | None = None
+            try:
+                state_conn = sqlite3.connect(
+                    f"{state_path.resolve().as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=0.05,
+                )
+                for offset in range(0, len(native_ids), 500):
+                    batch = native_ids[offset:offset + 500]
+                    if not batch:
+                        continue
+                    placeholders = ",".join("?" for _ in batch)
+                    for thread_id, title in state_conn.execute(
+                        f"SELECT id, title FROM threads WHERE id IN ({placeholders})",
+                        batch,
+                    ):
+                        clean_title = " ".join(str(title or "").split())
+                        if clean_title:
+                            short_names[str(thread_id)] = clean_title
+            except (OSError, sqlite3.Error):
+                continue
+            finally:
+                if state_conn is not None:
+                    state_conn.close()
+
+        metadata_by_native: dict[tuple[str, str], dict[str, object]] = {}
+        for (
+            root_key, source_path, native_thread_id, accounting_session_id,
+            project_key, project_label, started_at,
+        ) in rows:
+            identity = (str(root_key or ""), str(source_path or ""))
+            if not all(identity) or identity in metadata:
+                continue
+            item = {
+                "title": short_names.get(str(native_thread_id or "")),
+                "native_thread_id": native_thread_id,
+                "accounting_session_id": accounting_session_id,
+                "root_path": str(provider_roots.get(identity[0]) or ""),
+                "project_key": project_key,
+                "project_label": project_label,
+                "started_at": started_at,
+            }
+            metadata[identity] = item
+            native_identity = (identity[0], str(native_thread_id or ""))
+            existing = metadata_by_native.get(native_identity)
+            if existing is None or (not existing.get("project_key") and project_key):
+                metadata_by_native[native_identity] = item
+
+        # A child rollout can be accounting-complete while its own historical
+        # conversation-thread row is absent (for example, a file first cached
+        # before conversation normalization was introduced). The cursor still
+        # persists the rooted native thread id. Inherit only presentation
+        # metadata from that rooted task; the child's accounting path and
+        # session id remain its own identity and totals are never merged.
+        for root_key, source_path, native_thread_id, accounting_session_id in file_aliases:
+            identity = (str(root_key or ""), str(source_path or ""))
+            if not all(identity) or identity in metadata:
+                continue
+            native_identity = (identity[0], str(native_thread_id or ""))
+            inherited = metadata_by_native.get(native_identity)
+            metadata[identity] = {
+                "title": short_names.get(native_identity[1]) or (inherited or {}).get("title"),
+                "native_thread_id": native_thread_id,
+                "accounting_session_id": accounting_session_id,
+                "root_path": str(provider_roots.get(identity[0]) or ""),
+                "project_key": (inherited or {}).get("project_key"),
+                "project_label": (inherited or {}).get("project_label"),
+                "started_at": (inherited or {}).get("started_at"),
+            }
+    except sqlite3.Error:
+        return {}
+    return metadata
+
+
+def _session_wire(
+    view: Any,
+    *,
+    metadata: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
+) -> dict[str, object]:
     rows = []
-    for ordinal, row in enumerate(view.rows, start=1):
+    for row in view.rows:
         # The Codex session aggregator intentionally splits equal relative
         # session paths from distinct $CODEX_HOME roots.  The opaque detail
         # key must use that same grouping identity or two visible rows route
         # to one another's detail payload.
         root_identity = row.codex_root or "single-root"
+        row_metadata = (metadata or {}).get((str(row.codex_root or ""), str(row.session_id_path)))
+        if row_metadata is None and metadata is not None:
+            row_metadata = next((
+                value for (root_key, source_path), value in metadata.items()
+                if (
+                    str(value.get("native_thread_id") or "") == str(row.session_id or "")
+                    or str(value.get("accounting_session_id") or "") == str(row.session_id or "")
+                    or source_path == str(row.session_id_path)
+                )
+                and (
+                    not row.codex_root
+                    or str(row.codex_root) in (
+                        root_key,
+                        str(value.get("root_path") or ""),
+                    )
+                )
+            ), None)
+        title = str(row_metadata.get("title") or "").strip() if row_metadata else ""
+        project = str(row_metadata.get("project_label") or "").strip() if row_metadata else ""
+        started_at = row_metadata.get("started_at") if row_metadata else None
+        duration_min = None
+        if isinstance(started_at, str):
+            try:
+                started_dt = dt.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                duration_min = max(0, round((row.last_activity.astimezone(UTC) - started_dt.astimezone(UTC)).total_seconds() / 60))
+            except (TypeError, ValueError):
+                started_at = None
         rows.append({
             "key": dashboard_resource_key(
                 "session", "codex", root_identity, row.session_id_path,
             ),
             "source": "codex",
-            "label": f"Session {ordinal}",
+            "label": title or None,
+            "project": project or None,
+            "project_key": row_metadata.get("project_key") if row_metadata else None,
+            "started_at": started_at,
+            "duration_min": duration_min,
             "last_activity": row.last_activity.astimezone(UTC).isoformat(),
             "cost_usd": row.cost_usd,
             "input_tokens": row.input_tokens,
@@ -341,31 +665,111 @@ def _session_wire(view: Any) -> dict[str, object]:
     }
 
 
-def _quota_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
+def _quota_wire(
+    stats_conn: sqlite3.Connection,
+    *,
+    accounting_entries: Iterable[object] = (),
+    cycle: CodexCycleBoundary | None = None,
+    now_utc: dt.datetime | None = None,
+    display_tz_name: str | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Build current-cycle Codex 5-hour activity rows from durable windows.
+
+    The durable projection supplies the truthful native block boundaries. Cost,
+    tokens, and model splits come from root-qualified accounting inside each
+    half-open 300-minute interval. Weekly quota summaries are deliberately not
+    activity blocks and never enter this wire.
+    """
+    if cycle is None or now_utc is None:
+        return ()
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
-            "limit_name, resets_at_utc, current_percent, orphaned_at "
-            "FROM quota_window_blocks WHERE source='codex' "
+            "limit_name, resets_at_utc, nominal_start_at_utc, current_percent, orphaned_at "
+            "FROM quota_window_blocks WHERE source='codex' AND window_minutes=300 "
             "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot "
             "LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
         ).fetchall()
     except sqlite3.Error:
         return ()
-    return tuple({
-        "key": dashboard_resource_key(
-            "block", "codex", root_key, logical_limit_key, observed_slot, window_minutes, resets_at,
-        ),
-        "source": "codex",
-        "label": limit_name or "Codex quota",
-        "resets_at": resets_at,
-        "current_percent": current_percent,
-        "orphaned": orphaned_at is not None,
-    } for (
+    entries = tuple(accounting_entries)
+    display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+    c = sys.modules["cctally"]
+    wired: list[dict[str, object]] = []
+    seen_windows: set[tuple[str, dt.datetime, dt.datetime]] = set()
+    for (
         root_key, logical_limit_key, observed_slot, window_minutes,
-        limit_name, resets_at, current_percent, orphaned_at,
-    ) in rows)
+        _limit_name, resets_at_raw, nominal_start_raw, current_percent, orphaned_at,
+    ) in rows:
+        if orphaned_at is not None or str(root_key) not in cycle.source_root_keys:
+            continue
+        try:
+            start_at = dt.datetime.fromisoformat(str(nominal_start_raw).replace("Z", "+00:00"))
+            resets_at = dt.datetime.fromisoformat(str(resets_at_raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if start_at.tzinfo is None or resets_at.tzinfo is None:
+            continue
+        start_at = start_at.astimezone(UTC)
+        resets_at = resets_at.astimezone(UTC)
+        if resets_at <= cycle.start_at or start_at >= cycle.resets_at:
+            continue
+        physical_key = (str(root_key), start_at, resets_at)
+        if physical_key in seen_windows:
+            continue
+        seen_windows.add(physical_key)
+        block_entries = tuple(
+            entry for entry in entries
+            if str(getattr(entry, "source_root_key", "")) == str(root_key)
+            and start_at <= getattr(entry, "timestamp").astimezone(UTC) < resets_at
+        )
+        if not block_entries:
+            continue
+        by_model: dict[str, dict[str, object]] = {}
+        for entry in block_entries:
+            model = str(getattr(entry, "model", "") or "unknown")
+            aggregate = by_model.setdefault(model, {
+                "modelName": model,
+                "inputTokens": 0,
+                "cachedInputTokens": 0,
+                "outputTokens": 0,
+                "reasoningOutputTokens": 0,
+                "totalTokens": 0,
+                "costParts": [],
+            })
+            aggregate["inputTokens"] += int(getattr(entry, "input_tokens", 0))
+            aggregate["cachedInputTokens"] += int(getattr(entry, "cached_input_tokens", 0))
+            aggregate["outputTokens"] += int(getattr(entry, "output_tokens", 0))
+            aggregate["reasoningOutputTokens"] += int(getattr(entry, "reasoning_output_tokens", 0))
+            aggregate["totalTokens"] += int(getattr(entry, "total_tokens", 0))
+            aggregate["costParts"].append(float(getattr(entry, "cost_usd", 0.0)))
+        breakdowns: list[dict[str, object]] = []
+        for aggregate in by_model.values():
+            cost = stable_sum(aggregate.pop("costParts"))
+            breakdowns.append({**aggregate, "cost": cost})
+        breakdowns.sort(key=lambda row: (-float(row["cost"]), str(row["modelName"])))
+        cost_usd = stable_sum(float(row["cost"]) for row in breakdowns)
+        wired.append({
+            "key": dashboard_resource_key(
+                "block", "codex", root_key, logical_limit_key,
+                observed_slot, window_minutes, resets_at_raw,
+            ),
+            "source": "codex",
+            "label": c.format_display_dt(
+                start_at, display_tz, fmt="%H:%M %b %d", suffix=True,
+            ),
+            "window_minutes": window_minutes,
+            "start_at": start_at.isoformat(),
+            "end_at": resets_at.isoformat(),
+            "resets_at": resets_at_raw,
+            "current_percent": current_percent,
+            "orphaned": False,
+            "is_active": start_at <= now_utc < resets_at,
+            "cost_usd": cost_usd,
+            "model_breakdowns": tuple(breakdowns),
+        })
+    return tuple(wired)
 
 
 def _budget_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
@@ -511,7 +915,7 @@ def _quota_read_model(
         history_rows.append({
             "key": dashboard_resource_key("quota", "codex", *key_parts),
             "source": "codex",
-            "label": identity.limit_name or "Codex quota",
+            "label": _native_limit_label(identity.limit_name, identity.window_minutes),
             "observed_slot": identity.observed_slot,
             "window_minutes": identity.window_minutes,
             "current_percent": baseline.used_percent if baseline is not None else None,
@@ -607,6 +1011,41 @@ def _clock_freshness(
     return "stale" if age_seconds > stale_after else "fresh"
 
 
+def _clock_cycle_validity(
+    histories: Iterable[object],
+    now_utc: dt.datetime,
+) -> tuple[bool, str]:
+    """Re-evaluate frozen weekly evidence without touching cache or rollouts."""
+    boundaries: set[dt.datetime] = set()
+    stale_weekly_evidence = False
+    for raw_history in histories:
+        if not isinstance(raw_history, Mapping):
+            continue
+        if raw_history.get("window_minutes") != 10_080:
+            continue
+        current = raw_history.get("current_percent")
+        forecast = raw_history.get("forecast")
+        if current is None or not isinstance(forecast, Mapping):
+            continue
+        try:
+            resets_at = dt.datetime.fromisoformat(
+                str(forecast.get("resets_at")).replace("Z", "+00:00")
+            ).astimezone(UTC)
+        except (TypeError, ValueError):
+            continue
+        if resets_at <= now_utc:
+            continue
+        if raw_history.get("freshness") != "fresh":
+            stale_weekly_evidence = True
+            continue
+        boundaries.add(resets_at)
+    if len(boundaries) == 1:
+        return True, "ok"
+    if not boundaries and stale_weekly_evidence:
+        return False, "stale"
+    return False, "missing" if not boundaries else "conflicting"
+
+
 def _refresh_budget_status_clock(
     status: Mapping[str, object] | None,
     now_utc: dt.datetime,
@@ -676,6 +1115,11 @@ def refresh_codex_source_clock(
     data = dict(state.data)
     quota = data.get("quota")
     quota_changed = False
+    cycle_changed = False
+    capabilities = state.capabilities
+    warnings = state.warnings
+    availability = state.availability
+    freshness = state.freshness
     if isinstance(quota, Mapping):
         quota = dict(quota)
         refreshed_histories: list[dict[str, object]] = []
@@ -757,6 +1201,40 @@ def refresh_codex_source_clock(
         quota["summary"] = summary
         data["quota"] = quota
         quota_changed = bool(refreshed_histories)
+        hero = data.get("hero")
+        hero_capability = state.capabilities.get("hero")
+        if (
+            isinstance(hero, Mapping)
+            and isinstance(hero.get("cycle"), Mapping)
+            and hero_capability is not None
+            and hero_capability.status == "supported"
+        ):
+            cycle_valid, cycle_reason = _clock_cycle_validity(refreshed_histories, now_utc)
+            if not cycle_valid:
+                hero = dict(hero)
+                for field in (
+                    "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+                    "reasoning_output_tokens", "total_tokens", "cycle",
+                ):
+                    hero[field] = None
+                data["hero"] = hero
+                refreshed_capabilities = dict(state.capabilities)
+                refreshed_capabilities["hero"] = CapabilityRecord(
+                    "unavailable", "missing-or-conflicting-native-cycle",
+                )
+                capabilities = refreshed_capabilities
+                warnings = tuple(
+                    warning for warning in state.warnings
+                    if warning.code != "codex_cycle_unavailable"
+                ) + (SourceDashboardWarning(
+                    "codex_cycle_unavailable",
+                    "Codex native reset cycle is unavailable.",
+                    "hero",
+                ),)
+                availability = "partial"
+                if cycle_reason == "stale":
+                    freshness = "stale"
+                cycle_changed = True
     budget_domain = data.get("budget")
     budget_changed = False
     if isinstance(budget_domain, Mapping):
@@ -778,16 +1256,16 @@ def refresh_codex_source_clock(
                 hero["budget"] = refreshed_budget
                 data["hero"] = hero
             budget_changed = True
-    if not (quota_changed or budget_changed):
+    if not (quota_changed or budget_changed or cycle_changed):
         return state
     refreshed_state = SourceDashboardState(
         source=state.source,
-        availability=state.availability,
-        freshness=state.freshness,
-        warnings=state.warnings,
+        availability=availability,
+        freshness=freshness,
+        warnings=warnings,
         data_version=state.data_version,
         last_success_at=state.last_success_at,
-        capabilities=state.capabilities,
+        capabilities=capabilities,
         data=data,
         clock_data=state.clock_data,
     )
@@ -888,14 +1366,83 @@ def _projects_wire(
     }
 
 
-def _codex_entries_from_qualified(entries: Iterable[object]) -> list[CodexEntry]:
-    """Adapt the one root-qualified accounting read for shipped view kernels."""
+def _partial_projects_wire(
+    entries: Iterable[object],
+    metadata: Mapping[tuple[str, str], Mapping[str, object]],
+) -> dict[str, object]:
+    """Aggregate the qualified subset when older accounting metadata is mixed.
+
+    Rows without a cached conversation/project identity are omitted and remain
+    covered by the Projects-domain warning. Valid projects stay visible; their
+    totals never include an unqualified accounting row.
+    """
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    for entry in entries:
+        identity = (
+            str(getattr(entry, "source_root_key", "") or ""),
+            str(getattr(entry, "source_path", "") or ""),
+        )
+        row_metadata = metadata.get(identity)
+        project_key = str(row_metadata.get("project_key") or "").strip() if row_metadata else ""
+        project_label = str(row_metadata.get("project_label") or "").strip() if row_metadata else ""
+        if not project_key or not project_label:
+            continue
+        group_key = (identity[0], project_key)
+        group = groups.setdefault(group_key, {
+            "project_key": project_key,
+            "label": project_label,
+            "sessions": set(),
+            "first_seen": getattr(entry, "timestamp"),
+            "last_seen": getattr(entry, "timestamp"),
+            "cost_usd": 0.0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+        })
+        timestamp = getattr(entry, "timestamp")
+        group["first_seen"] = min(group["first_seen"], timestamp)
+        group["last_seen"] = max(group["last_seen"], timestamp)
+        group["sessions"].add(identity)
+        for field in (
+            "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens",
+        ):
+            group[field] += getattr(entry, field)
+
+    rows = []
+    for (root_key, _project_key), group in groups.items():
+        rows.append({
+            "key": dashboard_resource_key("project", "codex", root_key, group["project_key"]),
+            "source": "codex",
+            "label": group["label"],
+            "session_count": len(group["sessions"]),
+            "first_seen": group["first_seen"].astimezone(UTC).isoformat(),
+            "last_seen": group["last_seen"].astimezone(UTC).isoformat(),
+            "cost_usd": group["cost_usd"],
+            "input_tokens": group["input_tokens"],
+            "cached_input_tokens": group["cached_input_tokens"],
+            "output_tokens": group["output_tokens"],
+            "reasoning_output_tokens": group["reasoning_output_tokens"],
+            "total_tokens": group["total_tokens"],
+        })
+    rows.sort(key=lambda row: (-float(row["cost_usd"]), str(row["label"]), str(row["key"])))
+    return {
+        "rows": tuple(rows),
+        "total_cost_usd": stable_sum(float(row["cost_usd"]) for row in rows),
+        "total_tokens": sum(int(row["total_tokens"]) for row in rows),
+    }
+
+
+def _codex_entries_from_accounting(entries: Iterable[object]) -> list[CodexEntry]:
+    """Adapt coordinated accounting rows for the shipped non-project kernels."""
     converted: list[CodexEntry] = []
     for entry in entries:
         source_path = str(getattr(entry, "source_path", "") or "")
         session_id = str(getattr(entry, "session_id", "") or "")
         if not source_path or not session_id:
-            raise SourceCapabilityUnavailable("qualified accounting lacks session identity")
+            raise SourceCapabilityUnavailable("Codex accounting lacks session identity")
         converted.append(CodexEntry(
             timestamp=getattr(entry, "timestamp"),
             session_id=session_id,
@@ -908,6 +1455,67 @@ def _codex_entries_from_qualified(entries: Iterable[object]) -> list[CodexEntry]
             source_path=source_path,
         ))
     return converted
+
+
+def _codex_entries_from_qualified(entries: Iterable[object]) -> list[CodexEntry]:
+    """Compatibility name retained for the source-detail reader."""
+    return _codex_entries_from_accounting(entries)
+
+
+def _build_codex_native_weekly_view(
+    stats_conn: sqlite3.Connection,
+    entries: Iterable[object],
+    *,
+    source_root_keys: Iterable[str],
+    active_cycle: CodexCycleBoundary | None,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    speed: str,
+) -> CodexWeeklyView:
+    """Aggregate Codex cost into observed native quota-cycle segments."""
+    periods = _codex_weekly_periods(
+        stats_conn,
+        source_root_keys=source_root_keys,
+        active_cycle=active_cycle,
+    )
+    converted: list[CodexEntry] = []
+    bucket_by_entry: dict[int, str] = {}
+    display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+    labels: dict[str, str] = {}
+    for entry in entries:
+        timestamp = getattr(entry, "timestamp").astimezone(UTC)
+        root_key = str(getattr(entry, "source_root_key", "") or "")
+        period = next((
+            candidate for candidate in periods
+            if root_key in candidate.source_root_keys
+            and candidate.start_at <= timestamp < candidate.end_at
+        ), None)
+        if period is None:
+            continue
+        converted_entry = _codex_entries_from_accounting((entry,))[0]
+        bucket = period.start_at.isoformat()
+        converted.append(converted_entry)
+        bucket_by_entry[id(converted_entry)] = bucket
+        local_start = (
+            period.start_at.astimezone(display_tz)
+            if display_tz is not None else period.start_at.astimezone()
+        )
+        labels[bucket] = local_start.strftime("%m-%d %H:%M")
+
+    rows = _aggregate_codex_buckets(
+        converted,
+        key_fn=lambda entry: bucket_by_entry[id(entry)],
+        speed=speed,
+    )
+    display_rows = tuple(replace(row, bucket=labels[row.bucket]) for row in rows)
+    return CodexWeeklyView(
+        rows=display_rows,
+        total_cost_usd=stable_sum(row.cost_usd for row in display_rows),
+        total_tokens=sum(row.total_tokens for row in display_rows),
+        period_start=(periods[0].start_at if periods else None),
+        period_end=now_utc,
+        display_tz_label=display_tz_name or str(dt.datetime.now().astimezone().tzinfo),
+    )
 
 
 def build_codex_source_state(
@@ -938,8 +1546,7 @@ def build_codex_source_state(
     coherence = codex_projection_coherence(
         context,
     )
-    if not coherence.coherent:
-        raise CodexProjectionIncoherent(coherence.reason)
+    projection_incoherent = not coherence.coherent
     # The cache reader's established report surface treats the ``now`` instant
     # as inclusive.  The qualified adapter is half-open, so extend only its
     # query/result boundary by one microsecond and keep all live budget sums
@@ -949,37 +1556,119 @@ def build_codex_source_state(
     if context.codex_budget is not None:
         _period, budget_start, _budget_end = _configured_codex_budget_window(context)
         accounting_start = min(accounting_start, budget_start)
-    qualified_entries = load_qualified_codex_entries(
-        accounting_start,
-        accounting_end,
-        speed=context.speed,
-        sync=False,
+    health = load_codex_project_metadata_health(
+        cache_conn=context.cache_conn,
+        start=accounting_start,
+        end=accounting_end,
+    )
+    metadata_incomplete = health.incomplete_rows > 0
+    metadata_warning_message = (
+        f"{health.incomplete_rows} Codex accounting row(s) lack project metadata; "
+        "run `cctally cache-sync --source codex --rebuild`."
+        if metadata_incomplete
+        else "Codex project metadata could not be read; "
+        "run `cctally cache-sync --source codex --rebuild`."
+    )
+    qualified_entries: tuple[object, ...] = ()
+    if not metadata_incomplete:
+        try:
+            qualified_entries = load_qualified_codex_entries(
+                accounting_start,
+                accounting_end,
+                speed=context.speed,
+                sync=False,
+                cache_conn=context.cache_conn,
+            )
+            accounting_entries: tuple[object, ...] = qualified_entries
+        except QualifiedMetadataUnavailable:
+            # A cached read must be internally coherent, but retain accounting
+            # once if a defensive race or malformed row violates that premise.
+            _lib_log.get_logger("dashboard").warning(
+                "Codex qualified metadata read became unavailable; using cache-only accounting fallback"
+            )
+            metadata_incomplete = True
+            accounting_entries = load_cached_rooted_codex_accounting_entries(
+                accounting_start,
+                accounting_end,
+                speed=context.speed,
+                cache_conn=context.cache_conn,
+            )
+    else:
+        accounting_entries = load_cached_rooted_codex_accounting_entries(
+            accounting_start,
+            accounting_end,
+            speed=context.speed,
+            cache_conn=context.cache_conn,
+        )
+    budget_entries = _codex_entries_from_accounting(accounting_entries)
+    cycle_reason: str | None = None
+    try:
+        cycle = _resolve_codex_weekly_cycle(quota_observations, context.now_utc)
+    except CodexCycleUnavailable as exc:
+        cycle = None
+        cycle_reason = exc.reason
+    cycle_failure = cycle is None and has_cached_codex_accounting_entries(
         cache_conn=context.cache_conn,
     )
-    budget_entries = _codex_entries_from_qualified(qualified_entries)
-    visible_qualified_entries = tuple(
-        entry for entry in qualified_entries
+    hero_failure = projection_incoherent or cycle_failure
+    if cycle is None or hero_failure:
+        cycle_entries: list[CodexEntry] = []
+        cycle_cost_usd: float | None = None if hero_failure else 0.0
+    else:
+        cycle_end = min(accounting_end, cycle.resets_at)
+        cycle_rows = load_cached_rooted_codex_accounting_entries(
+            cycle.start_at,
+            cycle_end,
+            speed=context.speed,
+            cache_conn=context.cache_conn,
+            source_root_keys=cycle.source_root_keys,
+        )
+        cycle_entries = _codex_entries_from_accounting(cycle_rows)
+        cycle_cost_usd = build_codex_daily_view(
+            cycle_entries,
+            now_utc=context.now_utc,
+            tz_name=context.display_tz_name,
+            speed=context.speed,
+        ).total_cost_usd
+    visible_accounting_entries = tuple(
+        entry for entry in accounting_entries
         if context.range_start <= getattr(entry, "timestamp").astimezone(UTC) < accounting_end
     )
-    entries = _codex_entries_from_qualified(visible_qualified_entries)
+    entries = _codex_entries_from_accounting(visible_accounting_entries)
     daily = build_codex_daily_view(
         entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
     )
     monthly = build_codex_monthly_view(
         entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
     )
-    weekly = build_codex_weekly_view(
-        entries,
+    weekly = _build_codex_native_weekly_view(
+        context.stats_conn,
+        visible_accounting_entries,
+        source_root_keys=active_roots,
+        active_cycle=cycle,
         now_utc=context.now_utc,
-        tz_name=context.display_tz_name,
-        week_start_idx=context.week_start_idx,
+        display_tz_name=context.display_tz_name,
         speed=context.speed,
     )
-    sessions = build_codex_session_view(
-        entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
+    sessions = (
+        build_rooted_codex_session_view(
+            visible_accounting_entries,
+            now_utc=context.now_utc,
+            tz_name=context.display_tz_name,
+            speed=context.speed,
+        )
+        if metadata_incomplete else build_codex_session_view(
+            entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
+        )
     )
     quota = _quota_read_model(context, quota_observations)
-    quota_blocks = _quota_wire(context.stats_conn)
+    quota_blocks = _quota_wire(
+        context.stats_conn,
+        accounting_entries=visible_accounting_entries,
+        cycle=cycle,
+        now_utc=context.now_utc,
+        display_tz_name=context.display_tz_name,
+    )
     quota = {**quota, "blocks": quota_blocks}
     budget_rows = _budget_wire(context.stats_conn)
     projected_budget_rows = _projected_budget_wire(context.stats_conn)
@@ -987,45 +1676,94 @@ def build_codex_source_state(
     configured_budget = _configured_codex_budget_status(
         context, budget_entries, cost_events=budget_cost_events,
     )
-    projects = _projects_wire(
-        context,
-        quota_observations,
-        visible_qualified_entries,
-        accounting_end=accounting_end,
+    conversation_metadata = _codex_conversation_metadata(context.cache_conn)
+    projects = (
+        _partial_projects_wire(visible_accounting_entries, conversation_metadata)
+        if metadata_incomplete else _projects_wire(
+            context,
+            quota_observations,
+            visible_accounting_entries,
+            accounting_end=accounting_end,
+        )
     )
     alerts = _alerts_wire(context.stats_conn)
-    availability = "ok" if (entries or quota_blocks or budget_rows) else "empty"
-    total_input = sum(entry.input_tokens for entry in entries)
-    total_cached = sum(entry.cached_input_tokens for entry in entries)
-    total_output = sum(entry.output_tokens for entry in entries)
-    total_reasoning = sum(entry.reasoning_output_tokens for entry in entries)
+    availability = (
+        "partial" if metadata_incomplete or hero_failure
+        else ("ok" if (entries or quota_blocks or budget_rows) else "empty")
+    )
+    hero_input = None if hero_failure else sum(entry.input_tokens for entry in cycle_entries)
+    hero_cached = None if hero_failure else sum(entry.cached_input_tokens for entry in cycle_entries)
+    hero_output = None if hero_failure else sum(entry.output_tokens for entry in cycle_entries)
+    hero_reasoning = None if hero_failure else sum(entry.reasoning_output_tokens for entry in cycle_entries)
+    hero_total = None if hero_failure else sum(entry.total_tokens for entry in cycle_entries)
+    warnings: list[SourceDashboardWarning] = []
+    if metadata_incomplete:
+        warnings.append(SourceDashboardWarning(
+            "codex_metadata_incomplete",
+            metadata_warning_message,
+            "projects",
+        ))
+    if projection_incoherent:
+        warnings.append(SourceDashboardWarning(
+            "codex_projection_incoherent",
+            "Codex quota projection is unavailable.",
+            "hero",
+        ))
+    if cycle_failure:
+        warnings.append(SourceDashboardWarning(
+            "codex_cycle_unavailable",
+            "Codex native reset cycle is unavailable.",
+            "hero",
+        ))
     return SourceDashboardState(
         source="codex",
         availability=availability,
-        freshness="fresh",
-        warnings=(),
+        freshness=("stale" if cycle_reason == "stale" else "fresh"),
+        warnings=tuple(warnings),
         data_version=data_version,
         last_success_at=context.now_utc,
         capabilities={
-            "hero": CapabilityRecord("supported", "calendar-accounting"),
+            "hero": (
+                CapabilityRecord(
+                    "unavailable",
+                    (
+                        "projection-incoherent" if projection_incoherent
+                        else "missing-or-conflicting-native-cycle"
+                    ),
+                )
+                if hero_failure
+                else CapabilityRecord("supported", "native-reset-cycle")
+            ),
             "daily": CapabilityRecord("supported", "calendar-day"),
             "monthly": CapabilityRecord("supported", "calendar-month"),
-            "weekly": CapabilityRecord("supported", "calendar-week"),
+            "weekly": CapabilityRecord("derived", "native-reset-cycles"),
             "sessions": CapabilityRecord("supported", "inclusive-input-tokens"),
             "forensics": CapabilityRecord("supported", "inclusive-input-token-reuse"),
             "quota": CapabilityRecord("derived", "native-windows"),
             "budget": CapabilityRecord("supported", "calendar-period"),
-            "projects": CapabilityRecord("supported", "qualified-attribution"),
+            "projects": (
+                CapabilityRecord("supported", "conversation-metadata-partial")
+                if metadata_incomplete
+                else CapabilityRecord("supported", "qualified-attribution")
+            ),
             "alerts": CapabilityRecord("supported", "provider-native"),
         },
         data={
             "hero": {
-                "cost_usd": daily.total_cost_usd,
-                "input_tokens": total_input,
-                "cached_input_tokens": total_cached,
-                "output_tokens": total_output,
-                "reasoning_output_tokens": total_reasoning,
-                "total_tokens": daily.total_tokens,
+                "cost_usd": cycle_cost_usd,
+                "input_tokens": hero_input,
+                "cached_input_tokens": hero_cached,
+                "output_tokens": hero_output,
+                "reasoning_output_tokens": hero_reasoning,
+                "total_tokens": hero_total,
+                "cycle": (
+                    {
+                        "window_minutes": cycle.window_minutes,
+                        "start_at": cycle.start_at.astimezone(UTC).isoformat(),
+                        "resets_at": cycle.resets_at.astimezone(UTC).isoformat(),
+                    }
+                    if cycle is not None and not hero_failure else None
+                ),
                 "quota": quota["summary"],
                 "budget": configured_budget,
                 "alerts": {"count": len(alerts)},
@@ -1035,7 +1773,7 @@ def build_codex_source_state(
                 "monthly": _period_wire(monthly),
                 "weekly": _period_wire(weekly),
             },
-            "sessions": _session_wire(sessions),
+            "sessions": _session_wire(sessions, metadata=conversation_metadata),
             "quota": quota,
             "budget": {
                 "status": configured_budget,

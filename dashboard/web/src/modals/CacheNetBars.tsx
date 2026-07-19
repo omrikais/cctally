@@ -30,6 +30,7 @@ import { fmt } from '../lib/fmt';
 export interface CacheNetBarsProps {
   days: CacheReportDailyRow[];   // newest-first; render oldest-first
   size: 'mini' | 'large';
+  unavailableReason?: string;
 }
 
 const SIZES = {
@@ -37,10 +38,24 @@ const SIZES = {
   large: { width: 800, height: 110, padX: 28, padTop: 28, padBot: 28, barGap: 4 },
 } as const;
 
-export function CacheNetBars({ days, size }: CacheNetBarsProps) {
+export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProps) {
   const cfg = SIZES[size];
   const isLarge = size === 'large';
   const ordered = [...days].reverse();
+
+  if (isLarge && unavailableReason) {
+    return (
+      <div className="crm-section modal-cache-unavailable">
+        <div className="crm-section-head crm-sh-net">
+          Net $ per day · saved (green) − wasted (red)
+          <span className="meta">provider-native limitation</span>
+        </div>
+        <div className="crm-chart-frame netbars">
+          <div className="m-unavailable" style={{ padding: '16px 4px' }}>{unavailableReason}</div>
+        </div>
+      </div>
+    );
+  }
 
   if (ordered.length === 0) {
     if (isLarge) {

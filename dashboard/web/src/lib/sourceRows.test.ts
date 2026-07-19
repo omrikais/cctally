@@ -3,6 +3,7 @@ import {
   adaptClaudeSessionRows,
   adaptCodexSessionRows,
   joinCodexQuotaLabels,
+  nativeLimitLabel,
 } from './sourceRows';
 import { makeClaudeSourceData, makeCodexSourceData } from '../test-utils/sourceEnvelope';
 import type { ClaudeSessionSourceRow } from '../types/envelope';
@@ -34,6 +35,19 @@ describe('joinCodexQuotaLabels (§6.1)', () => {
     expect(joined.some((j) => j.key.startsWith('block:'))).toBe(false);
     expect(joined.map((j) => j.key)).toEqual(['quota:codex-5h', 'quota:codex-weekly']);
   });
+
+  it('derives native duration labels when history labels are absent or generic', () => {
+    const data = makeCodexSourceData();
+    const histories = data.quota.histories.map((row) => ({ ...row, label: '' }));
+    const joined = joinCodexQuotaLabels(data.hero, { ...data.quota, histories });
+    expect(joined.map((row) => row.label)).toEqual(['5-hour limit', '7-day limit']);
+  });
+
+  it('preserves trimmed provider labels before deriving a duration label', () => {
+    expect(nativeLimitLabel('  Five-hour quota  ', 300)).toBe('Five-hour quota');
+    expect(nativeLimitLabel(' Weekly limit ', 10_080)).toBe('Weekly limit');
+    expect(nativeLimitLabel('', 300)).toBe('5-hour limit');
+  });
 });
 
 describe('session display-row adapters (§6.3)', () => {
@@ -63,5 +77,30 @@ describe('session display-row adapters (§6.3)', () => {
       expect(first.tokens.reasoning).toBe(4000);
       expect(first.tokens.total).toBe(276000);
     }
+  });
+
+  it('maps the persisted short name, project, start, and duration into canonical session cells', () => {
+    const data = makeCodexSourceData();
+    const row = {
+      ...data.sessions.rows[0],
+      label: 'Implement dashboard parity',
+      project: 'cctally-dev',
+      project_key: 'project:codex-alpha',
+      started_at: '2026-04-24T12:00:00Z',
+      duration_min: 30,
+    };
+    expect(adaptCodexSessionRows([row])[0]).toMatchObject({
+      title: 'Implement dashboard parity',
+      project: 'cctally-dev',
+      recencyUtc: '2026-04-24T12:00:00Z',
+      durationMin: 30,
+    });
+  });
+
+  it('does not derive a Codex session name when the persisted short name is absent', () => {
+    const data = makeCodexSourceData();
+    const row = { ...data.sessions.rows[0], label: null };
+
+    expect(adaptCodexSessionRows([row])[0].title).toBe('');
   });
 });

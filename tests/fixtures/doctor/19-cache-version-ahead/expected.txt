@@ -19,12 +19,12 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 99 / 25 known
+  ✓ cache.db                 version 99 / 27 known
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            cache.db ahead (v99 > known v25) — auto-heals
+  ⚠ Version ahead            cache.db ahead (v99 > known v27) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
-  ✓ Migrations               0/38 applied
-  ⚠ Pending migrations       38 pending
+  ✓ Migrations               0/40 applied
+  ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -33,6 +33,7 @@ Data
   ✓ Statusline pipeline      no recent regular-pool timer observed
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Codex project metadata   qualified
   ✓ Codex quota              not applicable
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
@@ -50,4 +51,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 31 OK · 5 WARN · 0 FAIL
+Summary: 32 OK · 5 WARN · 0 FAIL

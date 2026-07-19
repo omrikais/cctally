@@ -1587,11 +1587,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 }
 
 /* ==== Modals (v2) ==== */
-#modal-root {
+#modal-root,
+#source-detail-root {
   position: fixed; inset: 0; z-index: 100;
   display: flex; align-items: center; justify-content: center;
 }
-#modal-root[hidden] { display: none; }
+#source-detail-root { z-index: 150; }
+#modal-root[hidden],
+#source-detail-root[hidden] { display: none; }
 .modal-backdrop {
   position: absolute; inset: 0;
   background: rgba(0, 0, 0, 0.55);
@@ -1704,6 +1707,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   overscroll-behavior: contain;
 }
 .empty-state { color: var(--text-dim); padding: 18px; text-align: center; }
+.m-unavailable { color: var(--text-faint); }
+.m-pill.m-unavailable { border-style: dashed; }
+.modal-cache-unavailable { color: var(--text-faint); }
 
 /* =========================================================================
    Shared modal primitives — touched by mcw-, mfc-, mtr-, msess- prefixed
@@ -4442,8 +4448,32 @@ mark.current {
      #293 S1 (MOBILE-2) — tighter row/column gap so on the narrowest phones the
      strip packs into fewer wrapped rows (the wrap growth is what pushed the 320px
      hero ~86px taller than the 390px hero). Harmless at 390 (ample headroom). */
-  .hero-support { flex-direction: row; flex-wrap: wrap; gap: 2px var(--space-2); align-items: baseline; }
-  .hero-support .sup-row { justify-content: flex-start; gap: var(--space-1); }
+  /* Keep both quota blocks side-by-side even when one contains a wide value
+     (12.0% used to wrap Codex/All into a taller, provider-specific hero). */
+  .hero-usage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, .75fr);
+    column-gap: var(--space-2);
+    row-gap: var(--space-1);
+    align-items: end;
+  }
+  .hero-usage .hu-reset { grid-column: 1 / -1; }
+  /* Three compact semantic slots make the support transformation identical in
+     Claude, Codex and All without hiding values or growing a second row. */
+  .hero-support {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-2);
+    align-items: start;
+  }
+  .hero-support .sup-row {
+    min-width: 0;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 0;
+  }
+  .hero-support .sup-l,
+  .hero-support .sup-v { font-size: var(--fs-eyebrow); white-space: nowrap; }
 
   /* #293 S1 (MOBILE-2) — sanctioned secondary lever (spec §3c): tighten ONLY the
      dashboard, unscrolled topbar's inter-row gap so the first board card clears
@@ -4458,6 +4488,31 @@ mark.current {
      The base .panel{min-height:320px} precedes this block, so this same-
      specificity rule wins by source order — no #root prefix needed. */
   .panel { min-height: 0; }
+  /* Provider histories differ in row count, not card anatomy. Bound the shared
+     mobile viewport and expose the same local scrolling treatment everywhere. */
+  .dash-grid[data-board-mode="stack"] #panel-trend .trend-table-wrap {
+    max-height: 132px;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+  .dash-grid[data-board-mode="stack"] #panel-blocks.blocks-collapsed {
+    height: 184px;
+    max-height: 184px;
+  }
+  /* A populated first row includes a 14px-floor model legend beneath its
+     gauge. Give that canonical row enough room to remain fully visible above
+     the pinned footer; otherwise the legend is hidden behind an unmarked
+     25px local scroll at phone width. Empty cards keep the compact 184px shell. */
+  .dash-grid[data-board-mode="stack"] #panel-blocks.blocks-collapsed:has(.blocks-row) {
+    height: 216px;
+    max-height: 216px;
+  }
+  .dash-grid[data-board-mode="stack"] #panel-blocks.blocks-collapsed .panel-body {
+    max-height: none;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
   /* #264 S1: the desktop bento's per-row fixed heights only apply in the
      @media(min-width:900px) block; below that each `.bento-row` is a 1-col
      stack of content-height cards, and `.dash-grid .panel { min-height: 0 }`
@@ -4575,6 +4630,12 @@ mark.current {
     margin-left: auto;
     gap: 4px;
     flex-shrink: 0;
+    /* The Codex metadata-status chip joins this band. Give it its own
+       shrinkable row so the status can ellipsize while Doctor + all three
+       44px actions remain inside the viewport. */
+    width: 100%;
+    min-width: 0;
+    flex: 1 1 100%;
   }
   /* Mobile: drop the "cctally" word + the version since horizontal
      real estate is tight; keep just the update badge if present.
@@ -4675,7 +4736,8 @@ mark.current {
      paint. Backdrop tap and Esc still dismiss (Modal.tsx wires those
      in). The handle div above the title is decorative — no swipe
      gesture. */
-  #modal-root {
+  #modal-root,
+  #source-detail-root {
     align-items: flex-end;       /* pin sheet to bottom; leaves a top strip */
     justify-content: stretch;
   }
@@ -6691,6 +6753,10 @@ mark.current {
   background: var(--panel-bg-2);
   color: var(--text-dim);
   white-space: nowrap;
+  min-width: 0;
+  max-width: min(42vw, 260px);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .source-status-chip.is-stale { color: var(--text); border-color: var(--border); }
 .source-status-chip.is-degraded {
@@ -6720,6 +6786,7 @@ mark.current {
 }
 .source-chip--claude { color: var(--accent-blue, #4c8dff); border-color: currentColor; background: rgba(224, 207, 255, 0.10); }
 .source-chip--codex { color: var(--accent-green, #10b981); border-color: currentColor; background: rgba(148, 163, 184, 0.14); }
+.source-session-row .source-chip { margin-right: var(--space-1); }
 /* #294 S5 §7 — the `all` selection chip in share chrome (ShareModal /
    PreviewPane). "All" is both providers, so it takes a neutral accent rather
    than a third loud color — dim text with a matching border, mirroring the
@@ -6746,9 +6813,23 @@ mark.current {
   color: var(--text-dim);
   font-size: var(--fs-data);
 }
-.source-all-sections { display: flex; flex-direction: column; gap: var(--space-3); }
-.source-provider-section { display: flex; flex-direction: column; gap: var(--space-1); }
+.panel-body--source-native {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.source-all-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+.source-provider-section { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; min-height: 0; }
 .source-provider-head { display: flex; align-items: center; gap: var(--space-2); }
+.source-provider-body { min-width: 0; overflow-x: auto; }
 .codex-period-table,
 .codex-projects-table,
 .codex-sessions-table {
@@ -6788,43 +6869,31 @@ mark.current {
 }
 .codex-detail-open:hover { text-decoration: underline; }
 
-/* #294 S5 §5.6 — qualified source-detail modal (Codex/All rows). */
-.source-detail-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 900;
+/* The All shell is a direct child of a fixed-height bento host, unlike a
+   normal panel body. Give it its own scroll boundary so a full Claude child or
+   wide native table cannot bleed across peer cards. */
+@media (min-width: 900px) {
+  .dash-grid .panel .panel-body--source-native { overflow: auto; }
+  .dash-grid .panel-host > .source-all-sections { min-height: 0; height: 100%; overflow: auto; }
 }
-.source-detail-card {
-  position: relative;
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md, 10px);
-  padding: var(--space-4, 20px);
-  min-width: 280px;
-  max-width: min(560px, 92vw);
-  max-height: 86vh;
-  overflow: auto;
+
+@media (max-width: 640px) {
+  .source-status-chip { max-width: 42vw; }
+  .panel-body--source-native,
+  .source-provider-body {
+    max-height: 360px;
+    overflow-x: auto;
+    overflow-y: auto;
+  }
 }
-.source-detail-close {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 20px;
-  line-height: 1;
-  cursor: pointer;
-}
+
+/* #319 Task 1 — qualified source details reuse the shared modal shell. */
 .sd-tokens { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; margin: var(--space-2) 0; }
 .sd-tokens > div { display: flex; justify-content: space-between; }
 .sd-tokens dt { color: var(--text-faint); }
 .sd-tokens dd { margin: 0; }
+.sd-note { color: var(--accent-amber); margin: 0 0 var(--space-3); }
+.sd-block-label { color: var(--text-dim); margin-top: 0; }
 
 /* ---- Sessions panel: per-row "open conversation" affordance -------- */
 .sess-open-conv {

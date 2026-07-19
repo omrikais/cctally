@@ -24,16 +24,12 @@ describe('CacheReportPanel source labeling (§5.5 layer 2 / §6.6)', () => {
     expect(screen.queryByText('Claude', { selector: '.source-chip' })).toBeNull();
   });
 
-  it('All mode wraps cache-report in a Claude-labeled provider section', () => {
+  it('All mode keeps one canonical cache-report shell', () => {
     updateSnapshot(env());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<CacheReportPanel />);
-    // The provider-section chrome now labels it "Claude", matching every other
-    // panel in All mode.
-    expect(screen.getByText('Claude', { selector: '.source-chip' })).toBeInTheDocument();
-    // …wrapping the real cache-report content.
     expect(screen.getByText('Cache Report', { selector: 'h2' })).toBeInTheDocument();
-    // No Codex forensics domain → no Codex cache-report section.
-    expect(screen.queryByText('Codex', { selector: '.source-chip' })).toBeNull();
+    expect(document.querySelectorAll('#panel-cache-report')).toHaveLength(1);
+    expect(document.querySelector('.source-provider-section')).toBeNull();
   });
 });

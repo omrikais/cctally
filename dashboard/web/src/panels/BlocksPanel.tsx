@@ -6,19 +6,22 @@ import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
+import { modelChipStyle } from '../lib/model';
 import { dispatch, getState, subscribeStore } from '../store/store';
-import { openActiveOrNewestBlockModal } from '../store/actions';
 import { openShareModal } from '../store/shareSlice';
-import { SourcePanelShell, CodexBlocksList } from './sourcePanel';
-import type { BlocksPanelRow } from '../types/envelope';
+import { presentationBlocks, presentationProviders, type BlockPresentationRow } from '../lib/dashboardPresentation';
 
-function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number; isFirstMount: boolean }) {
-  const fillPct = maxCost > 0 ? (r.cost_usd / maxCost) * 100 : 0;
-  const open = () => dispatch({
-    type: 'OPEN_MODAL',
-    kind: 'block',
-    blockStartAt: r.start_at,
-  });
+function openBlockDetail(r: BlockPresentationRow): void {
+  if (r.source === 'claude') {
+    dispatch({ type: 'OPEN_MODAL', kind: 'block', blockStartAt: r.start_at });
+  } else {
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: r.source, resource: 'block', key: r.key });
+  }
+}
+
+function Row({ r, maxCost, isFirstMount }: { r: BlockPresentationRow; maxCost: number; isFirstMount: boolean }) {
+  const fillPct = maxCost > 0 ? (r.value / maxCost) * 100 : 0;
+  const open = () => openBlockDetail(r);
   return (
     <div
       className="blocks-row"
@@ -41,7 +44,7 @@ function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number;
           {r.label}
           {r.is_active && <span className="pill-active">Active</span>}
         </span>
-        <span className="cost">{fmt.usd2(r.cost_usd)}</span>
+        <span className="cost">{r.valueLabel}</span>
       </div>
       <div className="gauge-track">
         <div
@@ -54,7 +57,7 @@ function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number;
             <span
               key={m.model}
               className={`seg-${m.chip}`}
-              style={{ width: `${m.cost_pct}%` }}
+              style={{ ...modelChipStyle(m.model), width: `${m.cost_pct}%` }}
               title={`${m.display} ${fmt.usd2(m.cost_usd)} (${m.cost_pct.toFixed(0)}%)`}
             />
           ))}
@@ -65,23 +68,11 @@ function Row({ r, maxCost, isFirstMount }: { r: BlocksPanelRow; maxCost: number;
   );
 }
 
-// #294 S5 — source-aware wrapper. Claude = legacy 5h blocks (unchanged, reading
-// data.quota.blocks); Codex = native quota-window blocks under their own labels;
-// All = provider sections.
+// #294 S5 — source-aware wrapper. Both providers render real 5h activity
+// blocks; Codex boundaries come from its durable native 300-minute windows.
 export function BlocksPanel() {
-  return (
-    <SourcePanelShell
-      panel="blocks"
-      panelKind="blocks"
-      claude={<ClaudeBlocksPanel />}
-      codex={(d) => <CodexBlocksList data={d} />}
-      emptyLabel="No Codex quota windows yet."
-    />
-  );
-}
-
-function ClaudeBlocksPanel() {
   const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const collapsed = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.blocksCollapsed,
@@ -91,17 +82,13 @@ function ClaudeBlocksPanel() {
   // 4..N with no view for them). `maxCost` still spans the full week so every
   // bar keeps its true scale vs the week's peak; the footer count + total
   // already summarize the whole set (each row still opens its own Block modal).
-  const allRows = env?.blocks?.rows ?? [];
+  const allRows = presentationBlocks(env, activeSource);
   const rows = allRows;
-  const maxCost = allRows.length > 0 ? Math.max(...allRows.map((r) => r.cost_usd), 0) : 0;
-  // View-model unification follow-up (issue #56): footer total comes
-  // from the typed envelope scalar rather than re-summing rows in JS.
-  // The Python sync thread sums over the same visible rows via
-  // `BlocksView.total_cost_usd` so the invariant
-  // `total === sum(rows[*].cost_usd)` still holds structurally; the
-  // `?? 0` fallback covers pre-#56 first-paint envelopes that haven't
-  // populated the additive scalar yet.
-  const total = env?.blocks?.total_cost_usd ?? 0;
+  const maxCost = allRows.length > 0 ? Math.max(...allRows.map((r) => r.value), 0) : 0;
+  // Compatible provider costs can be combined once in All mode. These rows
+  // are already source-qualified, so summing their displayed values preserves
+  // the no-double-count invariant while keeping Codex-only totals truthful.
+  const total = allRows.reduce((sum, row) => sum + row.value, 0);
   const hasHeuristic = rows.some((r) => r.anchor === 'heuristic');
 
   // First-mount animation: paint .gauge-fill width:0, then rAF flips to
@@ -123,6 +110,7 @@ function ClaudeBlocksPanel() {
       role="region"
       aria-label="Blocks panel"
       data-panel-kind="blocks"
+      data-source={activeSource}
     >
       <div className="panel-header" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -130,7 +118,7 @@ function ClaudeBlocksPanel() {
             <use href="/static/icons.svg#layers" />
           </svg>
           <h2>
-            Blocks <span className="sub">(5h · current week)</span>
+            Blocks <span className="sub">({activeSource === 'codex' ? '5h · current cycle' : activeSource === 'all' ? '5h · current cycles' : '5h · current week'})</span>
           </h2>
         </div>
         <div className="panel-header-actions">
@@ -142,7 +130,11 @@ function ClaudeBlocksPanel() {
           />
           <ExpandButton
             label="Blocks"
-            onOpen={openActiveOrNewestBlockModal}
+            onOpen={() => {
+              const row = allRows.find((item) => item.is_active) ?? allRows[0];
+              if (!row) return;
+              openBlockDetail(row);
+            }}
             disabled={allRows.length === 0}
           />
           <button
@@ -169,15 +161,21 @@ function ClaudeBlocksPanel() {
       </div>
       <div className="panel-body" id="panel-blocks-body">
         {rows.length === 0 ? (
-          env?.hydrating ? (
+            presentationProviders(env, activeSource).hydrating ? (
             <PanelSkeleton />
           ) : (
-            <div className="panel-empty">No activity blocks this week yet.</div>
+            <div className="panel-empty">
+              {activeSource === 'codex'
+                ? 'No 5-hour activity blocks in the current Codex cycle.'
+                : activeSource === 'all'
+                  ? 'No 5-hour activity blocks in the current provider cycles.'
+                  : 'No activity blocks this week yet.'}
+            </div>
           )
         ) : (
           rows.map((r) => (
             <Row
-              key={r.start_at}
+              key={r.key}
               r={r}
               maxCost={maxCost}
               isFirstMount={!seenStarts.current.has(r.start_at)}

@@ -162,6 +162,61 @@ function firstWarning(warnings: SourceWarning[] | undefined): SourceWarning | nu
   return warnings != null && warnings.length > 0 ? warnings[0] : null;
 }
 
+const CAPABILITY_WARNING_DOMAINS = new Set([
+  'hero',
+  'daily',
+  'weekly',
+  'monthly',
+  'sessions',
+  'projects',
+  'quota',
+  'budget',
+  'forensics',
+  'alerts',
+]);
+
+function isSourceWideWarning(warning: SourceWarning): boolean {
+  const domain = warning.domain;
+  return domain == null || domain === 'ingest' || domain === 'read_model'
+    || !CAPABILITY_WARNING_DOMAINS.has(domain);
+}
+
+// A source-wide warning always takes precedence. Otherwise a panel is governed
+// only by the first warning for its capability domain; a fresh partial source
+// may therefore render unrelated supported panels normally.
+export function warningForPanel(
+  warnings: SourceWarning[] | undefined,
+  capability: string,
+): SourceWarning | null {
+  if (warnings == null) return null;
+  return warnings.find(isSourceWideWarning)
+    ?? warnings.find((warning) => warning.domain === capability)
+    ?? null;
+}
+
+// The status chip represents the physical source rather than one capability.
+// Keep its visible state aligned with source-wide precedence while leaving the
+// detailed warning available to title/assistive text consumers.
+export function warningForSource(
+  warnings: SourceWarning[] | undefined,
+): SourceWarning | null {
+  if (warnings == null) return null;
+  return warnings.find(isSourceWideWarning) ?? firstWarning(warnings);
+}
+
+// Hero and other provider-specific surfaces need an explicit domain selector,
+// not source-list order. A matching known domain wins; source-wide warnings are
+// the fallback because they genuinely govern every domain.
+export function warningForDomain(
+  warnings: SourceWarning[] | undefined,
+  domain: string,
+): SourceWarning | null {
+  if (warnings == null) return null;
+  return warnings.find((warning) => warning.domain === domain)
+    ?? warnings.find(isSourceWideWarning)
+    ?? firstWarning(warnings);
+}
+
 // §5.5 — whether the panel's gating row gives THIS source a way to produce data:
 // a non-null mapped path, or (Claude only) a legacy fallback with an envelope to
 // read from. A source with neither can NEVER render the panel, so it hides
@@ -243,6 +298,7 @@ function gateSingleSource(view: SourceView, panel: PanelId, source: SourceName):
   const cap = entry.capabilities?.[spec.capability];
   const status = cap?.status;
   const noSuccessYet = entry.last_success_at == null;
+  const warning = warningForPanel(entry.warnings, spec.capability);
 
   // Layer 1 — a capability the source explicitly does not offer hides.
   if (status === 'deferred' || status === 'not_applicable') {
@@ -251,7 +307,7 @@ function gateSingleSource(view: SourceView, panel: PanelId, source: SourceName):
 
   // Layer 3 — an entry-level unavailable renders an explicit unavailable state.
   if (entry.availability === 'unavailable') {
-    return { mode: 'degraded', warning: firstWarning(entry.warnings), noSuccessYet };
+    return { mode: 'degraded', warning, noSuccessYet };
   }
 
   // Resolve the mapped data path (or Claude legacy fallback). `pathFn` may be
@@ -270,7 +326,7 @@ function gateSingleSource(view: SourceView, panel: PanelId, source: SourceName):
   // Layer 1 — a runtime-unavailable capability renders an explicit degraded
   // state (D2), distinct from the entry-level availability above.
   if (status === 'unavailable') {
-    return { mode: 'degraded', warning: firstWarning(entry.warnings), noSuccessYet };
+    return { mode: 'degraded', warning, noSuccessYet };
   }
 
   // Layer 1 — supported/derived (or unknown) with no resolvable path/fallback
@@ -290,9 +346,10 @@ function gateSingleSource(view: SourceView, panel: PanelId, source: SourceName):
     return { mode: 'hidden', noSuccessYet: false };
   }
 
-  // Layer 3 — partial/stale renders retained data with a degraded chip.
-  if (entry.availability === 'partial') {
-    return { mode: 'degraded', warning: firstWarning(entry.warnings), noSuccessYet };
+  // A fresh partial source degrades only panels whose domain is warned; stale
+  // freshness is source-wide and keeps every published panel explicitly stale.
+  if (entry.availability === 'partial' && (entry.freshness === 'stale' || warning != null)) {
+    return { mode: 'degraded', warning, noSuccessYet };
   }
 
   // Unknown capability status but data present → degrade generically (never

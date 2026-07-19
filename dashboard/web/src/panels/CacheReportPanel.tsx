@@ -30,8 +30,9 @@
 // No ShareIcon in v1 — cache-report is not in SHARE_CAPABLE_PANELS
 // (spec §2.6).
 import { useSnapshot } from '../hooks/useSnapshot';
+import { useSyncExternalStore } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ExpandButton } from '../components/ExpandButton';
@@ -40,7 +41,8 @@ import { CacheNetBars } from '../modals/CacheNetBars';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
-import { SourcePanelShell } from './sourcePanel';
+import { presentationCacheDays, presentationProviders } from '../lib/dashboardPresentation';
+import type { CacheReportEnvelope } from '../types/envelope';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
@@ -55,21 +57,36 @@ const GREEN = 'var(--accent-green)';
 // `codex` renderer is never invoked. Codex-only mode hides the panel entirely
 // (App never mounts a source-hidden panel).
 export function CacheReportPanel() {
-  return (
-    <SourcePanelShell
-      panel="cache-report"
-      panelKind="cache-report"
-      claude={<ClaudeCacheReportPanel />}
-      // Codex publishes no forensics domain — the gating table hides the Codex
-      // section, so this is never rendered. Returning null is the safe floor.
-      codex={() => null}
-    />
-  );
-}
-
-function ClaudeCacheReportPanel() {
   const env = useSnapshot();
-  const cr = env?.cache_report;
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const adaptedDays = presentationCacheDays(env, activeSource);
+  const newest = adaptedDays?.[0];
+  const adapted: CacheReportEnvelope | undefined = activeSource === 'claude' ? undefined : adaptedDays == null ? undefined : {
+    window_days: adaptedDays.length,
+    anomaly_threshold_pp: 15,
+    anomaly_window_days: 14,
+    today: {
+      date: newest?.date ?? '',
+      cache_hit_percent: newest?.cache_hit_percent ?? 0,
+      baseline_median_percent: null,
+      delta_pp: null,
+      net_usd: 0,
+      saved_usd: 0,
+      wasted_usd: 0,
+      anomaly_triggered: false,
+      anomaly_reasons: [],
+      baseline_daily_row_count: adaptedDays.length,
+    },
+    days: adaptedDays,
+    by_project: [],
+    by_model: [],
+    seven_day_net_usd: 0,
+    seven_day_anomaly_count: 0,
+    fourteen_day_counterfactual_usd: 0,
+    fourteen_day_efficiency_ratio: 0,
+    is_empty: adaptedDays.length === 0,
+  };
+  const cr = activeSource === 'claude' ? env?.cache_report : adapted;
   // Mobile-driven collapse (< 720 px). The `.cache-report-collapsed`
   // modifier class hides the sparkline + secondary subline via the
   // existing @media rule at index.css:4186 so the panel reads as a
@@ -77,7 +94,9 @@ function ClaudeCacheReportPanel() {
   // sessions-collapsed convention but is viewport-driven (no user pref).
   const isMobile = useIsMobile();
   const collapseClass = isMobile ? ' cache-report-collapsed' : '';
-  const openModal = () => dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
+  const openModal = () => {
+    dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
+  };
   // #293 S4 — the region describes (role=region + aria-label); the Expand
   // button is the sole keyboard/SR open path. The guarded pointer body-click is
   // preserved via cardRegionClick so a nested control / grip never double-fires.
@@ -92,6 +111,7 @@ function ClaudeCacheReportPanel() {
         className={`panel accent-teal${collapseClass}`}
         id="panel-cache-report"
         data-panel-kind="cache-report"
+        data-source={activeSource}
         role="region"
         aria-label="Cache Report"
         onClick={cardRegionClick(openModal)}
@@ -112,7 +132,7 @@ function ClaudeCacheReportPanel() {
             hasn't been built yet; show a loading skeleton body. When NOT
             hydrating, `!cr` is a build-failure/no-cache edge — keep the
             header-only minimal placeholder. */}
-        {env?.hydrating && (
+        {presentationProviders(env, activeSource).hydrating && (
           <div className="panel-body">
             <PanelSkeleton lines={2} />
           </div>
@@ -128,6 +148,7 @@ function ClaudeCacheReportPanel() {
         className={`panel accent-teal${collapseClass}`}
         id="panel-cache-report"
         data-panel-kind="cache-report"
+        data-source={activeSource}
         role="region"
         aria-label="Cache Report"
         onClick={cardRegionClick(openModal)}
@@ -145,7 +166,7 @@ function ClaudeCacheReportPanel() {
         <div className="cr-status-row">
           <span className="cr-glyph thin">−</span>
           <div>
-            <div className="cr-headline">No Claude activity yet</div>
+            <div className="cr-headline">No {activeSource === 'all' ? 'combined' : activeSource === 'codex' ? 'Codex' : 'Claude'} activity yet</div>
             <div className="cr-subline">Run a session to start tracking</div>
           </div>
         </div>
@@ -263,6 +284,7 @@ function ClaudeCacheReportPanel() {
       className={`panel ${accentClass}${collapseClass}`}
       id="panel-cache-report"
       data-panel-kind="cache-report"
+      data-source={activeSource}
       role="region"
       aria-label="Cache Report"
       onClick={cardRegionClick(openModal)}

@@ -73,6 +73,11 @@ def test_classify_coverage_empty_when_all_priced():
     assert pc.classify_coverage(observed, _resolve_claude, _is_codex_fallback) == []
 
 
+def test_classify_coverage_ignores_codex_unattributed_model_sentinel():
+    observed = [("codex", "unknown", 53, 2_485_412)]
+    assert pc.classify_coverage(observed, _resolve_claude, _is_codex_fallback) == []
+
+
 def test_scope_litellm_keeps_only_claude_and_codex_set():
     litellm = {
         "claude-3-5-haiku-latest": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-6},
@@ -499,6 +504,17 @@ def test_pricing_check_offline_finding_exit1(tmp_path):
     doc = _json.loads(r.stdout)
     assert any(g["kind"] == "unpriced" and g["model"] == "claude-totally-made-up-9000"
                for g in doc["coverage"]), doc
+
+
+def test_pricing_check_offline_ignores_codex_unattributed_model_sentinel(tmp_path):
+    _seed_cache_with_models(
+        tmp_path,
+        codex_models=[("unknown", 2_485_412)],
+        age_days=1,
+    )
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    assert _json.loads(r.stdout)["coverage"] == []
 
 
 def test_pricing_check_offline_today_no_suppressions(tmp_path):

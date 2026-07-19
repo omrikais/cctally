@@ -21,7 +21,7 @@
 // a11y (spec §12.4): role="dialog" aria-modal="true"
 // aria-labelledby="share-modal-title". The close button is reachable via
 // Esc as a backstop even if the user has tabbed past it.
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { SharePanelId, ShareOptions, ShareTemplate } from './types';
 import { SELECTION_LABEL } from './types';
 import type { DashboardSelection } from '../types/envelope';
@@ -34,9 +34,14 @@ import { PresetDropdown } from './PresetDropdown';
 import { ManagePresetsModal } from './ManagePresetsModal';
 import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
+import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { useIsMobile } from '../hooks/useIsMobile';
-import { getState } from '../store/store';
+import {
+  getState,
+  subscribeStore,
+  topmostStoreFocusLayer,
+} from '../store/store';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ModalCloseButton } from '../modals/ModalCloseButton';
 
@@ -86,6 +91,7 @@ function mergeOptions(base: ShareOptions, override: Partial<ShareOptions> | unde
 }
 
 export function ShareModal({ panel, source = 'claude', onClose, initialParams }: Props) {
+  const cardRef = useRef<HTMLDivElement>(null);
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -115,6 +121,19 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
   // M1-1: lock background page scroll. ShareModal mounts only when
   // ShareModalRoot's slot is non-null, so it's always "open" when mounted.
   useScrollLock(true);
+
+  // Share is a store-tracked layer above panel/source-detail modals. Move focus
+  // to its heading on mount and own Tab only while it remains topmost (the
+  // composer can layer above it). ShareModalRoot retains trigger restoration.
+  const trapEnabled = useSyncExternalStore(
+    subscribeStore,
+    () => topmostStoreFocusLayer(getState()) === 'share',
+  );
+  useModalFocus(cardRef, {
+    active: true,
+    trapEnabled,
+    initialFocus: 'heading',
+  });
 
   // SHARE-1 (#293 S4): on phone the Live preview leads the body so editing any
   // top-of-stack knob gives immediate feedback. `.share-preview-col` is nested
@@ -212,6 +231,7 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
 
   return (
     <div
+      ref={cardRef}
       className="share-modal"
       role="dialog"
       aria-modal="true"
@@ -280,6 +300,7 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
             <div className="share-preview-col" aria-label="Live preview">
               <PreviewPane
                 panel={panel}
+                source={source}
                 templateId={selectedTemplateId}
                 options={options}
               />

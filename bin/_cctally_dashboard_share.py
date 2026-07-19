@@ -1404,6 +1404,8 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         raise ValueError("source capability unavailable")
     required_domain = {
         "current-week": "hero",
+        "trend": "periods",
+        "forecast": "quota",
         "daily": "periods",
         "monthly": "periods",
         "weekly": "periods",
@@ -1425,14 +1427,47 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         source_rows = all_rows[-1:] if all_rows else ()
         command = "codex-weekly"
         display_tz = str(weekly.get("display_tz") or "UTC")
-    elif panel in ("daily", "monthly", "weekly"):
+    elif panel in ("daily", "monthly", "weekly", "trend"):
         periods = data.get("periods")
-        panel_data = periods.get(panel) if isinstance(periods, Mapping) else {}
+        period_key = "weekly" if panel == "trend" else panel
+        panel_data = periods.get(period_key) if isinstance(periods, Mapping) else {}
         if not isinstance(panel_data, Mapping):
             raise ValueError("source capability unavailable")
         source_rows = tuple(panel_data.get("rows", ()))
-        command = f"codex-{panel}"
+        command = f"codex-{period_key}"
         display_tz = str(panel_data.get("display_tz") or "UTC")
+    elif panel == "forecast":
+        quota = data.get("quota")
+        panel_data = quota if isinstance(quota, Mapping) else {}
+        source_rows = tuple(panel_data.get("histories", ())) if isinstance(panel_data, Mapping) else ()
+        start, end = _share_codex_period_bounds(
+            state=state, panel="weekly", options=options, rows=source_rows,
+        )
+        rows = []
+        for row in source_rows:
+            if not isinstance(row, Mapping):
+                continue
+            forecast = row.get("forecast") if isinstance(row.get("forecast"), Mapping) else {}
+            current = row.get("current_percent")
+            projected = forecast.get("projected_percent")
+            rows.append(ls.Row(cells={
+                "limit": ls.TextCell(str(row.get("label") or "Codex quota")),
+                "current": ls.TextCell("—" if current is None else f"{float(current):.1f}%"),
+                "projected": ls.TextCell("—" if projected is None else f"{float(projected):.1f}%"),
+            }))
+        return ls.ShareSnapshot(
+            cmd="codex-quota", title="Codex Quota Forecast", subtitle=None,
+            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            columns=(
+                ls.ColumnSpec(key="limit", label="Limit"),
+                ls.ColumnSpec(key="current", label="Current", align="right"),
+                ls.ColumnSpec(key="projected", label="Projected", align="right"),
+            ),
+            rows=tuple(rows), chart=None, totals=(), notes=(), generated_at=end,
+            version=sys.modules["cctally"]._share_resolve_version(),
+            template_id=template_id, source="codex", source_label="Codex",
+            availability=availability, availability_reason=reason,
+        )
     elif panel == "sessions":
         panel_data = data.get(panel) if isinstance(data.get(panel), Mapping) else {}
         source_rows = tuple(panel_data.get("rows", ())) if isinstance(panel_data, Mapping) else ()

@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.74.0] - 2026-07-19
+
+### Fixed
+- Dashboard Daily, Weekly, and Monthly details now use the same bounded history density across Claude, Codex, and All sources—30 days, 12 weeks, and 8 months—with compact date labels and contained mobile tables; Codex Blocks remains explicitly unavailable when native 5-hour activity does not exist. (#319)
+- Dashboard Trend, Projects, Cache Report, Forecast, and Alerts details now keep their canonical composed structure for Codex and All sources, show provider-native values or explicit unavailable reasons in every slot, and route provider-qualified project rows through the source-bound detail foundation. (#319)
+- Dashboard source-qualified Session and Project details now preserve Codex accounting totals when project metadata is incomplete; the combined source retains server-issued Claude Block identities and opens the canonical Block modal; source details share the standard focus, Escape, return-focus, and scroll-lock lifecycle; and desktop Share previews retain the captured provider. (#319)
+- Codex accounting no longer double-counts parent token events copied into a forked/subagent rollout before its first model context. Those records remain available to the physical conversation reader but are excluded from accounting; cache migration 027 safely replays retained Codex rollouts to remove existing `unknown` duplicates. Consequently, `cctally pricing-check` and `doctor` no longer report those ingest artifacts as a missing embedded price, while real unknown model IDs remain actionable. The complete scoped OpenAI model set and tracked rates were reverified against the live pricing sources, and the embedded pricing snapshot date is now 2026-07-19.
+- Dashboard Codex Weekly rows now follow observed native seven-day quota-cycle re-anchors instead of calendar weeks, collapsing reset jitter and clipping an older cycle when OpenAI grants an early reset. Codex quota forecasts now use elapsed native-cycle pace rather than activity-only bursts, avoiding misleading projections pinned at 100%. (#312)
+- Dashboard Codex source reads now retain accounting, quota, budget, session, and forensics panels when retained historical rows still lack project attribution. The cache replay path repairs this metadata when possible; until then the source is fresh-but-partial and disables Projects only, with a rebuild remedy. (#312)
+- Dashboard Codex hero cost and token counters now cover the active native seven-day reset cycle, rather than an unrelated calendar slice. A missing or conflicting active seven-day boundary leaves quota and budget visible while clearly marking the hero unavailable; Codex panels regain bounded native chrome and source warnings degrade only the affected domain. (#312)
+
 ## [1.73.0] - 2026-07-18
 
 ### Added

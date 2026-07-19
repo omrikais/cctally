@@ -17,20 +17,12 @@ beforeEach(() => {
 // / forecast are hidden (visible: sessions, projects, daily, weekly, monthly,
 // blocks, alerts).
 describe('SWAP_PANELS — visible-list indexing with full-order write-back (§6.11)', () => {
-  it('Codex: swapping the 3rd visible (daily) forward lands on weekly and keeps hidden panels put', () => {
+  it('Codex: swapping uses the same full canonical positions as Claude', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    // visible index 2 = daily (a medium-row card); direction +1 → next medium
-    // visible = weekly (visible index 3).
+    // index 2 = projects; direction +1 stays within the tall row and clamps.
     dispatch({ type: 'SWAP_PANELS', index: 2, direction: 1 });
     const order = getState().prefs.panelOrder;
-    expect(order).toEqual([
-      'sessions', 'trend', 'projects', 'weekly', 'cache-report',
-      'daily', 'monthly', 'blocks', 'forecast', 'alerts',
-    ]);
-    // Hidden panels held their absolute indices.
-    expect(order[FULL.indexOf('trend')]).toBe('trend');
-    expect(order[FULL.indexOf('cache-report')]).toBe('cache-report');
-    expect(order[FULL.indexOf('forecast')]).toBe('forecast');
+    expect(order).toEqual(FULL);
     expect([...order].sort()).toEqual([...FULL].sort());
   });
 
@@ -44,14 +36,12 @@ describe('SWAP_PANELS — visible-list indexing with full-order write-back (§6.
 });
 
 describe('REORDER_PANELS — visible-list indexing with full-order write-back (§6.11)', () => {
-  it('Codex: reordering visible sessions→projects slot preserves hidden trend', () => {
+  it('Codex: reordering sessions→trend uses the same canonical slots', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    // Move visible[0] (sessions) to visible[1] (projects' slot).
+    // Move canonical[0] (sessions) to canonical[1] (trend's slot).
     dispatch({ type: 'REORDER_PANELS', from: 0, to: 1 });
     const order = getState().prefs.panelOrder;
-    // trend (hidden) stays at index 1; the two visibles swap around it.
-    expect(order[FULL.indexOf('trend')]).toBe('trend');
-    expect(order.indexOf('projects')).toBeLessThan(order.indexOf('sessions'));
+    expect(order.slice(0, 3)).toEqual(['trend', 'sessions', 'projects']);
     expect([...order].sort()).toEqual([...FULL].sort());
   });
 

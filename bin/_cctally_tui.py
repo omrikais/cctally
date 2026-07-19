@@ -227,6 +227,7 @@ from _lib_fmt import stable_sum
 # shared no-op singleton), so the _tui_build_snapshot seam wraps below cost
 # nothing on the default path.
 import _lib_perf as _perf
+import _lib_log
 
 import importlib.util as _ilu
 
@@ -261,7 +262,6 @@ from _lib_forecast import _compute_forecast, ForecastInputs, ForecastOutput, Bud
 _ensure_sibling_loaded("_lib_dashboard_sources")
 _ensure_sibling_loaded("_cctally_dashboard_sources")
 from _cctally_dashboard_sources import (
-    CodexProjectionIncoherent,
     DashboardReadContext,
     build_codex_source_state,
     refresh_codex_source_clock,
@@ -2520,8 +2520,18 @@ def _tui_build_source_bundle(
                 else unavailable_source_state("codex", warning)
             )
         else:
-            codex = reuse_coherent_source_state(
-                prior_codex, data_version=codex_version,
+            # Projection coherence can recover when S2 writes its certificate
+            # without changing physical accounting.  A current, hero-scoped
+            # incoherence generation is intentionally not retained through
+            # that repair opportunity; all other fresh partial states remain
+            # eligible for exact reuse.
+            codex = (
+                None if prior_codex is not None and any(
+                    warning.code == "codex_projection_incoherent"
+                    for warning in prior_codex.warnings
+                ) else reuse_coherent_source_state(
+                    prior_codex, data_version=codex_version,
+                )
             )
         if codex is None:
             try:
@@ -2539,18 +2549,11 @@ def _tui_build_source_bundle(
                     ),
                     data_version=codex_version,
                 )
-            except CodexProjectionIncoherent:
-                warning = SourceDashboardWarning(
-                    "codex_projection_incoherent",
-                    "Codex quota projection is unavailable.",
-                    "quota",
-                )
-                codex = (
-                    degrade_source_state(prior_codex, warning)
-                    if prior_codex is not None
-                    else unavailable_source_state("codex", warning)
-                )
             except Exception:
+                _lib_log.get_logger("dashboard").error(
+                    "codex_read_model source build failed",
+                    exc_info=True,
+                )
                 warning = SourceDashboardWarning(
                     "source_build_failed", "Source data could not be built.", "read_model",
                 )

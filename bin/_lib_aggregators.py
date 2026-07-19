@@ -42,7 +42,7 @@ import os
 import pathlib
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 
 def _cctally():
@@ -414,6 +414,17 @@ class CodexSessionUsage:
     codex_root: str = ""
 
 
+@dataclass(frozen=True)
+class CodexSessionIdentity:
+    """Caller-supplied identity for the pure Codex session accumulator."""
+
+    group_key: tuple[str, str]
+    session_id_path: str
+    session_file: str
+    directory: str
+    codex_root: str
+
+
 @dataclass
 class ClaudeSessionUsage:
     """Aggregated Claude usage for one sessionId (may span multiple JSONL files)."""
@@ -619,41 +630,19 @@ def _codex_home_root_from_prefix(root_prefix: str) -> str:
     return s
 
 
-def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard") -> list[CodexSessionUsage]:
-    """Group by session file path (upstream-compatible).
-
-    Sessions are keyed by the full relative-path-without-.jsonl rather than
-    the inner UUID. Result is sorted by last_activity descending (most
-    recent first), matching upstream's default view.
-
-    Per-model breakdowns include `isFallback: bool` — true when the model is
-    absent from CODEX_MODEL_PRICING.
-    """
+def _aggregate_codex_sessions_keyed(
+    entries: Iterable[tuple[CodexEntry, CodexSessionIdentity]],
+    speed: str = "standard",
+) -> list[CodexSessionUsage]:
+    """Pure Codex session arithmetic over caller-owned file identities."""
     by_session: dict[tuple[str, str], dict[str, Any]] = {}
-    for entry in entries:
-        id_path, file_name, directory = _session_path_parts(entry.source_path)
-        # Disambiguate identical relative paths under DIFFERENT $CODEX_HOME
-        # roots (issue #108). _session_path_parts strips the matched root, so
-        # <rootA>/sessions/2026/04/17/rollout-x.jsonl and the same relative
-        # path under <rootB> both yield id_path "2026/04/17/rollout-x";
-        # grouping on id_path alone would silently merge two distinct sessions
-        # (summed tokens, one UUID). Key on (root_prefix, id_path), where
-        # root_prefix is source_path with the id_path tail removed. Single-root
-        # data — and the bare-relative fixture form — has a constant prefix, so
-        # the grouping, insertion order, and every golden stay byte-identical;
-        # only a genuine cross-root collision splits into separate rows.
-        suffix = id_path + ".jsonl"
-        sp = entry.source_path
-        root_prefix = sp[: -len(suffix)] if sp.endswith(suffix) else sp
-        sess = by_session.setdefault((root_prefix, id_path), {
+    for entry, identity in entries:
+        sess = by_session.setdefault(identity.group_key, {
             "session_id_uuid": entry.session_id,
-            "session_id_path": id_path,
-            "session_file": file_name,
-            "directory": directory,
-            # Matched $CODEX_HOME root (home-root form) — issue #110 display
-            # disambiguator. Derived from the same root_prefix that keys the
-            # group, so it's constant per group.
-            "codex_root": _codex_home_root_from_prefix(root_prefix),
+            "session_id_path": identity.session_id_path,
+            "session_file": identity.session_file,
+            "directory": identity.directory,
+            "codex_root": identity.codex_root,
             "input": 0, "cached_input": 0, "output": 0, "reasoning": 0,
             "cost": 0.0, "models": {}, "models_order": [],
             "last": entry.timestamp,
@@ -722,6 +711,31 @@ def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard"
         ))
     result.sort(key=lambda x: x.last_activity, reverse=True)
     return result
+
+
+def _aggregate_codex_sessions(entries: list[CodexEntry], speed: str = "standard") -> list[CodexSessionUsage]:
+    """Group CLI Codex entries by their existing filesystem-derived identity.
+
+    The wrapper preserves the historic CLI path parsing and byte-stable output;
+    only the accumulation itself lives in the keyed pure seam above.
+    """
+    keyed: list[tuple[CodexEntry, CodexSessionIdentity]] = []
+    for entry in entries:
+        id_path, file_name, directory = _session_path_parts(entry.source_path)
+        # Disambiguate equal relative paths under separate configured roots.
+        suffix = id_path + ".jsonl"
+        source_path = entry.source_path
+        root_prefix = (
+            source_path[: -len(suffix)] if source_path.endswith(suffix) else source_path
+        )
+        keyed.append((entry, CodexSessionIdentity(
+            group_key=(root_prefix, id_path),
+            session_id_path=id_path,
+            session_file=file_name,
+            directory=directory,
+            codex_root=_codex_home_root_from_prefix(root_prefix),
+        )))
+    return _aggregate_codex_sessions_keyed(keyed, speed=speed)
 
 
 def _aggregate_claude_sessions(

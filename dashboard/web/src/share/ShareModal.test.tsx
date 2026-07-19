@@ -8,7 +8,7 @@
 // hasTouch Playwright gate); the DOM ORDER is the real, non-vacuous thing to
 // assert here. Non-vacuous: with the reorder absent, the mobile branch renders
 // the desktop knobs-first order and the "preview precedes knobs" case is RED.
-import { render, act } from '@testing-library/react';
+import { render, act, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShareModalRoot } from './ShareModalRoot';
 import { _resetForTests, dispatch } from '../store/store';
@@ -99,5 +99,20 @@ describe('#293 S4 SHARE-1 — mobile preview-first render reorder', () => {
     stubMatchMedia(true);
     await openShare();
     expect(document.querySelectorAll('.share-preview-col').length).toBe(1);
+  });
+
+  it('desktop preview renders the source captured when the share flow opened', async () => {
+    stubMatchMedia(false);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    await openShare();
+
+    await waitFor(() => {
+      const renderCall = (fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+        ([url]) => typeof url === 'string' && url.includes('/api/share/render'),
+      );
+      expect(renderCall).toBeDefined();
+      const body = JSON.parse((renderCall?.[1] as RequestInit).body as string);
+      expect(body.source).toBe('codex');
+    });
   });
 });

@@ -15,9 +15,10 @@ import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
 
 export interface CacheReportSpotlightProps {
   cr: CacheReportEnvelope;
+  nativeCacheOnly?: boolean;
 }
 
-export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
+export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheReportSpotlightProps) {
   const insufficient =
     cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
   // Insufficient baseline takes precedence over anomaly_triggered: during
@@ -43,6 +44,9 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
     pill = { text: '⚠ Anomaly', cls: '' };
   } else {
     pill = { text: '✓ Healthy', cls: 'ok' };
+  }
+  if (nativeCacheOnly) {
+    pill = { text: 'Provider cache reuse', cls: 'ok' };
   }
 
   const median = cr.today.baseline_median_percent;
@@ -73,24 +77,26 @@ export function CacheReportSpotlight({ cr }: CacheReportSpotlightProps) {
           <span className={`pill${pill.cls ? ' ' + pill.cls : ''}`}>{pill.text}</span>
           <span>
             <span className="k">Cache hit</span>{' '}
-            <strong>{fmt.pctFloor(cr.today.cache_hit_percent)}%</strong>
+            <strong>
+              {nativeCacheOnly && cr.days.length === 0
+                ? <span className="m-unavailable">Unavailable</span>
+                : `${fmt.pctFloor(cr.today.cache_hit_percent)}%`}
+            </strong>
           </span>
           <span>
             <span className="k">14d median</span>{' '}
-            <strong>{median !== null ? `${fmt.pctFloor(median)}%` : '—'}</strong>
+            <strong>{median !== null ? `${fmt.pctFloor(median)}%` : <span className="m-unavailable">Unavailable</span>}</strong>
           </span>
           <span>
-            <span className="k">Δ</span> <strong>{deltaText}</strong>
+            <span className="k">Δ</span> <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : deltaText}</strong>
           </span>
           <span>
             <span className="k">Net</span>{' '}
-            <strong>{fmt.usdSigned(cr.today.net_usd)}</strong>
+            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : fmt.usdSigned(cr.today.net_usd)}</strong>
           </span>
           <span>
             <span className="k">Saved / Wasted</span>{' '}
-            <strong>
-              ${cr.today.saved_usd.toFixed(2)} / ${cr.today.wasted_usd.toFixed(2)}
-            </strong>
+            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : `$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`}</strong>
           </span>
         </div>
         {anomalous && cr.today.anomaly_reasons.length > 0 && (

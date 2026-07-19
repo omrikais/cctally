@@ -151,26 +151,22 @@ function trendLeakEnv(): Envelope {
 }
 
 describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () => {
-  it('Codex mode renders NO trend rows and no Claude trend panel', () => {
+  it('Codex mode renders the shared trend visualization with Codex weekly cost', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     const { container } = render(<TrendPanel />);
-    expect(container.querySelector('#panel-trend')).toBeNull();
-    expect(container.querySelectorAll('.trend-table tbody tr').length).toBe(0);
+    expect(container.querySelector('#panel-trend[data-source="codex"]')).not.toBeNull();
+    expect(container.querySelector('.trend-chart')).not.toBeNull();
+    expect(container.querySelectorAll('.trend-table tbody tr').length).toBeGreaterThan(0);
   });
 
-  it('All mode wraps the Claude trend in a Claude-labeled provider section (no Codex section)', () => {
+  it('All mode renders one shared trend shell with combined rows', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<TrendPanel />);
-    const section = container.querySelector('.source-provider-section[data-source="claude"]');
-    expect(section).not.toBeNull();
-    expect(section!.querySelector('.source-chip')?.textContent).toBe('Claude');
-    // The real trend table renders inside the Claude section.
-    expect(section!.querySelector('#panel-trend')).not.toBeNull();
-    expect(section!.querySelectorAll('.trend-table tbody tr').length).toBe(3);
-    // Codex has no trend path → no Codex section.
-    expect(container.querySelector('.source-provider-section[data-source="codex"]')).toBeNull();
+    expect(container.querySelectorAll('#panel-trend')).toHaveLength(1);
+    expect(container.querySelector('#panel-trend[data-source="all"]')).not.toBeNull();
+    expect(container.querySelector('.source-provider-section')).toBeNull();
   });
 
   it('Claude mode still renders the trend table through the wrap (transparent)', () => {

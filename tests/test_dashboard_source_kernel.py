@@ -42,6 +42,7 @@ def _provider_state(
     cost_usd: float = 0.0,
     total_tokens: int = 0,
     alerts: tuple[dict[str, object], ...] = (),
+    hero_capability: CapabilityRecord | None = None,
 ) -> SourceDashboardState:
     return SourceDashboardState(
         source=source,
@@ -50,7 +51,10 @@ def _provider_state(
         warnings=(),
         data_version=f"{source}-version",
         last_success_at=dt.datetime(2026, 7, 16, tzinfo=UTC),
-        capabilities={"quota": CapabilityRecord("supported", "native-windows")},
+        capabilities={
+            "hero": hero_capability or CapabilityRecord("supported", "native-reset-cycle"),
+            "quota": CapabilityRecord("supported", "native-windows"),
+        },
         data={
             "hero": {"cost_usd": cost_usd, "total_tokens": total_tokens},
             "quota": {"label": f"{source} native quota"},
@@ -187,6 +191,52 @@ def test_all_composition_never_blends_current_and_stale_provider_data(
     assert combined.freshness == "stale"
     assert combined.data["combined"] is None
     assert set(combined.data["providers"]) == {"claude", "codex"}
+
+
+def test_fresh_partial_provider_is_reusable_and_contributes_all_totals():
+    codex = _provider_state(
+        "codex", availability="partial", freshness="fresh", cost_usd=2.0, total_tokens=20,
+    )
+    claude = _provider_state(
+        "claude", availability="ok", freshness="fresh", cost_usd=1.0, total_tokens=10,
+    )
+
+    assert source_kernel.reuse_coherent_source_state(
+        codex, data_version=codex.data_version,
+    ) is codex
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert (combined.availability, combined.freshness) == ("partial", "fresh")
+    assert combined.data["combined"] == {"cost_usd": 3.0, "total_tokens": 30}
+
+
+def test_all_composition_keeps_fresh_provider_sections_when_codex_hero_is_unavailable():
+    claude = _provider_state("claude", cost_usd=1.0, total_tokens=10)
+    codex = _provider_state(
+        "codex",
+        availability="partial",
+        freshness="fresh",
+        cost_usd=None,
+        total_tokens=None,
+        hero_capability=CapabilityRecord("unavailable", "missing-or-conflicting-native-cycle"),
+    )
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert combined.availability == "partial"
+    assert combined.freshness == "fresh"
+    assert combined.data["combined"] is None
+    assert set(combined.data["providers"]) == {"claude", "codex"}
+
+
+def test_stale_partial_provider_is_not_reusable_or_composable():
+    codex = _provider_state(
+        "codex", availability="partial", freshness="stale", cost_usd=2.0, total_tokens=20,
+    )
+
+    assert source_kernel.reuse_coherent_source_state(
+        codex, data_version=codex.data_version,
+    ) is None
 
 
 def test_all_composition_reports_both_empty_as_successful_empty_data():

@@ -95,11 +95,12 @@ describe('#248 Task 5 — Forecast calm tile', () => {
   });
 
   it('OVER (capped) renders ⛔ + red escalation', () => {
-    const { container } = renderFor('capped');
+    const { container } = renderFor('capped', 100);
     const chip = container.querySelector('.fc-verdict-chip');
     expect(chip?.textContent).toContain('⛔');
     expect(chip?.className).toContain('is-over');
     expect(container.querySelector('.fc-accent-edge')).not.toBeNull();
+    expect(container.querySelector('.fc-num')?.textContent).toContain('≥100%');
     const section = container.querySelector('[data-panel-kind="forecast"]');
     expect(section?.className).toContain('fc-esc-over');
   });
@@ -161,24 +162,21 @@ describe('ForecastPanel source seam — no Claude leak under Codex (#294 S5)', (
     _resetForTests();
   });
 
-  it('Codex mode renders NO forecast values and no Claude forecast tile', () => {
+  it('Codex mode renders the shared forecast tile from native quota forecast', () => {
     updateSnapshot(forecastLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     const { container } = render(<ForecastPanel />);
-    expect(container.querySelector('[data-panel-kind="forecast"]')).toBeNull();
-    expect(container.querySelector('.fc-num')).toBeNull();
+    expect(container.querySelector('[data-panel-kind="forecast"][data-source="codex"]')).not.toBeNull();
+    expect(container.querySelector('.fc-num')).not.toBeNull();
   });
 
-  it('All mode wraps the Claude forecast tile in a Claude-labeled provider section (no Codex section)', () => {
+  it('All mode renders one shared forecast shell', () => {
     updateSnapshot(forecastLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<ForecastPanel />);
-    const section = container.querySelector('.source-provider-section[data-source="claude"]');
-    expect(section).not.toBeNull();
-    expect(section!.querySelector('.source-chip')?.textContent).toBe('Claude');
-    expect(section!.querySelector('[data-panel-kind="forecast"]')).not.toBeNull();
-    expect(section!.querySelector('.fc-num')?.textContent).toContain('88%');
-    expect(container.querySelector('.source-provider-section[data-source="codex"]')).toBeNull();
+    expect(container.querySelectorAll('[data-panel-kind="forecast"]')).toHaveLength(1);
+    expect(container.querySelector('[data-source="all"]')).not.toBeNull();
+    expect(container.querySelector('.source-provider-section')).toBeNull();
   });
 
   it('Claude mode still renders the forecast tile through the wrap (transparent)', () => {

@@ -10,9 +10,9 @@ import type { SessionBookmarks } from './bookmarks';
 import { loadRailPrefs, saveRailPrefs } from './conversationRailPrefs';
 import { clampOutlineWidth, loadOutlineWidth, saveOutlineWidth } from './outlineWidth';
 import {
-  applySessionFilter,
   computeSearchMatches,
   ctxFromEnvelope,
+  applySessionFilter,
   sessionComparator,
 } from './selectors';
 import { DEFAULT_PANEL_ORDER, CARD_LAYOUT, type GridPanelId } from '../lib/panelIds';
@@ -42,6 +42,7 @@ import { resolveSourceView } from './sourceView';
 import { deriveVisiblePanelOrder, mapVisibleReorderToFull } from '../lib/visiblePanelOrder';
 import {
   applySourceSessionFilter,
+  adaptClaudeSessionRows,
   collectSourceSessionRows,
   computeSourceSessionMatches,
   type SessionDisplayRow,
@@ -412,6 +413,10 @@ export interface UIState {
   // churn). Accumulate-only (never shrinks); not persisted.
   conversationTitles: Record<string, string>;
   openModal: ModalKind | null;
+  // Source captured when a legacy panel modal opens. Source switches update the
+  // board only; an already-open modal and any share action it launches remain
+  // bound to the initiating selection.
+  openModalSource: DashboardSelection | null;
   openSessionId: string | null;
   openBlockStartAt: string | null;
   openDailyDate: string | null;
@@ -538,6 +543,10 @@ export interface UIState {
   // legacy `openSessionId`/`openBlockStartAt` fields (which stay the Claude
   // legacy-route path).
   openSourceDetail: { source: SourceName; resource: SourceResource; key: string } | null;
+  // Dashboard selection captured when the qualified detail opens. This can be
+  // `all` even though the route itself is provider-qualified, and keeps a
+  // modal-launched share action stable across a later board source switch.
+  openSourceDetailSelection: DashboardSelection | null;
   // #294 S5 §6.3 — the header-click sort override for the source-aware Sessions
   // grid (Codex + All), over the SOURCE_SESSIONS_COLUMNS set (recency / label /
   // total / cost). TRANSIENT (not persisted — no new config key): defaults to
@@ -697,6 +706,7 @@ function loadInitial(): UIState {
     // #227 — empty title cache; filled lazily as the rail browse list loads.
     conversationTitles: {},
     openModal: null,
+    openModalSource: null,
     openSessionId: null,
     openBlockStartAt: null,
     openDailyDate: null,
@@ -728,6 +738,7 @@ function loadInitial(): UIState {
     heroScrolled: false,
     chromeOverlayOpen: 0,
     openSourceDetail: null,
+    openSourceDetailSelection: null,
     // #294 S5 — transient; the source-grid sort defaults to native recency desc.
     sourceSessionsSort: null,
   };
@@ -775,13 +786,14 @@ export function selectLiveTailEnabled(s: UIState = state): boolean {
 // track their open-state in component-local React state and are intentionally
 // NOT seen here — the `useModalFocus` contains-guard covers them (Settings is
 // mutually exclusive with a panel modal, and Help moves focus into itself).
-export type StoreFocusLayer = 'composer' | 'share' | 'update' | 'doctor' | 'panel' | null;
+export type StoreFocusLayer = 'composer' | 'share' | 'update' | 'doctor' | 'source-detail' | 'panel' | null;
 
 export function topmostStoreFocusLayer(s: UIState): StoreFocusLayer {
   if (s.composerModal) return 'composer';
   if (s.shareModal) return 'share';
   if (s.update.modalOpen) return 'update';
   if (s.doctorModalOpen) return 'doctor';
+  if (s.openSourceDetail != null) return 'source-detail';
   if (s.openModal != null) return 'panel';
   return null;
 }
@@ -816,13 +828,26 @@ export function getRenderedRows(s: UIState = state): SessionRow[] {
 // Claude output is preserved because `_recomputeSearch` routes Claude away from
 // this path entirely.
 export function getRenderedSourceRows(s: UIState = state): SessionDisplayRow[] {
-  if (s.activeSource === 'claude') return [];
+  if (s.activeSource === 'claude') {
+    return adaptClaudeSessionRows(getRenderedRows(s).map((row) => ({
+      key: row.session_id,
+      source: 'claude',
+      started_utc: row.started_utc,
+      duration_min: row.duration_min,
+      model: row.model,
+      project: row.project,
+      project_key: row.project_key,
+      cost_usd: row.cost_usd,
+      cache_hit_pct: row.cache_hit_pct,
+      title: row.title,
+    })));
+  }
   const view = resolveSourceView(s.snapshot, s.activeSource);
   const rows = collectSourceSessionRows(view);
   const filtered = applySourceSessionFilter(rows, s.filterText);
   const override = s.sourceSessionsSort;
   const sorted = override
-    ? applyTableSort(filtered, sourceSessionsColumns({ includeSource: s.activeSource === 'all' }), override)
+    ? applyTableSort(filtered, sourceSessionsColumns({ includeSource: s.activeSource === 'all', oneModel: false }), override)
     : filtered.slice().sort(sourceRecencyDescCompare);
   return sorted.slice(0, s.prefs.sessionsPerPage);
 }
@@ -837,10 +862,9 @@ function _recomputeSearch(s: UIState): Pick<UIState, 'searchMatches' | 'searchIn
   // n/N and the in-cell highlight align with what the visible grid paints.
   // Claude keeps the legacy row+haystack path verbatim (byte-identical); Codex /
   // All match over the source display rows (haystack = label + models).
-  const matches =
-    s.activeSource === 'claude'
-      ? computeSearchMatches(getRenderedRows(s), s.searchText, ctxFromEnvelope(s.snapshot))
-      : computeSourceSessionMatches(getRenderedSourceRows(s), s.searchText);
+  const matches = s.activeSource === 'claude'
+    ? computeSearchMatches(getRenderedRows(s), s.searchText, ctxFromEnvelope(s.snapshot))
+    : computeSourceSessionMatches(getRenderedSourceRows(s), s.searchText);
   if (matches.length === 0) return { searchMatches: [], searchIndex: -1 };
   const idx =
     s.searchIndex < 0 || s.searchIndex >= matches.length ? 0 : s.searchIndex;
@@ -1070,6 +1094,7 @@ export type Action =
 // Esc staying view-agnostic (#156) is the belt; clearing here is the suspenders.
 const DISMISSED_ON_VIEW_SWITCH = {
   openModal: null,
+  openModalSource: null,
   openSessionId: null,
   openBlockStartAt: null,
   openDailyDate: null,
@@ -1078,6 +1103,7 @@ const DISMISSED_ON_VIEW_SWITCH = {
   composerModal: null,
   // #294 S5 — the qualified source-detail modal is a transient overlay too.
   openSourceDetail: null,
+  openSourceDetailSelection: null,
 } satisfies Partial<UIState>;
 
 export function dispatch(action: Action): void {
@@ -1086,6 +1112,7 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         openModal: action.kind,
+        openModalSource: state.activeSource,
         openSessionId: action.sessionId ?? null,
         openBlockStartAt: action.blockStartAt ?? null,
         openDailyDate: action.dailyDate ?? null,
@@ -1096,6 +1123,7 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         openModal: null,
+        openModalSource: null,
         openSessionId: null,
         openBlockStartAt: null,
         openDailyDate: null,
@@ -1109,10 +1137,10 @@ export function dispatch(action: Action): void {
       if (state.activeSource === action.source) break;
       saveActiveSource(action.source);
       {
-        // A source switch closes any open qualified detail (its key belongs to
-        // the prior source's rows). Recompute search matches over the new
-        // source's rendered rows so an active `/` needle + n/N stay coherent.
-        const next = { ...state, activeSource: action.source, openSourceDetail: null };
+        // Qualified details carry their physical source and remain bound while
+        // the board switches behind them. Recompute only the board search
+        // indices; the open modal continues to read its captured key/source.
+        const next = { ...state, activeSource: action.source };
         state = { ...next, ..._recomputeSearch(next) };
       }
       break;
@@ -1120,11 +1148,12 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         openSourceDetail: { source: action.source, resource: action.resource, key: action.key },
+        openSourceDetailSelection: state.activeSource,
       };
       break;
     case 'CLOSE_SOURCE_DETAIL':
       if (state.openSourceDetail == null) break;
-      state = { ...state, openSourceDetail: null };
+      state = { ...state, openSourceDetail: null, openSourceDetailSelection: null };
       break;
     case 'SET_SOURCE_SESSIONS_SORT': {
       // Header-click sort reorders the source grid's rendered rows; search
@@ -1894,7 +1923,7 @@ export function dispatch(action: Action): void {
       // for the flow's lifetime — no restamp mid-flow.
       const enriched: ShareAction =
         action.type === 'OPEN_SHARE'
-          ? { ...action, source: action.source ?? state.activeSource }
+          ? { ...action, source: action.source ?? (state.openModal != null ? state.openModalSource : null) ?? state.activeSource }
           : action;
       const slice = shareReducer(
         { shareModal: state.shareModal, composerModal: state.composerModal },

@@ -1,8 +1,14 @@
-import { useSyncExternalStore } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSourceDetail } from '../hooks/useSourceDetail';
 import { fmt } from '../lib/fmt';
+import { ShareIcon } from '../components/ShareIcon';
+import { SELECTION_LABEL, type SharePanelId } from '../share/types';
+import { Modal } from './Modal';
 import type {
+  ClaudeBlockDetailBody,
+  ClaudeProjectDetailBody,
+  ClaudeSessionDetailBody,
   CodexBlockDetailBody,
   CodexProjectDetailBody,
   CodexSessionDetailBody,
@@ -17,14 +23,17 @@ import type {
 
 export function SourceDetailModal() {
   const open = useSyncExternalStore(subscribeStore, () => getState().openSourceDetail);
+  const selection = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openSourceDetailSelection ?? getState().activeSource,
+  );
   const detail = useSourceDetail<SourceDetailBody>(
     open?.source ?? 'codex',
     open?.resource ?? 'session',
     open?.key ?? null,
   );
+  const close = useCallback(() => dispatch({ type: 'CLOSE_SOURCE_DETAIL' }), []);
   if (open == null) return null;
-
-  const close = () => dispatch({ type: 'CLOSE_SOURCE_DETAIL' });
 
   let body: React.ReactNode;
   if (detail.loading && detail.data == null) {
@@ -43,54 +52,83 @@ export function SourceDetailModal() {
     body = <SourceDetailBodyView data={detail.data} />;
   }
 
+  const panel = open.resource === 'session' ? 'sessions' : `${open.resource}s` as SharePanelId;
+  const resourceLabel = `${open.resource[0].toUpperCase()}${open.resource.slice(1)}`;
   return (
-    <div
-      className="source-detail-backdrop"
-      onClick={close}
-      role="presentation"
-      data-testid="source-detail-modal"
+    <Modal
+      title={`${SELECTION_LABEL[open.source]} ${open.resource}`}
+      accentClass={open.resource === 'project' ? 'accent-orange' : 'accent-cyan'}
+      dataSource={open.source}
+      onClose={close}
+      focusLayer="source-detail"
+      rootId="source-detail-root"
+      titleId="source-detail-title"
+      bodyId="source-detail-body"
+      rootTestId="source-detail-modal"
+      cardClassName="source-detail-card"
+      headerExtras={(
+        <ShareIcon
+          panel={panel}
+          panelLabel={resourceLabel}
+          triggerId="source-detail-share"
+          onClick={() => dispatch({
+            type: 'OPEN_SHARE',
+            panel,
+            triggerId: 'source-detail-share',
+            source: selection,
+          })}
+        />
+      )}
     >
-      <div
-        className="source-detail-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Source detail"
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === 'Escape') {
-            e.stopPropagation();
-            close();
-          }
-        }}
-      >
-        <button type="button" className="source-detail-close" aria-label="Close" onClick={close}>
-          ×
-        </button>
-        {body}
-      </div>
-    </div>
+      {body}
+    </Modal>
   );
 }
 
 function SourceDetailBodyView({ data }: { data: SourceDetailBody }) {
   switch (data.detail_kind) {
+    case 'claude_session':
+      return <ClaudeSessionDetailView d={data} />;
+    case 'claude_project':
+      return <ClaudeProjectDetailView d={data} />;
+    case 'claude_block':
+      return <ClaudeBlockDetailView d={data} />;
     case 'codex_session':
       return <CodexSessionDetailView d={data} />;
     case 'codex_project':
       return <CodexProjectDetailView d={data} />;
     case 'codex_block':
       return <CodexBlockDetailView d={data} />;
-    default:
-      // Claude bodies are handled by the legacy modals in S5; the qualified
-      // path here is exercised by the Codex/All source rows.
-      return <p className="sd-generic">{data.detail_kind}</p>;
   }
+}
+
+function ClaudeSessionDetailView({ d }: { d: ClaudeSessionDetailBody }) {
+  return (
+    <div className="sd-claude-session">
+      <dl className="sd-tokens">
+        <div><dt>Cost</dt><dd>{fmt.usd2(d.cost_total_usd)}</dd></div>
+        <div><dt>Input</dt><dd>{fmt.tokens(d.input_tokens)}</dd></div>
+        <div><dt>Cache write</dt><dd>{fmt.tokens(d.cache_creation_tokens)}</dd></div>
+        <div><dt>Cache read</dt><dd>{fmt.tokens(d.cache_read_tokens)}</dd></div>
+        <div><dt>Output</dt><dd>{fmt.tokens(d.output_tokens)}</dd></div>
+        <div><dt>Duration</dt><dd>{d.duration_min == null ? '—' : `${d.duration_min}m`}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
+function ClaudeProjectDetailView({ d }: { d: ClaudeProjectDetailBody }) {
+  return <div className="sd-claude-project"><p>{d.sessions_total} sessions · {fmt.usd2(d.window_cost_usd)} · {d.window_attributed_pct == null ? 'usage unavailable' : `${d.window_attributed_pct.toFixed(1)}% attributed`}</p></div>;
+}
+
+function ClaudeBlockDetailView({ d }: { d: ClaudeBlockDetailBody }) {
+  return <div className="sd-claude-block"><p>{fmt.usd2(d.cost_usd)} · {fmt.tokens(d.total_tokens)} tokens · {d.is_active ? 'active' : 'complete'}</p></div>;
 }
 
 function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
   return (
     <div className="sd-codex-session" data-testid="codex-session-detail">
-      <h2>Codex session</h2>
+      {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <dl className="sd-tokens">
         <div><dt>Cost</dt><dd>{fmt.usd2(d.cost_usd)}</dd></div>
         <div><dt>Input</dt><dd>{fmt.tokens(d.input_tokens)}</dd></div>
@@ -107,7 +145,7 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
 function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
   return (
     <div className="sd-codex-project" data-testid="codex-project-detail">
-      <h2>Codex project</h2>
+      {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <p>{d.session_count} sessions · {fmt.usd2(d.cost_usd)} · {fmt.tokens(d.total_tokens)} tokens</p>
     </div>
   );
@@ -116,7 +154,7 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
 function CodexBlockDetailView({ d }: { d: CodexBlockDetailBody }) {
   return (
     <div className="sd-codex-block" data-testid="codex-block-detail">
-      <h2>{d.label}</h2>
+      <p className="sd-block-label">{d.label}</p>
       <p>{fmt.pct0(d.current_percent)} · resets {d.resets_at}</p>
     </div>
   );

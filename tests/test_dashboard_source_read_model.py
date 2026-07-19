@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 from _cctally_dashboard_sources import (
-    CodexProjectionIncoherent,
     DashboardReadContext,
     build_codex_source_state,
     codex_projection_coherence,
@@ -29,6 +28,697 @@ START = dt.datetime(2026, 7, 1, tzinfo=UTC)
 NOW = dt.datetime(2026, 7, 20, tzinfo=UTC)
 
 
+def _quota_observation(
+    *,
+    root: str,
+    window_minutes: int,
+    resets_at: dt.datetime,
+    captured_at: dt.datetime = NOW - dt.timedelta(minutes=10),
+    limit_name: str | None = None,
+) -> QuotaObservation:
+    return QuotaObservation(
+        identity=QuotaWindowIdentity(
+            source="codex",
+            source_root_key=root,
+            logical_limit_key="limit",
+            observed_slot="primary",
+            window_minutes=window_minutes,
+            limit_name=limit_name,
+        ),
+        captured_at=captured_at,
+        used_percent=25.0,
+        resets_at=resets_at,
+        source_path=f"/private/{root}.jsonl",
+        line_offset=1,
+    )
+
+
+def test_native_quota_labels_derive_familiar_names_from_duration():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    assert source_module._native_limit_label("  five-hour quota  ", 300) == "five-hour quota"
+    assert source_module._native_limit_label(" Weekly limit ", 10_080) == "Weekly limit"
+    assert source_module._native_limit_label(None, 90) == "90-minute limit"
+
+
+def test_codex_blocks_wire_uses_current_cycle_five_hour_activity_and_models(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    cycle = source_module.CodexCycleBoundary(
+        window_minutes=10_080,
+        start_at=dt.datetime(2026, 7, 13, tzinfo=UTC),
+        resets_at=dt.datetime(2026, 7, 20, tzinfo=UTC),
+        source_root_keys=("root-a",),
+    )
+    try:
+        stats.executemany(
+            "INSERT INTO quota_window_blocks "
+            "(source, source_root_key, logical_limit_key, observed_slot, "
+            "window_minutes, limit_name, resets_at_utc, nominal_start_at_utc, "
+            "first_observed_at_utc, last_observed_at_utc, first_percent, "
+            "current_percent, last_source_path, last_line_offset, generation) "
+            "VALUES ('codex', 'root-a', ?, 'primary', ?, ?, ?, ?, ?, ?, 1, 2, ?, 1, 'g')",
+            (
+                (
+                    "five-hour", 300, "5-hour limit",
+                    "2026-07-18T15:00:00+00:00", "2026-07-18T10:00:00+00:00",
+                    "2026-07-18T10:05:00+00:00", "2026-07-18T14:00:00+00:00",
+                    "/private/five-hour.jsonl",
+                ),
+                (
+                    "weekly", 10_080, "7-day limit",
+                    "2026-07-20T00:00:00+00:00", "2026-07-13T00:00:00+00:00",
+                    "2026-07-13T00:05:00+00:00", "2026-07-18T14:00:00+00:00",
+                    "/private/weekly.jsonl",
+                ),
+            ),
+        )
+        entries = (
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 18, 11, tzinfo=UTC),
+                source_root_key="root-a", model="gpt-5.6-sol", cost_usd=7.0,
+                input_tokens=100, cached_input_tokens=80, output_tokens=10,
+                reasoning_output_tokens=2, total_tokens=110,
+            ),
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 18, 12, tzinfo=UTC),
+                source_root_key="root-a", model="gpt-5.6-terra", cost_usd=3.0,
+                input_tokens=50, cached_input_tokens=20, output_tokens=5,
+                reasoning_output_tokens=1, total_tokens=55,
+            ),
+        )
+
+        rows = source_module._quota_wire(
+            stats,
+            accounting_entries=entries,
+            cycle=cycle,
+            now_utc=dt.datetime(2026, 7, 18, 13, tzinfo=UTC),
+            display_tz_name="UTC",
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["window_minutes"] == 300
+        assert rows[0]["cost_usd"] == 10.0
+        assert [row["modelName"] for row in rows[0]["model_breakdowns"]] == [
+            "gpt-5.6-sol", "gpt-5.6-terra",
+        ]
+        assert rows[0]["model_breakdowns"][0]["inputTokens"] == 100
+
+        stats.execute("DELETE FROM quota_window_blocks WHERE window_minutes=300")
+        assert source_module._quota_wire(
+            stats,
+            accounting_entries=entries,
+            cycle=cycle,
+            now_utc=dt.datetime(2026, 7, 18, 13, tzinfo=UTC),
+            display_tz_name="UTC",
+        ) == ()
+    finally:
+        stats.close()
+
+
+def test_codex_cycle_selects_the_active_seven_day_boundary_over_five_hour_limit():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+
+    cycle = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(root="root", window_minutes=300, resets_at=NOW + dt.timedelta(hours=4)),
+        _quota_observation(root="root", window_minutes=10_080, resets_at=reset),
+    ), NOW)
+
+    assert cycle.window_minutes == 10_080
+    assert cycle.start_at == reset - dt.timedelta(days=7)
+    assert cycle.resets_at == reset
+
+
+def test_codex_cycle_allows_a_fresh_weekly_boundary_without_a_five_hour_window():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+
+    cycle = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(root="root", window_minutes=10_080, resets_at=reset),
+    ), NOW)
+
+    assert cycle.resets_at == reset
+
+
+def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = "root-native-weekly"
+    try:
+        stats.executemany(
+            "INSERT INTO quota_window_blocks "
+            "(source, source_root_key, logical_limit_key, observed_slot, "
+            "window_minutes, limit_name, resets_at_utc, nominal_start_at_utc, "
+            "first_observed_at_utc, last_observed_at_utc, first_percent, "
+            "current_percent, last_source_path, last_line_offset, generation) "
+            "VALUES ('codex', ?, ?, 'primary', 10080, '7-day limit', ?, ?, ?, ?, "
+            "0, 10, ?, 1, 'g')",
+            (
+                (
+                    root, "weekly-a", "2026-07-08T00:00:00+00:00",
+                    "2026-07-01T00:00:00+00:00", "2026-07-01T00:05:00+00:00",
+                    "2026-07-02T23:00:00+00:00", "/private/a.jsonl",
+                ),
+                (
+                    root, "weekly-b", "2026-07-10T00:00:00+00:00",
+                    "2026-07-03T00:00:00+00:00", "2026-07-03T00:05:00+00:00",
+                    "2026-07-09T23:00:00+00:00", "/private/b.jsonl",
+                ),
+                (
+                    root, "weekly-b-jitter", "2026-07-10T00:00:30+00:00",
+                    "2026-07-03T00:00:30+00:00", "2026-07-03T00:05:30+00:00",
+                    "2026-07-09T23:00:30+00:00", "/private/b-jitter.jsonl",
+                ),
+            ),
+        )
+        entries = (
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 2, 12, tzinfo=UTC),
+                source_root_key=root, source_path="/private/first.jsonl", session_id="first",
+                model="gpt-5", input_tokens=100, cached_input_tokens=0,
+                output_tokens=10, reasoning_output_tokens=0, total_tokens=110,
+            ),
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 3, 0, tzinfo=UTC),
+                source_root_key=root, source_path="/private/boundary.jsonl", session_id="boundary",
+                model="gpt-5", input_tokens=200, cached_input_tokens=0,
+                output_tokens=20, reasoning_output_tokens=0, total_tokens=220,
+            ),
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 8, 12, tzinfo=UTC),
+                source_root_key=root, source_path="/private/second.jsonl", session_id="second",
+                model="gpt-5", input_tokens=300, cached_input_tokens=0,
+                output_tokens=30, reasoning_output_tokens=0, total_tokens=330,
+            ),
+        )
+
+        periods = source_module._codex_weekly_periods(
+            stats, source_root_keys=(root,), active_cycle=None,
+        )
+        view = source_module._build_codex_native_weekly_view(
+            stats, entries, source_root_keys=(root,), active_cycle=None,
+            now_utc=dt.datetime(2026, 7, 9, tzinfo=UTC),
+            display_tz_name="UTC", speed="standard",
+        )
+
+        assert [(row.start_at, row.end_at) for row in periods] == [
+            (
+                dt.datetime(2026, 7, 1, tzinfo=UTC),
+                dt.datetime(2026, 7, 3, tzinfo=UTC),
+            ),
+            (
+                dt.datetime(2026, 7, 3, tzinfo=UTC),
+                dt.datetime(2026, 7, 10, 0, 0, 30, tzinfo=UTC),
+            ),
+        ]
+        assert [row.bucket for row in view.rows] == [
+            "07-01 00:00", "07-03 00:00",
+        ]
+        assert [row.input_tokens for row in view.rows] == [100, 500]
+        assert view.total_tokens == 660
+    finally:
+        stats.close()
+
+
+def test_codex_cycle_rejects_stale_weekly_evidence_even_before_its_reset():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    with pytest.raises(source_module.CodexCycleUnavailable, match="stale"):
+        source_module._resolve_codex_weekly_cycle((
+            _quota_observation(
+                root="root",
+                window_minutes=10_080,
+                resets_at=NOW + dt.timedelta(days=2),
+                captured_at=NOW - dt.timedelta(hours=2),
+            ),
+        ), NOW)
+
+
+def test_codex_cycle_collapses_duplicate_root_observations_for_one_boundary():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+
+    cycle = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(root="root-a", window_minutes=10_080, resets_at=reset),
+        _quota_observation(root="root-b", window_minutes=10_080, resets_at=reset),
+    ), NOW)
+
+    assert cycle.resets_at == reset
+    assert cycle.source_root_keys == ("root-a", "root-b")
+
+
+@pytest.mark.parametrize(
+    "observations, reason",
+    (
+        ((
+            _quota_observation(root="root", window_minutes=300, resets_at=NOW + dt.timedelta(hours=4)),
+        ), "missing"),
+        ((
+            _quota_observation(root="root-a", window_minutes=10_080, resets_at=NOW + dt.timedelta(days=1)),
+            _quota_observation(root="root-b", window_minutes=10_080, resets_at=NOW + dt.timedelta(days=2)),
+        ), "conflicting"),
+        ((
+            _quota_observation(root="root", window_minutes=10_080, resets_at=NOW),
+        ), "missing"),
+    ),
+    ids=("five-hour-only", "conflicting-weekly-boundaries", "expired-weekly-boundary"),
+)
+def test_codex_cycle_rejects_missing_conflicting_or_expired_weekly_boundaries(
+    observations: tuple[QuotaObservation, ...], reason: str,
+):
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    with pytest.raises(source_module.CodexCycleUnavailable, match=reason):
+        source_module._resolve_codex_weekly_cycle(observations, NOW)
+
+
+def _install_active_native_cycle(
+    monkeypatch,
+    source_module,
+    *,
+    reset: dt.datetime,
+    now_utc: dt.datetime = NOW,
+    root: str = "root",
+) -> None:
+    observations = (
+        _quota_observation(
+            root=root,
+            window_minutes=300,
+            resets_at=now_utc + dt.timedelta(hours=4),
+            captured_at=now_utc - dt.timedelta(minutes=10),
+        ),
+        _quota_observation(
+            root=root,
+            window_minutes=10_080,
+            resets_at=reset,
+            captured_at=now_utc - dt.timedelta(minutes=10),
+        ),
+    )
+    monkeypatch.setattr(
+        source_module,
+        "load_codex_quota_observations",
+        lambda **_kwargs: observations,
+    )
+
+
+def test_codex_cycle_hero_uses_only_native_boundary_accounting_rows(tmp_path, monkeypatch):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    cycle_start = reset - dt.timedelta(days=7)
+    try:
+        for offset, line_offset in (
+            (-dt.timedelta(microseconds=1), 20_001),
+            (dt.timedelta(), 20_002),
+            (NOW - cycle_start, 20_003),
+            (NOW - cycle_start + dt.timedelta(microseconds=1), 20_004),
+            (reset - cycle_start, 20_005),
+        ):
+            _insert_incomplete_accounting_row(
+                cache,
+                source_path=f"/cached/cycle-boundary-{line_offset}.jsonl",
+                line_offset=line_offset,
+                session_id=f"cycle-boundary-{line_offset}",
+                timestamp=cycle_start + offset,
+            )
+        cache.commit()
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=reset, root=_cache_root_key(cache),
+        )
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="cycle-boundary-v1",
+        )
+
+        hero = state.data["hero"]
+        assert hero["cycle"] == {
+            "window_minutes": 10_080,
+            "start_at": cycle_start.isoformat(),
+            "resets_at": reset.isoformat(),
+        }
+        assert hero["total_tokens"] == 3_200
+        assert hero["input_tokens"] == 2_400
+        assert hero["cached_input_tokens"] == 600
+        assert hero["output_tokens"] == 800
+        assert hero["reasoning_output_tokens"] == 200
+        assert state.capabilities["projects"].status == "supported"
+        assert state.capabilities["projects"].semantics == "conversation-metadata-partial"
+        assert state.data["periods"]["daily"]["rows"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_codex_cycle_failure_replaces_a_prior_generation_without_retained_hero_totals(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=_cache_root_key(cache),
+        )
+        coherent = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="cycle-coherent-v1",
+        )
+        assert coherent.capabilities["hero"].semantics == "native-reset-cycle"
+
+        monkeypatch.setattr(
+            source_module, "load_codex_quota_observations", lambda **_kwargs: (),
+        )
+        failed = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="cycle-failure-v2",
+        )
+
+        assert failed.availability == "partial"
+        assert failed.freshness == "fresh"
+        assert failed.data_version != coherent.data_version
+        assert failed.capabilities["hero"].status == "unavailable"
+        assert failed.capabilities["hero"].semantics == "missing-or-conflicting-native-cycle"
+        assert failed.warnings[-1].code == "codex_cycle_unavailable"
+        assert failed.warnings[-1].domain == "hero"
+        assert failed.data["hero"]["cycle"] is None
+        assert failed.data["hero"]["cost_usd"] is None
+        assert failed.data["hero"]["input_tokens"] is None
+        assert failed.data["hero"]["cached_input_tokens"] is None
+        assert failed.data["hero"]["output_tokens"] is None
+        assert failed.data["hero"]["reasoning_output_tokens"] is None
+        assert failed.data["hero"]["total_tokens"] is None
+        assert failed.data["periods"]["daily"]["rows"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_stale_weekly_baseline_builds_a_stale_partial_generation_without_a_hero(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        root_key = str(cache.execute(
+            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        monkeypatch.setattr(
+            source_module,
+            "load_codex_quota_observations",
+            lambda **_kwargs: (
+                _quota_observation(
+                    root=root_key,
+                    window_minutes=10_080,
+                    resets_at=NOW + dt.timedelta(days=2),
+                    captured_at=NOW - dt.timedelta(hours=2),
+                ),
+            ),
+        )
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="stale-cycle-v1",
+        )
+
+        assert state.availability == "partial"
+        assert state.freshness == "stale"
+        assert state.data["quota"]["summary"]["freshness"] == "stale"
+        assert state.capabilities["hero"].status == "unavailable"
+        assert state.data["hero"]["cycle"] is None
+        assert state.data["hero"]["total_tokens"] is None
+        assert state.warnings[-1].code == "codex_cycle_unavailable"
+        assert state.data["periods"]["daily"]["rows"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_idle_clock_stale_weekly_evidence_withdraws_the_hero_without_a_cache_read(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        root_key = str(cache.execute(
+            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=root_key,
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="clock-cycle-v1",
+        )
+        assert state.capabilities["hero"].status == "supported"
+        before_rows = cache.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0]
+
+        monkeypatch.setattr(
+            source_module,
+            "load_codex_quota_observations",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("idle clock must not read cache")),
+        )
+        refreshed = source_module.refresh_codex_source_clock(
+            state, now_utc=NOW + dt.timedelta(hours=2),
+        )
+
+        assert cache.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == before_rows
+        assert refreshed.availability == "partial"
+        assert refreshed.freshness == "stale"
+        assert refreshed.capabilities["hero"].status == "unavailable"
+        assert refreshed.data["hero"]["cycle"] is None
+        assert refreshed.data["hero"]["total_tokens"] is None
+        assert any(warning.code == "codex_cycle_unavailable" for warning in refreshed.warnings)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_idle_clock_crossing_a_native_reset_withdraws_the_hero_without_a_cache_read(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(minutes=10)
+    try:
+        root_key = str(cache.execute(
+            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        _install_active_native_cycle(monkeypatch, source_module, reset=reset, root=root_key)
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="clock-reset-v1",
+        )
+        assert state.capabilities["hero"].status == "supported"
+
+        refreshed = source_module.refresh_codex_source_clock(
+            state, now_utc=NOW + dt.timedelta(minutes=20),
+        )
+
+        assert refreshed.availability == "partial"
+        assert refreshed.freshness == "fresh"
+        assert refreshed.data["quota"]["summary"]["active_window_count"] == 1
+        assert refreshed.data["quota"]["summary"]["freshness"] == "fresh"
+        assert refreshed.capabilities["hero"].status == "unavailable"
+        assert refreshed.data["hero"]["cycle"] is None
+        assert refreshed.data["hero"]["total_tokens"] is None
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_cycle_accounting_excludes_a_non_supporting_root(tmp_path, monkeypatch):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    cycle_start = reset - dt.timedelta(days=7)
+    try:
+        root_a = str(cache.execute(
+            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        cache.execute(
+            "UPDATE codex_session_entries SET timestamp_utc=?",
+            ((cycle_start + dt.timedelta(hours=1)).isoformat(),),
+        )
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/root-b/outside-cycle-proof.jsonl",
+            line_offset=31_001,
+            session_id="root-b-outside-cycle-proof",
+            source_root_key="root-b-without-boundary",
+            timestamp=cycle_start + dt.timedelta(hours=2),
+        )
+        cache.commit()
+        expected = cache.execute(
+            "SELECT SUM(total_tokens) FROM codex_session_entries WHERE source_root_key=?",
+            (root_a,),
+        ).fetchone()[0]
+        _install_active_native_cycle(monkeypatch, source_module, reset=reset, root=root_a)
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="root-qualified-v1",
+        )
+
+        assert state.data["hero"]["total_tokens"] == expected
+        assert "root-b-without-boundary" not in repr(state.data)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_cycle_accounting_includes_each_duplicate_supporting_root_once(tmp_path, monkeypatch):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    cycle_start = reset - dt.timedelta(days=7)
+    try:
+        root_a = str(cache.execute(
+            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        root_b = "root-b-supporting-boundary"
+        root_c = "root-c-without-boundary"
+        cache.execute(
+            "UPDATE codex_session_entries SET timestamp_utc=?",
+            ((cycle_start + dt.timedelta(hours=1)).isoformat(),),
+        )
+        for root_key, line_offset in ((root_b, 31_002), (root_c, 31_003)):
+            _insert_incomplete_accounting_row(
+                cache,
+                source_path=f"/cached/{root_key}.jsonl",
+                line_offset=line_offset,
+                session_id=root_key,
+                source_root_key=root_key,
+                timestamp=cycle_start + dt.timedelta(hours=2),
+            )
+        cache.commit()
+        expected = cache.execute(
+            "SELECT SUM(total_tokens) FROM codex_session_entries WHERE source_root_key IN (?, ?)",
+            (root_a, root_b),
+        ).fetchone()[0]
+        monkeypatch.setattr(
+            source_module,
+            "load_codex_quota_observations",
+            lambda **_kwargs: (
+                _quota_observation(root=root_a, window_minutes=10_080, resets_at=reset),
+                _quota_observation(root=root_b, window_minutes=10_080, resets_at=reset),
+            ),
+        )
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="duplicate-root-cycle-v1",
+        )
+
+        assert state.data["hero"]["total_tokens"] == expected
+        assert root_a not in repr(state.data)
+        assert root_b not in repr(state.data)
+        assert root_c not in repr(state.data)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_missing_cycle_fails_closed_for_accounting_outside_the_visible_range(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        cache.execute(
+            "UPDATE codex_session_entries SET timestamp_utc=?",
+            ((NOW - dt.timedelta(days=60)).isoformat(),),
+        )
+        cache.commit()
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats,
+                range_start=NOW - dt.timedelta(days=1), now_utc=NOW,
+                display_tz_name="UTC",
+            ),
+            data_version="outside-range-cycle-v1",
+        )
+
+        assert state.availability == "partial"
+        assert state.capabilities["hero"].status == "unavailable"
+        assert state.data["hero"]["cycle"] is None
+        assert state.data["hero"]["total_tokens"] is None
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_codex_cycle_only_metadata_is_excluded_from_project_health_but_not_hero(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    cycle_start = reset - dt.timedelta(days=7)
+    try:
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/cycle-only-missing-project.jsonl",
+            line_offset=20_006,
+            session_id="cycle-only-missing-project",
+            timestamp=cycle_start,
+        )
+        cache.commit()
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=reset, root=_cache_root_key(cache),
+        )
+
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache,
+                stats_conn=stats,
+                range_start=NOW - dt.timedelta(days=1),
+                now_utc=NOW,
+                display_tz_name="UTC",
+            ),
+            data_version="cycle-only-metadata-v1",
+        )
+
+        assert state.capabilities["projects"].status == "supported"
+        assert state.data["hero"]["total_tokens"] == 1_600
+    finally:
+        cache.close()
+        stats.close()
+
+
 def _seeded_context(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
@@ -43,10 +733,462 @@ def _seeded_context(tmp_path, monkeypatch):
     return ns, cache, stats
 
 
+def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    provider_root = tmp_path / "provider"
+    native_thread_id = cache.execute(
+        "SELECT native_thread_id FROM codex_conversation_threads LIMIT 1"
+    ).fetchone()[0]
+    cache.execute(
+        "UPDATE codex_conversation_rollups SET title=?",
+        ("This is the beginning of the user's prompt, not the task name",),
+    )
+    cache.commit()
+    state_db = sqlite3.connect(provider_root / "state_5.sqlite")
+    try:
+        state_db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+        state_db.execute(
+            "INSERT INTO threads(id, title) VALUES (?, ?)",
+            (native_thread_id, "Fix dashboard cycle UI"),
+        )
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    try:
+        metadata = source_module._codex_conversation_metadata(cache)
+        assert "Fix dashboard cycle UI" in {
+            row["title"] for row in metadata.values()
+        }, metadata
+        _install_active_native_cycle(
+            monkeypatch, source_module,
+            reset=NOW + dt.timedelta(days=2),
+            root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="short-name-v1",
+        )
+
+        labels = [row["label"] for row in state.data["sessions"]["rows"]]
+        assert "Fix dashboard cycle UI" in labels, (labels, metadata)
+        assert "beginning of the user's prompt" not in repr(state.data["sessions"])
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_codex_subagent_accounting_inherits_root_task_and_project_metadata(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    provider_root = tmp_path / "provider"
+    root_row = cache.execute(
+        "SELECT source_root_key, native_thread_id, cwd, conversation_key "
+        "FROM codex_conversation_threads LIMIT 1"
+    ).fetchone()
+    assert root_row is not None
+    root_key, native_thread_id, _cwd, _conversation_key = root_row
+    child_path = "/cached/subagent-rollout.jsonl"
+    child_session_id = "native-subagent-session"
+    child_conversation_key = "v1.child-without-own-thread-row"
+    cache.execute(
+        "INSERT INTO codex_session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        "last_session_id, source_root_key, last_native_thread_id, "
+        "last_root_thread_id, last_conversation_key) "
+        "VALUES (?, 1, 1, 1, ?, ?, ?, ?, ?, ?)",
+        (
+            child_path, NOW.isoformat(), child_session_id, root_key,
+            native_thread_id, native_thread_id, child_conversation_key,
+        ),
+    )
+    _insert_incomplete_accounting_row(
+        cache,
+        source_path=child_path,
+        line_offset=11_001,
+        session_id=child_session_id,
+        conversation_key=child_conversation_key,
+        source_root_key=str(root_key),
+    )
+    cache.commit()
+    state_db = sqlite3.connect(provider_root / "state_5.sqlite")
+    try:
+        state_db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+        state_db.execute(
+            "INSERT INTO threads(id, title) VALUES (?, ?)",
+            (native_thread_id, "Inherited root task name"),
+        )
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    try:
+        health = sys.modules["_cctally_source_analytics"].load_codex_project_metadata_health(
+            cache_conn=cache, start=START, end=NOW + dt.timedelta(microseconds=1),
+        )
+        assert health.incomplete_rows == 0
+        metadata = source_module._codex_conversation_metadata(cache)
+        inherited = metadata[(str(root_key), child_path)]
+        assert inherited["title"] == "Inherited root task name"
+        assert inherited["project_label"] == "project-red"
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _cache_root_key(cache: sqlite3.Connection) -> str:
+    row = cache.execute(
+        "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _insert_incomplete_accounting_row(
+    cache: sqlite3.Connection,
+    *,
+    source_path: str,
+    line_offset: int,
+    session_id: str,
+    conversation_key: str | None = None,
+    source_root_key: str | None = None,
+    timestamp: dt.datetime | None = None,
+) -> tuple[str, str]:
+    """Clone known-good accounting while withholding only project metadata."""
+    row = cache.execute(
+        "SELECT source_root_key, model, input_tokens, cached_input_tokens, "
+        "output_tokens, reasoning_output_tokens, total_tokens "
+        "FROM codex_session_entries ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    root_key = source_root_key or str(row[0])
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, source_root_key, conversation_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            source_path, line_offset,
+            (timestamp or (NOW - dt.timedelta(hours=1))).isoformat(),
+            session_id, row[1], row[2], row[3], row[4], row[5], row[6],
+            root_key, conversation_key,
+        ),
+    )
+    return root_key, str(row[1])
+
+
+def _mixed_metadata_context(tmp_path, monkeypatch):
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    _insert_incomplete_accounting_row(
+        cache,
+        source_path="/cached/root-a/missing-project-metadata.jsonl",
+        line_offset=10_001,
+        session_id="native-missing-project-metadata",
+    )
+    cache.commit()
+    return ns, cache, stats, DashboardReadContext(
+        cache_conn=cache,
+        stats_conn=stats,
+        range_start=START,
+        now_utc=NOW,
+        display_tz_name="UTC",
+    )
+
+
+def test_mixed_codex_metadata_preserves_accounting_and_keeps_qualified_projects(
+    tmp_path, monkeypatch,
+):
+    ns, cache, stats, context = _mixed_metadata_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(context, data_version="mixed-v1")
+
+        assert state.availability == "partial"
+        assert state.freshness == "fresh"
+        assert state.warnings[0].code == "codex_metadata_incomplete"
+        assert state.warnings[0].domain == "projects"
+        assert state.capabilities["projects"].status == "supported"
+        assert state.capabilities["projects"].semantics == "conversation-metadata-partial"
+        assert state.data["hero"]["total_tokens"] > 0
+        assert state.data["sessions"]["total_sessions"] == 2
+        assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+        assert any(row["project"] == "project-red" for row in state.data["sessions"]["rows"])
+        assert ns["iter_codex_entries"](cache, START, NOW)
+    finally:
+        cache.close()
+        stats.close()
+
+
+@pytest.mark.parametrize("metadata_kind", ("all-unqualified", "missing-join", "wrong-root-join"))
+def test_incomplete_codex_metadata_keeps_nonproject_dashboard_data(
+    tmp_path, monkeypatch, metadata_kind,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        if metadata_kind == "all-unqualified":
+            cache.execute("UPDATE codex_session_entries SET conversation_key=NULL")
+        else:
+            key = f"{metadata_kind}-key"
+            root_key, _model = _insert_incomplete_accounting_row(
+                cache,
+                source_path=f"/cached/{metadata_kind}.jsonl",
+                line_offset=10_002,
+                session_id=f"native-{metadata_kind}",
+                conversation_key=key,
+            )
+            if metadata_kind == "wrong-root-join":
+                other_root = root_key + "-other"
+                cache.execute(
+                    "INSERT INTO codex_conversation_threads "
+                    "(conversation_key, source_root_key, native_thread_id, root_thread_id, source_path) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (key, other_root, "native", "root", "/cached/other.jsonl"),
+                )
+        cache.commit()
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version=f"{metadata_kind}-v1",
+        )
+
+        assert state.availability == "partial"
+        assert state.freshness == "fresh"
+        assert state.data["hero"]["cycle"]["window_minutes"] == 10_080
+        assert state.data["hero"]["total_tokens"] >= 0
+        assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_budget_only_incomplete_metadata_makes_the_visible_source_partial(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 31, 12, tzinfo=UTC)
+    visible_start = now - dt.timedelta(days=2)
+    try:
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/budget-only-incomplete.jsonl",
+            line_offset=10_003,
+            session_id="native-budget-only-incomplete",
+            timestamp=now - dt.timedelta(days=20),
+        )
+        cache.commit()
+        state = build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=visible_start,
+                now_utc=now, display_tz_name="UTC", codex_budget={
+                    "amount_usd": 10.0, "period": "calendar-month", "alert_thresholds": (80, 100),
+                },
+            ),
+            data_version="budget-only-incomplete-v1",
+        )
+
+        assert state.availability == "partial"
+        assert state.data["projects"]["rows"] == ()
+    finally:
+        cache.close()
+        stats.close()
+
+
+@pytest.mark.parametrize("name", ("_codex_session_roots", "_codex_home_roots"))
+def test_rooted_fallback_sessions_never_discover_filesystem(tmp_path, monkeypatch, name):
+    ns, cache, stats, context = _mixed_metadata_context(tmp_path, monkeypatch)
+    try:
+        cache.execute(
+            "UPDATE codex_session_entries SET session_id=? WHERE session_id=?",
+            ("same-native-session", "native-missing-project-metadata"),
+        )
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/root-a/second-session-file.jsonl",
+            line_offset=10_004,
+            session_id="same-native-session",
+        )
+        cache.commit()
+        monkeypatch.setitem(
+            ns, name, lambda: (_ for _ in ()).throw(AssertionError(name)),
+        )
+        monkeypatch.setattr(
+            pathlib.Path, "is_dir", lambda *_: (_ for _ in ()).throw(AssertionError("is_dir")),
+        )
+
+        state = build_codex_source_state(context, data_version=f"rooted-{name}")
+
+        assert state.data["sessions"]["total_sessions"] == 3
+        assert len({row["key"] for row in state.data["sessions"]["rows"]}) == 3
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_rooted_fallback_keeps_same_file_and_native_id_separate_across_roots(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    try:
+        original = cache.execute(
+            "SELECT id, source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()
+        assert original is not None
+        original_id, first_root = original
+        cache.execute("DELETE FROM codex_session_entries WHERE id != ?", (original_id,))
+        cache.execute(
+            "UPDATE codex_session_entries SET source_path=?, session_id=?, "
+            "conversation_key=NULL, input_tokens=?, cached_input_tokens=?, "
+            "output_tokens=?, reasoning_output_tokens=?, total_tokens=? WHERE id=?",
+            (
+                "/cached/shared/rollout.jsonl", "same-native-session",
+                10, 2, 4, 0, 14, original_id,
+            ),
+        )
+        second_root = f"{first_root}-second"
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/shared/rollout.jsonl",
+            line_offset=10_005,
+            session_id="same-native-session",
+            source_root_key=second_root,
+        )
+        cache.execute(
+            "UPDATE codex_session_entries SET input_tokens=?, cached_input_tokens=?, "
+            "output_tokens=?, reasoning_output_tokens=?, total_tokens=? "
+            "WHERE source_root_key=?",
+            (20, 3, 7, 1, 27, second_root),
+        )
+        cache.commit()
+
+        state = build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="rooted-cross-root-v1",
+        )
+
+        rows = state.data["sessions"]["rows"]
+        assert state.availability == "partial"
+        assert state.data["sessions"]["total_sessions"] == 2
+        assert {row["total_tokens"] for row in rows} == {14, 27}
+        assert len({row["key"] for row in rows}) == 2
+        assert all(row["key"].startswith("session:") for row in rows)
+        assert all("/cached/shared/rollout.jsonl" not in row["key"] for row in rows)
+        assert all("same-native-session" not in row["key"] for row in rows)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_complete_metadata_defensively_falls_back_once_when_qualified_read_fails(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        monkeypatch.setattr(
+            source_module,
+            "load_qualified_codex_entries",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable("race")
+            ),
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="defensive-fallback-v1",
+        )
+
+        assert state.availability == "partial"
+        assert state.freshness == "fresh"
+        assert state.warnings[0].code == "codex_metadata_incomplete"
+        assert state.warnings[0].message == (
+            "Codex project metadata could not be read; "
+            "run `cctally cache-sync --source codex --rebuild`."
+        )
+        assert "0 Codex accounting row(s)" not in state.warnings[0].message
+        assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_metadata_health_and_accounting_share_one_read_snapshot(tmp_path, monkeypatch):
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    try:
+        root_key, _model = _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/snapshot-race.jsonl",
+            line_offset=10_006,
+            session_id="native-snapshot-race",
+            conversation_key="snapshot-race-key",
+        )
+        cache.commit()
+        cache.execute("BEGIN")
+        before = sys.modules["_cctally_source_analytics"].load_codex_project_metadata_health(
+            cache_conn=cache, start=START, end=NOW + dt.timedelta(microseconds=1),
+        )
+        writer = ns["open_cache_db"]()
+        try:
+            writer.execute(
+                "INSERT INTO codex_conversation_threads "
+                "(conversation_key, source_root_key, native_thread_id, root_thread_id, source_path) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("snapshot-race-key", root_key, "native", "root", "/cached/snapshot-race.jsonl"),
+            )
+            writer.commit()
+            current = build_codex_source_state(
+                DashboardReadContext(
+                    cache_conn=cache, stats_conn=stats, range_start=START,
+                    now_utc=NOW, display_tz_name="UTC",
+                ),
+                data_version="snapshot-race-current",
+            )
+        finally:
+            writer.close()
+        cache.rollback()
+        next_generation = build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="snapshot-race-next",
+        )
+
+        assert before.incomplete_rows == 1
+        assert current.availability == "partial"
+        assert next_generation.capabilities["projects"].status == "supported"
+    finally:
+        cache.close()
+        stats.close()
+
+
 def test_codex_read_model_reuses_shipped_view_kernels_with_safe_native_vocabulary(
     tmp_path, monkeypatch,
 ):
     ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
     try:
         context = DashboardReadContext(
             cache_conn=cache,
@@ -57,22 +1199,28 @@ def test_codex_read_model_reuses_shipped_view_kernels_with_safe_native_vocabular
             week_start_idx=0,
             speed="standard",
         )
-        state = build_codex_source_state(context, data_version="codex-v1")
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(context, data_version="codex-v1")
         entries = ns["iter_codex_entries"](cache, START, NOW)
         expected_daily = ns["build_codex_daily_view"](entries, now_utc=NOW, tz_name="UTC")
         expected_monthly = ns["build_codex_monthly_view"](entries, now_utc=NOW, tz_name="UTC")
-        expected_weekly = ns["build_codex_weekly_view"](
-            entries, now_utc=NOW, tz_name="UTC", week_start_idx=0,
-        )
         expected_sessions = ns["build_codex_session_view"](entries, now_utc=NOW, tz_name="UTC")
 
         assert state.source == "codex"
         assert state.availability == "ok"
-        assert state.data["hero"]["cost_usd"] == expected_daily.total_cost_usd
-        assert state.data["hero"]["total_tokens"] == expected_daily.total_tokens
+        assert state.data["hero"]["cycle"]["window_minutes"] == 10_080
+        assert state.data["hero"]["cost_usd"] == 0.0
+        assert state.data["hero"]["total_tokens"] == 0
         assert state.data["periods"]["daily"]["total_cost_usd"] == expected_daily.total_cost_usd
         assert state.data["periods"]["monthly"]["total_tokens"] == expected_monthly.total_tokens
-        assert state.data["periods"]["weekly"]["total_cost_usd"] == expected_weekly.total_cost_usd
+        assert state.data["periods"]["weekly"]["total_cost_usd"] == 0.0
+        assert state.capabilities["weekly"].status == "derived"
+        assert state.capabilities["weekly"].semantics == "native-reset-cycles"
+        assert state.data["periods"]["daily"]["rows"][0]["model_breakdowns"] == tuple(
+            dict(row) for row in expected_daily.rows[0].model_breakdowns
+        )
         assert state.data["sessions"]["total_cost_usd"] == expected_sessions.total_cost_usd
         assert state.data["sessions"]["total_tokens"] == expected_sessions.total_tokens
         assert state.capabilities["projects"].status == "supported"
@@ -267,6 +1415,7 @@ def test_retained_codex_source_keeps_private_clock_data_for_idle_budget_refresh(
 ):
     """A contention-retained source keeps its clock kernel without publishing it."""
     ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
     config = {
         "collector": {"week_start": "sunday"},
         "budget": {
@@ -302,6 +1451,13 @@ def test_retained_codex_source_keeps_private_clock_data_for_idle_budget_refresh(
              (initial_now - dt.timedelta(hours=1)).isoformat(), row_id),
         )
         cache.commit()
+        _install_active_native_cycle(
+            monkeypatch,
+            source_module,
+            reset=initial_now + dt.timedelta(days=2),
+            now_utc=initial_now,
+            root=_cache_root_key(cache),
+        )
         tui = ns["_cctally_tui"]
         initial_bundle = tui._tui_build_source_bundle(
             stats_conn=stats,
@@ -371,6 +1527,7 @@ def test_calendar_month_budget_reads_the_exact_31_day_window_without_widening_vi
     tmp_path, monkeypatch,
 ):
     ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
     now = dt.datetime(2026, 7, 31, 23, 30, tzinfo=UTC)
     visible_start = now - dt.timedelta(days=30)
     config = {
@@ -390,7 +1547,14 @@ def test_calendar_month_budget_reads_the_exact_31_day_window_without_widening_vi
         )
         cache.commit()
         budget_cfg = ns["_get_budget_config"](config)["codex"]
-        state = build_codex_source_state(
+        _install_active_native_cycle(
+            monkeypatch,
+            source_module,
+            reset=now + dt.timedelta(days=2),
+            now_utc=now,
+            root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(
             DashboardReadContext(
                 cache_conn=cache,
                 stats_conn=stats,
@@ -774,6 +1938,7 @@ def test_codex_source_builder_never_opens_an_independent_cache_connection(
 ):
     ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     quota_module = sys.modules["_cctally_quota"]
+    source_module = sys.modules["_cctally_dashboard_sources"]
 
     def forbidden_open(*_args, **_kwargs):
         raise AssertionError("source builder must use DashboardReadContext.cache_conn")
@@ -781,7 +1946,10 @@ def test_codex_source_builder_never_opens_an_independent_cache_connection(
     monkeypatch.setattr(quota_module, "_cache_connection", forbidden_open)
     monkeypatch.setitem(ns, "open_cache_db", forbidden_open)
     try:
-        state = sys.modules["_cctally_dashboard_sources"].build_codex_source_state(
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(
             DashboardReadContext(
                 cache_conn=cache,
                 stats_conn=stats,
@@ -804,8 +1972,9 @@ def test_empty_codex_read_model_is_available_empty_data_not_unavailable(tmp_path
     redirect_paths(ns, monkeypatch, tmp_path / "data")
     cache = ns["open_cache_db"]()
     stats = ns["open_db"]()
+    source_module = sys.modules["_cctally_dashboard_sources"]
     try:
-        state = build_codex_source_state(
+        state = source_module.build_codex_source_state(
             DashboardReadContext(
                 cache_conn=cache,
                 stats_conn=stats,
@@ -820,6 +1989,9 @@ def test_empty_codex_read_model_is_available_empty_data_not_unavailable(tmp_path
         assert state.availability == "empty"
         assert state.freshness == "fresh"
         assert state.data is not None
+        assert state.capabilities["hero"].status == "supported"
+        assert state.data["hero"]["cycle"] is None
+        assert state.data["hero"]["total_tokens"] == 0
         assert state.data["sessions"]["rows"] == ()
         assert state.data["periods"]["daily"]["rows"] == ()
     finally:
@@ -846,12 +2018,19 @@ def test_codex_projection_coherence_requires_each_active_root_state(tmp_path, mo
         stats.close()
 
 
-def test_codex_read_model_refuses_new_accounting_when_projection_is_incoherent(
+def test_codex_projection_incoherence_is_scoped_to_the_current_hero_generation(
     tmp_path, monkeypatch,
 ):
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
     try:
         stats.execute("UPDATE quota_projection_state SET physical_signature='not-the-cache'")
+        _install_active_native_cycle(
+            monkeypatch,
+            source_module,
+            reset=NOW + dt.timedelta(days=2),
+            root=_cache_root_key(cache),
+        )
         context = DashboardReadContext(
             cache_conn=cache,
             stats_conn=stats,
@@ -860,8 +2039,22 @@ def test_codex_read_model_refuses_new_accounting_when_projection_is_incoherent(
             display_tz_name="UTC",
         )
 
-        with pytest.raises(CodexProjectionIncoherent):
-            build_codex_source_state(context, data_version="codex-v1")
+        state = source_module.build_codex_source_state(context, data_version="codex-v1")
+
+        assert state.availability == "partial"
+        assert state.freshness == "fresh"
+        assert state.capabilities["hero"].status == "unavailable"
+        assert state.capabilities["hero"].semantics == "projection-incoherent"
+        assert state.data["hero"]["cycle"] is None
+        assert state.data["hero"]["total_tokens"] is None
+        assert any(
+            warning.code == "codex_projection_incoherent" and warning.domain == "hero"
+            for warning in state.warnings
+        )
+        assert state.data["periods"]["daily"]["rows"]
+        assert state.data["sessions"]["rows"]
+        assert state.data["quota"]["histories"]
+        assert "root" not in repr(state.data["hero"])
     finally:
         cache.close()
         stats.close()

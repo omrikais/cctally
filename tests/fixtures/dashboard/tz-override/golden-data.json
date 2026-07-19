@@ -570,6 +570,7 @@
               "budget": null,
               "cached_input_tokens": 0,
               "cost_usd": 0.0,
+              "cycle": null,
               "input_tokens": 0,
               "output_tokens": 0,
               "quota": {
@@ -1001,7 +1002,7 @@
           "status": "supported"
         },
         "hero": {
-          "semantics": "calendar-accounting",
+          "semantics": "native-reset-cycle",
           "status": "supported"
         },
         "monthly": {
@@ -1021,8 +1022,8 @@
           "status": "supported"
         },
         "weekly": {
-          "semantics": "calendar-week",
-          "status": "supported"
+          "semantics": "native-reset-cycles",
+          "status": "derived"
         }
       },
       "data": {
@@ -1041,6 +1042,7 @@
           "budget": null,
           "cached_input_tokens": 0,
           "cost_usd": 0.0,
+          "cycle": null,
           "input_tokens": 0,
           "output_tokens": 0,
           "quota": {

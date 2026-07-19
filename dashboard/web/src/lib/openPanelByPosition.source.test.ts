@@ -10,52 +10,72 @@ beforeEach(() => {
   updateSnapshot(fixture as unknown as Envelope);
 });
 
-// §6.11 — digit shortcuts address VISIBLE positions only. The shared fixture's
-// Claude view shows all 10 panels; the Codex view hides trend / cache-report /
-// forecast (visible order: sessions, projects, daily, weekly, monthly, blocks,
-// alerts).
+// Digit shortcuts address the same canonical ten-card order in every mode.
 describe('openPanelByPosition — source-visible addressing (§6.11)', () => {
   it('Claude: position 2 opens Trend', () => {
     openPanelByPosition(2);
     expect(getState().openModal).toBe('trend');
   });
 
-  it('Codex: positions past the 7 visible panels are no-ops (hidden panels unreachable)', () => {
+  it('Codex: positions 8 and 9 address Blocks and Forecast', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     openPanelByPosition(8);
-    expect(getState().openModal).toBeNull();
+    expect(getState().openSourceDetail?.resource).toBe('block');
+    dispatch({ type: 'CLOSE_SOURCE_DETAIL' });
     openPanelByPosition(9);
-    expect(getState().openModal).toBeNull();
+    expect(getState().openModal).toBe('forecast');
   });
 });
 
-// ui-qa round-3 P2 — the legacy panel-family modals are Claude-shaped, so a
-// digit under a non-Claude selection must NOT open one (it would render Claude
-// data under the Codex/All label). Only source-aware modals (alerts) open.
-describe('openPanelByPosition — non-Claude selections gate legacy modals', () => {
-  it('Codex: position 2 (Projects, visible) is a no-op — legacy modal stays closed', () => {
+describe('openPanelByPosition — source-bound non-Claude interactions', () => {
+  it('Codex: position 2 opens the source-bound Trend modal', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     openPanelByPosition(2);
-    expect(getState().openModal).toBeNull();
+    expect(getState().openModal).toBe('trend');
+    expect(getState().openModalSource).toBe('codex');
   });
 
-  it('Codex: position 1 (Sessions, visible) is a no-op — Claude session modal cannot open', () => {
+  it('Codex: position 1 opens the qualified native session detail', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     openPanelByPosition(1);
     expect(getState().openModal).toBeNull();
-    expect(getState().openSessionId ?? null).toBeNull();
+    expect(getState().openSourceDetail).toMatchObject({ source: 'codex', resource: 'session' });
   });
 
-  it('Codex: position 7 (Recent alerts) opens — the alerts modal is source-aware', () => {
+  it('Codex: position 10 (Recent alerts) opens — canonical numbering is source-stable', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    openPanelByPosition(7);
+    openPanelByPosition(10);
     expect(getState().openModal).toBe('alerts');
   });
 
-  it('All: legacy panel modals do not open via digits either', () => {
+  it('All: position 1 opens one provider-qualified row from the chronological list', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     openPanelByPosition(1);
     expect(getState().openModal).toBeNull();
+    expect(getState().openSourceDetail?.resource).toBe('session');
+  });
+
+  it('All: the Blocks position uses the canonical modal for a Claude-backed row', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'opaque:server-issued-block-key',
+      source: 'claude',
+      start_at: '2026-04-24T08:00:00Z',
+      end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded',
+      is_active: true,
+      cost_usd: 4.2,
+      models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    openPanelByPosition(8);
+
+    expect(getState().openModal).toBe('block');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T08:00:00Z');
+    expect(getState().openSourceDetail).toBeNull();
   });
 
   it('Claude: gating does not apply — position 1 still opens the most recent session', () => {

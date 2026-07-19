@@ -21,6 +21,7 @@ from conftest import load_script, redirect_paths
 
 
 MIGRATION = "025_codex_conversation_normalization"
+SUCCESSOR = "026_codex_conversation_key_backfill"
 PREDECESSOR = "024_codex_fused_ingest_rebuild"
 FIXTURE_DIR = (
     pathlib.Path(__file__).resolve().parent
@@ -133,6 +134,12 @@ def _marker(conn) -> int:
         "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)).fetchone()[0]
 
 
+def _successor_marker(conn) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (SUCCESSOR,)
+    ).fetchone()[0]
+
+
 def _version(conn) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
@@ -161,6 +168,17 @@ def _assert_replayed(conn) -> None:
     assert conn.execute(
         "SELECT COUNT(*) FROM codex_conversation_file_touches "
         "WHERE file_path='golden.txt'").fetchone()[0] == 1
+
+
+def _assert_head_replay_is_recleared(conn) -> None:
+    """026 owns the full-head result after 025's dispatcher recovery."""
+    assert _norm_count(conn) == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM codex_conversation_events"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_messages WHERE text='keep me'"
+    ).fetchone()[0] == 1
 
 
 def test_cache_registry_025_is_contiguous_after_024(tmp_path, monkeypatch):
@@ -200,9 +218,10 @@ def test_025_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
         conn.close()
     conn = ns["open_cache_db"]()
     try:
-        _assert_replayed(conn)
+        _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 25
+        assert _successor_marker(conn) == 1
+        assert _version(conn) == 27
     finally:
         conn.close()
 
@@ -226,9 +245,10 @@ def test_025_defers_without_mutation_while_codex_lock_is_held(tmp_path, monkeypa
         lock_fh.close()
     conn = ns["open_cache_db"]()
     try:
-        _assert_replayed(conn)
+        _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 25
+        assert _successor_marker(conn) == 1
+        assert _version(conn) == 27
     finally:
         conn.close()
 
@@ -253,9 +273,10 @@ def test_025_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(tmp
     db._eagerly_apply_cache_migrations()
     conn = sqlite3.connect(core.CACHE_DB_PATH)
     try:
-        _assert_replayed(conn)
+        _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
-        assert _version(conn) == 25
+        assert _successor_marker(conn) == 1
+        assert _version(conn) == 27
     finally:
         conn.close()
 

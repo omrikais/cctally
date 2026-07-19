@@ -1,16 +1,9 @@
-import { getState } from '../store/store';
+import { dispatch, getState } from '../store/store';
 import { resolveSourceView } from '../store/sourceView';
+import { collectSourceSessionRows } from './sourceRows';
+import { presentationBlocks } from './dashboardPresentation';
 import { deriveVisiblePanelOrder } from './visiblePanelOrder';
 import { PANEL_REGISTRY } from './panelRegistry';
-import type { GridPanelId } from './panelIds';
-
-// #294 S5 — the legacy panel-family modals are Claude-shaped (they read the
-// legacy top-level envelope), so under a non-Claude selection a digit must not
-// open one: it would render Claude data under another source's label (ui-qa
-// round-3 P2). Only modals that resolve their data per-source may open there.
-// The visible Codex/All panels expose no click-to-modal affordance either, so
-// this keeps keyboard and pointer behavior consistent.
-const SOURCE_AWARE_MODAL_PANELS: ReadonlySet<GridPanelId> = new Set(['alerts']);
 
 /** 1-indexed: position 1 = the FIRST VISIBLE panel for the active source.
  *  Out-of-range (incl. addressing a hidden panel's slot) → no-op. */
@@ -31,7 +24,21 @@ export function openPanelByPosition(position: number): void {
   const idx = position - 1;
   if (idx < 0 || idx >= order.length) return;
   const id = order[idx];
-  if (s.activeSource !== 'claude' && !SOURCE_AWARE_MODAL_PANELS.has(id)) return;
+  if (s.activeSource !== 'claude' && id === 'sessions') {
+    const row = collectSourceSessionRows(resolveSourceView(s.snapshot, s.activeSource))[0];
+    if (row) dispatch({ type: 'OPEN_SOURCE_DETAIL', source: row.source, resource: 'session', key: row.key });
+    return;
+  }
+  if (s.activeSource !== 'claude' && id === 'blocks') {
+    const row = presentationBlocks(s.snapshot, s.activeSource).find((item) => item.is_active)
+      ?? presentationBlocks(s.snapshot, s.activeSource)[0];
+    if (row?.source === 'claude') {
+      dispatch({ type: 'OPEN_MODAL', kind: 'block', blockStartAt: row.start_at });
+    } else if (row) {
+      dispatch({ type: 'OPEN_SOURCE_DETAIL', source: row.source, resource: 'block', key: row.key });
+    }
+    return;
+  }
   const def = PANEL_REGISTRY[id];
   if (def) def.openAction();
 }

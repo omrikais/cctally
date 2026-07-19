@@ -255,8 +255,8 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        # S6 appended migration 025, so the registry head is now 25.
-        assert _version(conn) == 25
+        # Fork-preamble accounting rebuild appended migration 027.
+        assert _version(conn) == 27
     finally:
         conn.close()
 
@@ -285,8 +285,8 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        # S6 appended migration 025, so the registry head is now 25.
-        assert _version(conn) == 25
+        # Fork-preamble accounting rebuild appended migration 027.
+        assert _version(conn) == 27
     finally:
         conn.close()
 
@@ -316,8 +316,8 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
     try:
         _assert_codex_cleared_claude_unchanged(conn)
         assert _marker(conn) == 1
-        # S6 appended migration 025, so the registry head is now 25.
-        assert _version(conn) == 25
+        # Fork-preamble accounting rebuild appended migration 027.
+        assert _version(conn) == 27
     finally:
         conn.close()
 

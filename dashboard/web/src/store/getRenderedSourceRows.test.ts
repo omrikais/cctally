@@ -35,9 +35,9 @@ describe('getRenderedSourceRows (§6.3)', () => {
     expect(rows[0].recencyUtc).toBe('2026-04-24T12:30:00Z');
   });
 
-  it('Claude → [] (Claude renders via the legacy getRenderedRows path)', () => {
+  it('Claude can adapt the same provider-neutral display rows', () => {
     updateSnapshot(bundleEnv());
-    expect(getRenderedSourceRows()).toEqual([]);
+    expect(getRenderedSourceRows().every((row) => row.source === 'claude')).toBe(true);
   });
 
   it('filter narrows by the label + models haystack', () => {
@@ -88,7 +88,9 @@ describe('getRenderedSourceRows (§6.3)', () => {
     ]);
     // No merging: both providers are represented and labels stay native.
     expect(new Set(rows.map((r) => r.source))).toEqual(new Set(['claude', 'codex']));
-    expect(rows.find((r) => r.source === 'claude')?.title).toBe('project-00');
+    // A missing persisted short name stays empty; never substitute a project
+    // or prompt-derived label for the task name.
+    expect(rows.find((r) => r.source === 'claude')?.title).toBe('');
   });
 
   // #294 S5 QA regression: the real server spreads `sources` at the envelope top

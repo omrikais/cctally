@@ -109,6 +109,51 @@ describe('#247 S1 mobile form-control & data floor', () => {
   });
 });
 
+// #312 P1 — JSDOM does not resolve the dashboard's responsive stylesheet, so
+// these are intentionally focused cascade contracts. Real Chromium verifies
+// pixels; these pin the two mobile layout boundaries that prevent a future
+// source-aware header/table change from reviving document overflow or stacked
+// native token cells.
+describe('#312 mobile source-layout containment', () => {
+  const m = css.match(/@media \(max-width:\s*640px\)\s*\{([\s\S]*)$/);
+  const mobile = m ? m[1] : '';
+
+  it('makes the topbar action band a shrinkable full mobile row', () => {
+    expect(mobile).toMatch(
+      /\.topbar \.topbar-actions\s*\{(?=[^}]*width:\s*100%)(?=[^}]*flex:\s*1\s+1\s+100%)(?=[^}]*min-width:\s*0)/,
+    );
+  });
+
+  it('uses the canonical compact mobile session records for every source', () => {
+    expect(mobile).toMatch(/\.sess-table tr\.session-row\s*\{[^}]*display:\s*grid/);
+    expect(mobile).not.toMatch(/source-sess-table[^}]*min-width:\s*760px/);
+    expect(mobile).not.toMatch(/source-session-row[^}]*display:\s*table-row/);
+  });
+
+  it('bounds shared Trend and collapsed Blocks cards independent of provider row count', () => {
+    expect(mobile).toMatch(/#panel-trend \.trend-table-wrap\s*\{[^}]*max-height:\s*132px/);
+    expect(mobile).toMatch(/#panel-blocks\.blocks-collapsed\s*\{(?=[^}]*height:\s*184px)(?=[^}]*max-height:\s*184px)/);
+    expect(mobile).toMatch(/#panel-blocks\.blocks-collapsed:has\(\.blocks-row\)\s*\{(?=[^}]*height:\s*216px)(?=[^}]*max-height:\s*216px)/);
+  });
+
+  it('keeps both quota values and the three support slots in one shared hero grid', () => {
+    expect(mobile).toMatch(/\.hero-usage\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(0,\s*\.75fr\)/);
+    expect(mobile).toMatch(/\.hero-support\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+  });
+
+  it('bounds native quota and period bodies with their own mobile vertical scroller', () => {
+    expect(mobile).toMatch(
+      /\.panel-body--source-native,\s*\.source-provider-body\s*\{(?=[^}]*max-height:\s*360px)(?=[^}]*overflow-y:\s*auto)/,
+    );
+    expect(ruleBody('#panel-sessions .panel-body')).toMatch(/overflow-x:\s*auto/);
+  });
+
+  it('keeps shared period tables inside their pane and converts mobile rows to wrapping records', () => {
+    expect(css).toMatch(/\.period-table-pane\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*overflow-x:\s*auto)/);
+    expect(mobile).toMatch(/\.history-table tr\s*\{(?=[^}]*display:\s*flex)(?=[^}]*flex-wrap:\s*wrap)/);
+  });
+});
+
 // ============================================================================
 // #255 — GLOBAL no-orphan-literal lint (border-radius / box-shadow / accent).
 // Promotes the S1 scoped lint to a whole-dashboard ban. Operates on a

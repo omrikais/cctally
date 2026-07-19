@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
@@ -5,9 +6,9 @@ import { ExpandButton } from '../components/ExpandButton';
 import { resolveVerdict } from '../lib/verdict';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { SourcePanelShell } from './sourcePanel';
+import { presentationForecast } from '../lib/dashboardPresentation';
 
 // ForecastPanel (#248 §4) — a calm-when-healthy uniform TILE. The projected %
 // at reset is the dominant number; the verdict chip's glyph comes straight from
@@ -25,25 +26,20 @@ import { SourcePanelShell } from './sourcePanel';
 // section (no Codex forecast section). Wrapping stops the legacy top-level
 // `env.forecast` from leaking Claude forecast numbers under a Codex label.
 export function ForecastPanel() {
-  return (
-    <SourcePanelShell
-      panel="forecast"
-      panelKind="forecast"
-      claude={<ClaudeForecastPanel />}
-      codex={() => null}
-      emptyLabel="No Codex forecast."
-    />
-  );
-}
-
-function ClaudeForecastPanel() {
   const env = useSnapshot();
-  const fc = env?.forecast ?? null;
-  const v = resolveVerdict(fc?.verdict ?? null);
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const fc = presentationForecast(env, activeSource);
+  const v = resolveVerdict(fc.verdict);
   // `v.cls` is 'good' | 'warn' | 'over'. The accent edge escalates on any
   // non-OK verdict (cap/capped both set `warn: true`).
   const esc = v?.cls ?? 'good';
   const hasEdge = !!v?.warn;
+  // A quota cannot report more than 100%, so capped forecasts deliberately
+  // retain the backend's physical cap.  Mark it as a lower bound instead of
+  // presenting 100% as a suspiciously exact repeated estimate.
+  const projectedLabel = esc === 'over' && fc.projected != null
+    ? '≥100%'
+    : fmt.pct0(fc.projected);
   return (
     <section
       className={`panel accent-purple fc-tile fc-esc-${esc}${hasEdge ? ' fc-accent-edge' : ''}`}
@@ -51,6 +47,7 @@ function ClaudeForecastPanel() {
       role="region"
       aria-label="Forecast panel"
       data-panel-kind="forecast"
+      data-source={activeSource}
       onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' }))}
     >
       <div className="panel-header">
@@ -74,8 +71,8 @@ function ClaudeForecastPanel() {
       </div>
       <div className="panel-body fc-body">
         <div className="fc-hero">
-          <div className="fc-eyebrow">Projected @ reset</div>
-          <div className={`fc-num is-${esc}`}>{fmt.pct0(fc?.week_avg_projection_pct)}</div>
+          <div className="fc-eyebrow">{fc.primaryLabel}</div>
+          <div className={`fc-num is-${esc}`}>{projectedLabel}</div>
           {v && (
             <span className={`fc-verdict-chip is-${esc}`}>
               <span className="fc-verdict-glyph" aria-hidden="true">{v.glyph}</span>
@@ -92,22 +89,20 @@ function ClaudeForecastPanel() {
         <div className={`fc-pace is-${esc}`} role="presentation">
           <div
             className="fc-pace-fill"
-            style={{ width: `${Math.min(100, Math.max(0, fc?.week_avg_projection_pct ?? 0))}%` }}
+            style={{ width: `${Math.min(100, Math.max(0, fc.projected ?? 0))}%` }}
           />
         </div>
         <div className="fc-budget-foot">
           <div className="fc-foot-line">
-            <span className="fc-foot-k">Recent-24h</span>
-            <span className="fc-foot-v">{fmt.pct0(fc?.recent_24h_projection_pct)} @ reset</span>
+            <span className="fc-foot-k">{fc.recentLabel}</span>
+            <span className="fc-foot-v">{fmt.pct0(fc.recent)}</span>
           </div>
-          <div className="fc-foot-line">
-            <span className="fc-foot-k">Budget ≤100%</span>
-            <span className="fc-foot-v">{fmt.usd2(fc?.budget_100_per_day_usd)}/day</span>
-          </div>
-          <div className="fc-foot-line">
-            <span className="fc-foot-k">Budget ≤90%</span>
-            <span className="fc-foot-v">{fmt.usd2(fc?.budget_90_per_day_usd)}/day</span>
-          </div>
+          {fc.foot.map((line) => (
+            <div className="fc-foot-line" key={line.label}>
+              <span className="fc-foot-k">{line.label}</span>
+              <span className="fc-foot-v">{line.value}</span>
+            </div>
+          ))}
         </div>
       </div>
     </section>

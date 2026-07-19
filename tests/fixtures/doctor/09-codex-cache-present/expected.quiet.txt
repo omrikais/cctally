@@ -14,7 +14,7 @@ Hooks
       → Run `cctally setup`, then review the handler in Codex /hooks.
 Auth
 Database
-  ⚠ Pending migrations       38 pending
+  ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
   ⚠ Codex quota              no safely interpreted windows
@@ -25,4 +25,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 28 OK · 8 WARN · 0 FAIL
+Summary: 29 OK · 8 WARN · 0 FAIL

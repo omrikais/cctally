@@ -4115,6 +4115,145 @@ def build_per_migration_025_codex_conversation_normalization(scenario_dir: Path)
     _build_post(pre, post)
 
 
+def build_per_migration_026_codex_conversation_key_backfill(
+    scenario_dir: Path,
+) -> None:
+    """Build deterministic existing-cache goldens for cache migration 026.
+
+    Reuse 024's current-schema physical-Codex corpus, then make it a 025-head
+    cache by adding the normalized families, physical mutation sequence, and
+    quota projection certificate.  The production 026 handler must clear every
+    Codex-derived fact and only the dispatcher stamps its marker.
+    """
+    import shutil
+    import tempfile
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "026_codex_conversation_key_backfill"
+
+    with tempfile.TemporaryDirectory(prefix="cctally-migration-026-") as scratch:
+        seed_dir = Path(scratch) / "024"
+        build_per_migration_024_codex_fused_ingest_rebuild(seed_dir)
+        if pre.exists():
+            pre.unlink()
+        shutil.copy(seed_dir / "pre.sqlite", pre)
+
+    register_fixture_db(pre)
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executemany(
+            "INSERT INTO schema_migrations(name, applied_at_utc) VALUES (?, ?)",
+            (
+                ("024_codex_fused_ingest_rebuild", "2026-07-18T11:00:00Z"),
+                ("025_codex_conversation_normalization", "2026-07-18T11:00:00Z"),
+            ),
+        )
+        conn.execute("PRAGMA user_version = 25")
+        conn.execute(
+            "INSERT INTO codex_conversation_messages(id, conversation_key, source_root_key, source_path, "
+            "line_offset, kind, record_family, content_digest, content_len) "
+            "VALUES (1, 'conversation-a', 'root-a', '/codex/source.jsonl', 2, 'assistant', "
+            "'response_item', 'digest', 0)"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_file_touches(message_id, conversation_key, source_path, file_path, tool) "
+            "VALUES (1, 'conversation-a', '/codex/source.jsonl', 'edited.py', 'apply_patch')"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_rollups(conversation_key, source_root_key, item_count) "
+            "VALUES ('conversation-a', 'root-a', 1)"
+        )
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES ('codex_physical_mutation_seq', '7'), "
+            "('codex_quota_projection_certificate', 'stale')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    db = _load_db_module()
+    handler = next(
+        (item.handler for item in db._CACHE_MIGRATIONS if item.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"{migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        db._stamp_applied(conn, migration, "2026-07-18T12:00:00Z")
+    finally:
+        conn.close()
+    lock = Path(str(post) + ".codex.lock")
+    if lock.exists():
+        lock.unlink()
+
+
+def build_per_migration_027_codex_fork_preamble_rebuild(
+    scenario_dir: Path,
+) -> None:
+    """Build deterministic replay-arm goldens for cache migration 027."""
+    import shutil
+    import tempfile
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "027_codex_fork_preamble_rebuild"
+
+    with tempfile.TemporaryDirectory(prefix="cctally-migration-027-") as scratch:
+        seed_dir = Path(scratch) / "026"
+        build_per_migration_026_codex_conversation_key_backfill(seed_dir)
+        if pre.exists():
+            pre.unlink()
+        # A real post-026 cache has already replayed and become populated again.
+        # Reuse 026's populated pre-state, then stamp 026 as applied.
+        shutil.copy(seed_dir / "pre.sqlite", pre)
+
+    register_fixture_db(pre)
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO schema_migrations(name, applied_at_utc) VALUES (?, ?)",
+            ("026_codex_conversation_key_backfill", "2026-07-19T11:00:00Z"),
+        )
+        conn.execute("PRAGMA user_version = 26")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    db = _load_db_module()
+    handler = next(
+        (item.handler for item in db._CACHE_MIGRATIONS if item.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"{migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        db._stamp_applied(conn, migration, "2026-07-19T12:00:00Z")
+    finally:
+        conn.close()
+    lock = Path(str(post) + ".codex.lock")
+    if lock.exists():
+        lock.unlink()
+
+
 def build_per_migration_023_conversation_sessions_enrichment_columns(
     scenario_dir: Path,
 ) -> None:
@@ -4915,6 +5054,12 @@ def main() -> int:
     )
     build_per_migration_025_codex_conversation_normalization(
         FIXTURES_ROOT / "per-migration" / "025_codex_conversation_normalization"
+    )
+    build_per_migration_026_codex_conversation_key_backfill(
+        FIXTURES_ROOT / "per-migration" / "026_codex_conversation_key_backfill"
+    )
+    build_per_migration_027_codex_fork_preamble_rebuild(
+        FIXTURES_ROOT / "per-migration" / "027_codex_fork_preamble_rebuild"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

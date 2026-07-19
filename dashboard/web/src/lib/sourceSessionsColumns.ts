@@ -24,41 +24,32 @@ function recencyMs(r: SessionDisplayRow): number {
 // The full source-grid column set. `includeSource` splices the leading Source
 // chip column (All-mode interleave); single-source Codex passes false.
 export function sourceSessionsColumns(
-  { includeSource }: { includeSource: boolean },
+  { includeSource, oneModel }: { includeSource: boolean; oneModel: boolean },
 ): TableColumn<SessionDisplayRow>[] {
+  void includeSource;
   const cols: TableColumn<SessionDisplayRow>[] = [];
-  if (includeSource) {
-    cols.push({
-      id: 'source', label: 'Source', defaultDirection: 'asc', sortable: false,
-      compare: () => 0,
-    });
-  }
   cols.push(
-    { id: 'label', label: 'Session', defaultDirection: 'asc',
-      compare: (a, b) => (a.title || '').localeCompare(b.title || ''),
-    },
-    { id: 'recency', label: 'Last activity', defaultDirection: 'desc',
+    { id: 'started', label: 'Started', defaultDirection: 'desc',
       // Rows without a recency timestamp park at the END (direction-invariant).
       nullKey: (r) => r.recencyUtc ?? null,
       compare: (a, b) => recencyMs(a) - recencyMs(b),
     },
-    { id: 'models', label: 'Models', defaultDirection: 'asc', sortable: false,
-      compare: () => 0,
+    { id: 'duration', label: 'Dur', defaultDirection: 'desc', numeric: true,
+      nullKey: (r) => r.durationMin,
+      compare: (a, b) => (a.durationMin ?? 0) - (b.durationMin ?? 0),
     },
-    { id: 'input', label: 'Input', defaultDirection: 'desc', numeric: true, sortable: false,
-      compare: () => 0,
+    ...(oneModel ? [] : [{ id: 'model', label: 'Model', defaultDirection: 'asc' as const,
+      compare: (a: SessionDisplayRow, b: SessionDisplayRow) => a.models.join(',').localeCompare(b.models.join(',')),
+    }]),
+    { id: 'session', label: 'Session', defaultDirection: 'asc',
+      compare: (a, b) => (a.title || '').localeCompare(b.title || ''),
     },
-    { id: 'cached', label: 'Cached', defaultDirection: 'desc', numeric: true, sortable: false,
-      compare: () => 0,
+    { id: 'project', label: 'Project', defaultDirection: 'asc',
+      compare: (a, b) => a.project.localeCompare(b.project),
     },
-    { id: 'output', label: 'Output', defaultDirection: 'desc', numeric: true, sortable: false,
-      compare: () => 0,
-    },
-    { id: 'reasoning', label: 'Reasoning', defaultDirection: 'desc', numeric: true, sortable: false,
-      compare: () => 0,
-    },
-    { id: 'total', label: 'Total', defaultDirection: 'desc', numeric: true,
-      compare: (a, b) => sessionRowTotalTokens(a) - sessionRowTotalTokens(b),
+    { id: 'cache', label: 'Cache', defaultDirection: 'desc', numeric: true,
+      nullKey: (r) => r.cacheHitPct,
+      compare: (a, b) => (a.cacheHitPct ?? 0) - (b.cacheHitPct ?? 0),
     },
     { id: 'cost', label: 'Cost', defaultDirection: 'desc', numeric: true,
       compare: (a, b) => (a.costUsd ?? 0) - (b.costUsd ?? 0),

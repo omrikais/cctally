@@ -162,12 +162,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 25,
+                        "registry_size": 27,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 25 known",
+                    "summary": "version 99 / 27 known",
                     "title": "cache.db"
                 },
                 {
@@ -184,7 +184,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 25,
+                            "registry_size": 27,
                             "user_version": 99
                         },
                         "stats.db": {
@@ -196,7 +196,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v25) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v27) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -230,7 +230,9 @@
                                     "022_index_conversation_messages_model",
                                     "023_conversation_sessions_enrichment_columns",
                                     "024_codex_fused_ingest_rebuild",
-                                    "025_codex_conversation_normalization"
+                                    "025_codex_conversation_normalization",
+                                    "026_codex_conversation_key_backfill",
+                                    "027_codex_fork_preamble_rebuild"
                                 ],
                                 "skipped": []
                             },
@@ -258,7 +260,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/38 applied",
+                    "summary": "0/40 applied",
                     "title": "Migrations"
                 },
                 {
@@ -415,13 +417,21 @@
                             [
                                 "cache.db",
                                 "025_codex_conversation_normalization"
+                            ],
+                            [
+                                "cache.db",
+                                "026_codex_conversation_key_backfill"
+                            ],
+                            [
+                                "cache.db",
+                                "027_codex_fork_preamble_rebuild"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "38 pending",
+                    "summary": "40 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -497,6 +507,19 @@
                     "severity": "ok",
                     "summary": "none (no Codex session JSONL found)",
                     "title": "Codex cache"
+                },
+                {
+                    "details": {
+                        "incomplete_rows": 0,
+                        "missing_conversation_key_rows": 0,
+                        "missing_thread_join_rows": 0,
+                        "qualified_rows": 0,
+                        "total_rows": 0
+                    },
+                    "id": "data.codex_project_metadata",
+                    "severity": "ok",
+                    "summary": "qualified",
+                    "title": "Codex project metadata"
                 },
                 {
                     "details": {
@@ -650,7 +673,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 31,
+            "ok": 32,
             "warn": 5
         },
         "severity": "warn"

@@ -1,4 +1,4 @@
 Codex quota forecast · local-rollout
-primary · 5h 30m · root=root-a · limit=limit-primary · stale · current 16.1% · projected 25.3%
-secondary · 1h · root=root-a · limit=limit-secondary · stale · current 41.0% · projected 44.0%
-primary · 5h 30m · root=root-b · limit=limit-primary · stale · current 12.4% · projected 19.6%
+primary · 5h 30m · root=root-a · limit=limit-primary · stale · current 16.1% · projected 35.4%
+secondary · 1h · root=root-a · limit=limit-secondary · stale · current 41.0%
+primary · 5h 30m · root=root-b · limit=limit-primary · stale · current 12.4% · projected 27.3%

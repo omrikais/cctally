@@ -47,6 +47,62 @@ def _physical_seq(conn: sqlite3.Connection) -> int:
     return 0 if row is None else int(row[0])
 
 
+def _seed_active_codex_weekly_cycle(ns, cache: sqlite3.Connection, *, now):
+    """Add coherent root-qualified native 7-day evidence to a synced fixture."""
+    import _cctally_quota as quota_module
+
+    row = cache.execute(
+        "SELECT source_root_key, canonical_root_path FROM codex_source_roots"
+    ).fetchone()
+    assert row is not None
+    root_key, root_path = str(row[0]), str(row[1])
+    resets_at = now + ns["dt"].timedelta(days=1)
+    captured_at = now - ns["dt"].timedelta(minutes=1)
+    cache.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        "observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
+        "used_percent, resets_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "codex", root_key, f"{root_path}/weekly-quota.jsonl", 10_080,
+            captured_at.isoformat(), "fixture-weekly", "fixture-weekly-limit",
+            "fixture-weekly-limit", "Fixture weekly quota", 10_080, 25.0,
+            resets_at.isoformat(),
+        ),
+    )
+    ns["_cctally_cache"]._bump_codex_physical_mutation_seq(cache)
+    cache.commit()
+    quota_module.reconcile_codex_quota_projection(
+        source_root_keys=(root_key,), now=now,
+    )
+    return resets_at - ns["dt"].timedelta(minutes=10_080), resets_at
+
+
+def _append_active_codex_weekly_snapshot(ns, rollout: pathlib.Path, *, now) -> None:
+    """Persist a native 7-day observation for an ingest/recovery fixture."""
+    resets_at = now + ns["dt"].timedelta(days=1)
+    payload = {
+        "type": "event_msg",
+        "timestamp": (now - ns["dt"].timedelta(minutes=1)).isoformat(),
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "rate_limits": {
+                    "limit_id": "fixture-weekly-limit",
+                    "limit_name": "Fixture weekly quota",
+                    "primary": {
+                        "resets_at": int(resets_at.timestamp()),
+                        "used_percent": 25.0,
+                        "window_minutes": 10_080,
+                    },
+                },
+            },
+        },
+    }
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def test_codex_physical_mutation_sequence_tracks_metadata_only_and_reset_changes(
     tmp_path, monkeypatch,
 ):
@@ -520,6 +576,7 @@ def test_source_bundle_threads_the_canonical_fast_tier_and_week_start(
             'service_tier = "fast"\n', encoding="utf-8",
         )
         ns["sync_codex_cache"](cache)
+        cycle_start, resets_at = _seed_active_codex_weekly_cycle(ns, cache, now=now)
         monkeypatch.setattr(tui_module, "build_codex_source_state", capture)
 
         bundle = tui_module._tui_build_source_bundle(
@@ -536,9 +593,14 @@ def test_source_bundle_threads_the_canonical_fast_tier_and_week_start(
         assert len(seen) == 1
         assert seen[0].speed == "fast"
         assert seen[0].week_start_idx == 6
+        assert bundle.sources["codex"].data["hero"]["cycle"] == {
+            "window_minutes": 10_080,
+            "start_at": cycle_start.isoformat(),
+            "resets_at": resets_at.isoformat(),
+        }
         entries = ns["iter_codex_entries"](
             cache,
-            now - ns["dt"].timedelta(days=30),
+            cycle_start,
             now,
         )
         expected = ns["build_codex_daily_view"](
@@ -878,7 +940,7 @@ def test_snapshot_keeps_prior_complete_source_bundle_when_signature_and_builder_
     assert "canary/root" not in repr(snap.source_bundle)
 
 
-def test_source_bundle_combined_hero_uses_the_same_visible_interval_for_both_providers(
+def test_source_bundle_hero_uses_native_cycle_while_periods_respect_visible_range(
     tmp_path, monkeypatch,
 ):
     ns, _root, _rollout, cache = _sync_setup(tmp_path, monkeypatch)
@@ -887,6 +949,7 @@ def test_source_bundle_combined_hero_uses_the_same_visible_interval_for_both_pro
     visible_start = ns["dt"].datetime(2026, 7, 17, tzinfo=ns["dt"].timezone.utc)
     try:
         ns["sync_codex_cache"](cache)
+        _seed_active_codex_weekly_cycle(ns, cache, now=now)
         historical = build_codex_source_state(
             DashboardReadContext(
                 cache_conn=cache,
@@ -900,6 +963,19 @@ def test_source_bundle_combined_hero_uses_the_same_visible_interval_for_both_pro
         assert historical.data["hero"]["cost_usd"] > 0
         assert historical.data["periods"]["daily"]["rows"]
 
+        narrowed = build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache,
+                stats_conn=stats,
+                range_start=visible_start,
+                now_utc=now,
+                display_tz_name="UTC",
+            ),
+            data_version="narrowed",
+        )
+        assert narrowed.data["hero"] == historical.data["hero"]
+        assert narrowed.data["periods"]["daily"]["rows"] == ()
+
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
             stats_conn=stats,
             now_utc=now,
@@ -910,11 +986,11 @@ def test_source_bundle_combined_hero_uses_the_same_visible_interval_for_both_pro
             common_range_start=visible_start,
         )
 
-        assert bundle.sources["codex"].data["hero"]["cost_usd"] == 0.0
+        assert bundle.sources["codex"].data["hero"] == historical.data["hero"]
         assert bundle.sources["codex"].data["periods"]["daily"]["rows"] == ()
         assert bundle.sources["all"].data["combined"] == {
-            "cost_usd": 1.25,
-            "total_tokens": 25,
+            "cost_usd": pytest.approx(historical.data["hero"]["cost_usd"] + 1.25),
+            "total_tokens": historical.data["hero"]["total_tokens"] + 25,
         }
     finally:
         cache.close()
@@ -927,6 +1003,10 @@ def test_dashboard_no_sync_skips_both_ingests_and_reads_cached_codex_source(
     ns, _root, _rollout, cache = _sync_setup(tmp_path, monkeypatch)
     try:
         ns["sync_codex_cache"](cache)
+        _seed_active_codex_weekly_cycle(
+            ns, cache,
+            now=ns["dt"].datetime(2026, 7, 20, tzinfo=ns["dt"].timezone.utc),
+        )
     finally:
         cache.close()
     calls = {"claude": 0, "codex": 0}
@@ -1073,11 +1153,11 @@ def test_dashboard_held_codex_flock_publishes_unavailable_source_without_prior(
     assert codex.warnings[0].code == "source_ingest_contended"
 
 
-def test_dashboard_dispatch_retries_an_unavailable_codex_projection_after_certificate_recovery(
+def test_dashboard_dispatch_retries_a_hero_scoped_codex_projection_after_certificate_recovery(
     tmp_path, monkeypatch,
 ):
     """Certificate-only recovery must bypass idle and retry only Codex."""
-    ns, _root, _rollout, cache = _sync_setup(tmp_path, monkeypatch)
+    ns, _root, rollout, cache = _sync_setup(tmp_path, monkeypatch)
     import _cctally_quota as quota_module
     import _lib_snapshot_cache as sc
 
@@ -1085,6 +1165,7 @@ def test_dashboard_dispatch_retries_an_unavailable_codex_projection_after_certif
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     stats = ns["open_db"]()
     try:
+        _append_active_codex_weekly_snapshot(ns, rollout, now=now)
         ns["sync_codex_cache"](cache)
         cache.execute(
             "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
@@ -1100,8 +1181,13 @@ def test_dashboard_dispatch_retries_an_unavailable_codex_projection_after_certif
             runtime_bind="127.0.0.1",
         )
         unavailable_codex = unavailable.source_bundle.sources["codex"]
-        assert unavailable_codex.availability == "unavailable"
+        assert unavailable_codex.availability == "partial"
+        assert unavailable_codex.freshness == "fresh"
+        assert unavailable_codex.data is not None
+        assert unavailable_codex.capabilities["hero"].status == "unavailable"
+        assert unavailable_codex.data["hero"]["cycle"] is None
         assert unavailable_codex.warnings[0].code == "codex_projection_incoherent"
+        assert unavailable_codex.warnings[0].domain == "hero"
 
         # A normal unchanged-file ingest re-runs the durable reconciler and
         # stamps the certificate.  Neither physical accounting rows nor the
@@ -1158,8 +1244,11 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
             runtime_bind="127.0.0.1",
         )
         first_codex = first.source_bundle.sources["codex"]
-        assert first_codex.availability == "unavailable"
-        assert first_codex.data is None
+        assert first_codex.availability == "partial"
+        assert first_codex.freshness == "fresh"
+        assert first_codex.data is not None
+        assert first_codex.capabilities["hero"].status == "unavailable"
+        assert first_codex.data["hero"]["cycle"] is None
         assert first_codex.warnings[0].code == "codex_projection_incoherent"
         physical_seq = _physical_seq(cache)
         dispatch_signature = tui._tui_compute_dispatch_signature(stats)
@@ -1200,13 +1289,16 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
         assert third.sessions is first.sessions
         for snapshot in (second, third):
             codex = snapshot.source_bundle.sources["codex"]
-            assert codex.availability in ("unavailable", "partial")
-            assert codex.data is None
+            assert codex.availability == "partial"
+            assert codex.freshness == "fresh"
+            assert codex.data is not None
+            assert codex.capabilities["hero"].status == "unavailable"
+            assert codex.data["hero"]["cycle"] is None
             assert codex.warnings[0].code == "codex_projection_incoherent"
             assert snapshot.source_bundle.sources["claude"] is first.source_bundle.sources["claude"]
             wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(codex)
             assert "clock_data" not in wire
-            assert wire["data"] is None
+            assert wire["data"]["periods"]["daily"] is not None
     finally:
         sc.reset_dispatch_state()
         cache.close()
@@ -1273,7 +1365,9 @@ def test_dashboard_idle_source_retry_keeps_the_full_build_display_timezone_range
             precompute_envelope=True,
             runtime_bind="127.0.0.1",
         )
-        assert degraded.source_bundle.sources["codex"].availability == "unavailable"
+        assert degraded.source_bundle.sources["codex"].availability == "partial"
+        assert degraded.source_bundle.sources["codex"].data is not None
+        assert degraded.source_bundle.sources["codex"].capabilities["hero"].status == "unavailable"
         full_degraded_range = observed_ranges[-1]
 
         retried = ns["_tui_build_snapshot"](
@@ -1283,7 +1377,7 @@ def test_dashboard_idle_source_retry_keeps_the_full_build_display_timezone_range
             runtime_bind="127.0.0.1",
         )
         idle_retry_range = observed_ranges[-1]
-        assert retried.source_bundle.sources["codex"].availability in ("unavailable", "partial")
+        assert retried.source_bundle.sources["codex"].availability == "partial"
         assert len(observed_ranges) == 3
         assert normal_range == full_degraded_range == idle_retry_range
 
@@ -1340,7 +1434,7 @@ def test_dashboard_held_codex_flock_retains_the_prior_source_state(
     assert codex.warnings[0].code == "source_ingest_contended"
 
 
-def test_codex_projection_and_domain_failure_retain_prior_then_recover(
+def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
     tmp_path, monkeypatch,
 ):
     ns = load_script()
@@ -1363,10 +1457,12 @@ def test_codex_projection_and_domain_failure_retain_prior_then_recover(
         cache.commit()
 
         with monkeypatch.context() as m:
-            def projection_failure(*_args, **_kwargs):
-                raise ns["_cctally_tui"].CodexProjectionIncoherent("mismatch")
-
-            m.setattr(ns["_cctally_tui"], "build_codex_source_state", projection_failure)
+            source_module = sys.modules["_cctally_dashboard_sources"]
+            m.setattr(
+                source_module,
+                "codex_projection_coherence",
+                lambda *_args, **_kwargs: source_module.ProjectionCoherence(False, "mismatch"),
+            )
             incoherent = ns["_cctally_tui"]._tui_build_source_bundle(
                 stats_conn=stats,
                 now_utc=now,
@@ -1376,8 +1472,15 @@ def test_codex_projection_and_domain_failure_retain_prior_then_recover(
                 claude_total_tokens=10,
                 prior_bundle=prior,
             )
-        assert incoherent.sources["codex"].data is prior.sources["codex"].data
+        assert incoherent.sources["codex"].data is not prior.sources["codex"].data
+        assert incoherent.sources["codex"].availability == "partial"
+        assert incoherent.sources["codex"].freshness == "fresh"
+        assert incoherent.sources["codex"].capabilities["hero"].status == "unavailable"
+        assert incoherent.sources["codex"].data["hero"]["cycle"] is None
+        assert incoherent.sources["codex"].data["hero"]["total_tokens"] is None
         assert incoherent.sources["codex"].warnings[0].code == "codex_projection_incoherent"
+        assert incoherent.sources["codex"].warnings[0].domain == "hero"
+        assert incoherent.sources["all"].data["combined"] is None
 
         recovered = ns["_cctally_tui"]._tui_build_source_bundle(
             stats_conn=stats,
@@ -1396,7 +1499,19 @@ def test_codex_projection_and_domain_failure_retain_prior_then_recover(
             "UPDATE cache_meta SET value='2' WHERE key='codex_physical_mutation_seq'"
         )
         cache.commit()
+        errors = []
+
+        class PrivateDashboardLogger:
+            def error(self, *args, **kwargs):
+                errors.append((args, kwargs))
+
         with monkeypatch.context() as m:
+            m.setattr(
+                ns["_cctally_tui"],
+                "_lib_log",
+                SimpleNamespace(get_logger=lambda name: PrivateDashboardLogger()),
+                raising=False,
+            )
             m.setattr(
                 ns["_cctally_tui"], "build_codex_source_state",
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("private /canary/root")),
@@ -1413,6 +1528,11 @@ def test_codex_projection_and_domain_failure_retain_prior_then_recover(
         assert failed_domain.sources["codex"].data is recovered.sources["codex"].data
         assert failed_domain.sources["codex"].warnings[0].code == "source_build_failed"
         assert failed_domain.sources["codex"].warnings[0].domain == "read_model"
+        assert errors == [(
+            ("codex_read_model source build failed",),
+            {"exc_info": True},
+        )]
+        assert "private /canary/root" not in repr(failed_domain.sources["codex"].warnings)
 
         recovered_domain = ns["_cctally_tui"]._tui_build_source_bundle(
             stats_conn=stats,
@@ -1500,6 +1620,12 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
                 timestamp, slot, logical_limit, f"limit-id-{index}", "Scale quota",
                 300, 25.0, resets_at,
             ))
+        weekly_resets_at = (now + ns["dt"].timedelta(days=1)).isoformat()
+        quota_rows.append((
+            "codex", root_key, "/fixture/quota/weekly.jsonl", 24,
+            timestamp, "weekly-slot", "weekly-limit", "weekly-limit-id",
+            "Scale weekly quota", 10_080, 25.0, weekly_resets_at,
+        ))
         cache.executemany(
             "INSERT INTO quota_window_snapshots "
             "(source, source_root_key, source_path, line_offset, captured_at_utc, "
@@ -1516,6 +1642,20 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         import _cctally_quota as quota
         observations = quota.load_codex_quota_observations(source_root_keys=(root_key,))
         physical_signature = quota._signature(observations, root_key)
+        quota_block_rows = [
+            ("codex", root_key, f"limit-{index}", f"slot-{index}", 300,
+             "Scale quota", (now + ns["dt"].timedelta(hours=5 + index)).isoformat(),
+             timestamp, timestamp, timestamp, 25.0, 25.0,
+             f"/fixture/quota/{index}.jsonl", index, "scale")
+            for index in range(24)
+        ]
+        quota_block_rows.append((
+            "codex", root_key, "weekly-limit", "weekly-slot", 10_080,
+            "Scale weekly quota", weekly_resets_at,
+            (now - ns["dt"].timedelta(minutes=10_080)).isoformat(),
+            timestamp, timestamp, 25.0, 25.0,
+            "/fixture/quota/weekly.jsonl", 24, "scale",
+        ))
         stats.executemany(
             "INSERT INTO quota_window_blocks "
             "(source, source_root_key, logical_limit_key, observed_slot, window_minutes, "
@@ -1523,11 +1663,7 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
             "last_observed_at_utc, first_percent, current_percent, last_source_path, "
             "last_line_offset, generation) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (("codex", root_key, f"limit-{index}", f"slot-{index}", 300,
-              "Scale quota", (now + ns["dt"].timedelta(hours=5 + index)).isoformat(),
-              timestamp, timestamp, timestamp, 25.0, 25.0,
-              f"/fixture/quota/{index}.jsonl", index, "scale")
-             for index in range(24)),
+            quota_block_rows,
         )
         stats.execute(
             "INSERT INTO quota_projection_state "
@@ -1591,7 +1727,11 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         assert first.last_sync_error is None
         assert codex.availability == "ok"
         assert len(codex.data["projects"]["rows"]) == 200
-        assert len(codex.data["quota"]["blocks"]) == 24
+        blocks = codex.data["quota"]["blocks"]
+        assert len(blocks) == 24
+        assert all(block["window_minutes"] == 300 for block in blocks)
+        assert all(block["model_breakdowns"] for block in blocks)
+        assert not any(block["label"] == "Scale weekly quota" for block in blocks)
         assert calls == {"claude": 4, "codex": 4}
         assert all(idle.source_bundle.sources["claude"] is first.source_bundle.sources["claude"]
                    for idle in idles)
@@ -1627,7 +1767,7 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         print(
             "source-scale "
             f"changed={changed_elapsed:.3f}s digest={digest_elapsed:.3f}s "
-            f"idle3={idle_elapsed:.3f}s rows=100000/50000 files=2000 quota=24 projects=200"
+            f"idle3={idle_elapsed:.3f}s rows=100000/50000 files=2000 quota=24+1 projects=200"
         )
     finally:
         cache.close()

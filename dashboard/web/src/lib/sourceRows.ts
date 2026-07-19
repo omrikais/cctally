@@ -29,6 +29,22 @@ export interface JoinedCodexQuotaWindow {
   current: CodexQuotaActiveRow;
 }
 
+// Provider labels are presentation text, not identity. Preserve a supplied
+// nonempty label first; only absent labels receive deterministic duration copy.
+export function nativeLimitLabel(
+  label: string | null | undefined,
+  windowMinutes: number | null | undefined,
+): string {
+  const trimmed = label?.trim();
+  if (trimmed) return trimmed;
+  if (windowMinutes === 300) return '5-hour limit';
+  if (windowMinutes === 10_080) return '7-day limit';
+  if (windowMinutes == null || windowMinutes <= 0) return 'Codex quota';
+  if (windowMinutes % 1_440 === 0) return `${windowMinutes / 1_440}-day limit`;
+  if (windowMinutes % 60 === 0) return `${windowMinutes / 60}-hour limit`;
+  return `${windowMinutes}-minute limit`;
+}
+
 export function joinCodexQuotaLabels(
   hero: CodexHero,
   quota: CodexQuotaDomain,
@@ -41,7 +57,7 @@ export function joinCodexQuotaLabels(
     const history = byKey.get(row.key);
     return {
       key: row.key,
-      label: history?.label ?? 'Codex quota',
+      label: nativeLimitLabel(history?.label, history?.window_minutes),
       windowMinutes: history?.window_minutes ?? null,
       current: row,
     };
@@ -72,6 +88,10 @@ export interface SessionDisplayRow {
   recencyUtc: string | null;
   models: string[];
   costUsd: number | null;
+  durationMin: number | null;
+  project: string;
+  projectKey: string | null;
+  cacheHitPct: number | null;
   tokens: CodexTokenCells | ClaudeTokenCells;
   // Claude rows keep their legacy fields for the existing columns.
   legacy?: ClaudeSessionSourceRow;
@@ -81,10 +101,14 @@ export function adaptClaudeSessionRows(rows: ClaudeSessionSourceRow[]): SessionD
   return (rows ?? []).map((row) => ({
     source: 'claude',
     key: row.key,
-    title: row.project,
+    title: row.title?.trim() ?? '',
     recencyUtc: row.started_utc,
     models: row.model ? [row.model] : [],
     costUsd: row.cost_usd,
+    durationMin: row.duration_min ?? null,
+    project: row.project,
+    projectKey: row.project_key ?? null,
+    cacheHitPct: row.cache_hit_pct ?? null,
     tokens: { kind: 'claude' },
     legacy: row,
   }));
@@ -94,10 +118,14 @@ export function adaptCodexSessionRows(rows: CodexSessionRow[]): SessionDisplayRo
   return (rows ?? []).map((row) => ({
     source: 'codex',
     key: row.key,
-    title: row.label,
-    recencyUtc: row.last_activity,
+    title: row.label?.trim() ?? '',
+    recencyUtc: row.started_at ?? row.last_activity,
     models: [...(row.models ?? [])],
     costUsd: row.cost_usd,
+    durationMin: row.duration_min ?? null,
+    project: row.project ?? 'Project resolving',
+    projectKey: row.project_key ?? null,
+    cacheHitPct: row.input_tokens > 0 ? row.cached_input_tokens / row.input_tokens * 100 : null,
     tokens: {
       kind: 'codex',
       input: row.input_tokens,
@@ -109,23 +137,42 @@ export function adaptCodexSessionRows(rows: CodexSessionRow[]): SessionDisplayRo
   }));
 }
 
-// Collect the Sessions display rows for the active source view (§6.3). Codex →
-// its own native rows; All → the Claude + Codex provider children CONCATENATED
+// Collect the Sessions display rows for the active source view (§6.3). Claude
+// and Codex adapt their native rows; All concatenates both provider children
 // (the caller sorts by the shared recency comparator to interleave — no merging
-// of labels or native keys, each row keeps its own `source`). Claude single-
-// source is rendered by the legacy `getRenderedRows` path, so it returns [] here.
+// of labels or native keys, each row keeps its own `source`).
 export function collectSourceSessionRows(view: SourceView): SessionDisplayRow[] {
+  if (view.selection === 'claude') {
+    return adaptClaudeSessionRows((view.env?.sessions?.rows ?? []).map((row) => ({
+      key: row.session_id,
+      source: 'claude' as const,
+      started_utc: row.started_utc,
+      duration_min: row.duration_min,
+      model: row.model,
+      project: row.project,
+      project_key: row.project_key,
+      cost_usd: row.cost_usd,
+      cache_hit_pct: row.cache_hit_pct,
+      title: row.title,
+    })));
+  }
   if (view.selection === 'codex') {
     const data = view.entry?.data as CodexSourceData | null | undefined;
     return adaptCodexSessionRows(data?.sessions?.rows ?? []);
   }
   if (view.selection === 'all') {
     const providers = (view.entry?.data as AllSourceData | null | undefined)?.providers;
-    const claudeRows = providers?.claude
-      ? adaptClaudeSessionRows((providers.claude.sessions?.rows ?? []) as ClaudeSessionSourceRow[])
+    // The production All envelope may intentionally omit nested provider
+    // payloads and rely on the sibling source entries.  Keep All as one
+    // chronological list by falling back at the adapter boundary instead of
+    // rendering an empty board or duplicating provider sections.
+    const claude = providers?.claude ?? view.env?.sources?.claude?.data ?? null;
+    const codex = providers?.codex ?? view.env?.sources?.codex?.data ?? null;
+    const claudeRows = claude
+      ? adaptClaudeSessionRows((claude.sessions?.rows ?? []) as ClaudeSessionSourceRow[])
       : [];
-    const codexRows = providers?.codex
-      ? adaptCodexSessionRows(providers.codex.sessions?.rows ?? [])
+    const codexRows = codex
+      ? adaptCodexSessionRows(codex.sessions?.rows ?? [])
       : [];
     return [...claudeRows, ...codexRows];
   }
@@ -136,7 +183,8 @@ export function collectSourceSessionRows(view: SourceView): SessionDisplayRow[] 
 // models (§6.3, enumerated). Lowercased; whitespace inside the needle is a
 // literal char (mirrors the legacy Claude haystack contract).
 export function sourceSessionHaystack(r: SessionDisplayRow): string {
-  return [r.title || '', ...r.models].join(' ').toLowerCase();
+  return [r.title || '', r.project, r.durationMin == null ? '' : `${r.durationMin}m`,
+    r.costUsd == null ? '' : `$${r.costUsd.toFixed(2)}`, ...r.models].join(' ').toLowerCase();
 }
 
 export function applySourceSessionFilter(

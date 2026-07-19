@@ -91,6 +91,11 @@ severity != `OK`.
   never creates, prunes, repairs, or otherwise changes pipeline files.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
+- `data.codex_project_metadata` — an all-history, root-qualified partition of
+  retained Codex accounting rows. WARN when rows lack a conversation key or a
+  same-root conversation-thread join; rebuild with `cctally cache-sync --source
+  codex --rebuild`. FAIL when the read-only health query cannot run. Details
+  contain counts only, never source paths or identifiers.
 - `data.codex_quota` — physical local-rollout quota freshness per qualified
   Codex window. No Codex corpus is OK/not applicable; Codex files with no
   safely interpreted quota, or any applicable `future`, `stale`, or

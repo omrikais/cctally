@@ -28,7 +28,7 @@ Database
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       37 pending
+  ⚠ Pending migrations       39 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -38,6 +38,7 @@ Data
   ✓ Statusline pipeline      no recent regular-pool timer observed
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Codex project metadata   qualified
   ✓ Codex quota              not applicable
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
@@ -55,4 +56,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 25 OK · 8 WARN · 3 FAIL
+Summary: 26 OK · 8 WARN · 3 FAIL

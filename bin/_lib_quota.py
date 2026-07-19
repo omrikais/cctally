@@ -407,7 +407,7 @@ def _single_identity_history(observations: Iterable[QuotaObservation]) -> QuotaH
 def forecast_quota(
     observations: Iterable[QuotaObservation], as_of: dt.datetime,
 ) -> QuotaForecast:
-    """Fit a reset-scoped quota forecast from positive adjacent intervals only."""
+    """Forecast reset-scoped quota use from elapsed native-cycle pace."""
     _require_aware(as_of, "as_of")
     history = _single_identity_history(observations)
     if history is None:
@@ -423,28 +423,29 @@ def forecast_quota(
         if observation.resets_at == baseline.resets_at and observation.captured_at <= as_of
     )
     points = tuple(sorted(points, key=physical_order_key))
-    usable_elapsed_seconds = 0.0
-    positive_delta_percent = 0.0
     sample_count = 0
     for prior, current in zip(points, points[1:]):
         elapsed_seconds = (current.captured_at - prior.captured_at).total_seconds()
         delta_percent = current.used_percent - prior.used_percent
         if elapsed_seconds > 0 and delta_percent > 0:
-            usable_elapsed_seconds += elapsed_seconds
-            positive_delta_percent += delta_percent
             sample_count += 1
 
     remaining_seconds = max(0, int((baseline.resets_at - as_of).total_seconds()))
-    if usable_elapsed_seconds > 0:
-        rate = positive_delta_percent / (usable_elapsed_seconds / 3600)
+    native_window_seconds = baseline.identity.window_minutes * 60
+    cycle_start = baseline.resets_at - dt.timedelta(minutes=baseline.identity.window_minutes)
+    cycle_elapsed_seconds = min(
+        float(native_window_seconds),
+        max(0.0, (as_of - cycle_start).total_seconds()),
+    )
+    if sample_count > 0 and cycle_elapsed_seconds > 0:
+        rate = baseline.used_percent / (cycle_elapsed_seconds / 3600)
         projected = min(100.0, max(
             baseline.used_percent,
             baseline.used_percent + rate * (remaining_seconds / 3600),
         ))
-        native_window_seconds = baseline.identity.window_minutes * 60
-        if sample_count >= 4 and usable_elapsed_seconds >= native_window_seconds * 0.25:
+        if sample_count >= 4 and cycle_elapsed_seconds >= native_window_seconds * 0.25:
             confidence: Literal["high", "medium", "low"] = "high"
-        elif sample_count >= 2 and usable_elapsed_seconds >= native_window_seconds * 0.10:
+        elif sample_count >= 2 and cycle_elapsed_seconds >= native_window_seconds * 0.10:
             confidence = "medium"
         else:
             confidence = "low"
@@ -469,7 +470,7 @@ def forecast_quota(
         resets_at=baseline.resets_at,
         remaining_seconds=remaining_seconds,
         sample_count=sample_count,
-        sample_span_seconds=int(usable_elapsed_seconds),
+        sample_span_seconds=int(cycle_elapsed_seconds) if sample_count > 0 else 0,
         confidence=confidence,
     )
 

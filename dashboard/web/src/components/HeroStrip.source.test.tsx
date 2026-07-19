@@ -26,17 +26,60 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
   });
 
-  it('shows Codex spend + the five token counters, quota windows, and budget verdict', () => {
+  it('uses the shared three-zone hero with Codex cycle, quota, forecast, and budget values', () => {
     render(<HeroStrip />);
-    expect(screen.getByTestId('codex-hero-spent')).toHaveTextContent('$12.30');
-    const tokens = screen.getByTestId('codex-hero-tokens');
-    expect(tokens).toHaveTextContent('input');
-    expect(tokens).toHaveTextContent('cached input');
-    expect(tokens).toHaveTextContent('reasoning');
-    const support = screen.getByTestId('codex-hero-support');
-    expect(support).toHaveTextContent('5-hour limit');
-    expect(support).toHaveTextContent('Weekly limit');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('$12');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('552k');
+    expect(screen.getByTestId('shared-hero-usage')).toHaveTextContent('7-DAY LIMIT');
+    expect(screen.getByTestId('shared-hero-usage')).toHaveTextContent('5-HOUR');
+    const support = screen.getByTestId('shared-hero-support');
+    expect(support).toHaveTextContent('Forecast @ reset');
     expect(support).toHaveTextContent('Budget');
+  });
+
+  it('makes an unavailable native reset cycle explicit without rendering zero spend', () => {
+    updateSnapshot(
+      envWith((b) => {
+        const codex = b.sources.codex;
+        b.sources.codex = {
+          ...codex,
+          availability: 'partial',
+          freshness: 'fresh',
+          warnings: [{
+            code: 'codex_cycle_unavailable',
+            message: 'Codex native reset cycle is unavailable.',
+            domain: 'hero',
+          }],
+          capabilities: {
+            ...codex.capabilities,
+            hero: {
+              status: 'unavailable',
+              semantics: 'missing-or-conflicting-native-cycle',
+            },
+          },
+          data: {
+            ...codex.data!,
+            hero: {
+              ...codex.data!.hero,
+              cost_usd: null,
+              input_tokens: null,
+              cached_input_tokens: null,
+              output_tokens: null,
+              reasoning_output_tokens: null,
+              total_tokens: null,
+              cycle: null,
+            },
+          } as unknown as typeof codex.data,
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<HeroStrip />);
+    const unavailable = screen.getByTestId('shared-hero-spent');
+    expect(unavailable).toHaveTextContent('—');
+    expect(unavailable).toHaveTextContent('Codex native reset cycle is unavailable.');
+    expect(screen.getByTestId('shared-hero-usage')).toHaveTextContent('5-HOUR');
+    expect(screen.getByTestId('shared-hero-support')).toHaveTextContent('Budget');
   });
 
   it('shows NO $/1% and NO subscription-week copy under Codex', () => {
@@ -45,6 +88,26 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
     expect(container.textContent).not.toContain('WEEK USAGE');
     expect(container.textContent).not.toContain('SPENT THIS WEEK');
   });
+
+  it('treats a missing 300-minute limit as healthy and keeps weekly cycle spend', () => {
+    updateSnapshot(envWith((b) => {
+      const data = b.sources.codex.data!;
+      data.quota.histories = data.quota.histories.filter((row) => row.window_minutes !== 300);
+      data.quota.blocks = data.quota.blocks.filter((row) => !row.label.includes('5-hour'));
+      data.hero.quota.active = data.hero.quota.active.filter((row) => row.key !== 'quota:codex-5h');
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<HeroStrip />);
+    expect(screen.getByTestId('shared-hero-usage')).toHaveTextContent('5-HOUR—');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('$12');
+    expect(screen.queryByText(/unavailable/i)).not.toBeInTheDocument();
+  });
+
+  it('displays a restored 300-minute limit independently without changing cycle spend', () => {
+    render(<HeroStrip />);
+    expect(screen.getByTestId('shared-hero-usage')).toHaveTextContent('5-HOUR42%');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('$12');
+  });
 });
 
 describe('HeroStrip — All combined tiles (§6.1)', () => {
@@ -52,10 +115,10 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     updateSnapshot(envWith());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    const combined = screen.getByTestId('all-hero-combined');
+    const combined = screen.getByTestId('shared-hero-spent');
     // claude 8.4 + codex 12.3 = 20.7
-    expect(combined).toHaveTextContent('$20.70');
-    expect(screen.queryByTestId('combined-unavailable')).toBeNull();
+    expect(combined).toHaveTextContent('$21');
+    expect(combined).not.toHaveTextContent('unavailable');
   });
 
   it('shows an explicit combined-unavailable state when combined is null', () => {
@@ -70,7 +133,25 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     );
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    expect(screen.getByTestId('combined-unavailable')).toHaveTextContent('Codex ingest is in progress.');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('Codex ingest is in progress.');
+  });
+
+  it('uses the hero warning for an unavailable combined hero instead of an earlier panel warning', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.all = {
+          ...b.sources.all,
+          warnings: [
+            { code: 'projects', message: 'Projects metadata is incomplete.', domain: 'projects' },
+            { code: 'codex_cycle_unavailable', message: 'Codex native reset cycle is unavailable.', domain: 'hero' },
+          ],
+          data: { ...b.sources.all.data!, combined: null },
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('Codex native reset cycle is unavailable.');
   });
 });
 

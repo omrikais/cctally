@@ -854,9 +854,15 @@ export interface CodexQuotaBlockRow {
   key: string;
   source: 'codex';
   label: string;
+  window_minutes: number;
+  start_at: string;
+  end_at: string;
   resets_at: string;
   current_percent: number | null;
   orphaned: boolean;
+  is_active: boolean;
+  cost_usd: number;
+  model_breakdowns: CodexModelBreakdown[];
 }
 
 export interface CodexQuotaDomain {
@@ -919,13 +925,23 @@ export interface CodexBudgetDomain {
 
 // Codex hero counters — the five native token counters + cost, the quota
 // summary, the configured budget, and the alert count.
+export interface CodexCycle {
+  window_minutes: number;
+  start_at: string;
+  resets_at: string;
+}
+
 export interface CodexHero {
-  cost_usd: number;
-  input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  reasoning_output_tokens: number;
-  total_tokens: number;
+  // These accounting values are null only when Codex has visible accounting
+  // but no coherent active 10,080-minute native reset boundary. Consumers must
+  // render that failure explicitly rather than formatting a misleading zero.
+  cost_usd: number | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_output_tokens: number | null;
+  total_tokens: number | null;
+  cycle: CodexCycle | null;
   quota: CodexQuotaSummary;
   budget: CodexBudgetStatus | null;
   alerts: { count: number };
@@ -940,6 +956,7 @@ export interface CodexPeriodBucket {
   reasoning_output_tokens: number;
   total_tokens: number;
   models: string[];
+  model_breakdowns?: CodexModelBreakdown[];
 }
 
 export interface CodexPeriodView {
@@ -958,7 +975,11 @@ export interface CodexPeriodsDomain {
 export interface CodexSessionRow {
   key: string;
   source: 'codex';
-  label: string;
+  label?: string | null;
+  project?: string | null;
+  project_key?: string | null;
+  started_at?: string | null;
+  duration_min?: number | null;
   last_activity: string;
   cost_usd: number;
   input_tokens: number;
@@ -1057,6 +1078,7 @@ export interface ClaudeSessionSourceRow {
   duration_min: number;
   model: string;
   project: string;
+  project_key?: string | null;
   cost_usd: number | null;
   cache_hit_pct?: number | null;
   title?: string | null;
@@ -1292,6 +1314,8 @@ export interface CodexSessionDetailBody extends CodexTokenTotals {
   last_activity: string;
   models: string[];
   model_breakdowns: CodexModelBreakdown[];
+  metadata_availability?: 'partial';
+  metadata_reason?: string;
 }
 export interface CodexProjectDetailBody extends CodexTokenTotals {
   detail_kind: 'codex_project';
@@ -1303,6 +1327,8 @@ export interface CodexProjectDetailBody extends CodexTokenTotals {
   session_count: number;
   models: Array<{ model: string } & CodexTokenTotals>;
   sessions: Array<{ label: string; last_activity: string } & CodexTokenTotals>;
+  metadata_availability?: 'partial';
+  metadata_reason?: string;
 }
 export interface CodexBlockDetailBody {
   detail_kind: 'codex_block';

@@ -24,20 +24,20 @@ describe('panel re-key on source switch (§5.1)', () => {
     act(() => {
       dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     });
-    // The Claude subtree unmounted; only the Codex-native table remains.
-    expect(screen.queryByText(/heatmap · 30 days/)).toBeNull();
-    expect(screen.getByTestId('codex-period-daily')).toBeInTheDocument();
+    expect(screen.getByText(/heatmap · 30 days/)).toBeInTheDocument();
+    expect(document.querySelector('#panel-daily[data-source="codex"]')).toBeInTheDocument();
+    expect(screen.getAllByText('$12.30').length).toBeGreaterThan(0);
   });
 
   it('Codex → Claude: no stale Codex-sourced table survives the switch frame', () => {
     updateSnapshot(fixture as unknown as Envelope);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     render(<DailyPanel />);
-    expect(screen.getByTestId('codex-period-daily')).toBeInTheDocument();
+    expect(document.querySelector('#panel-daily[data-source="codex"]')).toBeInTheDocument();
     act(() => {
       dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
     });
-    expect(screen.queryByTestId('codex-period-daily')).toBeNull();
+    expect(document.querySelector('#panel-daily[data-source="claude"]')).toBeInTheDocument();
     expect(screen.getByText(/heatmap · 30 days/)).toBeInTheDocument();
   });
 });

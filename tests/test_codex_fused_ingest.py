@@ -480,6 +480,57 @@ def test_sync_codex_cache_fuses_all_physical_rows_and_skips_unchanged(
         conn.close()
 
 
+def test_byte_zero_replay_backfills_conversation_key_when_both_ids_exist(
+    tmp_path, monkeypatch,
+):
+    """A 026-triggered rebuild recovers source-derived keys, not cache guesses."""
+    ns, _provider_root, _rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    try:
+        first = ns["sync_codex_cache"](conn)
+        assert first.files_processed == 1
+        # Model an old accounting-only cache written before key enrichment.
+        conn.execute("UPDATE codex_session_entries SET conversation_key = NULL")
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_session_entries WHERE conversation_key IS NULL"
+        ).fetchone()[0] == 1
+
+        rebuilt = ns["sync_codex_cache"](conn, rebuild=True)
+
+        assert rebuilt.files_processed == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_session_entries WHERE conversation_key IS NULL"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_byte_zero_replay_does_not_fabricate_key_without_thread_source(
+    tmp_path, monkeypatch,
+):
+    """A modern accounting record with no thread source must retain NULL key."""
+    ns, _provider_root, rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
+    records = _object_records("modern-full")
+    del records[0]["payload"]["thread_source"]
+    rollout.write_text(
+        "".join(_canonical_json(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    conn = ns["open_cache_db"]()
+    try:
+        rebuilt = ns["sync_codex_cache"](conn, rebuild=True)
+        assert rebuilt.files_processed == 1
+        row = conn.execute(
+            "SELECT source_root_key, conversation_key FROM codex_session_entries"
+        ).fetchone()
+        assert row is not None
+        assert row[0]
+        assert row[1] is None
+    finally:
+        conn.close()
+
+
 def test_sync_codex_cache_skips_exponent_overflow_and_continues_file(
     tmp_path, monkeypatch,
 ):
@@ -1111,7 +1162,9 @@ def test_fused_iterator_detects_both_quota_locations_and_degrades_missing_or_mal
     assert not [q for emission in no_quotas for q in emission.quotas]
     partial = [q for emission in partial_quotas for q in emission.quotas]
     assert [quota.observed_slot for quota in partial] == ["primary"]
-    assert any(emission.accounting for emission in partial_quotas)
+    accounting = [emission.accounting for emission in partial_quotas if emission.accounting]
+    assert len(accounting) == 1
+    assert accounting[0].model == "gpt-synthetic-codex"
 
 
 def test_fused_iterator_resolves_conflicting_quota_locations_per_slot_and_field():
@@ -1301,6 +1354,51 @@ def test_accounting_compatibility_wrapper_filters_fused_emissions_and_keeps_file
     assert len(rows) == 1
     assert rows[0][1].session_id == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     assert rows[0][1].model == "unknown"
+
+
+def test_forked_child_preamble_tokens_are_physical_only_until_model_context():
+    session_meta = {
+        "timestamp": "2026-07-14T12:00:00Z", "type": "session_meta",
+        "payload": {
+            "id": "child-accounting-id",
+            "session_id": "parent-accounting-id",
+            "forked_from_id": "parent-thread-id",
+        },
+    }
+    copied_parent_tokens = {
+        "timestamp": "2026-07-14T12:00:01Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 80,
+                                 "output_tokens": 10, "reasoning_output_tokens": 2,
+                                 "total_tokens": 110},
+            "total_token_usage": {"total_tokens": 10_000},
+        }},
+    }
+    turn_context = {
+        "timestamp": "2026-07-14T12:00:02Z", "type": "turn_context",
+        "payload": {"model": "gpt-5.6-sol"},
+    }
+    child_tokens = {
+        "timestamp": "2026-07-14T12:00:03Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {
+            "last_token_usage": {"input_tokens": 20, "cached_input_tokens": 10,
+                                 "output_tokens": 3, "reasoning_output_tokens": 1,
+                                 "total_tokens": 23},
+            "total_token_usage": {"total_tokens": 10_023},
+        }},
+    }
+    raw = "".join(_canonical_json(record) + "\n" for record in (
+        session_meta, copied_parent_tokens, turn_context, child_tokens,
+    )).encode("utf-8")
+
+    emissions = list(FUSED_ITER(io.BytesIO(raw), "/synthetic/forked-child.jsonl"))
+    assert [emission.event.record_type for emission in emissions] == [
+        "session_meta", "event_msg", "turn_context", "event_msg",
+    ]
+    accounting = [emission.accounting for emission in emissions if emission.accounting]
+    assert len(accounting) == 1
+    assert accounting[0].model == "gpt-5.6-sol"
+    assert accounting[0].total_tokens == 23
 
 
 def test_fused_and_wrapper_trim_padded_turn_context_model_for_accounting_only():

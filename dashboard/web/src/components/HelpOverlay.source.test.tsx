@@ -37,20 +37,17 @@ afterEach(() => {
   uninstallGlobalKeydown();
 });
 
-describe('<HelpOverlay /> hidden-capability notes (§6.9)', () => {
-  it('Codex lists forecast/trend (quota pointer) + cache-report (hero pointer)', () => {
+describe('<HelpOverlay /> canonical source board', () => {
+  it('Codex has no hidden-capability section', () => {
     act(() => updateSnapshot(bundleEnv()));
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     render(<HelpOverlay />);
     openHelp();
     const hidden = document.querySelector('.help-hidden-capabilities');
-    expect(hidden).not.toBeNull();
-    expect(hidden!.textContent).toMatch(/Forecast — native forecasts live in the Blocks/);
-    expect(hidden!.textContent).toMatch(/Trend — native forecasts live in the Blocks/);
-    expect(hidden!.textContent).toMatch(/Cache report — token-reuse counters live in the hero/);
+    expect(hidden).toBeNull();
   });
 
-  it('Codex wholly-unavailable STILL lists forecast/trend/cache-report as hidden with their pointers', () => {
+  it('Codex wholly-unavailable still keeps all card positions instead of hiding capabilities', () => {
     // The QA P0 environment: even when Codex wholly failed to build (availability
     // 'unavailable', caps {}), the absent-path panels stay hidden — so the Help
     // overlay must still list them (with their pointers), not drop the section.
@@ -70,10 +67,7 @@ describe('<HelpOverlay /> hidden-capability notes (§6.9)', () => {
     render(<HelpOverlay />);
     openHelp();
     const hidden = document.querySelector('.help-hidden-capabilities');
-    expect(hidden).not.toBeNull();
-    expect(hidden!.textContent).toMatch(/Forecast — native forecasts live in the Blocks/);
-    expect(hidden!.textContent).toMatch(/Trend — native forecasts live in the Blocks/);
-    expect(hidden!.textContent).toMatch(/Cache report — token-reuse counters live in the hero/);
+    expect(hidden).toBeNull();
   });
 
   it('Claude shows no hidden-capabilities section (nothing is intentionally hidden)', () => {
@@ -83,7 +77,7 @@ describe('<HelpOverlay /> hidden-capability notes (§6.9)', () => {
     expect(document.querySelector('.help-hidden-capabilities')).toBeNull();
   });
 
-  it('the panel/digit list reflects the visible order (Codex hides forecast/trend/cache-report)', () => {
+  it('the panel/digit list is the same ten-card order under Codex', () => {
     act(() => updateSnapshot(bundleEnv()));
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     render(<HelpOverlay />);
@@ -91,9 +85,9 @@ describe('<HelpOverlay /> hidden-capability notes (§6.9)', () => {
     const table = document.querySelector('#help-overlay table');
     const text = table?.textContent ?? '';
     // Hidden panels are absent from the digit list; visible ones present.
-    expect(text).not.toMatch(/Open Forecast modal/);
-    expect(text).not.toMatch(/Open Trend modal/);
-    expect(text).not.toMatch(/Open Cache Report modal/);
+    expect(text).toMatch(/Open Forecast modal/);
+    expect(text).toMatch(/Open Trend modal/);
+    expect(text).toMatch(/Open Cache Report modal/);
     expect(text).toMatch(/Open Sessions modal/);
     expect(text).toMatch(/Open Blocks modal/);
   });

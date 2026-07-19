@@ -27,41 +27,29 @@ export function AlertsEmptyGauge({
   compact = false,
   source = 'claude',
 }: Props): JSX.Element {
-  if (source === 'codex') {
-    return (
-      <div className="panel-empty">
-        No Codex alerts yet. Codex budget alerts fire when spend crosses your
-        configured thresholds.
-      </div>
-    );
-  }
-  if (source === 'all') {
-    return (
-      <div className="panel-empty">
-        No alerts yet across Claude and Codex.
-      </div>
-    );
-  }
   const thresholdCopy = thresholds.map((t) => `${t}%`).join(' / ');
-  if (usedPct == null) {
-    return (
-      <div className="panel-empty">
-        No alerts yet. Alerts appear when usage crosses {thresholdCopy}.
-      </div>
-    );
-  }
   const lowest = Math.min(...thresholds);
   const highest = Math.max(...thresholds);
-  const fillPct = Math.max(0, Math.min(usedPct, 100));
+  const fillPct = usedPct == null ? 0 : Math.max(0, Math.min(usedPct, 100));
+  const headline = source === 'codex'
+    ? 'No Codex alerts yet'
+    : source === 'all'
+      ? 'No alerts yet across Claude and Codex'
+      : usedPct != null && usedPct < lowest
+        ? `You're at ${Math.round(usedPct)}% — well under the line`
+        : 'No alerts yet';
+  const description = source === 'codex'
+    ? `Codex budget alerts fire when spend crosses ${thresholdCopy}.`
+    : source === 'all'
+      ? `Provider-native alerts appear at their configured ${thresholdCopy} thresholds.`
+      : `Alerts fire when weekly usage crosses ${thresholdCopy}.`;
   return (
     <div className={'ra-gauge' + (compact ? ' ra-gauge--compact' : '')}>
-      {usedPct < lowest ? (
-        <div className="ra-gauge-head">
-          <span className="ra-gauge-check" aria-hidden="true">✓</span>
-          You're at {Math.round(usedPct)}% — well under the line
-        </div>
-      ) : null}
-      <div className="ra-gauge-hero">{Math.round(usedPct)}%</div>
+      <div className="ra-gauge-head">
+        <span className="ra-gauge-check" aria-hidden="true">✓</span>
+        {headline}
+      </div>
+      <div className="ra-gauge-hero">{usedPct == null ? '—' : `${Math.round(usedPct)}%`}</div>
       <div className="ra-gauge-bar">
         <div className="ra-gauge-fill" style={{ width: `${fillPct}%` }} />
         {thresholds.map((th, i) => (
@@ -77,7 +65,7 @@ export function AlertsEmptyGauge({
         ))}
       </div>
       <div className="ra-gauge-copy">
-        Alerts fire when weekly usage crosses {thresholdCopy}.
+        {description}
       </div>
     </div>
   );

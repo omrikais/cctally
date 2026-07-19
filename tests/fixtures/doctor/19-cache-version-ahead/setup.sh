@@ -79,6 +79,8 @@ write_oauth_credentials
 # Fresh weekly snapshot 2s before CCTALLY_AS_OF
 python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \
     "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
+python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-empty-codex-project-metadata \
+    "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
 python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])

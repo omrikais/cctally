@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
 import sqlite3
 import sys
 from dataclasses import replace
@@ -10,11 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import load_script, redirect_paths
+import _cctally_db as cctally_db  # noqa: E402
 import _lib_source_analytics as source_analytics  # noqa: E402
 import _cctally_source_analytics as source_commands  # noqa: E402
 from _cctally_source_analytics import (  # noqa: E402
     _QUALIFIED_CODEX_ENTRIES_SQL,
+    CodexProjectMetadataHealth,
     QualifiedMetadataUnavailable,
+    load_codex_project_metadata_health,
     load_qualified_codex_entries,
 )
 from _lib_source_analytics import opaque_project_key  # noqa: E402
@@ -61,6 +65,205 @@ def _seed_qualified_entries(conn: sqlite3.Connection) -> None:
             ),
         )
     conn.commit()
+
+
+def _metadata_health_cache() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    cctally_db._apply_cache_schema(conn)
+    return conn
+
+
+def _seed_metadata_health_entry(
+    conn: sqlite3.Connection,
+    *,
+    key: str | None,
+    root: str,
+    at: dt.datetime,
+    offset: int,
+) -> None:
+    conn.execute(
+        """INSERT INTO codex_session_entries
+           (source_path, line_offset, timestamp_utc, session_id, model,
+            total_tokens, source_root_key, conversation_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            f"/synthetic/{root}/{offset}.jsonl", offset,
+            # Production Codex ingest persists UTC in Python's canonical
+            # ``+00:00`` encoding; test bounds must share that sort order.
+            at.astimezone(UTC).isoformat(),
+            f"native-{offset}", "gpt-test", 1, root, key,
+        ),
+    )
+
+
+def _seed_metadata_health_thread(
+    conn: sqlite3.Connection, *, key: str, root: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO codex_conversation_threads
+           (conversation_key, source_root_key, native_thread_id, root_thread_id,
+            source_path)
+           VALUES (?, ?, ?, ?, ?)""",
+        (key, root, f"native-{key}", f"root-{key}", f"/synthetic/{root}/{key}.jsonl"),
+    )
+
+
+def test_codex_project_metadata_health_partitions_bounded_rows():
+    cache = _metadata_health_cache()
+    try:
+        # Qualified: a conversation key joins under the same root.
+        _seed_metadata_health_entry(cache, key="qualified", root="root-a",
+                                    at=START + dt.timedelta(hours=1), offset=1)
+        _seed_metadata_health_thread(cache, key="qualified", root="root-a")
+        # Missing key: no metadata can truthfully be joined.
+        _seed_metadata_health_entry(cache, key=None, root="root-a",
+                                    at=START + dt.timedelta(hours=2), offset=2)
+        # A matching key under another root must not cross provider-root identity.
+        _seed_metadata_health_entry(cache, key="wrong-root", root="root-a",
+                                    at=START + dt.timedelta(hours=3), offset=3)
+        _seed_metadata_health_thread(cache, key="wrong-root", root="root-b")
+        # End is exclusive.
+        _seed_metadata_health_entry(cache, key=None, root="root-a", at=END, offset=4)
+        cache.commit()
+
+        traces: list[str] = []
+        cache.set_trace_callback(traces.append)
+        health = load_codex_project_metadata_health(
+            cache_conn=cache, start=START, end=END,
+        )
+        cache.set_trace_callback(None)
+
+        assert health == CodexProjectMetadataHealth(
+            total_rows=3,
+            qualified_rows=1,
+            missing_conversation_key_rows=1,
+            missing_thread_join_rows=1,
+        )
+        assert health.incomplete_rows == 2
+        selects = [trace for trace in traces if trace.lstrip().upper().startswith("SELECT")]
+        assert len(selects) == 1
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            health.total_rows = 99  # type: ignore[misc]
+    finally:
+        cache.close()
+
+
+def test_codex_project_metadata_health_validates_bounds_and_empty_windows():
+    cache = _metadata_health_cache()
+    try:
+        _seed_metadata_health_entry(cache, key=None, root="root-a", at=START, offset=1)
+        cache.commit()
+        with pytest.raises(ValueError):
+            load_codex_project_metadata_health(cache_conn=cache, start=START, end=None)
+        with pytest.raises(ValueError):
+            load_codex_project_metadata_health(
+                cache_conn=cache, start=START.replace(tzinfo=None), end=END,
+            )
+
+        assert load_codex_project_metadata_health(
+            cache_conn=cache, start=START, end=START,
+        ) == CodexProjectMetadataHealth(0, 0, 0, 0)
+    finally:
+        cache.close()
+
+
+def test_codex_project_metadata_health_uses_accounting_half_open_bound_encoding():
+    """Exact production-encoded bounds follow the accounting [start, end) contract."""
+    cache = _metadata_health_cache()
+    try:
+        # Exact start is retained: an absent conversation key is incomplete.
+        _seed_metadata_health_entry(
+            cache, key=None, root="root-a", at=START, offset=1,
+        )
+        # Exact end is excluded: this otherwise-distinct failure bucket must
+        # not leak into the half-open window.
+        _seed_metadata_health_entry(
+            cache, key="end-only", root="root-a", at=END, offset=2,
+        )
+        cache.commit()
+
+        assert load_codex_project_metadata_health(
+            cache_conn=cache, start=START, end=END,
+        ) == CodexProjectMetadataHealth(
+            total_rows=1,
+            qualified_rows=0,
+            missing_conversation_key_rows=1,
+            missing_thread_join_rows=0,
+        )
+    finally:
+        cache.close()
+
+
+def test_codex_project_metadata_health_all_history_is_partitioned():
+    cache = _metadata_health_cache()
+    try:
+        _seed_metadata_health_entry(cache, key="qualified", root="root-a", at=START, offset=1)
+        _seed_metadata_health_thread(cache, key="qualified", root="root-a")
+        _seed_metadata_health_entry(cache, key=None, root="root-a", at=END, offset=2)
+        cache.commit()
+
+        assert load_codex_project_metadata_health(
+            cache_conn=cache,
+        ) == CodexProjectMetadataHealth(2, 1, 1, 0)
+    finally:
+        cache.close()
+
+
+def test_codex_project_metadata_health_accepts_pre_native_alias_schema():
+    """Doctor remains truthful while inspecting an older, unmigrated cache."""
+    cache = sqlite3.connect(":memory:")
+    try:
+        cache.executescript("""
+            CREATE TABLE codex_session_entries (
+                timestamp_utc TEXT, source_root_key TEXT, conversation_key TEXT
+            );
+            CREATE TABLE codex_conversation_threads (
+                conversation_key TEXT, source_root_key TEXT
+            );
+            CREATE TABLE codex_session_files (
+                path TEXT PRIMARY KEY, last_session_id TEXT
+            );
+            INSERT INTO codex_session_entries VALUES
+                ('2026-06-16T00:00:00+00:00', 'root-a', 'conversation-a');
+            INSERT INTO codex_conversation_threads VALUES
+                ('conversation-a', 'root-a');
+        """)
+
+        assert load_codex_project_metadata_health(cache_conn=cache) == (
+            CodexProjectMetadataHealth(1, 1, 0, 0)
+        )
+    finally:
+        cache.close()
+
+
+def test_rooted_cached_accounting_reader_uses_only_the_supplied_connection(monkeypatch):
+    """The dashboard fallback must never discover or read rollout files."""
+    cache = _metadata_health_cache()
+    try:
+        _seed_metadata_health_entry(
+            cache, key=None, root="root-a", at=START + dt.timedelta(hours=1), offset=1,
+        )
+        cache.execute(
+            "UPDATE codex_session_entries SET source_path=?, model=?, input_tokens=?, "
+            "cached_input_tokens=?, output_tokens=?, reasoning_output_tokens=?, total_tokens=?",
+            ("/cached/root-a/rollout.jsonl", "gpt-5", 10, 4, 6, 2, 16),
+        )
+        cache.commit()
+
+        def unexpected_cctally():
+            raise AssertionError("rooted cache reader must not reach cctally I/O helpers")
+
+        monkeypatch.setattr(source_commands, "_cctally", unexpected_cctally)
+        reader = getattr(source_commands, "load_cached_rooted_codex_accounting_entries")
+        entries = reader(START, END, speed="standard", cache_conn=cache)
+
+        assert len(entries) == 1
+        assert entries[0].source_root_key == "root-a"
+        assert entries[0].source_path == "/cached/root-a/rollout.jsonl"
+        assert entries[0].session_id == "native-1"
+        assert entries[0].total_tokens == 16
+    finally:
+        cache.close()
 
 
 @pytest.fixture
@@ -134,6 +337,37 @@ def test_qualified_join_never_falls_back_to_bare_session_id(db):
 
     with pytest.raises(QualifiedMetadataUnavailable):
         load_qualified_codex_entries(START, END, speed="standard", sync=False)
+
+
+def test_qualified_child_entry_inherits_root_project_without_merging_accounting(db):
+    root = "root-a"
+    child_path = "/synthetic/root-a/child-rollout.jsonl"
+    child_key = "child-without-thread-row"
+    db.execute(
+        "INSERT INTO codex_session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        "last_session_id, source_root_key, last_native_thread_id, "
+        "last_root_thread_id, last_conversation_key) "
+        "VALUES (?, 1, 1, 1, ?, ?, ?, ?, ?, ?)",
+        (
+            child_path, START.isoformat(), "child-session", root,
+            "same-session", "same-session", child_key,
+        ),
+    )
+    db.execute(
+        "UPDATE codex_session_entries SET source_path=?, session_id=?, conversation_key=? "
+        "WHERE source_root_key=?",
+        (child_path, "child-session", child_key, root),
+    )
+    db.commit()
+
+    rows = load_qualified_codex_entries(START, END, speed="standard", sync=False)
+    inherited = next(row for row in rows if row.source_root_key == root)
+
+    assert inherited.session_id == "child-session"
+    assert inherited.conversation_key == child_key
+    assert inherited.project_label == "subdir"
+    assert inherited.total_tokens == 130
 
 
 def test_qualified_git_metadata_without_cwd_is_not_an_unassigned_project(db):
