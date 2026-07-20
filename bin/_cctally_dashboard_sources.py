@@ -45,7 +45,7 @@ from _lib_quota import (
     quota_freshness,
     select_baseline,
 )
-from _lib_jsonl import CodexEntry
+from _lib_jsonl import CodexEntry, codex_model_scoped_quota_pool
 from _lib_fmt import stable_sum
 from _lib_aggregators import _aggregate_codex_buckets
 from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
@@ -103,6 +103,21 @@ class CodexWeeklyPeriod:
     used_percent: float | None = None
 
 
+def _is_model_scoped_codex_quota(logical_limit_key: object) -> bool:
+    """Whether an interpreted native identity belongs outside standard quota."""
+    if not isinstance(logical_limit_key, str):
+        return False
+    try:
+        payload = json.loads(logical_limit_key)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("modelPool"), str)
+        and bool(payload["modelPool"].strip())
+    )
+
+
 def _resolve_codex_weekly_cycle(
     observations: Iterable[object],
     now_utc: dt.datetime,
@@ -112,6 +127,8 @@ def _resolve_codex_weekly_cycle(
     stale_weekly_evidence = False
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
+            continue
+        if _is_model_scoped_codex_quota(history.identity.logical_limit_key):
             continue
         baseline = select_baseline(history.observations, now_utc)
         if baseline is None or baseline.resets_at <= now_utc:
@@ -161,7 +178,8 @@ def _codex_weekly_periods(
     placeholders = ",".join("?" for _ in roots)
     try:
         rows = stats_conn.execute(
-            "SELECT source_root_key, resets_at_utc, nominal_start_at_utc, current_percent "
+            "SELECT source_root_key, logical_limit_key, resets_at_utc, "
+            "nominal_start_at_utc, current_percent "
             "FROM quota_window_blocks "
             "WHERE source='codex' AND window_minutes=10080 "
             f"AND source_root_key IN ({placeholders}) AND orphaned_at IS NULL "
@@ -174,7 +192,9 @@ def _codex_weekly_periods(
 
     raw_boundaries: list[tuple[dt.datetime, dt.datetime, set[str], list[float]]] = []
 
-    for root_key, resets_at_raw, start_at_raw, current_percent in rows:
+    for root_key, logical_limit_key, resets_at_raw, start_at_raw, current_percent in rows:
+        if _is_model_scoped_codex_quota(logical_limit_key):
+            continue
         try:
             start_at = dt.datetime.fromisoformat(str(start_at_raw).replace("Z", "+00:00"))
             resets_at = dt.datetime.fromisoformat(str(resets_at_raw).replace("Z", "+00:00"))
@@ -1833,6 +1853,8 @@ def _build_codex_native_weekly_view(
     labels: dict[str, str] = {}
     periods_by_bucket: dict[str, CodexWeeklyPeriod] = {}
     for entry in entries:
+        if codex_model_scoped_quota_pool(getattr(entry, "model", None)) is not None:
+            continue
         timestamp = getattr(entry, "timestamp").astimezone(UTC)
         root_key = str(getattr(entry, "source_root_key", "") or "")
         period = next((

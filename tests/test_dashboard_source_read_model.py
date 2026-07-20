@@ -35,12 +35,13 @@ def _quota_observation(
     resets_at: dt.datetime,
     captured_at: dt.datetime = NOW - dt.timedelta(minutes=10),
     limit_name: str | None = None,
+    logical_limit_key: str = "limit",
 ) -> QuotaObservation:
     return QuotaObservation(
         identity=QuotaWindowIdentity(
             source="codex",
             source_root_key=root,
-            logical_limit_key="limit",
+            logical_limit_key=logical_limit_key,
             observed_slot="primary",
             window_minutes=window_minutes,
             limit_name=limit_name,
@@ -200,6 +201,26 @@ def test_codex_cycle_allows_a_fresh_weekly_boundary_without_a_five_hour_window()
     assert cycle.resets_at == reset
 
 
+def test_codex_cycle_ignores_a_concurrent_model_scoped_spark_week():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    standard_reset = NOW + dt.timedelta(days=5)
+    spark_reset = NOW + dt.timedelta(days=7)
+    spark_key = '{"modelPool":"gpt-5.3-codex-spark"}'
+
+    cycle = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=standard_reset,
+            logical_limit_key="standard-limit",
+        ),
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=spark_reset,
+            logical_limit_key=spark_key,
+        ),
+    ), NOW)
+
+    assert cycle.resets_at == standard_reset
+
+
 def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
     tmp_path, monkeypatch,
 ):
@@ -233,6 +254,12 @@ def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
                     "2026-07-03T00:00:30+00:00", "2026-07-03T00:05:30+00:00",
                     "2026-07-09T23:00:30+00:00", "/private/b-jitter.jsonl",
                 ),
+                (
+                    root, '{"modelPool":"gpt-5.3-codex-spark"}',
+                    "2026-07-12T00:00:00+00:00", "2026-07-05T00:00:00+00:00",
+                    "2026-07-05T00:00:05+00:00", "2026-07-05T00:01:00+00:00",
+                    "/private/spark.jsonl",
+                ),
             ),
         )
         entries = (
@@ -247,6 +274,12 @@ def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
                 source_root_key=root, source_path="/private/boundary.jsonl", session_id="boundary",
                 model="gpt-5", input_tokens=200, cached_input_tokens=0,
                 output_tokens=20, reasoning_output_tokens=0, total_tokens=220,
+            ),
+            SimpleNamespace(
+                timestamp=dt.datetime(2026, 7, 4, 0, tzinfo=UTC),
+                source_root_key=root, source_path="/private/spark.jsonl", session_id="spark",
+                model="gpt-5.3-codex-spark", input_tokens=400, cached_input_tokens=0,
+                output_tokens=40, reasoning_output_tokens=0, total_tokens=440,
             ),
             SimpleNamespace(
                 timestamp=dt.datetime(2026, 7, 8, 12, tzinfo=UTC),

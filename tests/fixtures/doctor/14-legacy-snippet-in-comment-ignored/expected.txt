@@ -27,6 +27,7 @@ Database
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
+  ✓ Reclaimable cache space  below threshold
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -50,4 +51,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 32 OK · 5 WARN · 0 FAIL
+Summary: 33 OK · 5 WARN · 0 FAIL

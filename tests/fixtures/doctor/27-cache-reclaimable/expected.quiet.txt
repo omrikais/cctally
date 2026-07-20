@@ -1,0 +1,22 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ Pending migrations       40 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+  ⚠ Reclaimable cache space  high — 97.1% of cache.db pages are free
+      → Run `cctally db vacuum --db cache` to reclaim disk space.
+Data
+Pricing
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+Telemetry
+
+Summary: 33 OK · 5 WARN · 0 FAIL

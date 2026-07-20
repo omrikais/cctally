@@ -200,6 +200,12 @@ class DoctorState:
     # DOCTOR_WAL_WARN_BYTES (2x the WAL cap) — only when the journal_size_limit
     # + forced-checkpoint machinery has genuinely failed to contain the WAL.
     cache_db_wal_bytes: Optional[int] = None
+    # #315: read-only PRAGMA page_count/freelist_count evidence. The pure
+    # db.reclaimable check warns when free pages reach 25% of cache.db and
+    # points at the already-guarded explicit vacuum command. None means the
+    # cache was absent or unreadable; the check degrades to OK.
+    cache_db_page_count: Optional[int] = None
+    cache_db_freelist_count: Optional[int] = None
     # #294 S2: root-qualified physical Codex quota freshness, per-root native
     # hook state, and lifecycle activity are gathered by _cctally_doctor.
     codex_quota_windows: Optional[list[dict]] = None
@@ -1725,6 +1731,48 @@ def _check_db_wal_size(s: DoctorState) -> CheckResult:
     )
 
 
+# #315: conservative advisory threshold. A quarter of cache.db being free is
+# large enough to make an explicit, guarded VACUUM useful without nagging for
+# ordinary page churn. This is a ratio, so it remains page-size independent.
+DOCTOR_RECLAIMABLE_WARN_RATIO = 0.25
+
+
+def _check_db_reclaimable(s: DoctorState) -> CheckResult:
+    """Surface cache free pages without mutating or auto-vacuuming the DB."""
+    page_count = s.cache_db_page_count
+    freelist_count = s.cache_db_freelist_count
+    ratio = None
+    if (
+        isinstance(page_count, int)
+        and not isinstance(page_count, bool)
+        and page_count > 0
+        and isinstance(freelist_count, int)
+        and not isinstance(freelist_count, bool)
+        and 0 <= freelist_count <= page_count
+    ):
+        ratio = freelist_count / page_count
+    details = {
+        "cache_db_page_count": page_count,
+        "cache_db_freelist_count": freelist_count,
+        "cache_db_free_ratio": ratio,
+        "warn_ratio": DOCTOR_RECLAIMABLE_WARN_RATIO,
+    }
+    if ratio is not None and ratio >= DOCTOR_RECLAIMABLE_WARN_RATIO:
+        return CheckResult(
+            id="db.reclaimable", title="Reclaimable cache space",
+            severity="warn",
+            summary=f"high — {ratio * 100:.1f}% of cache.db pages are free",
+            remediation=(
+                "Run `cctally db vacuum --db cache` to reclaim disk space."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        id="db.reclaimable", title="Reclaimable cache space", severity="ok",
+        summary="below threshold", remediation=None, details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1759,6 +1807,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.migrations.pending", "_check_db_migrations_pending"),
         ("db.lock_state", "_check_db_lock_state"),
         ("db.wal_size", "_check_db_wal_size"),
+        ("db.reclaimable", "_check_db_reclaimable"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),

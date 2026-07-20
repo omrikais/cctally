@@ -165,7 +165,7 @@ export function presentationPeriodRows(
     .map((row, index, allRows) => ({
       ...row,
       delta_cost_pct: allRows[index + 1]?.cost_usd
-        ? (row.cost_usd - allRows[index + 1].cost_usd) / allRows[index + 1].cost_usd * 100
+        ? (row.cost_usd - allRows[index + 1].cost_usd) / allRows[index + 1].cost_usd
         : null,
     }));
   const rows = selection === 'all'

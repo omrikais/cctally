@@ -32,6 +32,7 @@ Database
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
+  ✓ Reclaimable cache space  below threshold
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
@@ -56,4 +57,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 26 OK · 8 WARN · 3 FAIL
+Summary: 27 OK · 8 WARN · 3 FAIL

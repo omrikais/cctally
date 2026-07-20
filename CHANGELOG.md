@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.76.0] - 2026-07-20
+
+### Added
+- `cctally doctor` now reports `db.reclaimable` when at least 25% of `cache.db` pages are free, with a direct `cctally db vacuum --db cache` remediation. (#315)
+
+### Fixed
+- Codex dashboard Weekly cycles and `$ / 1%` accounting now keep the separately-metered GPT-5.3-Codex-Spark quota pool distinct from the standard seven-day Codex pool, preventing brief Spark sessions from creating phantom standard weeks.
+- Dashboard Codex Weekly cost deltas now use the shared fractional-ratio contract instead of rendering 100× too large, and the Codex **$/1% Trend** table once again aligns Used%, $/1%, and vs-prior values under their matching columns.
+- Claude dashboard quota now keeps updating automatically while Claude Code uses a bracketed context variant such as `opus[1m]`; context-window metadata no longer suppresses the valid account-wide 5-hour and 7-day observations supplied to the status line.
+- Conversation-retention pruning now commits each whole Claude session or Codex conversation separately while retaining its maintenance locks, bounding first-prune WAL growth without exposing partially deleted conversations; a 9.37 GB production-shaped benchmark reduced peak WAL from 889.7 MiB to 28.8 MiB with identical deleted-row counts and FTS integrity. (#315)
+
 ## [1.75.1] - 2026-07-20
 
 ### Fixed

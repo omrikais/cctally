@@ -584,20 +584,37 @@ def _first_valid_reset_at(
 
 def _codex_logical_limit_key(
     source_root_key: str | None, limit_id: str | None, observed_slot: str,
-    window_minutes: int,
+    window_minutes: int, model: str | None = None,
 ) -> str:
-    return _codex_canonical_json({
+    payload = {
         "limitId": limit_id,
         "observedSlot": observed_slot,
         "source": "codex",
         "sourceRootKey": source_root_key,
         "windowMinutes": window_minutes,
-    })
+    }
+    if (model_pool := codex_model_scoped_quota_pool(model)) is not None:
+        payload["modelPool"] = model_pool
+    return _codex_canonical_json(payload)
+
+
+def codex_model_scoped_quota_pool(model: object) -> str | None:
+    """Return the native model pool when Codex documents it as separate.
+
+    GPT Codex Spark runs against its own allowance and does not consume the
+    standard Codex quota.  Native payloads currently reuse ``limit_id=codex``
+    and the same slot/duration as the standard pool, so the sticky rollout
+    model is the only retained discriminator.
+    """
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    return normalized if "-codex-spark" in normalized else None
 
 
 def _codex_quota_observations(
     obj: dict[str, Any], payload: dict[str, Any], path_str: str, line_offset: int,
-    source_root_key: str | None,
+    source_root_key: str | None, model: str | None,
 ) -> tuple[CodexQuotaObservation, ...]:
     captured_at = _parse_codex_timestamp(obj.get("timestamp"))
     if captured_at is None:
@@ -638,7 +655,7 @@ def _codex_quota_observations(
             captured_at_utc=_format_codex_timestamp(captured_at),
             observed_slot=slot,
             logical_limit_key=_codex_logical_limit_key(
-                source_root_key, limit_id, slot, window_minutes
+                source_root_key, limit_id, slot, window_minutes, model
             ),
             limit_id=limit_id,
             limit_name=_first_valid_string(
@@ -867,7 +884,7 @@ def _iter_codex_fused_records_with_offsets(
             filename_session_id_warned,
         )
         quotas = _codex_quota_observations(
-            obj, payload, path_str, line_offset, source_root_key
+            obj, payload, path_str, line_offset, source_root_key, state.model
         )
         yield CodexFusedEmission(
             line_offset=line_offset,

@@ -41,10 +41,12 @@ from _lib_quota import (
     source_path_key,
 )
 from _lib_json_envelope import stamp_schema_version
+from _lib_jsonl import _codex_logical_limit_key, codex_model_scoped_quota_pool
 
 
 UTC = dt.timezone.utc
 _DASHBOARD_PROJECTION_CERTIFICATE_KEY = "codex_quota_projection_certificate"
+_CODEX_QUOTA_INTERPRETATION_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,11 @@ def load_codex_quota_projection_certificate(
         if row is None:
             return None
         payload = json.loads(str(row[0]))
+        if (
+            int(payload["interpretationVersion"])
+            != _CODEX_QUOTA_INTERPRETATION_VERSION
+        ):
+            return None
         sequence = int(payload["sequence"])
         signatures = {
             str(root_key): str(signature)
@@ -169,6 +176,7 @@ def _store_codex_quota_projection_certificate(
                 conn.rollback()
                 return
             payload = json.dumps({
+                "interpretationVersion": _CODEX_QUOTA_INTERPRETATION_VERSION,
                 "sequence": sequence,
                 "signatures": dict(sorted(signatures.items())),
             }, sort_keys=True, separators=(",", ":"))
@@ -262,14 +270,51 @@ def load_codex_quota_observations(
     previous_row_factory = conn.row_factory
     try:
         conn.row_factory = sqlite3.Row
+
+        def has_columns(table: str, required: set[str]) -> bool:
+            columns = {
+                str(row[1]) for row in conn.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            }
+            return required <= columns
+
+        has_conversation_events = has_columns(
+            "codex_conversation_events",
+            {"source_path", "line_offset", "record_type", "payload_json"},
+        )
+        has_session_entries = has_columns(
+            "codex_session_entries", {"source_path", "line_offset", "model"},
+        )
+        if has_conversation_events:
+            model_expr = """
+                (SELECT json_extract(events.payload_json, '$.payload.model')
+                   FROM codex_conversation_events AS events
+                  WHERE events.source_path=quota_window_snapshots.source_path
+                    AND events.line_offset<=quota_window_snapshots.line_offset
+                    AND events.record_type IN ('turn_context','session_meta')
+                    AND json_type(events.payload_json, '$.payload.model')='text'
+                  ORDER BY events.line_offset DESC LIMIT 1) AS observed_model
+            """
+        elif has_session_entries:
+            model_expr = """
+                (SELECT entries.model
+                   FROM codex_session_entries AS entries
+                  WHERE entries.source_path=quota_window_snapshots.source_path
+                    AND entries.line_offset<=quota_window_snapshots.line_offset
+                  ORDER BY entries.line_offset DESC LIMIT 1) AS observed_model
+            """
+        else:
+            model_expr = "NULL AS observed_model"
         sql = """
             SELECT source, source_root_key, source_path, line_offset,
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,
                    limit_name, window_minutes, used_percent, resets_at_utc,
-                   plan_type, individual_limit_json, reached_type
+                   plan_type, individual_limit_json, reached_type,
+                   {model_expr}
               FROM quota_window_snapshots
              WHERE source='codex' AND source_root_key IS NOT NULL
-        """
+        """.format(model_expr=model_expr)
         params: list[object] = []
         if requested is not None:
             if not requested:
@@ -317,10 +362,17 @@ def load_codex_quota_observations(
             if any(row[name] is None or not str(row[name]).strip() for name in required_text):
                 continue
             try:
+                logical_limit_key = str(row["logical_limit_key"])
+                if codex_model_scoped_quota_pool(row["observed_model"]) is not None:
+                    logical_limit_key = _codex_logical_limit_key(
+                        str(row["source_root_key"]), row["limit_id"],
+                        str(row["observed_slot"]), int(row["window_minutes"]),
+                        str(row["observed_model"]),
+                    )
                 identity = QuotaWindowIdentity(
                     source=str(row["source"]),
                     source_root_key=str(row["source_root_key"]),
-                    logical_limit_key=str(row["logical_limit_key"]),
+                    logical_limit_key=logical_limit_key,
                     observed_slot=str(row["observed_slot"]),
                     window_minutes=int(row["window_minutes"]),
                     limit_id=row["limit_id"],

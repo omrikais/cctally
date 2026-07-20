@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import importlib
+import json
 from pathlib import Path
 import shutil
 import sqlite3
@@ -118,6 +119,81 @@ def _stage_real_s1_codex_root(tmp_path, monkeypatch):
     shutil.copyfile(CODEX_S1_FIXTURE, rollout)
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
     return provider_root
+
+
+def test_legacy_spark_quota_rows_are_reinterpreted_as_a_separate_pool(
+    tmp_path, monkeypatch,
+):
+    ns, quota = _load(tmp_path, monkeypatch)
+    root_key = "root-a"
+    source_path = "/codex/root-a/spark.jsonl"
+    legacy_key = json.dumps({
+        "limitId": "codex",
+        "observedSlot": "primary",
+        "source": "codex",
+        "sourceRootKey": root_key,
+        "windowMinutes": 10_080,
+    }, sort_keys=True, separators=(",", ":"))
+    _seed_quota(
+        ns,
+        root_key=root_key,
+        source_path=source_path,
+        observations=[(_iso(10), 40, 1.0)],
+        logical_limit_key=legacy_key,
+        window_minutes=10_080,
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            """INSERT INTO codex_conversation_events
+               (source_path, line_offset, source_root_key, timestamp_utc,
+                record_type, payload_json)
+               VALUES (?, 10, ?, ?, 'turn_context', ?)""",
+            (
+                source_path, root_key, _iso(10),
+                json.dumps({"payload": {"model": "gpt-5.3-codex-spark"}}),
+            ),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+
+    observations = quota.load_codex_quota_observations(
+        source_root_keys=(root_key,),
+    )
+
+    assert len(observations) == 1
+    decoded = json.loads(observations[0].identity.logical_limit_key)
+    assert decoded["modelPool"] == "gpt-5.3-codex-spark"
+
+
+def test_quota_only_legacy_cache_preserves_opaque_limit_identity(
+    tmp_path, monkeypatch,
+):
+    ns, quota = _load(tmp_path, monkeypatch)
+    _seed_quota(
+        ns,
+        root_key="root-a",
+        source_path="/codex/root-a/legacy.jsonl",
+        observations=[(_iso(10), 40, 1.0)],
+        logical_limit_key="opaque-primary",
+        window_minutes=10_080,
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute("DROP TABLE codex_conversation_events")
+        cache.execute("DROP TABLE codex_session_entries")
+        cache.execute(
+            "CREATE TABLE codex_session_entries "
+            "(id INTEGER PRIMARY KEY, timestamp_utc TEXT NOT NULL, model TEXT)"
+        )
+        cache.commit()
+        observations = quota.load_codex_quota_observations(cache_conn=cache)
+    finally:
+        cache.close()
+
+    assert len(observations) == 1
+    assert observations[0].identity.logical_limit_key == "opaque-primary"
 
 
 def test_reconciliation_materializes_root_qualified_blocks_milestones_and_state(
@@ -729,6 +805,35 @@ def test_reconcile_runs_full_when_certificate_absent(tmp_path, monkeypatch):
     calls = _spy_loader(quota, monkeypatch)
     quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
     assert calls != [], "absent certificate must force a full reconcile"
+
+
+def test_reconcile_runs_full_when_interpretation_version_is_stale(
+    tmp_path, monkeypatch,
+):
+    ns, quota = _load(tmp_path, monkeypatch)
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    _establish_valid_certificate(ns, quota, now)
+    conn = ns["open_cache_db"]()
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_quota_projection_certificate'"
+        ).fetchone()
+        payload = json.loads(row[0])
+        payload["interpretationVersion"] = 1
+        conn.execute(
+            "UPDATE cache_meta SET value=? "
+            "WHERE key='codex_quota_projection_certificate'",
+            (json.dumps(payload),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    calls = _spy_loader(quota, monkeypatch)
+    quota.reconcile_codex_quota_projection(source_root_keys={"root-a"}, now=now)
+
+    assert calls != [], "stale interpretation must force a full reconcile"
 
 
 def test_reconcile_runs_full_when_sequence_advanced(tmp_path, monkeypatch):

@@ -151,7 +151,7 @@ export function TrendPanel() {
               {tableData.map((w) => (
                 <tr key={w.label} className={w.is_current ? 'current' : undefined}>
                   <td>{w.label}</td>
-                  {activeSource === 'claude' && <td className="num">{fmt.pct0(w.used_pct)}</td>}
+                  <td className="num">{fmt.pct0(w.used_pct)}</td>
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
                     {fmt.usd2(w.dollar_per_pct)}
                   </td>

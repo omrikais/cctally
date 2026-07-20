@@ -339,6 +339,111 @@ def test_orchestrator_runs_again_after_24h(tmp_path, monkeypatch):
         "SELECT COUNT(*) FROM conversation_messages WHERE session_id='old2'").fetchone()[0] == 0
 
 
+class _CommitCountingConnection:
+    """Proxy that records transaction boundaries and can fail before commit."""
+
+    def __init__(self, conn, *, fail_on_commit=None):
+        self._conn = conn
+        self.commit_calls = 0
+        self.fail_on_commit = fail_on_commit
+
+    def commit(self):
+        self.commit_calls += 1
+        if self.commit_calls == self.fail_on_commit:
+            raise RuntimeError("synthetic intermediate commit failure")
+        return self._conn.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_orchestrator_commits_each_pruned_conversation_separately(
+    tmp_path, monkeypatch
+):
+    """#315: bound WAL growth with one commit per whole conversation.
+
+    The final extra commit carries only the 24-hour throttle stamp. Provider and
+    maintenance locks stay held by the orchestrator across every boundary.
+    """
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    for session_id in ("claude-a", "claude-b", "claude-c"):
+        _seed_msg(conn, session_id, OLD)
+    for index, conversation_key in enumerate(("codex-a", "codex-b"), start=1):
+        _seed_codex_event(
+            conn,
+            conversation_key,
+            OLD,
+            source_path=f"/{conversation_key}.jsonl",
+            line_offset=index,
+        )
+    conn.commit()
+    counted = _CommitCountingConnection(conn)
+
+    stats = retention._maybe_prune_conversation_retention(
+        counted, now_utc=NOW, retention_days=180, force=True
+    )
+
+    assert stats is not None
+    assert stats.claude_sessions == 3
+    assert stats.codex_conversations == 2
+    assert counted.commit_calls == 6  # five whole groups + final stamp
+    assert conn.execute(
+        "SELECT COUNT(*) FROM cache_meta "
+        "WHERE key='conversation_retention_last_prune_at'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_intermediate_commit_failure_keeps_completed_groups_and_retries_rest(
+    tmp_path, monkeypatch
+):
+    """#315 partial-progress contract.
+
+    A completed conversation remains durably pruned, the active conversation
+    rolls back whole, and no throttle stamp suppresses the next retry.
+    """
+    import pytest
+
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_msg(conn, "a-first", OLD, text="FirstUnique")
+    _seed_msg(conn, "b-second", OLD, text="SecondUnique")
+    conn.commit()
+    failing = _CommitCountingConnection(conn, fail_on_commit=2)
+
+    with pytest.raises(RuntimeError, match="synthetic intermediate commit failure"):
+        retention._maybe_prune_conversation_retention(
+            failing, now_utc=NOW, retention_days=180, force=True
+        )
+
+    remaining_sessions = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT session_id FROM conversation_messages"
+        )
+    }
+    assert len(remaining_sessions) == 1
+    assert remaining_sessions <= {"a-first", "b-second"}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM cache_meta "
+        "WHERE key='conversation_retention_last_prune_at'"
+    ).fetchone()[0] == 0
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+    conn.commit()
+
+    retry = retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=180, force=True
+    )
+
+    assert retry is not None and retry.claude_sessions == 1
+    assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM cache_meta "
+        "WHERE key='conversation_retention_last_prune_at'"
+    ).fetchone()[0] == 1
+    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('integrity-check')")
+    conn.close()
+
+
 def test_orchestrator_disabled_when_retention_zero(tmp_path, monkeypatch):
     ns, conn, retention = _env(tmp_path, monkeypatch)
     _seed_msg(conn, "old1", OLD)

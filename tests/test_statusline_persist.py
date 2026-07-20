@@ -79,11 +79,7 @@ def _status_input(app, *, seven_pct, seven_resets_epoch,
 
 
 def _count_rows(app, table):
-    """Row count for ``table``, or 0 if the table doesn't exist yet.
-
-    Used by the pool-guard blast-radius assertions: a fired guard means the
-    record kernel never ran, so these tables are either empty or never
-    created."""
+    """Row count for ``table``, or 0 if the table doesn't exist yet."""
     conn = app.open_db()
     try:
         try:
@@ -798,53 +794,12 @@ def test_concurrent_renders_yield_at_most_one_snapshot(tmp_path):
     assert final == 1, f"expected exactly one snapshot from the herd, got {final}"
 
 
-# --- pool-identity guard predicate (Task 1 / spec D1) ----------------------
+def test_bracketed_context_variant_persists_global_rate_limits(app):
+    """`model.id` context metadata must not suppress the global 5h/7d axes.
 
-
-@pytest.mark.parametrize(
-    "model_id,expected",
-    [
-        (None, False),               # missing / null model id → persist proceeds
-        ("", False),                 # empty string → not a variant
-        ("claude-opus-4-8", False),  # bare default-pool id → persist proceeds
-        ("claude-sonnet-4-5", False),
-        ("claude-opus-4-8[1m]", True),      # the real 1M-context variant
-        ("claude-opus-4-7[1m]", True),
-        ("claude-sonnet-4-5[fast]", True),  # ANY bracket suffix → skip (fail-safe)
-        ("model[anything]", True),
-        ("claude[", False),          # malformed: unterminated bracket
-        ("claude]", False),          # malformed: stray close bracket
-        ("claude][", False),         # malformed: reversed order, no trailing [..]
-        ("foo[1m]bar", False),       # bracket not at END → not a variant suffix
-        (123, False),                # non-string → False (never raises)
-        (["claude-opus-4-8[1m]"], False),
-    ],
-)
-def test_is_alternate_pool_model_id_predicate(app, model_id, expected):
-    assert app._lib_statusline.is_alternate_pool_model_id(model_id) is expected
-
-
-# --- pool-identity guard in _statusline_persist (Task 1 / spec D1) ---------
-
-
-def _POOL_TABLES():
-    # The full blast radius a successful record writes (spec D1 / Codex R1 F7):
-    # weekly snapshot + weekly milestones + 5h block/milestone rollups.
-    return (
-        "weekly_usage_snapshots",
-        "percent_milestones",
-        "five_hour_blocks",
-        "five_hour_milestones",
-    )
-
-
-def test_alternate_pool_payload_persists_nothing(app):
-    """A `[1m]`-variant session reports a SEPARATE rate-limit pool that would
-    poison the default-pool DB. The guard skips persistence entirely: no
-    snapshot, no weekly milestone, no 5h block/milestone, the observation
-    marker is NOT touched (a foreign-pool session is not evidence the
-    regular pipeline is alive), and no persist-lock file is even created
-    (the guard returns before the lock acquire)."""
+    Claude Code exposes model-scoped quotas separately; the top-level
+    `five_hour` and `seven_day` fields remain the account-wide usage windows.
+    """
     now = int(time.time())
     parsed = _status_input(
         app, seven_pct=41.0, seven_resets_epoch=now + 3 * 86400,
@@ -853,19 +808,16 @@ def test_alternate_pool_payload_persists_nothing(app):
     )
     app._statusline_persist(parsed, sync_for_test=True)
 
-    for table in _POOL_TABLES():
-        assert _count_rows(app, table) == 0, f"guard leaked a row into {table}"
-    # Observation marker untouched → OAuth backfill keeps aging.
-    assert app._statusline_observe_age_seconds() == float("inf")
-    # The guard returns BEFORE _try_acquire_persist_lock, so no lock file.
-    # (redirect_paths mirrors the pinned path constant onto the ns.)
-    assert not app.STATUSLINE_PERSIST_LOCK_PATH.exists()
+    row = _newest_row(app)
+    assert row is not None
+    assert row["source"] == "statusline"
+    assert row["weekly_percent"] == pytest.approx(41.0)
+    assert row["five_hour_percent"] == pytest.approx(42.0)
+    assert app._statusline_observe_age_seconds() < 5.0
 
 
 def test_normal_model_id_still_persists(app):
-    """A normal (default-pool) model id persists exactly as before — proving
-    the guard call didn't AttributeError into cmd_statusline's silent
-    `except: pass` and disable ALL persistence (Codex R1 F1)."""
+    """A normal model id persists exactly as before."""
     now = int(time.time())
     parsed = _status_input(
         app, seven_pct=27.0, seven_resets_epoch=now + 3 * 86400,
@@ -889,90 +841,3 @@ def test_absent_model_id_still_persists(app):
     assert parsed.model_id is None
     app._statusline_persist(parsed, sync_for_test=True)
     assert _count_rows(app, "weekly_usage_snapshots") == 1
-
-
-def test_concurrent_normal_and_alternate_pool_only_normal_persists(tmp_path):
-    """Mixed multi-process herd (real fork path, pattern of
-    test_concurrent_renders_yield_at_most_one_snapshot): simultaneous normal
-    and alternate-pool `cctally statusline` renders sharing one data dir. The
-    alternate-pool data must reach NEITHER axis, the normal persist succeeds
-    exactly once, and the surviving snapshot carries the NORMAL pool's
-    weekly_percent (never the alternate pool's poisoned value)."""
-    tmp_home = tmp_path / "home"
-    tmp_data = tmp_path / "data"
-    (tmp_home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
-    tmp_data.mkdir(parents=True, exist_ok=True)
-    db_path = tmp_data / "stats.db"
-
-    env = dict(os.environ)
-    env["HOME"] = str(tmp_home)
-    env["CCTALLY_DATA_DIR"] = str(tmp_data)
-    env["CLAUDE_CONFIG_DIR"] = str(tmp_home / ".claude")
-    env.pop("CCTALLY_AS_OF", None)
-
-    now = int(time.time())
-    normal_pct = 27.0
-    alt_pct = 41.0
-    normal_payload = json.dumps(_rate_limits_payload(
-        seven_pct=normal_pct, seven_resets_epoch=now + 3 * 86400,
-        five_pct=12.0, five_resets_epoch=now + 2 * 3600,
-        model_id="claude-opus-4-8",
-    )).encode()
-    alt_payload = json.dumps(_rate_limits_payload(
-        seven_pct=alt_pct, seven_resets_epoch=now + 3 * 86400,
-        five_pct=42.0, five_resets_epoch=now + 2 * 3600,
-        model_id="claude-opus-4-8[1m]",
-    )).encode()
-
-    # 2 normal + 3 alternate-pool renders, launched together.
-    specs = [normal_payload, alt_payload, normal_payload, alt_payload, alt_payload]
-    procs = [
-        (
-            subprocess.Popen(
-                [sys.executable, str(_CCTALLY_BIN), "statusline"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, env=env,
-            ),
-            payload,
-        )
-        for payload in specs
-    ]
-    for p, payload in procs:
-        try:
-            p.stdin.write(payload)
-            p.stdin.close()
-        except BrokenPipeError:
-            pass
-    for p, _ in procs:
-        p.wait(timeout=30)
-
-    # Detached feeders outlive the render process — poll to quiescence.
-    deadline = time.time() + 25.0
-    last = _count_snapshots(db_path)
-    stable = 0
-    while time.time() < deadline:
-        time.sleep(0.4)
-        cur = _count_snapshots(db_path)
-        if cur == last:
-            stable += 1
-            if stable >= 5 and cur >= 1:
-                break
-        else:
-            stable = 0
-            last = cur
-
-    final = _count_snapshots(db_path)
-    assert final == 1, f"expected exactly one snapshot (the normal pool), got {final}"
-
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
-    try:
-        pct = conn.execute(
-            "SELECT weekly_percent FROM weekly_usage_snapshots "
-            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    assert abs(pct - normal_pct) < 1e-6, (
-        f"surviving snapshot carries {pct}, expected the normal pool {normal_pct} "
-        f"(alternate pool {alt_pct} must never reach the DB)"
-    )

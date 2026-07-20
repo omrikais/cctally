@@ -25,14 +25,16 @@ The FTS5 indexes over ``conversation_messages`` (``conversation_fts``) and
 ``conversation_ai_titles`` (``conversation_title_fts``) are external-content and
 maintained by AFTER-DELETE triggers, which are logically correct on subset
 deletes. Whole groups are deleted so those triggers keep the index consistent.
-The kernel runs inside the caller's open transaction (the orchestrator owns the
-flocks, ``BEGIN IMMEDIATE``, and commit).
+The kernel normally runs inside the caller's open transaction. The orchestrator
+supplies a post-group boundary that commits each whole conversation separately
+while retaining every flock for the full pass (#315), bounding WAL growth.
 """
 from __future__ import annotations
 
 import datetime as dt
 import fcntl
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import _cctally_core
@@ -71,12 +73,25 @@ def _cutoff_iso(cutoff_utc: dt.datetime) -> str:
 
 
 def prune_conversation_transcripts(
-    conn: sqlite3.Connection, *, cutoff_utc: dt.datetime
+    conn: sqlite3.Connection,
+    *,
+    cutoff_utc: dt.datetime,
+    after_group: "Callable[[], None] | None" = None,
 ) -> PruneStats:
-    """Prune every transcript group whose latest activity is before ``cutoff_utc``."""
+    """Prune every transcript group whose latest activity is before ``cutoff_utc``.
+
+    ``after_group`` runs only after every table and FTS posting owned by one
+    session/conversation has been deleted. Direct kernel callers leave it unset
+    and retain their caller-managed transaction; the orchestrator uses it for
+    #315's whole-conversation intermediate commits.
+    """
     cutoff = _cutoff_iso(cutoff_utc)
-    claude_sessions, claude_messages = _prune_claude(conn, cutoff)
-    codex_conversations, codex_events = _prune_codex(conn, cutoff)
+    claude_sessions, claude_messages = _prune_claude(
+        conn, cutoff, after_group=after_group
+    )
+    codex_conversations, codex_events = _prune_codex(
+        conn, cutoff, after_group=after_group
+    )
     return PruneStats(
         claude_sessions=claude_sessions,
         claude_messages=claude_messages,
@@ -116,7 +131,12 @@ def _prunable_null_identity_paths(
     return [row[0] for row in conn.execute(sql, (cutoff,))]
 
 
-def _prune_claude(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
+def _prune_claude(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    *,
+    after_group: "Callable[[], None] | None" = None,
+) -> tuple[int, int]:
     sessions = 0
     messages = 0
     for session_id in _prunable_groups(
@@ -140,6 +160,8 @@ def _prune_claude(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
             (session_id,),
         )
         sessions += 1
+        if after_group is not None:
+            after_group()
     for source_path in _prunable_null_identity_paths(
         conn, "conversation_messages", "session_id", cutoff
     ):
@@ -166,6 +188,8 @@ def _prune_claude(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
         )
         messages += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         sessions += 1
+        if after_group is not None:
+            after_group()
     return sessions, messages
 
 
@@ -235,9 +259,11 @@ def _maybe_prune_conversation_retention(
     two provider flocks are taken in a FIXED order (Claude then Codex),
     non-blocking, so a rebuild/reingest mid-flight makes the prune skip this
     cycle rather than race between candidate selection and deletion. The prune of
-    both providers and the throttle stamp run in ONE ``BEGIN IMMEDIATE``
-    transaction, so the stamp is written only after both provider phases succeed;
-    any failure rolls back the whole thing (no stamp → retried next cycle).
+    each whole session/conversation runs in its own ``BEGIN IMMEDIATE``
+    transaction (#315), while every flock remains held for the full pass. The
+    throttle stamp is committed only after both provider phases succeed. A
+    failure rolls back the active group but preserves completed groups, writes no
+    stamp, and therefore retries the remainder next cycle.
 
     ``conn`` must hold no provider flock and no open transaction (the caller
     guarantees this — the dashboard opens a dedicated cache connection; the
@@ -274,7 +300,15 @@ def _maybe_prune_conversation_retention(
                 cutoff = now_utc - dt.timedelta(days=int(retention_days))
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    stats = prune_conversation_transcripts(conn, cutoff_utc=cutoff)
+                    def commit_group() -> None:
+                        conn.commit()
+                        conn.execute("BEGIN IMMEDIATE")
+
+                    stats = prune_conversation_transcripts(
+                        conn,
+                        cutoff_utc=cutoff,
+                        after_group=commit_group,
+                    )
                     _stamp_retention_prune(conn, now_utc)
                     conn.commit()
                 except Exception:
@@ -354,7 +388,12 @@ def _delete_codex_conversation_derived(
     )
 
 
-def _prune_codex(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
+def _prune_codex(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    *,
+    after_group: "Callable[[], None] | None" = None,
+) -> tuple[int, int]:
     conversations = 0
     events = 0
     for conversation_key in _prunable_groups(
@@ -369,6 +408,8 @@ def _prune_codex(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
         )
         events += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         conversations += 1
+        if after_group is not None:
+            after_group()
     for source_path in _prunable_null_identity_paths(
         conn, "codex_conversation_events", "conversation_key", cutoff
     ):
@@ -381,4 +422,6 @@ def _prune_codex(conn: sqlite3.Connection, cutoff: str) -> tuple[int, int]:
         )
         events += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         conversations += 1
+        if after_group is not None:
+            after_group()
     return conversations, events

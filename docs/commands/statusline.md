@@ -309,9 +309,15 @@ This is a **Claude Code `settings.json` key**, not the `cctally statusline --ref
 
 Removal semantics: **deleting** the `refreshInterval` key is not durable — the next `cctally setup` re-adds `30` under the add-when-absent rule. The durable way to change or disable the cadence is to **set your own value** (e.g. a larger number, or the Claude Code minimum of `1`); setup never mutates a `refreshInterval` you set yourself.
 
-### Pool-identity guard (`[1m]`-variant sessions)
+### Bracketed context variants (`[1m]` sessions)
 
-A session running a bracketed model variant such as `claude-opus-4-8[1m]` (the 1M-context variant) reports its `rate_limits` for a **separate usage pool** on the same account. Persisting that reading would poison the default-pool snapshots (the reset-aware high-water-mark clamp would latch the foreign value and freeze subsequent genuine writes), so the persist is **skipped** for any bracket-variant model id. Such a session still **renders** its own true pool numbers on the status line — only the write is suppressed, and the OAuth backfill's liveness clock keeps aging (a foreign-pool tick is not evidence the default-pool pipeline is alive).
+A bracketed model suffix such as `claude-opus-4-8[1m]` describes model or
+context-window metadata; it does not change the identity of the top-level
+`rate_limits.five_hour` and `rate_limits.seven_day` fields. cctally therefore
+persists those account-wide observations normally, so the dashboard continues
+to update on the configured status-line cadence. Model-scoped limits such as
+Fable's separate weekly quota are distinct fields and are never inferred from
+the active model ID.
 
 ## Examples
 

@@ -385,10 +385,21 @@ def doctor_gather_state(
 
     cache_entries_count = None
     cache_last_entry_at = None
+    cache_db_page_count = None
+    cache_db_freelist_count = None
     try:
         if _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
+                try:
+                    row = conn.execute("PRAGMA page_count").fetchone()
+                    if row and row[0] is not None:
+                        cache_db_page_count = int(row[0])
+                    row = conn.execute("PRAGMA freelist_count").fetchone()
+                    if row and row[0] is not None:
+                        cache_db_freelist_count = int(row[0])
+                except sqlite3.Error:
+                    pass
                 row = conn.execute(
                     "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
                 ).fetchone()
@@ -863,6 +874,9 @@ def doctor_gather_state(
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,
+        # #315: read-only cache free-page evidence for the reclaim hint.
+        cache_db_page_count=cache_db_page_count,
+        cache_db_freelist_count=cache_db_freelist_count,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,

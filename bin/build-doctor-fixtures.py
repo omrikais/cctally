@@ -59,6 +59,9 @@ SCENARIOS = {
     # #318: a write-ahead authoritative tombstone survived a prior writer,
     # so doctor must surface the bounded repair action without mutating it.
     "26-statusline-authority-repair": "statusline_authority_repair",
+    # #315: cache.db with a deliberately high free-page ratio. The doctor
+    # check must WARN and point at the guarded explicit vacuum command.
+    "27-cache-reclaimable":          "cache_reclaimable",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -274,6 +277,27 @@ def _scenario_body(slug: str) -> str:
             cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-authoritative-7d.json" <<'JSON'
             {"schemaVersion":1,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
             JSON
+        """)
+    if slug == "cache_reclaimable":
+        return _scenario_body("all_ok") + textwrap.dedent("""\
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-empty-codex-project-metadata \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
+            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db" <<'PY'
+            import sqlite3, sys
+            conn = sqlite3.connect(sys.argv[1])
+            conn.execute("CREATE TABLE reclaimable_payload (payload BLOB)")
+            conn.executemany(
+                "INSERT INTO reclaimable_payload(payload) VALUES (?)",
+                [(b"x" * 8192,) for _ in range(64)],
+            )
+            conn.commit()
+            conn.execute("DELETE FROM reclaimable_payload")
+            conn.commit()
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            assert page_count > 0 and freelist_count / page_count >= 0.25
+            conn.close()
+            PY
         """)
     if slug == "legacy_hooks_detected":
         return textwrap.dedent("""\

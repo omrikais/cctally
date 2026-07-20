@@ -1205,8 +1205,6 @@ def _fork_persist(parent_lock_fd: int) -> None:
 
 def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
     """Spool an eligible session candidate then reduce it opportunistically."""
-    if _lib_statusline.is_alternate_pool_model_id(parsed.model_id):
-        return
     candidate = _candidate_from_input(parsed, received_at=int(time.time()))
     if candidate is None:
         return

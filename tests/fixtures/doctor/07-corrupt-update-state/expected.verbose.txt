@@ -84,6 +84,12 @@ Database
   ✓ cache.db WAL size        within limit
       details:
         cache_db_wal_bytes: 0
+  ✓ Reclaimable cache space  below threshold
+      details:
+        cache_db_page_count: None
+        cache_db_freelist_count: None
+        cache_db_free_ratio: None
+        warn_ratio: 0.25
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -165,4 +171,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 30 OK · 6 WARN · 1 FAIL
+Summary: 31 OK · 6 WARN · 1 FAIL

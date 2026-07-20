@@ -249,6 +249,35 @@ def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
     assert state.cache_db_quick_check == "ok"
 
 
+def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+
+    conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    conn.execute("CREATE TABLE reclaimable_payload (payload BLOB)")
+    conn.executemany(
+        "INSERT INTO reclaimable_payload(payload) VALUES (?)",
+        [(b"x" * 8192,) for _ in range(64)],
+    )
+    conn.commit()
+    conn.execute("DELETE FROM reclaimable_payload")
+    conn.commit()
+    expected_page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    expected_freelist_count = int(
+        conn.execute("PRAGMA freelist_count").fetchone()[0]
+    )
+    conn.close()
+    assert expected_freelist_count > 0
+
+    state = ns["doctor_gather_state"](deep=False)
+
+    assert state.cache_db_page_count == expected_page_count
+    assert state.cache_db_freelist_count == expected_freelist_count
+
+
 def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
     ns = load_script()
     import _cctally_core

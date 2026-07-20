@@ -1154,6 +1154,62 @@ def test_fused_iterator_emits_two_shared_limit_quota_windows_with_distinct_compo
     assert {key["observedSlot"] for key in decoded_keys} == {"primary", "secondary"}
 
 
+def test_fused_iterator_separates_spark_from_standard_quota_pool_identity():
+    records = (
+        {
+            "timestamp": "2026-07-20T06:59:00Z", "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"},
+        },
+        {
+            "timestamp": "2026-07-20T07:00:00Z", "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 31.0, "window_minutes": 10_080,
+                        "resets_at": 1_784_966_699,
+                    },
+                },
+            },
+        },
+        {
+            "timestamp": "2026-07-20T07:01:00Z", "type": "turn_context",
+            "payload": {"model": "gpt-5.3-codex-spark"},
+        },
+        {
+            "timestamp": "2026-07-20T07:02:00Z", "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 0.0, "window_minutes": 10_080,
+                        "resets_at": 1_785_135_768,
+                    },
+                },
+            },
+        },
+    )
+    fh = io.BytesIO("".join(
+        _canonical_json(record) + "\n" for record in records
+    ).encode("utf-8"))
+
+    emissions = tuple(FUSED_ITER(
+        fh, "/synthetic/mixed-pools.jsonl",
+        source_root_key=identity.source_root_key(ROOT_A),
+    ))
+    keys = [
+        json.loads(quota.logical_limit_key)
+        for emission in emissions for quota in emission.quotas
+    ]
+
+    assert len(keys) == 2
+    assert "modelPool" not in keys[0]
+    assert keys[1]["modelPool"] == "gpt-5.3-codex-spark"
+    assert keys[0] != keys[1]
+
+
 def test_fused_iterator_detects_both_quota_locations_and_degrades_missing_or_malformed_slots():
     payload_quotas, _ = _fused_scenario("modern-quota-payload")
     no_quotas, _ = _fused_scenario("modern-no-quota")

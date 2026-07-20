@@ -451,6 +451,18 @@
                     "severity": "ok",
                     "summary": "within limit",
                     "title": "cache.db WAL size"
+                },
+                {
+                    "details": {
+                        "cache_db_free_ratio": null,
+                        "cache_db_freelist_count": null,
+                        "cache_db_page_count": null,
+                        "warn_ratio": 0.25
+                    },
+                    "id": "db.reclaimable",
+                    "severity": "ok",
+                    "summary": "below threshold",
+                    "title": "Reclaimable cache space"
                 }
             ],
             "id": "db",
@@ -671,7 +683,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 31,
+            "ok": 32,
             "warn": 6
         },
         "severity": "warn"

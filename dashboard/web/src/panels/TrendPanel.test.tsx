@@ -160,6 +160,37 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     expect(container.querySelectorAll('.trend-table tbody tr').length).toBeGreaterThan(0);
   });
 
+  it('Codex mode aligns Used%, $/1%, and vs-prior values with all four headers', () => {
+    const env = trendLeakEnv();
+    const template = env.sources!.codex.data!.periods.weekly.rows[0];
+    env.sources!.codex.data!.periods.weekly.rows = [
+      {
+        ...template,
+        label: '07-18 06:24',
+        cost_usd: 639.31,
+        used_pct: 30,
+        dollar_per_pct: 21.31,
+      },
+      {
+        ...template,
+        label: '07-16 07:16',
+        cost_usd: 418.35,
+        used_pct: 23,
+        dollar_per_pct: 18.19,
+      },
+    ];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<TrendPanel />);
+
+    const headers = Array.from(container.querySelectorAll('.trend-table thead th'))
+      .map((cell) => cell.getAttribute('data-col'));
+    const cells = Array.from(container.querySelectorAll('.trend-table tbody tr:last-child td'))
+      .map((cell) => cell.textContent);
+    expect(headers).toEqual(['week', 'used_pct', 'dollar_per_pct', 'delta']);
+    expect(cells).toEqual(['07-18 06:24', '30%', '$21.31', '+3.12 ↑']);
+  });
+
   it('All mode renders one shared trend shell with combined rows', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });

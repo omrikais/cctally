@@ -139,6 +139,20 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(rows[0].models[0]).toMatchObject({ display: 'Codex', cost_pct: 100 });
   });
 
+  it('Codex period cost deltas keep the shared fractional ratio contract', () => {
+    const env = cloneFixture();
+    const template = env.sources!.codex.data!.periods.weekly.rows[0];
+    env.sources!.codex.data!.periods.weekly.rows = [
+      { ...template, label: '07-18 06:24', cost_usd: 639.31 },
+      { ...template, label: '07-16 07:16', cost_usd: 418.35 },
+    ];
+
+    const rows = presentationPeriodRows(env, 'codex', 'weekly');
+
+    expect(rows[0].delta_cost_pct).toBeCloseTo((639.31 - 418.35) / 418.35);
+    expect(rows[1].delta_cost_pct).toBeNull();
+  });
+
   it('keeps the canonical $/1% Trend title and values for Codex', () => {
     const env = cloneFixture();
     Object.assign(env.sources!.codex.data!.periods.weekly.rows[0], {

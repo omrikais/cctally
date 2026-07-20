@@ -78,6 +78,8 @@ severity != `OK`.
 - `db.migrations.applied` — WARN on `skipped` rows; FAIL on `failed` rows.
 - `db.migrations.pending` — WARN when any migration is pending.
 - `db.lock_state` — informational (always OK). A non-blocking flock probe reports whether either sync lock file (`cache.db.lock` / `cache.db.codex.lock`) is currently held; a held lock usually just means an active sync or dashboard is running, so it never WARNs. The summary notes that a hold persisting across repeated `doctor` runs may indicate a wedged process. Read-only — the probe never creates the data dir or the lock files (it opens existing files read-only).
+- `db.wal_size` — WARN when `cache.db-wal` exceeds 256 MiB, indicating that the normal WAL cap/checkpoint defenses have not contained it; remediation is `cctally db checkpoint`.
+- `db.reclaimable` — WARN when at least 25% of `cache.db` pages are on SQLite's freelist, meaning a substantial part of the file can be returned to the filesystem. Remediation is `cctally db vacuum --db cache`. The probe reads `PRAGMA page_count` and `PRAGMA freelist_count` only; it never vacuums or otherwise mutates the database. An absent or unreadable cache degrades to OK, and the raw counts plus ratio are available in the unstable `details` block.
 
 ### Data
 - `data.latest_snapshot_age` — WARN at 5min-1h, FAIL >1h or never.
