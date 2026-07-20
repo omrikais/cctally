@@ -197,6 +197,27 @@ def _stamp_retention_prune(conn: sqlite3.Connection, now_utc: dt.datetime) -> No
     )
 
 
+def _reclaim_incremental_vacuum(conn: sqlite3.Connection) -> None:
+    """Drive zero-column incremental-vacuum rows to completion portably."""
+    remaining = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    if remaining <= 0:
+        return
+    chunk_pages = 4096
+    max_passes = (remaining + chunk_pages - 1) // chunk_pages + 1
+    for _ in range(max_passes):
+        requested = min(remaining, chunk_pages)
+        # executescript() routes through sqlite3_exec(), which steps zero-column
+        # pragma rows through SQLITE_DONE on Python/SQLite combinations where a
+        # Cursor.fetchall() can stop after the first row (public Linux 3.11).
+        conn.executescript(f"PRAGMA incremental_vacuum({requested});")
+        after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        if after <= 0:
+            return
+        if after >= remaining:
+            return
+        remaining = after
+
+
 def _maybe_prune_conversation_retention(
     conn: sqlite3.Connection,
     *,
@@ -271,12 +292,11 @@ def _maybe_prune_conversation_retention(
                 # already-durable prune.
                 if stats.total_rows > 0:
                     try:
-                        # `.fetchall()` drives the pragma to completion — a bare
-                        # execute() steps it once and reclaims a single page. This
-                        # clears the freelist and drops page_count; the physical
-                        # file shrinks on the next `wal_checkpoint(TRUNCATE)` the
-                        # sync loop already forces (#297).
-                        conn.execute("PRAGMA incremental_vacuum").fetchall()
+                        # Use the sqlite3_exec path and verify progress between
+                        # bounded chunks. This clears the freelist and drops
+                        # page_count; the physical file shrinks on the next
+                        # `wal_checkpoint(TRUNCATE)` the sync loop forces (#297).
+                        _reclaim_incremental_vacuum(conn)
                     except sqlite3.Error:
                         pass
                 return stats

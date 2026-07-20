@@ -6411,6 +6411,25 @@ def _run_sqlite_recover(
     return True, ""
 
 
+def _probe_sqlite_recover(sqlite_binary: str) -> "tuple[bool, str]":
+    """Prove the selected shell has a functional ``.recover`` command."""
+    try:
+        probe = subprocess.run(
+            [sqlite_binary, ":memory:", ".recover"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    stderr = probe.stderr.decode("utf-8", "replace").strip()
+    if probe.returncode != 0:
+        return False, stderr or f"sqlite3 .recover probe exited {probe.returncode}"
+    if b"BEGIN;" not in probe.stdout or b"COMMIT;" not in probe.stdout:
+        return False, stderr or "sqlite3 .recover probe produced incomplete SQL"
+    return True, ""
+
+
 def _repair_preflight_and_copy(
     path: pathlib.Path,
     backup: pathlib.Path,
@@ -6549,6 +6568,28 @@ def _cmd_db_repair_claimed(args: argparse.Namespace, path: pathlib.Path) -> int:
     """Repair body; caller owns the marker and has proved no old handles."""
 
     timeout_ms = int(getattr(args, "busy_timeout_ms", 250) or 250)
+    sqlite_binary = (
+        getattr(args, "sqlite3_binary", None) or shutil.which("sqlite3")
+    )
+    if not sqlite_binary:
+        eprint(
+            "cctally: db repair requires the sqlite3 command-line tool for "
+            'its corruption-tolerant ".recover" operation. The live DB is '
+            "untouched and no corrupt backup was created."
+        )
+        return 3
+    recover_supported, recover_reason = _probe_sqlite_recover(
+        str(sqlite_binary)
+    )
+    if not recover_supported:
+        eprint(
+            "cctally: the selected sqlite3 build does not support SQLite "
+            f".recover ({recover_reason}). Install the official sqlite.org "
+            "CLI built with SQLITE_ENABLE_DBPAGE_VTAB. The live DB is "
+            "untouched and no corrupt backup was created."
+        )
+        return 3
+
     stamp = _db_backup_timestamp()
     backup = _unique_sibling_path(
         path.with_name(f"{path.name}.bak-corrupt-malformed-{stamp}")
@@ -6619,18 +6660,6 @@ def _cmd_db_repair_claimed(args: argparse.Namespace, path: pathlib.Path) -> int:
                 "cctally: the SQLite header is too damaged to preserve "
                 "PRAGMA user_version safely; refusing the automated swap. "
                 f"The live DB is untouched and the corrupt backup is {backup}."
-            )
-            close_guard()
-            return 3
-
-        sqlite_binary = (
-            getattr(args, "sqlite3_binary", None) or shutil.which("sqlite3")
-        )
-        if not sqlite_binary:
-            eprint(
-                "cctally: db repair requires the sqlite3 command-line tool for "
-                'its corruption-tolerant ".recover" operation. The live DB is '
-                f"untouched and the corrupt backup is {backup}."
             )
             close_guard()
             return 3

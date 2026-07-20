@@ -150,9 +150,11 @@ the running binary.
 
 Stop the dashboard and other cctally processes first. The command refuses when
 another writer holds the database. It also requires `--yes`, honors the existing
-dev-checkout-to-production guard, and requires the `sqlite3` command-line tool.
-There is deliberately no `--force` race bypass for the non-re-derivable stats
-database.
+dev-checkout-to-production guard, and requires a recovery-capable `sqlite3`
+command-line shell. cctally probes `.recover` before copying or changing any
+database bytes; a distro build without `SQLITE_ENABLE_DBPAGE_VTAB` is rejected
+with an installation hint for the official sqlite.org CLI. There is deliberately
+no `--force` race bypass for the non-re-derivable stats database.
 
 The repair sequence is fail-safe:
 
@@ -187,7 +189,8 @@ instead.
 
 `0` repaired (or stats.db absent); `2` missing `--yes`, healthy-database
 refusal, or dev-to-production guard refusal; `3` database still active,
-`sqlite3` unavailable, recovery/import failure, or verification failure.
+`sqlite3` unavailable or missing `.recover` support, recovery/import failure,
+or verification failure.
 
 ## `cctally db backup --db {cache,stats} [--output <path>]`
 

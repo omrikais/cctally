@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.75.1] - 2026-07-20
+
+### Fixed
+- Database repair now rejects an SQLite shell without functional `.recover` support before creating a forensic copy, explains the required `SQLITE_ENABLE_DBPAGE_VTAB` capability, and runs its public Linux recovery tests against a checksum-pinned official SQLite shell instead of Ubuntu's incompatible distro build.
+- Automatic transcript-space reclamation now drives zero-column `incremental_vacuum` pragmas through SQLite's completion path in bounded, progress-checked chunks, fixing the Python 3.11/Linux case that could leave freed pages on the freelist after retention pruning.
+
 ## [1.75.0] - 2026-07-20
 
 ### Added

@@ -186,6 +186,47 @@ def test_orchestrated_prune_reclaims_freed_pages(tmp_path, monkeypatch):
     assert conn.execute("PRAGMA page_count").fetchone()[0] < pages_before
 
 
+class _PartialVacuumConnection:
+    """Model Python 3.11 stopping after one zero-column vacuum row."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.script_calls = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().rstrip(";").lower() == "pragma incremental_vacuum":
+            return self._conn.execute("PRAGMA incremental_vacuum(1)")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def executescript(self, sql):
+        self.script_calls += 1
+        if self.script_calls == 1:
+            return self._conn.executescript("PRAGMA incremental_vacuum(1);")
+        return self._conn.executescript(sql)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_orchestrated_prune_retries_partial_incremental_vacuum(
+    tmp_path, monkeypatch
+):
+    """A partial zero-column pragma step is retried until reclaim completes."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    for i in range(2000):
+        _seed_msg(conn, f"old-{i}", OLD, text="x" * 500)
+    _seed_msg(conn, "fresh", FRESH)
+    conn.commit()
+    partial = _PartialVacuumConnection(conn)
+
+    stats = retention._maybe_prune_conversation_retention(
+        partial, now_utc=NOW, retention_days=180, force=True)
+
+    assert stats is not None and stats.claude_messages == 2000
+    assert partial.script_calls == 2
+    assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+
+
 def test_codex_events_pruned_threads_retained(tmp_path, monkeypatch):
     """F5: prune only codex_conversation_events; keep codex_conversation_threads
     (and codex_session_entries) so source_analytics's range still resolves."""

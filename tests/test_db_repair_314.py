@@ -255,6 +255,32 @@ def test_repair_stats_requires_yes_and_leaves_bytes_untouched(
     assert not list(tmp_path.glob("stats.db.bak-corrupt-malformed-*"))
 
 
+def test_repair_rejects_sqlite_without_recover_capability_before_backup(
+    monkeypatch, tmp_path, capsys
+):
+    c = _ns(monkeypatch, tmp_path)
+    source = c._cctally_core.DB_PATH
+    before = _seed_corrupt_stats(source)
+    incompatible = tmp_path / "sqlite3-no-dbpage"
+    incompatible.write_text(
+        "#!/bin/sh\n"
+        "echo 'sql error: no such table: sqlite_dbpage (1)' >&2\n"
+        "exit 1\n"
+    )
+    incompatible.chmod(0o755)
+
+    rc = c.cmd_db_repair(
+        _repair_args(sqlite3_binary=str(incompatible))
+    )
+
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "does not support SQLite .recover" in err
+    assert "SQLITE_ENABLE_DBPAGE_VTAB" in err
+    assert source.read_bytes() == before
+    assert not list(source.parent.glob("stats.db.bak-corrupt-malformed-*"))
+
+
 def test_repair_stats_honors_dev_to_prod_guard(
     monkeypatch, tmp_path, capsys
 ):

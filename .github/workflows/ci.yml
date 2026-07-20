@@ -227,12 +227,15 @@ jobs:
           node-version-file: 'dashboard/web/.nvmrc'
           cache: npm
           cache-dependency-path: dashboard/web/package-lock.json
+      - name: Install recovery-capable SQLite CLI
+        run: .github/scripts/install-recovery-sqlite.sh "$RUNNER_TEMP/cctally-sqlite"
       - name: Assert required CLI tools present
         run: |
           # Harnesses shell out to these (jq: dashboard/migrations goldens;
           # column: table renders; ps: legacy-poller ownership probe; bc:
-          # arithmetic; sqlite3: 5h/migrations state dumps). ubuntu-latest
-          # ships them all — assert (with a best-effort install fallback) so a
+          # arithmetic; sqlite3: 5h/migrations state dumps + db repair). The
+          # prior step pins the official recovery-capable SQLite shell; assert
+          # the remaining tools (with a best-effort install fallback) so a
           # future image dropping one FAILS LOUDLY here rather than surfacing
           # as a confusing golden mismatch deep in the suite (issue #132: a
           # missing `jq` masqueraded as 36 phantom dashboard failures locally).
@@ -246,6 +249,7 @@ jobs:
             sudo apt-get install -y -qq sqlite3 jq bsdmainutils procps bc
           fi
           sqlite3 --version
+          sqlite3 :memory: '.recover' >/dev/null
       - name: Install Python test deps
         run: python -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
       # Unlike ci-linux-matrix (which deliberately skips npm ci), this lane
