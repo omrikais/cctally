@@ -483,16 +483,20 @@ def _source_safe_native_detail(row: Mapping, *, source: str,
     common = {"detail_kind": f"{source}_{resource}", "key": key}
     allowed = {
         "session": (
-            "last_activity", "cost_usd", "input_tokens", "cached_input_tokens",
+            "label", "project", "started_at", "duration_min", "last_activity",
+            "cost_usd", "input_tokens", "cached_input_tokens",
             "output_tokens", "reasoning_output_tokens", "total_tokens", "models",
+            "model_breakdowns",
         ),
         "project": (
-            "first_seen", "last_seen", "cost_usd", "input_tokens",
+            "label", "first_seen", "last_seen", "range_start", "range_end",
+            "cost_usd", "input_tokens",
             "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
-            "total_tokens", "session_count", "sessions_count",
+            "total_tokens", "session_count", "sessions_count", "models", "sessions",
         ),
         "block": (
-            "resets_at", "current_percent", "orphaned", "forecast",
+            "label", "start_at", "end_at", "resets_at", "current_percent",
+            "orphaned", "is_active", "cost_usd", "model_breakdowns", "forecast",
             "window_minutes", "observed_slot", "milestones",
         ),
     }[resource]
@@ -570,6 +574,9 @@ def _codex_detail_inputs(snapshot):
             week_start_name=semantics.week_start_name,
             speed=semantics.speed,
             codex_budget=semantics.codex_budget,
+            codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
+            codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
+            cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
         )
         qualified = load_qualified_codex_entries(
             range_start,
@@ -769,16 +776,15 @@ def _codex_partial_source_detail(snapshot, row: Mapping, *, resource: str,
     detail = _source_safe_native_detail(
         row, source="codex", resource=resource, key=key,
     )
-    detail.update({
-        "metadata_availability": "partial",
-        "metadata_reason": (
-            "Codex project metadata is incomplete; available accounting totals "
-            "are preserved."
-        ),
-    })
+    metadata_missing = resource != "session" or not row.get("project")
+    if metadata_missing:
+        detail.update({
+            "metadata_availability": "partial",
+            "metadata_reason": "Project metadata is unavailable for this item.",
+        })
     if resource == "session":
         detail.setdefault("models", [])
-        detail["model_breakdowns"] = []
+        detail.setdefault("model_breakdowns", [])
     elif resource == "project":
         generated_at = getattr(snapshot, "generated_at", None)
         detail.setdefault("range_start", detail.get("first_seen"))
@@ -787,8 +793,8 @@ def _codex_partial_source_detail(snapshot, row: Mapping, *, resource: str,
             generated_at.astimezone(dt.timezone.utc).isoformat()
             if isinstance(generated_at, dt.datetime) else detail.get("last_seen"),
         )
-        detail["models"] = []
-        detail["sessions"] = []
+        detail.setdefault("models", [])
+        detail.setdefault("sessions", [])
     return detail
 
 
@@ -988,7 +994,19 @@ def build_source_detail(*, snapshot, source: str, resource: str,
     if source == "claude":
         return _build_claude_source_detail(snapshot, resource=resource, key=key)
     try:
-        return _build_codex_source_detail(snapshot, resource=resource, key=key)
+        detail = _build_codex_source_detail(snapshot, resource=resource, key=key)
+        if resource == "session":
+            for field in ("label", "project", "started_at", "duration_min"):
+                detail[field] = row.get(field)
+        elif resource == "project":
+            detail["label"] = row.get("label")
+        elif resource == "block":
+            for field in (
+                "label", "start_at", "end_at", "is_active", "cost_usd",
+                "model_breakdowns",
+            ):
+                detail[field] = row.get(field)
+        return detail
     except sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable:
         return _codex_partial_source_detail(
             snapshot, row, resource=resource, key=key,

@@ -8,7 +8,9 @@ API response clears the deadline and resets the counter.
 """
 import datetime as dt
 import email.utils
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -355,3 +357,214 @@ def test_force_refresh_bypasses_backoff_gate_and_clears_on_ok(monkeypatch, tmp_p
     assert result.status == "ok"
     assert called["n"] == 1  # fetched despite the pending backoff
     assert ns["_oauth_backoff_remaining_seconds"]() == 0.0  # success cleared it
+
+
+def _start_refresh_thread(*, name, target, results, errors, start_gate=None):
+    """Run one refresh path while retaining assertion-friendly failures."""
+    def run():
+        try:
+            if start_gate is not None:
+                start_gate.wait(timeout=2)
+            results[name] = target()
+        except BaseException as exc:  # surfaced in the parent test thread
+            errors[name] = exc
+
+    thread = threading.Thread(target=run, name=name)
+    thread.start()
+    return thread
+
+
+def test_force_and_hook_429_transitions_are_serialized(monkeypatch, tmp_path):
+    """A force refresh and automatic refresh must not lose either 429.
+
+    The instrumented transition intentionally loses the count and furthest
+    deadline if both callers enter it together.  The selected-state lock must
+    make those complete transitions sequential instead.
+    """
+    ns = _load(monkeypatch, tmp_path)
+    _prime_hook(ns, monkeypatch)
+    selected_lock = threading.Lock()
+    monkeypatch.setitem(ns, "_selected_state_lock", lambda: selected_lock)
+
+    now = time.time()
+    short_deadline = now + 120
+    long_deadline = now + 360
+    state = {"count": 0, "deadline": 0.0}
+    transition_gate = threading.Barrier(2)
+    long_written = threading.Event()
+
+    def register_429(*, retry_after_deadline, now):
+        old_count = state["count"]
+        old_deadline = state["deadline"]
+        try:
+            transition_gate.wait(timeout=0.5)
+            concurrent = True
+        except threading.BrokenBarrierError:
+            concurrent = False
+        target = max(float(retry_after_deadline), old_deadline)
+        if concurrent and retry_after_deadline == short_deadline:
+            assert long_written.wait(timeout=2)
+        state["deadline"] = target
+        state["count"] = old_count + 1
+        if concurrent and retry_after_deadline == long_deadline:
+            long_written.set()
+        return target
+
+    monkeypatch.setitem(ns, "_oauth_backoff_register_429", register_429)
+    monkeypatch.setitem(
+        ns,
+        "_oauth_backoff_remaining_seconds",
+        lambda: max(0.0, state["deadline"] - time.time()),
+    )
+
+    def fetch(token, timeout_seconds):
+        deadline = (
+            short_deadline
+            if threading.current_thread().name == "force"
+            else long_deadline
+        )
+        raise ns["RefreshUsageRateLimitError"](
+            "429", retry_after_deadline=deadline
+        )
+
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", fetch)
+    start_gate = threading.Barrier(2)
+    results = {}
+    errors = {}
+    threads = [
+        _start_refresh_thread(
+            name="force",
+            target=ns["_refresh_usage_inproc"],
+            results=results,
+            errors=errors,
+            start_gate=start_gate,
+        ),
+        _start_refresh_thread(
+            name="automatic",
+            target=lambda: ns["_hook_tick_oauth_refresh"](throttle_seconds=0),
+            results=results,
+            errors=errors,
+            start_gate=start_gate,
+        ),
+    ]
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == {}
+    assert results["force"].status == "rate_limited"
+    assert results["automatic"][0] == "err(rate-limit)"
+    assert state == {"count": 2, "deadline": long_deadline}
+
+
+def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path):
+    """The force success reset belongs to the same ordered transition as its
+    authoritative record, so a later automatic 429 must remain registered."""
+    ns = _load(monkeypatch, tmp_path)
+    _prime_hook(ns, monkeypatch)
+    selected_lock = threading.Lock()
+    monkeypatch.setitem(ns, "_selected_state_lock", lambda: selected_lock)
+    monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "absent")
+
+    state = {"count": 0, "deadline": 0.0}
+    force_authority_entered = threading.Event()
+    automatic_started = threading.Event()
+    automatic_registered = threading.Event()
+
+    def authoritative_record(args, observed_axes, *, lock_held=False):
+        def finish():
+            force_authority_entered.set()
+            assert automatic_started.wait(timeout=2)
+            return SimpleNamespace(status="ok", reason=None)
+
+        if lock_held:
+            return finish()
+        with selected_lock:
+            return finish()
+
+    def register_429(*, retry_after_deadline, now):
+        state["count"] += 1
+        state["deadline"] = float(retry_after_deadline)
+        automatic_registered.set()
+        return state["deadline"]
+
+    def reset_backoff():
+        automatic_registered.wait(timeout=0.5)
+        state["count"] = 0
+        state["deadline"] = 0.0
+
+    def fetch(token, timeout_seconds):
+        if threading.current_thread().name == "force":
+            return _ok_api()
+        raise ns["RefreshUsageRateLimitError"](
+            "429", retry_after_deadline=time.time() + 300
+        )
+
+    monkeypatch.setitem(ns, "_authoritative_record_usage", authoritative_record)
+    monkeypatch.setitem(ns, "_oauth_backoff_register_429", register_429)
+    monkeypatch.setitem(ns, "_oauth_backoff_reset", reset_backoff)
+    monkeypatch.setitem(
+        ns,
+        "_oauth_backoff_remaining_seconds",
+        lambda: max(0.0, state["deadline"] - time.time()),
+    )
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", fetch)
+
+    results = {}
+    errors = {}
+    force = _start_refresh_thread(
+        name="force",
+        target=ns["_refresh_usage_inproc"],
+        results=results,
+        errors=errors,
+    )
+    assert force_authority_entered.wait(timeout=2)
+
+    def automatic_refresh():
+        automatic_started.set()
+        return ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+
+    automatic = _start_refresh_thread(
+        name="automatic",
+        target=automatic_refresh,
+        results=results,
+        errors=errors,
+    )
+    for thread in (force, automatic):
+        thread.join(timeout=5)
+
+    assert not force.is_alive()
+    assert not automatic.is_alive()
+    assert errors == {}
+    assert results["force"].status == "ok"
+    assert results["automatic"][0] == "err(rate-limit)"
+    assert state["count"] == 1
+    assert state["deadline"] > time.time()
+
+
+def test_later_force_success_clears_earlier_hook_429(monkeypatch, tmp_path):
+    """The inverse ordering still allows a fully committed force success to
+    clear the earlier automatic-refresh cooldown."""
+    ns = _load(monkeypatch, tmp_path)
+    _prime_hook(ns, monkeypatch)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "absent")
+    calls = {"count": 0}
+
+    def fetch(token, timeout_seconds):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise ns["RefreshUsageRateLimitError"](
+                "429", retry_after_deadline=time.time() + 300
+            )
+        return _ok_api()
+
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", fetch)
+
+    hook_status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+    force_result = ns["_refresh_usage_inproc"]()
+
+    assert hook_status == "err(rate-limit)"
+    assert force_result.status == "ok"
+    assert ns["_oauth_backoff_count"]() == 0
+    assert ns["_oauth_backoff_remaining_seconds"]() == 0.0

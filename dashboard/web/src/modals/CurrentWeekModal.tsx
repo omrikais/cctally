@@ -1,12 +1,20 @@
+import { useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
-import { dispatch } from '../store/store';
+import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
-import type { Milestone, FiveHourMilestone, FiveHourCredit } from '../types/envelope';
+import type {
+  CodexQuotaMilestoneRow,
+  CodexSourceData,
+  Envelope,
+  Milestone,
+  FiveHourMilestone,
+  FiveHourCredit,
+} from '../types/envelope';
 
 function clamp0_100(v: number | null | undefined): number {
   if (v == null || !isFinite(v)) return 0;
@@ -40,8 +48,8 @@ function splitBigNum(pct: number | null | undefined): [string, string] {
 }
 
 // Dedup milestones < 3% apart; keep first, drop near follow-ups.
-function dedupeTicks(ms: Milestone[]): Milestone[] {
-  const kept: Milestone[] = [];
+function dedupeTicks<T extends { percent: number | null | undefined }>(ms: T[]): T[] {
+  const kept: T[] = [];
   const sorted = [...ms].sort((a, b) => (a.percent ?? 0) - (b.percent ?? 0));
   for (const m of sorted) {
     if (m.percent == null) continue;
@@ -85,10 +93,163 @@ function buildFhStream(
   return entries;
 }
 
+function milestoneFiveHourPercent(
+  weekly: CodexQuotaMilestoneRow,
+  fiveHour: CodexQuotaMilestoneRow[],
+): number | null {
+  if (weekly.five_hour_percent != null) return weekly.five_hour_percent;
+  const crossedAt = Date.parse(weekly.captured_at);
+  const eligible = fiveHour.filter((row) => {
+    const capturedAt = Date.parse(row.captured_at);
+    const resetsAt = row.resets_at ? Date.parse(row.resets_at) : Number.POSITIVE_INFINITY;
+    return capturedAt <= crossedAt && crossedAt < resetsAt;
+  });
+  eligible.sort((a, b) => Date.parse(b.captured_at) - Date.parse(a.captured_at));
+  return eligible[0]?.percent ?? null;
+}
+
+function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCtx }) {
+  const codex = env?.sources?.codex?.data as CodexSourceData | undefined;
+  const hero = codex?.hero;
+  const cycle = hero?.cycle;
+  const weeklyHistories = codex?.quota.histories
+    .filter((row) => row.window_minutes === 10_080) ?? [];
+  const activeWeeklyKeys = new Set(
+    hero?.quota.active
+      .filter((row) => row.resets_at === cycle?.resets_at)
+      .map((row) => row.key) ?? [],
+  );
+  const history = [...weeklyHistories]
+    .sort((a, b) => {
+      const aActive = activeWeeklyKeys.has(a.key) || a.forecast.resets_at === cycle?.resets_at;
+      const bActive = activeWeeklyKeys.has(b.key) || b.forecast.resets_at === cycle?.resets_at;
+      if (aActive !== bActive) return aActive ? -1 : 1;
+      return (b.current_percent ?? -1) - (a.current_percent ?? -1)
+        || (b.captured_at ?? '').localeCompare(a.captured_at ?? '');
+    })[0];
+  const currentPercent = history?.current_percent
+    ?? hero?.quota.active.find((row) => row.key === history?.key)?.current_percent
+    ?? 0;
+  const pct = clamp0_100(currentPercent);
+  const [bigInt, bigUnit] = splitBigNum(currentPercent);
+  const dpp = hero?.cost_usd != null && currentPercent > 0
+    ? hero.cost_usd / currentPercent
+    : null;
+  const cycleStart = cycle?.start_at ? Date.parse(cycle.start_at) : Number.NaN;
+  const cycleEnd = cycle?.resets_at ? Date.parse(cycle.resets_at) : Number.NaN;
+  const allMilestones = codex?.quota.milestones ?? [];
+  const inCycle = (row: CodexQuotaMilestoneRow) => {
+    const capturedAt = Date.parse(row.captured_at);
+    return Number.isFinite(cycleStart) && Number.isFinite(cycleEnd)
+      ? cycleStart <= capturedAt && capturedAt < cycleEnd
+      : true;
+  };
+  const weeklyMilestones = allMilestones
+    .filter((row) => row.window_minutes === 10_080
+      && row.quota_key === history?.key
+      && row.resets_at === cycle?.resets_at
+      && inCycle(row))
+    .sort((a, b) => a.percent - b.percent || a.captured_at.localeCompare(b.captured_at));
+  const weeklyTicks = dedupeTicks(weeklyMilestones);
+  const fiveHourHistory = codex?.quota.histories.find((row) => row.window_minutes === 300);
+  const fiveHourMilestones = allMilestones
+    .filter((row) => row.window_minutes === 300
+      && row.quota_key === fiveHourHistory?.key
+      && inCycle(row));
+  const pill = cycle
+    ? `${fmt.dateShort(cycle.start_at, ctx)} → ${fmt.dateShort(cycle.resets_at, ctx)}`
+    : 'Native 7-day cycle unavailable';
+
+  return (
+    <Modal
+      title="Current Cycle — per-percent milestones"
+      accentClass="accent-orange"
+      headerExtras={
+        <ShareIcon
+          panel="current-week"
+          panelLabel="Current cycle"
+          triggerId="current-week-modal"
+          onClick={() => dispatch(openShareModal('current-week', 'current-week-modal'))}
+        />
+      }
+    >
+      <section className="modal-current-week" data-source="codex">
+        <div className="m-chipstrip" id="mcw-badges">
+          <span className="m-pill accent-orange" id="mcw-week-pill">{pill}</span>
+          <span className="m-pill accent-orange">Codex · native 7-day quota</span>
+        </div>
+
+        <div className="mcw-herobar">
+          <div className="mcw-bignum" id="mcw-bignum">
+            <span className="int">{bigInt}</span>
+            <span className="unit">{bigUnit}</span>
+          </div>
+          <div className="mcw-pbar-wrap">
+            <div className="mcw-pbar">
+              <div className="fill" id="mcw-fill" style={{ width: pct + '%' }} />
+              {shouldShowMilestoneTicks(pct) && (
+                <div className="ticks" id="mcw-ticks">
+                  {weeklyTicks.map((row) => (
+                    <div key={row.key} className="tick" data-p={String(row.percent)} style={{ left: clamp0_100(row.percent) + '%' }} />
+                  ))}
+                </div>
+              )}
+              <div className="marker" id="mcw-marker" style={{ left: pct + '%' }} />
+            </div>
+            <div className="mcw-pscale">
+              <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+            </div>
+          </div>
+          <div className="mcw-mini" id="mcw-mini">
+            <div className="s"><span className="k">spent</span><span className="v v-magenta">{fmt.usd2(hero?.cost_usd)}</span></div>
+            <div className="s"><span className="k">$ / 1%</span><span className="v v-cyan">{fmt.usd3(dpp)}</span></div>
+            <div className="s"><span className="k">reset</span><span className="v">{fmt.datetimeShortZ(cycle?.resets_at, ctx)}</span></div>
+          </div>
+        </div>
+
+        <h3 className="m-sec sec-ms">
+          <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg>
+          Milestones
+        </h3>
+        <div className="mcw-mshead">
+          <span className="m-pill accent-orange" id="mcw-ms-count">{weeklyMilestones.length} crossed</span>
+          <span className="mcw-ms-sub">Derived from retained OpenAI quota observations</span>
+        </div>
+        <table className="m-histable" id="mcw-table">
+          <thead>
+            <tr>
+              <th>%</th>
+              <th>Crossed ({ctx.offsetLabel})</th>
+              <th className="num">Cumulative $</th>
+              <th className="num">Marginal $</th>
+              <th className="num">5h %</th>
+            </tr>
+          </thead>
+          <tbody id="mcw-rows">
+            {weeklyMilestones.length === 0 ? (
+              <tr><td colSpan={5} className="empty-state">No integer-percent crossing has been retained in this cycle yet.</td></tr>
+            ) : weeklyMilestones.map((row) => (
+              <tr key={row.key}>
+                <td><span className="m-pill accent-orange pct-cell">{row.percent}</span></td>
+                <td className="d">{fmt.startedShort(row.captured_at, ctx, { noSuffix: true })}</td>
+                <td className="num">{fmt.usd2(row.cumulative_usd)}</td>
+                <td className="num"><span className="m-marginal">{fmt.usd2(row.marginal_usd)}</span></td>
+                <td className="num"><span className="m-fh">{fmt.pct0(milestoneFiveHourPercent(row, fiveHourMilestones))}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </Modal>
+  );
+}
+
 export function CurrentWeekModal() {
   const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const display = useDisplayTz();
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  if (activeSource === 'codex') return <CodexCurrentCycleModal env={env} ctx={ctx} />;
   const cw = env?.current_week ?? null;
   const header = env?.header ?? null;
   const ms = Array.isArray(cw?.milestones) ? cw!.milestones : [];

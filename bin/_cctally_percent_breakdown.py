@@ -33,6 +33,51 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+def _render_percent_breakdown_terminal(
+    *,
+    week_start_date: str,
+    week_end_date: str,
+    display_start_iso: str | None,
+    display_end_iso: str | None,
+    milestone_list: list[dict[str, object]],
+    tz,
+    empty_message: str = "No percent milestones recorded for this week.",
+) -> str:
+    """Render the canonical weekly per-percent terminal design."""
+    c = _cctally()
+    lines: list[str] = []
+    if display_start_iso and display_end_iso:
+        lines.append(
+            f"Week: {c._format_ts_compact(display_start_iso, tz=tz)} -> "
+            f"{c._format_ts_compact(display_end_iso, tz=tz)}"
+        )
+    else:
+        lines.append(f"Week: {week_start_date}..{week_end_date}")
+    if not milestone_list:
+        lines.append(empty_message)
+        return "\n".join(lines)
+
+    lines.extend(("Percent breakdown:", ""))
+    headers = ["#", "Threshold", "Cumulative Cost", "Marginal Cost", "5h at crossing"]
+    rows: list[list[str]] = []
+    for idx, milestone in enumerate(milestone_list, start=1):
+        percent = int(milestone["percentThreshold"])
+        cumulative = float(milestone["cumulativeCostUSD"])
+        marginal_value = milestone["marginalCostUSD"]
+        five_hour_value = milestone["fiveHourPercentAtCrossing"]
+        rows.append([
+            str(idx),
+            f"{percent}%",
+            f"${cumulative:.6f}",
+            f"${float(marginal_value):.6f}" if marginal_value is not None else "n/a",
+            f"{float(five_hour_value):.0f}%" if five_hour_value is not None else "n/a",
+        ])
+    lines.append(c._boxed_table(
+        headers, rows, ["right", "right", "right", "right", "right"],
+    ))
+    return "\n".join(lines)
+
+
 def cmd_percent_breakdown(args: argparse.Namespace) -> int:
     c = _cctally()
     config = c.load_config()
@@ -159,40 +204,20 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             print(json.dumps(c.stamp_schema_version(output), indent=2))
             return 0
 
-        # Prefer the reset-adjusted ISO timestamps in the terminal header
-        # when available; fall back to the raw dates for legacy installs.
-        if display_start_iso and display_end_iso:
-            print(
-                f"Week: {c._format_ts_compact(display_start_iso, tz=tz)} -> "
-                f"{c._format_ts_compact(display_end_iso, tz=tz)}"
-            )
-        else:
-            print(f"Week: {week_start_date}..{week_end_date}")
-        if not milestone_list:
-            if active_segment > 0:
-                # v1.7.2: distinguish post-credit empty (just got
-                # credited, no crossings yet) from genuinely-empty week.
-                # The pre-credit ledger still exists in the DB — just
-                # filtered out of the body — so the user shouldn't see
-                # "No milestones" and assume the data is gone.
-                print(
-                    "(post-credit segment, no milestones crossed yet)"
-                )
-            else:
-                print("No percent milestones recorded for this week.")
-            return 0
-
-        print("Percent breakdown:\n")
-        headers = ["#", "Threshold", "Cumulative Cost", "Marginal Cost", "5h at crossing"]
-        rows: list[list[str]] = []
-        for idx, m in enumerate(milestone_list, start=1):
-            pct = f"{m['percentThreshold']}%"
-            cum = f"${m['cumulativeCostUSD']:.6f}"
-            marg = f"${m['marginalCostUSD']:.6f}" if m["marginalCostUSD"] is not None else "n/a"
-            fh = f"{m['fiveHourPercentAtCrossing']:.0f}%" if m["fiveHourPercentAtCrossing"] is not None else "n/a"
-            rows.append([str(idx), pct, cum, marg, fh])
-
-        print(c._boxed_table(headers, rows, ["right", "right", "right", "right", "right"]))
+        empty_message = (
+            "(post-credit segment, no milestones crossed yet)"
+            if active_segment > 0
+            else "No percent milestones recorded for this week."
+        )
+        print(_render_percent_breakdown_terminal(
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            display_start_iso=display_start_iso,
+            display_end_iso=display_end_iso,
+            milestone_list=milestone_list,
+            tz=tz,
+            empty_message=empty_message,
+        ))
 
         return 0
     finally:

@@ -82,16 +82,19 @@ describe('<ForecastModal />', () => {
     expect(document.getElementById('mfc-bud90')?.textContent).toBe('$21.00 / day');
   });
 
-  it('renders the empty state when forecast is null', () => {
+  it('keeps the canonical detail composition when forecast is null', () => {
     _resetForTests();
     updateSnapshot({
       ...(fixture as unknown as Envelope),
       forecast: null,
     });
     render(<ForecastModal />);
-    const empty = document.getElementById('mfc-empty');
-    expect(empty).not.toBeNull();
-    expect(empty?.textContent).toMatch(/No forecast data yet/);
+    expect(document.getElementById('mfc-empty')).toBeNull();
+    expect(document.querySelector('#mfc-chips .m-unavailable')?.textContent)
+      .toBe('Forecast unavailable');
+    expect(document.getElementById('mfc-wa-pct')?.textContent).toBe('—');
+    expect(document.getElementById('mfc-r24-pct')?.textContent).toBe('—');
+    expect(document.querySelector('.m-hero.cols-2')).not.toBeNull();
   });
 
   it('verdict pill gets amber class on WARN / red on OVER', () => {

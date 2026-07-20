@@ -5,9 +5,7 @@
 //   per-provider source-data path, and permitted legacy fallback (cache-report
 //   only). A panel renders for a provider iff the capability record is
 //   supported/derived AND its mapped data path resolves (or its legacy fallback
-//   exists). A capability without a resolvable path/fallback hides (D2), which
-//   is what keeps Codex `forensics: supported` (hero counters only) and Codex
-//   forecast/trend from rendering ghost panels.
+//   exists). A capability without a resolvable path/fallback hides (D2).
 // Layer 2 — selection-level gating for `all`: the `all` entry's own capabilities
 //   govern only the combined hero tiles and the alerts union; every other panel
 //   in All mode renders provider-labeled sections from each provider child
@@ -48,8 +46,8 @@ type PathFn = (data: unknown) => unknown | undefined;
 export interface PanelGateSpec {
   capability: string;
   // A per-source data path, or `null` when the source's gating row has NO data
-  // path for the panel (e.g. Codex publishes no forecast/trend; neither provider
-  // has a cache-report path — Claude renders it via `legacyFallback`). A `null`
+  // path for the panel (e.g. Codex publishes no direct forecast/trend object;
+  // those canonical views are derived from quota + period rows). A `null`
   // path + no applicable fallback means the source can NEVER render the panel, so
   // it hides UNCONDITIONALLY (ahead of availability/hydration layering) — see
   // `sourceHasPanelPath` / `gateSingleSource`.
@@ -61,12 +59,9 @@ function rec(v: unknown): Record<string, unknown> | undefined {
   return v != null && typeof v === 'object' ? (v as Record<string, unknown>) : undefined;
 }
 
-// §5.5 Layer 1 — the panel gating table, verbatim. `current-week` is the hero
-// (strip + modal). Forecast/trend map to the `hero` capability but their Codex
-// path is intentionally absent (Codex hero publishes no forecast/trend →
-// hidden). Blocks map to the `quota` capability. Cache-report has NO source path
-// under either provider; Claude renders it only via the top-level `cache_report`
-// legacy fallback.
+// §5.5 Layer 1 — the panel gating table. `current-week` is the hero (strip +
+// modal). Forecast/trend are canonical client-side derivations for Codex, while
+// cache-report is a provider-owned computed object. Blocks map to quota.
 export const PANEL_GATING: Record<PanelId, PanelGateSpec> = {
   'current-week': {
     capability: 'hero',
@@ -136,11 +131,10 @@ export const PANEL_GATING: Record<PanelId, PanelGateSpec> = {
   'cache-report': {
     capability: 'forensics',
     path: {
-      // Neither provider publishes a cache-report path; Claude renders it ONLY
-      // via the top-level `cache_report` legacy fallback (below). Codex has no
-      // path and no fallback → hidden unconditionally.
+      // Claude keeps its legacy top-level report; Codex publishes the same
+      // canonical computed shape inside its provider-owned data.
       claude: null,
-      codex: null,
+      codex: (d) => rec(d)?.cache_report,
     },
     legacyFallback: (env) => env.cache_report ?? undefined,
   },

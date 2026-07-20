@@ -2546,6 +2546,9 @@ def _tui_build_source_bundle(
                         week_start_name=semantics.week_start_name,
                         speed=semantics.speed,
                         codex_budget=semantics.codex_budget,
+                        codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
+                        codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
+                        cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
                     ),
                     data_version=codex_version,
                 )

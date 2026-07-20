@@ -230,12 +230,14 @@ describe('gateSingleSource — wholly-unavailable Codex: absent-path hidden wins
     });
   }
 
-  it('hides forecast/trend/cache-report (no Codex path) even though the entry is unavailable', () => {
+  it('hides absent forecast/trend paths but degrades a published Codex cache report', () => {
     const v = viewFor('codex', { codex: unavailCodex() });
-    for (const p of ['forecast', 'trend', 'cache-report'] as const) {
+    for (const p of ['forecast', 'trend'] as const) {
       expect(gatePanel(v, p).mode).toBe('hidden');
       expect(isPanelVisible(v, p)).toBe(false);
     }
+    expect(gatePanel(v, 'cache-report').mode).toBe('degraded');
+    expect(isPanelVisible(v, 'cache-report')).toBe(true);
   });
 
   it('degrades (not hides) the panels Codex CAN have — daily/weekly/monthly/sessions/projects/blocks/hero/alerts', () => {

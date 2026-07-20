@@ -25,28 +25,36 @@ function deltaCellCls(d: number | null): string {
   return d > 0 ? 'num delta-up' : 'num delta-down';
 }
 
-// Dedup by chip family so a row with `opus-4-7` + `opus-4-6` shows ONE
-// `opus` chip, not two. Order is preserved (cost-desc upstream).
-function uniqueChipKeys(models: ModelCostRow[]): string[] {
+interface ModelChip {
+  key: string;
+  cls: string;
+  label: string;
+}
+
+// Known Claude families remain deduped (`opus-4-7` + `opus-4-6` → one Opus
+// chip). Provider models in the neutral `other` class retain their own model
+// identity, otherwise every Codex split collapses into a useless "other".
+function uniqueModelChips(models: ModelCostRow[]): ModelChip[] {
   const seen = new Set<string>();
-  const keys: string[] = [];
+  const chips: ModelChip[] = [];
   for (const m of models) {
-    if (!seen.has(m.chip)) {
-      seen.add(m.chip);
-      keys.push(m.chip);
+    const key = m.chip === 'other' ? `other:${m.model}` : m.chip;
+    if (!seen.has(key)) {
+      seen.add(key);
+      chips.push({ key, cls: m.chip, label: m.chip === 'other' ? m.display : m.chip });
     }
   }
-  return keys;
+  return chips;
 }
 
 function ModelsCell({ models }: { models: ModelCostRow[] }) {
-  const keys = uniqueChipKeys(models);
-  const top = keys.slice(0, 3);
-  const extra = keys.length > 3 ? keys.length - 3 : 0;
+  const chips = uniqueModelChips(models);
+  const top = chips.slice(0, 3);
+  const extra = chips.length > 3 ? chips.length - 3 : 0;
   return (
     <span className="models-chips">
-      {top.map((k) => (
-        <span key={k} className={`chip ${k}`}>{k}</span>
+      {top.map((chip) => (
+        <span key={chip.key} className={`chip ${chip.cls}`}>{chip.label}</span>
       ))}
       {extra > 0 && <span className="models-chips-more">…+{extra}</span>}
     </span>

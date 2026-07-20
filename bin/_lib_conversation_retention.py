@@ -1,4 +1,4 @@
-"""#313 P3: 180-day conversation-transcript retention prune kernel.
+"""#313 P3: conversation-transcript retention prune kernel.
 
 Prunes ONLY the re-derivable transcript rows:
   * Claude: ``conversation_messages`` + their ``conversation_file_touches`` /
@@ -63,7 +63,7 @@ def _cutoff_iso(cutoff_utc: dt.datetime) -> str:
     ``...Z`` timestamps.
 
     Second-granular: the sub-second mixed-precision edge at the exact cutoff
-    second is immaterial for a 180-day window — any message wrongly classified
+    second is immaterial for a multi-day retention window — any message wrongly classified
     there is re-derivable from JSONL and the boundary self-corrects on the next
     (daily) prune.
     """
@@ -259,6 +259,26 @@ def _maybe_prune_conversation_retention(
                 except Exception:
                     conn.rollback()
                     raise
+                # Return the freed pages to the OS. On an INCREMENTAL auto-vacuum
+                # cache.db (the default for freshly-created DBs, #313 P3) this
+                # shrinks the file on disk instead of leaving a growing freelist,
+                # so the transcript prune reclaims space automatically without a
+                # manual `cctally db vacuum`; on a legacy auto_vacuum=NONE cache it
+                # is a harmless no-op (those still reclaim via `db vacuum` or a
+                # `cache-sync --rebuild`). Runs OUTSIDE the committed transaction,
+                # still under the maintenance + provider flocks (no concurrent
+                # writer), and best-effort — a reclaim error must never fail the
+                # already-durable prune.
+                if stats.total_rows > 0:
+                    try:
+                        # `.fetchall()` drives the pragma to completion — a bare
+                        # execute() steps it once and reclaims a single page. This
+                        # clears the freelist and drops page_count; the physical
+                        # file shrinks on the next `wal_checkpoint(TRUNCATE)` the
+                        # sync loop already forces (#297).
+                        conn.execute("PRAGMA incremental_vacuum").fetchall()
+                    except sqlite3.Error:
+                        pass
                 return stats
             finally:
                 try:

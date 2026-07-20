@@ -1055,7 +1055,7 @@ def _build_codex_session_parser(subparsers, name, *, help_text, xref):
     return p
 
 
-def _add_codex_quota_common_args(parser) -> None:
+def _add_codex_quota_common_args(parser, *, sync_by_default: bool = True) -> None:
     """Attach the shared exact-selector/reporting surface for native quotas."""
     parser.add_argument(
         "--root-key", dest="root_key", metavar="FULL_SOURCE_ROOT_KEY",
@@ -1065,10 +1065,16 @@ def _add_codex_quota_common_args(parser) -> None:
         "--limit-key", dest="limit_key", metavar="FULL_LOGICAL_LIMIT_KEY",
         help="Exact case-sensitive logicalLimitKey selector (no prefix matching).",
     )
-    parser.add_argument(
-        "--no-sync", action="store_true",
-        help="Read retained local-rollout quota evidence without a Codex cache sync.",
-    )
+    if sync_by_default:
+        parser.add_argument(
+            "--no-sync", action="store_true",
+            help="Read retained local-rollout quota evidence without a Codex cache sync.",
+        )
+    else:
+        parser.add_argument(
+            "--sync", action="store_true",
+            help="Refresh retained Codex evidence before reading the materialized projection.",
+        )
     parser.add_argument(
         "--config", default=None, metavar="PATH",
         help="Read display settings from PATH for this invocation only.",
@@ -1143,6 +1149,46 @@ def _build_codex_quota_parser(subparsers, name, *, help_text, xref=None):
     _add_codex_quota_common_args(breakdown)
     breakdown.set_defaults(func=c.cmd_codex_quota_breakdown)
     return quota
+
+
+def _build_codex_percent_breakdown_parser(subparsers, name, *, help_text, xref=None):
+    """Build the current native seven-day Codex milestone view."""
+    c = _cctally()
+    parser = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Show cumulative and marginal Codex cost at each integer percent
+            threshold for one native 7-day quota cycle, using the same terminal
+            design as `cctally percent-breakdown`.
+            """
+        ),
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              cctally codex percent-breakdown
+              cctally codex percent-breakdown --root-key <key> --limit-key <key>
+              cctally codex percent-breakdown --reset-at 2026-07-15T15:00:00Z
+            """
+        ),
+    )
+    parser.add_argument(
+        "--reset-at", default=None, metavar="ISO-8601",
+        help="Exact retained 7-day reset timestamp. Defaults to the active cycle.",
+    )
+    parser.add_argument(
+        "--speed", choices=("auto", "standard", "fast"), default="auto",
+        help="Codex pricing tier for query-time cost correlation (default: auto).",
+    )
+    _add_codex_quota_common_args(parser, sync_by_default=False)
+    parser.add_argument(
+        "--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. Overrides config display.tz.",
+    )
+    parser.set_defaults(func=c.cmd_codex_percent_breakdown)
+    return parser
 
 
 def _build_sync_week_parser(subparsers, name, *, help_text, xref=None):
@@ -2138,7 +2184,7 @@ def _build_cache_sync_parser(subparsers, name, *, help_text, xref=None):
         "--prune-conversations",
         action="store_true",
         help="Prune conversation transcripts older than "
-             "conversation.retention_days (default 180) now, without a full "
+             "conversation.retention_days (default 90) now, without a full "
              "rebuild. Re-derivable from JSONL; run `cctally db vacuum` to "
              "reclaim the freed disk space.",
     )
@@ -2372,6 +2418,8 @@ def _build_codex_parser(subparsers, name, *, help_text, xref=None):
         help_text="Show Codex token-reuse analytics", fixed_source="codex")
     _build_report_parser(codex_sub, "report",
         help_text="Show Codex quota-window report", fixed_source="codex")
+    _build_codex_percent_breakdown_parser(codex_sub, "percent-breakdown",
+        help_text="Show per-percent cost milestones for one native 7-day cycle")
     _build_codex_quota_parser(codex_sub, "quota",
         help_text="Native root-qualified Codex quota reports")
 
@@ -2800,6 +2848,52 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Required for --db stats (non-re-derivable; may need a re-record)",
     )
     db_recover.set_defaults(func=c.cmd_db_recover)
+    db_repair = db_sub.add_parser(
+        "repair",
+        help="Recover a malformed stats.db through a verified fresh copy",
+    )
+    db_repair.add_argument(
+        "--db",
+        required=True,
+        choices=("stats",),
+        help="Database to repair (stats only; rebuild cache.db instead)",
+    )
+    db_repair.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required: preserve the corrupt original, then replace stats.db",
+    )
+    db_repair.add_argument(
+        "--busy-timeout-ms",
+        dest="busy_timeout_ms",
+        type=int,
+        default=250,
+        help=argparse.SUPPRESS,
+    )
+    db_repair.set_defaults(func=c.cmd_db_repair)
+    db_backup = db_sub.add_parser(
+        "backup",
+        help="Create a consistent SQLite online-backup snapshot",
+    )
+    db_backup.add_argument(
+        "--db",
+        required=True,
+        choices=("cache", "stats"),
+        help="Which DB to back up",
+    )
+    db_backup.add_argument(
+        "--output",
+        dest="backup_output",
+        help="Destination file (default: timestamped sibling; never overwritten)",
+    )
+    db_backup.add_argument(
+        "--busy-timeout-ms",
+        dest="busy_timeout_ms",
+        type=int,
+        default=15000,
+        help=argparse.SUPPRESS,
+    )
+    db_backup.set_defaults(func=c.cmd_db_backup)
     db_checkpoint = db_sub.add_parser(
         "checkpoint",
         help="Drain the WAL (TRUNCATE checkpoint) — fast, non-destructive",

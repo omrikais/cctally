@@ -20,7 +20,7 @@ cctally config unset <key>
 | `dashboard.live_tail` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the conversation-viewer live-tail. `true` (default) lets the open reader follow an active session in near-real time via a dedicated per-conversation SSE stream (new turns within ~1s of the session's file changing); set `false` to fall back to the periodic 5-second snapshot tick. Absence is treated as ON. Also toggleable from the dashboard settings modal. See [`dashboard.md`](dashboard.md#live-tail). | `true` |
 | `telemetry.enabled` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the anonymous install-count telemetry. `true` (default) sends an anonymous once-a-day install beat (a rotating monthly token + version + OS family); set `false` to disable it. Absence is treated as ON. Also disabled by `CCTALLY_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1`, and dev checkouts. `cctally telemetry off`/`on` is a thin wrapper over this key. See [`telemetry.md`](telemetry.md) and the full [`../telemetry.md`](../telemetry.md) privacy page. | `true` |
 | `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`) | `local` |
-| `conversation.retention_days` | Positive integer, or `off` / `0` to disable (keep transcripts forever). How many days of conversation transcripts the dashboard/CLI retains before pruning them from `cache.db`; the underlying cost/usage history is never affected and transcripts are re-derivable from the JSONL. Config-only (not dashboard-mirrored). A malformed persisted value resolves to the `180` default. See [`cache-sync.md`](cache-sync.md#--prune-conversations) and [`db.md`](db.md#db-vacuum). | `180` |
+| `conversation.retention_days` | Positive integer, or `off` / `0` to disable (keep transcripts forever). How many days of conversation transcripts the dashboard/CLI retains before pruning them from `cache.db`; the underlying cost/usage history is never affected and transcripts are re-derivable from the JSONL. Config-only (not dashboard-mirrored). A malformed persisted value resolves to the `90` default. See [`cache-sync.md`](cache-sync.md#--prune-conversations) and [`db.md`](db.md#db-vacuum). | `90` |
 | `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. See [Alerts dispatch keys](#alerts-dispatch-keys). | `auto` |
 | `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. See [Alerts dispatch keys](#alerts-dispatch-keys). | `null` |
 | `budget.codex` | Whole Codex budget object, or `null` for no Codex budget. This compatibility key remains round-trippable; the leaf keys below are preferred for partial edits. | `null` |
@@ -147,7 +147,8 @@ leaves the stored config untouched.
 Every subcommand that renders a clock instant (forecast, tui, dashboard,
 report, weekly, daily, monthly, blocks, five-hour-blocks,
 five-hour-breakdown, session, codex-{daily,monthly,weekly,session},
-cache-report, diff, percent-breakdown, project) reads `display.tz` to
+cache-report, diff, percent-breakdown, `cctally codex percent-breakdown`,
+project) reads `display.tz` to
 decide which zone to render labels in. A per-call `--tz <value>` flag
 overrides the persisted value for that one invocation.
 

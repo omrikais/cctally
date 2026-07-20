@@ -1,7 +1,7 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Five actions: `status`, `skip`,
-`unskip`, `recover`, `checkpoint`.
+Migration / DB-management subcommand. Eight actions: `status`, `skip`,
+`unskip`, `recover`, `repair`, `backup`, `checkpoint`, and `vacuum`.
 
 ## Synopsis
 
@@ -10,6 +10,8 @@ cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
 cctally db recover --db {cache,stats} [--yes]
+cctally db repair --db stats --yes
+cctally db backup --db {cache,stats} [--output <path>]
 cctally db checkpoint [--db {cache,stats}] [--json]
 cctally db vacuum [--db {cache,stats,all}]
 ```
@@ -139,6 +141,75 @@ no-op when the DB is not ahead.
 without `--yes` while the DB is ahead, **or** the #146 prod guard
 refused a dev-checkout recovery of the real prod stats.db.
 
+## `cctally db repair --db stats --yes`
+
+Recovers a physically malformed `stats.db` through SQLite's
+corruption-tolerant `.recover` operation (issue #314). This is distinct from
+`db recover`, which only reconciles a database whose schema version is ahead of
+the running binary.
+
+Stop the dashboard and other cctally processes first. The command refuses when
+another writer holds the database. It also requires `--yes`, honors the existing
+dev-checkout-to-production guard, and requires the `sqlite3` command-line tool.
+There is deliberately no `--force` race bypass for the non-re-derivable stats
+database.
+
+The repair sequence is fail-safe:
+
+1. Create a crash-recoverable repair marker that blocks new cctally stats
+   opens, then refuse unless all earlier main/WAL/SHM handles are closed.
+2. Prove the database is malformed, acquire SQLite's writer lock, and preserve
+   exact `stats.db`, `stats.db-wal`, and `stats.db-shm` bytes under a
+   timestamped `stats.db.bak-corrupt-malformed-*` family before replacing
+   anything.
+3. Checkpoint all committed WAL frames into the old main file, acquire one
+   write exclusion that remains held through recovery and replacement, and
+   recover a private same-filesystem main-file copy.
+4. Restore SQLite's WAL-aware effective `PRAGMA user_version`, run full
+   `PRAGMA integrity_check`, and verify `weekly_usage_snapshots` remains
+   readable and row-count equal. If the
+   source count cannot be read, refuse the automated swap rather than claim
+   preservation without proof. Report other table-count losses or unreadable
+   source tables explicitly.
+5. Atomically replace the live main file while the continuous writer guard is
+   still held, then close the old handle and remove only the now-empty stale
+   WAL/SHM sidecars. The recovered file is mode `0600`.
+
+A failure before replacement leaves the live logical contents in place (a WAL
+checkpoint may have changed their physical representation) and keeps the exact
+pre-checkpoint corrupt family for manual analysis. Replacement failure leaves
+the coherent old main file and empty sidecars in place. A healthy database is
+refused before a backup or replacement is created. `cache.db` is fully
+re-derivable and is not a repair target; use `cctally cache-sync --rebuild`
+instead.
+
+### Exit codes
+
+`0` repaired (or stats.db absent); `2` missing `--yes`, healthy-database
+refusal, or dev-to-production guard refusal; `3` database still active,
+`sqlite3` unavailable, recovery/import failure, or verification failure.
+
+## `cctally db backup --db {cache,stats} [--output <path>]`
+
+Creates a consistent, standalone SQLite backup. Without `--output`, the
+destination is a timestamped sibling (`stats.db.bak-*` or `cache.db.bak-*`). An
+existing destination is never overwritten.
+
+This command uses SQLite's online backup API. It captures committed WAL content
+into one verified database file while normal readers and writers may continue;
+the result needs no `-wal` or `-shm` sidecar. This is the supported backup path.
+
+**Never `cp`, restore, move, or replace a live `stats.db` or its sidecars while
+cctally is running.** Copying `stats.db` plus whatever `-wal`/`-shm` files happen
+to exist is not an atomic SQLite snapshot and can create the corruption this
+command is designed to prevent. Stop cctally before restoring a backup.
+
+### Exit codes
+
+`0` verified backup created (or source absent); `2` destination exists or its
+parent is absent; `3` SQLite backup/integrity or filesystem failure. If stats.db
+is already malformed, the error points to `cctally db repair --db stats --yes`.
+
 ## `cctally db checkpoint [--db {cache,stats}] [--json]`
 
 Fast, non-destructive WAL drain (issue #297). Runs a single `PRAGMA
@@ -225,8 +296,7 @@ operation is already running, or free disk is below the required margin.
 - **No `down()`.** This framework does not support rollback / down
   migrations. Per-migration transactional safety inside `BEGIN`/`COMMIT`
   handles partial-failure rollback; full reversibility is not a goal.
-- **Banner suppression.** `db status` / `db skip` / `db unskip` /
-  `db recover` / `db checkpoint` self-suppress the migration-error banner
+- **Banner suppression.** All `db` actions self-suppress the migration-error banner
   (the whole `db` namespace shows failure state in its own output or is
   mid-fix). Other interactive commands continue to render the banner when
   failures are pending.

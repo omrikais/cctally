@@ -5,6 +5,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.75.0] - 2026-07-20
+
+### Added
+- Add `cctally codex percent-breakdown`, a cached native seven-day Codex milestone command with the same terminal design as `cctally percent-breakdown`, exact root/limit selection, current or retained cycle selection, query-time pricing, and matching five-hour context. The materialized dashboard projection is read by default; `--sync` explicitly refreshes it.
+- Add guided `stats.db` corruption repair and SQLite-native online backups, with verified recovery, preserved usage history/schema version, safe original-file retention, active-writer and production guards, and actionable malformed-database errors. (#314)
+
+### Fixed
+- Dashboard Codex hero now uses the exact Claude hero composition and metric order. Its native seven-day cycle supplies Week Usage, optional 5-hour usage, reset countdown, cycle spend, `$ / 1%`, forecast-at-reset, prior-cycle `$ / 1%` delta, and snapshot age; unavailable cycle accounting stays explicit instead of falling back to token or budget tiles.
+- Force-refresh and automatic OAuth refresh now serialize their complete 429 backoff transitions under the same selected-state lock. Concurrent rate limits preserve both the consecutive-429 count and furthest deadline, while a completed force-refresh can no longer erase a newer automatic-refresh cooldown. (#309)
+- Dashboard Codex modals now populate the canonical Claude-shaped current-cycle, session, period, project, cache, forecast, alert, and **$/1% Trend** views from native session metadata, quota observations, token accounting, and computed cache/model breakdowns instead of sparse placeholders or renamed semantics. The current-cycle modal reuses the complete durable quota breakdown, preserving every 1% crossing even when the dashboard's bounded observation tail begins later. (#319)
+- The current 5-hour block no longer lingers as an approximate (`~`) window in `cctally blocks` and the dashboard Blocks panel while the statusline already shows the correct 5-hour data. When a new 5-hour window opened while your usage percentage was flat, `record-usage` deduped the unchanged tick and never wrote the new window's canonical anchor, so the active block fell back to its heuristic start until the percentage next moved (a lag of up to several minutes at window start). The dedup self-heal now also materializes the rolled-over window's anchor, so the active block reads as API-anchored right away; the statusline was always correct because it renders the live rate limits rather than the stored snapshot.
+- Conversation-transcript retention now reclaims disk automatically and defaults to a tighter window, so `cache.db` no longer grows to multiple gigabytes of transcript text and search index that slow every dashboard sync tick — which, under multi-process contention (a second dashboard plus status-line hooks), could wedge the sync into a "sync paused" state and leave Codex quota/weekly panels blank. A freshly-created `cache.db` now uses SQLite `INCREMENTAL` auto-vacuum, and the once-a-day retention prune returns the freed pages to the OS (physically reclaimed on the next end-of-sync checkpoint) instead of requiring a manual `cctally db vacuum`; a `cache.db` created by an older version keeps the legacy behavior until a one-time `cctally db vacuum` or `cctally cache-sync --rebuild`, after which it too reclaims automatically. The default `conversation.retention_days` is now 90 (was 180) — set your own window or `off` with `cctally config set conversation.retention_days`.
+
 ## [1.74.0] - 2026-07-19
 
 ### Fixed

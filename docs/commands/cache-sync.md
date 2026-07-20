@@ -31,7 +31,7 @@ run. Use `cache-sync` when you want to:
 | --- | --- |
 | `--rebuild` | Drop all cached entries and re-ingest from scratch. Waits up to 30s for the cache lock and exits non-zero if it can't acquire it (see Notes). |
 | `--prune-orphans` | Remove cache rows for source files no longer on disk, without a full rebuild (Claude cache only). |
-| `--prune-conversations` | Prune conversation transcripts older than `conversation.retention_days` (default 180) right now, without a full rebuild. Reports the rows removed per provider. See `--prune-conversations` below. |
+| `--prune-conversations` | Prune conversation transcripts older than `conversation.retention_days` (default 90) right now, without a full rebuild. Reports the rows removed per provider. See `--prune-conversations` below. |
 | `--source {claude,codex,all}` | Which ingest half to sync/rebuild. Default `all`. |
 
 ## `--prune-orphans`
@@ -42,7 +42,7 @@ The prune is deliberately conservative. It removes an orphaned file's rows only 
 
 ## `--prune-conversations`
 
-Conversation transcripts (`cache.db`'s `conversation_messages` and Codex `codex_conversation_events`, plus the FTS search index over them) grow without bound — a normal sync only ever adds. `--prune-conversations` removes transcripts older than `conversation.retention_days` (default 180; set `cctally config set conversation.retention_days off` to disable, or a positive integer to change the window) right now, so you don't have to wait for the dashboard's automatic once-a-day pass.
+Conversation transcripts (`cache.db`'s `conversation_messages` and Codex `codex_conversation_events`, plus the FTS search index over them) grow without bound — a normal sync only ever adds. `--prune-conversations` removes transcripts older than `conversation.retention_days` (default 90; set `cctally config set conversation.retention_days off` to disable, or a positive integer to change the window) right now, so you don't have to wait for the dashboard's automatic once-a-day pass.
 
 Eligibility is decided per conversation from the authoritative message rows, never a rollup: a session (Claude) or conversation (Codex) is pruned only when **every** one of its messages is older than the cutoff — a conversation with any recent activity is kept whole. Only the transcript rows are removed; the cost/usage history (`daily`/`weekly`/`report`/…) and the Codex analytics metadata are untouched, and everything pruned is re-derivable from the underlying JSONL. Deleting the rows frees pages inside `cache.db` but does not shrink the file on disk — run [`cctally db vacuum`](db.md#db-vacuum) to reclaim that space.
 

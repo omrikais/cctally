@@ -1,5 +1,6 @@
 """Unit tests for cmd_refresh_usage orchestration + exit-code mapping."""
 import argparse
+import contextlib
 import json as _json
 import pathlib
 import subprocess
@@ -38,7 +39,8 @@ def _stub_fetch_raises(monkeypatch, ns, exc):
 
 
 def _stub_record_ok(monkeypatch, ns, capture=None):
-    def fake(record_args, observed_axes):
+    def fake(record_args, observed_axes, *, lock_held=False):
+        assert lock_held is True
         if capture is not None:
             capture["args"] = record_args
             capture["axes"] = observed_axes
@@ -47,7 +49,8 @@ def _stub_record_ok(monkeypatch, ns, capture=None):
 
 
 def _stub_record_raises(monkeypatch, ns, exc):
-    def boom(record_args, observed_axes):
+    def boom(record_args, observed_axes, *, lock_held=False):
+        assert lock_held is True
         return types.SimpleNamespace(status="record_failed", reason=str(exc))
     monkeypatch.setitem(ns, "_authoritative_record_usage", boom)
 
@@ -66,6 +69,7 @@ def _no_real_nudge(ns, monkeypatch):
     :8789) and never overwrites urlopen-capturing state. Nudge-specific
     tests below override this with their own spy."""
     monkeypatch.setitem(ns, "_nudge_dashboard_repaint", lambda *a, **k: None)
+    monkeypatch.setitem(ns, "_selected_state_lock", contextlib.nullcontext)
 
 
 def test_cmd_refresh_usage_success_writes_one_liner(ns, monkeypatch, capsys):
@@ -129,6 +133,32 @@ def test_cmd_refresh_usage_record_failure_returns_5(ns, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert rc == 5
     assert "db locked" in err
+
+
+def test_cmd_refresh_usage_corrupt_stats_is_actionable_staged_error(
+    ns, monkeypatch, capsys
+):
+    api_response = {
+        "seven_day": {
+            "utilization": 13.0,
+            "resets_at": "2026-05-02T12:00:00Z",
+        }
+    }
+    _stub_token(monkeypatch, ns)
+    _stub_fetch_ok(monkeypatch, ns, api_response)
+    _stub_record_raises(
+        monkeypatch,
+        ns,
+        RuntimeError("database disk image is malformed"),
+    )
+
+    rc = ns["cmd_refresh_usage"](_args())
+
+    err = capsys.readouterr().err
+    assert rc == 3
+    assert "stats.db is corrupt" in err
+    assert "cctally db repair --db stats --yes" in err
+    assert "failed to record usage: database disk image is malformed" not in err
 
 
 def test_cmd_refresh_usage_quiet_suppresses_stdout(ns, monkeypatch, capsys):

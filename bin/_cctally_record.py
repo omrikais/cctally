@@ -3593,6 +3593,7 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                 # ``_resolve_active_five_hour_reset_event_id`` to find
                 # the active segment for the latest snapshot's window.
                 need_5h_heal = False
+                incoming_block_saved: dict[str, Any] | None = None
                 window_key = latest_row["five_hour_window_key"]
                 if window_key is not None:
                     block_row = heal_conn.execute(
@@ -3647,10 +3648,55 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                                     existing_5h_m, latest_5h_floor
                                 ):
                                     need_5h_heal = True
+                # Window-rollover heal: this dedup tick observed a NEW 5h
+                # window (its canonical ``five_hour_window_key`` differs
+                # from the latest STORED snapshot's) whose
+                # ``five_hour_blocks`` anchor does not exist yet. The dedup
+                # above swallowed the snapshot insert because the weekly/5h
+                # percents were flat, so ``latest_row`` still points at the
+                # PREVIOUS window and the ``need_5h_heal`` probe only ever
+                # checked that old (still-fresh) window — leaving the
+                # current window unanchored. Materialize the missing block
+                # now so ``blocks`` and the dashboard anchor the ACTIVE
+                # block to its API-derived window instead of falling back to
+                # the heuristic "~" until the percent next moves (the
+                # statusline is unaffected — it renders the live
+                # rate_limits, not the DB). Block-only: NO snapshot is
+                # inserted (the tick stays deduped); the "latest snapshot"
+                # weekly/5h surfaces and monotonicity clamps are untouched.
+                # ``maybe_update_five_hour_block`` is an upsert keyed on
+                # ``five_hour_window_key``, so later flat ticks in the same
+                # window re-run it as an idempotent no-op.
+                if (
+                    five_hour_window_key is not None
+                    and five_hour_percent is not None
+                    and five_hour_resets_at_str is not None
+                    and (
+                        window_key is None
+                        or int(window_key) != int(five_hour_window_key)
+                    )
+                ):
+                    incoming_block_row = heal_conn.execute(
+                        "SELECT 1 FROM five_hour_blocks "
+                        "WHERE five_hour_window_key = ? LIMIT 1",
+                        (int(five_hour_window_key),),
+                    ).fetchone()
+                    if incoming_block_row is None:
+                        incoming_block_saved = {
+                            # ``id`` is extracted-but-unused by
+                            # maybe_update_five_hour_block; reuse latest_row's
+                            # for output-dict shape parity with a real insert.
+                            "id": int(latest_row["id"]),
+                            "capturedAt": now_utc_iso(),
+                            "weeklyPercent": weekly_percent,
+                            "fiveHourPercent": five_hour_percent,
+                            "fiveHourResetsAt": five_hour_resets_at_str,
+                            "fiveHourWindowKey": int(five_hour_window_key),
+                        }
             finally:
                 heal_conn.close()
 
-            if need_milestone_heal or need_5h_heal:
+            if need_milestone_heal or need_5h_heal or incoming_block_saved:
                 if need_milestone_heal:
                     try:
                         maybe_record_milestone(latest_saved)
@@ -3661,6 +3707,11 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
                         maybe_update_five_hour_block(latest_saved)
                     except Exception as exc:
                         eprint(f"[5h-block] self-heal error: {exc}")
+                if incoming_block_saved is not None:
+                    try:
+                        maybe_update_five_hour_block(incoming_block_saved)
+                    except Exception as exc:
+                        eprint(f"[5h-block] window-rollover heal error: {exc}")
 
             # Dollar-decoupled axes (budget / project-budget / projected) heal on
             # EVERY dedup tick — USD spend can cross a $ threshold while the

@@ -6,7 +6,7 @@ import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { presentationForecast } from '../lib/dashboardPresentation';
+import { presentationForecast, presentationPeriodRows } from '../lib/dashboardPresentation';
 import type { DashboardSelection, ForecastEnvelope } from '../types/envelope';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
@@ -360,20 +360,29 @@ function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
   const nativeElapsedHours = nativeHistory?.window_minutes == null || nativeRemainingHours == null
     ? null
     : Math.max(0, nativeHistory.window_minutes / 60 - nativeRemainingHours);
-  const nativeBudgetPace = env?.sources?.codex?.data?.budget.status?.pace.daily_usd ?? null;
+  const nativeWeek = presentationPeriodRows(env, 'codex', 'weekly')[0];
+  const nativeDollarsPerPercent = nativeWeek?.dollar_per_pct ?? null;
+  const nativeCurrentPercent = nativeHistory?.current_percent ?? null;
+  const nativeRemainingDays = nativeRemainingHours == null ? null : nativeRemainingHours / 24;
+  const nativeBudget100 = nativeDollarsPerPercent == null || nativeCurrentPercent == null || !nativeRemainingDays
+    ? null
+    : Math.max(0, 100 - nativeCurrentPercent) * nativeDollarsPerPercent / nativeRemainingDays;
+  const nativeBudget90 = nativeDollarsPerPercent == null || nativeCurrentPercent == null || !nativeRemainingDays
+    ? null
+    : Math.max(0, 90 - nativeCurrentPercent) * nativeDollarsPerPercent / nativeRemainingDays;
   const fc: ForecastEnvelope | null = isClaude
     ? env?.forecast ?? null
     : {
         verdict: presented.verdict ?? 'ok',
         week_avg_projection_pct: presented.projected,
         recent_24h_projection_pct: presented.recent,
-        budget_100_per_day_usd: null,
-        budget_90_per_day_usd: null,
+        budget_100_per_day_usd: nativeBudget100,
+        budget_90_per_day_usd: nativeBudget90,
         confidence: nativeForecast?.confidence === 'high' ? 'high' : 'unknown',
         confidence_score: 0,
         explain: {
           rates: {
-            dollars_per_percent: null,
+            dollars_per_percent: nativeDollarsPerPercent,
             week_average_pct_per_hour: nativeForecast?.rate_percent_per_hour ?? null,
             recent_24h_pct_per_hour: null,
           },
@@ -437,7 +446,7 @@ function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
           </span>
           {!isClaude && (
             <span className="m-pill accent-blue">
-              {source === 'all' ? 'Codex quota · combined spend' : 'Codex native quota'}
+              {source === 'all' ? 'Codex quota + spend' : 'Codex native quota'}
             </span>
           )}
           {((isClaude && !fc) || (!isClaude && nativeForecast == null)) && (
@@ -532,8 +541,8 @@ function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
         <div className="mfc-kvgrid">
           <div className="mfc-krow">
             <span className="l">$ / 1%</span>
-            <span className={`v v-cyan${!isClaude ? ' m-unavailable' : ''}`} id="mfc-dpp">
-              {isClaude ? fmt.usd3(rates?.dollars_per_percent) : 'Unavailable'}
+            <span className={`v v-cyan${rates?.dollars_per_percent == null ? ' m-unavailable' : ''}`} id="mfc-dpp">
+              {fmt.usd3(rates?.dollars_per_percent)}
             </span>
           </div>
           {!isClaude && <div className="mfc-krow">
@@ -560,19 +569,19 @@ function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#dollar" />
           </svg>
-          {isClaude ? 'Daily budgets to stay under' : 'Provider budget context'}
+          Daily budgets to stay under
         </h3>
         <div className="mfc-kvgrid mfc-kvgrid-single">
           <div className="mfc-krow">
-            <span className="l">{isClaude ? '@ 100% cap' : 'Budget pace'}</span>
-            <span className={`v v-magenta${!isClaude && nativeBudgetPace == null ? ' m-unavailable' : ''}`} id="mfc-bud100">
-              {isClaude ? fmt.usd2PerDay(fc?.budget_100_per_day_usd) : fmt.usd2PerDay(nativeBudgetPace)}
+            <span className="l">@ 100% cap</span>
+            <span className={`v v-magenta${fc?.budget_100_per_day_usd == null ? ' m-unavailable' : ''}`} id="mfc-bud100">
+              {fmt.usd2PerDay(fc?.budget_100_per_day_usd)}
             </span>
           </div>
           <div className="mfc-krow">
-            <span className="l">{isClaude ? '@ 90% cap' : 'Confidence'}</span>
-            <span className={`v v-amber${!isClaude && nativeForecast?.confidence == null ? ' m-unavailable' : ''}`} id="mfc-bud90">
-              {isClaude ? fmt.usd2PerDay(fc?.budget_90_per_day_usd) : nativeForecast?.confidence ?? 'Unavailable'}
+            <span className="l">@ 90% cap</span>
+            <span className={`v v-amber${fc?.budget_90_per_day_usd == null ? ' m-unavailable' : ''}`} id="mfc-bud90">
+              {fmt.usd2PerDay(fc?.budget_90_per_day_usd)}
             </span>
           </div>
         </div>

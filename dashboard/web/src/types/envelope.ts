@@ -844,8 +844,19 @@ export interface CodexQuotaMilestoneRow {
   key: string;
   source: 'codex';
   block_key: string;
+  quota_key?: string;
+  window_minutes?: number;
+  resets_at?: string;
   percent: number;
   captured_at: string;
+  cumulative_usd?: number;
+  marginal_usd?: number;
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  output_tokens?: number;
+  reasoning_output_tokens?: number;
+  total_tokens?: number;
+  five_hour_percent?: number | null;
 }
 
 // A durable quota-window block (`data.quota.blocks`, from _quota_wire). Distinct
@@ -957,6 +968,10 @@ export interface CodexPeriodBucket {
   total_tokens: number;
   models: string[];
   model_breakdowns?: CodexModelBreakdown[];
+  start_at?: string;
+  end_at?: string;
+  used_pct?: number | null;
+  dollar_per_pct?: number | null;
 }
 
 export interface CodexPeriodView {
@@ -1059,7 +1074,12 @@ export interface CodexSourceData {
   quota: CodexQuotaDomain;
   budget: CodexBudgetDomain;
   projects: CodexProjectsDomain;
-  alerts: { rows: CodexAlertRow[] };
+  alerts: {
+    rows: CodexAlertRow[];
+    actual_thresholds?: number[];
+    projected_thresholds?: number[];
+  };
+  cache_report?: CacheReportEnvelope | null;
 }
 
 // ---- Claude provider projection (_tui_project_claude_source_data) -----
@@ -1311,6 +1331,10 @@ export interface CodexTokenTotals {
 export interface CodexSessionDetailBody extends CodexTokenTotals {
   detail_kind: 'codex_session';
   key: string;
+  label?: string | null;
+  project?: string | null;
+  started_at?: string | null;
+  duration_min?: number | null;
   last_activity: string;
   models: string[];
   model_breakdowns: CodexModelBreakdown[];
@@ -1320,6 +1344,7 @@ export interface CodexSessionDetailBody extends CodexTokenTotals {
 export interface CodexProjectDetailBody extends CodexTokenTotals {
   detail_kind: 'codex_project';
   key: string;
+  label?: string | null;
   range_start: string;
   range_end: string;
   first_seen: string;
@@ -1334,6 +1359,11 @@ export interface CodexBlockDetailBody {
   detail_kind: 'codex_block';
   key: string;
   label: string;
+  start_at?: string;
+  end_at?: string;
+  is_active?: boolean;
+  cost_usd?: number;
+  model_breakdowns?: CodexModelBreakdown[];
   observed_slot: number;
   window_minutes: number | null;
   resets_at: string;

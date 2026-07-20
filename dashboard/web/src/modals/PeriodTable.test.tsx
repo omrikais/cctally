@@ -74,6 +74,23 @@ describe('PeriodTable header (WM-1)', () => {
   });
 });
 
+describe('PeriodTable provider model labels', () => {
+  it('keeps distinct Codex model identities instead of collapsing them to other', () => {
+    const codexRows = [periodRow({
+      models: [
+        { model: 'gpt-5.6-sol', display: '5.6-sol', chip: 'other', cost_usd: 7, cost_pct: 70 },
+        { model: 'gpt-5.6-terra', display: '5.6-terra', chip: 'other', cost_usd: 3, cost_pct: 30 },
+      ],
+    })];
+    render(
+      <PeriodTable rows={codexRows} variant="weekly" accentClass="accent-cyan" selectedKey={null} onSelect={vi.fn()} />,
+    );
+    expect(screen.getByText('5.6-sol')).toBeInTheDocument();
+    expect(screen.getByText('5.6-terra')).toBeInTheDocument();
+    expect(screen.queryByText('other')).toBeNull();
+  });
+});
+
 describe('PeriodTable sortable headers', () => {
   const firstRowLabel = (container: HTMLElement) =>
     container.querySelector('tbody tr td')?.textContent ?? '';

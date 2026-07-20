@@ -22,6 +22,7 @@
 import { useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
 import { useSnapshot } from '../hooks/useSnapshot';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { CacheReportSpotlight } from './CacheReportSpotlight';
 import { CacheSparkline } from './CacheSparkline';
@@ -69,7 +70,9 @@ function median(values: number[]): number | null {
 
 function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
   const env = useSnapshot();
+  const display = useDisplayTz();
   const isClaude = source === 'claude';
+  const nativeReport = env?.sources?.codex?.data?.cache_report ?? null;
   const sourceRows = isClaude
     ? null
     : (presentationCacheDays(env, source) ?? [])
@@ -77,12 +80,15 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
         .slice(0, 14);
   const baseline = sourceRows == null ? null : median(sourceRows.slice(1).map((row) => row.cache_hit_percent));
   const first = sourceRows?.[0];
-  const sourceCr: CacheReportEnvelope | null = sourceRows == null ? null : {
+  const sourceCr: CacheReportEnvelope | null = nativeReport ?? (sourceRows == null ? null : {
     window_days: 14,
     anomaly_threshold_pp: CACHE_REPORT_BAND_PP,
     anomaly_window_days: 14,
     today: {
-      date: first?.date ?? env?.generated_at?.slice(0, 10) ?? '1970-01-01',
+      date: first?.date ?? fmt.calendarDateKey(env?.generated_at, {
+        tz: display.resolvedTz,
+        offsetLabel: display.offsetLabel,
+      }) ?? '1970-01-01',
       cache_hit_percent: first?.cache_hit_percent ?? 0,
       baseline_median_percent: baseline,
       delta_pp: first == null || baseline == null ? null : first.cache_hit_percent - baseline,
@@ -101,7 +107,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
     fourteen_day_counterfactual_usd: 0,
     fourteen_day_efficiency_ratio: 0,
     is_empty: false,
-  };
+  });
   const cr = isClaude ? env?.cache_report : sourceCr;
   const [showSettings, setShowSettings] = useState(false);
   // CR-2/CR-3 — the 8-column daily table reflows into an unlabeled run-on on
@@ -123,11 +129,11 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
   // Empty state — no Claude activity in the window. The panel renders
   // its own short-circuit too; here we surface the same posture in
   // the modal body so the user understands the modal isn't broken.
-  if (cr.is_empty && isClaude) {
+  if (cr.is_empty) {
     return (
       <Modal title="Cache Report" accentClass="accent-teal">
         <div style={{ color: 'var(--text-dim)', padding: '20px 0' }}>
-          No Claude activity in the last {cr.window_days} days.
+          No {source === 'codex' ? 'Codex' : source === 'all' ? 'provider' : 'Claude'} activity in the last {cr.window_days} days.
         </div>
       </Modal>
     );
@@ -147,13 +153,11 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
         type="button"
         aria-label="Cache Report settings"
         data-cr-settings-toggle
-        disabled={!isClaude}
-        title={!isClaude ? 'Cache anomaly settings apply to Claude only' : undefined}
         onClick={(e) => {
           // stopPropagation so the surrounding modal's chrome (close,
           // backdrop) doesn't also process the click.
           e.stopPropagation();
-          if (isClaude) setShowSettings((v) => !v);
+          setShowSettings((v) => !v);
         }}
         style={{
           background: 'transparent',
@@ -184,7 +188,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
   // day and contradict the panel's "Building baseline" copy.
   const insufficient =
     cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
-  const chromeAmber = isClaude && cr.today.anomaly_triggered && !insufficient;
+  const chromeAmber = cr.today.anomaly_triggered && !insufficient;
 
   // Today's marker color for the timeline circle. Mirrors the panel's
   // todayMarker derivation so the modal and panel agree on the
@@ -212,7 +216,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       )}
 
       {/* 1. Spotlight */}
-      <CacheReportSpotlight cr={cr} nativeCacheOnly={!isClaude} />
+      <CacheReportSpotlight cr={cr} />
 
       {/* 2. Cache hit % timeline */}
       <div className="crm-section">
@@ -236,17 +240,14 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       <CacheNetBars
         days={cr.days}
         size="large"
-        unavailableReason={!isClaude ? 'Savings and waste attribution are unavailable for provider-native cache counters.' : undefined}
       />
 
       {/* 4. Counterfactual callout */}
-      <div className={`crm-counterfactual${!isClaude ? ' modal-cache-unavailable' : ''}`}>
-        {isClaude ? <>
+      <div className="crm-counterfactual">
           Without caching, you'd have paid{' '}
           <strong>+${cr.fourteen_day_counterfactual_usd.toFixed(2)} more</strong>{' '}
           over the last {cr.window_days} days · cache efficiency{' '}
           <span title={`saved / (saved + |wasted|) = ${efficiencyPct}%`}>{efficiencyPct}%</span>
-        </> : <span className="m-unavailable">Counterfactual savings are unavailable for provider-native cache counters.</span>}
       </div>
 
       {/* 5. Daily rows table */}
@@ -291,12 +292,12 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                 ],
                 [
                   'Net',
-                  <span className={!isClaude ? 'm-unavailable' : isNetNeg ? 'net-neg' : 'net-pos'}>
-                    {isClaude ? fmt.usdSigned(d.net_usd) : 'Unavailable'}
+                  <span className={isNetNeg ? 'net-neg' : 'net-pos'}>
+                    {fmt.usdSigned(d.net_usd)}
                   </span>,
                 ],
-                ['Saved', <span className={!isClaude ? 'm-unavailable' : undefined}>{isClaude ? fmt.usd2(d.saved_usd) : 'Unavailable'}</span>],
-                ['Wasted', <span className={!isClaude ? 'm-unavailable' : undefined}>{isClaude ? fmt.usd2(d.wasted_usd) : 'Unavailable'}</span>],
+                ['Saved', <span>{fmt.usd2(d.saved_usd)}</span>],
+                ['Wasted', <span>{fmt.usd2(d.wasted_usd)}</span>],
                 ['Tok In', <span>{fmt.compact(d.input_tokens, { upper: true })}</span>],
                 ['Tok Out', <span>{fmt.compact(d.output_tokens, { upper: true })}</span>],
               ];
@@ -310,9 +311,9 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                   <div className="crm-daily-card-head">
                     <span className="cd-date">{fmt.calDate(d.date)}</span>
                     <span
-                      className={'cd-flag ' + (!isClaude ? 'm-unavailable' : d.anomaly_triggered ? 'flag-warn' : 'flag-ok')}
+                      className={'cd-flag ' + (d.anomaly_triggered ? 'flag-warn' : 'flag-ok')}
                     >
-                      {isClaude ? d.anomaly_triggered ? '⚠' : '✓' : '—'}
+                      {d.anomaly_triggered ? '⚠' : '✓'}
                     </span>
                   </div>
                   <div className="crm-daily-card-grid">
@@ -365,17 +366,17 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                     </td>
                     <td className="num">{fmt.compact(d.input_tokens, { upper: true })}</td>
                     <td className="num">{fmt.compact(d.output_tokens, { upper: true })}</td>
-                    <td className={`num${!isClaude ? ' m-unavailable' : ''}`}>{isClaude ? fmt.usd2(d.saved_usd) : 'Unavailable'}</td>
-                    <td className={`num${!isClaude ? ' m-unavailable' : ''}`}>{isClaude ? fmt.usd2(d.wasted_usd) : 'Unavailable'}</td>
-                    <td className={`num ${!isClaude ? 'm-unavailable' : isNetNeg ? 'net-neg' : 'net-pos'}`}>
-                      {isClaude ? fmt.usdSigned(d.net_usd) : 'Unavailable'}
+                    <td className="num">{fmt.usd2(d.saved_usd)}</td>
+                    <td className="num">{fmt.usd2(d.wasted_usd)}</td>
+                    <td className={`num ${isNetNeg ? 'net-neg' : 'net-pos'}`}>
+                      {fmt.usdSigned(d.net_usd)}
                     </td>
                     <td
                       className={`num ${
-                        !isClaude ? 'm-unavailable' : d.anomaly_triggered ? 'flag-warn' : 'flag-ok'
+                        d.anomaly_triggered ? 'flag-warn' : 'flag-ok'
                       }`}
                     >
-                      {isClaude ? d.anomaly_triggered ? '⚠' : '✓' : '—'}
+                      {d.anomaly_triggered ? '⚠' : '✓'}
                     </td>
                   </tr>
                 );
@@ -388,8 +389,8 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       {/* 6. Breakdowns row */}
       <div className="crm-section">
         <div className="crm-breakdowns">
-          <CacheBreakdownCard kind="projects" rows={cr.by_project} unavailableReason={!isClaude ? 'Project cache attribution unavailable' : undefined} />
-          <CacheBreakdownCard kind="models" rows={cr.by_model} unavailableReason={!isClaude ? 'Model cache attribution unavailable' : undefined} />
+          <CacheBreakdownCard kind="projects" rows={cr.by_project} />
+          <CacheBreakdownCard kind="models" rows={cr.by_model} />
         </div>
       </div>
     </Modal>

@@ -4753,6 +4753,15 @@ def open_cache_db() -> sqlite3.Connection:
     except OSError as exc:
         eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
+    # #313 P3 reclaim: create a fresh cache.db in INCREMENTAL auto-vacuum mode so
+    # the transcript-retention prune can return freed pages to the OS via
+    # `PRAGMA incremental_vacuum` instead of only growing the freelist — the
+    # conversation-transcript store is what bloated cache.db to multiple GB and
+    # slowed every sync tick. This MUST run before the first page is written
+    # (before journal_mode=WAL / any CREATE TABLE) to take effect; it is a
+    # harmless no-op on an already-created DB, which keeps its existing mode
+    # until a full VACUUM (`cctally db vacuum`) or a `cache-sync --rebuild`.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.execute("PRAGMA journal_mode=WAL")
     # #297: 15 s (was 5 s) lets a writer wait out a slow-but-normal sync (>5 s)
     # instead of instantly erroring with "database is locked". Covers plain

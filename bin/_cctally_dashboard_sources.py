@@ -9,12 +9,14 @@ import sqlite3
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from _cctally_core import get_week_start_name
 from _cctally_quota import (
+    codex_five_hour_percent_at_crossing,
+    codex_quota_breakdown,
     codex_physical_mutation_seq,
     load_codex_quota_observations,
     load_codex_quota_projection_certificate,
@@ -88,6 +90,7 @@ class CodexCycleBoundary:
     resets_at: dt.datetime
     # Root provenance is server-only accounting input, never public wire data.
     source_root_keys: tuple[str, ...]
+    used_percent: float | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,7 @@ class CodexWeeklyPeriod:
     start_at: dt.datetime
     end_at: dt.datetime
     source_root_keys: tuple[str, ...]
+    used_percent: float | None = None
 
 
 def _resolve_codex_weekly_cycle(
@@ -104,7 +108,7 @@ def _resolve_codex_weekly_cycle(
     now_utc: dt.datetime,
 ) -> CodexCycleBoundary:
     """Select exactly one active account-level 10,080-minute native cycle."""
-    boundaries: dict[tuple[int, dt.datetime], set[str]] = {}
+    boundaries: dict[tuple[int, dt.datetime], dict[str, object]] = {}
     stale_weekly_evidence = False
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
@@ -116,17 +120,23 @@ def _resolve_codex_weekly_cycle(
             stale_weekly_evidence = True
             continue
         boundary = (history.identity.window_minutes, baseline.resets_at)
-        boundaries.setdefault(boundary, set()).add(history.identity.source_root_key)
+        item = boundaries.setdefault(boundary, {"roots": set(), "used": []})
+        item["roots"].add(history.identity.source_root_key)
+        if baseline.used_percent is not None:
+            item["used"].append(float(baseline.used_percent))
     if len(boundaries) != 1:
         if not boundaries:
             raise CodexCycleUnavailable("stale" if stale_weekly_evidence else "missing")
         raise CodexCycleUnavailable("conflicting")
-    (window_minutes, resets_at), root_keys = next(iter(boundaries.items()))
+    (window_minutes, resets_at), boundary_data = next(iter(boundaries.items()))
+    root_keys = boundary_data["roots"]
+    used_values = boundary_data["used"]
     return CodexCycleBoundary(
         window_minutes=window_minutes,
         start_at=resets_at - dt.timedelta(minutes=window_minutes),
         resets_at=resets_at,
         source_root_keys=tuple(sorted(root_keys)),
+        used_percent=max(used_values) if used_values else None,
     )
 
 
@@ -151,7 +161,7 @@ def _codex_weekly_periods(
     placeholders = ",".join("?" for _ in roots)
     try:
         rows = stats_conn.execute(
-            "SELECT source_root_key, resets_at_utc, nominal_start_at_utc "
+            "SELECT source_root_key, resets_at_utc, nominal_start_at_utc, current_percent "
             "FROM quota_window_blocks "
             "WHERE source='codex' AND window_minutes=10080 "
             f"AND source_root_key IN ({placeholders}) AND orphaned_at IS NULL "
@@ -162,9 +172,9 @@ def _codex_weekly_periods(
     except sqlite3.Error:
         rows = ()
 
-    raw_boundaries: list[tuple[dt.datetime, dt.datetime, set[str]]] = []
+    raw_boundaries: list[tuple[dt.datetime, dt.datetime, set[str], list[float]]] = []
 
-    for root_key, resets_at_raw, start_at_raw in rows:
+    for root_key, resets_at_raw, start_at_raw, current_percent in rows:
         try:
             start_at = dt.datetime.fromisoformat(str(start_at_raw).replace("Z", "+00:00"))
             resets_at = dt.datetime.fromisoformat(str(resets_at_raw).replace("Z", "+00:00"))
@@ -176,17 +186,21 @@ def _codex_weekly_periods(
         resets_at = resets_at.astimezone(UTC)
         if resets_at <= start_at:
             continue
-        raw_boundaries.append((start_at, resets_at, {str(root_key)}))
+        used_values = []
+        if isinstance(current_percent, (int, float)) and not isinstance(current_percent, bool):
+            used_values.append(float(current_percent))
+        raw_boundaries.append((start_at, resets_at, {str(root_key)}, used_values))
 
     if active_cycle is not None:
         raw_boundaries.append((
             active_cycle.start_at.astimezone(UTC),
             active_cycle.resets_at.astimezone(UTC),
             set(active_cycle.source_root_keys),
+            [active_cycle.used_percent] if active_cycle.used_percent is not None else [],
         ))
 
-    ordered: list[tuple[dt.datetime, dt.datetime, set[str]]] = []
-    for start_at, resets_at, period_roots in sorted(
+    ordered: list[tuple[dt.datetime, dt.datetime, set[str], list[float]]] = []
+    for start_at, resets_at, period_roots, used_values in sorted(
         raw_boundaries, key=lambda item: (item[0], item[1]),
     ):
         if (
@@ -194,13 +208,16 @@ def _codex_weekly_periods(
             and (start_at - ordered[-1][0]).total_seconds()
             < _FIVE_HOUR_JITTER_FLOOR_SECONDS
         ):
-            first_start, latest_reset, existing_roots = ordered[-1]
+            first_start, latest_reset, existing_roots, existing_used = ordered[-1]
             existing_roots.update(period_roots)
-            ordered[-1] = (first_start, max(latest_reset, resets_at), existing_roots)
+            existing_used.extend(used_values)
+            ordered[-1] = (
+                first_start, max(latest_reset, resets_at), existing_roots, existing_used,
+            )
         else:
-            ordered.append((start_at, resets_at, set(period_roots)))
+            ordered.append((start_at, resets_at, set(period_roots), list(used_values)))
     periods: list[CodexWeeklyPeriod] = []
-    for index, (start_at, resets_at, period_roots) in enumerate(ordered):
+    for index, (start_at, resets_at, period_roots, used_values) in enumerate(ordered):
         next_start = ordered[index + 1][0] if index + 1 < len(ordered) else None
         end_at = min(resets_at, next_start) if next_start is not None else resets_at
         if end_at <= start_at:
@@ -209,6 +226,7 @@ def _codex_weekly_periods(
             start_at=start_at,
             end_at=end_at,
             source_root_keys=tuple(sorted(period_roots)),
+            used_percent=max(used_values) if used_values else None,
         ))
     return tuple(periods)
 
@@ -245,6 +263,9 @@ class DashboardSourceSemantics:
     week_start_idx: int
     speed: str
     codex_budget: Mapping[str, object] | None
+    codex_quota_actual_thresholds: tuple[int, ...]
+    codex_quota_projected_thresholds: tuple[int, ...]
+    cache_report_anomaly_threshold_pp: int
     claude_identity: str
     codex_identity: str
 
@@ -267,6 +288,17 @@ def resolve_dashboard_source_semantics(
     week_start_idx = c.WEEKDAY_MAP[week_start_name]
     speed = c._resolve_codex_speed("auto")
     budget_config = c._get_budget_config(raw_config)
+    quota_alerts = c._get_quota_alerts_config(raw_config)
+    raw_cache_report = raw_config.get("cache_report")
+    raw_cache_threshold = (
+        raw_cache_report.get("anomaly_threshold_pp", 15)
+        if isinstance(raw_cache_report, Mapping) else 15
+    )
+    cache_threshold = (
+        int(raw_cache_threshold)
+        if isinstance(raw_cache_threshold, int) and not isinstance(raw_cache_threshold, bool)
+        and 1 <= raw_cache_threshold <= 100 else 15
+    )
     raw_codex_budget = budget_config.get("codex")
     codex_budget = (
         MappingProxyType(dict(raw_codex_budget))
@@ -290,6 +322,8 @@ def resolve_dashboard_source_semantics(
     }
     codex_identity_payload = {
         "codex_budget": dict(codex_budget) if codex_budget is not None else None,
+        "codex_quota_alerts": quota_alerts,
+        "cache_report_anomaly_threshold_pp": cache_threshold,
         "display_tz_name": display_tz_name,
         "speed": speed,
         "week_start_name": week_start_name,
@@ -306,6 +340,9 @@ def resolve_dashboard_source_semantics(
         week_start_idx=week_start_idx,
         speed=speed,
         codex_budget=codex_budget,
+        codex_quota_actual_thresholds=tuple(quota_alerts["actual_thresholds"]),
+        codex_quota_projected_thresholds=tuple(quota_alerts["projected_thresholds"]),
+        cache_report_anomaly_threshold_pp=cache_threshold,
         claude_identity=claude_identity,
         codex_identity=codex_identity,
     )
@@ -324,6 +361,9 @@ class DashboardReadContext:
     week_start_name: str = "monday"
     speed: str = "standard"
     codex_budget: Mapping[str, object] | None = None
+    codex_quota_actual_thresholds: tuple[int, ...] = ()
+    codex_quota_projected_thresholds: tuple[int, ...] = ()
+    cache_report_anomaly_threshold_pp: int = 15
 
     def __post_init__(self) -> None:
         for name in ("range_start", "now_utc"):
@@ -453,7 +493,7 @@ def _codex_budget_cost_events(
 
 
 def _bucket_wire(bucket: Any) -> dict[str, object]:
-    return {
+    result = {
         "label": bucket.bucket,
         "cost_usd": bucket.cost_usd,
         "input_tokens": bucket.input_tokens,
@@ -464,6 +504,15 @@ def _bucket_wire(bucket: Any) -> dict[str, object]:
         "models": tuple(bucket.models),
         "model_breakdowns": tuple(dict(row) for row in bucket.model_breakdowns),
     }
+    for name in ("period_start_at", "period_end_at"):
+        value = getattr(bucket, name, None)
+        if isinstance(value, dt.datetime):
+            result[name.replace("period_", "")] = value.astimezone(UTC).isoformat()
+    for name in ("used_pct", "dollar_per_pct"):
+        value = getattr(bucket, name, None)
+        if value is not None:
+            result[name] = value
+    return result
 
 
 def _period_wire(view: Any) -> dict[str, object]:
@@ -472,6 +521,188 @@ def _period_wire(view: Any) -> dict[str, object]:
         "total_cost_usd": view.total_cost_usd,
         "total_tokens": view.total_tokens,
         "display_tz": view.display_tz_label,
+    }
+
+
+def _codex_cache_report_wire(
+    entries: Iterable[object],
+    *,
+    metadata: Mapping[tuple[str, str], Mapping[str, object]],
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    speed: str,
+    anomaly_threshold_pp: int = 15,
+    window_days: int = 14,
+) -> dict[str, object]:
+    """Compute the canonical cache report from Codex's inclusive counters.
+
+    Codex input is cache-inclusive, so the shared cache-report kernel receives
+    uncached input plus cached input as two disjoint counters. OpenAI does not
+    charge a cache-write premium; the counterfactual is therefore the exact
+    uncached-vs-cached input price difference for each token-count event.
+    """
+    c = sys.modules["cctally"]
+    crk = c._load_sibling("_lib_cache_report")
+    display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+    cutoff = now_utc - dt.timedelta(days=window_days)
+
+    def _tiered_cost(tokens: int, pricing: Mapping[str, object], base: str, above: str) -> float:
+        if tokens <= 0:
+            return 0.0
+        base_rate = float(pricing.get(base, 0.0) or 0.0)
+        above_rate = pricing.get(above)
+        threshold = int(c.CODEX_TIERED_THRESHOLD)
+        if tokens > threshold and above_rate is not None:
+            return threshold * base_rate + (tokens - threshold) * float(above_rate)
+        return tokens * base_rate
+
+    wrapped = []
+    for entry in entries:
+        timestamp = getattr(entry, "timestamp", None)
+        if not isinstance(timestamp, dt.datetime) or timestamp < cutoff:
+            continue
+        model = str(getattr(entry, "model", "") or "unknown")
+        input_tokens = int(getattr(entry, "input_tokens", 0))
+        cached_tokens = min(input_tokens, int(getattr(entry, "cached_input_tokens", 0)))
+        uncached_tokens = max(0, input_tokens - cached_tokens)
+        pricing, _is_fallback = c._resolve_codex_pricing(model)
+        pricing = pricing or {}
+        uncached_counterfactual = _tiered_cost(
+            cached_tokens, pricing,
+            "input_cost_per_token", "input_cost_per_token_above_272k_tokens",
+        )
+        cached_actual = _tiered_cost(
+            cached_tokens, pricing,
+            "cache_read_input_token_cost", "cache_read_input_token_cost_above_272k_tokens",
+        )
+        multiplier = c._codex_fast_multiplier(model) if speed == "fast" else 1.0
+        saved = max(0.0, uncached_counterfactual - cached_actual) * multiplier
+        identity = (
+            str(getattr(entry, "source_root_key", "") or ""),
+            str(getattr(entry, "source_path", "") or ""),
+        )
+        item_metadata = metadata.get(identity) or {}
+        project = (
+            str(getattr(entry, "project_label", "") or "").strip()
+            or str(item_metadata.get("project_label") or "").strip()
+            or "(unknown)"
+        )
+        wrapped.append(SimpleNamespace(
+            timestamp=timestamp,
+            model=model,
+            cost_usd=float(getattr(entry, "cost_usd", 0.0)),
+            project_path=project,
+            input_tokens=uncached_tokens,
+            output_tokens=int(getattr(entry, "output_tokens", 0)),
+            cache_creation_tokens=0,
+            cache_read_tokens=cached_tokens,
+            cache_saved_usd=saved,
+            cache_wasted_usd=0.0,
+            cache_net_usd=saved,
+            usage={
+                "input_tokens": uncached_tokens,
+                "output_tokens": int(getattr(entry, "output_tokens", 0)),
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cached_tokens,
+            },
+        ))
+
+    today_iso = now_utc.astimezone(display_tz or UTC).strftime("%Y-%m-%d")
+    if not wrapped:
+        return {
+            "window_days": window_days,
+            "anomaly_threshold_pp": anomaly_threshold_pp,
+            "anomaly_window_days": window_days,
+            "today": {
+                "date": today_iso, "cache_hit_percent": 0.0,
+                "baseline_median_percent": None, "delta_pp": None,
+                "net_usd": 0.0, "saved_usd": 0.0, "wasted_usd": 0.0,
+                "anomaly_triggered": False, "anomaly_reasons": (),
+                "baseline_daily_row_count": 0,
+            },
+            "days": (), "by_project": (), "by_model": (),
+            "seven_day_net_usd": 0.0, "seven_day_anomaly_count": 0,
+            "fourteen_day_counterfactual_usd": 0.0,
+            "fourteen_day_efficiency_ratio": 0.0, "is_empty": True,
+        }
+
+    result = crk._build_cache_report(
+        wrapped,
+        now_utc=now_utc,
+        window_days=window_days,
+        anomaly_threshold_pp=anomaly_threshold_pp,
+        anomaly_window_days=window_days,
+        display_tz=display_tz,
+        pricing=c.CODEX_MODEL_PRICING,
+        cost_calculator=lambda _model, _usage, _mode, cost: float(cost or 0.0),
+    )
+    raw_rows = sorted(result.rows, key=lambda row: row.date or "", reverse=True)
+    days = tuple({
+        "date": row.date or "",
+        "cache_hit_percent": row.cache_hit_percent,
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "cache_creation_tokens": row.cache_creation_tokens,
+        "cache_read_tokens": row.cache_read_tokens,
+        "saved_usd": row.saved_usd,
+        "wasted_usd": row.wasted_usd,
+        "net_usd": row.net_usd,
+        "anomaly_triggered": row.anomaly_triggered,
+        "anomaly_reasons": tuple(row.anomaly_reasons),
+    } for row in raw_rows[:window_days])
+    today_row = next((row for row in raw_rows if row.date == today_iso), None)
+    baseline_count = sum(1 for row in raw_rows if row.date != today_iso)
+    baseline = result.today_baseline_median
+    today_hit = today_row.cache_hit_percent if today_row else 0.0
+    kept_dates = {row["date"] for row in days}
+    kept_entries = [
+        entry for entry in wrapped
+        if entry.timestamp.astimezone(display_tz or UTC).strftime("%Y-%m-%d") in kept_dates
+    ]
+    by_project = crk._aggregate_cache_breakdown(
+        kept_entries, key_fn=lambda entry: entry.project_path,
+        pricing=c.CODEX_MODEL_PRICING,
+    )
+    by_model = crk._aggregate_cache_breakdown(
+        kept_entries, key_fn=lambda entry: entry.model,
+        pricing=c.CODEX_MODEL_PRICING,
+    )
+    seven = days[:7]
+    saved_total = stable_sum(float(row["saved_usd"]) for row in days)
+    wasted_total = stable_sum(float(row["wasted_usd"]) for row in days)
+    efficiency_denom = saved_total + abs(wasted_total)
+    return {
+        "window_days": window_days,
+        "anomaly_threshold_pp": anomaly_threshold_pp,
+        "anomaly_window_days": window_days,
+        "today": {
+            "date": today_iso,
+            "cache_hit_percent": today_hit,
+            "baseline_median_percent": baseline,
+            "delta_pp": today_hit - baseline if baseline is not None else None,
+            "net_usd": today_row.net_usd if today_row else 0.0,
+            "saved_usd": today_row.saved_usd if today_row else 0.0,
+            "wasted_usd": today_row.wasted_usd if today_row else 0.0,
+            "anomaly_triggered": today_row.anomaly_triggered if today_row else False,
+            "anomaly_reasons": tuple(today_row.anomaly_reasons) if today_row else (),
+            "baseline_daily_row_count": baseline_count,
+        },
+        "days": days,
+        "by_project": tuple({
+            "key": row.key, "cache_hit_percent": row.cache_hit_percent,
+            "net_usd": row.net_usd,
+        } for row in by_project),
+        "by_model": tuple({
+            "key": row.key, "cache_hit_percent": row.cache_hit_percent,
+            "net_usd": row.net_usd,
+        } for row in by_model),
+        "seven_day_net_usd": stable_sum(float(row["net_usd"]) for row in seven),
+        "seven_day_anomaly_count": sum(bool(row["anomaly_triggered"]) for row in seven),
+        "fourteen_day_counterfactual_usd": saved_total,
+        "fourteen_day_efficiency_ratio": (
+            saved_total / efficiency_denom if efficiency_denom > 1e-9 else 0.0
+        ),
+        "is_empty": False,
     }
 
 
@@ -656,6 +887,9 @@ def _session_wire(
             "reasoning_output_tokens": row.reasoning_output_tokens,
             "total_tokens": row.total_tokens,
             "models": tuple(row.models),
+            "model_breakdowns": tuple(
+                dict(item) for item in getattr(row, "model_breakdowns", ())
+            ),
         })
     return {
         "rows": tuple(rows),
@@ -893,9 +1127,12 @@ def _configured_codex_budget_window(
 def _quota_read_model(
     context: DashboardReadContext,
     observations: Iterable[object],
+    *,
+    accounting_entries: Iterable[object] = (),
 ) -> dict[str, object]:
     """Use S2's pure history/block/forecast kernels over cache evidence."""
     quota_observations = tuple(observations)
+    cost_entries = tuple(accounting_entries)
     histories = build_history(quota_observations)
     blocks = build_blocks(quota_observations)
     history_rows: list[dict[str, object]] = []
@@ -955,7 +1192,82 @@ def _quota_read_model(
             identity.window_minutes,
             block.resets_at.astimezone(UTC).isoformat(),
         )
+        quota_key = dashboard_resource_key(
+            "quota", "codex", identity.source_root_key,
+            identity.logical_limit_key, identity.observed_slot,
+            identity.window_minutes,
+        )
+        block_cost_entries = tuple(
+            entry for entry in cost_entries
+            if str(getattr(entry, "source_root_key", "")) == identity.source_root_key
+            and block.nominal_start_at
+            <= getattr(entry, "timestamp").astimezone(UTC)
+            < block.resets_at
+        )
+        canonical_rows = ()
+        if identity.window_minutes == 10_080 and block.resets_at > context.now_utc:
+            try:
+                canonical_rows = codex_quota_breakdown(
+                    identity,
+                    block.resets_at,
+                    speed=context.speed,
+                    cache_conn=context.cache_conn,
+                    stats_conn=context.stats_conn,
+                )
+            except sqlite3.Error:
+                # Older or partially migrated stores retain the bounded
+                # observation-derived fallback below.  A coherent current
+                # store always has the durable projection used by the CLI.
+                canonical_rows = ()
+        if canonical_rows:
+            try:
+                correlated_five_hour = tuple(
+                    observation
+                    for observation in load_codex_quota_observations(
+                        source_root_keys={identity.source_root_key},
+                        cache_conn=context.cache_conn,
+                        captured_at_or_after=block.nominal_start_at,
+                    )
+                    if observation.identity.window_minutes == 300
+                    and observation.identity.observed_slot == identity.observed_slot
+                    and observation.identity.limit_id == identity.limit_id
+                )
+            except sqlite3.Error:
+                correlated_five_hour = ()
+
+            for row in canonical_rows:
+                milestone_rows.append({
+                    "key": dashboard_resource_key(
+                        "quota_milestone", "codex", *block_parts,
+                        row.percent, row.captured_at.astimezone(UTC).isoformat(),
+                    ),
+                    "source": "codex",
+                    "block_key": dashboard_resource_key("block", "codex", *block_parts),
+                    "quota_key": quota_key,
+                    "window_minutes": identity.window_minutes,
+                    "resets_at": block.resets_at.astimezone(UTC).isoformat(),
+                    "percent": row.percent,
+                    "captured_at": row.captured_at.astimezone(UTC).isoformat(),
+                    "cumulative_usd": row.cost_usd,
+                    "marginal_usd": row.marginal_cost_usd,
+                    "input_tokens": row.input_tokens,
+                    "cached_input_tokens": row.cached_input_tokens,
+                    "output_tokens": row.output_tokens,
+                    "reasoning_output_tokens": row.reasoning_output_tokens,
+                    "total_tokens": row.total_tokens,
+                    "five_hour_percent": codex_five_hour_percent_at_crossing(
+                        identity, row.captured_at, correlated_five_hour,
+                    ),
+                })
+            continue
+
+        previous_cumulative = 0.0
         for milestone in percent_milestones(block):
+            cumulative_usd = stable_sum(
+                float(getattr(entry, "cost_usd", 0.0))
+                for entry in block_cost_entries
+                if getattr(entry, "timestamp").astimezone(UTC) <= milestone.captured_at
+            )
             milestone_rows.append({
                 "key": dashboard_resource_key(
                     "quota_milestone", "codex", *block_parts,
@@ -963,9 +1275,15 @@ def _quota_read_model(
                 ),
                 "source": "codex",
                 "block_key": dashboard_resource_key("block", "codex", *block_parts),
+                "quota_key": quota_key,
+                "window_minutes": identity.window_minutes,
+                "resets_at": block.resets_at.astimezone(UTC).isoformat(),
                 "percent": milestone.percent,
                 "captured_at": milestone.captured_at.astimezone(UTC).isoformat(),
+                "cumulative_usd": cumulative_usd,
+                "marginal_usd": max(0.0, cumulative_usd - previous_cumulative),
             })
+            previous_cumulative = cumulative_usd
     latest_percent = max(
         (float(row["current_percent"]) for row in active_rows), default=None,
     )
@@ -1400,6 +1718,8 @@ def _partial_projects_wire(
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
             "total_tokens": 0,
+            "models": {},
+            "session_rows": {},
         })
         timestamp = getattr(entry, "timestamp")
         group["first_seen"] = min(group["first_seen"], timestamp)
@@ -1410,6 +1730,27 @@ def _partial_projects_wire(
             "reasoning_output_tokens", "total_tokens",
         ):
             group[field] += getattr(entry, field)
+        model = str(getattr(entry, "model", "") or "unknown")
+        model_totals = group["models"].setdefault(model, {
+            "model": model, "cost_usd": 0.0, "input_tokens": 0,
+            "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": 0,
+        })
+        session_totals = group["session_rows"].setdefault(identity, {
+            "label": str(row_metadata.get("title") or "Session"),
+            "last_activity": timestamp.astimezone(UTC).isoformat(),
+            "cost_usd": 0.0, "input_tokens": 0, "cached_input_tokens": 0,
+            "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 0,
+        })
+        if timestamp.astimezone(UTC).isoformat() > session_totals["last_activity"]:
+            session_totals["last_activity"] = timestamp.astimezone(UTC).isoformat()
+        for field in (
+            "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens",
+        ):
+            value = getattr(entry, field)
+            model_totals[field] += value
+            session_totals[field] += value
 
     rows = []
     for (root_key, _project_key), group in groups.items():
@@ -1426,6 +1767,14 @@ def _partial_projects_wire(
             "output_tokens": group["output_tokens"],
             "reasoning_output_tokens": group["reasoning_output_tokens"],
             "total_tokens": group["total_tokens"],
+            "models": tuple(sorted(
+                group["models"].values(),
+                key=lambda item: (-float(item["cost_usd"]), str(item["model"])),
+            )),
+            "sessions": tuple(sorted(
+                group["session_rows"].values(),
+                key=lambda item: str(item["last_activity"]), reverse=True,
+            )),
         })
     rows.sort(key=lambda row: (-float(row["cost_usd"]), str(row["label"]), str(row["key"])))
     return {
@@ -1482,6 +1831,7 @@ def _build_codex_native_weekly_view(
     bucket_by_entry: dict[int, str] = {}
     display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
     labels: dict[str, str] = {}
+    periods_by_bucket: dict[str, CodexWeeklyPeriod] = {}
     for entry in entries:
         timestamp = getattr(entry, "timestamp").astimezone(UTC)
         root_key = str(getattr(entry, "source_root_key", "") or "")
@@ -1501,13 +1851,29 @@ def _build_codex_native_weekly_view(
             if display_tz is not None else period.start_at.astimezone()
         )
         labels[bucket] = local_start.strftime("%m-%d %H:%M")
+        periods_by_bucket[bucket] = period
 
     rows = _aggregate_codex_buckets(
         converted,
         key_fn=lambda entry: bucket_by_entry[id(entry)],
         speed=speed,
     )
-    display_rows = tuple(replace(row, bucket=labels[row.bucket]) for row in rows)
+    display_rows = tuple(
+        replace(
+            row,
+            bucket=labels[row.bucket],
+            period_start_at=periods_by_bucket[row.bucket].start_at,
+            period_end_at=periods_by_bucket[row.bucket].end_at,
+            used_pct=periods_by_bucket[row.bucket].used_percent,
+            dollar_per_pct=(
+                row.cost_usd / periods_by_bucket[row.bucket].used_percent
+                if periods_by_bucket[row.bucket].used_percent is not None
+                and periods_by_bucket[row.bucket].used_percent > 0
+                else None
+            ),
+        )
+        for row in rows
+    )
     return CodexWeeklyView(
         rows=display_rows,
         total_cost_usd=stable_sum(row.cost_usd for row in display_rows),
@@ -1661,7 +2027,11 @@ def build_codex_source_state(
             entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
         )
     )
-    quota = _quota_read_model(context, quota_observations)
+    quota = _quota_read_model(
+        context,
+        quota_observations,
+        accounting_entries=visible_accounting_entries,
+    )
     quota_blocks = _quota_wire(
         context.stats_conn,
         accounting_entries=visible_accounting_entries,
@@ -1677,6 +2047,14 @@ def build_codex_source_state(
         context, budget_entries, cost_events=budget_cost_events,
     )
     conversation_metadata = _codex_conversation_metadata(context.cache_conn)
+    cache_report = _codex_cache_report_wire(
+        visible_accounting_entries,
+        metadata=conversation_metadata,
+        now_utc=context.now_utc,
+        display_tz_name=context.display_tz_name,
+        speed=context.speed,
+        anomaly_threshold_pp=context.cache_report_anomaly_threshold_pp,
+    )
     projects = (
         _partial_projects_wire(visible_accounting_entries, conversation_metadata)
         if metadata_incomplete else _projects_wire(
@@ -1781,7 +2159,12 @@ def build_codex_source_state(
                 "projected": projected_budget_rows,
             },
             "projects": projects,
-            "alerts": {"rows": alerts},
+            "alerts": {
+                "rows": alerts,
+                "actual_thresholds": context.codex_quota_actual_thresholds,
+                "projected_thresholds": context.codex_quota_projected_thresholds,
+            },
+            "cache_report": cache_report,
         },
         clock_data={"codex_budget_cost_events": budget_cost_events},
     )

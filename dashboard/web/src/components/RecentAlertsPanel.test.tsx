@@ -123,11 +123,12 @@ describe('RecentAlertsPanel empty-state teaching gauge (#264 S1)', () => {
     ]);
   });
 
-  it('falls back to the .panel-empty one-liner when used_pct is unknown', () => {
+  it('keeps the canonical empty-state gauge when used_pct is unknown', () => {
     seed(null);
     const { container } = render(<RecentAlertsPanel />);
-    expect(container.querySelector('.ra-gauge-fill')).toBeNull();
-    expect(container.querySelector('.panel-empty')).not.toBeNull();
+    expect((container.querySelector('.ra-gauge-fill') as HTMLElement).style.width).toBe('0%');
+    expect(container.querySelector('.ra-gauge-hero')?.textContent).toBe('—');
+    expect(container.querySelector('.panel-empty')).toBeNull();
     expect(container.textContent).toContain('No alerts yet');
   });
 });

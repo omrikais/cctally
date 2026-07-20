@@ -49,12 +49,10 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
   return `$/1% trend over ${data.length} weeks; latest ${latest}${dir}`;
 }
 
-// #294 S5 — source-aware wrapper. The $/1% trend is a Claude-only surface (Codex
-// hero publishes no trend, §5.5): Claude renders the existing sparkline+table
-// unchanged; Codex renders nothing (gate-hidden — the grid unmounts it, and the
-// shell returns null defensively); All renders the Claude-labeled provider
-// section (no Codex trend section). Wrapping stops the legacy top-level
-// `env.trend` from leaking Claude $/1% data under a Codex label.
+// Source-aware wrapper. Claude retains its canonical trend view; Codex derives
+// the same $/1% shape from native quota-window usage plus weekly accounting.
+// The All view intentionally leaves independent provider quota percentages
+// uncombined (presentationPeriodRows nulls quota-derived fields when merging).
 export function TrendPanel() {
   const env = useSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
@@ -73,11 +71,7 @@ export function TrendPanel() {
     () => getState().prefs.trendSortOverride,
   );
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));
-  const columns = activeSource === 'claude'
-    ? PANEL_TREND_COLUMNS
-    : PANEL_TREND_COLUMNS
-        .filter((column) => column.id !== 'used_pct')
-        .map((column) => column.id === 'dollar_per_pct' ? { ...column, label: 'Cost' } : column);
+  const columns = PANEL_TREND_COLUMNS;
   const tableData = trendOverride
     ? applyTableSort(decorated, columns, trendOverride)
     : decorated;

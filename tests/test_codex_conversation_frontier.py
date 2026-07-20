@@ -33,6 +33,7 @@ class FakeFS:
         self.dirs: dict[str, dict] = {}
         self.files: dict[str, int] = {}   # file -> size
         self.ops = 0
+        self.scandir_calls = 0
 
     def add_dir(self, path, *, mtime=1, entries=None):
         self.dirs[path] = {"mtime": mtime, "entries": list(entries or [])}
@@ -54,6 +55,7 @@ class FakeFS:
     # ── injected callables ────────────────────────────────────────────────
     def scandir(self, d):
         self.ops += 1
+        self.scandir_calls += 1
         info = self.dirs.get(d)
         if info is None:
             return []
@@ -193,31 +195,10 @@ def test_unchanged_dir_is_not_re_enumerated():
     fs.add_file("/root", "s.jsonl", size=50)
     front = _frontier(fs, "/root", op_budget=32)
     _drain(front, fs, known={"/root/s.jsonl"}, cycles=5)
-    scandirs_before = _scandir_count(fs)
+    scandirs_before = fs.scandir_calls
     _drain(front, fs, known={"/root/s.jsonl"}, cycles=5)
     # An unchanged directory mtime must not re-trigger a scandir.
-    assert _scandir_count(fs) == scandirs_before
-
-
-_SCANDIR_LOG: list = []
-
-
-def _scandir_count(fs):
-    # scandir ops are the only ones that read `entries`; approximate via a
-    # dedicated counter installed on the fake.
-    return getattr(fs, "_scandir_calls", 0)
-
-
-# Re-wire FakeFS.scandir to also count itself (kept simple + explicit).
-_orig_scandir = FakeFS.scandir
-
-
-def _counting_scandir(self, d):
-    self._scandir_calls = getattr(self, "_scandir_calls", 0) + 1
-    return _orig_scandir(self, d)
-
-
-FakeFS.scandir = _counting_scandir
+    assert fs.scandir_calls == scandirs_before
 
 
 def test_mid_rotation_create_found_next_rotation():
@@ -262,13 +243,13 @@ def test_contended_first_ingest_retried_without_re_enumeration():
     # Cycle 1 discovers + surfaces the file for ingest.
     first = front.cycle(known_paths=set(), committed_sizes={})
     assert "/root/child.jsonl" in first
-    scandirs_after_discovery = getattr(fs, "_scandir_calls", 0)
+    scandirs_after_discovery = fs.scandir_calls
     # Simulate a lock-contended first ingest: no committed cursor row, NOT
     # reaped. Dir mtime unchanged, so re-enumeration cannot re-find it — the
     # pending set alone must retry it.
     second = front.cycle(known_paths=set(), committed_sizes={})
     assert "/root/child.jsonl" in second
-    assert getattr(fs, "_scandir_calls", 0) == scandirs_after_discovery
+    assert fs.scandir_calls == scandirs_after_discovery
 
 
 def test_incomplete_child_growth_without_dir_mtime_change_is_retried():

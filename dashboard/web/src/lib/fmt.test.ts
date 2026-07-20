@@ -124,6 +124,21 @@ describe('fmt.calDate (S5 CR-5)', () => {
   });
 });
 
+describe('fmt.calendarDateKey', () => {
+  const ctx = (tz: string) => ({ tz, offsetLabel: 'test' });
+
+  it('derives the YYYY-MM-DD key in the configured display timezone', () => {
+    const instant = '2026-07-19T23:30:00Z';
+    expect(fmt.calendarDateKey(instant, ctx('Asia/Jerusalem'))).toBe('2026-07-20');
+    expect(fmt.calendarDateKey(instant, ctx('America/Los_Angeles'))).toBe('2026-07-19');
+  });
+
+  it('returns null on null or invalid input', () => {
+    expect(fmt.calendarDateKey(null, ctx('Etc/UTC'))).toBeNull();
+    expect(fmt.calendarDateKey('not-a-date', ctx('Etc/UTC'))).toBeNull();
+  });
+});
+
 describe('fmt.durationCompact', () => {
   it('drops the 0h prefix and zero-pad for sub-hour durations', () => {
     expect(fmt.durationCompact(7 * 60)).toBe('7m');

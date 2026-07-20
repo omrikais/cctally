@@ -114,6 +114,23 @@ function fmtCalendarDateShort(s: string | null | undefined): string | null {
   return `${months[monthIdx]} ${m[3]}`;
 }
 
+// Derive a YYYY-MM-DD calendar key from an instant in the server-resolved
+// display timezone. This is the key-producing counterpart to the visible
+// calendar-date formatters below: callers that synthesize a daily row from a
+// snapshot timestamp must not truncate UTC text and silently choose the wrong
+// day for non-UTC displays.
+function fmtCalendarDateKey(
+  iso: string | null | undefined,
+  ctx: FmtCtx,
+): string | null {
+  const d = isoToDate(iso);
+  if (!d) return null;
+  const p = partsByType(d, ctx.tz, {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
 // "2026-04-25 14:32 UTC" — row-level Started column. F4 of the spec
 // allows callers to pass `{ noSuffix: true }` for contexts where the
 // suffix is shown elsewhere (e.g. column header), trimming the body to
@@ -372,6 +389,7 @@ export const fmt = {
   // instant. Same helper as weekStart, semantically-honest name.
   calDate:        (s: string | null | undefined): string | null =>
     fmtCalendarDateShort(s),
+  calendarDateKey: fmtCalendarDateKey,
   timeOnly:       fmtTimeHHmm,
   // Threshold-actions T10/T11: relative-time formatter for the Recent
   // alerts panel/modal (and any future "X ago" surface). Goes through

@@ -11,7 +11,7 @@ import { joinCodexQuotaLabels } from '../lib/sourceRows';
 import { warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
 import { dispatch, getState, subscribeStore } from '../store/store';
-import type { AllSourceData, CodexSourceData, Envelope } from '../types/envelope';
+import type { AllSourceData, CodexSourceData, Envelope, FreshnessEnvelope } from '../types/envelope';
 
 // HeroStrip (#264 S1, spec §4; #294 S5 §6.1) — the dashboard's full-width
 // at-a-glance hero. The shared three-zone component keeps Claude's canonical
@@ -54,9 +54,9 @@ export function HeroStrip() {
 
   const openCurrentWeek = () => dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
 
-  const activate = activeSource === 'claude'
-    ? openCurrentWeek
-    : () => dispatch({ type: 'SHOW_STATUS_TOAST', text: `${activeSource === 'codex' ? 'Codex' : 'Combined'} cycle details remain source-bound in the dashboard cards.` });
+  const activate = activeSource === 'all'
+    ? () => dispatch({ type: 'SHOW_STATUS_TOAST', text: 'Claude and Codex quota cycles are independent; select a provider to inspect its current cycle.' })
+    : openCurrentWeek;
 
   const body = <SharedHero source={activeSource} env={env} ctx={ctx} verdict={verdict} heroLabel={heroLabel} />;
 
@@ -99,96 +99,181 @@ function SharedHero({
   const h = env?.header;
   const cw = env?.current_week ?? null;
   if (source === 'claude') {
-    return <ClaudeHero h={h} cw={cw} ctx={ctx} verdict={verdict} heroLabel={heroLabel} freshness={cw?.freshness ?? null} />;
+    return (
+      <CanonicalHero
+        weekLabel={h?.week_label}
+        usedPct={h?.used_pct}
+        fiveHourPct={h?.five_hour_pct}
+        resetInSec={cw?.reset_in_sec}
+        spentUsd={cw?.spent_usd}
+        dollarPerPct={h?.dollar_per_pct}
+        forecastPct={h?.forecast_pct}
+        vsLastWeekDelta={h?.vs_last_week_delta}
+        freshness={cw?.freshness ?? null}
+        ctx={ctx}
+        verdict={verdict}
+        heroLabel={heroLabel}
+      />
+    );
   }
   const codexEntry = resolveSourceView(env, 'codex').entry;
   const codex = codexEntry?.data as CodexSourceData | undefined;
-  const allEntry = resolveSourceView(env, 'all').entry;
-  const all = allEntry?.data as AllSourceData | undefined;
+  const cycle = codex?.hero.cycle;
   const windows = codex?.hero && codex.quota ? joinCodexQuotaLabels(codex.hero, codex.quota) : [];
-  const weekly = windows.find((window) => window.windowMinutes === 10_080) ?? windows[0];
+  const weekly = [...windows].sort((a, b) => {
+    const aMatchesCycle = a.current.resets_at === cycle?.resets_at;
+    const bMatchesCycle = b.current.resets_at === cycle?.resets_at;
+    if (aMatchesCycle !== bMatchesCycle) return aMatchesCycle ? -1 : 1;
+    const aIsWeekly = a.windowMinutes === 10_080;
+    const bIsWeekly = b.windowMinutes === 10_080;
+    if (aIsWeekly !== bIsWeekly) return aIsWeekly ? -1 : 1;
+    return b.current.current_percent - a.current.current_percent
+      || Date.parse(b.current.captured_at) - Date.parse(a.current.captured_at);
+  })[0];
   const fiveHour = windows.find((window) => window.windowMinutes === 300);
   const codexUnavailable = codexEntry?.capabilities?.hero?.status === 'unavailable'
-    || codex?.hero?.cost_usd == null || codex?.hero?.total_tokens == null;
+    || codex?.hero?.cost_usd == null;
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
+  const quotaForecast = codex?.quota.histories.find((row) => row.key === weekly?.key)?.forecast;
+  const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
+  const capturedMs = weekly ? Date.parse(weekly.current.captured_at) : Number.NaN;
+  const ageSeconds = Number.isFinite(capturedMs)
+    ? Math.max(0, (Date.now() - capturedMs) / 1000)
+    : null;
+  const codexHeroLabel = heroFreshnessLabel(ageSeconds);
+  const usedPct = weekly?.current.current_percent ?? null;
+  const spentUsd = codexUnavailable ? null : codex?.hero.cost_usd;
+  const dollarPerPct = spentUsd != null && usedPct != null && usedPct > 0
+    ? spentUsd / usedPct
+    : null;
+  const cycleStartMs = codex?.hero.cycle?.start_at ? Date.parse(codex.hero.cycle.start_at) : Number.NaN;
+  const previousDollarPerPct = codex?.periods.weekly.rows
+    .filter((row) => {
+      const endMs = row.end_at ? Date.parse(row.end_at) : Number.NaN;
+      return row.dollar_per_pct != null
+        && Number.isFinite(cycleStartMs)
+        && Number.isFinite(endMs)
+        && endMs <= cycleStartMs;
+    })
+    .sort((a, b) => Date.parse(b.end_at ?? '') - Date.parse(a.end_at ?? ''))[0]
+    ?.dollar_per_pct ?? null;
+  const vsLastWeekDelta = dollarPerPct != null && previousDollarPerPct != null
+    ? dollarPerPct - previousDollarPerPct
+    : null;
+  const forecastPct = quotaForecast?.status === 'ok'
+    ? quotaForecast.projected_percent
+    : null;
+  const codexVerdict = forecastPct == null
+    ? null
+    : resolveVerdict(forecastPct >= 100 ? 'capped' : forecastPct >= 90 ? 'cap' : 'ok');
+  const codexFreshness: FreshnessEnvelope | null = weekly && ageSeconds != null
+    ? { ...weekly.current, label: codexHeroLabel, age_seconds: ageSeconds }
+    : null;
+  const cycleStartLabel = cycle ? fmt.dateShort(cycle.start_at, ctx) : null;
+  const cycleEndLabel = cycle ? fmt.dateShort(cycle.resets_at, ctx) : null;
+  const weekLabel = cycleStartLabel && cycleEndLabel
+    ? `${cycleStartLabel}–${cycleEndLabel}`
+    : cycleStartLabel ?? cycleEndLabel;
+
+  if (source === 'codex') {
+    return (
+      <CanonicalHero
+        weekLabel={weekLabel}
+        usedPct={usedPct}
+        fiveHourPct={fiveHour?.current.current_percent}
+        resetInSec={resetSeconds}
+        spentUsd={spentUsd}
+        dollarPerPct={dollarPerPct}
+        forecastPct={forecastPct}
+        vsLastWeekDelta={vsLastWeekDelta}
+        freshness={codexFreshness}
+        ctx={ctx}
+        verdict={codexVerdict}
+        heroLabel={codexHeroLabel}
+        unavailableReason={codexUnavailable
+          ? warning?.message ?? 'Cycle accounting unavailable'
+          : null}
+      />
+    );
+  }
+
+  const allEntry = resolveSourceView(env, 'all').entry;
+  const all = allEntry?.data as AllSourceData | undefined;
   const combined = all?.combined ?? null;
   const allWarning = warningForDomain(allEntry?.warnings, 'hero');
-  const quotaForecast = codex?.quota.histories.find((row) => row.key === weekly?.key)?.forecast;
-  const budget = codex?.budget.status;
-
-  const primaryLabel = source === 'codex' ? '7-DAY LIMIT' : 'CLAUDE 7-DAY';
-  const primaryValue = source === 'codex' ? fmt.pct0(weekly?.current.current_percent) : fmt.pct1(h?.used_pct);
-  const secondaryLabel = source === 'all' ? 'CODEX 7-DAY' : '5-HOUR';
-  const secondaryValue = source === 'codex' ? fmt.pct0(fiveHour?.current.current_percent) : fmt.pct0(weekly?.current.current_percent);
-  const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
-  const spentLabel = source === 'codex' ? 'SPENT THIS CYCLE' : 'COMBINED SPEND';
-  const spent = source === 'codex' ? codex?.hero.cost_usd : combined?.cost_usd;
-  const totalTokens = source === 'codex' ? codex?.hero.total_tokens : combined?.total_tokens;
 
   return (
     <>
       <div className="hero-zone hero-usage" data-testid="shared-hero-usage">
         <div className="hu-block">
-          <div className="hu-label">{primaryLabel}</div>
-          <div className="hu-num">{primaryValue}</div>
+          <div className="hu-label">CLAUDE 7-DAY</div>
+          <div className="hu-num">{fmt.pct1(h?.used_pct)}</div>
         </div>
         <div className="hu-block">
-          <div className="hu-label">{secondaryLabel}</div>
-          <div className="hu-num hu-num--sm">{secondaryValue}</div>
+          <div className="hu-label">CODEX 7-DAY</div>
+          <div className="hu-num hu-num--sm">{fmt.pct0(weekly?.current.current_percent)}</div>
         </div>
         <div className="hu-reset">resets in <span>{fmt.ddhh(resetSeconds)}</span></div>
       </div>
 
       <div className="hero-zone hero-spent" data-testid="shared-hero-spent">
-        <div className="hs-label">{spentLabel}</div>
-        <div className="hs-big">{spent == null ? '—' : fmt.usd0(spent)}</div>
+        <div className="hs-label">COMBINED SPEND</div>
+        <div className="hs-big">{combined?.cost_usd == null ? '—' : fmt.usd0(combined.cost_usd)}</div>
         <div className="hs-sub">
-          {codexUnavailable && source === 'codex'
-              ? warning?.message ?? 'Cycle accounting unavailable'
-              : source === 'all' && combined == null
-                ? allWarning?.message ?? 'Combined totals are unavailable while a provider is degraded.'
-              : <><span>{fmt.tokens(totalTokens)}</span> total tokens</>}
+          {combined == null
+            ? allWarning?.message ?? 'Combined totals are unavailable while a provider is degraded.'
+            : <><span>{fmt.tokens(combined.total_tokens)}</span> total tokens</>}
         </div>
       </div>
 
       <div className="hero-zone hero-support" data-testid="shared-hero-support">
         <div className="sup-row">
-          <span className="sup-l">{source === 'codex' ? 'Forecast @ reset' : 'Claude quota'}</span>
-          <span className="sup-v">
-            {source === 'codex' ? fmt.pct0(quotaForecast?.projected_percent) : fmt.pct1(h?.used_pct)}
-          </span>
+          <span className="sup-l">Claude quota</span>
+          <span className="sup-v">{fmt.pct1(h?.used_pct)}</span>
         </div>
         <div className="sup-row">
-          <span className="sup-l">{source === 'codex' ? 'Budget' : 'Codex quota'}</span>
-          <span className="sup-v">{source === 'codex' ? budget == null ? '—' : `${fmt.pct0(budget.consumption_pct)} of ${fmt.usd0(budget.budget_usd)}` : fmt.pct1(weekly?.current.current_percent)}</span>
+          <span className="sup-l">Codex quota</span>
+          <span className="sup-v">{fmt.pct1(weekly?.current.current_percent)}</span>
         </div>
         <div className="sup-row">
-          <span className="sup-l">{source === 'codex' ? 'Snapshot' : 'Providers'}</span>
-          <span className="sup-v">
-            {source === 'codex' ? weekly?.current.freshness ?? 'unavailable' : 'Claude · Codex'}
-          </span>
+          <span className="sup-l">Providers</span>
+          <span className="sup-v">Claude · Codex</span>
         </div>
       </div>
     </>
   );
 }
 
-// ---- Claude hero (unchanged subscription-week vocabulary) -------------
+// ---- Canonical provider hero (Claude is the structure reference) -------
 
-function ClaudeHero({
-  h,
-  cw,
+function CanonicalHero({
+  weekLabel,
+  usedPct,
+  fiveHourPct,
+  resetInSec,
+  spentUsd,
+  dollarPerPct,
+  forecastPct,
+  vsLastWeekDelta,
   ctx,
   verdict,
   heroLabel,
   freshness,
+  unavailableReason = null,
 }: {
-  h: Envelope['header'] | undefined;
-  cw: Envelope['current_week'] | null;
+  weekLabel: string | null | undefined;
+  usedPct: number | null | undefined;
+  fiveHourPct: number | null | undefined;
+  resetInSec: number | null | undefined;
+  spentUsd: number | null | undefined;
+  dollarPerPct: number | null | undefined;
+  forecastPct: number | null | undefined;
+  vsLastWeekDelta: number | null | undefined;
   ctx: FmtCtx;
   verdict: ReturnType<typeof resolveVerdict>;
   heroLabel: string;
-  freshness: NonNullable<Envelope['current_week']>['freshness'];
+  freshness: FreshnessEnvelope | null;
+  unavailableReason?: string | null;
 }) {
   return (
     <>
@@ -196,24 +281,24 @@ function ClaudeHero({
         <div className="hu-block">
           <div className="hu-label">
             WEEK USAGE
-            {h?.week_label ? <span className="hu-week"> · {h.week_label}</span> : null}
+            {weekLabel ? <span className="hu-week"> · {weekLabel}</span> : null}
           </div>
-          <div className="hu-num">{fmt.pct1(h?.used_pct)}</div>
+          <div className="hu-num">{fmt.pct1(usedPct)}</div>
         </div>
         <div className="hu-block">
           <div className="hu-label">5-HOUR</div>
-          <div className="hu-num hu-num--sm">{fmt.pct0(h?.five_hour_pct)}</div>
+          <div className="hu-num hu-num--sm">{fmt.pct0(fiveHourPct)}</div>
         </div>
         <div className="hu-reset">
-          resets in <span>{fmt.ddhh(cw?.reset_in_sec)}</span>
+          resets in <span>{fmt.ddhh(resetInSec)}</span>
         </div>
       </div>
 
-      <div className="hero-zone hero-spent">
+      <div className="hero-zone hero-spent" title={unavailableReason ?? undefined}>
         <div className="hs-label">SPENT THIS WEEK</div>
-        <div className="hs-big">{fmt.usd0(cw?.spent_usd)}</div>
+        <div className="hs-big">{fmt.usd0(spentUsd)}</div>
         <div className="hs-sub">
-          <span>{fmt.usd2(h?.dollar_per_pct)}</span> / 1% used
+          <span>{fmt.usd2(dollarPerPct)}</span> / 1% used
         </div>
       </div>
 
@@ -221,11 +306,11 @@ function ClaudeHero({
         <div className="sup-row">
           <span className="sup-l">Forecast @ reset</span>
           <span className={`sup-v${verdict ? ` is-${verdict.cls}` : ''}`}>
-            {fmt.pct0(h?.forecast_pct)}
+            {fmt.pct0(forecastPct)}
           </span>
         </div>
         {(() => {
-          const d = h?.vs_last_week_delta;
+          const d = vsLastWeekDelta;
           if (d == null) {
             return (
               <div className="sup-row" data-metric="vs-last-week">

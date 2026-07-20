@@ -108,11 +108,13 @@ function codexPeriodRow(row: CodexPeriodBucket, index: number): PeriodRow {
     output_tokens: row.output_tokens + row.reasoning_output_tokens,
     cache_creation_tokens: 0,
     cache_read_tokens: row.cached_input_tokens,
-    used_pct: null,
-    dollar_per_pct: null,
+    used_pct: row.used_pct ?? null,
+    dollar_per_pct: row.dollar_per_pct ?? null,
     delta_cost_pct: null,
     is_current: index === 0,
     models,
+    week_start_at: row.start_at,
+    week_end_at: row.end_at,
   };
 }
 
@@ -159,7 +161,13 @@ export function presentationPeriodRows(
     : providers.claude?.periods?.[period]?.rows ?? [];
   const codex = [...(providers.codex?.periods?.[period]?.rows ?? [])]
     .sort((a, b) => b.label.localeCompare(a.label))
-    .map(codexPeriodRow);
+    .map(codexPeriodRow)
+    .map((row, index, allRows) => ({
+      ...row,
+      delta_cost_pct: allRows[index + 1]?.cost_usd
+        ? (row.cost_usd - allRows[index + 1].cost_usd) / allRows[index + 1].cost_usd * 100
+        : null,
+    }));
   const rows = selection === 'all'
     ? mergePeriodRows(legacy, codex)
     : selection === 'codex' ? codex : legacy;
@@ -184,13 +192,14 @@ function intensityRows(rows: DailyPanelRow[]): DailyPanelRow[] {
 
 function codexDailyRow(row: CodexPeriodBucket): DailyPanelRow {
   const date = dailyDate(row.label);
+  const breakdownModels = codexModelRows(row.cost_usd, row.model_breakdowns, true);
   return {
     date,
     label: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.slice(5) : row.label,
     cost_usd: row.cost_usd,
     is_today: false,
     intensity_bucket: 0,
-    models: sourceModels(row.cost_usd, 'codex'),
+    models: breakdownModels.length > 0 ? breakdownModels : sourceModels(row.cost_usd, 'codex'),
     input_tokens: row.input_tokens,
     output_tokens: row.output_tokens + row.reasoning_output_tokens,
     cache_creation_tokens: 0,
@@ -289,19 +298,21 @@ export function presentationTrend(env: Envelope | null, selection: DashboardSele
   if (selection === 'claude') {
     return { rows: env?.trend?.weeks ?? [], title: '$/1% Trend', chartLabel: '$/1% trend:', valueLabel: '$/1%', source: selection };
   }
-  const rows = presentationPeriodRows(env, selection, 'weekly');
+  const rows = presentationPeriodRows(env, selection, 'weekly').slice().reverse();
   return {
     rows: rows.map((row, index) => ({
       label: row.label,
-      used_pct: null,
-      dollar_per_pct: row.cost_usd,
-      delta: index + 1 < rows.length ? row.cost_usd - rows[index + 1].cost_usd : null,
+      used_pct: row.used_pct,
+      dollar_per_pct: row.dollar_per_pct,
+      delta: row.dollar_per_pct != null && rows[index - 1]?.dollar_per_pct != null
+        ? row.dollar_per_pct - rows[index - 1].dollar_per_pct!
+        : null,
       is_current: row.is_current,
       cost_usd: row.cost_usd,
     })),
-    title: 'Cost Trend',
-    chartLabel: selection === 'all' ? 'Combined weekly cost:' : 'Weekly cost:',
-    valueLabel: 'cost',
+    title: '$/1% Trend',
+    chartLabel: '$/1% trend:',
+    valueLabel: '$/1%',
     source: selection,
   };
 }
@@ -438,6 +449,8 @@ export function presentationBlocks(env: Envelope | null, selection: DashboardSel
 
 export function presentationCacheDays(env: Envelope | null, selection: DashboardSelection): CacheReportDailyRow[] | null {
   if (selection === 'claude') return env?.cache_report?.days ?? null;
+  const native = presentationProviders(env, selection).codex?.cache_report;
+  if (native != null) return native.days;
   const rows = presentationDailyRows(env, selection);
   return rows.map((row) => {
     // Codex input_tokens is cache-inclusive. codexDailyRow already normalizes

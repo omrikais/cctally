@@ -40,9 +40,9 @@ def _unset(ns):
     return ns["_cmd_config_unset"](argparse.Namespace(key=KEY))
 
 
-def test_get_default_is_180(tmp_path, monkeypatch):
+def test_get_default_is_90(tmp_path, monkeypatch):
     ns = _load(tmp_path, monkeypatch)
-    assert _get(ns) == 180
+    assert _get(ns) == 90
 
 
 def test_set_positive_persists(tmp_path, monkeypatch):
@@ -63,7 +63,7 @@ def test_set_off_and_zero_disable(tmp_path, monkeypatch):
 def test_set_negative_rejected(tmp_path, monkeypatch):
     ns = _load(tmp_path, monkeypatch)
     assert _set(ns, "-5") == 2
-    assert _get(ns) == 180  # unchanged
+    assert _get(ns) == 90  # unchanged
 
 
 def test_set_boolean_word_rejected(tmp_path, monkeypatch):
@@ -83,20 +83,20 @@ def test_unset_reverts_to_default(tmp_path, monkeypatch):
     assert _set(ns, "30") == 0
     assert _get(ns) == 30
     assert _unset(ns) == 0
-    assert _get(ns) == 180
+    assert _get(ns) == 90
 
 
 def test_resolver_defaults_and_malformed(tmp_path, monkeypatch):
     _load(tmp_path, monkeypatch)
     import _cctally_config as cfg
-    assert cfg.resolve_retention_days({}) == 180
+    assert cfg.resolve_retention_days({}) == 90
     assert cfg.resolve_retention_days({"conversation": {"retention_days": 45}}) == 45
     assert cfg.resolve_retention_days({"conversation": {"retention_days": 0}}) == 0
-    # Malformed persisted values degrade to the safe 180 default.
-    assert cfg.resolve_retention_days({"conversation": {"retention_days": "garbage"}}) == 180
-    assert cfg.resolve_retention_days({"conversation": {"retention_days": True}}) == 180
-    assert cfg.resolve_retention_days({"conversation": {"retention_days": -3}}) == 180
-    assert cfg.resolve_retention_days({"conversation": {"retention_days": 1.5}}) == 180
-    assert cfg.resolve_retention_days({"conversation": "not-an-object"}) == 180
+    # Malformed persisted values degrade to the safe 90 default.
+    assert cfg.resolve_retention_days({"conversation": {"retention_days": "garbage"}}) == 90
+    assert cfg.resolve_retention_days({"conversation": {"retention_days": True}}) == 90
+    assert cfg.resolve_retention_days({"conversation": {"retention_days": -3}}) == 90
+    assert cfg.resolve_retention_days({"conversation": {"retention_days": 1.5}}) == 90
+    assert cfg.resolve_retention_days({"conversation": "not-an-object"}) == 90
     # A clean integer string persisted by hand resolves.
     assert cfg.resolve_retention_days({"conversation": {"retention_days": "60"}}) == 60

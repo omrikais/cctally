@@ -53,6 +53,7 @@ One page per subcommand. Pages follow a consistent shape:
 | `codex-monthly` | [codex-monthly.md](codex-monthly.md) |
 | `codex-weekly` | [codex-weekly.md](codex-weekly.md) |
 | `codex-session` | [codex-session.md](codex-session.md) |
+| `cctally codex percent-breakdown` | [codex-percent-breakdown.md](codex-percent-breakdown.md) |
 
 ## Wrappers
 

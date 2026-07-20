@@ -603,6 +603,28 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
     if not token:
         return _RefreshUsageResult(status="no_oauth_token", reason="no token")
 
+    # Force-refresh deliberately bypasses the pre-fetch backoff gate, but its
+    # resulting 429/success transition must be ordered with the automatic
+    # refresh writer.  Hold the canonical selected-state lock from the fetch
+    # through authoritative publication and the matching backoff update.
+    try:
+        with c._selected_state_lock():
+            return _refresh_usage_inproc_locked(
+                c,
+                token=token,
+                timeout_seconds=timeout_seconds,
+            )
+    except OSError as exc:
+        return _RefreshUsageResult(status="record_failed", reason=str(exc))
+
+
+def _refresh_usage_inproc_locked(
+    c,
+    *,
+    token: str,
+    timeout_seconds: float,
+) -> _RefreshUsageResult:
+    """Force-refresh with the canonical selected-state lock already held."""
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
@@ -683,6 +705,7 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
             "sevenDay",
             *({"fiveHour"} if five_pct is not None else set()),
         },
+        lock_held=True,
     )
     if authoritative.status != "ok":
         return _RefreshUsageResult(
@@ -831,6 +854,9 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
 
     if result.status == "record_failed":
         reason = result.reason or ""
+        if c._is_sqlite_corruption_error(reason):
+            eprint(f"cctally: {c._stats_corruption_guidance()}")
+            return 3
         if reason.startswith("exit "):
             try:
                 rc = int(reason.split()[1])

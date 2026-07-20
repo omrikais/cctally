@@ -1491,7 +1491,7 @@ def test_db_integrity_stats_corrupt_is_fail_no_delete():
         cache_db_quick_check="ok"))
     assert r.severity == "fail"
     assert "backup" in r.remediation.lower() or "back up" in r.remediation.lower()
-    assert ".recover" in r.remediation
+    assert "cctally db repair --db stats --yes" in r.remediation
     assert "delete" in r.remediation.lower()  # "Do not delete"
 
 

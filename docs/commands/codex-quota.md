@@ -222,5 +222,7 @@ configuration.
 ## See also
 
 - [`codex`](codex.md) — Codex accounting subgroup
+- [`codex percent-breakdown`](codex-percent-breakdown.md) — current or retained
+  native seven-day milestones in the canonical weekly table design
 - [`setup`](setup.md) — Codex hook installation and trust review
 - [`doctor`](doctor.md) — local quota freshness and lifecycle diagnostics

@@ -256,12 +256,42 @@
           },
           "codex": {
             "alerts": {
+              "actual_thresholds": [
+                90,
+                95
+              ],
+              "projected_thresholds": [],
               "rows": []
             },
             "budget": {
               "milestones": [],
               "projected": [],
               "status": null
+            },
+            "cache_report": {
+              "anomaly_threshold_pp": 15,
+              "anomaly_window_days": 14,
+              "by_model": [],
+              "by_project": [],
+              "days": [],
+              "fourteen_day_counterfactual_usd": 0.0,
+              "fourteen_day_efficiency_ratio": 0.0,
+              "is_empty": true,
+              "seven_day_anomaly_count": 0,
+              "seven_day_net_usd": 0.0,
+              "today": {
+                "anomaly_reasons": [],
+                "anomaly_triggered": false,
+                "baseline_daily_row_count": 0,
+                "baseline_median_percent": null,
+                "cache_hit_percent": 0.0,
+                "date": "2026-04-20",
+                "delta_pp": null,
+                "net_usd": 0.0,
+                "saved_usd": 0.0,
+                "wasted_usd": 0.0
+              },
+              "window_days": 14
             },
             "hero": {
               "alerts": {
@@ -526,12 +556,42 @@
       },
       "data": {
         "alerts": {
+          "actual_thresholds": [
+            90,
+            95
+          ],
+          "projected_thresholds": [],
           "rows": []
         },
         "budget": {
           "milestones": [],
           "projected": [],
           "status": null
+        },
+        "cache_report": {
+          "anomaly_threshold_pp": 15,
+          "anomaly_window_days": 14,
+          "by_model": [],
+          "by_project": [],
+          "days": [],
+          "fourteen_day_counterfactual_usd": 0.0,
+          "fourteen_day_efficiency_ratio": 0.0,
+          "is_empty": true,
+          "seven_day_anomaly_count": 0,
+          "seven_day_net_usd": 0.0,
+          "today": {
+            "anomaly_reasons": [],
+            "anomaly_triggered": false,
+            "baseline_daily_row_count": 0,
+            "baseline_median_percent": null,
+            "cache_hit_percent": 0.0,
+            "date": "2026-04-20",
+            "delta_pp": null,
+            "net_usd": 0.0,
+            "saved_usd": 0.0,
+            "wasted_usd": 0.0
+          },
+          "window_days": 14
         },
         "hero": {
           "alerts": {

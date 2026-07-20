@@ -156,6 +156,36 @@ def test_cost_rows_preserved(tmp_path, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0] == before == 1
 
 
+def test_fresh_cache_uses_incremental_auto_vacuum(tmp_path, monkeypatch):
+    """A freshly created cache.db must be in INCREMENTAL auto_vacuum mode (2) so
+    the retention prune can return freed pages to the OS with an incremental
+    vacuum instead of requiring a full ``db vacuum``."""
+    _, conn, _ = _env(tmp_path, monkeypatch)
+    assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+
+
+def test_orchestrated_prune_reclaims_freed_pages(tmp_path, monkeypatch):
+    """The throttled/orchestrated prune reclaims freed pages (incremental vacuum)
+    so the file physically shrinks — deleting rows alone only grows the freelist.
+    Regression for the bloat that pegged the dashboard (8.7 GB cache.db)."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    # Enough old, sizeable messages that deleting them frees many pages.
+    for i in range(2000):
+        _seed_msg(conn, f"old-{i}", OLD, text="x" * 500)
+    _seed_msg(conn, "fresh", FRESH)
+    conn.commit()
+    pages_before = conn.execute("PRAGMA page_count").fetchone()[0]
+
+    stats = retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=180, force=True)
+
+    assert stats is not None and stats.claude_messages == 2000
+    # incremental_vacuum returned the freed pages to the OS: no freelist backlog
+    # remains and page_count drops. Without the reclaim page_count stays flat.
+    assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    assert conn.execute("PRAGMA page_count").fetchone()[0] < pages_before
+
+
 def test_codex_events_pruned_threads_retained(tmp_path, monkeypatch):
     """F5: prune only codex_conversation_events; keep codex_conversation_threads
     (and codex_session_entries) so source_analytics's range still resolves."""

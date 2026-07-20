@@ -6894,6 +6894,12 @@ mark.current {
 .sd-tokens dd { margin: 0; }
 .sd-note { color: var(--accent-amber); margin: 0 0 var(--space-3); }
 .sd-block-label { color: var(--text-dim); margin-top: 0; }
+.sd-total-tokens {
+  display: flex; justify-content: space-between; margin-top: var(--space-3);
+  padding-top: var(--space-2); border-top: 1px dotted var(--border-soft);
+  color: var(--text-dim); font-size: var(--fs-meta);
+}
+.sd-total-tokens strong { color: var(--text); font-family: var(--font-mono); }
 
 /* ---- Sessions panel: per-row "open conversation" affordance -------- */
 .sess-open-conv {

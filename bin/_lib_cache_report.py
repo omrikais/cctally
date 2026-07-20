@@ -359,9 +359,17 @@ def _aggregate_cache_by_day(
         cost = cost_calculator(entry.model, entry.usage, "auto", entry.cost_usd)
         create_tok = entry.usage.get("cache_creation_input_tokens", 0)
         read_tok = entry.usage.get("cache_read_input_tokens", 0)
-        saved, wasted, net = _compute_entry_cache_dollars(
-            entry.model, create_tok, read_tok, pricing=pricing,
-        )
+        explicit_saved = getattr(entry, "cache_saved_usd", None)
+        explicit_wasted = getattr(entry, "cache_wasted_usd", None)
+        explicit_net = getattr(entry, "cache_net_usd", None)
+        if all(value is not None for value in (explicit_saved, explicit_wasted, explicit_net)):
+            saved, wasted, net = (
+                float(explicit_saved), float(explicit_wasted), float(explicit_net),
+            )
+        else:
+            saved, wasted, net = _compute_entry_cache_dollars(
+                entry.model, create_tok, read_tok, pricing=pricing,
+            )
         models = day_model_buckets.setdefault(day_key, {})
         b = models.setdefault(entry.model, _Bucket())
         b.input_tokens += entry.usage.get("input_tokens", 0)
@@ -792,12 +800,20 @@ def _aggregate_cache_breakdown(
         b.input_tokens += getattr(e, "input_tokens", 0)
         b.cache_creation_tokens += getattr(e, "cache_creation_tokens", 0)
         b.cache_read_tokens += getattr(e, "cache_read_tokens", 0)
-        saved, wasted, net = _compute_entry_cache_dollars(
-            getattr(e, "model", ""),
-            getattr(e, "cache_creation_tokens", 0),
-            getattr(e, "cache_read_tokens", 0),
-            pricing=pricing,
-        )
+        explicit_saved = getattr(e, "cache_saved_usd", None)
+        explicit_wasted = getattr(e, "cache_wasted_usd", None)
+        explicit_net = getattr(e, "cache_net_usd", None)
+        if all(value is not None for value in (explicit_saved, explicit_wasted, explicit_net)):
+            saved, wasted, net = (
+                float(explicit_saved), float(explicit_wasted), float(explicit_net),
+            )
+        else:
+            saved, wasted, net = _compute_entry_cache_dollars(
+                getattr(e, "model", ""),
+                getattr(e, "cache_creation_tokens", 0),
+                getattr(e, "cache_read_tokens", 0),
+                pricing=pricing,
+            )
         b.saved_usd += saved
         b.wasted_usd += wasted
         b.net_usd += net

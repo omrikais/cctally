@@ -29,7 +29,7 @@ def _iso(hour: int, minute: int = 0) -> str:
 def _seed_quota(conn: sqlite3.Connection, *, root_key: str, source_path: str,
                 captures: list[tuple[str, int, float]],
                 limit_key: str = "limit-primary", slot: str = "primary",
-                window_minutes: int = 330) -> None:
+                window_minutes: int = 330, reset_at: str = RESET) -> None:
     conn.execute(
         """INSERT OR IGNORE INTO codex_source_roots
            (source_root_key, canonical_root_path, first_seen_utc, last_seen_utc)
@@ -46,7 +46,7 @@ def _seed_quota(conn: sqlite3.Connection, *, root_key: str, source_path: str,
                    ?, ?, ?, 'pro', NULL, NULL)""",
         [
             (root_key, source_path, offset, captured, slot, limit_key,
-             window_minutes, used_percent, RESET)
+             window_minutes, used_percent, reset_at)
             for captured, offset, used_percent in captures
         ],
     )
@@ -112,6 +112,175 @@ def _json(home: Path, *args: str) -> dict:
     result = _run(home, *args, "--json")
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def _run_percent_breakdown(
+    home: Path, source: str, *args: str,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(BIN)]
+    if source == "codex":
+        command.extend(("codex", "percent-breakdown"))
+    else:
+        command.append("percent-breakdown")
+    env = {
+        "HOME": str(home),
+        "TZ": "Etc/UTC",
+        "PATH": "/usr/bin:/bin",
+        "NO_COLOR": "1",
+        "CCTALLY_AS_OF": _iso(12),
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_DISABLE_UPDATE_CHECK": "1",
+        "CCTALLY_DISABLE_TELEMETRY": "1",
+    }
+    return subprocess.run(command + list(args), text=True, capture_output=True, env=env)
+
+
+@pytest.fixture
+def percent_breakdown_home(tmp_path, monkeypatch):
+    """Seed one native 7-day cycle plus its correlated five-hour evidence."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_quota(
+            cache,
+            root_key="root-weekly",
+            source_path="/codex/root-weekly/weekly.jsonl",
+            captures=[(_iso(9), 10, 10.0), (_iso(10), 20, 12.4), (_iso(11), 30, 16.1)],
+            limit_key="limit-weekly",
+            slot="primary",
+            window_minutes=10_080,
+        )
+        # The provider's reset timestamp can jitter by seconds across captures
+        # of one physical cycle.  The current-cycle convenience command must
+        # follow the latest fresh baseline (as the dashboard hero does), not
+        # treat every still-future jitter block as a separate active cycle.
+        _seed_quota(
+            cache,
+            root_key="root-weekly",
+            source_path="/codex/root-weekly/weekly-jitter.jsonl",
+            captures=[(_iso(8), 5, 9.0), (_iso(9, 30), 15, 10.0)],
+            limit_key="limit-weekly",
+            slot="primary",
+            window_minutes=10_080,
+            reset_at="2026-07-15T15:00:01Z",
+        )
+        _seed_quota(
+            cache,
+            root_key="root-weekly",
+            source_path="/codex/root-weekly/five-hour.jsonl",
+            captures=[(_iso(9), 110, 20.0), (_iso(10), 120, 25.0), (_iso(11), 130, 30.0)],
+            limit_key="limit-five-hour",
+            slot="primary",
+            window_minutes=300,
+        )
+        _seed_quota(
+            cache,
+            root_key="root-inactive",
+            source_path="/codex/root-inactive/weekly.jsonl",
+            captures=[(_iso(9), 10, 5.0), (_iso(10), 20, 6.0)],
+            limit_key="limit-inactive",
+            slot="primary",
+            window_minutes=10_080,
+            reset_at=_iso(11, 30),
+        )
+        cache.executemany(
+            """INSERT INTO codex_session_entries
+               (source_path, line_offset, timestamp_utc, session_id, model,
+                input_tokens, cached_input_tokens, output_tokens,
+                reasoning_output_tokens, total_tokens, source_root_key)
+               VALUES (?, ?, ?, 'session', 'gpt-5', ?, ?, ?, ?, ?, ?)""",
+            [
+                ("/codex/root-weekly/weekly.jsonl", 20, _iso(10),
+                 1000, 0, 100, 0, 1100, "root-weekly"),
+                ("/codex/root-weekly/weekly.jsonl", 30, _iso(11),
+                 2000, 0, 200, 0, 2200, "root-weekly"),
+            ],
+        )
+        cache.commit()
+    finally:
+        cache.close()
+    ns["reconcile_codex_quota_projection"](
+        now=dt.datetime(2026, 7, 15, 12, tzinfo=UTC),
+    )
+    config = tmp_path / ".local" / "share" / "cctally" / "config.json"
+    config.write_text(json.dumps({"display": {"tz": "utc"}}))
+    return tmp_path
+
+
+def test_codex_percent_breakdown_matches_claude_visual_design_byte_for_byte(
+    percent_breakdown_home,
+):
+    flags = (
+        "--root-key", "root-weekly", "--limit-key", "limit-weekly",
+        "--speed", "standard", "--tz", "utc",
+    )
+    codex_json = _run_percent_breakdown(
+        percent_breakdown_home, "codex", *flags, "--json",
+    )
+    assert codex_json.returncode == 0, codex_json.stderr
+    payload = json.loads(codex_json.stdout)
+    assert list(payload)[0] == "schemaVersion"
+    assert payload["source"] == "codex"
+    assert [row["percentThreshold"] for row in payload["milestones"]] == list(range(11, 17))
+    assert {row["fiveHourPercentAtCrossing"] for row in payload["milestones"]} == {25.0, 30.0}
+
+    ns = load_script()
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            """INSERT INTO weekly_usage_snapshots
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, weekly_percent,
+                page_url, source, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, 'fixture', '{}')""",
+            (
+                _iso(12), payload["weekStartDate"], payload["weekEndDate"],
+                payload["weekStartAt"], payload["weekEndAt"], 16.1,
+            ),
+        )
+        stats.executemany(
+            """INSERT INTO percent_milestones
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, percent_threshold,
+                cumulative_cost_usd, marginal_cost_usd,
+                usage_snapshot_id, cost_snapshot_id,
+                five_hour_percent_at_crossing, reset_event_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 0)""",
+            [
+                (
+                    row["capturedAt"], payload["weekStartDate"], payload["weekEndDate"],
+                    payload["weekStartAt"], payload["weekEndAt"],
+                    row["percentThreshold"], row["cumulativeCostUSD"],
+                    row["marginalCostUSD"], row["fiveHourPercentAtCrossing"],
+                )
+                for row in payload["milestones"]
+            ],
+        )
+        stats.commit()
+    finally:
+        stats.close()
+
+    claude = _run_percent_breakdown(
+        percent_breakdown_home, "claude",
+        "--week-start", payload["weekStartDate"], "--tz", "utc",
+    )
+    codex = _run_percent_breakdown(percent_breakdown_home, "codex", *flags)
+    assert claude.returncode == 0, claude.stderr
+    assert codex.returncode == 0, codex.stderr
+    assert codex.stdout == claude.stdout
+
+
+def test_codex_percent_breakdown_auto_selects_the_only_active_weekly_identity(
+    percent_breakdown_home,
+):
+    result = _run_percent_breakdown(
+        percent_breakdown_home, "codex", "--speed", "standard", "--json",
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["identity"]["sourceRootKey"] == "root-weekly"
+    assert payload["identity"]["logicalLimitKey"] == "limit-weekly"
 
 
 def test_all_five_canonical_nested_leaves_parse_and_stamp_json(quota_home):

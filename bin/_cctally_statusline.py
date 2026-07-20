@@ -940,9 +940,9 @@ def _authoritative_record_usage(
 ) -> _AuthoritativeRecordResult:
     """Record OAuth authority under write-ahead tombstones and reconcile it.
 
-    ``lock_held`` is reserved for automatic polling, which holds the selected
-    lock across its post-lock freshness/backoff recheck and network request.
-    All other callers acquire the same blocking lock here.
+    ``lock_held`` is for OAuth refresh callers that already hold the selected
+    lock across their fetch, authoritative publication, and matching backoff
+    transition. All other callers acquire the same blocking lock here.
     """
     if not lock_held:
         try:

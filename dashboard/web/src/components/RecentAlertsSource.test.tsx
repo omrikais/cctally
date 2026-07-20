@@ -159,6 +159,6 @@ describe('RecentAlertsPanel — All empty union copy', () => {
     expect(body.getByText(/No alerts yet/i)).toBeInTheDocument();
     expect(container.querySelector('.ra-gauge')).not.toBeNull();
     expect(container.querySelector('.ra-gauge-bar')).not.toBeNull();
-    expect(container.textContent).toContain('90% / 95% / 100%');
+    expect(container.textContent).toContain('90% / 95%');
   });
 });

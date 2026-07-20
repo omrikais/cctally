@@ -54,7 +54,11 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
             data: {
               detail_kind: 'codex_session',
               key: 'session:codex-a',
+              label: 'Fix modal parity',
+              project: 'cctally-dev',
+              started_at: '2026-04-24T12:00:00Z',
               last_activity: '2026-04-24T12:30:00Z',
+              duration_min: 30,
               cost_usd: 6.4,
               input_tokens: 240000,
               cached_input_tokens: 60000,
@@ -62,7 +66,7 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
               reasoning_output_tokens: 4000,
               total_tokens: 276000,
               models: ['gpt-5'],
-              model_breakdowns: [],
+              model_breakdowns: [{ modelName: 'gpt-5', cost: 6.4, totalTokens: 276000 }],
             },
           }),
       } as unknown as Response),
@@ -83,6 +87,15 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     const detail = screen.getByTestId('codex-session-detail');
     expect(detail).toHaveTextContent('Reasoning');
     expect(detail).toHaveTextContent('Cached input');
+    expect(detail).toHaveTextContent('Fix modal parity');
+    expect(detail).toHaveTextContent('cctally-dev');
+    expect(detail).toHaveTextContent('30 min');
+    expect(detail.querySelector('.m-chipstrip')).not.toBeNull();
+    expect(detail.querySelector('.m-hero.cols-3')).not.toBeNull();
+    expect(detail.querySelector('.msess-ts')).not.toBeNull();
+    expect(detail.querySelector('.msess-tok-grid')).not.toBeNull();
+    expect(detail.querySelector('.msess-model-caption')).not.toBeNull();
+    expect(screen.getByRole('heading', { name: 'Session detail' })).toBeInTheDocument();
     // No conversation-reader affordance — only the canonical Share and close
     // controls are present.
     const buttons = within(screen.getByRole('dialog')).getAllByRole('button');
@@ -115,7 +128,7 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
 
     const dialog = screen.getByRole('dialog');
     expect(dialog).toHaveAttribute('aria-labelledby', 'source-detail-title');
-    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Codex session' }));
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Session detail' }));
 
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(getState().openSourceDetail).toBeNull());

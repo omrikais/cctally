@@ -933,6 +933,9 @@ Migration = _cctally_db.Migration
 DowngradeDetected = _cctally_db.DowngradeDetected
 ProdMigrationRefused = _cctally_db.ProdMigrationRefused
 StatsDbCorruptError = _cctally_db.StatsDbCorruptError
+StatsDbMaintenanceError = _cctally_db.StatsDbMaintenanceError
+_is_sqlite_corruption_error = _cctally_db._is_sqlite_corruption_error
+_stats_corruption_guidance = _cctally_db._stats_corruption_guidance
 _STATS_MIGRATIONS = _cctally_db._STATS_MIGRATIONS
 _CACHE_MIGRATIONS = _cctally_db._CACHE_MIGRATIONS
 _make_migration_decorator = _cctally_db._make_migration_decorator
@@ -957,6 +960,8 @@ _db_path_for_label = _cctally_db._db_path_for_label
 cmd_db_skip = _cctally_db.cmd_db_skip
 cmd_db_unskip = _cctally_db.cmd_db_unskip
 cmd_db_recover = _cctally_db.cmd_db_recover
+cmd_db_repair = _cctally_db.cmd_db_repair
+cmd_db_backup = _cctally_db.cmd_db_backup
 cmd_db_checkpoint = _cctally_db.cmd_db_checkpoint
 cmd_db_vacuum = _cctally_db.cmd_db_vacuum
 
@@ -1384,6 +1389,7 @@ cmd_codex_quota_statusline = _cctally_quota.cmd_codex_quota_statusline
 cmd_codex_quota_forecast = _cctally_quota.cmd_codex_quota_forecast
 cmd_codex_quota_blocks = _cctally_quota.cmd_codex_quota_blocks
 cmd_codex_quota_breakdown = _cctally_quota.cmd_codex_quota_breakdown
+cmd_codex_percent_breakdown = _cctally_quota.cmd_codex_percent_breakdown
 
 # S3's qualified Codex accounting adapter is intentionally cache-only: callers
 # that need project identity must not downgrade to an unqualified rollout parse.
@@ -2926,6 +2932,7 @@ _is_reset_drop                      = _cctally_weekrefs._is_reset_drop
 # handler (C8, #125 Batch B). Parser dispatch reaches c.cmd_percent_breakdown.
 _cctally_percent_breakdown = _load_sibling("_cctally_percent_breakdown")
 cmd_percent_breakdown = _cctally_percent_breakdown.cmd_percent_breakdown
+_render_percent_breakdown_terminal = _cctally_percent_breakdown._render_percent_breakdown_terminal
 
 
 # _is_cctally_hook_command, SetupError, _load_claude_settings,
@@ -3207,7 +3214,26 @@ def main(argv: list[str] | None = None) -> int:
         # + recovery guidance, exit 2. Caught before the generic handler so it
         # never renders as a raw traceback.
         eprint(f"cctally: {exc}")
-        return 2
+        return 3
+    except StatsDbMaintenanceError as exc:
+        eprint(f"cctally: {exc}")
+        return 3
+    except sqlite3.DatabaseError as exc:
+        if _is_sqlite_corruption_error(exc):
+            eprint(
+                "cctally: a SQLite database is corrupt — run `cctally doctor` "
+                "to identify it. For stats.db run `cctally db repair --db "
+                "stats --yes`; cache.db is re-derivable via `cctally "
+                "cache-sync --rebuild`."
+            )
+            return 3
+        if _lib_log.debug_enabled():
+            _lib_log.get_logger("cli").debug(
+                "unhandled exception in %r",
+                getattr(args, "command", None), exc_info=True,
+            )
+        eprint(f"Error: {exc}")
+        rc = 1
     except Exception as exc:  # pragma: no cover
         # #279 S2 F2: CCTALLY_DEBUG=1 surfaces the full traceback on stderr
         # via the _lib_log chokepoint; default mode stays byte-identical.

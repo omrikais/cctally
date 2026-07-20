@@ -4,14 +4,12 @@ import type { DashboardSelection } from '../types/envelope';
 // Extracted so both surfaces render an identical "you're clear" gauge and can't
 // drift (they previously diverged: the panel had a one-liner + thin bar, the
 // modal had this richer gauge). `compact` sizes it down for the 200px bento
-// short-row tile (CSS `.ra-gauge--compact`). When `usedPct` is unknown we fall
-// back to the `.panel-empty` one-liner (a null-fill gauge would be broken) —
-// this matches both callers' prior behavior exactly.
+// short-row tile (CSS `.ra-gauge--compact`). The canonical anatomy stays
+// mounted even when `usedPct` is unknown: the hero renders an em dash and the
+// fill stays at zero so every source keeps the same detail composition.
 //
-// #294 S5 §6.7 — the empty copy is per active source. Claude keeps the weekly
-// used%-gauge (subscription-week semantics). Codex has no single weekly used%,
-// so it shows an honest one-liner about Codex budget thresholds; All shows a
-// union one-liner. Both non-Claude variants are honest empties, never zero-fills.
+// Codex uses the retained native weekly quota observation and configured quota
+// thresholds. Independent provider percentages are never combined.
 interface Props {
   usedPct: number | null;
   thresholds: number[];
@@ -39,7 +37,7 @@ export function AlertsEmptyGauge({
         ? `You're at ${Math.round(usedPct)}% — well under the line`
         : 'No alerts yet';
   const description = source === 'codex'
-    ? `Codex budget alerts fire when spend crosses ${thresholdCopy}.`
+    ? `Codex quota alerts fire when native usage crosses ${thresholdCopy}.`
     : source === 'all'
       ? `Provider-native alerts appear at their configured ${thresholdCopy} thresholds.`
       : `Alerts fire when weekly usage crosses ${thresholdCopy}.`;

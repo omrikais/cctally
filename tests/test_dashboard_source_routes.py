@@ -426,6 +426,10 @@ def test_codex_source_routes_build_real_relational_native_details_with_collision
             assert detail["model_breakdowns"]
             assert detail["input_tokens"] > 0
             assert detail["total_tokens"] > 0
+            assert detail["label"] == row["label"]
+            assert detail["project"] == row["project"]
+            assert detail["started_at"] == row["started_at"]
+            assert detail["duration_min"] == row["duration_min"]
             session_details.append(detail)
         assert {detail["key"] for detail in session_details} == {
             row["key"] for row in session_rows
@@ -487,7 +491,11 @@ def test_codex_source_routes_round_trip_published_rows_with_incomplete_project_m
                 detail = payload["data"]
                 assert detail["key"] == row["key"]
                 assert detail["detail_kind"] == f"codex_{resource}"
-                assert detail["metadata_availability"] == "partial"
+                if resource == "session" and row.get("project"):
+                    assert "metadata_availability" not in detail
+                    assert detail["project"] == row["project"]
+                else:
+                    assert detail["metadata_availability"] == "partial"
                 assert detail["total_tokens"] == row["total_tokens"]
                 assert detail["cost_usd"] == pytest.approx(row["cost_usd"])
                 details.append(detail)

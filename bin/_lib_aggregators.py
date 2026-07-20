@@ -378,6 +378,13 @@ class CodexBucketUsage:
     cost_usd: float
     models: list[str]                         # Distinct full model names (first-seen order)
     model_breakdowns: list[dict[str, Any]]    # Sorted by cost desc
+    # Native quota-cycle context. Calendar daily/monthly callers leave these
+    # null; the dashboard's subscription-week adapter fills them from the
+    # retained OpenAI rate-limit observations.
+    period_start_at: dt.datetime | None = None
+    period_end_at: dt.datetime | None = None
+    used_pct: float | None = None
+    dollar_per_pct: float | None = None
 
 
 @dataclass

@@ -35,6 +35,7 @@ from _lib_quota import (
     quota_rule_fingerprint,
     quota_threshold_decisions,
     percent_milestones,
+    physical_order_key,
     resolve_quota_rule,
     select_baseline,
     source_path_key,
@@ -902,8 +903,10 @@ def reconcile_codex_quota_projection(
 
 def _load_active_milestones(
     identity: QuotaWindowIdentity, resets_at: dt.datetime,
-) -> list[sqlite3.Row]:
-    stats = _cctally_core.open_db()
+    *, stats_conn: sqlite3.Connection | None = None,
+) -> list[sqlite3.Row | tuple[object, ...]]:
+    owns_conn = stats_conn is None
+    stats = _cctally_core.open_db() if stats_conn is None else stats_conn
     try:
         return list(stats.execute(
             """SELECT percent_threshold, captured_at_utc, source_path, line_offset
@@ -918,24 +921,62 @@ def _load_active_milestones(
             ),
         ))
     finally:
-        stats.close()
+        if owns_conn:
+            stats.close()
 
 
-def _matching_block_observations(
+def _first_block_physical_tuple(
     identity: QuotaWindowIdentity, resets_at: dt.datetime,
-) -> tuple[QuotaObservation, ...]:
-    return tuple(
-        observation for observation in load_codex_quota_observations(
-            source_root_keys={identity.source_root_key},
-        )
-        if observation.identity == identity and observation.resets_at == resets_at
-    )
+    *, cache_conn: sqlite3.Connection | None = None,
+) -> tuple[dt.datetime, str, int] | None:
+    """Read the first physical tuple for one exact projected block.
+
+    The prior implementation reconstructed every retained quota observation
+    for the root in Python just to discover this boundary.  Keep the same
+    physical ordering while letting SQLite filter the exact identity/reset.
+    ``unixepoch`` deliberately accepts retained ``Z`` and ``+00:00`` spellings.
+    """
+    owns_conn = cache_conn is None
+    if cache_conn is None:
+        try:
+            cache = _cache_connection()
+        except (FileNotFoundError, sqlite3.Error):
+            return None
+    else:
+        cache = cache_conn
+    try:
+        row = cache.execute(
+            """SELECT captured_at_utc, source_path, line_offset
+                 FROM quota_window_snapshots
+                WHERE source='codex' AND source_root_key=?
+                  AND logical_limit_key=? AND observed_slot=?
+                  AND window_minutes=?
+                  AND unixepoch(resets_at_utc)=unixepoch(?)
+                ORDER BY unixepoch(captured_at_utc), unixepoch(resets_at_utc),
+                         source_path, line_offset
+                LIMIT 1""",
+            (
+                identity.source_root_key, identity.logical_limit_key,
+                identity.observed_slot, identity.window_minutes,
+                _utc_iso(resets_at),
+            ),
+        ).fetchone()
+    finally:
+        if owns_conn:
+            cache.close()
+    if row is None:
+        return None
+    try:
+        return (_parse_utc(str(row[0]), "captured_at_utc"), str(row[1]), int(row[2]))
+    except (TypeError, ValueError):
+        return None
 
 
 def codex_quota_breakdown(
     identity: QuotaWindowIdentity,
     resets_at: str | dt.datetime,
-    *, speed: str = "auto",
+    *, speed: str = "auto", cache_conn: sqlite3.Connection | None = None,
+    stats_conn: sqlite3.Connection | None = None,
 ) -> tuple[CodexQuotaBreakdownRow, ...]:
     """Correlate durable milestone boundaries with live-priced cache accounting.
 
@@ -948,16 +989,34 @@ def codex_quota_breakdown(
     if reset.tzinfo is None or reset.utcoffset() is None:
         raise ValueError("resets_at must be timezone-aware")
     reset = reset.astimezone(UTC)
-    points = sorted(_matching_block_observations(identity, reset), key=_physical_tuple)
-    if not points:
-        return ()
-    milestones = _load_active_milestones(identity, reset)
+    milestones = _load_active_milestones(identity, reset, stats_conn=stats_conn)
     if not milestones:
         return ()
-    try:
-        cache = _cache_connection()
-    except (FileNotFoundError, sqlite3.Error):
+    owns_cache = cache_conn is None
+    if cache_conn is None:
+        try:
+            cache = _cache_connection()
+        except (FileNotFoundError, sqlite3.Error):
+            return ()
+    else:
+        cache = cache_conn
+    start = _first_block_physical_tuple(identity, reset, cache_conn=cache)
+    if start is None:
+        if owns_cache:
+            cache.close()
         return ()
+    # ``timestamp_utc`` is stored in canonical ``Z`` form, while retained
+    # quota observations may have arrived as ``+00:00``.  Keep this SQL bound
+    # deliberately one second wider and let the physical-tuple comparison
+    # below enforce the exact inclusive endpoint.  This preserves same-second
+    # path/offset ordering without relying on mixed-spelling text equality.
+    query_start = (
+        start[0] - dt.timedelta(seconds=1)
+    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    query_end = (
+        _parse_utc(str(milestones[-1][1]), "captured_at_utc")
+        + dt.timedelta(seconds=1)
+    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     try:
         entries = []
         for row in cache.execute(
@@ -965,21 +1024,28 @@ def codex_quota_breakdown(
                       input_tokens, cached_input_tokens, output_tokens,
                       reasoning_output_tokens, total_tokens
                  FROM codex_session_entries
-                WHERE source_root_key=?""",
-            (identity.source_root_key,),
+                WHERE source_root_key=?
+                  AND timestamp_utc>=? AND timestamp_utc<=?""",
+            (
+                identity.source_root_key,
+                query_start,
+                query_end,
+            ),
         ):
             try:
-                physical = (_parse_utc(str(row["timestamp_utc"]), "timestamp_utc"),
-                            str(row["source_path"]), int(row["line_offset"]))
+                physical = (
+                    _parse_utc(str(row[0]), "timestamp_utc"),
+                    str(row[1]), int(row[2]),
+                )
             except (TypeError, ValueError):
                 continue
             entries.append((physical, row))
     finally:
-        cache.close()
+        if owns_cache:
+            cache.close()
     entries.sort(key=lambda pair: pair[0])
     resolved_speed = sys.modules["cctally"]._resolve_codex_speed(speed)
     calculate_cost = sys.modules["cctally"]._calculate_codex_entry_cost
-    start = _physical_tuple(points[0])
     prior_cumulative = 0.0
     cumulative_input = 0
     cumulative_cached = 0
@@ -989,20 +1055,19 @@ def codex_quota_breakdown(
     result: list[CodexQuotaBreakdownRow] = []
     for milestone in milestones:
         end = (
-            _parse_utc(str(milestone["captured_at_utc"]), "captured_at_utc"),
-            str(milestone["source_path"]), int(milestone["line_offset"]),
+            _parse_utc(str(milestone[1]), "captured_at_utc"),
+            str(milestone[2]), int(milestone[3]),
         )
         selected = [row for physical, row in entries if start < physical <= end]
-        input_tokens = sum(int(row["input_tokens"]) for row in selected)
-        cached = sum(int(row["cached_input_tokens"]) for row in selected)
-        output = sum(int(row["output_tokens"]) for row in selected)
-        reasoning = sum(int(row["reasoning_output_tokens"]) for row in selected)
-        total = sum(int(row["total_tokens"]) for row in selected)
+        input_tokens = sum(int(row[4]) for row in selected)
+        cached = sum(int(row[5]) for row in selected)
+        output = sum(int(row[6]) for row in selected)
+        reasoning = sum(int(row[7]) for row in selected)
+        total = sum(int(row[8]) for row in selected)
         marginal = sum(
             calculate_cost(
-                str(row["model"]), int(row["input_tokens"]),
-                int(row["cached_input_tokens"]), int(row["output_tokens"]),
-                int(row["reasoning_output_tokens"]), speed=resolved_speed,
+                str(row[3]), int(row[4]), int(row[5]), int(row[6]),
+                int(row[7]), speed=resolved_speed,
             )
             for row in selected
         )
@@ -1013,7 +1078,7 @@ def codex_quota_breakdown(
         cumulative_reasoning += reasoning
         cumulative_total += total
         result.append(CodexQuotaBreakdownRow(
-            percent=int(milestone["percent_threshold"]), captured_at=end[0],
+            percent=int(milestone[0]), captured_at=end[0],
             input_tokens=cumulative_input, cached_input_tokens=cumulative_cached,
             output_tokens=cumulative_output, reasoning_output_tokens=cumulative_reasoning,
             total_tokens=cumulative_total, cost_usd=cumulative,
@@ -1022,6 +1087,76 @@ def codex_quota_breakdown(
         prior_cumulative = cumulative
         start = end
     return tuple(result)
+
+
+def codex_five_hour_percent_at_crossing(
+    identity: QuotaWindowIdentity,
+    captured_at: dt.datetime,
+    observations: Iterable[QuotaObservation] | None = None,
+    *, cache_conn: sqlite3.Connection | None = None,
+) -> float | None:
+    """Return the latest matching native five-hour percent at one crossing."""
+    if observations is not None:
+        eligible = tuple(
+            observation for observation in observations
+            if observation.identity.source_root_key == identity.source_root_key
+            and observation.identity.window_minutes == 300
+            and observation.identity.observed_slot == identity.observed_slot
+            and observation.identity.limit_id == identity.limit_id
+            and observation.captured_at <= captured_at < observation.resets_at
+        )
+        if not eligible:
+            return None
+        return float(max(eligible, key=physical_order_key).used_percent)
+
+    owns_conn = cache_conn is None
+    if cache_conn is None:
+        try:
+            cache = _cache_connection()
+        except (FileNotFoundError, sqlite3.Error):
+            return None
+    else:
+        cache = cache_conn
+    # A valid 300-minute observation that still covers the crossing must have
+    # been captured within the preceding native window.  The extra hour keeps
+    # seconds-level reset jitter and shortened/re-anchored blocks in range
+    # while avoiding a root-wide history reconstruction.
+    lower = (captured_at - dt.timedelta(hours=6)).astimezone(UTC).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    upper = (captured_at + dt.timedelta(seconds=1)).astimezone(UTC).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    try:
+        rows = cache.execute(
+            """SELECT captured_at_utc, resets_at_utc, source_path, line_offset,
+                      used_percent
+                 FROM quota_window_snapshots
+                WHERE source='codex' AND source_root_key=?
+                  AND window_minutes=300 AND observed_slot=? AND limit_id IS ?
+                  AND captured_at_utc>=? AND captured_at_utc<?""",
+            (
+                identity.source_root_key, identity.observed_slot,
+                identity.limit_id, lower, upper,
+            ),
+        ).fetchall()
+    finally:
+        if owns_conn:
+            cache.close()
+    eligible: list[tuple[tuple[dt.datetime, dt.datetime, str, int], float]] = []
+    for row in rows:
+        try:
+            observed_at = _parse_utc(str(row[0]), "captured_at_utc")
+            resets_at = _parse_utc(str(row[1]), "resets_at_utc")
+            physical = (observed_at, resets_at, str(row[2]), int(row[3]))
+            used_percent = float(row[4])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if observed_at <= captured_at < resets_at:
+            eligible.append((physical, used_percent))
+    if not eligible:
+        return None
+    return max(eligible, key=lambda item: item[0])[1]
 
 
 # === Canonical nested `cctally codex quota` CLI ===========================
@@ -1167,23 +1302,40 @@ def _select_histories(
     return selected
 
 
-def _sync_and_load(args, as_of: dt.datetime) -> tuple[QuotaHistory, ...]:
+def _sync_and_load(
+    args, as_of: dt.datetime, *, current_fresh_only: bool = False,
+    reconcile_projection: bool = True,
+) -> tuple[QuotaHistory, ...]:
     c = _cctally()
-    if not getattr(args, "no_sync", False):
+    sync_requested = getattr(args, "sync", None)
+    should_sync = (
+        bool(sync_requested)
+        if sync_requested is not None
+        else not getattr(args, "no_sync", False)
+    )
+    if should_sync:
         cache = c.open_cache_db()
         try:
             c.sync_codex_cache(cache)
         finally:
             cache.close()
-    # All five CLI leaves use the single durable projection reconciler.  It
-    # gives breakdown its milestone index and heals a cache/stats interruption
-    # without ever reinterpreting or mutating physical cache evidence here.
-    reconcile_codex_quota_projection(now=as_of)
-    observations = load_codex_quota_observations()
+    # The nested quota leaves heal the durable projection on every read.  The
+    # peer percent-breakdown command instead mirrors Claude's materialized-read
+    # default; its explicit --sync path still reconciles before rendering.
+    if reconcile_projection:
+        reconcile_codex_quota_projection(now=as_of)
+    observations = load_codex_quota_observations(
+        captured_at_or_after=(
+            as_of - dt.timedelta(hours=1) if current_fresh_only else None
+        ),
+    )
     return build_history(observations)
 
 
-def _command_context(args, *, range_args: bool = False):
+def _command_context(
+    args, *, range_args: bool = False, current_fresh_only: bool = False,
+    reconcile_projection: bool = True,
+):
     c = _cctally()
     config = c._load_claude_config_for_args(args)
     display_tz = c._resolve_display_tz_obj(config)
@@ -1194,7 +1346,10 @@ def _command_context(args, *, range_args: bool = False):
         until = _parse_range_bound(getattr(args, "until", None), display_tz=display_tz, option="--until")
         if since is not None and until is not None and until <= since:
             raise QuotaCLIError("--until must be after --since")
-    histories = _sync_and_load(args, as_of)
+    histories = _sync_and_load(
+        args, as_of, current_fresh_only=current_fresh_only,
+        reconcile_projection=reconcile_projection,
+    )
     selected = _select_histories(
         histories,
         root_key=getattr(args, "root_key", None),
@@ -1431,3 +1586,114 @@ def cmd_codex_quota_breakdown(args) -> int:
     if not rows:
         text_rows.append("No percent milestones.")
     return _emit(args, payload, "\n".join(text_rows))
+
+
+def cmd_codex_percent_breakdown(args) -> int:
+    """Render one native seven-day Codex cycle in the Claude table design."""
+    try:
+        reset_value = getattr(args, "reset_at", None)
+        as_of, _since, _until, selected = _command_context(
+            args, current_fresh_only=not bool(reset_value),
+            reconcile_projection=bool(getattr(args, "sync", False)),
+        )
+        histories = tuple(
+            history for history in selected
+            if history.identity.window_minutes == 10_080
+        )
+        if reset_value:
+            reset_at = _parse_reset_at(reset_value)
+            matching = tuple(
+                (history, block)
+                for history in histories
+                for block in build_blocks(history.physical_observations)
+                if block.resets_at == reset_at
+            )
+        else:
+            matching = tuple(
+                (history, block)
+                for history in histories
+                if (
+                    (baseline := select_baseline(history.observations, as_of))
+                    is not None
+                    and baseline.resets_at > as_of
+                    and quota_freshness(
+                        history.physical_observations, as_of,
+                    ).state == "fresh"
+                )
+                for block in build_blocks(history.physical_observations)
+                if block.resets_at == baseline.resets_at
+            )
+        if len(matching) != 1:
+            raise QuotaCLIError(
+                "percent-breakdown matches no unique native 7-day quota cycle; "
+                "use exact selectors or --reset-at for retained history; candidates:\n"
+                + _candidate_text(histories)
+            )
+    except QuotaCLIError as exc:
+        eprint(f"cctally codex percent-breakdown: {exc}")
+        return 2
+
+    c = _cctally()
+    speed = c._resolve_codex_speed(args.speed)
+    history, block = matching[0]
+    try:
+        cache = _cache_connection()
+    except (FileNotFoundError, sqlite3.Error):
+        cache = None
+    try:
+        rows = codex_quota_breakdown(
+            history.identity, block.resets_at, speed=speed, cache_conn=cache,
+        )
+        five_hour_observations = load_codex_quota_observations(
+            source_root_keys={history.identity.source_root_key},
+            cache_conn=cache,
+            captured_at_or_after=(
+                rows[0].captured_at - dt.timedelta(hours=6) if rows else as_of
+            ),
+        )
+        milestone_list = [
+            {
+                "percentThreshold": row.percent,
+                "cumulativeCostUSD": round(row.cost_usd, 9),
+                "marginalCostUSD": round(row.marginal_cost_usd, 9),
+                "capturedAt": _iso_z(row.captured_at),
+                "fiveHourPercentAtCrossing": (
+                    round(five_hour_percent, 1)
+                    if (five_hour_percent := codex_five_hour_percent_at_crossing(
+                        history.identity, row.captured_at, five_hour_observations,
+                    )) is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+    finally:
+        if cache is not None:
+            cache.close()
+    week_start = block.nominal_start_at.astimezone(UTC)
+    week_end = block.resets_at.astimezone(UTC)
+    output = {
+        "source": "codex",
+        "identity": _identity_wire(history.identity),
+        "weekStartDate": week_start.date().isoformat(),
+        "weekEndDate": (week_end - dt.timedelta(microseconds=1)).date().isoformat(),
+        "weekStartAt": _iso_z(week_start),
+        "weekEndAt": _iso_z(week_end),
+        "milestones": milestone_list,
+        "generatedAt": _iso_z(as_of),
+    }
+    if args.json:
+        print(json.dumps(stamp_schema_version(output), indent=2))
+        return 0
+
+    config = c._load_claude_config_for_args(args)
+    tz = c.resolve_display_tz(args, config)
+    print(c._render_percent_breakdown_terminal(
+        week_start_date=output["weekStartDate"],
+        week_end_date=output["weekEndDate"],
+        display_start_iso=output["weekStartAt"],
+        display_end_iso=output["weekEndAt"],
+        milestone_list=milestone_list,
+        tz=tz,
+    ))
+    return 0

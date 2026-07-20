@@ -39,6 +39,7 @@ edits — the forwarders hit ``sys.modules["_cctally_dashboard"]`` at call time
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sqlite3
 import sys
@@ -224,8 +225,7 @@ _QUALIFIED_SEARCH_ACCEPTED = ("source", "q", "kind", "limit", "cursor")
 _QUALIFIED_FACETS_ACCEPTED = ("source",)
 # A raw browse cursor is a conversation key — printable + URL-safe by construction
 # (§2.2). Syntactic-only validation: reject whitespace/control/empty; echo raw.
-import re as _re_qs  # noqa: E402 — module-level compile for the browse-cursor check
-_BROWSE_CURSOR_RE = _re_qs.compile(r"\A[!-~]+\Z")
+_BROWSE_CURSOR_RE = re.compile(r"\A[!-~]+\Z")
 
 
 def _resolve_effective_speed():

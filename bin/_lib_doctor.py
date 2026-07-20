@@ -1650,10 +1650,10 @@ def _check_db_integrity(s: DoctorState) -> CheckResult:
             summary=f"stats.db quick_check: {s.stats_db_quick_check}",
             remediation=(
                 "stats.db (the non-re-derivable DB) reports corruption. "
-                "Back up the file FIRST, then try "
-                "`sqlite3 <path> \".recover\"` into a fresh file; "
-                "`cctally db recover` does not repair corruption. Please "
-                "file a bug. Do not delete the file."),
+                "Stop the dashboard and other cctally processes, then run "
+                "`cctally db repair --db stats --yes`. The command preserves "
+                "a backup of the corrupt original before replacing anything. "
+                "Do not copy, restore, move, or delete the live DB by hand."),
             details=details,
         )
     if s.cache_db_quick_check is not None and s.cache_db_quick_check != "ok":

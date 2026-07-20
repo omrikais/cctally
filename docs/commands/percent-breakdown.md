@@ -50,3 +50,5 @@ cctally percent-breakdown --json
 
 - [`record-usage`](record-usage.md) — writes the milestones rendered here
 - [`report`](report.md) — `--detail` includes this view inline
+- [`cctally codex percent-breakdown`](codex-percent-breakdown.md) — the Codex
+  native seven-day equivalent with the same terminal design

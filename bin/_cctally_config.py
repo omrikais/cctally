@@ -333,7 +333,7 @@ ALLOWED_CONFIG_KEYS = (
 
 _CODEX_BUDGET_LEAF_PREFIX = "budget.codex."
 
-_DEFAULT_CONVERSATION_RETENTION_DAYS = 180
+_DEFAULT_CONVERSATION_RETENTION_DAYS = 90
 
 
 def _validate_retention_days_value(raw: object) -> int:
@@ -374,9 +374,9 @@ def _validate_retention_days_value(raw: object) -> int:
 def resolve_retention_days(config: dict) -> int:
     """Effective conversation transcript retention in days (F8).
 
-    Default is ``180``; ``0`` disables retention (keep forever). Any malformed
+    Default is ``90``; ``0`` disables retention (keep forever). Any malformed
     persisted value (non-int, boolean, negative, un-parseable string) degrades
-    to the safe 180 default rather than raising.
+    to the safe 90 default rather than raising.
     """
     default = _DEFAULT_CONVERSATION_RETENTION_DAYS
     block = config.get("conversation") if isinstance(config, dict) else None

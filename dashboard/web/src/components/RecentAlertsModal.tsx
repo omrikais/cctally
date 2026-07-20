@@ -189,17 +189,17 @@ export function RecentAlertsModal(): JSX.Element {
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const alertsConfig = useSyncExternalStore(subscribeStore, () => getState().alertsConfig);
-  const codexBudget = env?.sources?.codex?.data?.budget.status;
+  const codexQuota = env?.sources?.codex?.data?.quota.summary;
   const claudeThresholds = alertsConfig.weekly_thresholds?.length
     ? alertsConfig.weekly_thresholds
     : [90, 95];
-  const codexThresholds = codexBudget?.alert_thresholds?.length
-    ? codexBudget.alert_thresholds
-    : [90, 100];
+  const codexThresholds = env?.sources?.codex?.data?.alerts.actual_thresholds?.length
+    ? env.sources.codex.data.alerts.actual_thresholds
+    : [90, 95];
   const usedPct = activeSource === 'claude'
     ? env?.header?.used_pct ?? null
     : activeSource === 'codex'
-      ? codexBudget?.consumption_pct ?? null
+      ? codexQuota?.latest_percent ?? null
       : null;
   const weeklyThresholds = activeSource === 'claude'
     ? claudeThresholds

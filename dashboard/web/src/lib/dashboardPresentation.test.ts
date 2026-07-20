@@ -7,6 +7,7 @@ import {
   presentationPeriodRows,
   presentationProjects,
   presentationProviders,
+  presentationTrend,
 } from './dashboardPresentation';
 import type {
   CodexPeriodBucket,
@@ -124,12 +125,32 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(providers.codex).toBe(env.sources!.codex.data);
   });
 
-  it('Codex period rows use the canonical PeriodRow shape without quota fabrication', () => {
+  it('Codex weekly periods preserve provider-native quota usage and $/1%', () => {
     const env = cloneFixture();
+    Object.assign(env.sources!.codex.data!.periods.weekly.rows[0], {
+      start_at: '2026-07-13T00:00:00Z',
+      end_at: '2026-07-20T00:00:00Z',
+      used_pct: 25,
+      dollar_per_pct: 0.4,
+    });
     const rows = presentationPeriodRows(env, 'codex', 'weekly');
     expect(rows.length).toBeGreaterThan(0);
-    expect(rows[0]).toMatchObject({ used_pct: null, dollar_per_pct: null });
+    expect(rows[0]).toMatchObject({ used_pct: 25, dollar_per_pct: 0.4 });
     expect(rows[0].models[0]).toMatchObject({ display: 'Codex', cost_pct: 100 });
+  });
+
+  it('keeps the canonical $/1% Trend title and values for Codex', () => {
+    const env = cloneFixture();
+    Object.assign(env.sources!.codex.data!.periods.weekly.rows[0], {
+      used_pct: 20,
+      dollar_per_pct: 0.5,
+    });
+
+    const trend = presentationTrend(env, 'codex');
+    expect(trend.title).toBe('$/1% Trend');
+    expect(trend.chartLabel).toBe('$/1% trend:');
+    expect(trend.valueLabel).toBe('$/1%');
+    expect(trend.rows[0]).toMatchObject({ used_pct: 20, dollar_per_pct: 0.5 });
   });
 
   it('maps real Codex per-model costs into canonical model segments', () => {
@@ -144,6 +165,22 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(presentationPeriodRows(env, 'codex', 'monthly')[0].models).toMatchObject([
       { model: 'gpt-5.6-sol', display: '5.6-sol', cost_pct: 70 },
       { model: 'gpt-5.6-terra', display: '5.6-terra', cost_pct: 30 },
+    ]);
+  });
+
+  it('maps real Codex daily model breakdowns instead of a synthetic source row', () => {
+    const env = cloneFixture();
+    const bucket = env.sources!.codex.data!.periods.daily.rows[0];
+    bucket.cost_usd = 10;
+    bucket.model_breakdowns = [
+      { modelName: 'gpt-5.6-sol', cost: 7 },
+      { modelName: 'gpt-5.6-terra', cost: 3 },
+    ];
+
+    const row = presentationDailyRows(env, 'codex').find((item) => item.cost_usd === 10);
+    expect(row?.models).toMatchObject([
+      { model: 'gpt-5.6-sol', cost_pct: 70 },
+      { model: 'gpt-5.6-terra', cost_pct: 30 },
     ]);
   });
 
@@ -165,6 +202,19 @@ describe('provider-neutral dashboard presentation adapters', () => {
     }];
 
     expect(presentationCacheDays(env, 'codex')?.[0].cache_hit_percent).toBe(98);
+  });
+
+  it('uses the provider-computed Codex cache report instead of zero-dollar synthesis', () => {
+    const env = cloneFixture();
+    const report = structuredClone(env.cache_report!);
+    report.days[0].saved_usd = 12.5;
+    report.days[0].net_usd = 12.5;
+    (env.sources!.codex.data! as unknown as { cache_report: typeof report }).cache_report = report;
+
+    expect(presentationCacheDays(env, 'codex')?.[0]).toMatchObject({
+      saved_usd: 12.5,
+      net_usd: 12.5,
+    });
   });
 
   it('gap-fills Codex daily rows to the canonical Claude calendar shape', () => {

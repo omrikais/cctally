@@ -48,18 +48,14 @@ const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
 const GREEN = 'var(--accent-green)';
 
-// #294 S5 §5.5 (layer 2) / §6.6 — the cache-report (forensics) panel stays
-// Claude-only, rendered from the documented legacy `cache_report` fallback.
-// Claude mode renders the panel verbatim (bare — SourcePanelShell short-circuits
-// the claude branch with no extra chrome). In All mode the shell wraps it as a
-// Claude-labeled provider section (source chip), matching every other panel; the
-// Codex section is hidden by the gating table (no forensics domain), so the
-// `codex` renderer is never invoked. Codex-only mode hides the panel entirely
-// (App never mounts a source-hidden panel).
+// Provider-aware cache forensics. Claude keeps the legacy top-level report;
+// Codex publishes the same computed report shape from native inclusive-input
+// cache counters. The card and modal therefore share one canonical renderer.
 export function CacheReportPanel() {
   const env = useSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const adaptedDays = presentationCacheDays(env, activeSource);
+  const nativeReport = env?.sources?.codex?.data?.cache_report ?? undefined;
   const newest = adaptedDays?.[0];
   const adapted: CacheReportEnvelope | undefined = activeSource === 'claude' ? undefined : adaptedDays == null ? undefined : {
     window_days: adaptedDays.length,
@@ -86,7 +82,7 @@ export function CacheReportPanel() {
     fourteen_day_efficiency_ratio: 0,
     is_empty: adaptedDays.length === 0,
   };
-  const cr = activeSource === 'claude' ? env?.cache_report : adapted;
+  const cr = activeSource === 'claude' ? env?.cache_report : nativeReport ?? adapted;
   // Mobile-driven collapse (< 720 px). The `.cache-report-collapsed`
   // modifier class hides the sparkline + secondary subline via the
   // existing @media rule at index.css:4186 so the panel reads as a

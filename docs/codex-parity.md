@@ -185,13 +185,13 @@ combined presentation remain S8.
 
 | Outcome | Claude | Codex | Owner | Truthful contract |
 | --- | --- | --- | --- | --- |
-| source-aware envelope and hero | supported | supported | S4 | `/api/data` adds immutable Claude, Codex, and presentation-only `all` states without changing the legacy Claude subtree. |
+| source-aware envelope and hero | supported | supported | S4/S5 | `/api/data` adds immutable Claude, Codex, and presentation-only `all` states without changing the legacy Claude subtree; Claude and Codex feed the same canonical hero composition from their own cycle data. |
 | periods, sessions, projects, qualified details | supported | supported | S4 | Source-qualified routes own their opaque keys; same labels or native IDs never fall back across providers. |
 | quota blocks and alerts | supported | supported | S4 | Native quota windows and provider-specific alerts stay side by side, never merged. |
 | share backend | supported | supported | S4 | Render, compose, presets, and history carry `source`; `all` renders labelled provider sections rather than a blended quota. |
 | visible source selector and sharing controls | supported | supported | S5 | The Header radiogroup selector (`v` to cycle) drives every panel, modal, alert filter, and share default; capability gating hides ghost panels, and the source picker/matrix stamps every render, compose, preset, and history request with an explicit source. |
 | source-aware dashboard share identity | supported | supported | S5 | Basket items, composer sections, presets, and history rows carry and display their captured source; a mid-flow selector switch never restamps an open share flow; `all` composes provider-labelled sections and never a blended snapshot. |
-| dashboard cache-report / token-reuse forensics panel | supported | deferred | S5 | Claude's cache-report panel ships its cache hit/miss/create/read forensics, so dashboard forensics stay Claude-only; Codex publishes no forensics data domain, so the hero renders the token-reuse counters and a dedicated Codex forensics panel would need an S4-side contract addition first. |
+| dashboard cache-report / token-reuse forensics panel | supported | supported | S5 | Claude and Codex use the canonical Cache Report composition; Codex fills it from its provider-owned computed cache/accounting data instead of displacing the canonical hero metrics with token counters. |
 | debug diagnostics | supported | supported | S4 | Loopback-only `/api/debug/backend` reports source-aware aggregate counts and opaque versions. |
 
 ## S4 dashboard backend contract

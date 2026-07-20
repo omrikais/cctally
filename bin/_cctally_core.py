@@ -1098,11 +1098,19 @@ def open_db() -> sqlite3.Connection:
     _log_migration_error = c._log_migration_error
     _clear_migration_error_log_entries = c._clear_migration_error_log_entries
 
+    repair_marker = DB_PATH.with_name("stats.db.repairing")
+    if repair_marker.exists():
+        raise c.StatsDbMaintenanceError()
     ensure_dirs()
+    if repair_marker.exists():
+        raise c.StatsDbMaintenanceError()
     conn = sqlite3.connect(DB_PATH)
+    if repair_marker.exists():
+        conn.close()
+        raise c.StatsDbMaintenanceError()
     conn.row_factory = sqlite3.Row
     # #279 S1 F4: probe connect + initial PRAGMAs so a corrupt stats.db (the
-    # non-re-derivable DB) surfaces as a one-line diagnosis + exit 2 instead of
+    # non-re-derivable DB) surfaces as a one-line diagnosis + staged exit 3 instead of
     # a raw traceback. The catch boundary is DELIBERATELY narrow — ONLY the
     # connect/PRAGMA/probe below. The DDL + `_run_pending_migrations` region
     # further down is NOT wrapped: migration-handler failures have their own
@@ -1133,8 +1141,9 @@ def open_db() -> sqlite3.Connection:
         raise c.StatsDbCorruptError(
             f"stats.db appears corrupt or unreadable ({exc}). path: {DB_PATH}. "
             f"Not auto-recreated — it holds your recorded usage history. "
-            f'Recovery: back up the file, then try `sqlite3 "{DB_PATH}" ".recover"`, '
-            f"or move it aside to start fresh. If this recurs, please file an issue."
+            "Recovery: run `cctally db repair --db stats --yes`; it preserves "
+            "the corrupt original before replacing anything. Do not copy, "
+            "restore, or move the live DB by hand."
         ) from exc
     conn.execute(
         """

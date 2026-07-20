@@ -50,7 +50,7 @@ terminal/JSON/empty output is unchanged; they now also accept read-only
 ```
 cctally codex <command> [flags]
 
-<command> ∈ { daily, monthly, session, weekly, project, diff, range-cost, cache-report, report, quota }
+<command> ∈ { daily, monthly, session, weekly, project, diff, range-cost, cache-report, report, percent-breakdown, quota }
 ```
 
 ## Subcommands
@@ -66,6 +66,7 @@ cctally codex <command> [flags]
 | `cctally codex range-cost` | `cctally range-cost --source codex` | _cctally extension_ | [range-cost.md](range-cost.md) |
 | `cctally codex cache-report` | `cctally cache-report --source codex` | _cctally extension_ | [cache-report.md](cache-report.md) |
 | `cctally codex report` | `cctally report --source codex` | _cctally extension_ | [report.md](report.md) |
+| `cctally codex percent-breakdown` | native seven-day quota milestones | _cctally extension_ | [codex-percent-breakdown.md](codex-percent-breakdown.md) |
 | `cctally codex quota …` | native nested surface | _cctally extension_ | [codex-quota.md](codex-quota.md) |
 
 For the four accounting leaves, every flag, exit code, and output shape is
@@ -80,6 +81,7 @@ cctally codex daily --since 2026-05-01
 cctally codex monthly --breakdown
 cctally codex session --json
 cctally codex weekly
+cctally codex percent-breakdown
 cctally codex quota statusline
 cctally codex quota forecast --json
 ```
@@ -100,7 +102,8 @@ cctally codex quota forecast --json
 - `--speed {auto,standard,fast}` is accepted by the four accounting leaves
   (`daily`, `monthly`, `session`, and `weekly`), the five fixed-source
   provider-aware analytics leaves (`project`, `diff`, `range-cost`,
-  `cache-report`, and `report`), and `cctally codex quota breakdown`. For the
+  `cache-report`, and `report`), `cctally codex percent-breakdown`, and
+  `cctally codex quota breakdown`. For the
   fixed-source analytics leaves it selects the Codex query-time pricing tier
   just as `--source codex` does on their flat counterparts; it does not change
   their fixed Codex source. On quota it is accepted only by `breakdown`, where
@@ -128,3 +131,5 @@ cctally codex quota forecast --json
   [`codex-weekly`](codex-weekly.md)
 - [`codex-quota`](codex-quota.md) — native quota history, status, forecast,
   reset blocks, and percent-crossing breakdown
+- [`codex-percent-breakdown`](codex-percent-breakdown.md) — the canonical
+  seven-day per-percent cost table

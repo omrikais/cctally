@@ -67,8 +67,11 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
@@ -248,11 +251,52 @@ class StatsDbCorruptError(sqlite3.DatabaseError):
     Subclasses ``sqlite3.DatabaseError`` so graceful-degrade sites (doctor,
     dashboard/TUI background threads, the 5h-anchor fallback) keep treating it
     as a DB failure exactly as before — but command-level handlers that map DB
-    errors to OTHER exit codes must re-raise it so the global exit-2 diagnosis
+    errors to OTHER exit codes must re-raise it so the global staged diagnosis
     wins (``cmd_record_credit`` does; its documented DB-error exit is 3). NOT
     auto-recreated: stats.db is the non-re-derivable DB (recorded usage
     history), unlike cache.db.
     """
+
+
+class StatsDbMaintenanceError(sqlite3.OperationalError):
+    """A guided repair owns stats.db; new cctally opens must stay out."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "stats.db repair is in progress; retry after the repair command exits"
+        )
+
+
+_SQLITE_CORRUPTION_MESSAGES = (
+    "database disk image is malformed",
+    "file is not a database",
+    "malformed database schema",
+)
+
+
+def _is_sqlite_corruption_error(value: object) -> bool:
+    """Recognize SQLITE_CORRUPT / SQLITE_NOTADB, including string-only hops.
+
+    Some orchestration layers intentionally serialize an inner DB failure into
+    a structured ``reason`` string.  Prefer SQLite's numeric code when the
+    exception still carries it, then use the narrow canonical messages for the
+    string-only boundary (#314).
+    """
+    code = getattr(value, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        primary = code & 0xFF
+        if primary in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+            return True
+    text = str(value).casefold()
+    return any(token in text for token in _SQLITE_CORRUPTION_MESSAGES)
+
+
+def _stats_corruption_guidance() -> str:
+    return (
+        "stats.db is corrupt — run `cctally db repair --db stats --yes`. "
+        "The repair command preserves the corrupt original before replacing "
+        "anything; do not copy or restore the live DB by hand."
+    )
 
 
 class MigrationGateNotMet(Exception):
@@ -6134,6 +6178,655 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         return 0
     finally:
         conn.close()
+
+
+def _db_backup_timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _repair_marker_path(path: pathlib.Path) -> pathlib.Path:
+    return path.with_name("stats.db.repairing")
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_repair_marker(path: pathlib.Path) -> "tuple[bool, str]":
+    """Atomically block new cctally stats opens; reclaim dead-owner markers."""
+    marker = _repair_marker_path(path)
+    for _attempt in range(2):
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                owner = int(marker.read_text().strip())
+            except (OSError, ValueError):
+                owner = -1
+            if _pid_is_alive(owner):
+                return False, f"another stats.db repair owns {marker} (pid {owner})"
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return False, f"could not remove stale repair marker {marker}: {exc}"
+            continue
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_directory(marker.parent)
+        return True, ""
+    return False, f"could not claim repair marker {marker}"
+
+
+def _release_repair_marker(path: pathlib.Path) -> None:
+    marker = _repair_marker_path(path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(marker.parent)
+
+
+def _db_family_open_pids(path: pathlib.Path) -> "set[int] | None":
+    """Return processes with main/WAL/SHM open; None means unverifiable."""
+    family = [
+        pathlib.Path(str(path) + suffix)
+        for suffix in ("", "-wal", "-shm")
+        if pathlib.Path(str(path) + suffix).exists()
+    ]
+    lsof = shutil.which("lsof")
+    if lsof:
+        try:
+            result = subprocess.run(
+                [lsof, "-F", "p", "--", *(str(item) for item in family)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        return {
+            int(line[1:])
+            for line in result.stdout.splitlines()
+            if line.startswith("p") and line[1:].isdigit()
+        }
+
+    proc = pathlib.Path("/proc")
+    if not proc.is_dir():
+        return None
+    try:
+        identities = {(item.stat().st_dev, item.stat().st_ino) for item in family}
+    except OSError:
+        return None
+    pids: set[int] = set()
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            descriptors = (process / "fd").iterdir()
+            for descriptor in descriptors:
+                try:
+                    st = descriptor.stat()
+                except OSError:
+                    continue
+                if (st.st_dev, st.st_ino) in identities:
+                    pids.add(int(process.name))
+                    break
+        except (OSError, PermissionError):
+            continue
+    return pids
+
+
+def _unique_sibling_path(path: pathlib.Path) -> pathlib.Path:
+    """Return ``path`` or a numbered sibling without overwriting owner data."""
+    def family_exists(candidate: pathlib.Path) -> bool:
+        return any(
+            pathlib.Path(str(candidate) + suffix).exists()
+            for suffix in ("", "-wal", "-shm")
+        )
+
+    if not family_exists(path):
+        return path
+    for number in range(2, 10_000):
+        candidate = path.with_name(f"{path.name}-{number}")
+        if not family_exists(candidate):
+            return candidate
+    raise OSError(f"could not allocate a unique backup path beside {path}")
+
+
+def _fsync_file(path: pathlib.Path) -> None:
+    with path.open("rb") as fh:
+        os.fsync(fh.fileno())
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _copy_db_family(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    suffixes: "tuple[str, ...]" = ("", "-wal", "-shm"),
+) -> None:
+    """Copy main/WAL/SHM bytes while the caller holds SQLite's writer lock."""
+    for suffix in suffixes:
+        src = pathlib.Path(str(source) + suffix)
+        if not src.exists():
+            continue
+        dst = pathlib.Path(str(destination) + suffix)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o600)
+        _fsync_file(dst)
+
+
+def _read_user_version_header(path: pathlib.Path) -> "int | None":
+    """Read SQLite's big-endian user_version field without opening pages."""
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(100)
+    except OSError:
+        return None
+    if len(header) < 64 or header[:16] != b"SQLite format 3\x00":
+        return None
+    return int.from_bytes(header[60:64], "big", signed=False)
+
+
+def _table_counts_best_effort(conn: sqlite3.Connection) -> dict[str, "int | None"]:
+    try:
+        names = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+    except sqlite3.DatabaseError:
+        return {}
+    counts: dict[str, int | None] = {}
+    for name in names:
+        quoted = '"' + name.replace('"', '""') + '"'
+        try:
+            counts[name] = int(conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+        except sqlite3.DatabaseError:
+            counts[name] = None
+    return counts
+
+
+def _run_sqlite_recover(
+    sqlite_binary: str,
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    scratch: pathlib.Path,
+) -> "tuple[bool, str]":
+    """Stream sqlite3 ``.recover`` through a SQL file into a fresh database."""
+    sql_path = scratch / "recover.sql"
+    try:
+        with sql_path.open("wb") as sql_out:
+            recovered = subprocess.run(
+                [sqlite_binary, str(source), ".recover"],
+                stdout=sql_out,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except OSError as exc:
+        return False, str(exc)
+    if recovered.returncode != 0:
+        reason = recovered.stderr.decode("utf-8", "replace").strip()
+        return False, reason or f"sqlite3 .recover exited {recovered.returncode}"
+    try:
+        with sql_path.open("rb") as sql_in:
+            imported = subprocess.run(
+                [sqlite_binary, str(destination)],
+                stdin=sql_in,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except OSError as exc:
+        return False, str(exc)
+    if imported.returncode != 0:
+        reason = imported.stderr.decode("utf-8", "replace").strip()
+        return False, reason or f"sqlite3 import exited {imported.returncode}"
+    return True, ""
+
+
+def _repair_preflight_and_copy(
+    path: pathlib.Path,
+    backup: pathlib.Path,
+    snapshot: pathlib.Path,
+    *,
+    timeout_ms: int,
+) -> "tuple[int, dict[str, int | None], int | None, sqlite3.Connection | None, str]":
+    """Preserve forensic bytes, drain WAL, and return a held writer guard."""
+    conn = sqlite3.connect(
+        f"file:{path}?mode=rw", uri=True, timeout=max(timeout_ms, 0) / 1000
+    )
+    try:
+        if _would_block_prod_migration(conn):
+            conn.close()
+            return 2, {}, None, None, "prod guard"
+        conn.execute(f"PRAGMA busy_timeout={max(timeout_ms, 0)}")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            return 3, {}, None, None, str(exc)
+        try:
+            quick = conn.execute("PRAGMA quick_check(1)").fetchone()
+        except sqlite3.DatabaseError:
+            quick = None
+        if quick is not None and quick[0] == "ok":
+            conn.rollback()
+            conn.close()
+            return 4, {}, None, None, "quick_check ok"
+
+        # Preserve the exact corrupt family before checkpointing mutates the
+        # main/WAL representation. No other cctally process can open after the
+        # repair marker, and the caller has already proved no old handle exists.
+        _copy_db_family(path, backup)
+        _fsync_directory(path.parent)
+        conn.rollback()
+
+        try:
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            return 3, {}, None, None, f"WAL checkpoint failed: {exc}"
+        wal_path = pathlib.Path(str(path) + "-wal")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        if checkpoint is None or int(checkpoint[0]) != 0 or wal_bytes != 0:
+            conn.close()
+            return 3, {}, None, None, "WAL could not be fully checkpointed"
+
+        # Hold this one write exclusion continuously through .recover and the
+        # main-file replace. Since the WAL is empty, replacement failure leaves
+        # the old main file coherent and no committed frames can be lost.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            return 3, {}, None, None, str(exc)
+        try:
+            source_version = int(
+                conn.execute("PRAGMA user_version").fetchone()[0]
+            )
+        except sqlite3.DatabaseError:
+            source_version = None
+        counts = _table_counts_best_effort(conn)
+        _copy_db_family(path, snapshot, suffixes=("",))
+        return 0, counts, source_version, conn, ""
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.DatabaseError:
+            pass
+        conn.close()
+        raise
+
+
+def cmd_db_repair(args: argparse.Namespace) -> int:
+    """Claim exclusive maintenance ownership, then repair stats.db (#314)."""
+    path = _cctally_core.DB_PATH
+    if not path.exists():
+        print("cctally: stats.db not present; nothing to repair.")
+        return 0
+    if not getattr(args, "yes", False):
+        eprint(
+            "cctally: repairing stats.db replaces the live non-re-derivable "
+            "database after preserving the corrupt original. Re-run with "
+            "--yes after stopping the dashboard and other cctally processes."
+        )
+        return 2
+
+    try:
+        claimed, reason = _claim_repair_marker(path)
+    except OSError as exc:
+        eprint(f"cctally: could not create stats.db repair marker: {exc}")
+        return 3
+    if not claimed:
+        eprint(f"cctally: {reason}")
+        return 3
+    try:
+        rc = _cmd_db_repair_exclusive(args, path)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(f"cctally: stats.db repair failed before completion: {exc}")
+        rc = 3
+    except Exception as exc:  # defensive: marker cleanup still must run
+        eprint(f"cctally: unexpected stats.db repair failure: {exc}")
+        rc = 3
+    try:
+        _release_repair_marker(path)
+    except OSError as exc:
+        eprint(
+            f"cctally: stats.db repair marker cleanup failed ({exc}); "
+            f"remove {_repair_marker_path(path)} after confirming no repair runs."
+        )
+        return 3
+    return rc
+
+
+def _cmd_db_repair_exclusive(args: argparse.Namespace, path: pathlib.Path) -> int:
+    """Verify no pre-marker handle remains, then enter the repair body."""
+    open_pids = _db_family_open_pids(path)
+    if open_pids is None:
+        eprint(
+            "cctally: cannot verify that stats.db has no open handles on "
+            "this platform; refusing the destructive repair."
+        )
+        return 3
+    if open_pids:
+        eprint(
+            "cctally: stats.db is still open in process(es) "
+            + ", ".join(str(pid) for pid in sorted(open_pids))
+            + ". Stop the dashboard and other cctally processes, then retry."
+        )
+        return 3
+    return _cmd_db_repair_claimed(args, path)
+
+
+def _cmd_db_repair_claimed(args: argparse.Namespace, path: pathlib.Path) -> int:
+    """Repair body; caller owns the marker and has proved no old handles."""
+
+    timeout_ms = int(getattr(args, "busy_timeout_ms", 250) or 250)
+    stamp = _db_backup_timestamp()
+    backup = _unique_sibling_path(
+        path.with_name(f"{path.name}.bak-corrupt-malformed-{stamp}")
+    )
+    with tempfile.TemporaryDirectory(
+        prefix=".cctally-repair-", dir=path.parent
+    ) as scratch_raw:
+        scratch = pathlib.Path(scratch_raw)
+        snapshot = scratch / path.name
+        recovered_path = scratch / "recovered.db"
+        try:
+            (
+                preflight_rc,
+                source_counts,
+                source_version,
+                guard,
+                preflight_reason,
+            ) = _repair_preflight_and_copy(
+                path, backup, snapshot, timeout_ms=timeout_ms
+            )
+        except (OSError, sqlite3.DatabaseError) as exc:
+            eprint(f"cctally: could not preserve stats.db before repair: {exc}")
+            return 3
+        if preflight_rc == 2:
+            eprint(
+                "cctally: refusing to repair stats.db in the prod data dir "
+                "(~/.local/share/cctally) from a dev checkout. Run the "
+                "installed binary, or override with "
+                "CCTALLY_ALLOW_PROD_MIGRATION=1."
+            )
+            return 2
+        if preflight_rc == 3:
+            eprint(
+                "cctally: could not establish a quiescent stats.db writer "
+                f"guard ({preflight_reason}). The DB is still in use or too "
+                "damaged to lock safely. "
+                "Stop the dashboard and other cctally processes, then retry; "
+                "nothing was changed."
+            )
+            return 3
+        if preflight_rc == 4:
+            eprint(
+                "cctally: stats.db quick_check is ok; refusing a destructive "
+                "repair. Use `cctally db backup --db stats` for a safe backup."
+            )
+            return 2
+
+        assert guard is not None
+
+        def close_guard() -> None:
+            nonlocal guard
+            if guard is None:
+                return
+            try:
+                guard.rollback()
+            except sqlite3.DatabaseError:
+                pass
+            guard.close()
+            guard = None
+
+        # PRAGMA user_version above is WAL-aware. The WAL was then checkpointed
+        # before the snapshot; use its main header only if the pragma itself was
+        # unreadable rather than inventing a version (#148).
+        if source_version is None:
+            source_version = _read_user_version_header(snapshot)
+        if source_version is None:
+            eprint(
+                "cctally: the SQLite header is too damaged to preserve "
+                "PRAGMA user_version safely; refusing the automated swap. "
+                f"The live DB is untouched and the corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+
+        sqlite_binary = (
+            getattr(args, "sqlite3_binary", None) or shutil.which("sqlite3")
+        )
+        if not sqlite_binary:
+            eprint(
+                "cctally: db repair requires the sqlite3 command-line tool for "
+                'its corruption-tolerant ".recover" operation. The live DB is '
+                f"untouched and the corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+
+        ok, reason = _run_sqlite_recover(
+            str(sqlite_binary), snapshot, recovered_path, scratch
+        )
+        if not ok:
+            eprint(
+                f"cctally: sqlite3 recovery failed: {reason}. The corrupt "
+                f"original was preserved at {backup}."
+            )
+            close_guard()
+            return 3
+
+        try:
+            recovered_conn = sqlite3.connect(recovered_path)
+            try:
+                if source_version is not None:
+                    recovered_conn.execute(
+                        f"PRAGMA user_version={int(source_version)}"
+                    )
+                    recovered_conn.commit()
+                recovered_version = int(
+                    recovered_conn.execute("PRAGMA user_version").fetchone()[0]
+                )
+                integrity_rows = recovered_conn.execute(
+                    "PRAGMA integrity_check"
+                ).fetchall()
+                recovered_counts = _table_counts_best_effort(recovered_conn)
+            finally:
+                recovered_conn.close()
+        except sqlite3.DatabaseError as exc:
+            eprint(
+                f"cctally: recovered stats.db could not be verified ({exc}); "
+                f"the live DB is untouched and the corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+
+        if integrity_rows != [("ok",)]:
+            eprint(
+                "cctally: recovered stats.db failed integrity_check; the live "
+                f"DB is untouched and the corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+        recovered_usage = recovered_counts.get("weekly_usage_snapshots")
+        if recovered_usage is None:
+            eprint(
+                "cctally: recovered stats.db has no readable "
+                "weekly_usage_snapshots table; refusing to replace the live DB. "
+                f"The corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+        source_usage = source_counts.get("weekly_usage_snapshots")
+        if source_usage is None:
+            eprint(
+                "cctally: source weekly_usage_snapshots count is unreadable; "
+                "refusing an automated swap that cannot prove preservation. "
+                f"The live DB is untouched and the corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+        if recovered_usage != source_usage:
+            eprint(
+                "cctally: recovered weekly_usage_snapshots count changed "
+                f"({source_usage} -> {recovered_usage}); refusing the swap. "
+                f"The corrupt backup is {backup}."
+            )
+            close_guard()
+            return 3
+
+        try:
+            os.chmod(recovered_path, 0o600)
+            _fsync_file(recovered_path)
+            # WAL is already fully checkpointed and this same guard has blocked
+            # every writer since capture. Replace the coherent main file first;
+            # a failed replace therefore leaves the old coherent main + empty
+            # sidecars intact. New cctally opens remain blocked by the marker.
+            os.replace(recovered_path, path)
+            _fsync_directory(path.parent)
+            close_guard()
+            for suffix in ("-wal", "-shm"):
+                try:
+                    pathlib.Path(str(path) + suffix).unlink()
+                except FileNotFoundError:
+                    pass
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            close_guard()
+            eprint(
+                f"cctally: final stats.db swap failed ({exc}); the corrupt "
+                f"original remains preserved at {backup}."
+            )
+            return 3
+
+    print(f"cctally: repaired stats.db; integrity_check ok; user_version {recovered_version}.")
+    print(
+        "cctally: weekly_usage_snapshots: "
+        f"{source_usage} -> {recovered_usage}."
+    )
+    differences = []
+    for name in sorted(set(source_counts) | set(recovered_counts)):
+        before = source_counts.get(name)
+        after = recovered_counts.get(name)
+        if name == "weekly_usage_snapshots" or before == after:
+            continue
+        before_label = (
+            "missing" if name not in source_counts
+            else ("source unreadable" if before is None else str(before))
+        )
+        after_label = (
+            "missing" if name not in recovered_counts
+            else ("unreadable" if after is None else str(after))
+        )
+        differences.append(f"{name}: {before_label} -> {after_label}")
+    if differences:
+        print("cctally: recovered row differences: " + "; ".join(differences))
+    print(f"cctally: corrupt original preserved at {backup}")
+    return 0
+
+
+def cmd_db_backup(args: argparse.Namespace) -> int:
+    """Create one consistent SQLite online-backup snapshot (#314)."""
+    which = args.db
+    if which == "cache":
+        path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
+    else:
+        path, label = _cctally_core.DB_PATH, "stats.db"
+    if not path.exists():
+        print(f"cctally: {label} not present; nothing to back up.")
+        return 0
+
+    raw_output = (
+        getattr(args, "backup_output", None)
+        or getattr(args, "output", None)  # direct-call compatibility
+    )
+    if raw_output:
+        output = pathlib.Path(raw_output).expanduser()
+    else:
+        output = _unique_sibling_path(
+            path.with_name(f"{path.name}.bak-{_db_backup_timestamp()}")
+        )
+    if output.exists():
+        eprint(f"cctally: backup destination already exists: {output}")
+        return 2
+    if not output.parent.exists():
+        eprint(f"cctally: backup destination directory does not exist: {output.parent}")
+        return 2
+
+    timeout_ms = int(getattr(args, "busy_timeout_ms", 15_000) or 15_000)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output.name}.tmp-", dir=output.parent
+        ) as scratch_raw:
+            temp_path = pathlib.Path(scratch_raw) / output.name
+            source = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, timeout=max(timeout_ms, 0) / 1000
+            )
+            destination = sqlite3.connect(temp_path)
+            try:
+                source.execute(f"PRAGMA busy_timeout={max(timeout_ms, 0)}")
+                source.backup(destination)
+                destination.commit()
+                rows = destination.execute("PRAGMA integrity_check").fetchall()
+            finally:
+                destination.close()
+                source.close()
+            if rows != [("ok",)]:
+                eprint(f"cctally: backup integrity_check failed for {label}")
+                return 3
+            os.chmod(temp_path, 0o600)
+            _fsync_file(temp_path)
+            try:
+                # Hard-link publication is same-filesystem and fails atomically
+                # if another process created the destination after validation.
+                # TemporaryDirectory then removes only its original link.
+                os.link(temp_path, output)
+            except FileExistsError:
+                eprint(f"cctally: backup destination already exists: {output}")
+                return 2
+            _fsync_directory(output.parent)
+    except sqlite3.DatabaseError as exc:
+        if which == "stats" and _is_sqlite_corruption_error(exc):
+            eprint(f"cctally: {_stats_corruption_guidance()}")
+        else:
+            eprint(f"cctally: could not back up {label}: {exc}")
+        return 3
+    except OSError as exc:
+        eprint(f"cctally: could not back up {label}: {exc}")
+        return 3
+
+    print(f"cctally: backed up {label} to {output} (integrity_check ok).")
+    return 0
 
 
 def cmd_db_checkpoint(args: argparse.Namespace) -> int:

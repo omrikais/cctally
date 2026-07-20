@@ -140,6 +140,41 @@ def test_codex_blocks_wire_uses_current_cycle_five_hour_activity_and_models(
         stats.close()
 
 
+def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    entry = SimpleNamespace(
+        timestamp=NOW - dt.timedelta(hours=1),
+        source_root_key="root-a",
+        source_path="/private/session.jsonl",
+        project_label="cctally-dev",
+        model="gpt-5",
+        input_tokens=100,
+        cached_input_tokens=80,
+        output_tokens=10,
+        reasoning_output_tokens=2,
+        total_tokens=110,
+        cost_usd=0.01,
+    )
+
+    report = source_module._codex_cache_report_wire(
+        (entry,), metadata={}, now_utc=NOW,
+        display_tz_name="UTC", speed="standard",
+    )
+
+    assert report["is_empty"] is False
+    assert report["days"][0]["cache_hit_percent"] == pytest.approx(80.0)
+    assert report["days"][0]["saved_usd"] == pytest.approx(
+        80 * (1.25e-6 - 1.25e-7)
+    )
+    assert report["days"][0]["net_usd"] == report["days"][0]["saved_usd"]
+    assert report["by_project"][0]["key"] == "cctally-dev"
+    assert report["by_model"][0]["key"] == "gpt-5"
+
+
 def test_codex_cycle_selects_the_active_seven_day_boundary_over_five_hour_limit():
     source_module = sys.modules["_cctally_dashboard_sources"]
     reset = NOW + dt.timedelta(days=2)
@@ -244,6 +279,16 @@ def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
             "07-01 00:00", "07-03 00:00",
         ]
         assert [row.input_tokens for row in view.rows] == [100, 500]
+        assert [row.used_pct for row in view.rows] == [10, 10]
+        assert all(row.dollar_per_pct == pytest.approx(row.cost_usd / 10) for row in view.rows)
+        assert [row.period_start_at for row in view.rows] == [
+            dt.datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
+            dt.datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+        ]
+        assert [row.period_end_at for row in view.rows] == [
+            dt.datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+            dt.datetime(2026, 7, 10, 0, 0, 30, tzinfo=UTC),
+        ]
         assert view.total_tokens == 660
     finally:
         stats.close()
@@ -1823,6 +1868,166 @@ def test_dashboard_quota_read_model_caps_histories_active_rows_and_milestones():
         assert len(quota["histories"]) <= source_module.SOURCE_HISTORY_LIMIT
         assert len(quota["summary"]["active"]) <= source_module.SOURCE_HISTORY_LIMIT
         assert len(quota["milestones"]) <= source_module.SOURCE_HISTORY_LIMIT
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_dashboard_quota_milestones_include_native_window_and_accounting_costs():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    cache = sqlite3.connect(":memory:")
+    stats = sqlite3.connect(":memory:")
+    now = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
+    reset = now + dt.timedelta(days=2)
+    identity = QuotaWindowIdentity(
+        source="codex", source_root_key="root-a", logical_limit_key="weekly",
+        observed_slot="primary", window_minutes=10_080,
+    )
+    observations = (
+        QuotaObservation(
+            identity=identity, captured_at=now - dt.timedelta(hours=2),
+            used_percent=5.0, resets_at=reset,
+            source_path="/private/a.jsonl", line_offset=1,
+        ),
+        QuotaObservation(
+            identity=identity, captured_at=now - dt.timedelta(hours=1),
+            used_percent=6.0, resets_at=reset,
+            source_path="/private/a.jsonl", line_offset=2,
+        ),
+    )
+    accounting_entries = (
+        SimpleNamespace(
+            source_root_key="root-a", timestamp=now - dt.timedelta(hours=3),
+            cost_usd=1.25,
+        ),
+        SimpleNamespace(
+            source_root_key="root-a", timestamp=now - dt.timedelta(hours=1),
+            cost_usd=2.75,
+        ),
+    )
+    try:
+        quota = source_module._quota_read_model(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=now, display_tz_name="UTC",
+            ),
+            observations,
+            accounting_entries=accounting_entries,
+        )
+
+        milestone = quota["milestones"][0]
+        assert milestone["quota_key"] == quota["histories"][0]["key"]
+        assert milestone["window_minutes"] == 10_080
+        assert milestone["resets_at"] == reset.isoformat()
+        assert milestone["cumulative_usd"] == pytest.approx(4.0)
+        assert milestone["marginal_usd"] == pytest.approx(4.0)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_dashboard_current_cycle_uses_complete_durable_quota_breakdown():
+    """The hero modal must not rebuild milestones from its capped read tail.
+
+    The dashboard observation slice starts at 5%, while the durable projection
+    retains the complete 1-6% block derived from the rollout JSONLs.  The modal
+    contract is the canonical durable breakdown, not only the late 6% crossing.
+    """
+    load_script()
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    cache = sqlite3.connect(":memory:")
+    stats = sqlite3.connect(":memory:")
+    now = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
+    reset = now + dt.timedelta(days=2)
+    identity = QuotaWindowIdentity(
+        source="codex", source_root_key="root-a", logical_limit_key="weekly",
+        observed_slot="primary", window_minutes=10_080,
+    )
+    cache.executescript("""
+        CREATE TABLE quota_window_snapshots (
+            source TEXT, source_root_key TEXT, source_path TEXT,
+            line_offset INTEGER, captured_at_utc TEXT, observed_slot TEXT,
+            logical_limit_key TEXT, limit_id TEXT, limit_name TEXT,
+            window_minutes INTEGER, used_percent REAL, resets_at_utc TEXT,
+            plan_type TEXT, individual_limit_json TEXT, reached_type TEXT
+        );
+        CREATE TABLE codex_session_entries (
+            timestamp_utc TEXT, source_path TEXT, line_offset INTEGER,
+            model TEXT, input_tokens INTEGER, cached_input_tokens INTEGER,
+            output_tokens INTEGER, reasoning_output_tokens INTEGER,
+            total_tokens INTEGER, source_root_key TEXT
+        );
+    """)
+    stats.executescript("""
+        CREATE TABLE quota_percent_milestones (
+            source TEXT, source_root_key TEXT, logical_limit_key TEXT,
+            observed_slot TEXT, window_minutes INTEGER, resets_at_utc TEXT,
+            percent_threshold INTEGER, captured_at_utc TEXT,
+            source_path TEXT, line_offset INTEGER, orphaned_at TEXT
+        );
+    """)
+    path = "/private/a.jsonl"
+    for percent in range(7):
+        captured = now - dt.timedelta(hours=7 - percent)
+        cache.execute(
+            "INSERT INTO quota_window_snapshots VALUES "
+            "('codex', 'root-a', ?, ?, ?, 'primary', 'weekly', NULL, NULL, "
+            "10080, ?, ?, NULL, NULL, NULL)",
+            (path, percent, captured.isoformat(), float(percent), reset.isoformat()),
+        )
+        cache.execute(
+            "INSERT INTO quota_window_snapshots VALUES "
+            "('codex', 'root-a', ?, ?, ?, 'primary', 'five-hour', NULL, NULL, "
+            "300, ?, ?, NULL, NULL, NULL)",
+            (
+                path, 100 + percent, captured.isoformat(), float(percent * 2),
+                (captured + dt.timedelta(hours=4)).isoformat(),
+            ),
+        )
+        if percent:
+            stats.execute(
+                "INSERT INTO quota_percent_milestones VALUES "
+                "('codex', 'root-a', 'weekly', 'primary', 10080, ?, ?, ?, ?, ?, NULL)",
+                (reset.isoformat(), percent, captured.isoformat(), path, percent),
+            )
+            cache.execute(
+                "INSERT INTO codex_session_entries VALUES "
+                "(?, ?, ?, 'gpt-5', 1000, 500, 100, 25, 1100, 'root-a')",
+                (captured.isoformat(), path, percent),
+            )
+    cache.commit()
+    stats.commit()
+    # Simulate the dashboard's capped tail: the complete 1-4% crossings are
+    # absent here but remain available in the durable projection above.
+    observations = (
+        QuotaObservation(
+            identity=identity, captured_at=now - dt.timedelta(hours=2),
+            used_percent=5.0, resets_at=reset,
+            source_path=path, line_offset=5,
+        ),
+        QuotaObservation(
+            identity=identity, captured_at=now - dt.timedelta(hours=1),
+            used_percent=6.0, resets_at=reset,
+            source_path=path, line_offset=6,
+        ),
+    )
+    try:
+        quota = source_module._quota_read_model(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=now, display_tz_name="UTC", speed="standard",
+            ),
+            observations,
+        )
+
+        weekly = [
+            row for row in quota["milestones"]
+            if row["window_minutes"] == 10_080
+        ]
+        assert [row["percent"] for row in weekly] == [6, 5, 4, 3, 2, 1]
+        assert weekly[0]["cumulative_usd"] > weekly[-1]["cumulative_usd"]
+        assert all(row["marginal_usd"] > 0 for row in weekly)
+        assert [row["five_hour_percent"] for row in weekly] == [12, 10, 8, 6, 4, 2]
     finally:
         cache.close()
         stats.close()

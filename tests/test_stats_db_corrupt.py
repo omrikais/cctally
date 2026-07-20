@@ -1,10 +1,10 @@
-"""#279 S1 F4 — corrupt stats.db yields diagnosis + exit 2, not a traceback.
+"""#279 S1 F4 / #314 — corruption yields staged guidance, not a traceback.
 
 stats.db is the non-re-derivable DB (recorded usage history). Before this fix,
 `open_db()` connected + ran PRAGMAs/DDL with no `sqlite3.DatabaseError`
 handling, so a corrupt file surfaced as `Error: file is not a database` (rc 1)
-or a raw traceback, and `record-credit` mapped it to its documented exit 3. Now
-an open-time probe raises a typed `StatsDbCorruptError` → global exit 2 with a
+or a raw traceback. Now an open-time probe raises a typed
+`StatsDbCorruptError` → staged global exit 3 with a
 one-line diagnosis + recovery guidance; command handlers that map DB errors to
 other exit codes (record-credit → 3) re-raise so the exit-2 contract wins.
 """
@@ -38,13 +38,14 @@ def _corrupt_stats_db(data_dir: pathlib.Path):
 def test_corrupt_stats_db_diagnosis_exit_2(tmp_path):
     _corrupt_stats_db(tmp_path)
     r = _run(["weekly"], tmp_path)
-    assert r.returncode == 2, r.stderr
+    assert r.returncode == 3, r.stderr
     assert "stats.db" in r.stderr and "corrupt" in r.stderr.lower(), r.stderr
+    assert "cctally db repair --db stats --yes" in r.stderr, r.stderr
     assert "Traceback" not in r.stderr, r.stderr
 
 
-def test_corrupt_stats_db_record_credit_exit_2_not_3(tmp_path):
+def test_corrupt_stats_db_record_credit_uses_staged_exit_3(tmp_path):
     _corrupt_stats_db(tmp_path)
     r = _run(["record-credit", "--to", "31", "--yes"], tmp_path)
-    assert r.returncode == 2, r.stderr          # NOT the documented DB-error 3
+    assert r.returncode == 3, r.stderr
     assert "Traceback" not in r.stderr, r.stderr

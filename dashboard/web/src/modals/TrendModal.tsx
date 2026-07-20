@@ -342,9 +342,9 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
         <div className="v" id="mtr-cur">
           {cur && cur.dollar_per_pct != null
             ? '$' + cur.dollar_per_pct.toFixed(3)
-            : <span className={!isClaude ? 'm-unavailable' : undefined}>—</span>}
+            : <span className="m-unavailable">—</span>}
         </div>
-        <div className="lbl">{isClaude ? 'Current $ / 1%' : 'Current weekly cost'}</div>
+                <div className="lbl">Current $ / 1%</div>
       </div>
     </div>
   );
@@ -377,7 +377,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
                 <div className="v" id="mtr-med">
                   {'$' + med.toFixed(3)}
                 </div>
-                <div className="lbl">4-week median{isClaude ? '' : ' cost'}</div>
+                <div className="lbl">4-week median</div>
               </div>
             </div>
             <div className={`m-kv kv-delta ${dkv.cls}`} id="mtr-delta-kv">
@@ -413,11 +413,11 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#trending-down" />
           </svg>
-          {N > 0 ? `${N}-week` : 'Weekly'} history · {isClaude ? '$/1%' : 'cost'}
+          {N > 0 ? `${N}-week` : 'Weekly'} history · $/1%
           <span className={'mtr-legend' + (hasUsed ? '' : ' legend-no-used')} aria-hidden="true">
             <span className="sw sw-dpp" />
-            <span className="sw-lbl">{isClaude ? '$/1%' : 'cost'}</span>
-            {isClaude ? <><span className="sw sw-used" /><span className="sw-lbl">used %</span></> : <span className="sw-lbl m-unavailable">used % unavailable</span>}
+            <span className="sw-lbl">$/1%</span>
+            <><span className="sw sw-used" /><span className="sw-lbl">used %</span></>
           </span>
         </h3>
         <div className="mtr-sparkhero">
@@ -426,7 +426,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
             role="group"
-            aria-label={`${isClaude ? '$ per 1%' : 'Weekly cost'} over the last ${N} week${N === 1 ? '' : 's'}${isClaude ? ', with the used % line overlaid' : ''}`}
+            aria-label={`$ per 1% over the last ${N} week${N === 1 ? '' : 's'}, with the used % line overlaid`}
           >
             {svgPrims.map((p) => {
               const { el, attrs, text, key } = p;
@@ -562,9 +562,9 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
               // relabels rows.
               const k = N - 1 - r._chronoIdx;
               const wlab = historyWlab(r, k);
-              const usedTxt = isClaude && r.used_pct != null ? Math.round(r.used_pct) + '%' : 'Unavailable';
+              const usedTxt = r.used_pct != null ? Math.round(r.used_pct) + '%' : 'Unavailable';
               const dppTxt =
-                isClaude && r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : 'Unavailable';
+                r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : 'Unavailable';
               const d = renderDelta(r.delta);
               return (
                 <tr
@@ -575,8 +575,8 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
                     <span className="wlab">{wlab}</span>
                   </td>
                   <td className="num c-cost">{fmt.usd2(r.cost_usd)}</td>
-                  <td className={`num usedpct${!isClaude ? ' m-unavailable' : ''}`}>{usedTxt}</td>
-                  <td className={`num dpp${!isClaude ? ' m-unavailable' : ''}`}>{dppTxt}</td>
+                  <td className={`num usedpct${r.used_pct == null ? ' m-unavailable' : ''}`}>{usedTxt}</td>
+                  <td className={`num dpp${r.dollar_per_pct == null ? ' m-unavailable' : ''}`}>{dppTxt}</td>
                   <td className={`num delta ${d.cls}`}>{d.text}</td>
                 </tr>
               );

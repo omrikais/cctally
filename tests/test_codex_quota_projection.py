@@ -892,6 +892,13 @@ def test_breakdown_correlates_root_qualified_physical_tuples_and_reprices_at_rea
         source="codex", source_root_key="root-a", logical_limit_key="limit-primary",
         observed_slot="primary", window_minutes=300,
     )
+    monkeypatch.setattr(
+        quota,
+        "load_codex_quota_observations",
+        lambda **_kwargs: pytest.fail(
+            "breakdown must use indexed cache rows, not deserialize quota history"
+        ),
+    )
     standard = quota.codex_quota_breakdown(identity, RESET, speed="standard")
     fast = quota.codex_quota_breakdown(identity, RESET, speed="fast")
     monkeypatch.setattr(sys.modules["cctally"], "_resolve_codex_speed", lambda value: "fast")

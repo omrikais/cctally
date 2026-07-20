@@ -422,5 +422,70 @@ print("OK")
 PY
 )"
 
+# Scenario: a 5h window rollover at a FLAT weekly+5h percent still persists
+# the NEW window's canonical five_hour_blocks anchor. This is the "current
+# block shown as ~approximate in the blocks CLI + dashboard while the
+# statusline shows correct 5h data" bug: two ticks 5h apart at identical
+# percents — tick 1 opens window A (clean insert + block A); tick 2 opens
+# window B, but the flat percents make cmd_record_usage dedup the snapshot.
+# PRE-FIX the dedup self-heal only re-checked window A (still fresh), so
+# window B's canonical block was never created and both the primary anchor
+# path AND the CLI swap fell back to the heuristic "~" for the ACTIVE block
+# until the percent next moved (observed lag up to ~10 min at window start;
+# the statusline is immune — it renders the live rate_limits, not the DB).
+# POST-FIX the rollover heal materializes window B's block on the dedup
+# tick, WITHOUT inserting an extra snapshot row (the heal is block-only).
+run_credit_scenario "window-rollover-flat-percent-heals-block" "$(cat <<'PY'
+import importlib.util, os, pathlib, sys, argparse, datetime as dt
+from importlib.machinery import SourceFileLoader
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+now = dt.datetime.now(dt.timezone.utc)
+week_end = int((now + dt.timedelta(days=3)).replace(
+    minute=0, second=0, microsecond=0).timestamp())
+# window A reset ~1h out (active now); window B = A + 5h (the next window).
+e_a = int((now + dt.timedelta(hours=1)).replace(second=0, microsecond=0).timestamp())
+e_b = e_a + 5 * 3600
+key_a = mod._canonical_5h_window_key(e_a)
+key_b = mod._canonical_5h_window_key(e_b)
+assert key_a != key_b, f"windows collapsed to one key: {key_a}"
+
+def rec(five_reset):
+    ns = argparse.Namespace(
+        percent=50.0, resets_at=week_end,
+        five_hour_percent=0.0, five_hour_resets_at=five_reset,
+        week_start_name=None,
+    )
+    return mod.cmd_record_usage(ns)
+
+rc1 = rec(e_a)   # window A: clean insert + block A
+rc2 = rec(e_b)   # window B: FLAT percents -> snapshot dedup tick
+
+conn = mod.open_db()
+try:
+    n_b = conn.execute(
+        "SELECT COUNT(*) FROM five_hour_blocks WHERE five_hour_window_key = ?",
+        (int(key_b),),
+    ).fetchone()[0]
+    n_snap = conn.execute(
+        "SELECT COUNT(*) FROM weekly_usage_snapshots"
+    ).fetchone()[0]
+finally:
+    conn.close()
+
+assert rc1 == 0 and rc2 == 0, f"rc1={rc1} rc2={rc2}"
+# The heal is block-only: the flat tick is STILL deduped (one snapshot),
+# but window B's canonical anchor now exists.
+assert n_snap == 1, f"unexpected extra snapshot row(s): {n_snap}"
+assert n_b == 1, f"window B five_hour_blocks rows = {n_b} (expected 1)"
+print("OK")
+PY
+)"
+
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]
