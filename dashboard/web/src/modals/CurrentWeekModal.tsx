@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react';
+import { useSyncExternalStore, type ReactNode } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
@@ -7,6 +7,8 @@ import { fmt, type FmtCtx } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
+import { warningForDomain } from '../lib/sourceGating';
+import { SourceChip } from '../panels/sourcePanel';
 import type {
   CodexQuotaMilestoneRow,
   CodexSourceData,
@@ -108,7 +110,36 @@ function milestoneFiveHourPercent(
   return eligible[0]?.percent ?? null;
 }
 
-function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCtx }) {
+function CurrentWeekShell({
+  embedded,
+  title,
+  accentClass,
+  headerExtras,
+  children,
+}: {
+  embedded: boolean;
+  title: string;
+  accentClass: string;
+  headerExtras: ReactNode;
+  children: ReactNode;
+}) {
+  if (embedded) return <>{children}</>;
+  return (
+    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras}>
+      {children}
+    </Modal>
+  );
+}
+
+function CodexCurrentCycleModal({
+  env,
+  ctx,
+  embedded = false,
+}: {
+  env: Envelope | null;
+  ctx: FmtCtx;
+  embedded?: boolean;
+}) {
   const codex = env?.sources?.codex?.data as CodexSourceData | undefined;
   const hero = codex?.hero;
   const cycle = hero?.cycle;
@@ -159,9 +190,11 @@ function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCt
   const pill = cycle
     ? `${fmt.dateShort(cycle.start_at, ctx)} → ${fmt.dateShort(cycle.resets_at, ctx)}`
     : 'Native 7-day cycle unavailable';
+  const singleId = (value: string) => embedded ? undefined : value;
 
   return (
-    <Modal
+    <CurrentWeekShell
+      embedded={embedded}
       title="Current Cycle — per-percent milestones"
       accentClass="accent-orange"
       headerExtras={
@@ -174,33 +207,33 @@ function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCt
       }
     >
       <section className="modal-current-week" data-source="codex">
-        <div className="m-chipstrip" id="mcw-badges">
-          <span className="m-pill accent-orange" id="mcw-week-pill">{pill}</span>
+        <div className="m-chipstrip" id={singleId('mcw-badges')}>
+          <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>{pill}</span>
           <span className="m-pill accent-orange">Codex · native 7-day quota</span>
         </div>
 
         <div className="mcw-herobar">
-          <div className="mcw-bignum" id="mcw-bignum">
+          <div className="mcw-bignum" id={singleId('mcw-bignum')}>
             <span className="int">{bigInt}</span>
             <span className="unit">{bigUnit}</span>
           </div>
           <div className="mcw-pbar-wrap">
             <div className="mcw-pbar">
-              <div className="fill" id="mcw-fill" style={{ width: pct + '%' }} />
+              <div className="fill" id={singleId('mcw-fill')} style={{ width: pct + '%' }} />
               {shouldShowMilestoneTicks(pct) && (
-                <div className="ticks" id="mcw-ticks">
+                <div className="ticks" id={singleId('mcw-ticks')}>
                   {weeklyTicks.map((row) => (
                     <div key={row.key} className="tick" data-p={String(row.percent)} style={{ left: clamp0_100(row.percent) + '%' }} />
                   ))}
                 </div>
               )}
-              <div className="marker" id="mcw-marker" style={{ left: pct + '%' }} />
+              <div className="marker" id={singleId('mcw-marker')} style={{ left: pct + '%' }} />
             </div>
             <div className="mcw-pscale">
               <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
             </div>
           </div>
-          <div className="mcw-mini" id="mcw-mini">
+          <div className="mcw-mini" id={singleId('mcw-mini')}>
             <div className="s"><span className="k">spent</span><span className="v v-magenta">{fmt.usd2(hero?.cost_usd)}</span></div>
             <div className="s"><span className="k">$ / 1%</span><span className="v v-cyan">{fmt.usd3(dpp)}</span></div>
             <div className="s"><span className="k">reset</span><span className="v">{fmt.datetimeShortZ(cycle?.resets_at, ctx)}</span></div>
@@ -212,10 +245,10 @@ function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCt
           Milestones
         </h3>
         <div className="mcw-mshead">
-          <span className="m-pill accent-orange" id="mcw-ms-count">{weeklyMilestones.length} crossed</span>
+          <span className="m-pill accent-orange" id={singleId('mcw-ms-count')}>{weeklyMilestones.length} crossed</span>
           <span className="mcw-ms-sub">Derived from retained OpenAI quota observations</span>
         </div>
-        <table className="m-histable" id="mcw-table">
+        <table className="m-histable mcw-table" id={singleId('mcw-table')}>
           <thead>
             <tr>
               <th>%</th>
@@ -225,7 +258,7 @@ function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCt
               <th className="num">5h %</th>
             </tr>
           </thead>
-          <tbody id="mcw-rows">
+          <tbody id={singleId('mcw-rows')}>
             {weeklyMilestones.length === 0 ? (
               <tr><td colSpan={5} className="empty-state">No integer-percent crossing has been retained in this cycle yet.</td></tr>
             ) : weeklyMilestones.map((row) => (
@@ -240,16 +273,21 @@ function CodexCurrentCycleModal({ env, ctx }: { env: Envelope | null; ctx: FmtCt
           </tbody>
         </table>
       </section>
-    </Modal>
+    </CurrentWeekShell>
   );
 }
 
-export function CurrentWeekModal() {
-  const env = useSnapshot();
-  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
-  const display = useDisplayTz();
-  const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
-  if (activeSource === 'codex') return <CodexCurrentCycleModal env={env} ctx={ctx} />;
+function ClaudeCurrentWeekModal({
+  env,
+  ctx,
+  display,
+  embedded = false,
+}: {
+  env: Envelope | null;
+  ctx: FmtCtx;
+  display: ReturnType<typeof useDisplayTz>;
+  embedded?: boolean;
+}) {
   const cw = env?.current_week ?? null;
   const header = env?.header ?? null;
   const ms = Array.isArray(cw?.milestones) ? cw!.milestones : [];
@@ -267,9 +305,11 @@ export function CurrentWeekModal() {
     : '—';
   const ticks = dedupeTicks(ms);
   const subText = msSub(ms);
+  const singleId = (value: string) => embedded ? undefined : value;
 
   return (
-    <Modal
+    <CurrentWeekShell
+      embedded={embedded}
       title="Current Week — per-percent milestones"
       accentClass="accent-green"
       headerExtras={
@@ -281,23 +321,23 @@ export function CurrentWeekModal() {
         />
       }
     >
-      <section className="modal-current-week">
-        <div className="m-chipstrip" id="mcw-badges">
-          <span className="m-pill accent-green" id="mcw-week-pill">
+      <section className="modal-current-week" data-source="claude">
+        <div className="m-chipstrip" id={singleId('mcw-badges')}>
+          <span className="m-pill accent-green" id={singleId('mcw-week-pill')}>
             {weekPillText}
           </span>
         </div>
 
         <div className="mcw-herobar">
-          <div className="mcw-bignum" id="mcw-bignum">
+          <div className="mcw-bignum" id={singleId('mcw-bignum')}>
             <span className="int">{bigInt}</span>
             <span className="unit">{bigUnit}</span>
           </div>
           <div className="mcw-pbar-wrap">
             <div className="mcw-pbar">
-              <div className="fill" id="mcw-fill" style={{ width: pct + '%' }} />
+              <div className="fill" id={singleId('mcw-fill')} style={{ width: pct + '%' }} />
               {shouldShowMilestoneTicks(pct) && (
-                <div className="ticks" id="mcw-ticks">
+                <div className="ticks" id={singleId('mcw-ticks')}>
                   {ticks.map((m) => (
                     <div
                       key={m.percent}
@@ -308,7 +348,7 @@ export function CurrentWeekModal() {
                   ))}
                 </div>
               )}
-              <div className="marker" id="mcw-marker" style={{ left: pct + '%' }} />
+              <div className="marker" id={singleId('mcw-marker')} style={{ left: pct + '%' }} />
             </div>
             <div className="mcw-pscale">
               <span>0%</span>
@@ -318,18 +358,18 @@ export function CurrentWeekModal() {
               <span>100%</span>
             </div>
           </div>
-          <div className="mcw-mini" id="mcw-mini">
+          <div className="mcw-mini" id={singleId('mcw-mini')}>
             <div className="s">
               <span className="k">spent</span>
-              <span className="v v-magenta" id="mcw-spent">{fmt.usd2(cw?.spent_usd)}</span>
+              <span className="v v-magenta" id={singleId('mcw-spent')}>{fmt.usd2(cw?.spent_usd)}</span>
             </div>
             <div className="s">
               <span className="k">$ / 1%</span>
-              <span className="v v-cyan" id="mcw-dpp">{fmt.usd3(cw?.dollar_per_pct)}</span>
+              <span className="v v-cyan" id={singleId('mcw-dpp')}>{fmt.usd3(cw?.dollar_per_pct)}</span>
             </div>
             <div className="s">
               <span className="k">reset</span>
-              <span className="v" id="mcw-reset">{fmt.datetimeShortZ(cw?.reset_at_utc, ctx)}</span>
+              <span className="v" id={singleId('mcw-reset')}>{fmt.datetimeShortZ(cw?.reset_at_utc, ctx)}</span>
             </div>
           </div>
         </div>
@@ -341,19 +381,19 @@ export function CurrentWeekModal() {
           Milestones
         </h3>
         <div className="mcw-mshead">
-          <span className="m-pill accent-purple" id="mcw-ms-count">
+          <span className="m-pill accent-purple" id={singleId('mcw-ms-count')}>
             {ms.length} crossed
           </span>
-          <span className="mcw-ms-sub" id="mcw-ms-sub" hidden={!subText}>
+          <span className="mcw-ms-sub" id={singleId('mcw-ms-sub')} hidden={!subText}>
             {subText ?? ''}
           </span>
         </div>
         {ms.length === 0 ? (
-          <p className="empty-state" id="mcw-empty">
+          <p className="empty-state" id={singleId('mcw-empty')}>
             No milestones yet — earliest crosses at 1&nbsp;%.
           </p>
         ) : (
-          <table className="m-histable" id="mcw-table">
+          <table className="m-histable mcw-table" id={singleId('mcw-table')}>
             <thead>
               <tr>
                 <th>%</th>
@@ -363,7 +403,7 @@ export function CurrentWeekModal() {
                 <th className="num">5h %</th>
               </tr>
             </thead>
-            <tbody id="mcw-rows">
+            <tbody id={singleId('mcw-rows')}>
               {ms.map((m) => (
                 <tr key={m.percent}>
                   <td>
@@ -411,11 +451,11 @@ export function CurrentWeekModal() {
               5h milestones
             </h3>
             <div className="mcw-mshead">
-              <span className="m-pill accent-purple" id="mcw-5h-count">
+              <span className="m-pill accent-purple" id={singleId('mcw-5h-count')}>
                 {fhMs.length} crossed
               </span>
             </div>
-            <table className="m-histable mcw-5h-table" id="mcw-5h-table">
+            <table className="m-histable mcw-5h-table" id={singleId('mcw-5h-table')}>
               <thead>
                 <tr>
                   <th>%</th>
@@ -479,6 +519,88 @@ export function CurrentWeekModal() {
           </>
         )}
       </section>
+    </CurrentWeekShell>
+  );
+}
+
+function providerReason(env: Envelope | null, source: 'claude' | 'codex'): string | null {
+  const entry = env?.sources?.[source];
+  const warning = warningForDomain(entry?.warnings, 'hero');
+  if (warning != null) return warning.message;
+  if (entry?.availability === 'unavailable') {
+    return `${source === 'claude' ? 'Claude' : 'Codex'} source data is unavailable.`;
+  }
+  if (entry?.capabilities?.hero?.status === 'unavailable') {
+    return source === 'claude'
+      ? 'Claude current-week usage is unavailable.'
+      : 'Codex native reset cycle is unavailable.';
+  }
+  if (source === 'claude' && env?.current_week == null) {
+    return 'Claude current-week usage is unavailable.';
+  }
+  const codex = entry?.data as CodexSourceData | null | undefined;
+  if (source === 'codex' && codex?.hero?.cycle == null) {
+    return 'Codex native reset cycle is unavailable.';
+  }
+  return null;
+}
+
+function AllCurrentWeekModal({
+  env,
+  ctx,
+  display,
+}: {
+  env: Envelope | null;
+  ctx: FmtCtx;
+  display: ReturnType<typeof useDisplayTz>;
+}) {
+  const claudeReason = providerReason(env, 'claude');
+  const codexReason = providerReason(env, 'codex');
+  return (
+    <Modal
+      title="Current Usage — provider cycles"
+      accentClass="accent-blue"
+      wide
+      headerExtras={
+        <ShareIcon
+          panel="current-week"
+          panelLabel="Current usage"
+          triggerId="current-week-modal"
+          onClick={() => dispatch(openShareModal('current-week', 'current-week-modal'))}
+        />
+      }
+    >
+      <div className="provider-composition provider-composition--modal current-week-provider-composition">
+        <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="claude">
+          <div className="source-provider-head provider-composition-head">
+            <SourceChip source="claude" />
+            <span>subscription week</span>
+          </div>
+          {claudeReason && <p className="provider-section-reason">{claudeReason}</p>}
+          <ClaudeCurrentWeekModal env={env} ctx={ctx} display={display} embedded />
+        </section>
+        <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="codex">
+          <div className="source-provider-head provider-composition-head">
+            <SourceChip source="codex" />
+            <span>native 7-day quota</span>
+          </div>
+          {codexReason && <p className="provider-section-reason">{codexReason}</p>}
+          <CodexCurrentCycleModal env={env} ctx={ctx} embedded />
+        </section>
+      </div>
     </Modal>
   );
+}
+
+export function CurrentWeekModal() {
+  const env = useSnapshot();
+  const source = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModalSource ?? getState().activeSource,
+  );
+  const display = useDisplayTz();
+  const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  if (source === 'codex') return <CodexCurrentCycleModal env={env} ctx={ctx} />;
+  if (source === 'all') return <AllCurrentWeekModal env={env} ctx={ctx} display={display} />;
+  return <ClaudeCurrentWeekModal env={env} ctx={ctx} display={display} />;
 }

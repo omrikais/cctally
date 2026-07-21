@@ -8,8 +8,10 @@ import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { modelChipStyle } from '../lib/model';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { resolveSourceView } from '../store/sourceView';
 import { openShareModal } from '../store/shareSlice';
 import { presentationBlocks, presentationProviders, type BlockPresentationRow } from '../lib/dashboardPresentation';
+import type { CodexSourceData } from '../types/envelope';
 
 function openBlockDetail(r: BlockPresentationRow): void {
   if (r.source === 'claude') {
@@ -19,7 +21,17 @@ function openBlockDetail(r: BlockPresentationRow): void {
   }
 }
 
-function Row({ r, maxCost, isFirstMount }: { r: BlockPresentationRow; maxCost: number; isFirstMount: boolean }) {
+function Row({
+  r,
+  maxCost,
+  isFirstMount,
+  showSource,
+}: {
+  r: BlockPresentationRow;
+  maxCost: number;
+  isFirstMount: boolean;
+  showSource: boolean;
+}) {
   const fillPct = maxCost > 0 ? (r.value / maxCost) * 100 : 0;
   const open = () => openBlockDetail(r);
   return (
@@ -38,6 +50,9 @@ function Row({ r, maxCost, isFirstMount }: { r: BlockPresentationRow; maxCost: n
     >
       <div className="meta">
         <span className="label">
+          {showSource && (
+            <span className={`source-chip source-chip--${r.source}`}>{r.source === 'claude' ? 'Claude' : 'Codex'}</span>
+          )}
           {r.anchor === 'heuristic' && (
             <span className="anchor-marker" aria-label="approximate start">~</span>
           )}
@@ -84,6 +99,14 @@ export function BlocksPanel() {
   // already summarize the whole set (each row still opens its own Block modal).
   const allRows = presentationBlocks(env, activeSource);
   const rows = allRows;
+  const codexEntry = resolveSourceView(env, 'codex').entry;
+  const codex = codexEntry?.data as CodexSourceData | undefined;
+  const codexHasFiveHourWindow = codex?.quota.histories.some((row) => row.window_minutes === 300) ?? false;
+  const blocksScope = activeSource === 'codex'
+    ? `${codexHasFiveHourWindow ? '5h' : 'optional 5h'} · current cycle`
+    : activeSource === 'all'
+      ? '5h · current provider cycles'
+      : '5h · current week';
   const maxCost = allRows.length > 0 ? Math.max(...allRows.map((r) => r.value), 0) : 0;
   // Compatible provider costs can be combined once in All mode. These rows
   // are already source-qualified, so summing their displayed values preserves
@@ -118,7 +141,7 @@ export function BlocksPanel() {
             <use href="/static/icons.svg#layers" />
           </svg>
           <h2>
-            Blocks <span className="sub">({activeSource === 'codex' ? '5h · current cycle' : activeSource === 'all' ? '5h · current cycles' : '5h · current week'})</span>
+            Blocks <span className="sub">({blocksScope})</span>
           </h2>
         </div>
         <div className="panel-header-actions">
@@ -166,9 +189,13 @@ export function BlocksPanel() {
           ) : (
             <div className="panel-empty">
               {activeSource === 'codex'
-                ? 'No 5-hour activity blocks in the current Codex cycle.'
+                ? codexHasFiveHourWindow
+                  ? 'No 5-hour activity blocks in the current Codex cycle.'
+                  : 'No native 5-hour window is currently reported; the 7-day Codex cycle remains available.'
                 : activeSource === 'all'
-                  ? 'No 5-hour activity blocks in the current provider cycles.'
+                  ? codexHasFiveHourWindow
+                    ? 'No 5-hour activity blocks in the current provider cycles.'
+                    : 'No Claude 5-hour activity blocks; Codex is not currently reporting an optional 5-hour window.'
                   : 'No activity blocks this week yet.'}
             </div>
           )
@@ -179,6 +206,7 @@ export function BlocksPanel() {
               r={r}
               maxCost={maxCost}
               isFirstMount={!seenStarts.current.has(r.start_at)}
+              showSource={activeSource === 'all'}
             />
           ))
         )}

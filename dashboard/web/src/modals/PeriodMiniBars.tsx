@@ -42,6 +42,8 @@ interface Props {
   onSelect: (key: string) => void;
   /** Drives axis-label formatting + the "· today"/"· now" suffix copy. */
   unit: 'day' | 'week' | 'month';
+  /** Provider-native or neutral noun for accessible navigator copy. */
+  displayUnit?: 'cycle' | 'provider period';
 }
 
 function axisLabel(row: PeriodNavRow, unit: Props['unit']): string {
@@ -52,7 +54,8 @@ function axisLabel(row: PeriodNavRow, unit: Props['unit']): string {
   return row.label;
 }
 
-export function PeriodMiniBars({ rows, selectedKey, onSelect, unit }: Props) {
+export function PeriodMiniBars({ rows, selectedKey, onSelect, unit, displayUnit }: Props) {
+  const accessibleUnit = displayUnit ?? unit;
   // Render order: oldest-left → newest-right. Envelope is newest-first, so
   // copy + reverse rather than mutating the prop.
   const ordered = [...rows].reverse();
@@ -73,13 +76,13 @@ export function PeriodMiniBars({ rows, selectedKey, onSelect, unit }: Props) {
   const newerKey = stepPeriod(rows, selectedKey, 'newer');
 
   return (
-    <section className="daily-modal-bars" aria-label={`Cost by ${unit}`}>
+    <section className="daily-modal-bars" aria-label={`Cost by ${accessibleUnit}`}>
       <div className="daily-modal-bars-head">
         <span className="daily-bars-nav">
           <button
             type="button"
             className="daily-step-btn"
-            aria-label="Step to older period"
+            aria-label={`Step to older ${displayUnit ?? 'period'}`}
             disabled={olderKey === null}
             onClick={() => { if (olderKey) onSelect(olderKey); }}
           >
@@ -89,7 +92,7 @@ export function PeriodMiniBars({ rows, selectedKey, onSelect, unit }: Props) {
           <button
             type="button"
             className="daily-step-btn"
-            aria-label="Step to newer period"
+            aria-label={`Step to newer ${displayUnit ?? 'period'}`}
             disabled={newerKey === null}
             onClick={() => { if (newerKey) onSelect(newerKey); }}
           >
@@ -99,7 +102,7 @@ export function PeriodMiniBars({ rows, selectedKey, onSelect, unit }: Props) {
         <span className="hint hint-desktop">↑↓ navigate · click any bar</span>
         <span className="hint hint-mobile">‹ › to step · tap a bar</span>
       </div>
-      <div className="daily-modal-bars-grid" role="img" aria-label={`Cost by ${unit} histogram`}>
+      <div className="daily-modal-bars-grid" role="img" aria-label={`Cost by ${accessibleUnit} histogram`}>
         {ordered.map((r) => {
           const isSelected = r.key === selectedKey;
           // 4% floor so empty bars are still visible as a track.

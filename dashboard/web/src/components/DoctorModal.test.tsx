@@ -95,6 +95,30 @@ describe('DoctorCheckRow humanizes Latest snapshot age (#259)', () => {
   });
 });
 
+describe('DoctorCheckRow nullable details', () => {
+  it('renders unavailable statusline ages as explicit JSON null values', () => {
+    render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.statusline_pipeline',
+          title: 'Statusline pipeline',
+          severity: 'ok',
+          summary: 'no recent regular-pool timer observed',
+          details: {
+            transport_age_seconds: null,
+            selected_age_seconds: null,
+          },
+        }}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /details/i }));
+    const details = document.querySelector('.doctor-modal__details');
+    expect(details?.textContent).toContain('"transport_age_seconds": null');
+    expect(details?.textContent).toContain('"selected_age_seconds": null');
+  });
+});
+
 describe('DoctorCategoryRow caret (DOC-1)', () => {
   it('renders a caret that reflects and toggles aria-expanded', () => {
     const cat = { id: 'auth', title: 'Auth', severity: 'ok' as const, checks: [] };

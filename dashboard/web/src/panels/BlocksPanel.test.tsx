@@ -74,6 +74,8 @@ describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
 
   it('keeps Codex Blocks truthfully disabled when no retained 300-minute block exists', () => {
     const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.quota.histories = env.sources!.codex.data!.quota.histories
+      .filter((row) => row.window_minutes !== 300);
     env.sources!.codex.data!.quota.blocks = [];
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
@@ -82,11 +84,71 @@ describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
 
     expect(container.querySelector('[data-source="codex"]')).not.toBeNull();
     expect((container.querySelector('.panel-expand') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole('heading', { name: /Blocks/ })).toHaveTextContent('optional 5h · current cycle');
+    expect(screen.getByText('No native 5-hour window is currently reported; the 7-day Codex cycle remains available.')).toBeInTheDocument();
+  });
+
+  it('keeps native 5-hour framing when Codex reports a 300-minute window', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.quota.blocks = [];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+
+    render(<BlocksPanel />);
+
+    expect(screen.getByRole('heading', { name: /Blocks/ })).toHaveTextContent('5h · current cycle');
+    expect(screen.getByRole('heading', { name: /Blocks/ })).not.toHaveTextContent('optional');
     expect(screen.getByText('No 5-hour activity blocks in the current Codex cycle.')).toBeInTheDocument();
   });
 });
 
 describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
+  it('All labels each retained five-hour row with its provider owner', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'opaque:server-issued-block-key',
+      source: 'claude',
+      start_at: '2026-04-24T08:00:00Z',
+      end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded',
+      is_active: true,
+      cost_usd: 4.2,
+      models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<BlocksPanel />);
+
+    expect(container.querySelector('.source-chip--claude')).toHaveTextContent('Claude');
+    expect(container.querySelector('.source-chip--codex')).toHaveTextContent('Codex');
+  });
+
+  it('All keeps a Claude block when the optional Codex five-hour window is absent', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.quota.histories = env.sources!.codex.data!.quota.histories
+      .filter((row) => row.window_minutes !== 300);
+    env.sources!.codex.data!.quota.blocks = [];
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'opaque:server-issued-block-key',
+      source: 'claude',
+      start_at: '2026-04-24T08:00:00Z',
+      end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded',
+      is_active: true,
+      cost_usd: 4.2,
+      models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<BlocksPanel />);
+
+    expect(screen.getByRole('button', { name: 'Open detail for block starting 08:00 Apr 24 UTC' })).toBeInTheDocument();
+    expect(container.querySelector('.source-chip--claude')).toHaveTextContent('Claude');
+    expect(container.querySelector('.source-chip--codex')).toBeNull();
+  });
+
   it('All routes a Claude-backed row through the canonical Block modal', () => {
     const env = structuredClone(fixture) as unknown as Envelope;
     env.sources!.claude.data!.quota.blocks = [{

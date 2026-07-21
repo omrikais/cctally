@@ -102,8 +102,8 @@ Data
   ⚠ Statusline pipeline      authoritative state needs repair
       → Run `cctally refresh-usage`
       details:
-        transport_age_seconds: inf
-        selected_age_seconds: inf
+        transport_age_seconds: None
+        selected_age_seconds: None
         active_candidate_count: 0
         control_db_agrees: None
         tombstones: {'fiveHour': 'absent', 'sevenDay': 'inflight'}

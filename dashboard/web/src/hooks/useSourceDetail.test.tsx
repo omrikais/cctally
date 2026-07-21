@@ -56,6 +56,23 @@ describe('useSourceDetail (§5.6)', () => {
     expect(calledUrl.includes('/all/')).toBe(false);
   });
 
+  it('binds a qualified Claude project request to the selected project window', async () => {
+    const fetchFn = stubFetch(() =>
+      jsonResponse(200, {
+        source: 'claude',
+        resource: 'project',
+        data: { detail_kind: 'claude_project', key: 'project:opaque' },
+      }),
+    );
+    renderHook(() =>
+      useSourceDetail('claude', 'project', 'project:opaque', { windowWeeks: 4 }),
+    );
+    await waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    expect(fetchFn).toHaveBeenCalledWith(
+      '/api/source/claude/project/project%3Aopaque?weeks=4',
+    );
+  });
+
   it('a 400 capability error surfaces as the friendly capability variant', async () => {
     stubFetch(() => jsonResponse(400, { code: 'source_capability_unavailable', error: 'x' }));
     const { result } = renderHook(() => useSourceDetail('codex', 'block', 'block:x'));

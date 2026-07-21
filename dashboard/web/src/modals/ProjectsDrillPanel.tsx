@@ -17,16 +17,39 @@ import { modelChipClass } from '../lib/model';
 import { costClass } from '../lib/cost';
 import { abbreviateModel } from '../lib/modelName';
 import { ModelCostBars } from './ModelCostBars';
+import type { ProjectDetailModelRow } from '../types/envelope';
 
 export interface ProjectsDrillPanelProps {
   projectKey: string;
   windowWeeks: number;
 }
 
+export interface ProjectDetailContentData {
+  label: string;
+  window_weeks: number;
+  window_cost_usd: number;
+  models: ProjectDetailModelRow[];
+  sessions: Array<{
+    key: string;
+    started_at: string;
+    last_activity_at: string;
+    primary_model: string;
+    cost_usd: number;
+  }>;
+  sessions_total: number;
+}
+
+interface ProjectDetailContentProps {
+  data: ProjectDetailContentData;
+  onOpenSession: (key: string) => void;
+  onShowInSessions: () => void;
+  testId?: string;
+  sessionTestIdPrefix?: string;
+  showInSessionsTestId?: string;
+}
+
 export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPanelProps) {
   const { data, loading, error } = useProjectDetail(projectKey, windowWeeks);
-  const display = useDisplayTz();
-  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
 
   // Stale-on-switch guard: while `useProjectDetail` is fetching for the
   // newly selected project — OR for the same project under a different
@@ -46,15 +69,48 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
   if (error && !data) return <div className="panel-empty">{error}</div>;
   if (!data) return null;
 
+  return (
+    <ProjectDetailContent
+      data={{
+        ...data,
+        label: data.key,
+        sessions: data.sessions.map((session) => ({
+          ...session,
+          key: session.session_id,
+        })),
+      }}
+      onOpenSession={(sessionId) => dispatch({
+        type: 'OPEN_MODAL',
+        kind: 'session',
+        sessionId,
+      })}
+      onShowInSessions={() => {
+        dispatch({ type: 'SET_FILTER', text: data.key });
+        dispatch({ type: 'CLOSE_MODAL' });
+      }}
+    />
+  );
+}
+
+export function ProjectDetailContent({
+  data,
+  onOpenSession,
+  onShowInSessions,
+  testId = 'projects-drill',
+  sessionTestIdPrefix = 'drill-session',
+  showInSessionsTestId = 'drill-show-in-sessions',
+}: ProjectDetailContentProps) {
+  const display = useDisplayTz();
+  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const remaining = Math.max(0, data.sessions_total - data.sessions.length);
 
   return (
-    <div className="projects-drill" data-testid="projects-drill" aria-live="polite">
+    <div className="projects-drill" data-testid={testId} aria-live="polite">
       <div className="projects-drill-head">
         <span className="title">
-          ▾ {data.key} · {data.sessions_total} session{data.sessions_total === 1 ? '' : 's'}
+          ▾ {data.label} · {data.sessions_total} session{data.sessions_total === 1 ? '' : 's'}
           {' · '}
-          {fmt.usd2(data.window_cost_usd)} ({windowWeeks}w)
+          {fmt.usd2(data.window_cost_usd)} ({data.window_weeks}w)
         </span>
       </div>
       <div className="projects-drill-grid">
@@ -87,16 +143,10 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
           ) : (
             data.sessions.map((s, i) => (
               <button
-                key={s.session_id}
-                data-testid={`drill-session-${i}`}
+                key={s.key}
+                data-testid={`${sessionTestIdPrefix}-${i}`}
                 className="drill-session-row"
-                onClick={() =>
-                  dispatch({
-                    type: 'OPEN_MODAL',
-                    kind: 'session',
-                    sessionId: s.session_id,
-                  })
-                }
+                onClick={() => onOpenSession(s.key)}
               >
                 <span className="started">{fmt.datetimeShort(s.last_activity_at, ctx)}</span>
                 <span className={`chip ${modelChipClass(s.primary_model)}`}>
@@ -112,12 +162,9 @@ export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPan
             )}
             <button
               type="button"
-              data-testid="drill-show-in-sessions"
+              data-testid={showInSessionsTestId}
               className="drill-show-in-sessions"
-              onClick={() => {
-                dispatch({ type: 'SET_FILTER', text: data.key });
-                dispatch({ type: 'CLOSE_MODAL' });
-              }}
+              onClick={onShowInSessions}
             >
               Show in Sessions →
             </button>

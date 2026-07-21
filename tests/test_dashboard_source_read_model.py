@@ -172,6 +172,10 @@ def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters
         80 * (1.25e-6 - 1.25e-7)
     )
     assert report["days"][0]["net_usd"] == report["days"][0]["saved_usd"]
+    assert report["days"][0]["wasted_usd"] == 0.0
+    assert report["days"][0]["cache_creation_tokens"] == 0
+    assert report["fourteen_day_counterfactual_usd"] == report["days"][0]["saved_usd"]
+    assert report["fourteen_day_efficiency_ratio"] == 1.0
     assert report["by_project"][0]["key"] == "cctally-dev"
     assert report["by_model"][0]["key"] == "gpt-5"
 
@@ -1062,6 +1066,47 @@ def test_mixed_codex_metadata_preserves_accounting_and_keeps_qualified_projects(
     finally:
         cache.close()
         stats.close()
+
+
+def test_partial_projects_disambiguate_duplicate_labels_without_identity_leaks():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    entries = (
+        SimpleNamespace(
+            timestamp=NOW - dt.timedelta(hours=2), source_root_key="root-secret-b",
+            source_path="/Users/secret/work/repo/rollout-b.jsonl", session_id="native-b",
+            model="gpt-5", cost_usd=2.0, input_tokens=20, cached_input_tokens=5,
+            output_tokens=8, reasoning_output_tokens=2, total_tokens=28,
+        ),
+        SimpleNamespace(
+            timestamp=NOW - dt.timedelta(hours=1), source_root_key="root-secret-a",
+            source_path="/Users/secret/personal/repo/rollout-a.jsonl", session_id="native-a",
+            model="gpt-5", cost_usd=3.0, input_tokens=30, cached_input_tokens=7,
+            output_tokens=12, reasoning_output_tokens=3, total_tokens=42,
+        ),
+    )
+    metadata = {
+        ("root-secret-a", "/Users/secret/personal/repo/rollout-a.jsonl"): {
+            "project_key": "project:" + "a" * 24, "project_label": "repo", "title": "A",
+        },
+        ("root-secret-b", "/Users/secret/work/repo/rollout-b.jsonl"): {
+            "project_key": "project:" + "b" * 24, "project_label": "repo", "title": "B",
+        },
+    }
+
+    first = source_module._partial_projects_wire(entries, metadata)
+    second = source_module._partial_projects_wire(reversed(entries), metadata)
+
+    assert {row["label"] for row in first["rows"]} == {"repo (1)", "repo (2)"}
+    assert [(row["key"], row["label"]) for row in first["rows"]] == [
+        (row["key"], row["label"]) for row in second["rows"]
+    ]
+    assert len({row["key"] for row in first["rows"]}) == 2
+    public = repr(first)
+    for secret in (
+        "root-secret-a", "root-secret-b", "/Users/secret", "rollout-a.jsonl",
+        "rollout-b.jsonl", "project:" + "a" * 24, "project:" + "b" * 24,
+    ):
+        assert secret not in public
 
 
 @pytest.mark.parametrize("metadata_kind", ("all-unqualified", "missing-join", "wrong-root-join"))

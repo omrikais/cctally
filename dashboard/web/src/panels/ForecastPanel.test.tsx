@@ -170,13 +170,20 @@ describe('ForecastPanel source seam — no Claude leak under Codex (#294 S5)', (
     expect(container.querySelector('.fc-num')).not.toBeNull();
   });
 
-  it('All mode renders one shared forecast shell', () => {
+  it('All mode renders labelled Claude and Codex projections without one combined verdict', () => {
     updateSnapshot(forecastLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<ForecastPanel />);
     expect(container.querySelectorAll('[data-panel-kind="forecast"]')).toHaveLength(1);
     expect(container.querySelector('[data-source="all"]')).not.toBeNull();
-    expect(container.querySelector('.source-provider-section')).toBeNull();
+    const claude = container.querySelector('[data-provider-section="claude"]');
+    const codex = container.querySelector('[data-provider-section="codex"]');
+    expect(claude?.textContent).toContain('Claude');
+    expect(claude?.textContent).toContain('88%');
+    expect(claude?.textContent).toContain('OK');
+    expect(codex?.textContent).toContain('Codex');
+    expect(codex?.textContent).toContain('80%');
+    expect(container.querySelector('[data-provider-section="all"]')).toBeNull();
   });
 
   it('Claude mode still renders the forecast tile through the wrap (transparent)', () => {

@@ -173,7 +173,7 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
     }));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     render(<HeroStrip />);
-    expect(document.querySelector('.hero-usage')).toHaveTextContent('5-HOUR—');
+    expect(document.querySelector('.hero-usage')).not.toHaveTextContent('5-HOUR');
     expect(document.querySelector('.hero-spent')).toHaveTextContent('$12');
     expect(screen.queryByText(/unavailable/i)).not.toBeInTheDocument();
   });
@@ -186,6 +186,18 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
 });
 
 describe('HeroStrip — All combined tiles (§6.1)', () => {
+  it('opens the provider-composed Current Week modal', () => {
+    updateSnapshot(envWith());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<HeroStrip />);
+
+    act(() => { (container.querySelector('.hero-strip') as HTMLElement).click(); });
+
+    expect(getState().openModal).toBe('current-week');
+    expect(getState().openModalSource).toBe('all');
+    expect(getState().toast).toBeNull();
+  });
+
   it('shows the combined {cost_usd, total_tokens} when non-null', () => {
     updateSnapshot(envWith());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
@@ -208,7 +220,10 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     );
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('Codex ingest is in progress.');
+    const warning = screen.getByTestId('shared-hero-warning');
+    expect(warning).toHaveTextContent('Combined unavailable');
+    expect(warning).toHaveAttribute('title', 'Codex ingest is in progress.');
+    expect(warning).toHaveAttribute('aria-label', 'Combined totals unavailable: Codex ingest is in progress.');
   });
 
   it('uses the hero warning for an unavailable combined hero instead of an earlier panel warning', () => {
@@ -226,7 +241,10 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     );
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('Codex native reset cycle is unavailable.');
+    const warning = screen.getByTestId('shared-hero-warning');
+    expect(warning).toHaveTextContent('Combined unavailable');
+    expect(warning).toHaveAttribute('title', 'Codex native reset cycle is unavailable.');
+    expect(warning).toHaveAttribute('aria-label', 'Combined totals unavailable: Codex native reset cycle is unavailable.');
   });
 });
 

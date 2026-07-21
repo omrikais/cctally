@@ -841,3 +841,115 @@ def test_absent_model_id_still_persists(app):
     assert parsed.model_id is None
     app._statusline_persist(parsed, sync_for_test=True)
     assert _count_rows(app, "weekly_usage_snapshots") == 1
+
+
+# --- statusline-driven OAuth freshness -----------------------------------
+
+
+def test_statusline_tick_fetches_authoritative_usage_within_one_cycle(
+        app, monkeypatch):
+    """A live statusline must not wait five minutes when its payload stalls.
+
+    Claude can keep replaying an unchanged ``rate_limits`` object after the
+    provider's authoritative 5h/7d percentages have advanced.  The periodic
+    statusline tick therefore owns a bounded OAuth confirmation at the same
+    cadence, while the shared hook throttle keeps it account-wide.
+    """
+    import _cctally_core
+
+    interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    assert interval <= 30.0
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
+
+    calls = []
+
+    def refresh(*, throttle_seconds):
+        calls.append(throttle_seconds)
+        return "ok(7d=7,5h=2)", {}
+
+    monkeypatch.setattr(app, "_hook_tick_oauth_refresh", refresh)
+    app._statusline_oauth_tick(sync_for_test=True)
+
+    assert calls == [interval]
+    assert app._hook_tick_throttle_age_seconds() < 5.0
+
+
+def test_statusline_oauth_tick_is_account_wide_throttled(app, monkeypatch):
+    """Concurrent/session-local 30s timers still produce one account poll."""
+    import _cctally_core
+
+    interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
+    calls = []
+    monkeypatch.setattr(
+        app,
+        "_hook_tick_oauth_refresh",
+        lambda *, throttle_seconds: (
+            calls.append(throttle_seconds) or "ok(7d=7,5h=2)",
+            {},
+        ),
+    )
+
+    app._statusline_oauth_tick(sync_for_test=True)
+    app._statusline_oauth_tick(sync_for_test=True)
+
+    assert calls == [interval]
+
+
+def test_statusline_oauth_tick_honors_selected_freshness_and_backoff(
+        app, monkeypatch):
+    """Fresh selected data and a 429 deadline both suppress timer polling."""
+    import _cctally_core
+
+    interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    calls = []
+    monkeypatch.setattr(
+        app,
+        "_hook_tick_oauth_refresh",
+        lambda *, throttle_seconds: (calls.append(throttle_seconds), None),
+    )
+
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval - 1)
+    monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
+    app._statusline_oauth_tick(sync_for_test=True)
+
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 60.0)
+    app._statusline_oauth_tick(sync_for_test=True)
+
+    assert calls == []
+
+
+def test_statusline_oauth_tick_never_waits_for_another_session(app, monkeypatch):
+    """A concurrent account poll must not add latency to statusline output."""
+    import fcntl
+    import _cctally_core
+
+    interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
+    monkeypatch.setattr(app, "_hook_tick_throttle_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(
+        app,
+        "_hook_tick_oauth_refresh",
+        lambda **kwargs: pytest.fail("busy lock must suppress the refresh"),
+    )
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(
+        _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH,
+        os.O_WRONLY | os.O_CREAT,
+        0o644,
+    )
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        app._statusline_oauth_tick(sync_for_test=True)
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    assert elapsed < 0.1

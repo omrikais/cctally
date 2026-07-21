@@ -50,4 +50,36 @@ describe('PeriodDetailCard', () => {
     expect(document.querySelectorAll('.drill-bar-row')).toHaveLength(2);
     expect(screen.queryByText('Used %')).toBeNull();
   });
+
+  it('renders Codex native Input, Cached input, Output, Reasoning, and Total distinctly', () => {
+    render(<PeriodDetailCard row={periodRow({
+      source: 'codex',
+      codex_tokens: {
+        input_tokens: 1_200, cached_input_tokens: 300,
+        output_tokens: 400, reasoning_output_tokens: 100, total_tokens: 1_600,
+      },
+    })} variant="weekly" accentClass="accent-cyan" periodNoun="cycle" windowLabel="Reset cycle" />);
+
+    for (const label of ['Input', 'Cached input', 'Output', 'Reasoning', 'Total']) {
+      expect(screen.getByText(label, { exact: true })).toBeInTheDocument();
+    }
+    expect(screen.queryByText('Cache+', { exact: true })).toBeNull();
+    expect(screen.queryByText('Cache-read', { exact: true })).toBeNull();
+    expect(screen.getByText('1.2k')).toBeInTheDocument();
+    expect(screen.getByText('300')).toBeInTheDocument();
+    expect(screen.getByText('400')).toBeInTheDocument();
+    expect(screen.getByText('100')).toBeInTheDocument();
+    expect(screen.getByText('1.6k')).toBeInTheDocument();
+  });
+
+  it('uses cycle copy for Codex weekly deltas and reset windows', () => {
+    render(<PeriodDetailCard row={periodRow({
+      source: 'codex', week_start_at: '2026-07-13T00:00:00Z',
+      week_end_at: '2026-07-20T00:00:00Z',
+    })} variant="weekly" accentClass="accent-cyan" periodNoun="cycle" windowLabel="Reset cycle" />);
+
+    expect(screen.getByText(/vs prior cycle/)).toBeInTheDocument();
+    expect(screen.getByText(/Reset cycle:/)).toBeInTheDocument();
+    expect(screen.queryByText(/Subscription window:/)).toBeNull();
+  });
 });

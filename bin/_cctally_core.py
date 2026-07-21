@@ -252,9 +252,11 @@ def _real_prod_data_dir() -> pathlib.Path:
 # Internal (no config UI — YAGNI, spec §Out of scope); test injection only.
 # Spec 2026-07-17-usage-statusline-fallback-design.
 #
-# OAUTH_BACKFILL_STALE_SECONDS: the OAuth poll only backfills once the
-#   selected-freshness marker is at least this stale. The 30-second statusline
-#   transport tick does not run OAuth.
+# STATUSLINE_OAUTH_POLL_SECONDS: the account-wide authoritative confirmation
+#   cadence driven by Claude Code's 30-second statusline timer. Keep it below
+#   the timer so scheduling jitter does not skip every other tick.
+# OAUTH_BACKFILL_STALE_SECONDS: the matching selected-freshness gate shared by
+#   statusline-driven and hook-driven automatic OAuth refreshes.
 # OAUTH_BACKOFF_BASE_SECONDS / OAUTH_BACKOFF_CAP_SECONDS: the headerless
 #   exponential 429 backoff (base * 2**consecutive_429, capped).
 STATUSLINE_CANDIDATE_TTL_SECONDS = 90
@@ -270,7 +272,8 @@ STATUSLINE_TOMBSTONE_DOCUMENT_MAX_BYTES = 1024
 # session waits on a long subagent (event-driven updates go quiet then). MUST
 # Add-when-absent only; a user-set value is never mutated.
 STATUSLINE_REFRESH_INTERVAL_DEFAULT = 30
-OAUTH_BACKFILL_STALE_SECONDS = 300.0
+STATUSLINE_OAUTH_POLL_SECONDS = 25.0
+OAUTH_BACKFILL_STALE_SECONDS = STATUSLINE_OAUTH_POLL_SECONDS
 OAUTH_BACKOFF_BASE_SECONDS = 60.0
 OAUTH_BACKOFF_CAP_SECONDS = 3600.0
 

@@ -26,6 +26,10 @@ CODEX_ROOT_B="$RUNTIME/scratch/codex-b"
 export CODEX_HOME="$CODEX_ROOT_MAIN,$CODEX_ROOT_A,$CODEX_ROOT_B"
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
 export CCTALLY_DISABLE_TELEMETRY=1
+# Keep Task A/B's native quota fixtures active and deterministic. The source
+# builders honor this established clock seam; browser-side age rendering may
+# advance, but provider capability and cycle selection stay frozen.
+export CCTALLY_AS_OF=2026-07-14T16:10:00Z
 
 # 3) Generate the synthetic transcripts + manifest.json under the runtime dir.
 python3 "$REPO_ROOT/bin/build-e2e-fixtures.py" --out "$RUNTIME"
@@ -38,10 +42,12 @@ cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/modern-full.jsonl" \
    "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-parent.jsonl" \
    "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-child.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
-cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/root-a-collision.jsonl" \
+cp "$RUNTIME/codex-task-a/root-a-collision.jsonl" \
    "$CODEX_ROOT_A/sessions/2026/07/20/"
-cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/root-b-collision.jsonl" \
+cp "$RUNTIME/codex-task-a/root-b-collision.jsonl" \
    "$CODEX_ROOT_B/sessions/2026/07/20/"
+cp "$RUNTIME/codex-task-a/rollout-2026-07-07T12-00-00-32900000-0000-4000-8000-000000000001.jsonl" \
+   "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 
 # Shared native UUID across Claude, Codex root A, and Codex root B. The UI must
 # keep all three qualified identities distinct through open/persist/compare.

@@ -191,13 +191,22 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     expect(cells).toEqual(['07-18 06:24', '30%', '$21.31', '+3.12 ↑']);
   });
 
-  it('All mode renders one shared trend shell with combined rows', () => {
+  it('All mode renders provider-separated trend sections, never one combined series', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<TrendPanel />);
     expect(container.querySelectorAll('#panel-trend')).toHaveLength(1);
     expect(container.querySelector('#panel-trend[data-source="all"]')).not.toBeNull();
-    expect(container.querySelector('.source-provider-section')).toBeNull();
+    const sections = container.querySelectorAll('[data-provider-section]');
+    expect(sections).toHaveLength(2);
+    expect(Array.from(sections).map((section) => section.getAttribute('data-provider-section')))
+      .toEqual(['claude', 'codex']);
+    expect(sections[0].textContent).toContain('Claude');
+    expect(sections[1].textContent).toContain('Codex');
+    expect(sections[0].querySelectorAll('.trend-spark')).toHaveLength(1);
+    expect(sections[1].querySelectorAll('.trend-spark')).toHaveLength(1);
+    expect(Array.from(container.querySelectorAll('.trend-table tbody')).map((body) => body.id))
+      .toEqual(['trend-rows-claude', 'trend-rows-codex']);
   });
 
   it('Claude mode still renders the trend table through the wrap (transparent)', () => {

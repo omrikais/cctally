@@ -83,9 +83,26 @@ def assign_collision_safe_project_labels(
     selection the exact string that terminal, JSON, and share emit.
     """
     values = tuple(entries)
+    assigned = collision_safe_project_label_map(
+        (entry.project_key, entry.project_label) for entry in values
+    )
+    return tuple(
+        replace(entry, display_label=assigned.get(entry.project_key, entry.project_label))
+        for entry in values
+    )
+
+
+def collision_safe_project_label_map(
+    identities_and_labels: Iterable[tuple[str, str]],
+) -> dict[str, str]:
+    """Allocate the shared deterministic privacy-safe label contract.
+
+    Callers supply opaque internal identities. Only the returned labels are
+    presentation data; the identity keys must remain inside the adapter.
+    """
     keys_by_label: dict[str, set[str]] = defaultdict(set)
-    for entry in values:
-        keys_by_label[entry.project_label].add(entry.project_key)
+    for identity, label in identities_and_labels:
+        keys_by_label[label].add(identity)
     # Never let an allocator-owned ``label (N)`` shadow a literal project
     # label.  Reserving every raw label also makes a later presentation pass
     # unnecessary, which avoids producing ``label (N) (N)``.
@@ -107,10 +124,7 @@ def assign_collision_safe_project_labels(
             assigned[key] = candidate
             used_labels.add(candidate)
             ordinal += 1
-    return tuple(
-        replace(entry, display_label=assigned.get(entry.project_key, entry.project_label))
-        for entry in values
-    )
+    return assigned
 
 
 def opaque_project_key(source: str, root_key: str, resolved_key: str) -> str:

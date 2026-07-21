@@ -275,11 +275,20 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     # side effect that runs AFTER the line is printed and is FULLY guarded:
     # persistence must NEVER break or slow rendering, so the whole call is
     # wrapped here (the feeder itself forks detached + swallows its own
-    # errors, but this is belt-and-suspenders). Absence of rate_limits, a
-    # lost persist lock, or the throttle window all degrade to a clean
-    # no-op; the OAuth backfill covers the "no statusline feeding" case.
+    # errors, but this is belt-and-suspenders). Absence of rate_limits or a
+    # lost persist lock degrades to a clean no-op; the authoritative OAuth
+    # confirmation below covers the missing/stale-payload case.
     try:
         _statusline_persist(inp)
+    except Exception:
+        pass
+    # Claude Code may replay an unchanged rate_limits object across timer
+    # renders even after the provider counters have advanced. Confirm against
+    # the authoritative OAuth surface once per account-wide timer cycle. The
+    # helper is fully detached, shares hook-tick's throttle lock/marker, and
+    # honors the existing selected-freshness and 429-backoff gates.
+    try:
+        c._statusline_oauth_tick()
     except Exception:
         pass
     return 0
@@ -1227,6 +1236,122 @@ def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
         _fork_persist(lock_fd)
     finally:
         c._release_persist_lock(lock_fd)
+
+
+def _try_acquire_statusline_oauth_lock() -> "int | None":
+    """Take hook-tick's account-wide OAuth throttle lock without blocking."""
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            _cctally_core.HOOK_TICK_THROTTLE_LOCK_PATH,
+            os.O_WRONLY | os.O_CREAT,
+            0o644,
+        )
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _release_statusline_oauth_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _run_statusline_oauth_refresh() -> None:
+    """Run one already-throttled automatic OAuth confirmation."""
+    c = _cctally()
+    status, _ = c._hook_tick_oauth_refresh(
+        throttle_seconds=float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    )
+    if status.startswith("ok("):
+        c._hook_tick_throttle_touch()
+
+
+def _fork_statusline_oauth_refresh(lock_fd: int) -> bool:
+    """Detach one OAuth confirmation while keeping ``lock_fd`` in the child."""
+    try:
+        pid = os.fork()
+    except OSError:
+        return False
+    if pid > 0:
+        # Do not explicitly unlock: the child inherited the same open file
+        # description and owns the account-wide lock until its refresh ends.
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+        return True
+
+    try:
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        try:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            if devnull > 2:
+                os.close(devnull)
+        except OSError:
+            pass
+        _run_statusline_oauth_refresh()
+    except BaseException:
+        pass
+    finally:
+        _release_statusline_oauth_lock(lock_fd)
+        os._exit(0)
+
+
+def _statusline_oauth_tick(*, sync_for_test: bool = False) -> None:
+    """Schedule one bounded authoritative refresh from a statusline timer.
+
+    Fast prechecks avoid forks while selected data is fresh, a shared 429
+    deadline is active, or another session/hook owns the account-wide poll.
+    Every condition is rechecked under hook-tick's throttle lock before the
+    detached child starts.
+    """
+    c = _cctally()
+    interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
+    if c._statusline_observe_age_seconds() < interval:
+        return
+    if c._oauth_backoff_remaining_seconds() > 0:
+        return
+    if c._hook_tick_throttle_age_seconds() < interval:
+        return
+    lock_fd = _try_acquire_statusline_oauth_lock()
+    if lock_fd is None:
+        return
+    try:
+        if c._statusline_observe_age_seconds() < interval:
+            return
+        if c._oauth_backoff_remaining_seconds() > 0:
+            return
+        if c._hook_tick_throttle_age_seconds() < interval:
+            return
+        if sync_for_test:
+            _run_statusline_oauth_refresh()
+            return
+        if _fork_statusline_oauth_refresh(lock_fd):
+            lock_fd = -1
+    finally:
+        if lock_fd >= 0:
+            _release_statusline_oauth_lock(lock_fd)
 
 
 def _resolve_context_window(model_id, warn_once) -> "int | None":

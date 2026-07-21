@@ -6,8 +6,15 @@ import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { presentationForecast, presentationPeriodRows } from '../lib/dashboardPresentation';
-import type { DashboardSelection, ForecastEnvelope } from '../types/envelope';
+import {
+  presentationForecast,
+  presentationForecastComposition,
+  presentationPeriodRows,
+  type ForecastPresentation,
+  type ProviderPresentationSection,
+} from '../lib/dashboardPresentation';
+import type { ForecastEnvelope, SourceName } from '../types/envelope';
+import { SourceChip } from '../panels/sourcePanel';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
 // DOM-mutating layout in a ref effect; React manages only the container
@@ -346,7 +353,112 @@ function useRangeBar(
   }, [wrapRef, trackRef, fc, nowPct]);
 }
 
-function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
+function AllForecastSection({
+  section,
+}: {
+  section: ProviderPresentationSection<ForecastPresentation>;
+}) {
+  const value = section.value;
+  const verdict = resolveVerdict(value?.verdict ?? null);
+  return (
+    <section
+      className="modal-forecast provider-composition-section"
+      data-source={section.source}
+      data-provider-section={section.source}
+      aria-label={`${section.label} forecast detail`}
+    >
+      <div className="source-provider-head provider-composition-head">
+        <SourceChip source={section.source} />
+        <strong>{section.label} forecast</strong>
+        {section.status !== 'available' && (
+          <span className="provider-section-status">{section.status}</span>
+        )}
+      </div>
+      {value == null ? (
+        <div className="provider-section-reason m-unavailable">{section.reason}</div>
+      ) : (
+        <>
+          <div className="m-chipstrip">
+            <span className={verdict ? `m-pill ${verdict.accent}` : 'm-pill'}>
+              {verdict ? `${verdict.glyph} ${verdict.label}` : '—'}
+            </span>
+            {section.reason && <span className="m-pill m-unavailable">{section.reason}</span>}
+          </div>
+          <div className="m-hero cols-2">
+            <div className="m-kv kv-wa">
+              <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#gauge" /></svg>
+              <div>
+                <div className={`v${value.projected == null ? ' m-unavailable' : ''}`}>{fmt.pct1(value.projected)}</div>
+                <div className="lbl">{value.primaryLabel}</div>
+              </div>
+            </div>
+            <div className="m-kv kv-r24">
+              <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#zap" /></svg>
+              <div>
+                <div className={`v${value.recent == null ? ' m-unavailable' : ''}`}>{fmt.pct1(value.recent)}</div>
+                <div className="lbl">{value.recentLabel}</div>
+              </div>
+            </div>
+          </div>
+          <h3 className="m-sec sec-range">Range vs. caps</h3>
+          <div className="mfc-rangewrap provider-range-summary" aria-label={`${section.label} projected usage against caps`}>
+            <div className="mfc-rangetrack">
+              <div className="mfc-zone safe" />
+              <div className="mfc-zone warn" />
+              <div className="mfc-zone over" />
+              <div
+                className="provider-range-marker"
+                style={{ left: `${Math.min(100, Math.max(0, value.projected ?? 0)) / 1.1}%` }}
+              />
+              <div className="mfc-bound b0"><div className="lbl">0%</div></div>
+              <div className="mfc-bound b90"><div className="lbl">90%</div></div>
+              <div className="mfc-bound b100"><div className="lbl">100%</div></div>
+              <div className="mfc-bound b110"><div className="lbl">110%</div></div>
+            </div>
+          </div>
+          <h3 className="m-sec sec-rates">Provider-native projection</h3>
+          <div className="mfc-kvgrid">
+            <div className="mfc-krow"><span className="l">Projected</span><span className="v v-cyan">{fmt.pct1(value.projected)}</span></div>
+            <div className="mfc-krow"><span className="l">Current / recent</span><span className="v v-green">{fmt.pct1(value.recent)}</span></div>
+          </div>
+          <h3 className="m-sec sec-bud">Provider-native budgets and confidence</h3>
+          <div className="mfc-kvgrid mfc-kvgrid-single">
+            {value.foot.map((line) => (
+              <div className="mfc-krow" key={line.label}>
+                <span className="l">{line.label}</span>
+                <span className={`v${line.value === '—' || line.value === 'unavailable' ? ' m-unavailable' : ''}`}>{line.value}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function AllForecastModal() {
+  const env = useSnapshot();
+  const composition = presentationForecastComposition(env, 'all');
+  const headerExtras = (
+    <ShareIcon
+      panel="forecast"
+      panelLabel="Forecast"
+      triggerId="forecast-modal"
+      onClick={() => dispatch(openShareModal('forecast', 'forecast-modal'))}
+    />
+  );
+  return (
+    <Modal title="Forecast — by provider" accentClass="accent-purple" headerExtras={headerExtras}>
+      <div className="provider-composition provider-composition--modal" aria-label="Claude and Codex forecast reports">
+        {composition.sections.map((section) => (
+          <AllForecastSection key={section.source} section={section} />
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
+function CanonicalForecastModal({ source }: { source: SourceName }) {
   const env = useSnapshot();
   const isClaude = source === 'claude';
   const presented = presentationForecast(env, source);
@@ -446,7 +558,7 @@ function CanonicalForecastModal({ source }: { source: DashboardSelection }) {
           </span>
           {!isClaude && (
             <span className="m-pill accent-blue">
-              {source === 'all' ? 'Codex quota + spend' : 'Codex native quota'}
+              Codex native quota
             </span>
           )}
           {((isClaude && !fc) || (!isClaude && nativeForecast == null)) && (
@@ -595,5 +707,7 @@ export function ForecastModal() {
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,
   );
-  return <CanonicalForecastModal source={source} />;
+  return source === 'all'
+    ? <AllForecastModal />
+    : <CanonicalForecastModal source={source} />;
 }

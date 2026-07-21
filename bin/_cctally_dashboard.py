@@ -356,6 +356,10 @@ from _lib_blocks import _group_entries_into_blocks
 # #279 S2 F3: stdlib-logging chokepoint — server errors reach stderr via
 # the real log_error override below (leaf import, no cycle).
 import _lib_log
+from _lib_dashboard_json import (
+    encode_dashboard_json,
+    encode_dashboard_json_bytes,
+)
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
@@ -800,12 +804,20 @@ def _codex_partial_source_detail(snapshot, row: Mapping, *, resource: str,
     return detail
 
 
-def _source_safe_claude_session_detail(detail, *, key: str) -> dict[str, Any]:
+def _source_safe_claude_session_detail(
+    detail, *, key: str, project_key: str | None = None, label: str | None = None,
+) -> dict[str, Any]:
     """Adapt the existing Claude session detail builder to S4's safe route."""
     payload = _session_detail_to_envelope(detail)
     return {
         "detail_kind": "claude_session",
         "key": key,
+        "label": label or "Claude session",
+        "project_label": payload["project_label"],
+        "project_key": (
+            dashboard_resource_key("project", "claude", project_key)
+            if project_key else None
+        ),
         "started_utc": payload["started_utc"],
         "last_activity_utc": payload["last_activity_utc"],
         "duration_min": payload["duration_min"],
@@ -817,20 +829,32 @@ def _source_safe_claude_session_detail(detail, *, key: str) -> dict[str, Any]:
         "cache_hit_pct": payload["cache_hit_pct"],
         "cost_per_model": payload["cost_per_model"],
         "cost_total_usd": payload["cost_total_usd"],
+        "privacy_note": (
+            "Native session identity and source files are withheld to preserve "
+            "opaque identity. Cache rebuild history belongs to the private "
+            "conversation-detail surface and is intentionally not exposed by "
+            "this qualified accounting route."
+        ),
     }
 
 
-def _source_safe_claude_project_detail(detail: Mapping, *, key: str) -> dict[str, Any]:
+def _source_safe_claude_project_detail(
+    detail: Mapping, *, key: str, label: str,
+) -> dict[str, Any]:
     """Drop legacy raw bucket/session identifiers from a Claude project drill."""
     return {
         "detail_kind": "claude_project",
         "key": key,
+        "label": label,
         "window_weeks": detail.get("window_weeks"),
         "window_cost_usd": detail.get("window_cost_usd"),
         "window_attributed_pct": detail.get("window_attributed_pct"),
         "models": detail.get("models", []),
         "sessions": [
             {
+                "key": dashboard_resource_key(
+                    "session", "claude", item.get("session_id"),
+                ),
                 "started_at": item.get("started_at"),
                 "last_activity_at": item.get("last_activity_at"),
                 "primary_model": item.get("primary_model"),
@@ -859,13 +883,73 @@ def _source_safe_claude_block_detail(detail: Mapping, *, key: str) -> dict[str, 
     }
 
 
-def _claude_session_id_for_source_key(snapshot, key: str) -> str | None:
+def _claude_session_row_for_source_key(snapshot, key: str):
     for row in getattr(snapshot, "sessions", ()) or ():
         session_id = getattr(row, "session_id", None)
         if isinstance(session_id, str) and session_id and (
             dashboard_resource_key("session", "claude", session_id) == key
         ):
-            return session_id
+            return row
+    return None
+
+
+def _claude_session_id_for_source_key(snapshot, key: str) -> str | None:
+    """Resolve a qualified session key without exposing its native identity.
+
+    The published source bundle contains the bounded dashboard rows.  A project
+    drill can legitimately link to a recent session outside that panel slice,
+    so fall back to the compact ``session_files`` identity index and compare
+    opaque hashes.  This never scans transcript entries or returns a raw ID to
+    the client.
+    """
+    row = _claude_session_row_for_source_key(snapshot, key)
+    if row is not None:
+        return getattr(row, "session_id", None)
+    try:
+        conn = open_cache_db()
+    except (sqlite3.DatabaseError, OSError):
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT session_id FROM session_files "
+            "WHERE session_id IS NOT NULL AND session_id <> '' "
+            "ORDER BY session_id"
+        )
+        for (session_id,) in rows:
+            if (
+                isinstance(session_id, str)
+                and dashboard_resource_key(
+                    "session", "claude", session_id,
+                ) == key
+            ):
+                return session_id
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return None
+
+
+def _claude_project_key_for_path(snapshot, project_path: object) -> str | None:
+    """Map one private project path back to its public display key."""
+    if not isinstance(project_path, str) or not project_path:
+        return None
+    env = getattr(snapshot, "projects_envelope", None)
+    if not isinstance(env, Mapping):
+        return None
+    candidates: list[object] = []
+    current = env.get("current_week")
+    if isinstance(current, Mapping):
+        candidates.extend(current.get("rows") or ())
+    trend = env.get("trend")
+    if isinstance(trend, Mapping):
+        candidates.extend(trend.get("projects") or ())
+    for row in candidates:
+        if not isinstance(row, Mapping) or row.get("bucket_path") != project_path:
+            continue
+        project_key = row.get("key")
+        if isinstance(project_key, str) and project_key:
+            return project_key
     return None
 
 
@@ -906,19 +990,39 @@ def _claude_block_start_for_source_key(snapshot, key: str) -> dt.datetime | None
     return None
 
 
-def _build_claude_source_detail(snapshot, *, resource: str, key: str) -> dict[str, Any]:
+def _build_claude_source_detail(
+    snapshot, *, resource: str, key: str, row: Mapping,
+    window_weeks: int = 4,
+) -> dict[str, Any]:
     """Map a bounded legacy row to its existing, cache-only detail builder."""
     now_utc = getattr(snapshot, "generated_at", None) or _command_as_of()
     if resource == "session":
-        session_id = _claude_session_id_for_source_key(snapshot, key)
-        if session_id is None:
+        session_row = _claude_session_row_for_source_key(snapshot, key)
+        session_id = (
+            getattr(session_row, "session_id", None)
+            if session_row is not None
+            else _claude_session_id_for_source_key(snapshot, key)
+        )
+        if not isinstance(session_id, str) or not session_id:
             raise SourceResourceNotFound()
         detail = sys.modules["cctally"]._tui_build_session_detail(
             session_id, now_utc=now_utc,
         )
         if detail is None:
             raise SourceResourceNotFound()
-        return _source_safe_claude_session_detail(detail, key=key)
+        project_key = (
+            getattr(session_row, "project_key", None)
+            if session_row is not None
+            else _claude_project_key_for_path(
+                snapshot, getattr(detail, "project_path", None),
+            )
+        )
+        return _source_safe_claude_session_detail(
+            detail,
+            key=key,
+            project_key=project_key,
+            label=str(row.get("title") or row.get("label") or "Claude session"),
+        )
 
     if resource == "project":
         project_key = _claude_project_key_for_source_key(snapshot, key)
@@ -932,7 +1036,7 @@ def _build_claude_source_detail(snapshot, *, resource: str, key: str) -> dict[st
             detail = _project_detail_for_window(
                 conn,
                 project_key=project_key,
-                weeks_back=1,
+                weeks_back=window_weeks,
                 now_utc=now_utc,
                 current_week=getattr(snapshot, "current_week", None),
                 projects_envelope=getattr(snapshot, "projects_envelope", None),
@@ -947,7 +1051,9 @@ def _build_claude_source_detail(snapshot, *, resource: str, key: str) -> dict[st
             conn.close()
         if detail is None:
             raise SourceResourceNotFound()
-        return _source_safe_claude_project_detail(detail, key=key)
+        return _source_safe_claude_project_detail(
+            detail, key=key, label=project_key,
+        )
 
     start_at = _claude_block_start_for_source_key(snapshot, key)
     if start_at is None:
@@ -984,7 +1090,7 @@ def _build_claude_source_detail(snapshot, *, resource: str, key: str) -> dict[st
 
 
 def build_source_detail(*, snapshot, source: str, resource: str,
-                        key: str) -> dict[str, Any]:
+                        key: str, window_weeks: int = 4) -> dict[str, Any]:
     """Resolve one qualified opaque key to a provider-native read-only detail.
 
     The frozen published bundle is the first bounded key index.  Claude then
@@ -992,9 +1098,24 @@ def build_source_detail(*, snapshot, source: str, resource: str,
     the native S1-S3 adapter detail without a Claude fallback or a rollout
     parse.  Every branch preserves the generic handler errors above it.
     """
-    row = source_detail_lookup(snapshot.source_bundle, source, resource, key)
+    try:
+        row = source_detail_lookup(snapshot.source_bundle, source, resource, key)
+    except SourceResourceNotFound:
+        # A Claude project drill can expose a recent session outside the
+        # dashboard panel's bounded published slice.  The provider adapter
+        # resolves that opaque key against session_files below; all other
+        # resources retain the strict frozen-bundle membership gate.
+        if source != "claude" or resource != "session":
+            raise
+        row = {}
     if source == "claude":
-        return _build_claude_source_detail(snapshot, resource=resource, key=key)
+        return _build_claude_source_detail(
+            snapshot,
+            resource=resource,
+            key=key,
+            row=row,
+            window_weeks=window_weeks,
+        )
     try:
         detail = _build_codex_source_detail(snapshot, resource=resource, key=key)
         if resource == "session":
@@ -3934,7 +4055,7 @@ def _handle_get_project_detail_impl(handler, *,
     except (TypeError, ValueError):
         weeks = None
     if weeks not in {1, 4, 8, 12}:
-        body = json.dumps({"error": "invalid weeks param"}).encode("utf-8")
+        body = encode_dashboard_json_bytes({"error": "invalid weeks param"})
         handler.send_response(400)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
@@ -3977,9 +4098,9 @@ def _handle_get_project_detail_impl(handler, *,
         )
     except Exception as exc:
         handler.log_error("/api/project failed: %r", exc)
-        body = json.dumps(
+        body = encode_dashboard_json_bytes(
             {"error": "project detail failed"}
-        ).encode("utf-8")
+        )
         handler.send_response(500)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
@@ -3987,16 +4108,16 @@ def _handle_get_project_detail_impl(handler, *,
         handler.wfile.write(body)
         return
     if detail is None:
-        body = json.dumps(
+        body = encode_dashboard_json_bytes(
             {"error": "project not found", "key": project_key},
-        ).encode("utf-8")
+        )
         handler.send_response(404)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
         return
-    body = json.dumps(detail, ensure_ascii=False).encode("utf-8")
+    body = encode_dashboard_json_bytes(detail, ensure_ascii=False)
     handler.send_response(200)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
@@ -4456,7 +4577,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         _respond_json plus an explicit Allow header.
         """
         if self.path.split("?", 1)[0] == "/api/settings":
-            encoded = json.dumps({"error": "method not allowed"}).encode("utf-8")
+            encoded = encode_dashboard_json_bytes(
+                {"error": "method not allowed"}
+            )
             self.send_response(405)
             self.send_header("Allow", "POST")
             self.send_header("Content-Type", "application/json")
@@ -5689,7 +5812,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # ---- helpers ----
 
     def _respond_json(self, status: int, body: dict) -> None:
-        encoded = json.dumps(body).encode("utf-8")
+        encoded = encode_dashboard_json_bytes(body)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
@@ -5760,7 +5883,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # transcriptsEnabled=false, never enabled-then-403 (the pass-2 P2
             # finding) — one predicate, two consumers, desync impossible.
             env["transcriptsEnabled"] = visible
-            body = json.dumps(env, ensure_ascii=False).encode("utf-8")
+            body = encode_dashboard_json_bytes(env, ensure_ascii=False)
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -5795,9 +5918,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 runtime_bind=type(self).cctally_host,
             )
             report = _ld.run_checks(state)
-            body = json.dumps(
+            body = encode_dashboard_json_bytes(
                 _ld.serialize_json(report), ensure_ascii=False,
-            ).encode("utf-8")
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -5845,9 +5968,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if detail is None:
             self.send_error(404, "session not found")
             return
-        body = json.dumps(
+        body = encode_dashboard_json_bytes(
             _session_detail_to_envelope(detail), ensure_ascii=False
-        ).encode("utf-8")
+        )
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -5894,14 +6017,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "error": "source capability unavailable",
             })
             return
-        try:
-            snap = self.snapshot_ref.get()
-            detail = build_source_detail(
-                snapshot=snap,
-                source=source,
-                resource=resource,
-                key=key,
+        detail_kwargs = {
+            "source": source,
+            "resource": resource,
+            "key": key,
+        }
+        if resource == "project":
+            query = _urlparse.parse_qs(
+                _urlparse.urlsplit(self.path).query,
+                keep_blank_values=True,
             )
+            raw_weeks = query.get("weeks")
+            if raw_weeks is not None:
+                if len(raw_weeks) != 1 or raw_weeks[0] not in {"1", "4", "8", "12"}:
+                    self._respond_json(400, {
+                        "code": "source_capability_unavailable",
+                        "error": "source capability unavailable",
+                    })
+                    return
+                detail_kwargs["window_weeks"] = int(raw_weeks[0])
+        try:
+            detail_kwargs["snapshot"] = self.snapshot_ref.get()
+            detail = build_source_detail(**detail_kwargs)
         except SourceResourceNotFound:
             self._respond_json(404, {
                 "code": "source_resource_not_found",
@@ -6049,7 +6186,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         try:
             start_at = parse_iso_datetime(decoded, "start_at")
         except ValueError:
-            body = json.dumps({"error": "invalid start_at"}).encode("utf-8")
+            body = encode_dashboard_json_bytes({"error": "invalid start_at"})
             self.send_response(400)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -6097,7 +6234,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 None,
             )
             if target is None:
-                body = json.dumps({"error": "block not found"}).encode("utf-8")
+                body = encode_dashboard_json_bytes({"error": "block not found"})
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -6127,7 +6264,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.log_error("/api/block failed: %r", exc)
             self.send_error(500, "block detail failed")
             return
-        body = json.dumps(detail, ensure_ascii=False).encode("utf-8")
+        body = encode_dashboard_json_bytes(detail, ensure_ascii=False)
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -6189,7 +6326,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 env["transcriptsEnabled"] = transcripts_enabled
                 msg = (
                     "event: update\n"
-                    + "data: " + json.dumps(env, ensure_ascii=False) + "\n\n"
+                    + "data: "
+                    + encode_dashboard_json(env, ensure_ascii=False)
+                    + "\n\n"
                 )
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
@@ -6387,7 +6526,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         try:
             for ev in worker.stream(run_id):
                 ev_type = ev.get("type", "message")
-                ev_data = json.dumps(
+                ev_data = encode_dashboard_json(
                     {k: v for k, v in ev.items() if k != "type"},
                     ensure_ascii=False,
                 )

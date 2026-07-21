@@ -1,6 +1,7 @@
 import type {
   AllSourceData,
   BlocksPanelRow,
+  CacheReportEnvelope,
   CacheReportDailyRow,
   CodexPeriodBucket,
   CodexQuotaBlockRow,
@@ -11,6 +12,7 @@ import type {
   ModelCostRow,
   PeriodRow,
   SourceName,
+  SourceEntry,
   SourceWarning,
   TrendRow,
 } from '../types/envelope';
@@ -30,6 +32,92 @@ export interface PresentationProviders {
   codex: CodexSourceData | null;
   hydrating: boolean;
   warnings: SourceWarning[];
+}
+
+export type ProviderSectionStatus = 'available' | 'degraded' | 'empty' | 'unavailable';
+
+export interface ProviderPresentationSection<T> {
+  source: SourceName;
+  label: 'Claude' | 'Codex';
+  status: ProviderSectionStatus;
+  reason: string | null;
+  value: T | null;
+}
+
+export interface ProviderPresentationComposition<T> {
+  selection: DashboardSelection;
+  sections: ProviderPresentationSection<T>[];
+}
+
+function providerLabel(source: SourceName): 'Claude' | 'Codex' {
+  return source === 'claude' ? 'Claude' : 'Codex';
+}
+
+function providerEntry(
+  env: Envelope | null,
+  source: SourceName,
+): SourceEntry<unknown> | null {
+  return env?.sources?.[source] ?? null;
+}
+
+function providerSection<T>(
+  env: Envelope | null,
+  source: SourceName,
+  value: T | null,
+  domains: string[],
+  unavailableCopy: string,
+): ProviderPresentationSection<T> {
+  const entry = providerEntry(env, source);
+  const relevantWarning = entry?.warnings.find((warning) =>
+    warning.domain == null
+      || domains.includes(warning.domain)
+      || warning.domain === 'ingest'
+      || warning.domain === 'read_model',
+  );
+  const unsupportedDomain = domains.find((domain) => {
+    const status = entry?.capabilities[domain]?.status;
+    return status === 'unavailable' || status === 'deferred';
+  });
+
+  if (value == null) {
+    const status: ProviderSectionStatus = entry?.availability === 'empty'
+      ? 'empty'
+      : 'unavailable';
+    return {
+      source,
+      label: providerLabel(source),
+      status,
+      reason: relevantWarning?.message
+        ?? (unsupportedDomain ? entry?.capabilities[unsupportedDomain]?.semantics : null)
+        ?? unavailableCopy,
+      value: null,
+    };
+  }
+
+  if (relevantWarning != null || entry?.freshness === 'stale' || unsupportedDomain != null) {
+    return {
+      source,
+      label: providerLabel(source),
+      status: 'degraded',
+      reason: relevantWarning?.message
+        ?? (entry?.freshness === 'stale'
+          ? `${providerLabel(source)} data is stale.`
+          : entry?.capabilities[unsupportedDomain!]?.semantics ?? unavailableCopy),
+      value,
+    };
+  }
+
+  return {
+    source,
+    label: providerLabel(source),
+    status: 'available',
+    reason: null,
+    value,
+  };
+}
+
+function compositionSources(selection: DashboardSelection): SourceName[] {
+  return selection === 'all' ? ['claude', 'codex'] : [selection];
 }
 
 export function presentationProviders(
@@ -101,6 +189,7 @@ function codexPeriodRow(row: CodexPeriodBucket, index: number): PeriodRow {
     ? breakdownModels
     : sourceModels(row.cost_usd, 'codex');
   return {
+    source: 'codex',
     label: row.label,
     cost_usd: row.cost_usd,
     total_tokens: row.total_tokens,
@@ -115,6 +204,13 @@ function codexPeriodRow(row: CodexPeriodBucket, index: number): PeriodRow {
     models,
     week_start_at: row.start_at,
     week_end_at: row.end_at,
+    codex_tokens: {
+      input_tokens: row.input_tokens,
+      cached_input_tokens: row.cached_input_tokens,
+      output_tokens: row.output_tokens,
+      reasoning_output_tokens: row.reasoning_output_tokens,
+      total_tokens: row.total_tokens,
+    },
   };
 }
 
@@ -130,18 +226,20 @@ function mergePeriodRows(claudeRows: PeriodRow[], codexRows: PeriodRow[]): Perio
   for (const row of [...claudeRows, ...codexRows]) {
     const old = merged.get(row.label);
     if (!old) {
-      merged.set(row.label, { ...row, models: [...row.models] });
+      merged.set(row.label, { ...row, source: 'all', models: [...row.models] });
       continue;
     }
     const cost = old.cost_usd + row.cost_usd;
     merged.set(row.label, {
       ...old,
+      source: 'all',
       cost_usd: cost,
       total_tokens: old.total_tokens + row.total_tokens,
       input_tokens: old.input_tokens + row.input_tokens,
       output_tokens: old.output_tokens + row.output_tokens,
       cache_creation_tokens: old.cache_creation_tokens + row.cache_creation_tokens,
       cache_read_tokens: old.cache_read_tokens + row.cache_read_tokens,
+      codex_tokens: undefined,
       used_pct: null,
       dollar_per_pct: null,
       models: recomputeModelPct([...old.models, ...row.models], cost),
@@ -156,9 +254,10 @@ export function presentationPeriodRows(
   period: 'weekly' | 'monthly',
 ): PeriodRow[] {
   const providers = presentationProviders(env, selection);
-  const legacy = selection === 'claude'
+  const legacy = (selection === 'claude'
     ? env?.[period]?.rows ?? []
-    : providers.claude?.periods?.[period]?.rows ?? [];
+    : providers.claude?.periods?.[period]?.rows ?? [])
+    .map((row) => ({ ...row, source: 'claude' as const }));
   const codex = [...(providers.codex?.periods?.[period]?.rows ?? [])]
     .sort((a, b) => b.label.localeCompare(a.label))
     .map(codexPeriodRow)
@@ -168,6 +267,13 @@ export function presentationPeriodRows(
         ? (row.cost_usd - allRows[index + 1].cost_usd) / allRows[index + 1].cost_usd
         : null,
     }));
+  if (selection === 'all' && period === 'weekly') {
+    const cap = PERIOD_HISTORY_CAP.weekly;
+    // Independent reset axes do not share a join key. Keep each provider's
+    // history intact and grouped; source-qualified keys carry identity through
+    // selection and sorting even when visible labels collide.
+    return [...legacy.slice(0, cap), ...codex.slice(0, cap)];
+  }
   const rows = selection === 'all'
     ? mergePeriodRows(legacy, codex)
     : selection === 'codex' ? codex : legacy;
@@ -194,6 +300,7 @@ function codexDailyRow(row: CodexPeriodBucket): DailyPanelRow {
   const date = dailyDate(row.label);
   const breakdownModels = codexModelRows(row.cost_usd, row.model_breakdowns, true);
   return {
+    source: 'codex',
     date,
     label: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.slice(5) : row.label,
     cost_usd: row.cost_usd,
@@ -206,11 +313,19 @@ function codexDailyRow(row: CodexPeriodBucket): DailyPanelRow {
     cache_read_tokens: row.cached_input_tokens,
     total_tokens: row.total_tokens,
     cache_hit_pct: row.input_tokens > 0 ? row.cached_input_tokens / row.input_tokens * 100 : null,
+    codex_tokens: {
+      input_tokens: row.input_tokens,
+      cached_input_tokens: row.cached_input_tokens,
+      output_tokens: row.output_tokens,
+      reasoning_output_tokens: row.reasoning_output_tokens,
+      total_tokens: row.total_tokens,
+    },
   };
 }
 
-function emptyDailyRow(template: DailyPanelRow): DailyPanelRow {
+function emptyDailyRow(template: DailyPanelRow, source = template.source): DailyPanelRow {
   return {
+    source,
     date: template.date,
     label: template.label,
     cost_usd: 0,
@@ -223,12 +338,17 @@ function emptyDailyRow(template: DailyPanelRow): DailyPanelRow {
     cache_read_tokens: 0,
     total_tokens: 0,
     cache_hit_pct: null,
+    codex_tokens: source === 'codex' ? {
+      input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+      reasoning_output_tokens: 0, total_tokens: 0,
+    } : undefined,
   };
 }
 
 function gapFillDailyRows(
   rows: DailyPanelRow[],
   canonicalShape: DailyPanelRow[],
+  emptySource?: DashboardSelection,
 ): DailyPanelRow[] {
   if (canonicalShape.length === 0) return rows;
   const byDate = new Map(rows.map((row) => [row.date, row]));
@@ -236,7 +356,7 @@ function gapFillDailyRows(
   const shaped = canonicalShape.map((template) => {
     const row = byDate.get(template.date);
     return row == null
-      ? emptyDailyRow(template)
+      ? emptyDailyRow(template, emptySource)
       : { ...row, label: template.label, is_today: template.is_today };
   });
   const extras = rows.filter((row) => !canonicalDates.has(row.date));
@@ -254,7 +374,7 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
   if (selection === 'claude') return claudeRows.slice(0, DAILY_HISTORY_CAP);
   const canonicalShape = env?.daily?.rows ?? [];
   if (selection === 'codex') {
-    return intensityRows(gapFillDailyRows(codexRows, canonicalShape)).slice(0, DAILY_HISTORY_CAP);
+    return intensityRows(gapFillDailyRows(codexRows, canonicalShape, 'codex')).slice(0, DAILY_HISTORY_CAP);
   }
   const merged = new Map<string, DailyPanelRow>();
   for (const row of [...claudeRows, ...codexRows]) {
@@ -270,6 +390,7 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
     const cacheEligibleInput = old.input_tokens + old.cache_read_tokens + row.input_tokens;
     merged.set(row.date, {
       ...old,
+      source: 'all',
       cost_usd: cost,
       input_tokens: old.input_tokens + row.input_tokens,
       output_tokens: old.output_tokens + row.output_tokens,
@@ -279,6 +400,7 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
       cache_hit_pct: cacheEligibleInput > 0
         ? (old.cache_read_tokens + row.cache_read_tokens) / cacheEligibleInput * 100
         : null,
+      codex_tokens: undefined,
       models: recomputeModelPct([...old.models, ...row.models], cost),
     });
   }
@@ -288,28 +410,82 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
 
 export interface TrendPresentation {
   rows: TrendRow[];
+  sections: TrendProviderSection[];
   title: string;
   chartLabel: string;
   valueLabel: string;
   source: DashboardSelection;
 }
 
+export interface TrendProviderSection {
+  source: SourceName;
+  label: 'Claude' | 'Codex';
+  rows: TrendRow[];
+  historyRows: TrendRow[];
+}
+
+function periodRowsToTrend(rows: PeriodRow[], source: SourceName): TrendRow[] {
+  const chronological = rows.slice().reverse();
+  return chronological.map((row, index) => ({
+    source,
+    label: row.label,
+    used_pct: row.used_pct,
+    dollar_per_pct: row.dollar_per_pct,
+    delta: row.dollar_per_pct != null && chronological[index - 1]?.dollar_per_pct != null
+      ? row.dollar_per_pct - chronological[index - 1].dollar_per_pct!
+      : null,
+    is_current: row.is_current,
+    cost_usd: row.cost_usd,
+  }));
+}
+
+function trendSection(
+  source: SourceName,
+  rows: TrendRow[],
+  historyRows: TrendRow[],
+): TrendProviderSection {
+  return {
+    source,
+    label: providerLabel(source),
+    rows: rows.map((row) => ({ ...row, source })),
+    historyRows: historyRows.map((row) => ({ ...row, source })),
+  };
+}
+
 export function presentationTrend(env: Envelope | null, selection: DashboardSelection): TrendPresentation {
   if (selection === 'claude') {
-    return { rows: env?.trend?.weeks ?? [], title: '$/1% Trend', chartLabel: '$/1% trend:', valueLabel: '$/1%', source: selection };
+    const rows = env?.trend?.weeks ?? [];
+    const historyRows = env?.trend?.history ?? rows;
+    return {
+      rows,
+      sections: [trendSection('claude', rows, historyRows)],
+      title: '$/1% Trend', chartLabel: '$/1% trend:', valueLabel: '$/1%', source: selection,
+    };
   }
-  const rows = presentationPeriodRows(env, selection, 'weekly').slice().reverse();
+  if (selection === 'all') {
+    const claudeRows = env?.trend?.weeks
+      ?? periodRowsToTrend(presentationPeriodRows(env, 'claude', 'weekly'), 'claude');
+    const claudeHistory = env?.trend?.history ?? claudeRows;
+    const codexRows = periodRowsToTrend(
+      presentationPeriodRows(env, 'codex', 'weekly'),
+      'codex',
+    );
+    return {
+      rows: [],
+      sections: [
+        trendSection('claude', claudeRows, claudeHistory),
+        trendSection('codex', codexRows, codexRows),
+      ],
+      title: '$/1% Trend', chartLabel: '$/1% trend:', valueLabel: '$/1%', source: selection,
+    };
+  }
+  const rows = periodRowsToTrend(
+    presentationPeriodRows(env, 'codex', 'weekly'),
+    'codex',
+  );
   return {
-    rows: rows.map((row, index) => ({
-      label: row.label,
-      used_pct: row.used_pct,
-      dollar_per_pct: row.dollar_per_pct,
-      delta: row.dollar_per_pct != null && rows[index - 1]?.dollar_per_pct != null
-        ? row.dollar_per_pct - rows[index - 1].dollar_per_pct!
-        : null,
-      is_current: row.is_current,
-      cost_usd: row.cost_usd,
-    })),
+    rows,
+    sections: [trendSection('codex', rows, rows)],
     title: '$/1% Trend',
     chartLabel: '$/1% trend:',
     valueLabel: '$/1%',
@@ -326,9 +502,9 @@ export interface ForecastPresentation {
   verdict: 'ok' | 'cap' | 'capped' | null;
 }
 
-export function presentationForecast(env: Envelope | null, selection: DashboardSelection): ForecastPresentation {
+export function presentationForecast(env: Envelope | null, selection: SourceName): ForecastPresentation {
   if (selection === 'claude') {
-    const fc = env?.forecast ?? null;
+    const fc = env?.forecast ?? env?.sources?.claude?.data?.hero.forecast ?? null;
     return {
       projected: fc?.week_avg_projection_pct ?? null,
       recent: fc?.recent_24h_projection_pct ?? null,
@@ -357,6 +533,43 @@ export function presentationForecast(env: Envelope | null, selection: DashboardS
       { label: 'Budget pace', value: budget?.pace.daily_usd == null ? '—' : `$${budget.pace.daily_usd.toFixed(2)}/day` },
     ],
     verdict: projected == null ? null : projected >= 100 ? 'capped' : projected >= 90 ? 'cap' : 'ok',
+  };
+}
+
+export function presentationForecastComposition(
+  env: Envelope | null,
+  selection: DashboardSelection,
+): ProviderPresentationComposition<ForecastPresentation> {
+  return {
+    selection,
+    sections: compositionSources(selection).map((source) => {
+      const value = presentationForecast(env, source);
+      const codex = source === 'codex' ? presentationProviders(env, source).codex : null;
+      const nativeForecast = codex?.quota.histories.find(
+        (row) => row.window_minutes === 10_080,
+      )?.forecast ?? codex?.quota.histories[0]?.forecast;
+      const hasForecast = source === 'claude'
+        ? (env?.forecast ?? env?.sources?.claude?.data?.hero.forecast) != null
+        : codex?.quota.histories.some(
+          (row) => row.forecast != null,
+        ) === true;
+      const section = providerSection(
+        env,
+        source,
+        hasForecast ? value : null,
+        source === 'claude' ? ['hero', 'quota', 'budget'] : ['quota', 'budget'],
+        `${providerLabel(source)} forecast is unavailable.`,
+      );
+      if (source === 'codex' && section.value != null && nativeForecast?.status !== 'ok') {
+        const statusCopy = nativeForecast?.status === 'stale'
+          ? 'Codex forecast is stale.'
+          : nativeForecast?.status === 'insufficient-history'
+            ? 'Codex forecast needs more history.'
+            : 'Codex forecast is unavailable.';
+        return { ...section, status: 'degraded' as const, reason: statusCopy };
+      }
+      return section;
+    }),
   };
 }
 
@@ -472,4 +685,33 @@ export function presentationCacheDays(env: Envelope | null, selection: Dashboard
       anomaly_reasons: [],
     };
   });
+}
+
+export function presentationCacheReportComposition(
+  env: Envelope | null,
+  selection: DashboardSelection,
+): ProviderPresentationComposition<CacheReportEnvelope> {
+  return {
+    selection,
+    sections: compositionSources(selection).map((source) => {
+      const value = source === 'claude'
+        ? env?.cache_report ?? null
+        : presentationProviders(env, source).codex?.cache_report ?? null;
+      const section = providerSection(
+        env,
+        source,
+        value,
+        ['forensics'],
+        `${providerLabel(source)} cache report is unavailable.`,
+      );
+      if (section.value?.is_empty && section.status === 'available') {
+        return {
+          ...section,
+          status: 'empty' as const,
+          reason: `No ${providerLabel(source)} cache activity is available for this window.`,
+        };
+      }
+      return section;
+    }),
+  };
 }

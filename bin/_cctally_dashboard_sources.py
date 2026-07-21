@@ -49,7 +49,10 @@ from _lib_jsonl import CodexEntry, codex_model_scoped_quota_pool
 from _lib_fmt import stable_sum
 from _lib_aggregators import _aggregate_codex_buckets
 from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
-from _lib_source_analytics import build_codex_project_result
+from _lib_source_analytics import (
+    build_codex_project_result,
+    collision_safe_project_label_map,
+)
 from _lib_view_models import (
     CodexWeeklyView,
     build_codex_daily_view,
@@ -1783,12 +1786,17 @@ def _partial_projects_wire(
             model_totals[field] += value
             session_totals[field] += value
 
+    label_map = collision_safe_project_label_map(
+        (f"{root_key}\0{project_key}", str(group["label"]))
+        for (root_key, project_key), group in groups.items()
+    )
     rows = []
     for (root_key, _project_key), group in groups.items():
+        internal_identity = f"{root_key}\0{group['project_key']}"
         rows.append({
             "key": dashboard_resource_key("project", "codex", root_key, group["project_key"]),
             "source": "codex",
-            "label": group["label"],
+            "label": label_map[internal_identity],
             "session_count": len(group["sessions"]),
             "first_seen": group["first_seen"].astimezone(UTC).isoformat(),
             "last_seen": group["last_seen"].astimezone(UTC).isoformat(),

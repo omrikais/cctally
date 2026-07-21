@@ -38,7 +38,6 @@ edits — the forwarders hit ``sys.modules["_cctally_dashboard"]`` at call time
 """
 from __future__ import annotations
 
-import json
 import re
 import socket
 import sqlite3
@@ -51,6 +50,7 @@ from _cctally_cache import (
     sync_codex_conversations,
     _codex_provider_roots,
 )
+from _lib_dashboard_json import encode_dashboard_json
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -709,7 +709,8 @@ def _run_conversation_events_stream(
     import time as _time
     watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
     tail_frame = (
-        "event: tail\ndata: " + json.dumps(tail_data) + "\n\n").encode("utf-8")
+        "event: tail\ndata: " + encode_dashboard_json(tail_data) + "\n\n"
+    ).encode("utf-8")
 
     if passive:
         # Frozen-data contract: no ingest, no emit. Keep-alive only.

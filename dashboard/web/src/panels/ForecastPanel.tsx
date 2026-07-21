@@ -8,7 +8,64 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { presentationForecast } from '../lib/dashboardPresentation';
+import {
+  presentationForecast,
+  presentationForecastComposition,
+  type ProviderPresentationSection,
+  type ForecastPresentation,
+} from '../lib/dashboardPresentation';
+import { SourceChip } from './sourcePanel';
+
+function ForecastProviderSummary({
+  section,
+}: {
+  section: ProviderPresentationSection<ForecastPresentation>;
+}) {
+  const value = section.value;
+  const verdict = resolveVerdict(value?.verdict ?? null);
+  const verdictClass = verdict?.cls ?? 'good';
+  return (
+    <div
+      className="source-provider-section provider-summary-card forecast-provider-summary"
+      data-provider-section={section.source}
+      aria-label={`${section.label} forecast`}
+    >
+      <div className="source-provider-head">
+        <SourceChip source={section.source} />
+        {section.status !== 'available' && (
+          <span className="provider-section-status">{section.status}</span>
+        )}
+      </div>
+      {value == null ? (
+        <div className="provider-section-reason">{section.reason}</div>
+      ) : (
+        <>
+          <div className="provider-summary-kpis">
+            <div>
+              <span className="provider-summary-label">{value.primaryLabel}</span>
+              <strong className={`provider-summary-value is-${verdictClass}`}>
+                {verdictClass === 'over' && value.projected != null
+                  ? '≥100%'
+                  : fmt.pct0(value.projected)}
+              </strong>
+            </div>
+            <div>
+              <span className="provider-summary-label">{value.recentLabel}</span>
+              <strong className="provider-summary-value">{fmt.pct0(value.recent)}</strong>
+            </div>
+          </div>
+          {verdict && (
+            <span className={`fc-verdict-chip is-${verdictClass}`}>
+              <span className="fc-verdict-glyph" aria-hidden="true">{verdict.glyph}</span>
+              {' '}{verdict.label}
+            </span>
+          )}
+          {section.reason && <div className="provider-section-reason">{section.reason}</div>}
+        </>
+      )}
+    </div>
+  );
+}
 
 // ForecastPanel (#248 §4) — a calm-when-healthy uniform TILE. The projected %
 // at reset is the dominant number; the verdict chip's glyph comes straight from
@@ -19,15 +76,52 @@ import { presentationForecast } from '../lib/dashboardPresentation';
 // amber number tint; `capped` (OVER) is red. The recent-24h projection + the
 // two per-day budgets render muted at the foot; the full breakdown lives in the
 // (out-of-scope) Forecast modal the tile opens.
-// #294 S5 — source-aware wrapper. The Forecast tile is a Claude-only surface
-// (Codex hero publishes no forecast, §5.5): Claude renders the existing tile
-// unchanged; Codex renders nothing (gate-hidden — the grid unmounts it, and the
-// shell returns null defensively); All renders the Claude-labeled provider
-// section (no Codex forecast section). Wrapping stops the legacy top-level
-// `env.forecast` from leaking Claude forecast numbers under a Codex label.
+// #294 S5 / #324 Task A — source-aware wrapper. Single-provider selections
+// keep the canonical tile, while All composes independent Claude and Codex
+// summaries inside one shell. The adapter keeps the legacy top-level Claude
+// forecast from leaking into the Codex section.
 export function ForecastPanel() {
   const env = useSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const composition = presentationForecastComposition(env, activeSource);
+  if (activeSource === 'all') {
+    return (
+      <section
+        className="panel accent-purple fc-tile"
+        id="panel-forecast"
+        role="region"
+        aria-label="Forecast panel · Claude and Codex"
+        data-panel-kind="forecast"
+        data-source="all"
+        onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' }))}
+      >
+        <div className="panel-header">
+          <svg className="icon" aria-hidden="true">
+            <use href="/static/icons.svg#crystal-ball" />
+          </svg>
+          <h2>Forecast <span className="sub">by provider</span></h2>
+          <div className="panel-header-actions">
+            <ShareIcon
+              panel="forecast"
+              panelLabel="Forecast"
+              triggerId="forecast-panel"
+              onClick={() => dispatch(openShareModal('forecast', 'forecast-panel'))}
+            />
+            <ExpandButton
+              label="Forecast"
+              onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'forecast' })}
+            />
+            <PanelGrip />
+          </div>
+        </div>
+        <div className="panel-body source-all-sections provider-composition provider-composition--panel">
+          {composition.sections.map((section) => (
+            <ForecastProviderSummary key={section.source} section={section} />
+          ))}
+        </div>
+      </section>
+    );
+  }
   const fc = presentationForecast(env, activeSource);
   const v = resolveVerdict(fc.verdict);
   // `v.cls` is 'good' | 'warn' | 'over'. The accent edge escalates on any

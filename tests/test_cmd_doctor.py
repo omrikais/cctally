@@ -33,12 +33,28 @@ def test_doctor_default_human_mode(tmp_path):
 
 def test_doctor_json_mode_valid_schema(tmp_path):
     r = _run(["doctor", "--json"], home=tmp_path)
-    payload = json.loads(r.stdout)
+    def reject_nonfinite(token):
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    assert all(
+        token not in r.stdout for token in ("NaN", "Infinity", "-Infinity")
+    )
+    payload = json.loads(r.stdout, parse_constant=reject_nonfinite)
     assert payload["schema_version"] == 1
     assert {c["id"] for c in payload["categories"]} == {
         "install", "hooks", "auth", "db", "data", "pricing", "safety",
         "telemetry",
     }
+    data = next(
+        category for category in payload["categories"]
+        if category["id"] == "data"
+    )
+    pipeline = next(
+        check for check in data["checks"]
+        if check["id"] == "data.statusline_pipeline"
+    )
+    assert pipeline["details"]["transport_age_seconds"] is None
+    assert pipeline["details"]["selected_age_seconds"] is None
 
 
 def test_doctor_exit_code_two_on_corrupt_config(tmp_path):

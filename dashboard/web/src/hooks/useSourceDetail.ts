@@ -29,10 +29,15 @@ export interface SourceDetailState<T> {
   loading: boolean;
 }
 
+export interface SourceDetailOptions {
+  windowWeeks?: 1 | 4 | 8 | 12;
+}
+
 export function useSourceDetail<T extends { detail_kind: string }>(
   source: SourceName,
   resource: SourceResource,
   key: string | null,
+  options: SourceDetailOptions = {},
 ): SourceDetailState<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<SourceDetailError | null>(null);
@@ -56,7 +61,8 @@ export function useSourceDetail<T extends { detail_kind: string }>(
       reqIdRef.current += 1;
       return;
     }
-    const identity = `${source}/${resource}/${key}`;
+    const windowWeeks = resource === 'project' ? options.windowWeeks : undefined;
+    const identity = `${source}/${resource}/${key}/${windowWeeks ?? ''}`;
     const keyChanged = lastKeyRef.current !== identity;
     const isInitial = keyChanged || data == null;
     // Let an in-flight initial fetch for the same identity resolve; don't
@@ -70,7 +76,8 @@ export function useSourceDetail<T extends { detail_kind: string }>(
     lastKeyRef.current = identity;
     inFlightRef.current = true;
     const myReqId = ++reqIdRef.current;
-    const url = `/api/source/${source}/${resource}/${encodeURIComponent(key)}`;
+    const query = windowWeeks == null ? '' : `?weeks=${windowWeeks}`;
+    const url = `/api/source/${source}/${resource}/${encodeURIComponent(key)}${query}`;
     fetch(url)
       .then(async (r) => {
         if (reqIdRef.current !== myReqId) return; // superseded
@@ -118,7 +125,7 @@ export function useSourceDetail<T extends { detail_kind: string }>(
         if (reqIdRef.current === myReqId) inFlightRef.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source, resource, key, token]);
+  }, [source, resource, key, options.windowWeeks, token]);
 
   return { data, error, loading };
 }

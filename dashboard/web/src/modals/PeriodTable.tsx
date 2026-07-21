@@ -18,6 +18,8 @@ interface Props {
   // order, not the envelope order.
   selectedKey: string | null;
   onSelect: (key: string) => void;
+  showSource?: boolean;
+  periodLabel?: string;
 }
 
 function deltaCellCls(d: number | null): string {
@@ -61,9 +63,11 @@ function ModelsCell({ models }: { models: ModelCostRow[] }) {
   );
 }
 
-export function PeriodTable({ rows, variant, accentClass, selectedKey, onSelect }: Props) {
+export function PeriodTable({
+  rows, variant, accentClass, selectedKey, onSelect, showSource = false, periodLabel,
+}: Props) {
   const hv = variant === 'weekly' ? 'week' : 'month';
-  const columns = historyColumns(hv);
+  const columns = historyColumns(hv, showSource, periodLabel);
   const sortOverride = useSyncExternalStore(
     subscribeStore,
     () => getState().prefs.historySortOverride,
@@ -113,6 +117,13 @@ export function PeriodTable({ rows, variant, accentClass, selectedKey, onSelect 
               }}
             >
               <td>{r.label}{isSelected ? ' ▶' : ''}</td>
+              {showSource && (
+                <td>
+                  <span className={`source-chip source-chip--${r.source ?? 'all'}`}>
+                    {r.source === 'claude' ? 'Claude' : r.source === 'codex' ? 'Codex' : 'Combined'}
+                  </span>
+                </td>
+              )}
               <td><ModelsCell models={r.models} /></td>
               <td className="num">{fmt.usd2(r.cost_usd)}</td>
               {variant === 'weekly' && <td className="num">{fmt.pct0(r.used_pct)}</td>}

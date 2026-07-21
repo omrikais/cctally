@@ -17,13 +17,21 @@ import { useState, useCallback } from 'react';
 
 export type DoctorSeverity = 'ok' | 'warn' | 'fail';
 
+export type DoctorDetailValue =
+  | null
+  | boolean
+  | number
+  | string
+  | DoctorDetailValue[]
+  | { [key: string]: DoctorDetailValue };
+
 export interface DoctorCheck {
   id: string;
   title: string;
   severity: DoctorSeverity;
   summary: string;
   remediation?: string;
-  details: Record<string, unknown>;
+  details: Record<string, DoctorDetailValue>;
 }
 
 export interface DoctorCategory {

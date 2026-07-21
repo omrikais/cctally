@@ -171,13 +171,31 @@ export function SessionModal() {
           </div>
         ) : null}
 
-        {!loading && !error && data ? <SessionContent detail={data} ctx={ctx} /> : null}
+        {!loading && !error && data ? <SessionDetailContent detail={data} ctx={ctx} /> : null}
       </section>
     </Modal>
   );
 }
 
-function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx }) {
+interface SessionDetailContentProps {
+  detail: SessionDetail;
+  ctx: FmtCtx;
+  identityLabel?: string;
+  projectAction?: { label: string; onOpen: () => void };
+  privacyNote?: string;
+  showCacheRebuilds?: boolean;
+  testId?: string;
+}
+
+export function SessionDetailContent({
+  detail,
+  ctx,
+  identityLabel,
+  projectAction,
+  privacyNote,
+  showCacheRebuilds = true,
+  testId,
+}: SessionDetailContentProps) {
   const paths = Array.isArray(detail.source_paths) ? detail.source_paths : [];
   const primary: string[] = [];
   const subagents: string[] = [];
@@ -208,10 +226,10 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
     detail.cost_per_model?.[0]?.cost_usd ?? detail.cost_total_usd ?? null;
 
   return (
-    <div className="modal-content" id="msess-content">
+    <div className="modal-content" id="msess-content" data-testid={testId}>
       <div className="m-chipstrip">
         <span className="msess-badge" id="msess-id" aria-label="Session ID">
-          {detail.session_id ?? '—'}
+          {identityLabel ?? detail.session_id ?? '—'}
         </span>
       </div>
 
@@ -251,7 +269,16 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
               title={detail.project_path ?? ''}
               aria-label="Project"
             >
-              {detail.project_label ?? detail.project_path ?? '—'}
+              {projectAction ? (
+                <button
+                  type="button"
+                  className="sd-related-link"
+                  aria-label={`Open Claude project details: ${projectAction.label}`}
+                  onClick={projectAction.onOpen}
+                >
+                  {projectAction.label}
+                </button>
+              ) : detail.project_label ?? detail.project_path ?? '—'}
             </div>
             <div className="lbl">Project</div>
           </div>
@@ -304,10 +331,14 @@ function SessionContent({ detail, ctx }: { detail: SessionDetail; ctx: FmtCtx })
         ))}
       </div>
 
-      <CacheRebuildsSection
-        key={detail.session_id ?? 'no-session'}
-        sessionId={detail.session_id ?? null}
-      />
+      {showCacheRebuilds ? (
+        <CacheRebuildsSection
+          key={detail.session_id ?? 'no-session'}
+          sessionId={detail.session_id ?? null}
+        />
+      ) : null}
+
+      {privacyNote ? <p className="sd-note sd-privacy-note">{privacyNote}</p> : null}
 
       {oneModel ? (
         <div className="msess-model-caption" id="msess-model-caption">

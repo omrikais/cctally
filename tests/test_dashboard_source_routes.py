@@ -6,7 +6,9 @@ import json
 import pathlib
 import shutil
 import socketserver
+import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -292,6 +294,158 @@ def _close(server, thread):
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
+
+
+def test_claude_project_source_route_threads_the_selected_window(monkeypatch, tmp_path):
+    ns = load_script()
+    dashboard = __import__("sys").modules["_cctally_dashboard"]
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    calls = []
+
+    def _detail_builder(*, snapshot, source, resource, key, window_weeks):
+        calls.append((source, resource, key, window_weeks))
+        return {
+            "detail_kind": "claude_project",
+            "key": key,
+            "label": "Claude project",
+            "window_weeks": window_weeks,
+        }
+
+    monkeypatch.setattr(dashboard, "build_source_detail", _detail_builder)
+    try:
+        status, payload = _get(
+            server, "/api/source/claude/project/project%3Aclaude?weeks=4",
+        )
+        assert status == 200
+        assert payload["data"]["window_weeks"] == 4
+        assert calls == [("claude", "project", "project:claude", 4)]
+    finally:
+        _close(server, thread)
+
+
+def test_claude_safe_adapters_emit_opaque_cross_navigation_without_native_ids():
+    ns = load_script()
+    dashboard = __import__("sys").modules["_cctally_dashboard"]
+    source_module = __import__("sys").modules["_cctally_dashboard_sources"]
+    raw_session_id = "native-session-id"
+    raw_project_key = "project-red"
+    raw_path = "/private/projects/project-red/native-session-id.jsonl"
+    session_key = source_module.dashboard_resource_key(
+        "session", "claude", raw_session_id,
+    )
+    project_key = source_module.dashboard_resource_key(
+        "project", "claude", raw_project_key,
+    )
+
+    session = dashboard._source_safe_claude_session_detail(
+        SimpleNamespace(
+            session_id=raw_session_id,
+            started_at=dt.datetime(2026, 7, 14, 10, tzinfo=UTC),
+            last_activity_at=dt.datetime(2026, 7, 14, 10, 30, tzinfo=UTC),
+            duration_minutes=30,
+            project_label="project-red",
+            project_path="/private/projects/project-red",
+            source_paths=[raw_path],
+            models=[("claude-opus-4-8", "primary")],
+            input_tokens=100,
+            cache_creation_tokens=200,
+            cache_read_tokens=700,
+            output_tokens=50,
+            cache_hit_pct=70.0,
+            cost_per_model=[("claude-opus-4-8", 4.25)],
+            cost_total_usd=4.25,
+        ),
+        key=session_key,
+        project_key=raw_project_key,
+    )
+    assert session["project_label"] == "project-red"
+    assert session["project_key"] == project_key
+    assert "privacy_note" in session
+
+    project = dashboard._source_safe_claude_project_detail(
+        {
+            "window_weeks": 4,
+            "window_cost_usd": 4.25,
+            "window_attributed_pct": 25.0,
+            "models": [],
+            "sessions": [{
+                "session_id": raw_session_id,
+                "started_at": "2026-07-14T10:00:00Z",
+                "last_activity_at": "2026-07-14T10:30:00Z",
+                "primary_model": "claude-opus-4-8",
+                "cost_usd": 4.25,
+            }],
+            "models_total": 0,
+            "sessions_total": 1,
+        },
+        key=project_key,
+        label="project-red",
+    )
+    assert project["label"] == "project-red"
+    assert project["sessions"][0]["key"] == session_key
+
+    public = json.dumps({"session": session, "project": project})
+    assert raw_session_id not in public
+    assert raw_path not in public
+
+
+def test_claude_session_identity_resolves_project_recent_key_outside_panel_rows(
+    monkeypatch,
+):
+    load_script()
+    dashboard = __import__("sys").modules["_cctally_dashboard"]
+    source_module = __import__("sys").modules["_cctally_dashboard_sources"]
+    native_session_id = "project-recent-session"
+    session_key = source_module.dashboard_resource_key(
+        "session", "claude", native_session_id,
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE session_files (session_id TEXT)")
+    conn.executemany(
+        "INSERT INTO session_files(session_id) VALUES (?)",
+        [("panel-session",), (native_session_id,), (None,)],
+    )
+    monkeypatch.setattr(dashboard, "open_cache_db", lambda: conn)
+
+    assert dashboard._claude_session_id_for_source_key(
+        SimpleNamespace(sessions=()), session_key,
+    ) == native_session_id
+
+
+def test_build_source_detail_accepts_claude_session_emitted_by_project_detail(
+    monkeypatch,
+):
+    load_script()
+    dashboard = __import__("sys").modules["_cctally_dashboard"]
+    calls = []
+
+    def _missing_published_row(*_args, **_kwargs):
+        raise dashboard.SourceResourceNotFound()
+
+    def _detail_builder(snapshot, *, resource, key, row, window_weeks):
+        calls.append((snapshot, resource, key, row, window_weeks))
+        return {"detail_kind": "claude_session", "key": key}
+
+    snapshot = SimpleNamespace(source_bundle=object())
+    monkeypatch.setattr(dashboard, "source_detail_lookup", _missing_published_row)
+    monkeypatch.setattr(dashboard, "_build_claude_source_detail", _detail_builder)
+
+    assert dashboard.build_source_detail(
+        snapshot=snapshot,
+        source="claude",
+        resource="session",
+        key="opaque-project-recent-session",
+    ) == {
+        "detail_kind": "claude_session",
+        "key": "opaque-project-recent-session",
+    }
+    assert calls == [(
+        snapshot,
+        "session",
+        "opaque-project-recent-session",
+        {},
+        4,
+    )]
 
 
 @pytest.mark.parametrize(("source", "resource", "key"), [

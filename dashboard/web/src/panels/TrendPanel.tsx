@@ -13,7 +13,11 @@ import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import type { TrendChartDatum } from '../store/selectors';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { presentationProviders, presentationTrend } from '../lib/dashboardPresentation';
+import {
+  presentationProviders,
+  presentationTrend,
+  type TrendProviderSection,
+} from '../lib/dashboardPresentation';
 
 // Reads trend.weeks (8 rows) via buildTrendSparkData — CLAUDE.md
 // gotcha: do NOT merge with trend.history (12 rows, modal-only).
@@ -49,27 +53,19 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
   return `$/1% trend over ${data.length} weeks; latest ${latest}${dir}`;
 }
 
-// Source-aware wrapper. Claude retains its canonical trend view; Codex derives
-// the same $/1% shape from native quota-window usage plus weekly accounting.
-// The All view intentionally leaves independent provider quota percentages
-// uncombined (presentationPeriodRows nulls quota-derived fields when merging).
-export function TrendPanel() {
-  const env = useSnapshot();
-  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
-  const presentation = presentationTrend(env, activeSource);
-  const data: TrendChartDatum[] = presentation.rows.map((row) => ({
+function TrendSection({
+  section,
+  trendOverride,
+  composed,
+}: {
+  section: TrendProviderSection;
+  trendOverride: ReturnType<typeof getState>['prefs']['trendSortOverride'];
+  composed: boolean;
+}) {
+  const data: TrendChartDatum[] = section.rows.map((row) => ({
     ...row,
     spark_height: row.dollar_per_pct ?? 0,
   }));
-  // #278 Theme A (ui-qa P3): header sub-label predicate — while hydrating with
-  // no rows yet the sub-label reads "(loading)" instead of the misleading
-  // "(0 weeks)" final-state copy (mirrors CacheReportPanel's header). Same
-  // hydrating+empty condition the body's skeleton branch uses below.
-  const hydratingEmpty = presentationProviders(env, activeSource).hydrating && data.length === 0;
-  const trendOverride = useSyncExternalStore(
-    subscribeStore,
-    () => getState().prefs.trendSortOverride,
-  );
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));
   const columns = PANEL_TREND_COLUMNS;
   const tableData = trendOverride
@@ -79,54 +75,19 @@ export function TrendPanel() {
   // on the grid wrapper, not progressbar). Covers the weeks span + the
   // latest $/1% value and its direction vs the prior week.
   const sparkLabel = buildSparkLabel(data);
+  const sparkId = composed ? `trend-spark-${section.source}` : 'trend-spark';
   return (
-    <section
-      className="panel accent-amber"
-      id="panel-trend"
-      role="region"
-      aria-label="$/1% Trend panel"
-      data-panel-kind="trend"
-      data-source={activeSource}
-      onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' }))}
-    >
-      <div className="panel-header">
-        <svg className="icon" aria-hidden="true">
-          <use href="/static/icons.svg#bar-chart" />
-        </svg>
-        <h2>
-          {presentation.title} <span className="sub">{hydratingEmpty ? '(loading)' : `(${data.length} week${data.length === 1 ? '' : 's'})`}</span>
-        </h2>
-        <div className="panel-header-actions">
-          <ShareIcon
-            panel="trend"
-            panelLabel="Trend"
-            triggerId="trend-panel"
-            onClick={() => dispatch(openShareModal('trend', 'trend-panel'))}
-          />
-          <ExpandButton
-            label="Trend"
-            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' })}
-          />
-          <PanelGrip />
-        </div>
-      </div>
-      <div className="panel-body">
-        {env?.hydrating && data.length === 0 ? (
-          // #278 §1.4: the cheap first-paint seed hasn't built the trend rows
-          // yet; show a loading skeleton instead of an empty sparkline/table.
-          <PanelSkeleton />
-        ) : (
-        <>
+    <>
         {/* #265 B — the chart leads and stays pinned; the table scrolls beneath
             it (`.trend-table-wrap`), so a thin history no longer pushes the
             sparkline + legend below the S4 in-card fold. */}
         <div className="trend-chart">
-            <div className="trend-spark-title">{presentation.chartLabel}</div>
+            <div className="trend-spark-title">$/1% trend:</div>
           <div
             className="trend-spark"
-            id="trend-spark"
+            id={sparkId}
             role="img"
-            aria-label={sparkLabel}
+            aria-label={`${section.label} ${sparkLabel}`}
             style={{ gridTemplateColumns: `repeat(${Math.max(1, data.length)}, 1fr)` }}
           >
             <Sparkline data={data} />
@@ -147,9 +108,9 @@ export function TrendPanel() {
               }
               accentVar="--accent-amber"
             />
-            <tbody id="trend-rows">
+            <tbody id={composed ? `trend-rows-${section.source}` : 'trend-rows'}>
               {tableData.map((w) => (
-                <tr key={w.label} className={w.is_current ? 'current' : undefined}>
+                <tr key={`${section.source}:${w.label}`} className={w.is_current ? 'current' : undefined}>
                   <td>{w.label}</td>
                   <td className="num">{fmt.pct0(w.used_pct)}</td>
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
@@ -163,8 +124,84 @@ export function TrendPanel() {
             </tbody>
           </table>
         </div>
-        </>
-        )}
+    </>
+  );
+}
+
+// Source-aware wrapper. Claude and Codex retain their canonical series. All is
+// a pair of source-owned charts/tables, never a chronology formed by sorting
+// independent reset axes together.
+export function TrendPanel() {
+  const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const presentation = presentationTrend(env, activeSource);
+  const trendOverride = useSyncExternalStore(
+    subscribeStore,
+    () => getState().prefs.trendSortOverride,
+  );
+  const totalRows = presentation.sections.reduce((sum, section) => sum + section.rows.length, 0);
+  const hydratingEmpty = presentationProviders(env, activeSource).hydrating && totalRows === 0;
+  const single = presentation.sections[0];
+  const sub = activeSource === 'all'
+    ? `(Claude ${presentation.sections[0]?.rows.length ?? 0}w · Codex ${presentation.sections[1]?.rows.length ?? 0}c)`
+    : `(${single?.rows.length ?? 0} week${single?.rows.length === 1 ? '' : 's'})`;
+
+  return (
+    <section
+      className="panel accent-amber"
+      id="panel-trend"
+      role="region"
+      aria-label="$/1% Trend panel"
+      data-panel-kind="trend"
+      data-source={activeSource}
+      onClick={cardRegionClick(() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' }))}
+    >
+      <div className="panel-header">
+        <svg className="icon" aria-hidden="true">
+          <use href="/static/icons.svg#bar-chart" />
+        </svg>
+        <h2>
+          {presentation.title} <span className="sub">{hydratingEmpty ? '(loading)' : sub}</span>
+        </h2>
+        <div className="panel-header-actions">
+          <ShareIcon
+            panel="trend"
+            panelLabel="Trend"
+            triggerId="trend-panel"
+            onClick={() => dispatch(openShareModal('trend', 'trend-panel'))}
+          />
+          <ExpandButton
+            label="Trend"
+            onOpen={() => dispatch({ type: 'OPEN_MODAL', kind: 'trend' })}
+          />
+          <PanelGrip />
+        </div>
+      </div>
+      <div className="panel-body">
+        {env?.hydrating && totalRows === 0 ? (
+          <PanelSkeleton />
+        ) : activeSource === 'all' ? (
+          <div className="source-all-sections provider-composition trend-provider-composition">
+            {presentation.sections.map((section) => (
+              <section
+                key={section.source}
+                className="provider-summary-card source-provider-section trend-provider-section"
+                data-provider-section={section.source}
+                aria-label={`${section.label} $ per 1% trend`}
+              >
+                <div className="source-provider-head provider-composition-head">
+                  <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
+                  <span className="provider-summary-label">
+                    {section.rows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}
+                  </span>
+                </div>
+                <TrendSection section={section} trendOverride={trendOverride} composed />
+              </section>
+            ))}
+          </div>
+        ) : single ? (
+          <TrendSection section={single} trendOverride={trendOverride} composed={false} />
+        ) : null}
       </div>
     </section>
   );

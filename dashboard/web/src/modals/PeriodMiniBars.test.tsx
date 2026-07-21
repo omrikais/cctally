@@ -102,4 +102,12 @@ describe('PeriodMiniBars', () => {
     fireEvent.click(screen.getByRole('button', { name: /newer/i }));
     expect(onSelect).toHaveBeenCalledWith('d2');
   });
+
+  it('uses native cycle vocabulary in its region and step controls', () => {
+    render(<PeriodMiniBars unit="week" displayUnit="cycle" selectedKey="c1"
+      rows={[mk('c1', 5, true), mk('c0', 2)]} onSelect={vi.fn()} />);
+    expect(screen.getByRole('region', { name: 'Cost by cycle' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Step to older cycle' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Step to newer cycle' })).toBeInTheDocument();
+  });
 });

@@ -1,17 +1,11 @@
-// #294 S5 — the derived visible-panel order (§6.11). Pure functions only.
-//
-// One derived list — the persisted full panel order filtered through §5.5 for
-// the active source — is the single list consumed by the App grid, DnD rows,
-// digit shortcuts (openPanelByPosition), focus movement, Help's panel listing,
-// and share affordances. The persisted full order is NEVER rewritten by a source
-// switch; a DnD reorder in a filtered view maps its result back into the full
-// order, preserving hidden panels' relative positions.
+// Canonical ten-card order shared by Claude, Codex, and All. Pure functions only.
+// Source selection changes card contents, never board membership, digit
+// positions, or persisted order.
 
 import type { GridPanelId } from './panelIds';
 import type { SourceView } from '../store/sourceView';
 
-// Filter the persisted full order down to the panels visible for the active
-// source. Returns a NEW array — the caller's `order` is never mutated.
+// Return a NEW canonical-order array; the caller's `order` is never mutated.
 export function deriveVisiblePanelOrder(
   order: GridPanelId[],
   view: SourceView,
@@ -23,11 +17,9 @@ export function deriveVisiblePanelOrder(
   return [...order];
 }
 
-// Map a reorder performed on the FILTERED (visible) list back into the full
-// order, holding every hidden panel at its exact index. `visibleBefore` is the
-// visible subsequence of `full`; `visibleAfter` is a permutation of it after the
-// reorder. Each visible slot in `full` is refilled, in order, from
-// `visibleAfter`; hidden panels keep their positions.
+// Map a reorder back into the persisted full order. The visible arguments keep
+// the historical API shape used by DnD, but the fixed board makes them complete
+// canonical permutations rather than source-filtered subsequences.
 export function mapVisibleReorderToFull(
   full: GridPanelId[],
   visibleBefore: GridPanelId[],

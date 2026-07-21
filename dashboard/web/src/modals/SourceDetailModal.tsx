@@ -1,10 +1,12 @@
-import { useCallback, useSyncExternalStore } from 'react';
+import { useCallback, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSourceDetail } from '../hooks/useSourceDetail';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
 import { ModelCostBars } from './ModelCostBars';
+import { ProjectDetailContent } from './ProjectsDrillPanel';
+import { SessionDetailContent } from './SessionModal';
 import { ShareIcon } from '../components/ShareIcon';
 import type { SharePanelId } from '../share/types';
 import { Modal } from './Modal';
@@ -13,9 +15,12 @@ import type {
   ClaudeProjectDetailBody,
   ClaudeSessionDetailBody,
   CodexBlockDetailBody,
+  CodexModelBreakdown,
   CodexProjectDetailBody,
   CodexSessionDetailBody,
+  CodexTokenTotals,
   SourceDetailBody,
+  SessionDetail,
 } from '../types/envelope';
 
 // #294 S5 §5.6 — the qualified source-detail modal for Codex/All source rows.
@@ -30,10 +35,15 @@ export function SourceDetailModal() {
     subscribeStore,
     () => getState().openSourceDetailSelection ?? getState().activeSource,
   );
+  const projectWindowWeeks = useSyncExternalStore(
+    subscribeStore,
+    () => getState().prefs.projectsWindowWeeks,
+  );
   const detail = useSourceDetail<SourceDetailBody>(
     open?.source ?? 'codex',
     open?.resource ?? 'session',
     open?.key ?? null,
+    { windowWeeks: open?.resource === 'project' ? projectWindowWeeks : undefined },
   );
   const close = useCallback(() => dispatch({ type: 'CLOSE_SOURCE_DETAIL' }), []);
   if (open == null) return null;
@@ -62,6 +72,7 @@ export function SourceDetailModal() {
     : open.resource === 'project' ? 'Project detail' : 'Block detail';
   return (
     <Modal
+      key={`${open.source}:${open.resource}:${open.key}`}
       title={title}
       accentClass={open.resource === 'block' ? 'accent-cyan' : 'accent-orange'}
       dataSource={open.source}
@@ -109,26 +120,171 @@ function SourceDetailBodyView({ data }: { data: SourceDetailBody }) {
 }
 
 function ClaudeSessionDetailView({ d }: { d: ClaudeSessionDetailBody }) {
+  const display = useDisplayTz();
+  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  const detail: SessionDetail = {
+    session_id: null,
+    started_utc: d.started_utc,
+    last_activity_utc: d.last_activity_utc,
+    duration_min: d.duration_min,
+    cost_total_usd: d.cost_total_usd,
+    project_label: d.project_label,
+    project_path: null,
+    input_tokens: d.input_tokens,
+    output_tokens: d.output_tokens,
+    cache_creation_tokens: d.cache_creation_tokens,
+    cache_read_tokens: d.cache_read_tokens,
+    cache_hit_pct: d.cache_hit_pct,
+    models: d.models,
+    cost_per_model: d.cost_per_model,
+    source_paths: [],
+  };
   return (
-    <div className="sd-claude-session">
-      <dl className="sd-tokens">
-        <div><dt>Cost</dt><dd>{fmt.usd2(d.cost_total_usd)}</dd></div>
-        <div><dt>Input</dt><dd>{fmt.tokens(d.input_tokens)}</dd></div>
-        <div><dt>Cache write</dt><dd>{fmt.tokens(d.cache_creation_tokens)}</dd></div>
-        <div><dt>Cache read</dt><dd>{fmt.tokens(d.cache_read_tokens)}</dd></div>
-        <div><dt>Output</dt><dd>{fmt.tokens(d.output_tokens)}</dd></div>
-        <div><dt>Duration</dt><dd>{d.duration_min == null ? '—' : `${d.duration_min}m`}</dd></div>
-      </dl>
-    </div>
+    <SessionDetailContent
+      detail={detail}
+      ctx={ctx}
+      identityLabel={d.label}
+      projectAction={d.project_key && d.project_label ? {
+        label: d.project_label,
+        onOpen: () => dispatch({
+          type: 'OPEN_SOURCE_DETAIL',
+          source: 'claude',
+          resource: 'project',
+          key: d.project_key!,
+        }),
+      } : undefined}
+      privacyNote={d.privacy_note}
+      showCacheRebuilds={false}
+      testId="claude-session-detail"
+    />
   );
 }
 
 function ClaudeProjectDetailView({ d }: { d: ClaudeProjectDetailBody }) {
-  return <div className="sd-claude-project"><p>{d.sessions_total} sessions · {fmt.usd2(d.window_cost_usd)} · {d.window_attributed_pct == null ? 'usage unavailable' : `${d.window_attributed_pct.toFixed(1)}% attributed`}</p></div>;
+  return (
+    <div className="sd-claude-project" data-testid="claude-project-detail">
+      <ProjectDetailContent
+        data={d}
+        testId="qualified-project-drill"
+        sessionTestIdPrefix="qualified-project-session"
+        showInSessionsTestId="qualified-project-show-in-sessions"
+        onOpenSession={(key) => dispatch({
+          type: 'OPEN_SOURCE_DETAIL',
+          source: 'claude',
+          resource: 'session',
+          key,
+        })}
+        onShowInSessions={() => {
+          dispatch({ type: 'SET_FILTER', text: d.label });
+          dispatch({ type: 'CLOSE_SOURCE_DETAIL' });
+        }}
+      />
+    </div>
+  );
 }
 
 function ClaudeBlockDetailView({ d }: { d: ClaudeBlockDetailBody }) {
   return <div className="sd-claude-block"><p>{fmt.usd2(d.cost_usd)} · {fmt.tokens(d.total_tokens)} tokens · {d.is_active ? 'active' : 'complete'}</p></div>;
+}
+
+function BoundedCollection<T>({
+  items,
+  initial,
+  noun,
+  empty,
+  rowTestId,
+  itemKey,
+  renderItem,
+}: {
+  items: readonly T[];
+  initial: number;
+  noun: string;
+  empty: string;
+  rowTestId: string;
+  itemKey: (item: T, index: number) => string;
+  renderItem: (item: T, index: number) => React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (items.length === 0) return <p className="sd-empty-note">{empty}</p>;
+  const visible = expanded ? items : items.slice(0, initial);
+  const hidden = items.length - Math.min(items.length, initial);
+  return (
+    <div className={`sd-bounded-collection${expanded ? ' is-expanded' : ''}`}>
+      <ul className="sd-collection-list">
+        {visible.map((item, index) => (
+          <li key={itemKey(item, index)} data-testid={rowTestId}>
+            {renderItem(item, index)}
+          </li>
+        ))}
+      </ul>
+      {hidden > 0 ? (
+        <button
+          type="button"
+          className="sd-collection-toggle"
+          aria-expanded={expanded}
+          aria-label={expanded ? `Show first ${initial} ${noun}` : `Show all ${items.length} ${noun}`}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? 'Show less' : `+${hidden} more`}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function CodexTokenGrid({ totals }: { totals: CodexTokenTotals }) {
+  const cacheHit = totals.input_tokens > 0
+    ? totals.cached_input_tokens / totals.input_tokens * 100
+    : null;
+  const tokenTiles: Array<[string, number, boolean]> = [
+    ['Input', totals.input_tokens, false],
+    ['Output', totals.output_tokens, false],
+    ['Cached input', totals.cached_input_tokens, false],
+    ['Reasoning', totals.reasoning_output_tokens, false],
+    ['Cache hit %', cacheHit ?? 0, true],
+  ];
+  return (
+    <div className="msess-tok-grid">
+      {tokenTiles.map(([label, value, percent]) => (
+        <div key={label} className={`msess-tok-tile${percent ? ' cache-hit' : ''}`}>
+          <div className="lbl">{label}</div>
+          <div className="n">{percent ? `${value.toFixed(1)}%` : value.toLocaleString('en-US')}</div>
+          {percent ? <div className="bar"><div className="fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} /></div> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CodexModelCollection({
+  rows,
+  rowTestId,
+  initial = 6,
+}: {
+  rows: readonly CodexModelBreakdown[];
+  rowTestId: string;
+  initial?: number;
+}) {
+  const named = rows.filter((row) => row.modelName?.trim());
+  return (
+    <BoundedCollection
+      items={named}
+      initial={initial}
+      noun="models"
+      empty="No model breakdown is available."
+      rowTestId={rowTestId}
+      itemKey={(row, index) => `${row.modelName}:${index}`}
+      renderItem={(row) => (
+        <>
+          <span className="sd-collection-primary">
+            <span className={`sw ${modelChipClass(row.modelName!)}`} aria-hidden="true" />
+            {row.modelName}
+          </span>
+          <span>{fmt.usd2(row.cost ?? null)}</span>
+        </>
+      )}
+    />
+  );
 }
 
 function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
@@ -137,13 +293,7 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
   const cacheHit = d.input_tokens > 0
     ? d.cached_input_tokens / d.input_tokens * 100
     : null;
-  const tokenTiles: Array<[string, number, boolean]> = [
-    ['Input', d.input_tokens, false],
-    ['Output', d.output_tokens, false],
-    ['Cached input', d.cached_input_tokens, false],
-    ['Reasoning', d.reasoning_output_tokens, false],
-    ['Cache hit %', cacheHit ?? 0, true],
-  ];
+  const label = d.label?.trim() || 'Untitled session';
   const modelRows = d.model_breakdowns.flatMap((model) => {
     const name = model.modelName?.trim();
     return name ? [{ model: name, cost_usd: model.cost ?? 0, label: name.replace(/^gpt-/i, '') }] : [];
@@ -152,10 +302,16 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
   return (
     <div className="sd-codex-session modal-content" data-testid="codex-session-detail">
       {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
-      <div className="m-chipstrip">
-        <span className="msess-badge" aria-label="Session">{d.label || 'Untitled session'}</span>
+      <div className="m-chipstrip sd-session-chipstrip">
+        <span className="msess-badge sd-prompt-clamp" aria-label="Session prompt" title={label}>{label}</span>
         <span className="m-pill accent-blue">Codex</span>
       </div>
+      {label.length > 96 ? (
+        <details className="sd-prompt-disclosure">
+          <summary>Show full prompt</summary>
+          <div className="sd-prompt-full" tabIndex={0}>{label}</div>
+        </details>
+      ) : null}
 
       <div className="m-hero cols-3">
         <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd)}</div><div className="lbl">Total cost</div></div></div>
@@ -170,15 +326,7 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
       </div>
 
       <h3 className="m-sec sec-tok"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg>Tokens</h3>
-      <div className="msess-tok-grid">
-        {tokenTiles.map(([label, value, percent]) => (
-          <div key={label} className={`msess-tok-tile${percent ? ' cache-hit' : ''}`}>
-            <div className="lbl">{label}</div>
-            <div className="n">{percent ? `${value.toFixed(1)}%` : value.toLocaleString('en-US')}</div>
-            {percent ? <div className="bar"><div className="fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} /></div> : null}
-          </div>
-        ))}
-      </div>
+      <CodexTokenGrid totals={d} />
 
       <h3 className="m-sec sec-rebuild"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#refresh-cw" /></svg>Cache reuse</h3>
       <div className="msess-rebuild-saved">
@@ -203,53 +351,121 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
 }
 
 function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
+  const display = useDisplayTz();
+  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  const models: CodexModelBreakdown[] = d.models.map((model) => ({
+    modelName: model.model,
+    cost: model.cost_usd,
+    inputTokens: model.input_tokens,
+    cachedInputTokens: model.cached_input_tokens,
+    outputTokens: model.output_tokens,
+    reasoningOutputTokens: model.reasoning_output_tokens,
+    totalTokens: model.total_tokens,
+  }));
   return (
-    <div className="sd-codex-project" data-testid="codex-project-detail">
+    <div className="sd-codex-project modal-content" data-testid="codex-project-detail">
       {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
-      <h3>{d.label || 'Codex project'}</h3>
-      <p>{d.session_count} sessions · {fmt.usd2(d.cost_usd)} · {fmt.tokens(d.total_tokens)} tokens</p>
-      <dl className="sd-context">
-        <div><dt>First seen</dt><dd>{d.first_seen}</dd></div>
-        <div><dt>Last seen</dt><dd>{d.last_seen}</dd></div>
-        <div><dt>Range</dt><dd>{d.range_start} → {d.range_end}</dd></div>
-      </dl>
-      <h3>Models</h3>
-      <ul className="sd-model-breakdown">
-        {d.models.map((model) => (
-          <li key={model.model}><span>{model.model}</span><span>{fmt.usd2(model.cost_usd)}</span></li>
-        ))}
-      </ul>
-      <h3>Recent sessions</h3>
-      <ul className="sd-recent-sessions">
-        {d.sessions.map((session) => (
-          <li key={`${session.label}:${session.last_activity}`}>
-            <span>{session.label}</span><span>{fmt.usd2(session.cost_usd)} · {fmt.tokens(session.total_tokens)}</span>
-          </li>
-        ))}
-      </ul>
+      <div className="m-chipstrip">
+        <span className="msess-badge sd-project-label" title={d.label || 'Codex project'}>{d.label || 'Codex project'}</span>
+        <span className="m-pill accent-blue">Codex</span>
+      </div>
+      <div className="m-hero cols-3">
+        <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd)}</div><div className="lbl">Total cost</div></div></div>
+        <div className="m-kv kv-dur"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#clock" /></svg><div><div className="v">{d.session_count}</div><div className="lbl">Sessions</div></div></div>
+        <div className="m-kv kv-proj"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg><div><div className="v">{fmt.tokens(d.total_tokens)}</div><div className="lbl">Total tokens</div></div></div>
+      </div>
+      <div className="msess-ts sd-project-ts">
+        <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#calendar" /></svg>
+        <div><span className="k">first seen</span><span className="v">{fmt.datetimeShort(d.first_seen, ctx)}</span></div>
+        <div><span className="k">last activity</span><span className="v">{fmt.datetimeShort(d.last_seen, ctx)}</span></div>
+        <div><span className="k">range</span><span className="v">{fmt.datetimeShort(d.range_start, ctx)} → {fmt.datetimeShort(d.range_end, ctx)}</span></div>
+      </div>
+      <h3 className="m-sec sec-tok"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg>Native token totals</h3>
+      <CodexTokenGrid totals={d} />
+      <h3 className="m-sec sec-costm"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#pie-chart" /></svg>Models</h3>
+      <CodexModelCollection rows={models} rowTestId="codex-project-model-row" />
+      <h3 className="m-sec sec-src"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#clock" /></svg>Recent sessions</h3>
+      <BoundedCollection
+        items={d.sessions}
+        initial={6}
+        noun="sessions"
+        empty="No retained sessions are available."
+        rowTestId="codex-project-session-row"
+        itemKey={(session, index) => `${session.label}:${session.last_activity}:${index}`}
+        renderItem={(session) => (
+          <>
+            <span className="sd-collection-primary sd-session-summary">
+              <span>{session.label}</span>
+              <span className="sd-collection-meta">{fmt.datetimeShort(session.last_activity, ctx)}</span>
+            </span>
+            <span>{fmt.usd2(session.cost_usd)} · {fmt.tokens(session.total_tokens)}</span>
+          </>
+        )}
+      />
     </div>
   );
 }
 
 function CodexBlockDetailView({ d }: { d: CodexBlockDetailBody }) {
+  const display = useDisplayTz();
+  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  const models = d.model_breakdowns ?? [];
+  const observations = d.observations ?? [];
+  const milestones = d.milestones ?? [];
+  const freshness = d.freshness ?? 'unavailable';
   return (
-    <div className="sd-codex-block" data-testid="codex-block-detail">
-      <p className="sd-block-label">{d.label}</p>
-      <p>{fmt.pct0(d.current_percent)} · {d.is_active ? 'active' : 'complete'} · resets {d.resets_at}</p>
-      <dl className="sd-context">
-        <div><dt>Window</dt><dd>{d.start_at || '—'} → {d.end_at || d.resets_at}</dd></div>
-        <div><dt>Cost</dt><dd>{fmt.usd2(d.cost_usd ?? null)}</dd></div>
-        <div><dt>Forecast</dt><dd>{fmt.pct1(d.forecast.projected_percent)}</dd></div>
-        <div><dt>Freshness</dt><dd>{d.freshness}</dd></div>
-      </dl>
-      <h3>Models</h3>
-      <ul className="sd-model-breakdown">
-        {(d.model_breakdowns ?? []).map((model) => (
-          <li key={model.modelName ?? 'unknown'}><span>{model.modelName ?? 'Unknown model'}</span><span>{fmt.usd2(model.cost ?? null)}</span></li>
-        ))}
-      </ul>
-      <h3>Quota observations</h3>
-      <p>{d.observations.length} observations · {d.milestones.length} milestones</p>
+    <div className="sd-codex-block modal-content" data-testid="codex-block-detail">
+      <div className="m-chipstrip">
+        <span className="msess-badge sd-project-label" title={d.label}>{d.label}</span>
+        <span className="m-pill accent-blue">Codex</span>
+        <span className={`m-pill ${d.is_active ? 'accent-green' : 'm-unavailable'}`}>{d.is_active ? 'Active' : 'Complete'}</span>
+        <span className="m-pill accent-cyan">{freshness}</span>
+      </div>
+      <div className="m-hero cols-3">
+        <div className="m-kv kv-dur"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg><div><div className="v">{fmt.pct0(d.current_percent)}</div><div className="lbl">Current usage</div></div></div>
+        <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd ?? null)}</div><div className="lbl">Retained cost</div></div></div>
+        <div className="m-kv kv-proj"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#trending-up" /></svg><div><div className="v">{fmt.pct1(d.forecast.projected_percent)}</div><div className="lbl">Projected at reset</div><div className="sub">{d.forecast.status}</div></div></div>
+      </div>
+      <div className="msess-ts sd-block-ts">
+        <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#calendar" /></svg>
+        <div><span className="k">window</span><span className="v">{fmt.datetimeShort(d.start_at ?? null, ctx)} → {fmt.datetimeShort(d.end_at ?? d.resets_at, ctx)}</span></div>
+        <div><span className="k">resets</span><span className="v">{fmt.datetimeShort(d.resets_at, ctx)}</span></div>
+      </div>
+      <h3 className="m-sec sec-costm"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#pie-chart" /></svg>Models</h3>
+      <CodexModelCollection rows={models} rowTestId="codex-block-model-row" />
+      <h3 className="m-sec sec-prog"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg>Quota progression</h3>
+      <p className="sd-progression-summary">{observations.length} observations · {milestones.length} milestones</p>
+      <h4 className="sd-subsection-title">Observations</h4>
+      <BoundedCollection
+        items={observations}
+        initial={8}
+        noun="observations"
+        empty="No retained quota observations are available."
+        rowTestId="codex-block-observation-row"
+        itemKey={(observation, index) => `${observation.captured_at}:${index}`}
+        renderItem={(observation) => (
+          <>
+            <span className="sd-collection-primary sd-observation-time">{fmt.datetimeShort(observation.captured_at, ctx)}</span>
+            <span className="sd-observation-value">{fmt.pct1(observation.used_percent)}</span>
+            <span className="sd-observation-track" aria-hidden="true"><span style={{ width: `${Math.max(0, Math.min(100, observation.used_percent))}%` }} /></span>
+          </>
+        )}
+      />
+      <h4 className="sd-subsection-title">Milestones</h4>
+      <BoundedCollection
+        items={milestones}
+        initial={8}
+        noun="milestones"
+        empty="No quota milestones were crossed in this window."
+        rowTestId="codex-block-milestone-row"
+        itemKey={(milestone, index) => `${milestone.percent}:${milestone.captured_at}:${index}`}
+        renderItem={(milestone) => (
+          <>
+            <span className="sd-collection-primary">Crossed {fmt.pct0(milestone.percent)}</span>
+            <span>{fmt.datetimeShort(milestone.captured_at, ctx)}</span>
+          </>
+        )}
+      />
     </div>
   );
 }

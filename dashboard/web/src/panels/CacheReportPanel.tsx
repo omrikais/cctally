@@ -41,12 +41,64 @@ import { CacheNetBars } from '../modals/CacheNetBars';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
-import { presentationCacheDays, presentationProviders } from '../lib/dashboardPresentation';
+import {
+  presentationCacheDays,
+  presentationCacheReportComposition,
+  presentationProviders,
+  type ProviderPresentationSection,
+} from '../lib/dashboardPresentation';
 import type { CacheReportEnvelope } from '../types/envelope';
+import { SourceChip } from './sourcePanel';
 
 const TEAL = 'var(--accent-teal)';
 const AMBER = 'var(--accent-amber)';
 const GREEN = 'var(--accent-green)';
+
+function CacheProviderSummary({
+  section,
+}: {
+  section: ProviderPresentationSection<CacheReportEnvelope>;
+}) {
+  const report = section.value;
+  const windowNetUsd = report?.days.reduce((sum, day) => sum + day.net_usd, 0) ?? 0;
+  return (
+    <div
+      className="source-provider-section provider-summary-card cache-provider-summary"
+      data-provider-section={section.source}
+      aria-label={`${section.label} cache report`}
+    >
+      <div className="source-provider-head">
+        <SourceChip source={section.source} />
+        {section.status !== 'available' && (
+          <span className="provider-section-status">{section.status}</span>
+        )}
+      </div>
+      {report == null ? (
+        <div className="provider-section-reason">{section.reason}</div>
+      ) : (
+        <>
+          <div className="provider-summary-kpis">
+            <div>
+              <span className="provider-summary-label">Cache hit</span>
+              <strong className="provider-summary-value">{fmt.pctFloor(report.today.cache_hit_percent)}%</strong>
+            </div>
+            <div>
+              <span className="provider-summary-label">{report.window_days}d net</span>
+              <strong className={windowNetUsd < 0 ? 'provider-summary-value warn' : 'provider-summary-value ok'}>
+                {fmt.usdSigned(windowNetUsd)}
+              </strong>
+            </div>
+          </div>
+          <div className="provider-summary-foot">
+            <span>{report.today.anomaly_triggered ? '⚠ anomaly' : '✓ healthy'}</span>
+            <span>{report.window_days}d native report</span>
+          </div>
+          {section.reason && <div className="provider-section-reason">{section.reason}</div>}
+        </>
+      )}
+    </div>
+  );
+}
 
 // Provider-aware cache forensics. Claude keeps the legacy top-level report;
 // Codex publishes the same computed report shape from native inclusive-input
@@ -54,6 +106,43 @@ const GREEN = 'var(--accent-green)';
 export function CacheReportPanel() {
   const env = useSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const isMobile = useIsMobile();
+  const collapseClass = isMobile ? ' cache-report-collapsed' : '';
+  const openModal = () => {
+    dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
+  };
+  const composition = presentationCacheReportComposition(env, activeSource);
+
+  if (activeSource === 'all') {
+    return (
+      <section
+        className={`panel accent-teal${collapseClass}`}
+        id="panel-cache-report"
+        data-panel-kind="cache-report"
+        data-source="all"
+        role="region"
+        aria-label="Cache Report · Claude and Codex"
+        onClick={cardRegionClick(openModal)}
+        style={{ cursor: 'pointer' }}
+      >
+        <div className="panel-header" style={{ justifyContent: 'space-between' }}>
+          <div className="cr-panel-header-inner">
+            <h2 style={{ color: TEAL }}>Cache Report <span className="sub">by provider</span></h2>
+          </div>
+          <div className="panel-header-actions">
+            <ExpandButton label="Cache Report" onOpen={openModal} />
+            <PanelGrip />
+          </div>
+        </div>
+        <div className="panel-body source-all-sections provider-composition provider-composition--panel">
+          {composition.sections.map((section) => (
+            <CacheProviderSummary key={section.source} section={section} />
+          ))}
+        </div>
+      </section>
+    );
+  }
+
   const adaptedDays = presentationCacheDays(env, activeSource);
   const nativeReport = env?.sources?.codex?.data?.cache_report ?? undefined;
   const newest = adaptedDays?.[0];
@@ -88,11 +177,6 @@ export function CacheReportPanel() {
   // existing @media rule at index.css:4186 so the panel reads as a
   // single-line summary on phones. Mirrors the daily-collapsed /
   // sessions-collapsed convention but is viewport-driven (no user pref).
-  const isMobile = useIsMobile();
-  const collapseClass = isMobile ? ' cache-report-collapsed' : '';
-  const openModal = () => {
-    dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
-  };
   // #293 S4 — the region describes (role=region + aria-label); the Expand
   // button is the sole keyboard/SR open path. The guarded pointer body-click is
   // preserved via cardRegionClick so a nested control / grip never double-fires.
@@ -162,7 +246,7 @@ export function CacheReportPanel() {
         <div className="cr-status-row">
           <span className="cr-glyph thin">−</span>
           <div>
-            <div className="cr-headline">No {activeSource === 'all' ? 'combined' : activeSource === 'codex' ? 'Codex' : 'Claude'} activity yet</div>
+            <div className="cr-headline">No {activeSource === 'codex' ? 'Codex' : 'Claude'} activity yet</div>
             <div className="cr-subline">Run a session to start tracking</div>
           </div>
         </div>

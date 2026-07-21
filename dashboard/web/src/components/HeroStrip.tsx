@@ -53,10 +53,7 @@ export function HeroStrip() {
   }, [isMobile]);
 
   const openCurrentWeek = () => dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
-
-  const activate = activeSource === 'all'
-    ? () => dispatch({ type: 'SHOW_STATUS_TOAST', text: 'Claude and Codex quota cycles are independent; select a provider to inspect its current cycle.' })
-    : openCurrentWeek;
+  const activate = openCurrentWeek;
 
   const body = <SharedHero source={activeSource} env={env} ctx={ctx} verdict={verdict} heroLabel={heroLabel} />;
 
@@ -113,6 +110,7 @@ function SharedHero({
         ctx={ctx}
         verdict={verdict}
         heroLabel={heroLabel}
+        showFiveHour
       />
     );
   }
@@ -190,6 +188,7 @@ function SharedHero({
         ctx={ctx}
         verdict={codexVerdict}
         heroLabel={codexHeroLabel}
+        showFiveHour={fiveHour != null}
         unavailableReason={codexUnavailable
           ? warning?.message ?? 'Cycle accounting unavailable'
           : null}
@@ -201,6 +200,8 @@ function SharedHero({
   const all = allEntry?.data as AllSourceData | undefined;
   const combined = all?.combined ?? null;
   const allWarning = warningForDomain(allEntry?.warnings, 'hero');
+  const allWarningDetail = allWarning?.message
+    ?? 'Combined totals are unavailable while a provider is degraded.';
 
   return (
     <>
@@ -221,7 +222,16 @@ function SharedHero({
         <div className="hs-big">{combined?.cost_usd == null ? '—' : fmt.usd0(combined.cost_usd)}</div>
         <div className="hs-sub">
           {combined == null
-            ? allWarning?.message ?? 'Combined totals are unavailable while a provider is degraded.'
+            ? (
+              <span
+                className="panel-degraded-chip hero-warning-chip"
+                data-testid="shared-hero-warning"
+                title={allWarningDetail}
+                aria-label={`Combined totals unavailable: ${allWarningDetail}`}
+              >
+                Combined unavailable
+              </span>
+            )
             : <><span>{fmt.tokens(combined.total_tokens)}</span> total tokens</>}
         </div>
       </div>
@@ -259,6 +269,7 @@ function CanonicalHero({
   verdict,
   heroLabel,
   freshness,
+  showFiveHour,
   unavailableReason = null,
 }: {
   weekLabel: string | null | undefined;
@@ -273,6 +284,7 @@ function CanonicalHero({
   verdict: ReturnType<typeof resolveVerdict>;
   heroLabel: string;
   freshness: FreshnessEnvelope | null;
+  showFiveHour: boolean;
   unavailableReason?: string | null;
 }) {
   return (
@@ -285,10 +297,12 @@ function CanonicalHero({
           </div>
           <div className="hu-num">{fmt.pct1(usedPct)}</div>
         </div>
-        <div className="hu-block">
-          <div className="hu-label">5-HOUR</div>
-          <div className="hu-num hu-num--sm">{fmt.pct0(fiveHourPct)}</div>
-        </div>
+        {showFiveHour && (
+          <div className="hu-block" data-testid="hero-five-hour">
+            <div className="hu-label">5-HOUR</div>
+            <div className="hu-num hu-num--sm">{fmt.pct0(fiveHourPct)}</div>
+          </div>
+        )}
         <div className="hu-reset">
           resets in <span>{fmt.ddhh(resetInSec)}</span>
         </div>

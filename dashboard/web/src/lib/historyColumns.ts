@@ -1,5 +1,5 @@
 import type { TableColumn } from './tableSort';
-import type { ModelCostRow } from '../types/envelope';
+import type { DashboardSelection, ModelCostRow } from '../types/envelope';
 
 // Decorated row type for the History (Weekly/Monthly) sortable table.
 // Mirrors the fields PeriodTable renders — reusing PeriodRow's field
@@ -8,6 +8,7 @@ import type { ModelCostRow } from '../types/envelope';
 // dollar_per_pct) are null for monthly rows.
 export interface HistoryTableRow {
   key: string;
+  source?: DashboardSelection;
   label: string;
   cost_usd: number;
   used_pct: number | null;
@@ -29,29 +30,40 @@ const cmpStr = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 // sort (the header stays clickable via SortableHeader, which ignores the
 // `sortable` flag, but rows keep envelope order). Monthly drops the two
 // weekly-only percent columns (WM-1: Monthly correctly omits Used%/$/1%).
-export function historyColumns(variant: HistoryVariant): TableColumn<HistoryTableRow>[] {
+export function historyColumns(
+  variant: HistoryVariant,
+  includeSource = false,
+  periodLabel?: string,
+): TableColumn<HistoryTableRow>[] {
   const cols: TableColumn<HistoryTableRow>[] = [
     {
       id: 'label',
-      label: variant === 'week' ? 'Week' : 'Month',
+      label: periodLabel ?? (variant === 'week' ? 'Week' : 'Month'),
       defaultDirection: 'asc',
       compare: (a, b) => cmpStr(a.label, b.label),
     },
-    {
+  ];
+  if (includeSource) {
+    cols.push({
+      id: 'source',
+      label: 'Source',
+      defaultDirection: 'asc',
+      compare: (a, b) => cmpStr(a.source ?? '', b.source ?? ''),
+    });
+  }
+  cols.push({
       id: 'models',
       label: 'Models',
       defaultDirection: 'desc',
       // No meaningful ordering for the chip cluster — keep rows stable.
       compare: () => 0,
-    },
-    {
+    }, {
       id: 'cost_usd',
       label: 'Cost (USD)',
       defaultDirection: 'desc',
       numeric: true,
       compare: (a, b) => a.cost_usd - b.cost_usd,
-    },
-  ];
+    });
   if (variant === 'week') {
     cols.push(
       {

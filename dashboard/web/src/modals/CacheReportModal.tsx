@@ -30,7 +30,11 @@ import { CacheNetBars } from './CacheNetBars';
 import { CacheBreakdownCard } from './CacheBreakdownCard';
 import { CacheReportSettings } from './CacheReportSettings';
 import { fmt } from '../lib/fmt';
-import { presentationCacheDays } from '../lib/dashboardPresentation';
+import {
+  presentationCacheDays,
+  presentationCacheReportComposition,
+  type ProviderPresentationSection,
+} from '../lib/dashboardPresentation';
 import { getState, subscribeStore } from '../store/store';
 import type { DashboardSelection } from '../types/envelope';
 import {
@@ -38,6 +42,7 @@ import {
   CACHE_REPORT_MIN_BASELINE_DAYS,
 } from '../lib/cache-report-constants';
 import type { CacheReportDailyRow, CacheReportEnvelope } from '../types/envelope';
+import { SourceChip } from '../panels/sourcePanel';
 
 // Shared per-row coloring rules for the daily section (desktop table + mobile
 // cards render from the same derivation, so the two surfaces never diverge):
@@ -66,6 +71,93 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 1
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function AllCacheReportSection({
+  section,
+}: {
+  section: ProviderPresentationSection<CacheReportEnvelope>;
+}) {
+  const report = section.value;
+  return (
+    <section
+      className="provider-composition-section cache-provider-detail"
+      data-provider-section={section.source}
+      aria-label={`${section.label} cache report detail`}
+    >
+      <div className="source-provider-head provider-composition-head">
+        <SourceChip source={section.source} />
+        <strong>{section.label} cache report</strong>
+        {section.status !== 'available' && (
+          <span className="provider-section-status">{section.status}</span>
+        )}
+      </div>
+      {report == null ? (
+        <div className="provider-section-reason m-unavailable">{section.reason}</div>
+      ) : (
+        <>
+          <div className="crm-section">
+            <CacheReportSpotlight cr={report} />
+          </div>
+          <div className="crm-section">
+            <div className="crm-section-head crm-sh-timeline">
+              Cache hit % — {report.window_days}-day timeline
+              <span className="meta">provider-local</span>
+            </div>
+            <div className="crm-chart-frame timeline">
+              <CacheSparkline
+                days={report.days}
+                baseline_median_percent={report.today.baseline_median_percent}
+                today_marker_color={report.today.anomaly_triggered ? 'var(--accent-amber)' : 'var(--accent-green)'}
+                size="large"
+              />
+            </div>
+          </div>
+          <CacheNetBars days={report.days} size="large" />
+          <div className="crm-counterfactual">
+            Provider-local counterfactual:{' '}
+            <strong>+${report.fourteen_day_counterfactual_usd.toFixed(2)}</strong>
+          </div>
+          <div className="crm-section">
+            <div className="crm-section-head crm-sh-table">
+              Daily rows · {report.window_days} days
+              <span className="meta">{report.days.length} observed</span>
+            </div>
+            <div className="provider-daily-summary">
+              {report.days.map((day) => (
+                <div className="provider-daily-summary-row" key={day.date}>
+                  <span>{fmt.calDate(day.date)}</span>
+                  <span>{fmt.pctFloor(day.cache_hit_percent)}%</span>
+                  <span className={day.net_usd < 0 ? 'net-neg' : 'net-pos'}>{fmt.usdSigned(day.net_usd)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="crm-section">
+            <div className="crm-breakdowns">
+              <CacheBreakdownCard kind="projects" rows={report.by_project} />
+              <CacheBreakdownCard kind="models" rows={report.by_model} />
+            </div>
+          </div>
+          {section.reason && <div className="provider-section-reason">{section.reason}</div>}
+        </>
+      )}
+    </section>
+  );
+}
+
+function AllCacheReportModal() {
+  const env = useSnapshot();
+  const composition = presentationCacheReportComposition(env, 'all');
+  return (
+    <Modal title="Cache Report — by provider" accentClass="accent-teal">
+      <div className="provider-composition provider-composition--modal" aria-label="Claude and Codex cache reports">
+        {composition.sections.map((section) => (
+          <AllCacheReportSection key={section.source} section={section} />
+        ))}
+      </div>
+    </Modal>
+  );
 }
 
 function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
@@ -402,5 +494,7 @@ export function CacheReportModal() {
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,
   );
-  return <CanonicalCacheReportModal source={source} />;
+  return source === 'all'
+    ? <AllCacheReportModal />
+    : <CanonicalCacheReportModal source={source} />;
 }

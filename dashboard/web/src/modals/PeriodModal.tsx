@@ -38,6 +38,19 @@ interface Props {
 const UNIT_PLURAL: Record<Variant, string> = { day: 'days', week: 'weeks', month: 'months' };
 const DETAIL_VARIANT: Record<Variant, 'daily' | 'weekly' | 'monthly'> = { day: 'daily', week: 'weekly', month: 'monthly' };
 
+function weeklyVocabulary(source: DashboardSelection) {
+  if (source === 'codex') {
+    return { plural: 'cycles', noun: 'cycle', window: 'Reset cycle', column: 'Cycle', nav: 'cycle' as const };
+  }
+  if (source === 'all') {
+    return {
+      plural: 'provider periods', noun: 'provider period', window: 'Provider window',
+      column: 'Provider period', nav: 'provider period' as const,
+    };
+  }
+  return { plural: 'weeks', noun: 'week', window: 'Subscription window', column: 'Week', nav: undefined };
+}
+
 interface Keyed { key: string; nav: PeriodNavRow; period: PeriodRow; }
 
 function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSelection): Keyed[] {
@@ -53,7 +66,15 @@ function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSel
   const v: PeriodVariant = variant;
   return rows.map((r) => ({
     key: keyOf(r, v),
-    nav: { key: keyOf(r, v), label: r.label, cost: r.cost_usd, isCurrent: r.is_current, isEmpty: r.cost_usd <= 0 },
+    nav: {
+      key: keyOf(r, v),
+      label: source === 'all' && variant === 'week' && r.source != null
+        ? `${r.source === 'claude' ? 'Claude' : 'Codex'} · ${r.label}`
+        : r.label,
+      cost: r.cost_usd,
+      isCurrent: r.is_current,
+      isEmpty: r.cost_usd <= 0,
+    },
     period: r,
   }));
 }
@@ -81,6 +102,7 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
   const firstKey = keyed[0]?.key ?? null;
   const effectiveKey = selectedKey != null && keySet.has(selectedKey) ? selectedKey : firstKey;
   const selectedRow = keyed.find((k) => k.key === effectiveKey)?.period ?? null;
+  const vocabulary = weeklyVocabulary(source);
 
   // ↑/↓ steps the navigator's chronological order (same order PeriodMiniBars'
   // ‹/› uses), so the two steppers always agree even under a table sort.
@@ -112,11 +134,19 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
   );
 
   const title = navRows.length > 0
-    ? `${panelLabel} · last ${navRows.length} ${UNIT_PLURAL[variant]}`
+    ? source === 'all' && variant === 'week'
+      ? `${panelLabel} · ${navRows.length} ${vocabulary.plural}`
+      : `${panelLabel} · last ${navRows.length} ${variant === 'week' ? vocabulary.plural : UNIT_PLURAL[variant]}`
     : panelLabel;
 
   const detail = selectedRow && (
-    <PeriodDetailCard row={selectedRow} variant={DETAIL_VARIANT[variant]} accentClass={accentClass} />
+    <PeriodDetailCard
+      row={selectedRow}
+      variant={DETAIL_VARIANT[variant]}
+      accentClass={accentClass}
+      periodNoun={variant === 'week' ? vocabulary.noun : undefined}
+      windowLabel={variant === 'week' ? vocabulary.window : undefined}
+    />
   );
 
   return (
@@ -125,7 +155,13 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
         <div className="panel-empty">No usage history yet.</div>
       ) : (
         <>
-          <PeriodMiniBars unit={variant} rows={navRows} selectedKey={effectiveKey} onSelect={setSelectedKey} />
+          <PeriodMiniBars
+            unit={variant}
+            displayUnit={variant === 'week' ? vocabulary.nav : undefined}
+            rows={navRows}
+            selectedKey={effectiveKey}
+            onSelect={setSelectedKey}
+          />
           {variant === 'day' ? (
             detail
           ) : (
@@ -138,6 +174,8 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
                   accentClass={accentClass}
                   selectedKey={effectiveKey}
                   onSelect={setSelectedKey}
+                  showSource={source === 'all' && variant === 'week'}
+                  periodLabel={variant === 'week' ? vocabulary.column : undefined}
                 />
               </div>
             </div>

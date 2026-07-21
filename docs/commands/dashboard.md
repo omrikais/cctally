@@ -172,8 +172,11 @@ The periodic background sync runs every 5 seconds (configurable via
 the OAuth API, so Anthropic's rate limit is not affected by background
 ticks. A usage observation selected by the statusline reducer appears in the
 next normal rebuild and is sent over the existing SSE stream; no dashboard
-action or dashboard-owned OAuth request is involved. Only chip clicks / `r`
-presses trigger OAuth fetches.
+action or dashboard-owned OAuth request is involved. The separate 30-second
+Claude status-line timer may perform one account-wide, detached OAuth
+confirmation when selected usage is stale; it shares the hook throttle and
+`429` backoff. Within the dashboard itself, only chip clicks / `r` presses
+trigger OAuth fetches.
 
 ## Startup sync
 

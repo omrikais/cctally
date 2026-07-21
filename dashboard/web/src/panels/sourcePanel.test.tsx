@@ -156,4 +156,66 @@ describe('availability chrome (§5.5 Layer 3)', () => {
     // retained data still renders
     expect(document.querySelector('.daily-cal-grid')).toBeInTheDocument();
   });
+
+  it.each([
+    ['missing', undefined],
+    ['ingest', 'ingest'],
+    ['read_model', 'read_model'],
+    ['unknown', 'future-domain'],
+  ] as const)(
+    'shows a %s source-wide warning on Daily and Projects',
+    (label, domain) => {
+      updateSnapshot(
+        codexEnv((b) => {
+          b.sources.codex = {
+            ...b.sources.codex,
+            availability: 'partial',
+            freshness: 'fresh',
+            warnings: [{
+              code: `source_${label}`,
+              message: `Source-wide ${label} warning.`,
+              ...(domain === undefined ? {} : { domain }),
+            }],
+          };
+        }),
+      );
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+
+      const daily = render(<DailyPanel />);
+      const projects = render(<ProjectsPanel />);
+
+      expect(daily.container.querySelector('.panel-degraded-chip')).toHaveAccessibleName(
+        `Degraded: Source-wide ${label} warning.`,
+      );
+      expect(projects.container.querySelector('.panel-degraded-chip')).toHaveAccessibleName(
+        `Degraded: Source-wide ${label} warning.`,
+      );
+    },
+  );
+
+  it('keeps a projects-only warning scoped to Projects', () => {
+    updateSnapshot(
+      codexEnv((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          freshness: 'fresh',
+          warnings: [{
+            code: 'codex_metadata_incomplete',
+            message: 'Project metadata is incomplete.',
+            domain: 'projects',
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+
+    const daily = render(<DailyPanel />);
+    const projects = render(<ProjectsPanel />);
+
+    expect(daily.container.querySelector('.panel-degraded-chip')).toBeNull();
+    expect(projects.container.querySelector('.panel-degraded-chip')).toHaveAccessibleName(
+      'Degraded: Project metadata is incomplete.',
+    );
+  });
 });

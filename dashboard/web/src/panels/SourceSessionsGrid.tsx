@@ -19,7 +19,7 @@ import { modelChipClass, modelChipStyle } from '../lib/model';
 import { HighlightText } from '../lib/highlightText';
 import { rovingAction } from '../lib/sessionsRovingKeyboard';
 import { resolveSourceView } from '../store/sourceView';
-import { gatePanel } from '../lib/sourceGating';
+import { gateSessions } from '../lib/sourceGating';
 import { sourceSessionsColumns } from '../lib/sourceSessionsColumns';
 import { collectSourceSessionRows, type SessionDisplayRow } from '../lib/sourceRows';
 import { costClass } from '../lib/cost';
@@ -64,7 +64,7 @@ export function SourceSessionsGrid() {
   const isMobile = useIsMobile();
   const isAll = activeSource === 'all';
   const view = resolveSourceView(env, activeSource);
-  const gate = gatePanel(view, 'sessions');
+  const gate = gateSessions(view);
   const rows = getRenderedSourceRows();
   const allRows = collectSourceSessionRows(view);
   const models = new Set(allRows.flatMap((row) => row.models));

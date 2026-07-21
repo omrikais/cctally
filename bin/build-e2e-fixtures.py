@@ -416,6 +416,69 @@ def build_second_model(projects: pathlib.Path, rng: random.Random) -> dict:
     }
 
 
+def build_codex_task_a(out: pathlib.Path) -> dict:
+    """Build #329 Task A's native-cycle and partial-project browser inputs.
+
+    The complete root fixtures keep their conversation content/identity but use
+    the same basename under distinct synthetic parents. A token-only UUID file
+    contributes a prior exact seven-day cycle and one metadata-incomplete
+    accounting row without creating an extra conversation.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    source_dir = repo / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
+    target = out / "codex-task-a"
+    target.mkdir(parents=True, exist_ok=True)
+
+    def records(name: str) -> list[dict]:
+        return [json.loads(line) for line in (source_dir / name).read_text().splitlines() if line]
+
+    def normalize_native_limits(value):
+        if isinstance(value, dict):
+            for key, item in tuple(value.items()):
+                if key == "window_minutes" and item == 10_020:
+                    value[key] = 10_080
+                elif key == "window_minutes" and item == 330:
+                    value[key] = 300
+                else:
+                    normalize_native_limits(item)
+        elif isinstance(value, list):
+            for item in value:
+                normalize_native_limits(item)
+
+    current_files: dict[str, str] = {}
+    for scenario, parent in (("root-a-collision", "workspace"), ("root-b-collision", "personal")):
+        values = records(f"{scenario}.jsonl")
+        for value in values:
+            normalize_native_limits(value)
+            if value.get("type") == "session_meta":
+                value["payload"]["cwd"] = f"/synthetic/{parent}/repo"
+        path = target / f"{scenario}.jsonl"
+        path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in values))
+        current_files[scenario] = str(path.resolve())
+
+    modern = records("modern-full.jsonl")
+    token = next(value for value in modern if value.get("payload", {}).get("type") == "token_count")
+    token["timestamp"] = "2026-07-07T12:02:00Z"
+    normalize_native_limits(token)
+    limits = token["payload"]["info"]["rate_limits"]
+    limits["secondary"]["resets_at"] = 1_784_030_400  # 2026-07-14T12:00:00Z
+    prior = [
+        {
+            "timestamp": "2026-07-07T12:01:00Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-synthetic-codex", "turn_id": "issue-329-prior-cycle"},
+        },
+        token,
+    ]
+    prior_path = target / "rollout-2026-07-07T12-00-00-32900000-0000-4000-8000-000000000001.jsonl"
+    prior_path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in prior))
+
+    return {
+        "codex_task_a_current_files": current_files,
+        "codex_task_a_prior_file": str(prior_path.resolve()),
+    }
+
+
 def build(out: pathlib.Path) -> dict:
     scratch = out / "scratch"
     data = scratch / "data"
@@ -432,6 +495,7 @@ def build(out: pathlib.Path) -> dict:
     manifest.update(build_sidechain(projects, rng))
     manifest.update(build_live(projects, rng))
     manifest.update(build_second_model(projects, rng))
+    manifest.update(build_codex_task_a(out))
     manifest["project_dir"] = PROJECT_DIR
     manifest["cwd"] = CWD
     manifest["page_size"] = PAGE

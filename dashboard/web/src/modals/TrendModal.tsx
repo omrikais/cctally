@@ -273,7 +273,13 @@ function deltaKv(delta: number | null): DeltaKv {
   return { cls: 'delta-flat', iconHref: '/static/icons.svg#minus', text: '$0.000' };
 }
 
-function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
+function CanonicalTrendModal({
+  source,
+  embedded = false,
+}: {
+  source: DashboardSelection;
+  embedded?: boolean;
+}) {
   const env = useSnapshot();
   const isClaude = source === 'claude';
   const presentation = presentationTrend(env, source);
@@ -321,6 +327,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
   const svgPrims = buildSparklinePrimitives(rows, curIdx);
   const hasUsed = rows.some((r) => r.used_pct != null && isFinite(r.used_pct));
   const N = rows.length;
+  const idFor = (base: string): string => embedded ? `${base}-${source}` : base;
 
   // Decorate rows with their chronological index (finding 2) BEFORE sorting,
   // so the "Now / W−1 / W−2" label and the `.cur` highlight follow the row's
@@ -339,7 +346,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
         <use href="/static/icons.svg#dollar" />
       </svg>
       <div>
-        <div className="v" id="mtr-cur">
+        <div className="v" id={idFor('mtr-cur')}>
           {cur && cur.dollar_per_pct != null
             ? '$' + cur.dollar_per_pct.toFixed(3)
             : <span className="m-unavailable">—</span>}
@@ -349,16 +356,10 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
     </div>
   );
 
-  return (
-    <Modal
-      title={N > 0 ? `Trend — last ${N} weeks` : 'Trend'}
-      accentClass="accent-amber"
-      headerExtras={headerExtras}
-      wide
-    >
+  const content = (
       <section className="modal-trend" data-source={source}>
         <div className="m-chipstrip">
-          <span className={`m-pill accent-amber${N === 0 ? ' m-unavailable' : ''}`} id="mtr-weeks-pill">
+          <span className={`m-pill accent-amber${N === 0 ? ' m-unavailable' : ''}`} id={idFor('mtr-weeks-pill')}>
             {N === 0 ? 'History unavailable' : formatWeeksPill(N)}
           </span>
           {!isClaude && <span className="m-pill accent-blue">{source === 'all' ? 'All sources' : 'Codex'}</span>}
@@ -374,18 +375,18 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
                 <use href="/static/icons.svg#minus" />
               </svg>
               <div>
-                <div className="v" id="mtr-med">
+                <div className="v" id={idFor('mtr-med')}>
                   {'$' + med.toFixed(3)}
                 </div>
                 <div className="lbl">4-week median</div>
               </div>
             </div>
-            <div className={`m-kv kv-delta ${dkv.cls}`} id="mtr-delta-kv">
+            <div className={`m-kv kv-delta ${dkv.cls}`} id={idFor('mtr-delta-kv')}>
               <svg className="icon" aria-hidden="true">
                 <use href={dkv.iconHref} />
               </svg>
               <div>
-                <div className="v" id="mtr-delta">{dkv.text}</div>
+                <div className="v" id={idFor('mtr-delta')}>{dkv.text}</div>
                 <div className="lbl">vs median</div>
               </div>
             </div>
@@ -397,7 +398,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
              value, "Median" as the label) rather than an empty "—" KPI. */
           <div className="m-hero cols-2">
             {heroCur}
-            <div className="m-kv kv-med kv-hint" id="mtr-med-hint">
+            <div className="m-kv kv-med kv-hint" id={idFor('mtr-med-hint')}>
               <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#minus" />
               </svg>
@@ -422,7 +423,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
         </h3>
         <div className="mtr-sparkhero">
           <svg
-            id="mtr-svg"
+            id={idFor('mtr-svg')}
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
             role="group"
@@ -485,7 +486,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
               );
             })}
           </svg>
-          {N === 0 && <div className="empty-state m-unavailable" id="mtr-empty">No history data is available for this source yet.</div>}
+          {N === 0 && <div className="empty-state m-unavailable" id={idFor('mtr-empty')}>No history data is available for this source yet.</div>}
           {hovered != null && rows[hovered]
             ? (() => {
                 const r = rows[hovered];
@@ -515,7 +516,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
                 );
               })()
             : null}
-          <div className="mtr-sparkaxis" id="mtr-sparkaxis">
+          <div className="mtr-sparkaxis" id={idFor('mtr-sparkaxis')}>
             {N > 0 ? (
               <Fragment>
                 <span>W−{N - 1}</span>
@@ -535,14 +536,14 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
           Weekly detail
         </h3>
         <div className="mtr-tbl-head">
-          <span className="m-pill accent-purple" id="mtr-tbl-count">
+          <span className="m-pill accent-purple" id={idFor('mtr-tbl-count')}>
             {N} weeks
           </span>
           <span className="mtr-tbl-sub">
             current row highlighted · negative Δ = $/1% down vs prior week
           </span>
         </div>
-        <table className="m-histable" id="mtr-table">
+        <table className="m-histable" id={idFor('mtr-table')}>
           {/* Sortable header off the shared TREND_COLUMNS (Week · Cost · Used%
               · $/1% · Δ). The override is the modal-local, ephemeral `localSort`
               — NOT the panel's persisted `prefs.trendSortOverride` (decision 7).
@@ -554,7 +555,7 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
             onChange={setLocalSort}
             accentVar="--accent-amber"
           />
-          <tbody id="mtr-rows">
+          <tbody id={idFor('mtr-rows')}>
             {tableRows.map((r) => {
               // finding 2: the "Now / W−1 / W−2" label keys off the row's
               // chronological identity (`_chronoIdx`), NOT its (possibly
@@ -586,14 +587,64 @@ function CanonicalTrendModal({ source }: { source: DashboardSelection }) {
           </div>{/* /period-table-pane */}
         </div>{/* /period-two-pane */}
       </section>
+  );
+  if (embedded) return content;
+  return (
+    <Modal
+      title={N > 0 ? `Trend — last ${N} weeks` : 'Trend'}
+      accentClass="accent-amber"
+      headerExtras={headerExtras}
+      wide
+    >
+      {content}
     </Modal>
   );
 }
 
 export function TrendModal() {
+  const env = useSnapshot();
   const source = useSyncExternalStore(
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,
   );
-  return <CanonicalTrendModal source={source} />;
+  if (source !== 'all') return <CanonicalTrendModal source={source} />;
+  const presentation = presentationTrend(env, 'all');
+  const headerExtras = (
+    <ShareIcon
+      panel="trend"
+      panelLabel="Trend"
+      triggerId="trend-modal"
+      onClick={() => dispatch(openShareModal('trend', 'trend-modal'))}
+    />
+  );
+  const claudeN = presentation.sections.find((section) => section.source === 'claude')?.historyRows.length ?? 0;
+  const codexN = presentation.sections.find((section) => section.source === 'codex')?.historyRows.length ?? 0;
+  return (
+    <Modal
+      title={`Trend · Claude ${claudeN} weeks · Codex ${codexN} cycles`}
+      accentClass="accent-amber"
+      headerExtras={headerExtras}
+      wide
+      dataSource="all"
+    >
+      <div className="provider-composition provider-composition--modal trend-modal-composition">
+        {presentation.sections.map((section) => (
+          <section
+            key={section.source}
+            className="provider-composition-section"
+            data-provider-section={section.source}
+            aria-label={`${section.label} $ per 1% trend history`}
+          >
+            <div className="source-provider-head provider-composition-head">
+              <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
+              <span className="provider-summary-label">
+                {section.historyRows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}
+              </span>
+            </div>
+            <CanonicalTrendModal source={section.source} embedded />
+          </section>
+        ))}
+      </div>
+    </Modal>
+  );
 }

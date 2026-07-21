@@ -7,8 +7,9 @@ export type PeriodVariant = 'day' | 'week' | 'month';
  *  `?? label` guards a null/absent week_start_at. */
 export function keyOf(row: DailyPanelRow | PeriodRow, variant: PeriodVariant): string {
   if (variant === 'day') return (row as DailyPanelRow).date;
-  if (variant === 'week') return (row as PeriodRow).week_start_at ?? (row as PeriodRow).label;
-  return (row as PeriodRow).label;
+  const period = row as PeriodRow;
+  const base = variant === 'week' ? period.week_start_at ?? period.label : period.label;
+  return period.source == null ? base : `${period.source}:${base}`;
 }
 
 /** rows are newest-first. 'older' → next index, 'newer' → prev index.

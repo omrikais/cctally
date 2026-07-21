@@ -37,7 +37,7 @@ export function KeyHintFooter({ hints, trailing, className, 'data-testid': dataT
           <span>{h.keys} {h.label}</span>
         </Fragment>
       ))}
-      {trailing ?? <SyncChip />}
+      {trailing ?? <SyncChip id="modal-sync-chip" />}
     </div>
   );
 }

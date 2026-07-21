@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import {
+  presentationCacheReportComposition,
   presentationCacheDays,
   presentationBlocks,
   presentationDailyRows,
+  presentationForecastComposition,
   presentationPeriodRows,
   presentationProjects,
   presentationProviders,
@@ -49,6 +51,131 @@ function dailyRow(day: number): DailyPanelRow {
 }
 
 describe('provider-neutral dashboard presentation adapters', () => {
+  it('composes distinct provider-labelled Forecast values in All mode', () => {
+    const env = cloneFixture();
+    env.forecast!.week_avg_projection_pct = 68.5;
+    env.sources!.codex.data!.quota.histories.find(
+      (row) => row.window_minutes === 10_080,
+    )!.forecast.projected_percent = 74;
+
+    const composition = presentationForecastComposition(env, 'all');
+
+    expect(composition.selection).toBe('all');
+    expect(composition.sections).toHaveLength(2);
+    expect(composition.sections.map((section) => section.source)).toEqual(['claude', 'codex']);
+    expect(composition.sections[0]).toMatchObject({
+      label: 'Claude',
+      status: 'available',
+      value: { projected: 68.5, verdict: 'ok' },
+    });
+    expect(composition.sections[1]).toMatchObject({
+      label: 'Codex',
+      status: 'available',
+      value: { projected: 74 },
+    });
+    expect('verdict' in composition).toBe(false);
+  });
+
+  it('composes distinct provider-native Cache reports without blending their facts', () => {
+    const env = cloneFixture();
+    const codexReport = structuredClone(env.cache_report!);
+    codexReport.today.cache_hit_percent = 42;
+    codexReport.today.net_usd = 12.5;
+    codexReport.days[0].cache_hit_percent = 42;
+    codexReport.days[0].net_usd = 12.5;
+    env.sources!.codex.data!.cache_report = codexReport;
+
+    const composition = presentationCacheReportComposition(env, 'all');
+
+    expect(composition.sections).toHaveLength(2);
+    expect(composition.sections[0]).toMatchObject({
+      source: 'claude',
+      label: 'Claude',
+      status: 'available',
+      value: { today: { cache_hit_percent: 87.3, net_usd: 3.1 } },
+    });
+    expect(composition.sections[1]).toMatchObject({
+      source: 'codex',
+      label: 'Codex',
+      status: 'available',
+      value: { today: { cache_hit_percent: 42, net_usd: 12.5 } },
+    });
+    expect(composition.sections[0].value).not.toBe(composition.sections[1].value);
+  });
+
+  it('keeps a missing provider section explicit instead of relabelling its sibling as All', () => {
+    const env = cloneFixture();
+    env.sources!.codex.data!.cache_report = null;
+    env.sources!.codex.capabilities.forensics = {
+      status: 'unavailable',
+      semantics: 'native cache report unavailable',
+    };
+    env.sources!.codex.warnings = [{
+      code: 'codex_cache_unavailable',
+      domain: 'forensics',
+      message: 'Codex cache counters are unavailable.',
+    }];
+
+    const composition = presentationCacheReportComposition(env, 'all');
+
+    expect(composition.sections[0]).toMatchObject({ source: 'claude', status: 'available' });
+    expect(composition.sections[1]).toMatchObject({
+      source: 'codex',
+      status: 'unavailable',
+      value: null,
+      reason: 'Codex cache counters are unavailable.',
+    });
+  });
+
+  it('labels stale native Forecast evidence as degraded with its provider reason', () => {
+    const env = cloneFixture();
+    const weekly = env.sources!.codex.data!.quota.histories.find(
+      (row) => row.window_minutes === 10_080,
+    )!;
+    weekly.forecast.status = 'stale';
+
+    const codex = presentationForecastComposition(env, 'all').sections[1];
+
+    expect(codex).toMatchObject({
+      source: 'codex',
+      status: 'degraded',
+      reason: 'Codex forecast is stale.',
+      value: { recent: weekly.current_percent },
+    });
+  });
+
+  it('labels an empty provider-native Cache report without hiding the other provider', () => {
+    const env = cloneFixture();
+    const codexReport = structuredClone(env.cache_report!);
+    codexReport.is_empty = true;
+    env.sources!.codex.data!.cache_report = codexReport;
+
+    const composition = presentationCacheReportComposition(env, 'all');
+
+    expect(composition.sections[0]).toMatchObject({ source: 'claude', status: 'available' });
+    expect(composition.sections[1]).toMatchObject({
+      source: 'codex',
+      status: 'empty',
+      reason: 'No Codex cache activity is available for this window.',
+      value: codexReport,
+    });
+  });
+
+  it('does not degrade Forecast or Cache for an unrelated Projects warning', () => {
+    const env = cloneFixture();
+    const codexReport = structuredClone(env.cache_report!);
+    env.sources!.codex.data!.cache_report = codexReport;
+    env.sources!.codex.availability = 'partial';
+    env.sources!.codex.warnings = [{
+      code: 'codex_metadata_incomplete',
+      domain: 'projects',
+      message: 'Project metadata is incomplete.',
+    }];
+
+    expect(presentationForecastComposition(env, 'all').sections[1].status).toBe('available');
+    expect(presentationCacheReportComposition(env, 'all').sections[1].status).toBe('available');
+  });
+
   it.each(['claude', 'codex', 'all'] as DashboardSelection[])(
     'caps %s period history to the canonical 12-week / 8-month windows',
     (selection) => {
@@ -65,7 +192,9 @@ describe('provider-neutral dashboard presentation adapters', () => {
       env.sources!.codex.data!.periods.monthly.rows = codexMonthly;
       env.sources!.all.data = null;
 
-      expect(presentationPeriodRows(env, selection, 'weekly')).toHaveLength(12);
+      expect(presentationPeriodRows(env, selection, 'weekly')).toHaveLength(
+        selection === 'all' ? 24 : 12,
+      );
       expect(presentationPeriodRows(env, selection, 'monthly')).toHaveLength(8);
     },
   );
@@ -139,6 +268,61 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(rows[0].models[0]).toMatchObject({ display: 'Codex', cost_pct: 100 });
   });
 
+  it('retains Codex native token categories without changing the reconciled total', () => {
+    const env = cloneFixture();
+    env.sources!.codex.data!.periods.weekly.rows = [{
+      label: 'Native cycle', cost_usd: 12, input_tokens: 1_200,
+      cached_input_tokens: 300, output_tokens: 400,
+      reasoning_output_tokens: 100, total_tokens: 1_600, models: ['gpt-5'],
+    }];
+    env.sources!.codex.data!.periods.daily.rows = [{
+      label: '2026-07-20', cost_usd: 12, input_tokens: 1_200,
+      cached_input_tokens: 300, output_tokens: 400,
+      reasoning_output_tokens: 100, total_tokens: 1_600, models: ['gpt-5'],
+    }];
+
+    const weekly = presentationPeriodRows(env, 'codex', 'weekly')[0];
+    const daily = presentationDailyRows(env, 'codex').find((row) => row.cost_usd === 12);
+
+    expect(weekly.codex_tokens).toEqual({
+      input_tokens: 1_200, cached_input_tokens: 300,
+      output_tokens: 400, reasoning_output_tokens: 100, total_tokens: 1_600,
+    });
+    expect(daily?.codex_tokens).toEqual(weekly.codex_tokens);
+    expect(weekly.total_tokens).toBe(1_600);
+    expect(daily?.total_tokens).toBe(1_600);
+  });
+
+  it('All keeps non-colliding weekly quota rows provider-attributed', () => {
+    const env = cloneFixture();
+    const claude = env.weekly.rows.map((row, index) => ({
+      ...row,
+      label: `Claude week ${index + 1}`,
+      used_pct: 60 + index,
+      dollar_per_pct: 1.4 + index / 10,
+    }));
+    const template = env.sources!.codex.data!.periods.weekly.rows[0];
+    env.sources!.claude.data!.periods.weekly.rows = claude;
+    env.sources!.codex.data!.periods.weekly.rows = [{
+      ...template,
+      label: 'Codex cycle A',
+      used_pct: 31,
+      dollar_per_pct: 0.75,
+    }];
+    env.sources!.all.data = null;
+
+    const rows = presentationPeriodRows(env, 'all', 'weekly') as Array<PeriodRow & {
+      source?: 'claude' | 'codex';
+    }>;
+
+    expect(rows).toHaveLength(claude.length + 1);
+    expect(rows.map((row) => [row.source, row.label, row.used_pct, row.dollar_per_pct])).toEqual([
+      ['claude', 'Claude week 1', 60, 1.4],
+      ['claude', 'Claude week 2', 61, 1.5],
+      ['codex', 'Codex cycle A', 31, 0.75],
+    ]);
+  });
+
   it('Codex period cost deltas keep the shared fractional ratio contract', () => {
     const env = cloneFixture();
     const template = env.sources!.codex.data!.periods.weekly.rows[0];
@@ -165,6 +349,28 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(trend.chartLabel).toBe('$/1% trend:');
     expect(trend.valueLabel).toBe('$/1%');
     expect(trend.rows[0]).toMatchObject({ used_pct: 20, dollar_per_pct: 0.5 });
+  });
+
+  it('All exposes separate Claude and Codex trend series instead of one quota series', () => {
+    const env = cloneFixture();
+    Object.assign(env.sources!.codex.data!.periods.weekly.rows[0], {
+      used_pct: 20,
+      dollar_per_pct: 0.5,
+    });
+
+    const trend = presentationTrend(env, 'all') as ReturnType<typeof presentationTrend> & {
+      sections?: Array<{ source: 'claude' | 'codex'; rows: unknown[]; historyRows: unknown[] }>;
+    };
+
+    expect(trend.rows).toEqual([]);
+    expect(trend.sections?.map((section) => section.source)).toEqual(['claude', 'codex']);
+    expect(trend.sections?.[0].rows).toEqual(
+      env.trend!.weeks.map((row) => ({ ...row, source: 'claude' })),
+    );
+    expect(trend.sections?.[0].historyRows).toEqual(
+      env.trend!.history.map((row) => ({ ...row, source: 'claude' })),
+    );
+    expect(trend.sections?.[1].rows).toHaveLength(1);
   });
 
   it('maps real Codex per-model costs into canonical model segments', () => {

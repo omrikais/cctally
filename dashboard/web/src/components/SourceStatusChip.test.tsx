@@ -68,6 +68,8 @@ describe('SourceStatusChip (§6.8)', () => {
     render(<SourceStatusChip />);
     const chip = screen.getByTestId('source-status-chip');
     expect(chip).toHaveTextContent('Projects partial');
+    expect(chip.querySelector('.source-status-label--full')).toHaveTextContent('Projects partial');
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Projects');
     expect(chip).toHaveAttribute('title', '47 Codex accounting rows lack project metadata; rebuild the cache.');
     expect(chip).toHaveAttribute('aria-label', expect.stringContaining('47 Codex accounting rows'));
   });

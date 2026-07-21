@@ -167,4 +167,18 @@ describe('SourceSessionsGrid — All-mode interleave (§6.3)', () => {
     expect(rows).toHaveLength(3);
     expect(rows[2].getAttribute('data-detail-source')).toBe('claude'); // oldest
   });
+
+  it('routes an All-mode Claude row through its opaque qualified identity', () => {
+    render(<SessionsPanel />);
+    const button = screen.getByRole('button', {
+      name: 'Open claude session details: —',
+    });
+    act(() => button.click());
+    expect(getState().openSourceDetail).toEqual({
+      source: 'claude',
+      resource: 'session',
+      key: 'session:claude-a',
+    });
+    expect(getState().openModal).toBeNull();
+  });
 });

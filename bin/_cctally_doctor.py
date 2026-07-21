@@ -27,6 +27,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import math
 import pathlib
 import shutil
 import sqlite3
@@ -35,6 +36,7 @@ import sys
 import _cctally_core
 import _lib_changelog
 from _cctally_core import _now_utc, eprint, now_utc_iso, parse_iso_datetime
+from _lib_dashboard_json import encode_dashboard_json
 
 
 def _cctally():
@@ -53,11 +55,25 @@ def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
         "tombstones": {"fiveHour": "absent", "sevenDay": "absent"},
     }
     try:
-        result["transport_age_seconds"] = c._statusline_transport_age_seconds()
+        age = c._statusline_transport_age_seconds()
+        result["transport_age_seconds"] = (
+            age
+            if isinstance(age, (int, float))
+            and not isinstance(age, bool)
+            and math.isfinite(float(age))
+            else None
+        )
     except Exception:
         pass
     try:
-        result["selected_age_seconds"] = c._statusline_observe_age_seconds()
+        age = c._statusline_observe_age_seconds()
+        result["selected_age_seconds"] = (
+            age
+            if isinstance(age, (int, float))
+            and not isinstance(age, bool)
+            and math.isfinite(float(age))
+            else None
+        )
     except Exception:
         pass
     try:
@@ -943,7 +959,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     state = c.doctor_gather_state(deep=True)
     report = _lib_doctor.run_checks(state)
     if getattr(args, "json", False):
-        print(json.dumps(
+        print(encode_dashboard_json(
             _lib_doctor.serialize_json(report), indent=2, sort_keys=True,
         ))
     else:

@@ -11,6 +11,8 @@ describe('KeyHintFooter', () => {
     expect(screen.getByText('row')).toBeInTheDocument();
     expect(screen.getByText('close')).toBeInTheDocument();
     expect(document.querySelectorAll('.sep')).toHaveLength(1); // N-1 separators
+    expect(document.getElementById('modal-sync-chip')).not.toBeNull();
+    expect(document.getElementById('sync-chip')).toBeNull();
   });
 
   it('renders a trailing slot when provided', () => {

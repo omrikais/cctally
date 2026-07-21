@@ -283,12 +283,13 @@ Properties of the persist (all side effects — the rendered line never changes)
   a regular-pool statusline tick records transport liveness, but selected
   freshness advances only when the reducer or an authoritative writer has
   reconciled the database observation. This prevents an unchanged stale
-  renderer from indefinitely suppressing the OAuth backfill: its selected-age
-  gate never treats transport liveness alone as proof of selected usage.
+  renderer from suppressing the account-wide OAuth confirmation: its
+  selected-age gate never treats transport liveness alone as proof of selected
+  usage.
 - **Detached + fail-safe.** The write runs in a detached child so the render
   stays fast, and the whole persist is guarded so it can never break rendering.
   If `rate_limits` is absent (older Claude Code, or none supplied), the persist
-  is a clean no-op and the OAuth backfill covers that case.
+  is a clean no-op and the authoritative OAuth confirmation covers that case.
 
 OAuth and manual credit writers use the same selected-state protocol. They
 write an independent per-axis recovery marker before the database operation,
@@ -303,7 +304,9 @@ labeled `source=api`.
 
 ### Keeping usage fresh during subagent waits (`statusLine.refreshInterval`)
 
-Claude Code's status-line updates are **event-driven**, so while a coordinator session waits on a long-running subagent those events go quiet: `cctally statusline` isn't invoked, and the usage snapshots stop advancing for the whole subagent run. Claude Code's documented `statusLine.refreshInterval` setting re-runs the status-line command on a fixed timer *in addition to* the event-driven updates, which is the only idle-time trigger for the persist. `cctally setup` therefore adds `"refreshInterval": 30` to a cctally-pointing `statusLine` block that doesn't already have one (see [setup.md](setup.md) for the add-when-absent / never-mutate / never-remove ownership rules), so usage keeps ticking on a 30-second cadence even during an otherwise-idle wait. Candidate arbitration removed the old internal persistence throttle, so this timer is not paired with a second cadence gate.
+Claude Code's status-line updates are **event-driven**, so while a coordinator session waits on a long-running subagent those events go quiet: `cctally statusline` isn't invoked, and the usage snapshots stop advancing for the whole subagent run. Claude Code's documented `statusLine.refreshInterval` setting re-runs the status-line command on a fixed timer *in addition to* the event-driven updates. `cctally setup` therefore adds `"refreshInterval": 30` to a cctally-pointing `statusLine` block that doesn't already have one (see [setup.md](setup.md) for the add-when-absent / never-mutate / never-remove ownership rules), so usage keeps ticking on a 30-second cadence even during an otherwise-idle wait.
+
+Each timer render still persists Claude Code's supplied `rate_limits` first. Because Claude Code can replay that object unchanged after Anthropic's authoritative counters have moved, the same tick also schedules a detached OAuth confirmation when selected usage is at least 25 seconds old. The hook and every concurrent Claude session share one throttle lock and marker, so this is at most one account request per timer cycle—not one request per session. A successful confirmation renews selected freshness even when the percentages are unchanged; `Retry-After` and exponential `429` backoff remain authoritative. Rendering never waits for the network request.
 
 This is a **Claude Code `settings.json` key**, not the `cctally statusline --refresh-interval N` flag — those are unrelated. The CLI `--refresh-interval` flag is a **no-op** accepted only for `ccusage` drop-in compatibility (see the flag reference above); the timer is entirely Claude Code's, driven by `statusLine.refreshInterval` in `~/.claude/settings.json`.
 
@@ -315,9 +318,10 @@ A bracketed model suffix such as `claude-opus-4-8[1m]` describes model or
 context-window metadata; it does not change the identity of the top-level
 `rate_limits.five_hour` and `rate_limits.seven_day` fields. cctally therefore
 persists those account-wide observations normally, so the dashboard continues
-to update on the configured status-line cadence. Model-scoped limits such as
-Fable's separate weekly quota are distinct fields and are never inferred from
-the active model ID.
+to update on the configured status-line cadence; the bounded OAuth confirmation
+closes any gap when Claude Code replays an older top-level observation.
+Model-scoped limits such as Fable's separate weekly quota are distinct fields
+and are never inferred from the active model ID.
 
 ## Examples
 
@@ -343,7 +347,7 @@ cctally statusline --config /tmp/custom-cctally.json < /tmp/cc-hook-payload.json
 
 ## See also
 
-- `cctally record-usage` — the shared kernel that both this command (see *Usage persistence*) and the OAuth backfill feed to write `rate_limits` snapshots; also usable directly for manual replay.
-- `cctally hook-tick` — internal CC hook that keeps the session-entry cache warm and runs the OAuth **backfill** poll (only when the status line has not fed recently, honoring `Retry-After` + `429` backoff).
+- `cctally record-usage` — the shared kernel that both this command (see *Usage persistence*) and authoritative OAuth confirmation feed to write `rate_limits` snapshots; also usable directly for manual replay.
+- `cctally hook-tick` — internal CC hook that keeps the session-entry cache warm and shares the account-wide OAuth throttle, selected-freshness gate, and `Retry-After` / exponential `429` backoff with the status-line timer.
 - `cctally blocks --active` — the same active-5h-block kernel statusline reuses for segments 2's `block` slot + segment 3's burn rate.
 - `cctally claude statusline` — canonical hierarchical form.

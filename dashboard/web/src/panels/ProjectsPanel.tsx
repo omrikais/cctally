@@ -21,6 +21,7 @@ import { openShareModal } from '../store/shareSlice';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { presentationProjects, presentationProviders } from '../lib/dashboardPresentation';
+import { warningForDomain } from '../lib/sourceGating';
 import { DegradedChip } from './sourcePanel';
 
 const TOP_N = 5;
@@ -38,9 +39,10 @@ export function ProjectsPanel() {
   // still null / empty; show a loading skeleton instead of the "restart the
   // dashboard" / "no activity" copy, which would wrongly imply a broken instance.
   const hydrating = presentationProviders(env, activeSource).hydrating;
-  const projectWarning = presentationProviders(env, activeSource).warnings.find(
-    (warning) => warning.domain == null || warning.domain === 'projects',
-  ) ?? null;
+  const projectWarning = warningForDomain(
+    presentationProviders(env, activeSource).warnings,
+    'projects',
+  );
   // #278 Theme A (ui-qa P3): mirror CacheReportPanel's header — while hydrating
   // with no data yet, the sub-label reads "(loading)" instead of the misleading
   // final-state "(unavailable)" (which re-implies a broken instance) or
@@ -169,7 +171,9 @@ export function ProjectsPanel() {
                   className="projects-row"
                   role="button"
                   tabIndex={0}
-                  aria-label={`Open Projects modal for ${r.key}`}
+                  aria-label={activeSource === 'claude'
+                    ? `Open Projects modal for ${r.key}`
+                    : `Open ${r.source} project details: ${r.label}`}
                   onClick={onRowClick(r.source, r.key)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {

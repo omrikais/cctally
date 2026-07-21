@@ -34,9 +34,9 @@ describe('deriveVisiblePanelOrder — canonical board parity', () => {
   });
 
   it('Codex wholly-unavailable still preserves card shells and digit positions', () => {
-    // The QA P0 environment: Codex availability 'unavailable', caps {}, data null.
-    // Absent-path panels must hide regardless of availability; the rest degrade
-    // (visible), so the visible order matches the healthy-Codex order.
+    // The QA P0 environment: Codex availability 'unavailable', caps {}, data
+    // null. Provider state changes content inside the fixed shells, never the
+    // canonical board membership.
     const codex = makeCodexSourceEntry({
       availability: 'unavailable',
       data: null,

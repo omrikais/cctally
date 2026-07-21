@@ -12,7 +12,7 @@ import { syncFreshness, type SyncBucket } from '../lib/syncFreshness';
 // the chip up at the expiry boundary so the post-floor state paints
 // immediately instead of lagging up to 1 s behind the next tick.
 
-export function SyncChip() {
+export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   const env = useSnapshot();
   const { disconnected } = useConnectionStatus();
   const floorUntil = useSyncExternalStore(
@@ -138,7 +138,7 @@ export function SyncChip() {
     return (
       <span
         className="sync-chip mute syncing"
-        id="sync-chip"
+        id={id}
         aria-busy="true"
         aria-live="polite"
       >
@@ -150,7 +150,7 @@ export function SyncChip() {
     return (
       <span
         className="sync-chip mute sync-error"
-        id="sync-chip"
+        id={id}
         aria-live="polite"
         style={{ color: 'var(--accent-red)' }}
       >
@@ -162,7 +162,7 @@ export function SyncChip() {
     return (
       <span
         className="sync-chip mute sync-success"
-        id="sync-chip"
+        id={id}
         aria-live="polite"
       >
         ✓ updated
@@ -172,7 +172,7 @@ export function SyncChip() {
   return (
     <span
       className={'sync-chip mute' + (bucket ? ` sync-chip--${bucket}` : '')}
-      id="sync-chip"
+      id={id}
       aria-live="polite"
       style={{ color }}
     >

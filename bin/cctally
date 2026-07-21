@@ -558,6 +558,10 @@ _lib_log = _load_sibling("_lib_log")
 _lib_json_envelope = _load_sibling("_lib_json_envelope")
 stamp_schema_version = _lib_json_envelope.stamp_schema_version
 
+# Strict outbound dashboard/Doctor JSON: recursive non-finite normalization
+# followed by allow_nan=False serialization.
+_lib_dashboard_json = _load_sibling("_lib_dashboard_json")
+
 _lib_changelog = _load_sibling("_lib_changelog")
 # Backward-compat re-export: callers and tests reach the helper through
 # ``cctally._release_read_latest_release_version`` (incl. monkeypatch
@@ -1336,6 +1340,7 @@ _build_statusline_injections = _cctally_statusline._build_statusline_injections
 # `cctally._statusline_persist` (test surface) + the `_cctally()` accessor
 # resolve them.
 _statusline_persist = _cctally_statusline._statusline_persist
+_statusline_oauth_tick = _cctally_statusline._statusline_oauth_tick
 _fork_persist = _cctally_statusline._fork_persist
 _record_args = _cctally_statusline._record_args
 _try_acquire_persist_lock = _cctally_statusline._try_acquire_persist_lock

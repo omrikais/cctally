@@ -5,6 +5,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.78.0] - 2026-07-21
+
+### Changed
+- Dashboard Codex Daily, Weekly, and Monthly details now retain native Input, Cached input, Output, Reasoning, and Total counters; Codex Weekly uses reset-cycle vocabulary, All Weekly uses neutral provider-period wording, and partial-metadata projects with the same basename remain collision-safe without exposing identities. (#329)
+- Dashboard Codex session, project, and quota-block details now use bounded native hierarchies, localized timestamps, retained quota progression, and accessible prompt expansion across desktop and mobile. (#325)
+- Dashboard All-mode Claude project and session rows now open the same useful detail hierarchy and cross-navigation as the canonical Claude views while keeping native session IDs and source paths private. (#325)
+- Dashboard All-mode Forecast and Cache Report cards and details now compose separate, provider-labelled Claude and Codex reports with provider-local values, confidence, and degraded or unavailable reasons instead of presenting Codex-only data under an All heading. (#324)
+- Dashboard All-mode Weekly and `$ / 1% Trend` views now keep Claude and Codex quota histories in separate provider-labelled sections and series, while explicitly combining only compatible cost totals. (#324)
+
+### Fixed
+- Dashboard narrow layouts now keep degraded source status readable, hide the optional Codex five-hour slot when no native 300-minute window is reported, label real All-mode five-hour rows by provider, and bound unavailable combined-total warnings without losing their accessible detail. (#329)
+- Dashboard source-wide freshness and read-model warnings now reach Daily and Projects without hiding the fixed ten-card board; Current Usage and Share stay bound to the source that opened them, and All shows separate Claude and Codex current-cycle sections instead of silently falling back to Claude. (#328)
+- Dashboard HTTP and live-event JSON now convert non-finite numeric values to `null` at one strict outbound boundary, so missing Doctor freshness markers no longer emit browser-invalid `Infinity` tokens and the full Doctor report opens normally. (#327)
+- Claude 5-hour and 7-day usage now receive one account-wide authoritative OAuth confirmation per 30-second status-line cycle, so a stale Claude Code `rate_limits` payload can no longer leave dashboard milestones behind for up to five minutes. The confirmation is detached from rendering, shares the existing hook throttle lock, and preserves `Retry-After` plus exponential `429` backoff.
+
 ## [1.77.0] - 2026-07-21
 
 ### Added

@@ -432,6 +432,8 @@ export interface TrendEnvelope {
 }
 
 export interface TrendRow {
+  // Client-only provider attribution in All-mode trend compositions.
+  source?: SourceName;
   label: string;
   used_pct: number | null;
   dollar_per_pct: number | null;
@@ -602,7 +604,22 @@ export interface ModelCostRow {
   cost_pct: number;     // 0..100
 }
 
+// Client-only preservation of Codex's native inclusive-input vocabulary.
+// The legacy PeriodRow counters remain for provider-neutral aggregation, while
+// provider-owned detail surfaces render these five source-native fields.
+export interface CodexNativeTokens {
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+
 export interface PeriodRow {
+  // Client-only provider attribution for source-composed period views. The
+  // server's canonical rows omit it; presentation adapters stamp it before
+  // independent quota rows reach All-mode UI.
+  source?: DashboardSelection;
   label: string;                       // "04-23" | "2026-04"
   cost_usd: number;
   total_tokens: number;
@@ -618,6 +635,7 @@ export interface PeriodRow {
   week_start_at?: string;              // weekly only
   week_end_at?: string;                // weekly only
   cache_hit_pct?: number | null;       // v2.3 — populated by daily variant only for v1
+  codex_tokens?: CodexNativeTokens;
 }
 
 export interface WeeklyEnvelope {
@@ -697,6 +715,8 @@ export interface BlockDetail {
 // ---- Daily panel (envelope §1.3) -------------------------------------
 
 export interface DailyPanelRow {
+  // Client-only provider attribution/native counters for source-aware details.
+  source?: DashboardSelection;
   date:             string;    // local-tz YYYY-MM-DD
   label:            string;    // "MM-DD" — pre-formatted, mirrors Weekly idiom
   cost_usd:         number;
@@ -710,6 +730,7 @@ export interface DailyPanelRow {
   cache_read_tokens:     number;
   total_tokens:          number;
   cache_hit_pct:         number | null;
+  codex_tokens?: CodexNativeTokens;
 }
 
 export interface DailyEnvelope {
@@ -1259,6 +1280,9 @@ export interface QualifiedDetailEnvelope<T> {
 export interface ClaudeSessionDetailBody {
   detail_kind: 'claude_session';
   key: string;
+  label: string;
+  project_label: string | null;
+  project_key: string | null;
   started_utc: string | null;
   last_activity_utc: string | null;
   duration_min: number | null;
@@ -1270,15 +1294,18 @@ export interface ClaudeSessionDetailBody {
   cache_hit_pct: number | null;
   cost_per_model: SessionDetailCostPerModel[];
   cost_total_usd: number | null;
+  privacy_note: string;
 }
 export interface ClaudeProjectDetailBody {
   detail_kind: 'claude_project';
   key: string;
+  label: string;
   window_weeks: number;
   window_cost_usd: number;
   window_attributed_pct: number | null;
   models: ProjectDetailModelRow[];
   sessions: Array<{
+    key: string;
     started_at: string;
     last_activity_at: string;
     primary_model: string;
@@ -1369,9 +1396,9 @@ export interface CodexBlockDetailBody {
   resets_at: string;
   current_percent: number | null;
   orphaned: boolean;
-  freshness: string;
-  observations: Array<{ captured_at: string; used_percent: number; resets_at: string }>;
-  milestones: Array<{ percent: number; captured_at: string }>;
+  freshness?: string;
+  observations?: Array<{ captured_at: string; used_percent: number; resets_at: string }>;
+  milestones?: Array<{ percent: number; captured_at: string }>;
   forecast: {
     status: string;
     current_percent: number | null;

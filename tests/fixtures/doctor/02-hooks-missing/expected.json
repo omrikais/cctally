@@ -529,12 +529,12 @@
                     "details": {
                         "active_candidate_count": 0,
                         "control_db_agrees": null,
-                        "selected_age_seconds": Infinity,
+                        "selected_age_seconds": null,
                         "tombstones": {
                             "fiveHour": "absent",
                             "sevenDay": "absent"
                         },
-                        "transport_age_seconds": Infinity
+                        "transport_age_seconds": null
                     },
                     "id": "data.statusline_pipeline",
                     "severity": "ok",

@@ -10,6 +10,7 @@ import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { presentationDailyRows, presentationProviders } from '../lib/dashboardPresentation';
+import { warningForDomain } from '../lib/sourceGating';
 import { DegradedChip } from './sourcePanel';
 import type { DailyPanelRow } from '../types/envelope';
 
@@ -127,7 +128,7 @@ export function DailyPanel() {
           : best == null || row.cost_usd > best.cost_usd ? row : best, null);
   const hydrating = presentationProviders(env, activeSource).hydrating;
   const providerState = presentationProviders(env, activeSource);
-  const warning = providerState.warnings.find((item) => item.domain == null || item.domain === 'daily') ?? null;
+  const warning = warningForDomain(providerState.warnings, 'daily');
 
   return (
     <section

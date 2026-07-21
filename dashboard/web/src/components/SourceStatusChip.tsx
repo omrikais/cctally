@@ -33,6 +33,7 @@ export function SourceStatusChip() {
   else if (degraded) label = 'degraded';
   else label = stale ? 'stale' : 'fresh';
   detail = warning?.message ?? label;
+  const compactLabel = compactStatusLabel(label);
 
   const cls =
     'source-status-chip' +
@@ -47,7 +48,8 @@ export function SourceStatusChip() {
       title={detail}
       aria-label={`${active} source status: ${detail}`}
     >
-      {label}
+      <span className="source-status-label source-status-label--full" aria-hidden="true">{label}</span>
+      <span className="source-status-label source-status-label--compact" aria-hidden="true">{compactLabel}</span>
     </span>
   );
 }
@@ -68,4 +70,11 @@ const WARNING_DOMAIN_LABELS: Record<string, string> = {
 function conciseWarningLabel(domain: string | undefined, code?: string): string {
   if (domain === 'projects' && code === 'codex_metadata_incomplete') return 'Projects partial';
   return domain != null ? (WARNING_DOMAIN_LABELS[domain] ?? 'Source degraded') : 'Source degraded';
+}
+
+function compactStatusLabel(label: string): string {
+  if (label === 'no successful snapshot yet') return 'No snapshot';
+  if (label === 'Source degraded' || label === 'degraded') return 'Degraded';
+  if (label === 'Projects partial') return 'Projects';
+  return label.replace(/ unavailable$/, '');
 }

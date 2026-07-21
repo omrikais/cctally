@@ -67,9 +67,18 @@ export function WeeklyPanel() {
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const allRows = presentationPeriodRows(env, activeSource, 'weekly');
   const mode = useContext(BoardModeContext);
-  const { visible, hiddenCount } = summarize(allRows, mode);
+  const providerGroups = activeSource === 'all'
+    ? (['claude', 'codex'] as const).map((source) => {
+        const rows = allRows.filter((row) => row.source === source);
+        return { source, rows, ...summarize(rows, mode) };
+      })
+    : null;
+  const singleSummary = summarize(allRows, mode);
+  const visible = providerGroups?.flatMap((group) => group.visible) ?? singleSummary.visible;
+  const hiddenCount = providerGroups?.reduce((sum, group) => sum + group.hiddenCount, 0)
+    ?? singleSummary.hiddenCount;
   const total = allRows.reduce((sum, row) => sum + row.cost_usd, 0);
-  const rowNoun = activeSource === 'claude' ? 'weeks' : activeSource === 'codex' ? 'cycles' : 'periods';
+  const rowNoun = activeSource === 'claude' ? 'weeks' : activeSource === 'codex' ? 'cycles' : 'provider periods';
   const totalLabel = activeSource === 'claude' ? `${allRows.length}w` : `${allRows.length} ${rowNoun}`;
   const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
@@ -122,6 +131,36 @@ export function WeeklyPanel() {
           ) : (
             <div className="panel-empty">No usage history yet.</div>
           )
+        ) : providerGroups ? (
+          <div className="source-all-sections provider-composition provider-composition--panel">
+            {providerGroups.map((group) => (
+              <section
+                key={group.source}
+                className="provider-summary-card source-provider-section weekly-provider-section"
+                data-provider-section={group.source}
+                aria-label={`${group.source === 'claude' ? 'Claude' : 'Codex'} weekly quota history`}
+              >
+                <div className="source-provider-head provider-composition-head">
+                  <span className={`source-chip source-chip--${group.source}`}>
+                    {group.source === 'claude' ? 'Claude' : 'Codex'}
+                  </span>
+                  <span className="provider-summary-label">
+                    {group.rows.length} {group.source === 'claude' ? 'weeks' : 'cycles'}
+                  </span>
+                </div>
+                {group.visible.length === 0 ? (
+                  <div className="panel-source-empty">No quota history yet.</div>
+                ) : group.visible.map((r) => (
+                  <Row
+                    key={keyOf(r, 'week')}
+                    r={r}
+                    isFirstMount={!seen.current.has(keyOf(r, 'week'))}
+                    reduced={reduced}
+                  />
+                ))}
+              </section>
+            ))}
+          </div>
         ) : (
           visible.map((r) => (
             <Row
@@ -162,7 +201,7 @@ export function WeeklyPanel() {
             <span>
               {totalLabel} total
               <span className="sep" aria-hidden="true"> · </span>
-              <span className="total">{fmt.usd2(total)}</span>
+              <span className="total">{fmt.usd2(total)}{activeSource === 'all' ? ' combined cost' : ''}</span>
             </span>
           )}
         </div>

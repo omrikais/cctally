@@ -23,6 +23,10 @@ describe('historyColumns', () => {
     expect(historyColumns('week')[0].label).toBe('Week');
     expect(historyColumns('month')[0].label).toBe('Month');
   });
+  it('accepts provider-native and neutral weekly column vocabulary', () => {
+    expect(historyColumns('week', false, 'Cycle')[0].label).toBe('Cycle');
+    expect(historyColumns('week', true, 'Provider period')[0].label).toBe('Provider period');
+  });
   it('sorts by cost descending', () => {
     const cols = historyColumns('week');
     const sorted = applyTableSort(rows, cols, { column: 'cost_usd', direction: 'desc' });

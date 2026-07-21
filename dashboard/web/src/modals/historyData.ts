@@ -18,6 +18,7 @@ export function dailyToPeriodRow(row: DailyPanelRow, prior?: DailyPanelRow): Per
       ? (row.cost_usd - prior.cost_usd) / prior.cost_usd
       : null;
   return {
+    source: row.source,
     label: row.label,
     cost_usd: row.cost_usd,
     total_tokens: row.total_tokens,
@@ -31,6 +32,7 @@ export function dailyToPeriodRow(row: DailyPanelRow, prior?: DailyPanelRow): Per
     is_current: row.is_today,
     models: row.models,
     cache_hit_pct: row.cache_hit_pct,
+    codex_tokens: row.codex_tokens,
   };
 }
 
@@ -44,6 +46,7 @@ export function dailyToPeriodRow(row: DailyPanelRow, prior?: DailyPanelRow): Per
 export function decorateHistoryRows(rows: PeriodRow[], variant: HistoryVariant): HistoryTableRow[] {
   return rows.map((r) => ({
     key: keyOf(r, variant),
+    source: r.source,
     label: r.label,
     cost_usd: r.cost_usd,
     used_pct: r.used_pct,
