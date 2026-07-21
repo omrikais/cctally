@@ -86,7 +86,7 @@ def _cmd_transcript_export(args) -> int:
         eprint(_SPEED_ONLY_CODEX_MSG)
         return 2
 
-    conn = c.open_cache_db()
+    conn = c.open_conversations_db()
     try:
         cq = c._load_sibling("_lib_conversation_query")
         md = cq.get_conversation_export(conn, session_id, scope)
@@ -118,7 +118,7 @@ def _cmd_transcript_export_qualified(
         return 2
     speed = c._resolve_codex_speed(speed_arg or "auto")
 
-    conn = c.open_cache_db()
+    conn = c.open_conversations_db()
     try:
         env = disp.neutral_export(
             conn, session_id, scope=scope, effective_speed=speed)
@@ -189,7 +189,7 @@ def _cmd_transcript_search_claude(args) -> int:
             eprint(f"transcript: {exc}")
             return 2
 
-    conn = c.open_cache_db()
+    conn = c.open_conversations_db()
     try:
         cq = c._load_sibling("_lib_conversation_query")
         try:
@@ -264,7 +264,7 @@ def _cmd_transcript_search_codex(args) -> int:
             eprint("transcript: invalid --cursor")
             return 2
 
-    conn = c.open_cache_db()
+    conn = c.open_conversations_db()
     try:
         result = disp.neutral_search(
             conn, query, source="codex", kind=kind,

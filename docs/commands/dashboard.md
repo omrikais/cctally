@@ -181,7 +181,7 @@ The dashboard binds its HTTP port immediately and serves the current cached snap
 
 ## Transcript retention
 
-The dashboard's background sync thread also runs an automatic, throttled transcript-retention prune — at most once every 24 hours — that removes conversation transcripts older than `conversation.retention_days` (default 90) from `cache.db`. This bounds the cache's otherwise-unbounded growth; only transcript rows are pruned (cost/usage history and Codex analytics metadata are untouched, and everything pruned is re-derivable from the JSONL). Set `cctally config set conversation.retention_days off` to keep transcripts forever, or a positive integer to change the window. The prune is gated off under `--no-sync`. Caches created by current versions use SQLite `INCREMENTAL` auto-vacuum, so the prune reclaims the freed pages automatically (they are returned to the OS on the next end-of-sync checkpoint) — no manual step. A `cache.db` created by an older version stays in the legacy `NONE` mode, where deleting rows frees pages inside the file but does not shrink it on disk; reclaim that space with a one-time [`cctally db vacuum`](db.md#db-vacuum) (stop the dashboard first; VACUUM needs exclusive access) or a [`cctally cache-sync --rebuild`](cache-sync.md), after which it too reclaims automatically. You can also prune on demand with [`cctally cache-sync --prune-conversations`](cache-sync.md#--prune-conversations).
+The dashboard's independent conversation sync thread also runs an automatic, throttled transcript-retention prune — at most once every 24 hours — that removes conversation transcripts older than `conversation.retention_days` (default 90) from `conversations.db`. This bounds transcript growth without delaying the compact accounting/quota sync; only transcript rows are pruned, and everything pruned is re-derivable from JSONL. Set `cctally config set conversation.retention_days off` to keep transcripts forever, or a positive integer to change the window. The prune is gated off under `--no-sync`. Current conversation stores use SQLite `INCREMENTAL` auto-vacuum; compact a legacy store explicitly with `cctally db vacuum --db conversations` after stopping the dashboard. You can also prune on demand with [`cctally cache-sync --prune-conversations`](cache-sync.md#--prune-conversations).
 
 ## Manual verification (post-v2)
 
@@ -265,7 +265,7 @@ is recorded only in the private `cctally.dashboard` log.
 
 ### Source selector and source-aware UX (S5)
 
-The Header hosts a three-state `Claude | Codex | All` selector (a radiogroup — Arrow keys move focus and selection, Home/End jump to the ends; the `v` shortcut cycles Claude → Codex → All). The choice persists in `localStorage` under `cctally:dashboard:source` (default `claude`) and is a pure client re-selection over the already-delivered `sources` bundle — the store never waits for or reconciles it against an envelope, and panel subtrees re-key on switch so no mixed-source frame is ever shown. The selector governs the dashboard workspace only; the Conversations workspace is unaffected.
+The Header hosts a three-state `Claude | Codex | All` selector (a radiogroup — Arrow keys move focus and selection, Home/End jump to the ends; the `v` shortcut cycles Claude → Codex → All). The choice persists in `localStorage` under `cctally:dashboard:source` (default `claude`) and is a pure client re-selection over the already-delivered `sources` bundle — the store never waits for or reconciles it against an envelope, and panel subtrees re-key on switch so no mixed-source frame is ever shown. This control is visible in the dashboard workspace; Conversations exposes the persisted selection through its own rail control.
 
 Claude and Codex use one canonical hero composition and metric order. Under Codex, the active native **seven-day (10,080-minute) reset cycle** supplies Week Usage, the reset countdown, cycle spend, `$ / 1%`, forecast-at-reset, the `$ / 1%` delta against the previous retained native cycle, and snapshot age; the independent five-hour (300-minute) limit fills the same optional 5-Hour slot. The values are derived only from retained Codex quota and cycle-bounded accounting. If the cache has accounting but no single coherent active seven-day boundary, those accounting slots render unavailable rather than showing a misleading zero. `All` remains a separate composition: it shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered side by side and never as a blended gauge.
 
@@ -274,6 +274,30 @@ Capability gating (per the S4 manifest) hides — rather than zero-fills — any
 The visible-panel order (digit shortcuts, drag-reorder, Help's panel list) is derived from the persisted full order filtered through the active source's gating; the persisted order is never rewritten by a source switch, and a reorder in a filtered view maps back into the full order preserving hidden panels' positions.
 
 Alerts are source-aware. The Recent-alerts panel and modal show the active source's own rows (Claude axes; Codex `codex_budget` / projected / quota rows with native labels; `All` a source-labelled union — never merged). Toasts fire for alerts of every source regardless of the active selection (an alert is a notification), each carrying a source chip; they are read only from the per-source projections, so a Codex budget alert can never double-toast. The Settings overlay (`s`) groups the persistable toggles into a global Notifications group (the notifier backend, shared across vendors), a Claude group (threshold + projected-weekly + a labelled Claude-budget subgroup), and a Codex group (the mirrored `budget.codex.*` toggles) — with a CLI pointer noting Codex quota-threshold rules are not configurable here. Regrouping is presentation-only; the `POST /api/settings` body is unchanged.
+
+### Conversation source selector and mixed-source reader (S8)
+
+Conversations has its own `Claude | Codex | All` control in the browse rail over
+the same persisted source selection used by the dashboard header. Claude and
+Codex rows use opaque qualified conversation keys and the same reader surface.
+The reader preserves Codex-native reasoning, cached-input, tool-event, thread,
+payload, find, export, and live-tail semantics instead of relabelling them as
+Claude fields. Permalinks and browser-local reading positions/bookmarks include
+the source-qualified identity, so equal native UUIDs from different providers
+or Codex roots remain isolated.
+
+`All` is a client composition: it fetches the strict Claude and Codex
+collections separately, merges them by activity with qualified-key tie-breaking,
+and source-labels every row. It never sends `source=all`. Provider-local filters
+and sorting are disabled in this view with an explanatory note; switch to a
+single source to use them.
+
+A comparison may cross providers. Its header labels each run's source; cost and
+prompt count are compared normally, while tokens, errors, and files remain
+side-by-side provider-specific values and duration is marked unavailable when
+the providers differ. The comparison copy action fetches each whole export and
+emits separate `Run A · <source>` and `Run B · <source>` sections, never a
+combined transcript body.
 
 ## Conversation viewer endpoints (Plan 2)
 
@@ -312,10 +336,10 @@ per-request predicate, so a request the conversation routes would `403` always
 reports `transcriptsEnabled=false` — the client never offers a button that
 would 403.
 
-**At-rest hardening.** Since `cache.db` now holds plaintext conversation prose,
-`open_cache_db` best-effort `chmod`s the data dir to `0700` and `cache.db` to
+**At-rest hardening.** Since `conversations.db` holds plaintext conversation prose,
+`open_conversations_db` best-effort `chmod`s the data dir to `0700` and `conversations.db` to
 `0600`; the `-wal` / `-shm` sidecars (materialized only on the first write) are
-hardened to `0600` at the end of the `sync_cache` write transaction. The chmod
+hardened to `0600` at the end of the conversation sync transaction. The chmod
 is best-effort: a failure (e.g. an exotic filesystem) logs and continues rather
 than aborting.
 
@@ -375,7 +399,7 @@ A compact **Sort** control in the rail header orders the Browse list by **Recent
 
 The reader now opens a long conversation **at the bottom** — the newest turns — rather than at the top, so a session you return to lands where the action is. On open it fetches the last page in one request (`?tail=1`) and lands on the newest turn with live-tail engaged; a short conversation that fits a single page opens at the top instead, so it reads from the start. From there the window pages **both directions**: scrolling down appends older→newer pages (as before), and scrolling up **prepends** earlier pages via a reverse cursor, anchored so the turn you were reading stays fixed under the viewport instead of jumping. The two edges are independent — a backward (scroll-up) page never disturbs the live-tail "follow the bottom" state, so a reader opened at the tail keeps following the live session even after you scroll up to read history.
 
-**Reading-position memory.** The reader remembers where you were in each conversation: when you switch away and come back later, it restores you to the turn you were last reading (anchored to that turn, not a pixel offset, so it survives a different window size or a grown transcript). A deep-link or jump target always wins over the saved position; if the saved turn no longer exists, the reader falls back to opening at the bottom (or the top for a single-page session). The memory is a small bounded list (the ~50 most-recently-read conversations) kept in your browser's local storage.
+**Reading-position memory.** The reader remembers where you were in each conversation: when you switch away and come back later, it restores you to the turn you were last reading (anchored to that turn, not a pixel offset, so it survives a different window size or a grown transcript). A deep-link or jump target always wins over the saved position; if the saved turn no longer exists, the reader falls back to opening at the bottom (or the top for a single-page session). The memory is a small bounded list (the ~50 most-recently-read conversations) kept in your browser's local storage, keyed by source plus the opaque qualified conversation key so native-key collisions cannot share a position.
 
 **Direct jumps to the last prompt / last error.** Beyond the `e`/`E` and `u`/`U` step-to-next-or-previous keys, two keys jump **directly to the most-recent occurrence**: `a` lands on the last prompt and `L` lands on the last error turn — handy for "take me to where I last asked something" or "show me the latest failure" without stepping. Both are no-ops when the conversation has none, and both are suppressed while a filter input or modal is focused. The outline's **"Jump to" chips** follow the same model: a **primary click jumps to the latest occurrence** of that landmark family, and **shift-click steps to the previous** one (the chip arrows / reader step-keys are unchanged).
 
@@ -452,7 +476,7 @@ The conversation viewer can put **two** sessions side by side and diff their **h
 
 **Entry.** From an open reader, click **⟷ Compare with…** in the reader head. The conversation list enters a **pick-mode** — a banner ("Comparing with `<anchor>` — pick a session") with a **Cancel** control (or **Esc**); the anchor session's own row is greyed out and non-pickable, every other row picks the second session. Choosing one opens the comparison. The comparison is shareable and cold-loadable via its URL, `#/conversations/compare/<A>/<B>`; an `A === B` URL degrades to the single reader, and an unknown/removed session shows a "couldn't load — close comparison" fallback rather than a broken split.
 
-**Layout.** Above ~1100px the view is a **two-column** split (run A left, run B right); below ~1100px it falls back to a **unified** single column (the same aligned data, shared one alignment model — this is the mobile path and also a legitimate desktop view if you prefer it). A **metrics-delta strip** heads the view with six A→B cells — Cost, Tokens, Prompts, Errors, Duration, Files — each with a delta; a subtle green ▼ marks an improvement on the unambiguously lower-is-better metrics (cost / errors / duration), while tokens / prompts / files show a plain signed delta with no value-judgment color. (Tokens is cache-inclusive — the sum of the per-session token breakdown; "# prompts" is the length of the aligned prompt spine.) The header carries **⇄ swap** (flip which run is on the left — the URL follows) and **✕ close** (return to the single reader).
+**Layout.** Above ~1100px the view is a **two-column** split (run A left, run B right); below ~1100px it falls back to a **unified** single column (the same aligned data, shared one alignment model — this is the mobile path and also a legitimate desktop view if you prefer it). The header source-labels both runs. A **metrics strip** heads the view with six A→B cells — Cost, Tokens, Prompts, Errors, Duration, Files. Within one provider it keeps the normal deltas and lower-is-better cues. Across providers, only semantically compatible Cost and Prompts receive deltas; Tokens, Errors, and Files show the two native values as `provider-specific`, and Duration is `unavailable`, preventing a false comparison between provider-native event models. The header carries **⇄ swap** (flip which run is on the left — the URL follows) and **✕ close** (return to the single reader). Copying the comparison produces two complete, source-labelled export sections rather than blending their bodies.
 
 **The aligned diff.** The two runs' prompts are aligned by a longest-common-subsequence over each prompt's **normalized first line** (trimmed, whitespace-collapsed, lowercased). Matched prompts sit on a shared neutral row; a replaced region is marked with a **⚡ DIVERGENCE** bar and rendered A (removed) / B (added); a prompt only one run has renders as a real row with a hatched gap on the empty side. Divergence is conveyed by the ⚡ bar + a ◆ marker + the add/del styling, never by color alone. Clicking any row lazily fetches and expands the **full** prompt text for both runs inline (via [`/api/conversation/<id>/prompts`](#endpoints), once per session), each with an **"open in reader →"** jump to that session's single reader at the turn.
 

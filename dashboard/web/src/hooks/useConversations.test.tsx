@@ -47,6 +47,20 @@ function fullPage(prefix: string, nextOffset: number | null) {
 }
 
 describe('useConversations', () => {
+  it('uses the qualified Codex browse contract and preserves the opaque key', async () => {
+    mockFetchOnce({
+      status: 'ok',
+      rows: [{ conversation_key: 'v1.root-a', title: 'Codex thread', project_key: 'p1', project_label: 'proj', started_utc: '2026-07-01T00:00:00Z', last_activity_utc: '2026-07-01T01:00:00Z', count: 2, cost_usd: 0.25, models: ['gpt-5.6-codex'], parent: null, is_fork: false }],
+      facets: { projects: [], models: [] },
+      page: { total: 1, returned: 1, cursor: null },
+    });
+    const { result } = renderHook(() => useConversations('codex'));
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect(result.current.rows[0].conversation_ref).toEqual({ source: 'codex', key: 'v1.root-a' });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversations?source=codex');
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain('offset=');
+  });
+
   it('loads the first page on mount', async () => {
     mockFetchOnce(page1);
     const { result } = renderHook(() => useConversations());
@@ -67,7 +81,10 @@ describe('useConversations', () => {
     mockFetchOnce(titled);
     const { result } = renderHook(() => useConversations());
     await waitFor(() => expect(result.current.rows).toHaveLength(2));
-    await waitFor(() => expect(getState().conversationTitles).toEqual({ a: 'Refactor the store', b: 'Fix the dashboard' }));
+    await waitFor(() => expect(getState().conversationTitles).toEqual({
+      '["claude","a"]': 'Refactor the store',
+      '["claude","b"]': 'Fix the dashboard',
+    }));
   });
 
   it('appends the next page via loadMore (offset cursor)', async () => {

@@ -56,9 +56,9 @@ def isolated(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
-    conn = ns["open_cache_db"]()
-    sync_cache = ns["sync_cache"]
-    yield ns, conn, projects, sync_cache
+    conn = ns["open_conversations_db"]()
+    sync_conversations = ns["sync_claude_conversations"]
+    yield ns, conn, projects, sync_conversations
     try:
         conn.close()
     except Exception:

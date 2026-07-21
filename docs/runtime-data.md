@@ -7,9 +7,10 @@ All persistent state lives under `~/.local/share/cctally/` (a dev checkout uses 
 | Path | Regenerated automatically? | What is lost if deleted? |
 | --- | --- | --- |
 | `stats.db` | **No** | Your entire recorded history — usage snapshots, cost snapshots, and the percent / 5-hour / budget milestones, reset events, and credit floors derived from them. Not re-derivable from JSONL. Back it up before touching it. |
-| `stats.db-wal`, `stats.db-shm`, `cache.db-wal`, `cache.db-shm` | Yes — SQLite auto-manages them | Nothing once the owning DB is closed cleanly (they checkpoint back into the parent `.db`). Deleting them under a live writer can drop the most recent uncheckpointed writes. |
-| `cache.db` | Yes — `cache-sync --rebuild`, or it rebuilds on the next read | Nothing durable. Re-derived from your `~/.claude` / `~/.codex` JSONL; the first rebuild is just slower, and the conversation-viewer tables re-ingest too. |
-| `cache.db.lock`, `cache.db.codex.lock`, `config.json.lock` | Yes — `fcntl.flock` files, re-created on demand | Nothing — they carry no data. |
+| `stats.db-wal`, `stats.db-shm`, `cache.db-wal`, `cache.db-shm`, `conversations.db-wal`, `conversations.db-shm` | Yes — SQLite auto-manages them | Nothing once the owning DB is closed cleanly (they checkpoint back into the parent `.db`). Deleting them under a live writer can drop the most recent uncheckpointed writes. |
+| `cache.db` | Yes — `cache-sync --rebuild`, or it rebuilds on the next read | Compact accounting, quota observations, source cursors, and Codex thread identity. Re-derived from your `~/.claude` / `~/.codex` JSONL. |
+| `conversations.db` | Yes — `cache-sync --rebuild` or the dashboard conversation worker | Transcript prose/events, browse rollups, and full-text indexes. Independently re-derived from the same JSONL without blocking core accounting refresh. |
+| `cache.db.lock`, `cache.db.codex.lock`, `conversations.db.lock`, `conversations.db.codex.lock`, `conversations.db.maintenance.lock`, `config.json.lock` | Yes — `fcntl.flock` files, re-created on demand | Nothing — they carry no data. |
 | `config.json` | Yes, **but only to defaults** | Your saved settings (`display.tz`, the `dashboard.*` keys, `telemetry.enabled`, week-start, budget, alert config, …). It comes back empty/default — your preferences are not recovered. See [configuration.md](configuration.md). |
 | `install_id` | Yes, **but as a new identity** | Your anonymous telemetry identity rotates — a fresh random id mints on the next beat, so the install count may count you once more. Equivalent to `cctally telemetry reset`. Never leaves your machine. |
 | `hwm-7d`, `hwm-5h` | Yes — climbs back from snapshots | The 7-day / 5-hour high-water-mark floor used by the status line and reports. It re-derives from `weekly_usage_snapshots` and re-climbs on subsequent ticks. |
@@ -62,7 +63,7 @@ One row per `sync-week` invocation. Stores the computed USD cost for a week wind
 
 ## `cache.db` schema
 
-Fully re-derivable from JSONL — `rm cache.db` or `cache-sync --rebuild` is always safe. It carries three estates: the Claude session cache, the Codex session cache, and the conversation-viewer tables.
+Fully re-derivable from JSONL through `cache-sync --rebuild`. It carries the compact Claude and Codex accounting/quota estates. Transcript/search state lives separately in `conversations.db`; do not unlink either SQLite family beneath a live process.
 
 ### Claude side
 
@@ -78,7 +79,7 @@ Fully re-derivable from JSONL — `rm cache.db` or `cache-sync --rebuild` is alw
 
 ### Conversation viewer
 
-The read-only transcript reader is backed by a further set of cache tables — `conversation_sessions`, `conversation_messages`, `conversation_file_touches`, `conversation_ai_titles`, the consolidated `conversation_fts(text, search_tool, search_thinking)` full-text index over the messages, and the `cache_meta` key/value store (ingest sentinels and reingest cursors). These re-derive on the next sync like the rest of `cache.db`; see [dashboard.md](commands/dashboard.md) for the reader, its privacy gate, and the search-depth surface.
+The read-only transcript reader is backed by `conversations.db`: `conversation_sessions`, `conversation_messages`, `conversation_file_touches`, `conversation_ai_titles`, the consolidated `conversation_fts(text, search_tool, search_thinking)` index, the parallel Codex event/normalized/rollup families, independent source cursors, and transcript-only `cache_meta` rebuild flags. A conversation connection may attach `cache.db` read-only for cost/token joins; core cache connections never attach `conversations.db`. Both stores re-derive independently from JSONL; see [dashboard.md](commands/dashboard.md) for the reader, privacy gate, and search-depth surface.
 
 ### Cost
 
@@ -87,10 +88,17 @@ Pricing-derived cost is **not stored**: it is computed at query time from `CLAUD
 ## Safe destructive ops
 
 ```bash
-rm ~/.local/share/cctally/cache.db          # rebuild on next read
 rm ~/.local/share/cctally/hwm-7d            # high-water mark resets, re-climbs from snapshots
 cctally cache-sync --rebuild                # explicit cache rebuild
 cctally cache-sync --source codex --rebuild # Codex half only
 ```
 
-Deleting `cache.db` and the various markers above is safe — they re-derive or re-arm. Two files deserve a pause: `stats.db` (and any `stats.db.bak-*` that is your only backup of it) holds weeks of history that cannot be recovered, and `config.json` comes back only as empty defaults, so deleting it discards your saved settings.
+`conversations.db` is re-derivable, but never unlink its main file beneath a
+live dashboard or other cctally process: SQLite's main/WAL/SHM files are one
+family. Prefer `cache-sync --rebuild`. To recover a corrupt transcript store,
+stop every cctally process first, then move the complete
+`conversations.db`/`conversations.db-wal`/`conversations.db-shm` family aside
+together before rebuilding. Two files deserve a harder pause: `stats.db` (and
+any `stats.db.bak-*` that is your only backup of it) holds weeks of history that
+cannot be recovered, and `config.json` comes back only as empty defaults, so
+deleting it discards your saved settings.

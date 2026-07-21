@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { fetchJson, isAbortError, HttpError } from '../lib/fetchJson';
 import { useDebouncedValue } from './useDebouncedValue';
-import type { ConversationFindResult, FindAnchor } from '../types/conversation';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { adaptQualifiedFind } from '../lib/conversationAdapters';
+import { conversationRefKey, isQualifiedConversationRef, normalizeConversationRef, type ConversationFindResult, type ConversationRefInput, type FindAnchor } from '../types/conversation';
 
 // #177 S6 — in-conversation find. A debounced, session-scoped fetch to
 // /api/conversation/<id>/find returning the full ordered rendered-turn anchor
@@ -39,10 +41,12 @@ export interface UseConversationFindOptions {
 const DEBOUNCE_MS = 200;
 
 export function useConversationFind(
-  sessionId: string,
+  rawRef: ConversationRefInput,
   needle: string,
   opts: UseConversationFindOptions = {},
 ): UseConversationFind {
+  const conversationRef = normalizeConversationRef(rawRef);
+  const identityKey = conversationRefKey(conversationRef);
   const { regex = false, case: caseSensitive = false, tailRevision = 0 } = opts;
   const [anchors, setAnchors] = useState<FindAnchor[]>([]);
   const [total, setTotal] = useState(0);
@@ -73,11 +77,16 @@ export function useConversationFind(
     const ctl = new AbortController();
     ctlRef.current = ctl;
     setFetching(true);
-    let url = `/api/conversation/${encodeURIComponent(sessionId)}/find?q=${encodeURIComponent(debouncedQ)}`;
-    if (regex) url += '&regex=1';
-    if (caseSensitive) url += '&case=1';
-    fetchJson<ConversationFindResult>(url, ctl.signal)
-      .then((body) => {
+    const url = conversationEntityUrl(conversationRef, 'find', {
+      q: debouncedQ,
+      regex: regex || undefined,
+      case: caseSensitive || undefined,
+    });
+    fetchJson<ConversationFindResult | Parameters<typeof adaptQualifiedFind>[0]>(url, ctl.signal)
+      .then((raw) => {
+        const body = isQualifiedConversationRef(conversationRef)
+          ? adaptQualifiedFind(raw as Parameters<typeof adaptQualifiedFind>[0])
+          : raw as ConversationFindResult;
         setAnchors(body.anchors);
         setTotal(body.total);
         setTruncated(body.anchors_truncated);
@@ -100,7 +109,7 @@ export function useConversationFind(
         setFetching(false);
       });
     return () => ctl.abort();
-  }, [sessionId, debouncedQ, regex, caseSensitive, debouncedRev]);
+  }, [identityKey, debouncedQ, regex, caseSensitive, debouncedRev]);
 
   // Derived, mirroring useConversationSearch: true while a non-empty needle's
   // results aren't ready (debounce lag or fetch in flight).

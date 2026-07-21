@@ -6,12 +6,46 @@ beforeEach(() => { clearRailPrefs(); _resetForTests(); });
 afterEach(() => { clearRailPrefs(); _resetForTests(); });
 
 describe('compare slice', () => {
+  it('treats same opaque key under different sources as different conversations', () => {
+    const claude = { source: 'claude', key: 'same' } as const;
+    const codex = { source: 'codex', key: 'same' } as const;
+    dispatch({ type: 'OPEN_COMPARE', aRef: claude, bRef: codex } as never);
+    expect((getState() as unknown as { selectedConversationRef?: unknown }).selectedConversationRef).toEqual(claude);
+    expect(getState().compare).toEqual({ a: claude, b: codex });
+  });
+
+  it('resets source-scoped pin and jump state when the opaque key is unchanged', () => {
+    const claude = { source: 'claude', key: 'same' } as const;
+    const codex = { source: 'codex', key: 'same' } as const;
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      conversationRef: claude,
+      jump: { conversation_ref: claude, session_id: 'same', uuid: 'claude-turn' },
+    });
+    dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'claude-turn' });
+
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: codex });
+
+    expect(getState().selectedConversationRef).toEqual(codex);
+    expect(getState().conversationJump).toBeNull();
+    expect(getState().convPinnedUuid).toBeNull();
+  });
+
+  it('rejects comparison of the same qualified reference', () => {
+    const rootA = { source: 'codex', key: 'v1.root-a-same' } as const;
+    dispatch({ type: 'OPEN_COMPARE', aRef: rootA, bRef: { ...rootA } } as never);
+    expect(getState().compare).toBeNull();
+  });
+
   it('OPEN_COMPARE sets the anchor + view, clears pick', () => {
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
     const s = getState();
     expect(s.view).toBe('conversations');
-    expect(s.compare).toEqual({ a: 'A', b: 'B' });
+    expect(s.compare).toEqual({
+      a: { source: 'claude', key: 'A' },
+      b: { source: 'claude', key: 'B' },
+    });
     expect(s.selectedConversationId).toBe('A');      // anchor set (cold-boot safe)
     expect(s.comparePick).toBeNull();
   });
@@ -24,7 +58,10 @@ describe('compare slice', () => {
   it('SWAP_COMPARE flips sides', () => {
     dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
     dispatch({ type: 'SWAP_COMPARE' });
-    expect(getState().compare).toEqual({ a: 'B', b: 'A' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'B' },
+      b: { source: 'claude', key: 'A' },
+    });
   });
 
   it('CLOSE_COMPARE clears compare but keeps the anchor selection', () => {
@@ -51,7 +88,7 @@ describe('compare slice', () => {
   it('CANCEL_COMPARE_PICK clears the pick anchor', () => {
     dispatch({ type: 'SELECT_CONVERSATION', sessionId: 'A' });   // NEW: satisfy the F2 precondition
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
-    expect(getState().comparePick).toEqual({ anchor: 'A' });
+    expect(getState().comparePick).toEqual({ anchor: { source: 'claude', key: 'A' } });
     dispatch({ type: 'CANCEL_COMPARE_PICK' });
     expect(getState().comparePick).toBeNull();
   });
@@ -139,6 +176,19 @@ describe('compare slice', () => {
 // #227 — the shared session_id → title cache the rail feeds and the comparison
 // header reads.
 describe('CACHE_CONVERSATION_TITLES', () => {
+  it('does not collide same-key Claude and Codex titles', () => {
+    const claude = { source: 'claude', key: 'same' } as const;
+    const codex = { source: 'codex', key: 'same' } as const;
+    dispatch({
+      type: 'CACHE_CONVERSATION_TITLES',
+      titles: [[claude, 'Claude title'], [codex, 'Codex title']],
+    } as never);
+    expect(getState().conversationTitles).toEqual({
+      '["claude","same"]': 'Claude title',
+      '["codex","same"]': 'Codex title',
+    });
+  });
+
   it('starts empty and merges non-empty titles, accumulating across dispatches', () => {
     expect(getState().conversationTitles).toEqual({});
     dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: [['a', 'First run'], ['b', 'Second run']] });

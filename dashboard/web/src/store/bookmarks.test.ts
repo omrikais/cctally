@@ -8,6 +8,18 @@ beforeEach(() => clearBookmarks());
 afterEach(() => clearBookmarks());
 
 describe('bookmarks persistence (#217 S6 F4)', () => {
+  it('keeps same-native-id provider/root references independent', () => {
+    const claude = { source: 'claude', key: 'same' } as const;
+    const codexA = { source: 'codex', key: 'v1.root-a-same' } as const;
+    const codexB = { source: 'codex', key: 'v1.root-b-same' } as const;
+    toggleBookmark(claude as never, 'u', 1000);
+    setBookmarkNote(codexA as never, 'u', 'root A', 2000);
+    setBookmarkNote(codexB as never, 'u', 'root B', 3000);
+    expect(loadBookmarks(claude as never).u.note).toBe('');
+    expect(loadBookmarks(codexA as never).u.note).toBe('root A');
+    expect(loadBookmarks(codexB as never).u.note).toBe('root B');
+  });
+
   it('toggles a bookmark on and off, persisting per session', () => {
     expect(loadBookmarks('s1')).toEqual({});
     toggleBookmark('s1', 'u1', 1000);
@@ -39,5 +51,14 @@ describe('bookmarks persistence (#217 S6 F4)', () => {
   it('tolerates corrupt localStorage (bad JSON) by reading empty', () => {
     localStorage.setItem(BOOKMARKS_KEY, '{not json');
     expect(loadBookmarks('s1')).toEqual({});
+  });
+  it('reads a legacy bare-Claude entry and rewrites it under the qualified key', () => {
+    localStorage.setItem(BOOKMARKS_KEY, JSON.stringify({ legacy: { u: { note: 'old', ts: 1 } } }));
+    const ref = { source: 'claude', key: 'legacy' } as const;
+    expect(loadBookmarks(ref).u.note).toBe('old');
+    setBookmarkNote(ref, 'u', 'new', 2);
+    const raw = JSON.parse(localStorage.getItem(BOOKMARKS_KEY)!);
+    expect(raw.legacy).toBeUndefined();
+    expect(raw['["claude","legacy"]'].u.note).toBe('new');
   });
 });

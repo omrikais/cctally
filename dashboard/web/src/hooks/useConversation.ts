@@ -5,7 +5,19 @@ import { revalToken } from '../lib/revalToken';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
 import { planTrim } from '../conversations/windowedCap';
 import { VIRTUAL_INDEX_BASE, applyFirstItemDelta } from '../conversations/virtuosoFirstIndex';
-import type { ConversationDetail, ConversationItem, OpenIntent, OutlineTurn } from '../types/conversation';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { adaptQualifiedDetail, ConversationNormalizationPending } from '../lib/conversationAdapters';
+import {
+  conversationRefKey,
+  isQualifiedConversationRef,
+  normalizeConversationRef,
+  type ConversationDetail,
+  type ConversationItem,
+  type ConversationRef,
+  type ConversationRefInput,
+  type OpenIntent,
+  type OutlineTurn,
+} from '../types/conversation';
 
 // #217 S3 E2 — the bidirectional windowed reader pager. The reader holds ONE
 // contiguous window with TWO first-class edge cursors: `prevBeforeRef` (the TOP
@@ -86,7 +98,7 @@ export interface UseConversation {
   // TOP edge (#217 S3 E2): more reverse pages exist.
   hasPrev: boolean;
   // The current top-edge cursor (the id for the next `?before=`), or null.
-  prevBefore: number | null;
+  prevBefore: number | string | null;
   // #217 S3 E2 — where the reader should land on open (computed from the FIRST
   // response's `has_prev`): 'bottom' for a multi-page tail open, 'top' for a
   // single-page session (everything fits one page → read from the start). null
@@ -165,7 +177,22 @@ export interface UseConversationOptions {
   live?: boolean;
 }
 
-export function useConversation(sessionId: string | null, opts: UseConversationOptions = {}): UseConversation {
+async function fetchConversationDetail(
+  ref: ConversationRef,
+  url: string,
+  signal?: AbortSignal,
+): Promise<ConversationDetail> {
+  const body = await fetchJson<ConversationDetail | Parameters<typeof adaptQualifiedDetail>[1]>(url, signal);
+  return isQualifiedConversationRef(ref)
+    ? adaptQualifiedDetail(ref, body as Parameters<typeof adaptQualifiedDetail>[1])
+    : body as ConversationDetail;
+}
+
+export function useConversation(rawRef: ConversationRefInput | null, opts: UseConversationOptions = {}): UseConversation {
+  const conversationRef = rawRef ? normalizeConversationRef(rawRef) : null;
+  // Existing paging machinery uses a scalar generation key. Make that scalar
+  // the injective qualified tuple, while all network paths use the opaque ref.
+  const sessionId = conversationRef ? conversationRefKey(conversationRef) : null;
   const { outlineTurns, openIntent, protectedUuids, growthNonce = 0, live = false } = opts;
   // Live mirror so the ref-stable trim effect reads the latest protected set
   // without re-creating itself (mirrors outlineTurnsRef).
@@ -201,8 +228,8 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const [loadedSessionId, setLoadedSessionId] = useState<string | null>(null);
   // The TWO edge cursors. `nextAfterRef` = bottom (forward + live-tail gate);
   // `prevBeforeRef` = top (reverse). Each is fed ONLY from its own envelope key.
-  const nextAfterRef = useRef<number | null>(null);
-  const prevBeforeRef = useRef<number | null>(null);
+  const nextAfterRef = useRef<number | string | null>(null);
+  const prevBeforeRef = useRef<number | string | null>(null);
   const [hasPrev, setHasPrev] = useState(false);
   const hasPrevRef = useRef(false);
   hasPrevRef.current = hasPrev;
@@ -228,6 +255,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     found: false, direction: 'none', exhausted: true, terminalOpRev: 0,
   });
   const sessionRef = useRef<string | null>(null);
+  const conversationRefRef = useRef<ConversationRef | null>(conversationRef);
   // #175 F4 live-tail bookkeeping.
   const hasMoreRef = useRef(false);
   const pollingRef = useRef(false);
@@ -275,6 +303,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // ── Initial fetch (hook-owned, precedence-correct — Codex P1) ──────────────
   useEffect(() => {
     sessionRef.current = sessionId;
+    conversationRefRef.current = conversationRef;
     if (!sessionId) {
       setDetailSynced(null); setLoadedSessionId(null); setLoading(false); setError(null);
       nextAfterRef.current = null; prevBeforeRef.current = null; setHasPrev(false);
@@ -294,11 +323,11 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
     // For an anchor/restore open we still START from the tail (the natural
     // resting place) and let loadToTarget walk to the target; for a bare tail
     // open we land per has_prev; with NO intent we keep the legacy head page.
-    const firstUrl = intentKind == null
-      ? `/api/conversation/${encodeURIComponent(sessionId)}?limit=${PAGE}`
-      : `/api/conversation/${encodeURIComponent(sessionId)}?tail=1&limit=${PAGE}`;
+    const firstUrl = conversationEntityUrl(conversationRef!, 'detail', intentKind == null
+      ? { limit: PAGE }
+      : { tail: 1, limit: PAGE });
 
-    fetchJson<ConversationDetail>(firstUrl, ctl.signal)
+    fetchConversationDetail(conversationRef!, firstUrl, ctl.signal)
       .then((body) => {
         if (sessionRef.current !== sessionId) return;  // session changed mid-fetch
         applyWindow(body);
@@ -320,7 +349,9 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       .catch((e) => {
         if (isAbortError(e)) return;
         if (e instanceof HttpError && e.status === 404) { setError('Conversation not found.'); setLoading(false); return; }
-        setError("Couldn't load the conversation."); setLoading(false);
+        setError(e instanceof ConversationNormalizationPending
+          ? 'Conversation indexing is still finishing.'
+          : "Couldn't load the conversation."); setLoading(false);
       });
     return () => ctl.abort();
     // sessionId + the intent KIND/uuid only — NOT generated_at (immutable
@@ -336,12 +367,13 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const fetchNext = useCallback(async (): Promise<WindowOp | null> => {
     const after = nextAfterRef.current;
     const sid = sessionRef.current;
-    if (after == null || sid == null || loadingMoreRef.current) return null;
+    const ref = conversationRefRef.current;
+    if (after == null || sid == null || ref == null || loadingMoreRef.current) return null;
     loadingMoreRef.current = true;
     try {
       let body: ConversationDetail;
       try {
-        body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&after=${after}`);
+        body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, after }));
       } catch {
         return null;
       }
@@ -372,16 +404,27 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const fetchPrev = useCallback(async (): Promise<WindowOp | null> => {
     const before = prevBeforeRef.current;
     const sid = sessionRef.current;
-    if (before == null || sid == null || loadingPrevRef.current) return null;
+    const ref = conversationRefRef.current;
+    if (before == null || sid == null || ref == null || loadingPrevRef.current) return null;
     loadingPrevRef.current = true;
     try {
       let body: ConversationDetail;
       try {
-        body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}&before=${before}`);
+        body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, before }));
       } catch {
         return null;
       }
       if (sessionRef.current !== sid) return null;
+      // Qualified before pages are cursor-exclusive in the steady state, but a
+      // stale edge response can race a same-conversation reset and overlap the
+      // already-committed window. Deduplicate by the provider-neutral turn UUID
+      // before both the array prepend and Virtuoso's first-item delta. Numeric
+      // anchor ids are only local render bookkeeping for Codex and are not the
+      // cross-response identity contract.
+      const existingUuids = new Set(
+        (detailRef.current?.items ?? []).map((item) => item.anchor.uuid),
+      );
+      const prependItems = body.items.filter((item) => !existingUuids.has(item.anchor.uuid));
       // PREPEND the page and update ONLY the top edge. The before-page envelope
       // legitimately carries next_after / has_more for the items AFTER it (already
       // loaded) — storing those would flip the reader to "not at tail" and kill
@@ -392,15 +435,15 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
       // — this is how Virtuoso pins the viewport across a reverse-paging prepend.
       setWindowState((ws) => {
         const prev = ws.detail;
-        const next = prev ? { ...prev, items: [...body.items, ...prev.items],
+        const next = prev ? { ...prev, items: [...prependItems, ...prev.items],
           page: { ...prev.page, prev_before: body.page.prev_before ?? null, has_prev: body.page.has_prev ?? false },
           subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body;
         detailRef.current = next;
-        return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: body.items.length, droppedTop: 0 }) };
+        return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: prependItems.length, droppedTop: 0 }) };
       });
       prevBeforeRef.current = body.page.prev_before ?? null;
       setHasPrev(body.page.has_prev ?? false);
-      return emitOp({ op: 'prepend', addedTop: body.items.length, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
+      return emitOp({ op: 'prepend', addedTop: prependItems.length, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
     } finally {
       loadingPrevRef.current = false;
     }
@@ -674,10 +717,11 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   // ── Jump-to-latest = a ?tail=1 RESET (instant; not a forward drain) ─────────
   const jumpToLatest = useCallback(async () => {
     const sid = sessionRef.current;
-    if (sid == null) return;
+    const ref = conversationRefRef.current;
+    if (sid == null || ref == null) return;
     let body: ConversationDetail;
     try {
-      body = await fetchJson<ConversationDetail>(`/api/conversation/${encodeURIComponent(sid)}?tail=1&limit=${PAGE}`);
+      body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { tail: 1, limit: PAGE }));
     } catch {
       return;
     }
@@ -704,19 +748,24 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
   const pollTail = useCallback(async () => {
     if (pollingRef.current) { pendingTickRef.current = true; return; }  // coalesce a mid-fetch tick
     const sid = sessionRef.current;
-    if (!sid || hasMoreRef.current || loadingMoreRef.current) return;   // only at the tail, never racing loadMore
+    const ref = conversationRefRef.current;
+    if (!sid || !ref || hasMoreRef.current || loadingMoreRef.current) return;   // only at the tail, never racing loadMore
     pollingRef.current = true;
     try {
       for (let i = 0; i < 50; i++) {                                    // drain a >PAGE burst within one tick
         const items = detailRef.current?.items ?? [];
         if (!items.length) break;
         const splitIdx = Math.max(0, items.length - TAIL_WINDOW);
-        const cursor = splitIdx > 0 ? items[splitIdx - 1].anchor.id : null;
+        const cursor = splitIdx > 0
+          ? (isQualifiedConversationRef(ref) ? items[splitIdx - 1].anchor.uuid : items[splitIdx - 1].anchor.id)
+          : null;
         let body: ConversationDetail;
         try {
-          const q = `/api/conversation/${encodeURIComponent(sid)}?limit=${PAGE}`
-            + (cursor != null ? `&after=${cursor}` : '');
-          body = await fetchJson<ConversationDetail>(q);
+          const q = conversationEntityUrl(ref, 'detail', {
+            limit: PAGE,
+            after: cursor ?? undefined,
+          });
+          body = await fetchConversationDetail(ref, q);
         } catch {
           break;                                                        // transient blip — keep what we have
         }
@@ -757,6 +806,7 @@ export function useConversation(sessionId: string | null, opts: UseConversationO
           last_anchor: body.last_anchor ?? prev.last_anchor,
           last_activity_utc: body.last_activity_utc ?? prev.last_activity_utc,
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
+          provider_meta: body.provider_meta ?? prev.provider_meta,
           page: prev.page,                                             // stays fully-paged at the bottom; top edge preserved
         } : prev));
         // #217 S4 / I-1.6 — a merge that touched the corpus bumps the monotonic

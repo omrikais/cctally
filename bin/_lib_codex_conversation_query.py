@@ -71,9 +71,25 @@ _SEARCH_BADGE = {
 
 
 def codex_normalization_authoritative(conn: sqlite3.Connection) -> bool:
-    """True iff migration 025 is stamped applied — i.e. the normalized corpus is
-    authoritative (§3.5). A missing ``schema_migrations`` table (bare
-    ``_apply_cache_schema`` conn, or a pre-migration cache) reads as pending."""
+    """True iff the normalized Codex corpus is authoritative (§3.5).
+
+    Split stores use their provider-local rebuild marker: current schema alone
+    is not authority while migration 028's byte-zero replay is pending. Legacy
+    monolithic/bare connections retain the migration-025 stamp contract.
+    """
+    try:
+        split = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_schema_version'"
+        ).fetchone() is not None
+        if split:
+            pending = conn.execute(
+                "SELECT 1 FROM cache_meta "
+                "WHERE key='conversation_rebuild_codex_pending'"
+            ).fetchone() is not None
+            return not pending
+    except sqlite3.OperationalError:
+        pass
     try:
         row = conn.execute(
             "SELECT 1 FROM schema_migrations WHERE name = ?",

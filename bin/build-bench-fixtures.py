@@ -273,7 +273,8 @@ def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:
 
     Writes JSONL under ``root/claude/projects/**``, pins ``CCTALLY_DATA_DIR`` =
     ``root/data`` + ``CLAUDE_CONFIG_DIR`` = ``root/claude``, builds ``cache.db``
-    via ``sync_cache``, and returns ``root/data`` (the resolved
+    via ``sync_cache`` and ``conversations.db`` via
+    ``sync_claude_conversations``, and returns ``root/data`` (the resolved
     ``CCTALLY_DATA_DIR``). Idempotent: if a marker records a matching
     ``(seed, scale, pricing_date)`` and ``cache.db`` exists, the JSONL-emit +
     ``sync_cache`` are skipped (a ``large`` rebuild is slow), but env is still
@@ -290,7 +291,9 @@ def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:
     cctally = _pin_env(data_dir, claude_dir)
     want = _marker_payload(cctally, seed=seed, scale=scale)
     marker = _marker_path(data_dir)
-    if (data_dir / "cache.db").exists() and marker.exists():
+    if ((data_dir / "cache.db").exists()
+            and (data_dir / "conversations.db").exists()
+            and marker.exists()):
         try:
             if json.loads(marker.read_text()) == want:
                 return data_dir       # cached hit — nothing to rebuild
@@ -301,6 +304,11 @@ def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:
     conn = cctally.open_cache_db()
     try:
         cctally.sync_cache(conn)
+    finally:
+        conn.close()
+    conn = cctally.open_conversations_db()
+    try:
+        cctally.sync_claude_conversations(conn)
     finally:
         conn.close()
     marker.write_text(json.dumps(want, sort_keys=True))
@@ -323,7 +331,7 @@ def semantic_hash(conn: sqlite3.Connection) -> str:
     for sql in (
         "SELECT msg_id, req_id, timestamp_utc, model, input_tokens, "
         "output_tokens, cache_read_tokens, cache_create_tokens "
-        "FROM session_entries ORDER BY msg_id, req_id",
+        "FROM cache_db.session_entries ORDER BY msg_id, req_id",
         "SELECT session_id, uuid, parent_uuid, timestamp_utc, entry_type, text, "
         "model, msg_id FROM conversation_messages ORDER BY session_id, uuid",
         "SELECT session_id, msg_count, ROUND(cost_usd, 6) "
@@ -340,9 +348,18 @@ def dataset_counts(conn: sqlite3.Connection) -> dict:
         return conn.execute(q).fetchone()[0]
     return {
         "sessions": n("SELECT COUNT(*) FROM conversation_sessions"),
-        "entries": n("SELECT COUNT(*) FROM session_entries"),
+        "entries": n("SELECT COUNT(*) FROM cache_db.session_entries"),
         "messages": n("SELECT COUNT(*) FROM conversation_messages"),
     }
+
+
+def open_fixture_db(data_dir) -> sqlite3.Connection:
+    """Open the split benchmark corpus with compact cache metadata attached."""
+    data_dir = pathlib.Path(data_dir)
+    conn = sqlite3.connect(data_dir / "conversations.db")
+    cache_uri = (data_dir / "cache.db").resolve().as_uri() + "?mode=ro"
+    conn.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
+    return conn
 
 
 def _main(argv=None) -> int:
@@ -375,7 +392,8 @@ def _main(argv=None) -> int:
         except FileNotFoundError:
             pass
     data_dir = build_fixture(scale=args.scale, seed=args.seed, root=root)
-    conn = sqlite3.connect(data_dir / "cache.db")
+    cctally = _pin_env(data_dir, root / "claude")
+    conn = cctally.open_conversations_db()
     try:
         counts = dataset_counts(conn)
         digest = semantic_hash(conn)

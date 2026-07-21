@@ -99,6 +99,11 @@ def _boot_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full",
         ).fetchone()[0]
     finally:
         conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
+    finally:
+        conn.close()
     srv = _wire_handler(ns, no_sync=no_sync)   # loads the dashboard + conv sibling
     if fast:
         _speed_up(monkeypatch)
@@ -254,6 +259,11 @@ def test_qualified_claude_key_speaks_conversation_key(tmp_path, monkeypatch):
         ns["sync_cache"](conn, rebuild=True)
     finally:
         conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_claude_conversations"](conn, rebuild=True)
+    finally:
+        conn.close()
     srv = _wire_handler(ns)
     key = disp._mint_claude_conversation_key("s1")
     try:
@@ -344,6 +354,11 @@ def test_unrelated_conversation_growth_does_not_emit(tmp_path, monkeypatch):
             "WHERE source_path=?", (str(a),)).fetchone()[0]
     finally:
         conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
+    finally:
+        conn.close()
     srv = _wire_handler(ns)
     try:
         port = srv.server_address[1]
@@ -385,7 +400,7 @@ def test_codex_child_discovery_emits_tail(tmp_path, monkeypatch):
         finally:
             s.close()
         # The child was ingested and joined the parent's widened file set.
-        conn = ns["open_cache_db"]()
+        conn = ns["open_conversations_db"]()
         try:
             paths = set(cq.codex_conversation_source_paths(conn, parent_key))
         finally:
@@ -403,7 +418,7 @@ def test_neutral_events_preflight_statuses(tmp_path, monkeypatch):
     ns = load_script()
     srv, _root, _rollout, key = _boot_codex(ns, tmp_path, monkeypatch)
     srv.shutdown()
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     try:
         ok = disp.neutral_events_preflight(conn, key)
         assert ok["status"] == "ok" and ok["source"] == "codex"

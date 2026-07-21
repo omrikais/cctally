@@ -14,6 +14,18 @@ beforeEach(() => clearReadingPositions());
 afterEach(() => clearReadingPositions());
 
 describe('readingPosition persistence (#217 S3 E1)', () => {
+  it('keeps same-native-id provider/root references independent', () => {
+    const claude = { source: 'claude', key: 'same' } as const;
+    const codexA = { source: 'codex', key: 'v1.root-a-same' } as const;
+    const codexB = { source: 'codex', key: 'v1.root-b-same' } as const;
+    recordReadingPos(claude as never, 'u-claude', 1000);
+    recordReadingPos(codexA as never, 'u-a', 2000);
+    recordReadingPos(codexB as never, 'u-b', 3000);
+    expect(loadReadingPos(claude as never)?.uuid).toBe('u-claude');
+    expect(loadReadingPos(codexA as never)?.uuid).toBe('u-a');
+    expect(loadReadingPos(codexB as never)?.uuid).toBe('u-b');
+  });
+
   it('records and restores a position for a session', () => {
     expect(loadReadingPos('s1')).toBeNull();
     recordReadingPos('s1', 'u7', 1000);
@@ -74,5 +86,15 @@ describe('readingPosition persistence (#217 S3 E1)', () => {
     // A subsequent record overwrites the corrupt blob with a valid map.
     recordReadingPos('s1', 'u1', 1000);
     expect(loadReadingPos('s1')?.uuid).toBe('u1');
+  });
+
+  it('reads a legacy bare-Claude entry and rewrites it under the qualified key', () => {
+    localStorage.setItem(READING_POS_KEY, JSON.stringify({ legacy: { uuid: 'old', ts: 1 } }));
+    const ref = { source: 'claude', key: 'legacy' } as const;
+    expect(loadReadingPos(ref)).toEqual({ uuid: 'old', ts: 1 });
+    recordReadingPos(ref, 'new', 2000);
+    const raw = JSON.parse(localStorage.getItem(READING_POS_KEY)!);
+    expect(raw.legacy).toBeUndefined();
+    expect(raw['["claude","legacy"]']).toEqual({ uuid: 'new', ts: 2000 });
   });
 });

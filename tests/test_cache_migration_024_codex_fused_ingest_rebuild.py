@@ -146,11 +146,17 @@ def _handler(db):
 
 
 def _counts(conn: sqlite3.Connection) -> dict[str, int]:
+    def _count_if_present(table: str) -> int:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is None:
+            return 0
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
     return {
         "claude_entries": conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0],
-        "claude_messages": conn.execute(
-            "SELECT COUNT(*) FROM conversation_messages"
-        ).fetchone()[0],
+        "claude_messages": _count_if_present("conversation_messages"),
         "claude_quota": conn.execute(
             "SELECT COUNT(*) FROM quota_window_snapshots WHERE source='claude'"
         ).fetchone()[0],
@@ -163,7 +169,7 @@ def _counts(conn: sqlite3.Connection) -> dict[str, int]:
         "codex_quota": conn.execute(
             "SELECT COUNT(*) FROM quota_window_snapshots WHERE source='codex'"
         ).fetchone()[0],
-        "codex_events": conn.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0],
+        "codex_events": _count_if_present("codex_conversation_events"),
     }
 
 
@@ -177,10 +183,12 @@ def _version(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
-def _assert_codex_cleared_claude_unchanged(conn: sqlite3.Connection) -> None:
+def _assert_codex_cleared_claude_unchanged(
+    conn: sqlite3.Connection, *, legacy_claude_messages: bool = True,
+) -> None:
     assert _counts(conn) == {
         "claude_entries": 1,
-        "claude_messages": 1,
+        "claude_messages": 1 if legacy_claude_messages else 0,
         "claude_quota": 1,
         "codex_entries": 0,
         "codex_files": 0,
@@ -253,10 +261,12 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
 
     conn = ns["open_cache_db"]()
     try:
-        _assert_codex_cleared_claude_unchanged(conn)
+        _assert_codex_cleared_claude_unchanged(
+            conn, legacy_claude_messages=False
+        )
         assert _marker(conn) == 1
         # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 27
+        assert _version(conn) == 28
     finally:
         conn.close()
 
@@ -283,10 +293,12 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
 
     conn = ns["open_cache_db"]()
     try:
-        _assert_codex_cleared_claude_unchanged(conn)
+        _assert_codex_cleared_claude_unchanged(
+            conn, legacy_claude_messages=False
+        )
         assert _marker(conn) == 1
         # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 27
+        assert _version(conn) == 28
     finally:
         conn.close()
 
@@ -314,10 +326,12 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
     db._eagerly_apply_cache_migrations()
     conn = sqlite3.connect(core.CACHE_DB_PATH)
     try:
-        _assert_codex_cleared_claude_unchanged(conn)
+        _assert_codex_cleared_claude_unchanged(
+            conn, legacy_claude_messages=False
+        )
         assert _marker(conn) == 1
         # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 27
+        assert _version(conn) == 28
     finally:
         conn.close()
 

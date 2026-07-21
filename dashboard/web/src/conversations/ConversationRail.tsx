@@ -1,8 +1,8 @@
 import { Fragment, useEffect, useRef, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { useConversations } from '../hooks/useConversations';
-import { useConversationSearch } from '../hooks/useConversationSearch';
+import { useConversations, type UseConversations } from '../hooks/useConversations';
+import { useConversationSearch, type UseConversationSearch } from '../hooks/useConversationSearch';
 import { renderSnippet } from '../lib/snippet';
 import { railSectionLabel } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
@@ -10,7 +10,20 @@ import { pickBannerLabel } from './pickBannerLabel';
 import { allOneProject, visibleBadges } from './railDiscovery';
 import { modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
-import type { ConversationFilters, ConversationSummary, RailSortKey, SearchHit, SearchKind } from '../types/conversation';
+import { mergeConversationRows, mergeSearchHits } from './conversationComposition';
+import {
+  conversationRefKey,
+  conversationSummaryRef,
+  sameConversationRef,
+  searchHitConversationRef,
+  type ConversationFilters,
+  type ConversationRef,
+  type ConversationSource,
+  type ConversationSummary,
+  type RailSortKey,
+  type SearchHit,
+  type SearchKind,
+} from '../types/conversation';
 
 // #217 S4 / I-2.4 — rail sort options, 1:1 with the backend `_SORTS` keys.
 const SORT_OPTIONS: { key: RailSortKey; label: string }[] = [
@@ -89,7 +102,7 @@ function anyFilterActive(f: ConversationFilters): boolean {
   );
 }
 
-function activeFilterChips(f: ConversationFilters): FilterChip[] {
+function activeFilterChips(f: ConversationFilters, source: ConversationSource): FilterChip[] {
   const chips: FilterChip[] = [];
   if (f.dateFrom || f.dateTo) {
     const label = f.datePreset
@@ -106,7 +119,9 @@ function activeFilterChips(f: ConversationFilters): FilterChip[] {
   }
   for (const proj of f.projects) {
     chips.push({
-      key: `proj:${proj}`, label: proj,
+      // Codex project filters are opaque resource keys on the wire. The
+      // popover shows their retained labels; never leak the key in a chip.
+      key: `proj:${proj}`, label: source === 'codex' ? 'Project' : proj,
       remove: () => dispatch({
         type: 'SET_CONVERSATION_FILTERS',
         patch: { projects: f.projects.filter((p) => p !== proj) },
@@ -152,9 +167,11 @@ function activeFilterChips(f: ConversationFilters): FilterChip[] {
 // hotkeys stay suppressed while typing. The container carries the
 // `conv-rail-search` class the view shell's '/' binding focuses.
 export function ConversationRail() {
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const source: ConversationSource | 'all' = activeSource;
   const search = useSyncExternalStore(subscribeStore, () => getState().conversationSearch);
   const kind = useSyncExternalStore(subscribeStore, () => getState().conversationSearchKind);
-  const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
+  const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationRef);
   const filtersOpen = useSyncExternalStore(subscribeStore, () => getState().convFiltersOpen);
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
@@ -205,9 +222,18 @@ export function ConversationRail() {
   }, [comparePick]);
 
   const isSearching = search.trim() !== '';
-  const chips = activeFilterChips(filters);
+  const chips = source === 'all' ? [] : activeFilterChips(filters, source);
   // #228 S5 E5 — the cached title (truncated) when known, else the short hash.
   const pickLabel = comparePick ? pickBannerLabel(comparePick.anchor, titles) : null;
+  const selectSource = (next: ConversationSource | 'all'): void => {
+    if (next === source) return;
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: next });
+    // During comparison pick, the selected conversation is the anchor. Keep it
+    // mounted while switching sources so a Claude↔Codex pair can be chosen.
+    if (!comparePick) dispatch({ type: 'SELECT_CONVERSATION', conversationRef: null });
+    dispatch({ type: 'CLEAR_CONVERSATION_FILTERS' });
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' });
+  };
 
   return (
     <aside className={`conv-rail${comparePick ? ' conv-rail--picking' : ''}`}>
@@ -231,6 +257,17 @@ export function ConversationRail() {
         </div>
       )}
       <div className="conv-rail-search">
+        <div className="conv-rail-source" role="group" aria-label="Conversation source">
+          {(['claude', 'codex', 'all'] as const).map((item) => (
+            <button
+              key={item}
+              type="button"
+              aria-pressed={source === item}
+              className={`conv-rail-source-btn${source === item ? ' is-on' : ''}`}
+              onClick={() => selectSource(item)}
+            >{item === 'claude' ? 'Claude' : item === 'codex' ? 'Codex' : 'All'}</button>
+          ))}
+        </div>
         {/* #228 S4 C4 — the search header is now two rows: a full-width input row
             (with a leading magnifier glyph) over a controls row (Filters + Sort).
             The single-row layout starved the input so even its placeholder
@@ -244,7 +281,7 @@ export function ConversationRail() {
               ref={inputRef}
               type="search"
               className="conv-rail-search-input"
-              placeholder="search all conversations…"
+              placeholder={`search ${source === 'all' ? 'all' : source === 'codex' ? 'Codex' : 'Claude'} conversations…`}
               value={search}
               onChange={(e) => dispatch({ type: 'SET_CONVERSATION_SEARCH', text: e.target.value })}
               onFocus={() => dispatch({ type: 'SET_INPUT_MODE', mode: 'search' })}
@@ -271,7 +308,8 @@ export function ConversationRail() {
               type="button"
               className={`conv-rail-filters-btn${filtersOpen ? ' is-on' : ''}`}
               aria-expanded={filtersOpen}
-              title="Filter conversations"
+              disabled={source === 'all'}
+              title={source === 'all' ? 'Filters are source-specific' : 'Filter conversations'}
               onClick={() => dispatch({ type: 'TOGGLE_CONV_FILTERS' })}
               // The popover's own Esc-to-close only fires when focus is INSIDE
               // it; right after a click focus sits on this toggle (a sibling
@@ -292,7 +330,8 @@ export function ConversationRail() {
               <select
                 className="conv-rail-sort-select"
                 aria-label="Sort conversations"
-                value={railSort}
+                value={source === 'claude' ? railSort : 'recent'}
+                disabled={source !== 'claude'}
                 onChange={(e) => dispatch({
                   type: 'SET_CONVERSATION_RAIL_SORT',
                   sort: e.target.value as RailSortKey,
@@ -305,7 +344,8 @@ export function ConversationRail() {
             </label>
           </div>
         </div>
-        {filtersOpen && <ConversationFiltersPopover />}
+        {filtersOpen && source !== 'all' && <ConversationFiltersPopover source={source} />}
+        {source === 'all' && <div className="conv-rail-composed-note">Merged locally · source-specific filters and sort</div>}
         {chips.length > 0 && (
           <div className="conv-rail-filters-active">
             {chips.map((c) => (
@@ -331,8 +371,12 @@ export function ConversationRail() {
         )}
       </div>
       {isSearching
-        ? <SearchList needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
-        : <BrowseList selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
+        ? source === 'all'
+          ? <AllSearchList needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
+          : <SearchList source={source} needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
+        : source === 'all'
+          ? <AllBrowseList selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />
+          : <BrowseList source={source} selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
     </aside>
   );
 }
@@ -343,20 +387,56 @@ export function ConversationRail() {
 // open/select action. The anchor row is rendered disabled, so its click never
 // reaches here.
 function pickOr(
-  pickAnchor: string | null,
-  rowSessionId: string,
+  pickAnchor: ConversationRef | null,
+  rowRef: ConversationRef,
   fallback: () => void,
 ): () => void {
-  if (pickAnchor && pickAnchor !== rowSessionId) {
-    return () => dispatch({ type: 'OPEN_COMPARE', a: pickAnchor, b: rowSessionId });
+  if (pickAnchor && !sameConversationRef(pickAnchor, rowRef)) {
+    return () => dispatch({ type: 'OPEN_COMPARE', aRef: pickAnchor, bRef: rowRef });
   }
   return fallback;
 }
 
 interface RailCtx { tz: string; offsetLabel: string }
 
-function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null; ctx: RailCtx; pickAnchor: string | null }) {
-  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry } = useConversations();
+function BrowseList({ source, selectedId, ctx, pickAnchor }: { source: ConversationSource; selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
+  const data = useConversations(source);
+  return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} />;
+}
+
+function AllBrowseList({ selectedId, ctx, pickAnchor }: { selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
+  // Both requests are qualified. S7 deliberately has no source=all route.
+  const claude = useConversations('claude', { qualified: true });
+  const codex = useConversations('codex', { qualified: true });
+  const data: UseConversations = {
+    rows: mergeConversationRows(claude.rows, codex.rows),
+    loading: claude.loading || codex.loading,
+    error: claude.error && codex.error ? "Couldn't load either conversation source." : null,
+    hasMore: claude.hasMore || codex.hasMore,
+    loadMore: async () => { await Promise.all([claude.hasMore ? claude.loadMore() : undefined, codex.hasMore ? codex.loadMore() : undefined]); },
+    loadingMore: claude.loadingMore || codex.loadingMore,
+    filterDegraded: false,
+    sortDegraded: false,
+    retry: () => { claude.retry(); codex.retry(); },
+    pending: claude.pending && codex.pending,
+  };
+  const partialNote = claude.error || codex.error
+    ? 'One source is temporarily unavailable.'
+    : claude.pending || codex.pending
+      ? 'One source is still indexing.'
+      : null;
+  return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} forcedRecent partialNote={partialNote} />;
+}
+
+function BrowseResults({ data, selectedId, ctx, pickAnchor, forcedRecent = false, partialNote = null }: {
+  data: UseConversations;
+  selectedId: ConversationRef | null;
+  ctx: RailCtx;
+  pickAnchor: ConversationRef | null;
+  forcedRecent?: boolean;
+  partialNote?: string | null;
+}) {
+  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending } = data;
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
   // filters spec §1 dual-branch parity — a one-line muted note when the
@@ -366,6 +446,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
   // recent order in the same non-authoritative window.
   const degradedNote = (
     <>
+      {partialNote && <div className="conv-rail-filters-degraded">{partialNote}</div>}
       {filterDegraded && (
         <div className="conv-rail-filters-degraded">Project/cost/rebuild filters apply once indexing finishes.</div>
       )}
@@ -382,6 +463,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
       </div>
     </div>
   );
+  if (pending) return <div className="conv-rail-list"><div className="conv-rail-empty" role="status">Codex conversations are still indexing.</div></div>;
   if (loading && rows.length === 0) return <div className="conv-rail-list">{degradedNote}<div className="conv-rail-empty">Loading…</div></div>;
   if (rows.length === 0) {
     // spec §4 Empty state — filtered-to-zero is DISTINCT from no-conversations-
@@ -409,7 +491,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
   // #238 S2 D1 — section off the EFFECTIVE sort: a degraded cost/project sort
   // fell back to recent order, so it gets DATE headers (not repeating project
   // headers over recent-ordered rows).
-  const effectiveSort = sortDegraded ? 'recent' : railSort;
+  const effectiveSort = forcedRecent || sortDegraded ? 'recent' : railSort;
   const isProjectSort = effectiveSort === 'project';
   // boundary key is case-insensitive (backend orders project labels COLLATE
   // NOCASE, so 'App'/'app' sort adjacent and must coalesce under one header).
@@ -428,7 +510,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
         const showHeader = label !== null && key !== lastKey;
         if (key !== null) lastKey = key;
         return (
-          <Fragment key={r.session_id}>
+          <Fragment key={conversationRefKey(conversationSummaryRef(r))}>
             {showHeader && (
               <div
                 className={`conv-rail-sec${isProjectSort ? ' conv-rail-sec--project' : ''}`}
@@ -437,7 +519,7 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
                 {label}
               </div>
             )}
-            <BrowseRow row={r} ctx={ctx} active={r.session_id === selectedId} pickAnchor={pickAnchor} hideProject={hideProject} />
+            <BrowseRow row={r} ctx={ctx} active={sameConversationRef(conversationSummaryRef(r), selectedId)} pickAnchor={pickAnchor} hideProject={hideProject} />
           </Fragment>
         );
       })}
@@ -459,9 +541,10 @@ function BrowseList({ selectedId, ctx, pickAnchor }: { selectedId: string | null
 }
 
 function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
-  row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: string | null; hideProject: boolean;
+  row: ConversationSummary; ctx: RailCtx; active: boolean; pickAnchor: ConversationRef | null; hideProject: boolean;
 }) {
-  const isAnchor = pickAnchor === row.session_id;
+  const rowRef = conversationSummaryRef(row);
+  const isAnchor = sameConversationRef(pickAnchor, rowRef);
   // #228 S4 D2 — the model chip from row.models (browse-only; search hits carry
   // no models). Empty models → no chip. #243: cap=1 — show ONLY the PRIMARY
   // model chip (row.models is now main-session-first, so this is opus, not a
@@ -478,9 +561,10 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
       disabled={isAnchor}
       aria-disabled={isAnchor || undefined}
       title={isAnchor ? 'This is the anchor session' : undefined}
-      onClick={pickOr(pickAnchor, row.session_id, () => dispatch({ type: 'SELECT_CONVERSATION', sessionId: row.session_id }))}
+      onClick={pickOr(pickAnchor, rowRef, () => dispatch({ type: 'SELECT_CONVERSATION', conversationRef: rowRef }))}
     >
       <div className="conv-rail-row-title">{row.title}</div>
+      <span className={`conv-source-badge conv-source-badge--${rowRef.source}`}>{rowRef.source === 'codex' ? 'Codex' : 'Claude'}</span>
       {/* #304 S3 §2 — TWO-LINE meta contract. Line 1 = IDENTITY: [project ·]
           branch (ellipsize inside the overflow-hidden metaleft) + when (a rigid
           protected sibling, #238 S2 D4). Line 2 = STATS: the model chip + $cost +
@@ -567,9 +651,45 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
   );
 }
 
-function SearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: string; kind: SearchKind; ctx: RailCtx; selectedId: string | null; pickAnchor: string | null }) {
-  const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore } =
-    useConversationSearch(needle, kind);
+function SearchList({ source, needle, kind, ctx, selectedId, pickAnchor }: { source: ConversationSource; needle: string; kind: SearchKind; ctx: RailCtx; selectedId: ConversationRef | null; pickAnchor: ConversationRef | null }) {
+  const data = useConversationSearch(needle, kind, source);
+  return <SearchResults data={data} needle={needle} kind={kind} ctx={ctx} selectedId={selectedId} pickAnchor={pickAnchor} />;
+}
+
+function AllSearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: string; kind: SearchKind; ctx: RailCtx; selectedId: ConversationRef | null; pickAnchor: ConversationRef | null }) {
+  const claude = useConversationSearch(needle, kind, 'claude', { qualified: true });
+  const codex = useConversationSearch(needle, kind, 'codex', { qualified: true });
+  const data: UseConversationSearch = {
+    hits: mergeSearchHits(claude.hits, codex.hits),
+    mode: claude.mode === 'like' || codex.mode === 'like' ? 'like' : claude.mode ?? codex.mode,
+    total: claude.total + codex.total,
+    loading: claude.loading || codex.loading,
+    loadingMore: claude.loadingMore || codex.loadingMore,
+    searchDepth: claude.searchDepth === 'prose-only' || codex.searchDepth === 'prose-only'
+      ? 'prose-only' : claude.searchDepth ?? codex.searchDepth,
+    filterDegraded: false,
+    error: claude.error && codex.error ? 'Search failed for both sources.' : null,
+    loadMore: () => { if (claude.hits.length < claude.total) claude.loadMore(); if (codex.hits.length < codex.total) codex.loadMore(); },
+    pending: claude.pending && codex.pending,
+  };
+  const partialNote = claude.error || codex.error
+    ? 'One source search is temporarily unavailable.'
+    : claude.pending || codex.pending
+      ? 'One source is still indexing.'
+      : null;
+  return <SearchResults data={data} needle={needle} kind={kind} ctx={ctx} selectedId={selectedId} pickAnchor={pickAnchor} partialNote={partialNote} />;
+}
+
+function SearchResults({ data, needle, kind, ctx, selectedId, pickAnchor, partialNote = null }: {
+  data: UseConversationSearch;
+  needle: string;
+  kind: SearchKind;
+  ctx: RailCtx;
+  selectedId: ConversationRef | null;
+  pickAnchor: ConversationRef | null;
+  partialNote?: string | null;
+}) {
+  const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending } = data;
   const proseOnly = searchDepth === 'prose-only';
   const remaining = total - hits.length;
   // #177 S6 M1 — when the active chip is a split-needing kind (Tools/Thinking)
@@ -600,8 +720,11 @@ function SearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: str
       {filterDegraded && (
         <div className="conv-rail-search-filters-degraded">Some filters unavailable while indexing.</div>
       )}
+      {partialNote && <div className="conv-rail-search-filters-degraded">{partialNote}</div>}
       {error
         ? <div className="conv-rail-empty" role="alert">{error}</div>
+        : pending
+          ? <div className="conv-rail-empty" role="status">Codex conversations are still indexing.</div>
         : loading && hits.length === 0
           ? <div className="conv-rail-empty" role="status">Searching…</div>
           : isEmpty
@@ -634,7 +757,7 @@ function SearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: str
               <>
                 <div className="conv-rail-count" aria-live="polite">{countText}</div>
                 {hits.map((h, i) => (
-                  <SearchRow key={`${h.session_id}-${h.uuid}-${i}`} hit={h} ctx={ctx} kind={kind} selectedId={selectedId} pickAnchor={pickAnchor} />
+                  <SearchRow key={`${conversationRefKey(searchHitConversationRef(h))}-${h.uuid}-${i}`} hit={h} ctx={ctx} kind={kind} selectedId={selectedId} pickAnchor={pickAnchor} />
                 ))}
                 {hits.length < total && (
                   <button
@@ -652,7 +775,7 @@ function SearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: str
   );
 }
 
-function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit; ctx: RailCtx; kind: SearchKind; selectedId: string | null; pickAnchor: string | null }) {
+function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit; ctx: RailCtx; kind: SearchKind; selectedId: ConversationRef | null; pickAnchor: ConversationRef | null }) {
   // #228 S4 D5 (Codex gate P1-1) — keep the RAW match_kinds for behavioral checks
   // (the file-hit layout switch), and feed only the DISPLAYED badge group through
   // visibleBadges (which drops the badge that merely echoes a single-kind facet).
@@ -661,11 +784,12 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
   const rawBadges = hit.match_kinds ?? [];
   const isFileHit = rawBadges.includes('file');
   const shownBadges = visibleBadges(rawBadges, kind);
-  const isAnchor = pickAnchor === hit.session_id;
+  const hitRef = searchHitConversationRef(hit);
+  const isAnchor = sameConversationRef(pickAnchor, hitRef);
   // #228 S4 D3 — you-are-here: a hit from the open conversation is highlighted
   // (multiple hits from the same session all highlight — they're all "in the
   // conversation you're reading").
-  const active = hit.session_id === selectedId;
+  const active = sameConversationRef(hitRef, selectedId);
   // #217 S4 / I-3.3 — a kind=files hit renders the FILE PATH prominently (primary
   // line, file styling) with the session title secondary; its snippet IS the
   // plain path. Every other hit keeps the #177 S6 title-prominent layout. Click
@@ -678,11 +802,11 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
       disabled={isAnchor}
       aria-disabled={isAnchor || undefined}
       title={isAnchor ? 'This is the anchor session' : undefined}
-      onClick={pickOr(pickAnchor, hit.session_id, () =>
+      onClick={pickOr(pickAnchor, hitRef, () =>
         dispatch({
           type: 'OPEN_CONVERSATION',
-          sessionId: hit.session_id,
-          jump: { session_id: hit.session_id, uuid: hit.uuid },
+          conversationRef: hitRef,
+          jump: { conversation_ref: hitRef, session_id: hitRef.key, uuid: hit.uuid },
         }),
       )}
     >
@@ -693,6 +817,7 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
         <>
           <div className="conv-rail-row-title conv-rail-row-title--hit">
             <span className="conv-rail-row-filepath conv-rail-row-title-text">{hit.snippet}</span>
+            <span className={`conv-source-badge conv-source-badge--${hitRef.source}`}>{hitRef.source === 'codex' ? 'Codex' : 'Claude'}</span>
             {shownBadges.length > 0 && <KindBadges badges={shownBadges} />}
           </div>
           <div className="conv-rail-row-filetitle">{hit.title}</div>
@@ -703,6 +828,7 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
         // the clamp box so a long title can never clip it off as a third line.
         <div className="conv-rail-row-title conv-rail-row-title--hit">
           <span className="conv-rail-row-title-text">{hit.title}</span>
+          <span className={`conv-source-badge conv-source-badge--${hitRef.source}`}>{hitRef.source === 'codex' ? 'Codex' : 'Claude'}</span>
           {shownBadges.length > 0 && <KindBadges badges={shownBadges} />}
         </div>
       )}

@@ -47,6 +47,36 @@ function bumpTick(rerender: () => void, tag: string) {
 }
 
 describe('useConversation', () => {
+  it('adapts a qualified Claude detail envelope instead of treating it as the legacy shape', async () => {
+    mockOnce({
+      status: 'ok', conversation_key: 'v1.claude', title: 'Claude collision',
+      items: [
+        {
+          item_key: 'cliv1_user', kind: 'human', timestamp_utc: '2026-07-14T12:00:00Z', model: null,
+          blocks: [{ kind: 'text', text: 'Claude prompt' }], cost_usd: null, tokens: null,
+        },
+        {
+          item_key: 'cliv1_assistant', kind: 'assistant', timestamp_utc: '2026-07-14T12:00:05Z', model: 'claude-opus-4-8',
+          blocks: [{ kind: 'text', text: 'Claude reply' }], cost_usd: 0.5,
+          tokens: { source: 'claude', input: 10, output: 20, cache_create: 3, cache_read: 4 },
+        },
+      ],
+      page: { total: 2, returned: 2, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0.5,
+      tokens: { source: 'claude', input: 10, output: 20, cache_create: 3, cache_read: 4 },
+    });
+    const ref = { source: 'claude' as const, key: 'v1.claude' };
+    const { result } = renderHook(() => useConversation(ref));
+
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.detail?.items.map((item) => [item.kind, item.anchor.uuid, item.text])).toEqual([
+      ['human', 'cliv1_user', 'Claude prompt'],
+      ['assistant', 'cliv1_assistant', 'Claude reply'],
+    ]);
+    expect(result.current.detail?.provider_meta?.source).toBe('claude');
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversation/v1.claude');
+  });
+
   it('loads page 1 for a session', async () => {
     mockOnce(detail([it1], 2));
     const { result } = renderHook(() => useConversation('s'));
@@ -704,6 +734,24 @@ describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => 
     // Top edge advanced to the before-page's prev_before.
     expect(result.current.prevBefore).toBe(1);
     expect(result.current.hasPrev).toBe(true);
+  });
+
+  it('deduplicates a stale overlapping before page by qualified turn identity', async () => {
+    mockOnce(detail([it2, it3], null, {
+      page: { next_after: null, has_more: false, prev_before: 2, has_prev: true },
+    }));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    // A raced/stale qualified edge can include the cursor-owned turn already in
+    // the window. It must replace no history and must never duplicate the turn.
+    mockOnce(detail([it1, it2], null, {
+      page: { next_after: 2, has_more: true, prev_before: null, has_prev: false },
+    }));
+    await act(async () => { await result.current.loadPrev(); });
+
+    expect(result.current.detail?.items.map((i) => i.anchor.uuid)).toEqual(['u1', 'u2', 'u3']);
+    expect(result.current.virtualFirstItemIndex).toBe(VIRTUAL_INDEX_BASE - 1);
   });
 
   it('loadPrev stops at the top edge when has_prev is false', async () => {

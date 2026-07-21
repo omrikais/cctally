@@ -3,7 +3,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useConversationFacets } from '../hooks/useConversationFacets';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
-import type { ConversationFilters } from '../types/conversation';
+import type { ConversationFilters, ConversationSource } from '../types/conversation';
 
 // Browse-list filters popover (filters spec §4). Holds all four filter axes —
 // date (preset chips + from/to range), project (multi-select from the facets
@@ -77,9 +77,9 @@ function patch(p: Partial<ConversationFilters>): void {
   dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: p });
 }
 
-export function ConversationFiltersPopover() {
+export function ConversationFiltersPopover({ source = 'claude' }: { source?: ConversationSource }) {
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
-  const facets = useConversationFacets();
+  const facets = useConversationFacets(source);
   // Resolved display tz (concrete IANA zone, Etc/UTC fallback) drives which
   // calendar month a date preset lands on, so it matches the server's display-tz
   // interpretation of the YYYY-MM-DD bounds (FINDING 4).
@@ -127,10 +127,10 @@ export function ConversationFiltersPopover() {
   // suppressing single-char reader hotkeys until the next focus/blur. Reset it.
   useEffect(() => () => { dispatch({ type: 'SET_INPUT_MODE', mode: null }); }, []);
 
-  const toggleProject = (label: string): void => {
-    const next = filters.projects.includes(label)
-      ? filters.projects.filter((p) => p !== label)
-      : [...filters.projects, label];
+  const toggleProject = (value: string): void => {
+    const next = filters.projects.includes(value)
+      ? filters.projects.filter((p) => p !== value)
+      : source === 'codex' ? [value] : [...filters.projects, value];
     patch({ projects: next });
   };
 
@@ -138,7 +138,7 @@ export function ConversationFiltersPopover() {
   const toggleModel = (fam: string): void => {
     const next = filters.models.includes(fam)
       ? filters.models.filter((m) => m !== fam)
-      : [...filters.models, fam];
+      : source === 'codex' ? [fam] : [...filters.models, fam];
     patch({ models: next });
   };
 
@@ -159,7 +159,7 @@ export function ConversationFiltersPopover() {
         }
       }}
     >
-      <section className="conv-rail-filters-sec">
+      {source === 'claude' && <section className="conv-rail-filters-sec">
         <div className="conv-rail-filters-label">Date (last activity)</div>
         <div className="conv-rail-filters-chips">
           {DATE_PRESETS.map((p) => (
@@ -200,7 +200,7 @@ export function ConversationFiltersPopover() {
             />
           </label>
         </div>
-      </section>
+      </section>}
 
       <section className="conv-rail-filters-sec">
         <div className="conv-rail-filters-label">Project</div>
@@ -208,18 +208,19 @@ export function ConversationFiltersPopover() {
           {facets.projects.length === 0 && (
             <div className="conv-rail-filters-empty">No projects.</div>
           )}
-          {facets.projects.map((p) => (
-            <label key={p.project_label} className="conv-rail-filters-proj">
+          {facets.projects.map((p) => {
+            const value = p.filter_value ?? p.project_label;
+            return <label key={value} className="conv-rail-filters-proj">
               <input
                 type="checkbox"
-                checked={filters.projects.includes(p.project_label)}
+                checked={filters.projects.includes(value)}
                 aria-label={p.project_label}
-                onChange={() => toggleProject(p.project_label)}
+                onChange={() => toggleProject(value)}
               />
               <span className="conv-rail-filters-proj-name">{p.project_label}</span>
               <span className="conv-rail-filters-proj-count">{p.count}</span>
-            </label>
-          ))}
+            </label>;
+          })}
         </div>
       </section>
 
@@ -231,13 +232,13 @@ export function ConversationFiltersPopover() {
           )}
           {facets.models.map((m) => (
             <button
-              key={m.family}
+              key={m.filter_value ?? m.family}
               type="button"
               // Reuse the family palette (modelChipClass) on the filter chip so
               // Opus/Sonnet/Haiku/Fable carry their established colour.
-              className={`conv-rail-filters-chip chip ${modelChipClass(m.family)}${filters.models.includes(m.family) ? ' is-on' : ''}`}
-              aria-pressed={filters.models.includes(m.family)}
-              onClick={() => toggleModel(m.family)}
+              className={`conv-rail-filters-chip chip ${modelChipClass(m.family)}${filters.models.includes(m.filter_value ?? m.family) ? ' is-on' : ''}`}
+              aria-pressed={filters.models.includes(m.filter_value ?? m.family)}
+              onClick={() => toggleModel(m.filter_value ?? m.family)}
             >
               {m.family} <span className="conv-rail-filters-proj-count">{m.count}</span>
             </button>
@@ -245,7 +246,7 @@ export function ConversationFiltersPopover() {
         </div>
       </section>
 
-      <section className="conv-rail-filters-sec">
+      {source === 'claude' && <section className="conv-rail-filters-sec">
         <div className="conv-rail-filters-label">Cost (USD)</div>
         <div className="conv-rail-filters-chips">
           {COST_PRESETS.map((c) => (
@@ -299,9 +300,9 @@ export function ConversationFiltersPopover() {
             />
           </label>
         </div>
-      </section>
+      </section>}
 
-      <section className="conv-rail-filters-sec">
+      {source === 'claude' && <section className="conv-rail-filters-sec">
         <div className="conv-rail-filters-label">Cache rebuilds</div>
         <div className="conv-rail-filters-chips">
           {REBUILD_PRESETS.map((r) => (
@@ -338,7 +339,11 @@ export function ConversationFiltersPopover() {
             />
           </label>
         </div>
-      </section>
+      </section>}
+
+      {source === 'codex' && (
+        <div className="conv-rail-filters-degraded">Codex browse supports one project and one native model filter. Search remains corpus-wide.</div>
+      )}
 
       <div className="conv-rail-filters-footer">
         <button

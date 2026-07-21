@@ -12,6 +12,7 @@
 import { createContext, useContext } from 'react';
 import type { FocusMode } from './applyFocusMode';
 import type { FmtCtx } from '../lib/fmt';
+import { legacyClaudeConversationRef, type ConversationRef } from '../types/conversation';
 
 // #184 — the display-tz FmtCtx rides on the context too. Memo economics: the
 // reader memoizes its MessageItems precisely so an SSE tick doesn't re-render
@@ -25,6 +26,7 @@ const DEFAULT_FMT_CTX: FmtCtx = { tz: 'Etc/UTC', offsetLabel: 'UTC' };
 
 export interface TranscriptCtxValue {
   sessionId: string | null;
+  conversationRef?: ConversationRef | null;
   // Optional so the many existing card tests that build a `{ sessionId }`
   // provider value keep compiling; consumers default a missing mode to 'all'.
   focusMode?: FocusMode;
@@ -57,6 +59,10 @@ export const TranscriptContext = createContext<TranscriptCtxValue>({
 });
 
 export const useSessionId = () => useContext(TranscriptContext).sessionId;
+export const useConversationRef = (): ConversationRef | null => {
+  const value = useContext(TranscriptContext);
+  return value.conversationRef ?? (value.sessionId ? legacyClaudeConversationRef(value.sessionId) : null);
+};
 export const useFocusMode = (): FocusMode => useContext(TranscriptContext).focusMode ?? 'all';
 export const useFmtCtx = (): FmtCtx => useContext(TranscriptContext).fmtCtx ?? DEFAULT_FMT_CTX;
 // Default true (opt-out): a missing provider value reads as markers-on.

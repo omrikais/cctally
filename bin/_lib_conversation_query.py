@@ -2048,7 +2048,9 @@ def _assemble_memo_clear() -> None:
 def _assemble_memo_key(conn, session_id):
     """Return (session_id, msg_count, last_activity_utc, entry_mutation_seq), or
     None to signal 'bypass the memo' — a missing rollup row or an unreadable
-    cache_meta (bare/path-less conn). The caller has already confirmed the
+    accounting ``cache_meta``. Split-store connections read that watermark
+    from the read-only ``cache_db`` attachment; legacy/bare test connections
+    retain the main-schema fallback. The caller has already confirmed the
     rollup is authoritative."""
     try:
         row = conn.execute(
@@ -2059,9 +2061,12 @@ def _assemble_memo_key(conn, session_id):
     if row is None:
         return None
     try:
+        schemas = {row[1] for row in conn.execute("PRAGMA database_list")}
+        meta_schema = "cache_db" if "cache_db" in schemas else "main"
         seq_row = conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='session_entries_mutation_seq'").fetchone()
+            f"SELECT value FROM {meta_schema}.cache_meta "
+            "WHERE key='session_entries_mutation_seq'"
+        ).fetchone()
     except sqlite3.OperationalError:
         return None
     seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 0

@@ -14,13 +14,14 @@ import { ComparisonView } from './ComparisonView';
 import { OutlinePanel } from './OutlinePanel';
 import { OutlineResizer } from '../components/OutlineResizer';
 import { ChatIcon } from './ConvIcons';
+import type { ConversationRef } from '../types/conversation';
 
 // Two-pane Conversations workspace (spec §4). Mounted by App.tsx only
 // when view==='conversations', so its keymap bindings exist only while
 // active (no collision with the unmounted dashboard panels). Registers
 // view-aware '/' (focus rail search) and Esc (clear search, else exit).
 export function ConversationsView() {
-  const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationId);
+  const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationRef);
   // #217 S7 F10 — when a comparison is open, the whole workspace renders the
   // side-by-side ComparisonView instead of the single reader (see the branch
   // below). Subscribed here so an OPEN_COMPARE / SWAP_COMPARE / CLOSE_COMPARE
@@ -116,7 +117,7 @@ export function ConversationsView() {
   // dispatch CLOSE_CONV_OUTLINE_MOBILE to dismiss it. Shared by the mobile
   // single-pane branch AND the desktop two-pane branch below (the tablet band
   // 641–1100 keeps the two-pane shell but gets the sheet, not the column).
-  const outlineSheet = (sid: string) => (
+  const outlineSheet = (conversationRef: ConversationRef) => (
     outlineMobileOpen && (
       <>
         <button
@@ -135,7 +136,7 @@ export function ConversationsView() {
               onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
             >✕</button>
           </div>
-          <OutlinePanel sessionId={sid} outline={outline} />
+          <OutlinePanel sessionId={conversationRef} outline={outline} />
         </div>
       </>
     )
@@ -154,7 +155,7 @@ export function ConversationsView() {
         {comparePick != null || selected == null
           ? <ConversationRail />
           : <>
-              <ConversationReader sessionId={selected} outline={outline} growthNonce={growthNonce} live={live} mobileBack />
+              <ConversationReader conversationRef={selected} outline={outline} growthNonce={growthNonce} live={live} mobileBack />
               {outlineSheet(selected)}
             </>}
       </div>
@@ -173,7 +174,7 @@ export function ConversationsView() {
     >
       <ConversationRail />
       {selected != null
-        ? <ConversationReader sessionId={selected} outline={outline} growthNonce={growthNonce} live={live} />
+        ? <ConversationReader conversationRef={selected} outline={outline} growthNonce={growthNonce} live={live} />
         : <div className="conv-reader conv-reader--empty">
             <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><ChatIcon /></span>
               <div className="conv-state-title">Select a conversation</div>
@@ -221,7 +222,7 @@ export const CONVERSATIONS_BINDINGS = [
         el?.focus(); el?.select();
         return;
       }
-      if (getState().selectedConversationId) {
+      if (getState().selectedConversationRef) {
         dispatch({ type: 'OPEN_CONV_FIND' });
         return;
       }
@@ -280,7 +281,7 @@ export const CONVERSATIONS_BINDINGS = [
       // LIST (SELECT_CONVERSATION null keeps view:'conversations' and preserves
       // any rail needle — the list you return to stays filtered until the next
       // Escape clears it). This is the same destination as the mobileBack button.
-      if (getState().selectedConversationId) { dispatch({ type: 'SELECT_CONVERSATION', sessionId: null }); return; }
+      if (getState().selectedConversationRef) { dispatch({ type: 'SELECT_CONVERSATION', conversationRef: null }); return; }
       if (getState().conversationSearch) { dispatch({ type: 'SET_CONVERSATION_SEARCH', text: '' }); return; }
       dispatch({ type: 'SET_VIEW', view: 'dashboard' });
     },

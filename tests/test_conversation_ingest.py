@@ -253,21 +253,32 @@ def _user_line(uuid, text, *, ts="2026-06-01T00:01:00Z"):
 
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
-    """Load bin/cctally under a redirected tmp data dir + Claude projects
-    tree. Returns (ns, conn, projects_dir, sync)."""
+    """Load the split core/conversation stores under redirected tmp paths.
+
+    Returns the conversation connection so the existing transcript assertions
+    keep exercising the same SQL surface.  Its read-only ``cache_db`` attachment
+    also preserves the handful of accounting assertions in this suite.
+    """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
-    conn = ns["open_cache_db"]()
+    cache_conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     sync_cache = ns["sync_cache"]
+    sync_conversations = ns["sync_claude_conversations"]
 
     def sync(rebuild=False):
-        return sync_cache(conn, rebuild=rebuild)
+        sync_cache(cache_conn, rebuild=rebuild)
+        return sync_conversations(conn, rebuild=rebuild)
 
     yield ns, conn, projects, sync
     try:
         conn.close()
+    except Exception:
+        pass
+    try:
+        cache_conn.close()
     except Exception:
         pass
 
@@ -564,68 +575,28 @@ def test_backfill_migration_stamped_not_run_on_fresh_install(tmp_path, monkeypat
         conn.close()
 
 
-def test_existing_install_defers_backfill_to_sync_then_consumes_flag(isolated, monkeypatch):
-    """REGRESSION (Plan 1 Task 5; deferral is issue #139): on an EXISTING
-    install the 002 handler must NOT walk the JSONL history inline — that
-    blocked the triggering command, even a stats-only ``cctally report`` that
-    fires the cache dispatcher but never reads cache.db. Instead the handler
-    sets the ``conversation_backfill_pending`` cache_meta flag and returns (the
-    dispatcher central-stamps the migration marker on the handler's clean
-    return, #140); the next ``sync_cache`` — which already holds the flock + owns the
-    walker — consumes the flag and runs the offset-0 backfill once.
-
-    Models the upgrade state precisely: cost already ingested (session_entries
-    non-empty, session_files cursors at EOF) but conversation_messages empty AND
-    no 002 marker. Spies on the real walker to prove WHO runs it and WHEN:
-      1. After the dispatcher run the marker is persisted and the flag is SET,
-         but the backfill has NOT run (spy 0) and conversation_messages is still
-         empty — the command returns without the walk.
-      2. The first ``sync_cache`` consumes the flag: backfill runs exactly once
-         (spy 1), conversation_messages is populated, and the flag is cleared.
-      3. A second ``sync_cache`` does NOT re-run the backfill (spy still 1, flag
-         already gone) — stable row counts alone are insufficient since INSERT
-         OR IGNORE keeps them stable even on a redundant re-walk.
-      4. A second dispatcher run does NOT re-invoke the handler (the marker
-         persists), so the flag is never re-set.
-    """
-    import _cctally_db as db
-    import _cctally_cache as cache  # the module whose global sync_cache calls
+def test_existing_install_backfill_is_consumed_by_conversation_sync_only(
+    isolated, monkeypatch,
+):
+    """Deferred transcript rebuilds never rewind the core accounting cursor."""
+    import _cctally_cache as cache
     ns, conn, projects, sync = isolated
     fa = projects / "a.jsonl"
     fb = projects / "b.jsonl"
     fa.write_text(_asst_line("a1", "m1", "r1", "hello") + _user_line("u1", "q1"))
     fb.write_text(_asst_line("b1", "mb", "rb", "world"))
 
-    # Cost-ingest (populates session_entries + session_files cursors at EOF and,
-    # on this fresh cache, stamps 002 via the fresh-install fast-path). Then
-    # rewind to the pre-feature upgrade state: drop the 002 marker, empty
-    # conversation_messages + any pending flag, and roll PRAGMA user_version
-    # back to 1 (the value a cache.db carried when only cache 001 was registered
-    # — before 002 shipped). That reproduces exactly what an upgrading install
-    # looks like: schema_migrations exists with 001 applied, session_entries
-    # non-empty (=> NOT fresh), 002 pending, user_version < len(registry) so the
-    # dispatcher's user_version fast-path does NOT short-circuit the walk.
     sync()
-    conn.execute(
-        "DELETE FROM schema_migrations "
-        "WHERE name='002_conversation_messages_backfill'"
-    )
+    core_cursor = conn.execute(
+        "SELECT path,size_bytes,last_byte_offset FROM session_files ORDER BY path"
+    ).fetchall()
     conn.execute("DELETE FROM conversation_messages")
-    conn.execute("DELETE FROM cache_meta WHERE key='conversation_backfill_pending'")
-    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "INSERT INTO cache_meta(key,value) "
+        "VALUES('conversation_backfill_pending','1')"
+    )
     conn.commit()
-    assert conn.execute(
-        "SELECT COUNT(*) FROM conversation_messages"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT 1 FROM schema_migrations "
-        "WHERE name='002_conversation_messages_backfill'"
-    ).fetchone() is None
-    assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0] > 0
 
-    # Spy on the real walker. sync_cache calls the bare module global
-    # ``backfill_conversation_messages``; rebinding it on the module patches the
-    # exact name sync_cache resolves at call time.
     calls = {"n": 0}
     real_backfill = cache.backfill_conversation_messages
 
@@ -635,30 +606,8 @@ def test_existing_install_defers_backfill_to_sync_then_consumes_flag(isolated, m
 
     monkeypatch.setattr(cache, "backfill_conversation_messages", _spy)
 
-    # (1) Dispatcher run: 002 pending on an existing install -> handler sets the
-    # flag and the dispatcher central-stamps the marker (#140), but does NOT walk.
-    db._run_pending_migrations(
-        conn, registry=db._CACHE_MIGRATIONS, db_label="cache.db",
-    )
-    assert calls["n"] == 0, "handler must NOT walk inline — it only sets a flag"
-    assert conn.execute(
-        "SELECT 1 FROM schema_migrations "
-        "WHERE name='002_conversation_messages_backfill'"
-    ).fetchone() is not None, (
-        "the dispatcher must central-stamp 002's marker on the handler's clean "
-        "return (#140) — even on the existing-install path"
-    )
-    assert conn.execute(
-        "SELECT value FROM cache_meta WHERE key='conversation_backfill_pending'"
-    ).fetchone() == ("1",), "handler must set the pending flag"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM conversation_messages"
-    ).fetchone()[0] == 0, "no inline backfill — the command returns un-stalled"
-
-    # (2) First sync consumes the flag: backfill runs ONCE, index populated,
-    # flag cleared.
     sync()
-    assert calls["n"] == 1, "the first sync after the flag must run the backfill"
+    assert calls["n"] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM conversation_messages"
     ).fetchone()[0] == 3
@@ -666,27 +615,14 @@ def test_existing_install_defers_backfill_to_sync_then_consumes_flag(isolated, m
         "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
     ).fetchone() is None, "sync must clear the pending flag after backfilling"
 
-    # (3) Second sync does NOT re-run the backfill (flag gone).
     sync()
-    assert calls["n"] == 1, (
-        "a later sync must NOT re-walk — the flag was cleared, so the one-time "
-        "backfill never repeats"
-    )
+    assert calls["n"] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM conversation_messages"
     ).fetchone()[0] == 3
-
-    # (4) Second dispatcher run: the persisted marker keeps the handler from
-    # re-running, so the flag is never re-set.
-    db._run_pending_migrations(
-        conn, registry=db._CACHE_MIGRATIONS, db_label="cache.db",
-    )
     assert conn.execute(
-        "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
-    ).fetchone() is None, (
-        "a re-dispatch must not re-set the flag — the marker persists the "
-        "migration so the handler never re-runs"
-    )
+        "SELECT path,size_bytes,last_byte_offset FROM session_files ORDER BY path"
+    ).fetchall() == core_cursor
 
 
 def test_rebuild_clears_pending_flag_without_separate_backfill(isolated, monkeypatch):

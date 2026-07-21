@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationRail, MATCH_KIND_LABELS } from './ConversationRail';
 import { _resetForTests, dispatch, getState } from '../store/store';
 import { clearRailPrefs } from '../store/conversationRailPrefs';
+import { SOURCE_STORAGE_KEY } from '../store/sourcePrefs';
 import type { ConversationSummary, SearchHit } from '../types/conversation';
 
 // Mirror the hook-test mocking convention (useConversations.test.tsx etc.):
@@ -98,6 +99,7 @@ beforeEach(() => {
   // localStorage; clear it BEFORE _resetForTests so loadInitial re-seeds clean
   // (a prior test's SET_CONVERSATION_FILTERS would otherwise bleed across).
   clearRailPrefs();
+  localStorage.removeItem(SOURCE_STORAGE_KEY);
   _resetForTests();
   browseRows = [];
   searchHits = [];
@@ -119,11 +121,23 @@ beforeEach(() => {
 });
 afterEach(() => {
   clearRailPrefs();
+  localStorage.removeItem(SOURCE_STORAGE_KEY);
   _resetForTests();
   vi.restoreAllMocks();
 });
 
 describe('ConversationRail', () => {
+  it('switches the conversation workspace between Claude, Codex, and client-composed All sources', () => {
+    render(<ConversationRail />);
+    expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Codex' }));
+    expect(getState().activeSource).toBe('codex');
+    expect(screen.getByRole('button', { name: 'Codex' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    expect(getState().activeSource).toBe('all');
+    expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('browse rows lead with the title and show date dividers', () => {
     // Two rows in different date buckets (recent vs an older month), each titled.
     // Buckets group on last_activity_utc (filters spec §4 last-activity-everywhere),
@@ -639,7 +653,11 @@ describe('ConversationRail', () => {
     render(<ConversationRail />);
     fireEvent.click(document.querySelector('.conv-rail-row--hit') as HTMLButtonElement);
     expect(getState().selectedConversationId).toBe('s7');
-    expect(getState().conversationJump).toEqual({ session_id: 's7', uuid: 'first-turn' });
+    expect(getState().conversationJump).toEqual({
+      conversation_ref: { source: 'claude', key: 's7' },
+      session_id: 's7',
+      uuid: 'first-turn',
+    });
   });
 
   it('a file hit click navigates to the most-recent-touch anchor (hit.uuid)', () => {
@@ -650,7 +668,11 @@ describe('ConversationRail', () => {
     render(<ConversationRail />);
     fireEvent.click(document.querySelector('.conv-rail-row--hit') as HTMLButtonElement);
     expect(getState().selectedConversationId).toBe('s9');
-    expect(getState().conversationJump).toEqual({ session_id: 's9', uuid: 'touch-anchor' });
+    expect(getState().conversationJump).toEqual({
+      conversation_ref: { source: 'claude', key: 's9' },
+      session_id: 's9',
+      uuid: 'touch-anchor',
+    });
   });
 
   // ---- #177 S6: load-more button ----
@@ -1128,7 +1150,10 @@ describe('ConversationRail compare pick-mode (#217 S7 F10)', () => {
     dispatch({ type: 'START_COMPARE_PICK', anchor: 'A' });
     render(<ConversationRail />);
     fireEvent.click(screen.getByText('pick me'));
-    expect(getState().compare).toEqual({ a: 'A', b: 'B' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'A' },
+      b: { source: 'claude', key: 'B' },
+    });
     // selection was NOT set by a SELECT_CONVERSATION
     expect(getState().selectedConversationId).toBe('A'); // OPEN_COMPARE sets the anchor
   });

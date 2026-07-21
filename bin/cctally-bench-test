@@ -122,11 +122,12 @@ if [ -n "$(find "$SCRATCH/claude/projects" -name '*.jsonl' -print -quit 2>/dev/n
 else
     report FAIL isolation-scratch-claude-root "no synthetic JSONL under scratch Claude root"
 fi
-# Isolation (source-axis proof): the scratch cache.db must actually CONTAIN a
-# synthetic `sess-*` id — proving sync_cache INGESTED the scratch Claude root
+# Isolation (source-axis proof): the scratch conversations.db must actually
+# CONTAIN a synthetic `sess-*` id — proving the transcript sync INGESTED the
+# scratch Claude root
 # (not merely that JSONL was written there). An un-pinned CLAUDE_CONFIG_DIR
 # would ingest the real ~/.claude and leave no `sess-*` rows.
-if python3 - "$SCRATCH/data/cache.db" <<'PY'
+if python3 - "$SCRATCH/data/conversations.db" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 n = conn.execute(
@@ -137,7 +138,7 @@ PY
 then
     report PASS isolation-ingest-source-synthetic
 else
-    report FAIL isolation-ingest-source-synthetic "no synthetic sess-* id in scratch cache.db — the scratch Claude root was not the ingest source"
+    report FAIL isolation-ingest-source-synthetic "no synthetic sess-* id in scratch conversations.db — the scratch Claude root was not the ingest source"
 fi
 # Isolation (clean-machine backstop): the real dirs must not be CREATED from
 # absent by the run. On a machine where they already exist (a live cctally

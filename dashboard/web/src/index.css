@@ -131,7 +131,7 @@
 
 html, body {
   margin: 0; padding: 0;
-  background: var(--bg);
+  background: var(--panel-bg-2);
   color: var(--text);
   font-family: var(--font-mono);
   font-size: var(--fs-body);
@@ -7814,6 +7814,88 @@ mark.current {
   border-bottom: 1px solid var(--border-soft);
   flex: 0 0 auto;
 }
+
+/* #321 Task B — provider selection and qualified-reader context. */
+.conv-rail-source {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+}
+.conv-rail-source-btn {
+  min-height: 32px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-dim);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.conv-rail-source-btn.is-on {
+  color: var(--text);
+  background: var(--panel-hover);
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
+.conv-rail-composed-note {
+  margin-top: 6px;
+  color: var(--text-faint);
+  font: 500 11px/1.4 var(--font-mono);
+}
+.conv-source-badge {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 55%, var(--border));
+  border-radius: 999px;
+  color: var(--text-dim);
+  font: 600 11px/1.4 var(--font-mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.conv-source-badge--codex { color: var(--accent-blue); }
+.conv-source-badge--claude { color: var(--accent-purple); }
+.conv-rail-row > .conv-source-badge {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+}
+.conv-rail-row { position: relative; }
+.conv-rail-row-title { padding-right: 48px; }
+.conv-provider-strip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font: 11px/1.4 var(--font-mono);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.conv-thread-link {
+  flex: 0 0 auto;
+  border: 0;
+  padding: 3px 6px;
+  color: var(--accent-blue);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.conv-thread-link:hover,
+.conv-thread-link:focus-visible { text-decoration: underline; }
+.conv-provider-tokens { margin-left: auto; white-space: nowrap; }
+.conv-provider-unattributed { color: var(--accent-amber); white-space: nowrap; }
+@media (max-width: 880px) {
+  .conv-rail-source-btn { min-height: 44px; }
+  .conv-provider-strip { flex-wrap: wrap; overflow: visible; }
+  .conv-provider-tokens { width: 100%; margin-left: 0; }
+}
 .conv-rail-search-input {
   width: 100%;
   box-sizing: border-box;
@@ -11071,6 +11153,7 @@ mark.current {
 }
 .conv-cmp-head-side-meta { font-size: var(--fs-eyebrow); color: var(--text-dim); }
 .conv-cmp-head-controls { display: flex; gap: var(--space-2); flex: 0 0 auto; }
+.conv-cmp-export,
 .conv-cmp-swap,
 .conv-cmp-close {
   appearance: none;
@@ -11084,8 +11167,10 @@ mark.current {
   cursor: pointer;
   white-space: nowrap;
 }
+.conv-cmp-export:hover,
 .conv-cmp-swap:hover,
 .conv-cmp-close:hover { color: var(--text); border-color: var(--accent-blue); }
+.conv-cmp-export:focus-visible,
 .conv-cmp-swap:focus-visible,
 .conv-cmp-close:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
@@ -11485,6 +11570,7 @@ mark.current {
 /* ---- ≥44px tap targets on the comparison touch controls (#205) --------- */
 @media (pointer: coarse) {
   #root .conv-compare-with,
+  #root .conv-cmp-export,
   #root .conv-cmp-swap,
   #root .conv-cmp-close,
   #root .conv-cmp-expand-open,

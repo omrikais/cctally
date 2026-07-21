@@ -74,8 +74,8 @@ def test_generator_deterministic(tmp_path):
     gen = _load_build_bench()
     a = gen.build_fixture(scale="small", seed=42, root=tmp_path / "a")
     b = gen.build_fixture(scale="small", seed=42, root=tmp_path / "b")
-    ca = sqlite3.connect(a / "cache.db")
-    cb = sqlite3.connect(b / "cache.db")
+    ca = gen.open_fixture_db(a)
+    cb = gen.open_fixture_db(b)
     try:
         assert gen.semantic_hash(ca) == gen.semantic_hash(cb)
         assert gen.dataset_counts(ca) == gen.dataset_counts(cb)
@@ -87,7 +87,7 @@ def test_generator_deterministic(tmp_path):
 def test_corpus_shapes(tmp_path):
     gen = _load_build_bench()
     data = gen.build_fixture(scale="small", seed=42, root=tmp_path)
-    conn = sqlite3.connect(data / "cache.db")
+    conn = gen.open_fixture_db(data)
     try:
         counts = gen.dataset_counts(conn)
         assert counts["sessions"] >= 5           # many sessions for the rail
@@ -99,7 +99,7 @@ def test_corpus_shapes(tmp_path):
         ).fetchone()[0]
         assert big >= gen.SCALES["small"]["large_session_turns"]
         models = conn.execute(
-            "SELECT COUNT(DISTINCT model) FROM session_entries"
+            "SELECT COUNT(DISTINCT model) FROM cache_db.session_entries"
         ).fetchone()[0]
         assert models >= 2                        # model diversity for reconciles
     finally:

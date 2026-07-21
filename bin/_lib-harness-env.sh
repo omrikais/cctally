@@ -12,6 +12,15 @@
 # Coverage is enforced by tests/test_harness_dev_autodetect_coverage.py.
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
 
+# Fixture commands run against short-lived fake HOME directories. Suppress
+# post-command update and telemetry workers centrally: both are detached, so a
+# harness can otherwise remove its scratch tree while a worker is still
+# creating marker files or SQLite sidecars inside it. That race presents as
+# intermittent `disk I/O error` / `Directory not empty` failures under CI
+# parallelism. The flag gates the post-command hook only; update/telemetry
+# command handlers and doctor state resolution remain testable directly.
+export CCTALLY_DISABLE_UPDATE_CHECK=1
+
 # Issue #108: cctally now honors $CODEX_HOME. Neutralize a dev's exported
 # value so it can't leak into codex-* goldens (the codex harnesses pin HOME
 # to a fake tree whose .codex/sessions the fixtures populate).

@@ -429,16 +429,35 @@ def doctor_gather_state(
     # Conversation-sessions rollup consistency (#217 S1 / U9). Two cheap COUNTs
     # (graceful None on a missing table / unreadable DB) + an in-progress signal
     # so a transient mid-sync mismatch never WARNs. The in-progress signal is a
-    # NON-BLOCKING cache.db.lock flock probe (a writer mid-walk holds it) OR the
+    # NON-BLOCKING conversations flock probe (a writer mid-walk holds it) OR the
     # presence of any pending reingest/split/backfill cache_meta flag — doctor
     # stays read-only and never blocks on the lock.
     conv_sessions_rollup_count = None
     conv_messages_distinct_sessions = None
     conv_rollup_sync_in_progress = False
+    conversations_db_page_count = None
+    conversations_db_freelist_count = None
     try:
-        if _cctally_core.CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+        if _cctally_core.CONVERSATIONS_DB_PATH.exists():
+            # This gather also runs inside dashboard snapshot precompute. A
+            # transcript writer may hold an exclusive SQLite lock, so use a
+            # read-only zero-timeout probe: conversation health can degrade,
+            # but it must never delay core snapshot freshness (#320).
+            conv_uri = (
+                _cctally_core.CONVERSATIONS_DB_PATH.resolve().as_uri()
+                + "?mode=ro"
+            )
+            conn = sqlite3.connect(conv_uri, uri=True, timeout=0.0)
             try:
+                try:
+                    row = conn.execute("PRAGMA page_count").fetchone()
+                    if row and row[0] is not None:
+                        conversations_db_page_count = int(row[0])
+                    row = conn.execute("PRAGMA freelist_count").fetchone()
+                    if row and row[0] is not None:
+                        conversations_db_freelist_count = int(row[0])
+                except sqlite3.Error:
+                    pass
                 try:
                     row = conn.execute(
                         "SELECT COUNT(*) FROM conversation_sessions"
@@ -472,12 +491,12 @@ def doctor_gather_state(
                     pass
             finally:
                 conn.close()
-        # Non-blocking flock probe: if a writer (sync_cache / a reingest) holds
-        # the cache.db.lock, the rollup may be mid-recompute → in progress. We
+        # Non-blocking flock probe: if a transcript writer/reingest holds the
+        # conversations.db lock, the rollup may be mid-recompute → in progress. We
         # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
         # signal. Never blocks (LOCK_NB), so doctor stays read-only + prompt.
         if not conv_rollup_sync_in_progress:
-            lock_path = _cctally_core.CACHE_LOCK_PATH
+            lock_path = _cctally_core.CONVERSATIONS_LOCK_PATH
             if lock_path is not None and pathlib.Path(lock_path).exists():
                 import fcntl as _fcntl
                 lock_fh = open(str(lock_path), "w")
@@ -669,6 +688,15 @@ def doctor_gather_state(
         for _name, _lp in (
             ("cache.db.lock", _cctally_core.CACHE_LOCK_PATH),
             ("cache.db.codex.lock", _cctally_core.CACHE_LOCK_CODEX_PATH),
+            ("conversations.db.lock", _cctally_core.CONVERSATIONS_LOCK_PATH),
+            (
+                "conversations.db.codex.lock",
+                _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH,
+            ),
+            (
+                "conversations.db.maintenance.lock",
+                _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
+            ),
         ):
             if not _lp.exists():
                 locks_held[_name] = False
@@ -877,6 +905,8 @@ def doctor_gather_state(
         # #315: read-only cache free-page evidence for the reclaim hint.
         cache_db_page_count=cache_db_page_count,
         cache_db_freelist_count=cache_db_freelist_count,
+        conversations_db_page_count=conversations_db_page_count,
+        conversations_db_freelist_count=conversations_db_freelist_count,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,

@@ -92,6 +92,12 @@ export interface TokenUsage {
   output: number;
   cache_creation: number;
   cache_read: number;
+  // Qualified Codex detail keeps its native vocabulary. The legacy cache fields
+  // remain zero on Codex values for arithmetic compatibility, but renderers must
+  // branch on `source` and show cached-input/reasoning-output instead.
+  source?: 'claude' | 'codex';
+  cached_input?: number;
+  reasoning_output?: number;
 }
 
 // #177 S5 — GET /api/conversation/<id>/outline (spec §1). `ts` nullable (F6).
@@ -163,6 +169,15 @@ export interface OutlineFile {
   del: number | null;
   touches: OutlineFileTouch[];
 }
+// Provider-neutral S7 file fact. Unlike Claude edit-family touches, Codex
+// normalization retains the native tool + count but no trustworthy turn
+// anchor or +/- stat. Keep that distinction explicit instead of fabricating
+// jump targets to fit OutlineFile.
+export interface QualifiedOutlineFile {
+  path: string;
+  tool: string;
+  count: number;
+}
 // #217 S5 F7 — main-thread task-completion. The server emits this whenever the
 // MAIN thread carried any task snapshot (Task* / legacy TodoWrite); the client
 // renders the chip + outline landmark ONLY when `all_done`. `anchor_uuid` is the
@@ -187,6 +202,7 @@ export interface ConversationOutline {
   // #217 S5 F2 — whole-session files-touched aggregation. Always present from a
   // current server (possibly []); optional for back-compat with an older one.
   files?: OutlineFile[];
+  provider_files?: QualifiedOutlineFile[];
   // #217 S5 F7 — main-thread task-completion (null when no main-thread tasks).
   // Present from a current server; optional for back-compat with an older one.
   task_completion?: OutlineTaskCompletion | null;
@@ -244,6 +260,10 @@ export type ConversationBlock =
       edit_stat?: { add: number; del: number };
       preview: string;
       tool_use_id: string | null;
+      // Qualified Codex blocks can always re-read their call/output through the
+      // opaque block_key payload route, even when the bounded detail projection
+      // does not claim truncation.
+      payload_capable?: boolean;
       // #177 S4 — `media` (tool-result media placeholders, render-ready) folds
       // into the result object on owned calls; absent when the result carried
       // no image/document items (and on pre-009-reingest rows).
@@ -282,6 +302,7 @@ export type ConversationBlock =
   | { kind: 'tool_reference'; name: string | null };
 
 export interface ConversationSummary {
+  conversation_ref?: ConversationRef;
   session_id: string;
   title: string; // derived conversation title (first real user line; #165 Q-F1)
   project_label: string;
@@ -346,8 +367,8 @@ export const EMPTY_FILTERS: ConversationFilters = {
 // C adds `models`: per-model-family session counts (families-present-only,
 // excluding 'other', in the backend's fixed opus/sonnet/haiku/fable order).
 export interface ConversationFacets {
-  projects: { project_label: string; count: number }[];
-  models: { family: string; count: number }[];
+  projects: { project_label: string; count: number; filter_value?: string }[];
+  models: { family: string; count: number; filter_value?: string }[];
 }
 
 // #166: per-subagent kind + toolUseResult meta, keyed by subagent_key (the same
@@ -387,7 +408,7 @@ export interface ConversationDetail {
   // here for back-compat with fixtures/responses predating the keys (a missing
   // `has_prev` reads as a single-page / no-top-edge open). See
   // bin/_lib_conversation_query.py::get_conversation.
-  page: { next_after: number | null; has_more: boolean; prev_before?: number | null; has_prev?: boolean };
+  page: { next_after: number | string | null; has_more: boolean; prev_before?: number | string | null; has_prev?: boolean };
   subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
   // jump-to-latest spec §3 — the conversation's final RENDERED turn (the last
   // grouped/deduped item, not the last raw JSONL row). Constructed explicitly by
@@ -395,6 +416,17 @@ export interface ConversationDetail {
   // null session_id, Codex P2 #4). `null` only for a genuinely empty conversation
   // (the Jump-to-latest control hides). Task 4 consumes it.
   last_anchor?: { session_id: string; uuid: string; id: number } | null;
+  // Provider-neutral metadata that has no honest legacy-Claude analogue. The
+  // shared reader uses this only for source labels, Codex parent/child links,
+  // native token totals, and unattributed cost; Claude responses omit it.
+  provider_meta?: {
+    source: ConversationSource;
+    conversation_key: string;
+    tokens?: TokenUsage | null;
+    unattributed_cost_usd?: number;
+    parent?: { conversation_key: string; title: string | null } | null;
+    children?: { conversation_key: string; title: string | null; cost_usd: number }[];
+  };
 }
 
 // #177 S6 — kind facet for the rail search chips. Maps 1:1 to the backend
@@ -408,6 +440,7 @@ export type SearchKind =
   | 'all' | 'prompts' | 'assistant' | 'tools' | 'thinking' | 'title' | 'files';
 
 export interface SearchHit {
+  conversation_ref?: ConversationRef;
   session_id: string;
   uuid: string;
   project_label: string;
@@ -441,6 +474,10 @@ export interface ConversationSearchResult {
 }
 
 export interface ConversationJump {
+  // Qualified identity is authoritative for new client paths. `session_id`
+  // remains the legacy Claude compatibility field while bare links/actions are
+  // still accepted during the Task A migration.
+  conversation_ref?: ConversationRef;
   session_id: string;
   uuid: string;
   // #177 S6 — when the matched anchor carried a tool/thinking match the find
@@ -450,6 +487,10 @@ export interface ConversationJump {
   // other jump (search-hit click, outline jump, jump-to-next): the reader's
   // jump effect only expands when this is truthy.
   expand_details?: boolean;
+}
+
+export function conversationJumpRef(jump: ConversationJump): ConversationRef {
+  return jump.conversation_ref ?? legacyClaudeConversationRef(jump.session_id);
 }
 
 // #177 S6 — one rendered-turn anchor for the in-conversation find bar.
@@ -522,7 +563,72 @@ export interface ReadingPos {
   uuid: string;
   ts: number; // epoch ms — the LRU recency key
 }
-export type ReadingPosMap = Record<string, ReadingPos>; // keyed by session_id
+export type ReadingPosMap = Record<string, ReadingPos>; // keyed by conversationRefKey
+
+// #321 Task A — canonical client identity. `key` is deliberately opaque: it is
+// either the S7 `v1.` conversation key or the legacy Claude session id carried
+// by the explicit compatibility adapter. Client code compares/serializes the
+// pair and never decodes a native UUID or provider root from it.
+export type ConversationSource = 'claude' | 'codex';
+export interface ConversationRef {
+  source: ConversationSource;
+  key: string;
+}
+export type ConversationRefInput = ConversationRef | string;
+
+export function isConversationRef(value: unknown): value is ConversationRef {
+  if (!value || typeof value !== 'object') return false;
+  const ref = value as Record<string, unknown>;
+  return (ref.source === 'claude' || ref.source === 'codex')
+    && typeof ref.key === 'string'
+    && ref.key.length > 0;
+}
+
+export function legacyClaudeConversationRef(sessionId: string): ConversationRef {
+  return { source: 'claude', key: sessionId };
+}
+
+export function normalizeConversationRef(ref: ConversationRefInput): ConversationRef {
+  return typeof ref === 'string' ? legacyClaudeConversationRef(ref) : ref;
+}
+
+// The entity response shape is selected lexically by the opaque key, not by
+// provider. A qualified Claude `v1.` ref uses the same neutral envelopes as a
+// qualified Codex ref; only a bare Claude session id uses the legacy shapes.
+export function isQualifiedConversationRef(ref: ConversationRefInput): boolean {
+  return normalizeConversationRef(ref).key.startsWith('v1.');
+}
+
+// JSON tuple framing is injective even when an opaque key contains punctuation
+// that would collide under delimiter concatenation.
+export function conversationRefKey(ref: ConversationRefInput): string {
+  const normalized = normalizeConversationRef(ref);
+  return JSON.stringify([normalized.source, normalized.key]);
+}
+
+export function parseConversationRefKey(value: string): ConversationRef | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed) || parsed.length !== 2) return null;
+    const ref = { source: parsed[0], key: parsed[1] };
+    return isConversationRef(ref) ? ref : null;
+  } catch {
+    return null;
+  }
+}
+
+export function sameConversationRef(a: ConversationRefInput | null, b: ConversationRefInput | null): boolean {
+  if (a === null || b === null) return a === b;
+  return conversationRefKey(a) === conversationRefKey(b);
+}
+
+export function conversationSummaryRef(row: Pick<ConversationSummary, 'conversation_ref' | 'session_id'>): ConversationRef {
+  return row.conversation_ref ?? legacyClaudeConversationRef(row.session_id);
+}
+
+export function searchHitConversationRef(hit: Pick<SearchHit, 'conversation_ref' | 'session_id'>): ConversationRef {
+  return hit.conversation_ref ?? legacyClaudeConversationRef(hit.session_id);
+}
 
 // #217 S3 E2 — the reader's open intent, computed by precedence BEFORE the hook
 // fetches so the FIRST request is already correct (no head-fetch-then-redirect

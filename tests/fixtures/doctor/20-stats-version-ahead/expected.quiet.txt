@@ -11,7 +11,7 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✗ Version ahead            stats.db ahead (v99 > known v13)
       → Run `cctally db recover --db stats --yes` (or restore from backup)
-  ⚠ Pending migrations       40 pending
+  ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Data
 Pricing
@@ -20,4 +20,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 32 OK · 5 WARN · 1 FAIL
+Summary: 33 OK · 5 WARN · 1 FAIL

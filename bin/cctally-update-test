@@ -415,6 +415,17 @@ LOCKBODY
     local out_file="$scratch/_stdout.txt"
     local err_file="$scratch/_stderr.txt"
 
+    # The shared harness preamble suppresses detached post-command workers so
+    # they cannot race scratch cleanup. Banner scenarios must exercise the
+    # post-command hook itself, so enable it narrowly while keeping both
+    # worker gates inert: a fresh update marker blocks the update worker and
+    # the telemetry kill switch blocks the independent telemetry worker.
+    local disable_update_hooks=1
+    if [ "${BANNER_CHECK:-0}" = "1" ]; then
+        touch "$scratch/.local/share/cctally/update-check.last-fetch"
+        disable_update_hooks=0
+    fi
+
     # shellcheck disable=SC2086
     set +u
     if [ "$TTY_SIM" = "1" ]; then
@@ -435,6 +446,8 @@ LOCKBODY
             CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
             CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
             CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+            CCTALLY_DISABLE_UPDATE_CHECK="$disable_update_hooks" \
+            CCTALLY_DISABLE_TELEMETRY=1 \
             BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \
             BREW_UPGRADE_EXIT="$BREW_UPGRADE_EXIT" \
             BREW_FORMULA_VERSION="${BREW_FORMULA_VERSION:-}" \
@@ -457,6 +470,8 @@ LOCKBODY
         CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
         CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
         CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+        CCTALLY_DISABLE_UPDATE_CHECK="$disable_update_hooks" \
+        CCTALLY_DISABLE_TELEMETRY=1 \
         BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \
         BREW_UPGRADE_EXIT="$BREW_UPGRADE_EXIT" \
         BREW_FORMULA_VERSION="${BREW_FORMULA_VERSION:-}" \

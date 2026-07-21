@@ -2,7 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import { revalToken } from '../lib/revalToken';
-import type { ConversationOutline } from '../types/conversation';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { adaptQualifiedOutline, ConversationNormalizationPending } from '../lib/conversationAdapters';
+import type { NativeTokens } from '../lib/conversationAdapters';
+import {
+  conversationRefKey,
+  isQualifiedConversationRef,
+  normalizeConversationRef,
+  type ConversationOutline,
+  type ConversationRef,
+  type ConversationRefInput,
+} from '../types/conversation';
 
 // #177 S5 — full-session outline + stats. Owns its OWN SSE tick subscription
 // (Codex F3: useConversation only tail-polls once fully paged), with the same
@@ -25,16 +35,19 @@ import type { ConversationOutline } from '../types/conversation';
 // the raw 5s `generated_at` heartbeat, so a finished/static conversation
 // fetches its outline once instead of re-GET every tick while open.
 export function useConversationOutline(
-  sessionId: string | null,
+  rawRef: ConversationRefInput | null,
   opts?: { revalidateOnTick?: boolean; growthNonce?: number; live?: boolean },
 ) {
+  const conversationRef = rawRef ? normalizeConversationRef(rawRef) : null;
+  const identityKey = conversationRef ? conversationRefKey(conversationRef) : null;
   const revalidateOnTick = opts?.revalidateOnTick ?? true;
   const growthNonce = opts?.growthNonce ?? 0;
   const live = opts?.live ?? false;
   const [outline, setOutline] = useState<ConversationOutline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const sessionRef = useRef(sessionId);
+  const identityRef = useRef(identityKey);
+  const conversationRefRef = useRef<ConversationRef | null>(conversationRef);
   const outlineRef = useRef<ConversationOutline | null>(null);
   const fetchingRef = useRef(false);
   const pendingRef = useRef(false);
@@ -43,24 +56,40 @@ export function useConversationOutline(
     // Coalesce a tick that lands mid-fetch into ONE trailing replay (the
     // `finally` re-invokes once pendingRef is set). Never concurrent requests.
     if (fetchingRef.current) { pendingRef.current = true; return; }
-    const sid = sessionRef.current;
-    if (!sid) return;
+    const key = identityRef.current;
+    const ref = conversationRefRef.current;
+    if (!key || !ref) return;
     fetchingRef.current = true;
     try {
-      const body = await fetchJson<ConversationOutline>(
-        `/api/conversation/${encodeURIComponent(sid)}/outline`);
-      if (sessionRef.current !== sid) return;   // session switched mid-fetch — drop
+      const body = isQualifiedConversationRef(ref)
+        ? await Promise.all([
+            fetchJson<Parameters<typeof adaptQualifiedOutline>[1]>(conversationEntityUrl(ref, 'outline')),
+            fetchJson<{ total_cost_usd?: number; tokens?: NativeTokens }>(
+              conversationEntityUrl(ref, 'detail', { limit: 1 })),
+            ref.source === 'claude'
+              ? fetchJson<{ prompts?: { item_key: string; text: string }[] }>(conversationEntityUrl(ref, 'prompts'))
+              : Promise.resolve(null),
+          ]).then(([rawOutline, rawDetail, rawPrompts]) => adaptQualifiedOutline(
+            ref,
+            rawOutline,
+            rawDetail,
+            rawPrompts ? new Set((rawPrompts.prompts ?? []).map((prompt) => prompt.item_key)) : undefined,
+          ))
+        : await fetchJson<ConversationOutline>(conversationEntityUrl(ref, 'outline'));
+      if (identityRef.current !== key) return;   // session switched mid-fetch — drop
       outlineRef.current = body;
       setOutline(body); setError(null); setLoading(false);
-    } catch {
+    } catch (e) {
       // Deliberate no-AbortController choice (#184): the single-in-flight guard
       // (`fetchingRef`) already prevents overlapping requests, and the
       // `sessionRef.current !== sid` check below drops any stale response a
       // session switch left in flight — so there is no fetch to abort and no
       // AbortError to special-case. A genuine fetch failure for the CURRENT
       // session degrades to the inline error banner.
-      if (sessionRef.current !== sid) return;
-      setError("Couldn't load the outline."); setLoading(false);
+      if (identityRef.current !== key) return;
+      setError(e instanceof ConversationNormalizationPending
+        ? 'Conversation indexing is still finishing.'
+        : "Couldn't load the outline."); setLoading(false);
     } finally {
       fetchingRef.current = false;
       if (pendingRef.current) { pendingRef.current = false; void refetch(); }
@@ -68,7 +97,8 @@ export function useConversationOutline(
   }, []);
 
   useEffect(() => {
-    sessionRef.current = sessionId;
+    identityRef.current = identityKey;
+    conversationRefRef.current = conversationRef;
     outlineRef.current = null;
     // Clear the in-flight/coalesce guards on a session switch: a fetch still in
     // flight for the OLD session must not block the NEW session's fetch (its
@@ -78,10 +108,10 @@ export function useConversationOutline(
     fetchingRef.current = false;
     pendingRef.current = false;
     setOutline(null); setError(null);
-    if (!sessionId) { setLoading(false); return; }
+    if (!conversationRef) { setLoading(false); return; }
     setLoading(true);
     void refetch();
-  }, [sessionId, refetch]);
+  }, [identityKey, refetch]);
 
   const env = useSnapshot();
   // #300 — gate the non-live fallback on the change signal (`data_version`), not

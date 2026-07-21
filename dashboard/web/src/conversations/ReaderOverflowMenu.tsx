@@ -3,6 +3,7 @@ import { nextRovingIndex } from './menuKeyboard';
 import { useOutsideDismiss } from './useOutsideDismiss';
 import { ExportMenu } from './ExportMenu';
 import { fmt } from '../lib/fmt';
+import type { ConversationRefInput } from '../types/conversation';
 
 // #228 S3 C2 — the mobile (≤640px) reader-header "⋯" overflow menu. Collapses
 // the secondary reader actions — Export, Compare with…, Latest ↓, Expand-all,
@@ -28,7 +29,7 @@ import { fmt } from '../lib/fmt';
 
 export interface ReaderOverflowMenuProps {
   // Export rides as the embedded ExportMenu (its own nested popover).
-  sessionId: string;
+  sessionId: ConversationRefInput;
   exportTitle?: string;
   // #281 S4 — the Anonymize toggle. The SAME store state as the desktop header
   // chip (the reader owns `anonMode` + `toggleAnonMode`), so a flip here updates
@@ -245,7 +246,7 @@ export function ReaderOverflowMenu({
               It honors the SAME anonMode as the toggle below (a desktop OFF now
               flows through to mobile exports). */}
           <div className="conv-overflow-export" role="none">
-            <ExportMenu sessionId={sessionId} title={exportTitle} anonMode={anonMode} />
+            <ExportMenu conversationRef={sessionId} title={exportTitle} anonMode={anonMode} />
           </div>
           {items.map((it, i) => (
             <button

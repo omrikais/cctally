@@ -90,4 +90,13 @@ describe('ComparisonMetrics', () => {
     expect(cell.querySelector('.conv-cmp-metric-b .sr-only')!.textContent).toBe('Run B ');
     expect(cell.querySelector('.conv-cmp-metric-arrow')!.getAttribute('aria-hidden')).toBe('true');
   });
+
+  it('does not calculate a token delta across providers', () => {
+    const { container } = render(
+      <ComparisonMetrics a={M()} b={M({ tokens: 200 })} aSource="claude" bSource="codex" />,
+    );
+    const cell = container.querySelector('[data-metric="tokens"]') as HTMLElement;
+    expect(cell.textContent).toContain('provider-specific');
+    expect(deltaOf(container, 'tokens')).toBeNull();
+  });
 });

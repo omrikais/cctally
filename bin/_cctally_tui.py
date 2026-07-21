@@ -1772,40 +1772,12 @@ def _tui_build_sessions(
             (), now_utc=now_utc, limit=limit, display_tz=None,
             aggregated_override=aggregated_override,
         )
-    rows = list(view.rows)
-    # Attach human-readable titles for the dashboard/TUI Sessions surface.
-    # Reuses the conversation viewer's title derivation (AI title wins, else
-    # first non-marker human line), which reads the CACHE db
-    # (conversation_messages / conversation_ai_titles). Fail-soft: any cache
-    # failure leaves titles ``None`` -> the client renders an em-dash. One
-    # bounded indexed query (<= `limit` session ids, rides idx_conv_session_ts)
-    # per snapshot build. Titles are stashed unconditionally on this
-    # server-internal row; the privacy gate is applied later, at envelope
-    # serialization (``snapshot_to_envelope(transcripts_visible=...)``).
-    if rows:
-        session_ids = [r.session_id for r in rows if r.session_id]
-        try:
-            conn = c.open_cache_db()
-        except (sqlite3.DatabaseError, OSError):
-            conn = None
-        if conn is not None:
-            try:
-                titles = c._load_sibling(
-                    "_lib_conversation_query"
-                )._session_titles_map(conn, session_ids)
-                rows = [
-                    dataclasses.replace(r, title=titles.get(r.session_id))
-                    if r.session_id in titles else r
-                    for r in rows
-                ]
-            except (sqlite3.DatabaseError, OSError):
-                pass  # fail-soft: leave titles None
-            finally:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-    return rows
+    # #320: transcript-derived titles are optional decoration. The core
+    # dashboard/TUI snapshot must never open conversations.db, because even a
+    # fail-soft read pays SQLite's lock timeout before it can fail. Conversation
+    # routes retain title derivation; the accounting Sessions panel renders its
+    # existing em-dash fallback when the independent store is unavailable.
+    return list(view.rows)
 
 
 def _tui_sessions_cached(

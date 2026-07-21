@@ -66,12 +66,16 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
     jsonl = projects / "s1.jsonl"
     jsonl.write_text(_asst_line("a1", "m1", "r1", "answer A", sid="s1"))
 
-    # Full sync so conversation_messages + session_files are populated for s1
-    # (the watch loop resolves the file set from conversation_messages, and
-    # baselines `seen` from session_files).
+    # Full core + transcript sync so the watch loop can resolve and baseline
+    # the session's independent transcript cursor.
     conn = ns["open_cache_db"]()
     try:
         ns["sync_cache"](conn, rebuild=True)
+    finally:
+        conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_claude_conversations"](conn, rebuild=True)
     finally:
         conn.close()
 

@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { adaptQualifiedPrompts } from '../lib/conversationAdapters';
+import { conversationRefKey, isQualifiedConversationRef, normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
 
 // #217 S7 F10 — lazy full-prompt-text fetch for the session-comparison view.
 // The metrics strip + the alignment spine come from each session's /outline, so
@@ -16,7 +19,9 @@ export interface PromptsResult {
   error: string | null;
 }
 
-export function useConversationPrompts(sessionId: string | null, active: boolean): PromptsResult {
+export function useConversationPrompts(rawRef: ConversationRefInput | null, active: boolean): PromptsResult {
+  const conversationRef = rawRef ? normalizeConversationRef(rawRef) : null;
+  const identityKey = conversationRef ? conversationRefKey(conversationRef) : null;
   const [byUuid, setByUuid] = useState<Record<string, string> | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -29,23 +34,26 @@ export function useConversationPrompts(sessionId: string | null, active: boolean
     loadedFor.current = null;
     setByUuid(null);
     setError(null);
-  }, [sessionId]);
+  }, [identityKey]);
 
   useEffect(() => {
-    if (!active || !sessionId || loadedFor.current === sessionId) return;
+    if (!active || !conversationRef || !identityKey || loadedFor.current === identityKey) return;
     const ctl = new AbortController();
     setLoading(true);
     setError(null);
-    fetch(`/api/conversation/${encodeURIComponent(sessionId)}/prompts`, { signal: ctl.signal })
+    fetch(conversationEntityUrl(conversationRef, 'prompts'), { signal: ctl.signal })
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((data: { prompts: PromptEntry[] }) => {
+      .then((raw: { prompts: PromptEntry[] } | Parameters<typeof adaptQualifiedPrompts>[0]) => {
+        const data = isQualifiedConversationRef(conversationRef)
+          ? adaptQualifiedPrompts(raw as Parameters<typeof adaptQualifiedPrompts>[0])
+          : raw as { prompts: PromptEntry[] };
         const map: Record<string, string> = {};
         for (const p of data.prompts) map[p.uuid] = p.text;
         setByUuid(map);
-        loadedFor.current = sessionId;
+        loadedFor.current = identityKey;
       })
       .catch((e: unknown) => {
         if (e instanceof DOMException && e.name === 'AbortError') return;
@@ -54,7 +62,7 @@ export function useConversationPrompts(sessionId: string | null, active: boolean
       })
       .finally(() => setLoading(false));
     return () => ctl.abort();
-  }, [active, sessionId]);
+  }, [active, identityKey]);
 
   return { byUuid, loading, error };
 }

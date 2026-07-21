@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useCopy } from './useCopy';
 import { nextRovingIndex } from './menuKeyboard';
 import { useOutsideDismiss } from './useOutsideDismiss';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { conversationRefKey, normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
 
 // #217 S5 §4 (F1/F5) — the reader-header "Export ▾" menu. Lists the four
 // Markdown export scopes, each with a Copy (clipboard) and a Download (.md
@@ -45,13 +47,15 @@ export function slugifyTitle(title: string | undefined, sessionId: string): stri
 
 // #281 S4 — when anon mode is ON the 8 copy/download items fetch the
 // server-scrubbed body (`&anonymize=1`); OFF is byte-identical to today's URL.
-function exportUrl(sessionId: string, scope: Scope, anon: boolean): string {
-  const base = `/api/conversation/${encodeURIComponent(sessionId)}/export?scope=${scope}`;
-  return anon ? `${base}&anonymize=1` : base;
+function exportUrl(conversationRef: ConversationRefInput, scope: Scope, anon: boolean): string {
+  return conversationEntityUrl(normalizeConversationRef(conversationRef), 'export', {
+    scope,
+    anonymize: anon || undefined,
+  });
 }
 
-async function fetchExport(sessionId: string, scope: Scope, anon: boolean): Promise<string> {
-  const res = await fetch(exportUrl(sessionId, scope, anon));
+async function fetchExport(conversationRef: ConversationRefInput, scope: Scope, anon: boolean): Promise<string> {
+  const res = await fetch(exportUrl(conversationRef, scope, anon));
   if (!res.ok) throw new Error(`export failed: ${res.status}`);
   return res.text();
 }
@@ -76,16 +80,24 @@ function triggerDownload(filename: string, text: string): void {
 }
 
 export function ExportMenu({
-  sessionId,
+  conversationRef: qualifiedRef,
+  sessionId: legacySessionId,
   title,
   anonMode = false,
 }: {
-  sessionId: string;
+  conversationRef?: ConversationRefInput;
+  sessionId?: string;
   title?: string;
   // #281 S4 — when true, exports fetch `&anonymize=1` and filenames gain `-anon`.
   // Defaults false so provider-less tests keep asserting today's OFF-path bytes.
   anonMode?: boolean;
 }) {
+  const conversationRef = normalizeConversationRef(qualifiedRef ?? legacySessionId!);
+  const sessionId = conversationRef.key;
+  const identityKey = conversationRefKey(conversationRef);
+  // S7 Codex export supports the whole-conversation scope only. Keep the shared
+  // menu, but do not expose Claude-only scopes that the qualified route rejects.
+  const scopes = conversationRef.source === 'codex' ? SCOPES.slice(0, 1) : SCOPES;
   const [open, setOpen] = useState(false);
   // The action currently fetching, encoded `${scope}:${kind}`, so its row shows
   // a disabled/loading state without freezing the others.
@@ -100,7 +112,7 @@ export function ExportMenu({
   // Roving-focus state for the menuitems (flat index over the scope×{copy,download}
   // grid). A mirroring ref lets the focus-on-open effect read the latest value
   // without re-subscribing to it.
-  const itemCount = SCOPES.length * 2;
+  const itemCount = scopes.length * 2;
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const activeIndexRef = useRef(0);
@@ -124,7 +136,7 @@ export function ExportMenu({
   // across a session switch; close it when the conversation changes.
   useEffect(() => {
     setOpen(false);
-  }, [sessionId]);
+  }, [identityKey]);
 
   const close = useCallback(() => {
     setOpen(false);
@@ -193,7 +205,7 @@ export function ExportMenu({
       const key = `${scope}:copy`;
       setBusy(key);
       try {
-        const text = await fetchExport(sessionId, scope, anonMode);
+        const text = await fetchExport(conversationRef, scope, anonMode);
         copy(text);
       } catch {
         /* swallow — a failed export leaves the clipboard untouched */
@@ -201,7 +213,7 @@ export function ExportMenu({
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [sessionId, copy, anonMode],
+    [identityKey, copy, anonMode],
   );
 
   const doDownload = useCallback(
@@ -209,7 +221,7 @@ export function ExportMenu({
       const key = `${scope}:download`;
       setBusy(key);
       try {
-        const text = await fetchExport(sessionId, scope, anonMode);
+        const text = await fetchExport(conversationRef, scope, anonMode);
         triggerDownload(exportFilename(title, sessionId, scope, anonMode), text);
       } catch {
         /* swallow */
@@ -217,7 +229,7 @@ export function ExportMenu({
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [sessionId, title, anonMode],
+    [identityKey, title, anonMode],
   );
 
   return (
@@ -254,7 +266,7 @@ export function ExportMenu({
               Anonymized — project paths, home, username &amp; known secrets redacted
             </div>
           )}
-          {SCOPES.map(({ scope, label }, rowIdx) => {
+          {scopes.map(({ scope, label }, rowIdx) => {
             const copyIdx = rowIdx * 2;
             const downloadIdx = copyIdx + 1;
             return (

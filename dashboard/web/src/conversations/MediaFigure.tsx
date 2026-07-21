@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ImageIcon, DocumentIcon } from './ConvIcons';
-import { useSessionId } from './TranscriptContext';
+import { useConversationRef } from './TranscriptContext';
+import { conversationEntityUrl } from '../lib/conversationTransport';
 import type { MediaRef } from '../types/conversation';
 
 // #177 S4 (Q7-A): inline lazy-loaded media. Addressing: exactly one of
@@ -29,7 +30,7 @@ export function MediaFigure({
   uuid?: string | null;
   context: string;
 }) {
-  const sessionId = useSessionId();
+  const conversationRef = useConversationRef();
   const [failed, setFailed] = useState(false);
   // #217 S6 F9 — inline PDF expand state. Collapsed by default so the <object>
   // (and thus the byte fetch) mounts only on demand; a transcript with several
@@ -42,7 +43,7 @@ export function MediaFigure({
       ? `uuid=${encodeURIComponent(uuid)}`
       : null;
   const addressable =
-    sessionId != null && key != null && Number.isInteger(media.index) && media.index >= 0;
+    conversationRef != null && key != null && Number.isInteger(media.index) && media.index >= 0;
 
   if (!addressable || failed) {
     return (
@@ -53,7 +54,10 @@ export function MediaFigure({
       </span>
     );
   }
-  const url = `/api/conversation/${encodeURIComponent(sessionId)}/media?${key}&index=${media.index}`;
+  const url = conversationEntityUrl(conversationRef!, 'media', {
+    ...(toolUseId ? { tool_use_id: toolUseId } : { uuid: uuid! }),
+    index: media.index,
+  });
 
   if (media.kind === 'document') {
     // #217 S6 F9 — only application/pdf gets the inline click-to-expand option;

@@ -6,8 +6,10 @@
 // friendly message for the 410 source-gone case. No-ops when there's no open
 // session id (sessionId === null).
 
-import { useCallback, useRef, useState } from 'react';
-import type { FullPayload } from '../types/conversation';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { adaptQualifiedPayload } from '../lib/conversationAdapters';
+import { conversationRefKey, normalizeConversationRef, type ConversationRefInput, type FullPayload } from '../types/conversation';
 
 type State =
   | { status: 'idle' }
@@ -16,10 +18,12 @@ type State =
   | { status: 'error'; error: string };
 
 export function useFullPayload(
-  sessionId: string | null,
+  rawRef: ConversationRefInput | null,
   toolUseId: string,
   which: 'result' | 'input',
 ) {
+  const conversationRef = rawRef ? normalizeConversationRef(rawRef) : null;
+  const identityKey = conversationRef ? conversationRefKey(conversationRef) : null;
   const [state, setState] = useState<State>({ status: 'idle' });
   // Synchronous in-flight guard (mirrors useConversation's loadingMoreRef /
   // pollingRef). `state.status` is async React state, so two SYNCHRONOUS load()
@@ -30,16 +34,26 @@ export function useFullPayload(
   // no-op even before its setState commits.
   const inFlightRef = useRef(false);
   const doneRef = useRef(false);
+  const requestKey = `${identityKey ?? ''}\u0000${toolUseId}\u0000${which}`;
+  const requestKeyRef = useRef(requestKey);
+  useEffect(() => {
+    requestKeyRef.current = requestKey;
+    inFlightRef.current = false;
+    doneRef.current = false;
+    setState({ status: 'idle' });
+  }, [requestKey]);
   const load = useCallback(async () => {
     // Already loaded / in flight (sync ref), or nothing to address → nothing to do.
-    if (inFlightRef.current || doneRef.current || !sessionId) return;
+    if (inFlightRef.current || doneRef.current || !conversationRef) return;
+    const startedFor = requestKey;
     inFlightRef.current = true;
     setState({ status: 'loading' });
     try {
-      const url =
-        `/api/conversation/${encodeURIComponent(sessionId)}/payload` +
-        `?tool_use_id=${encodeURIComponent(toolUseId)}&which=${which}`;
+      const url = conversationEntityUrl(conversationRef, 'payload', conversationRef.source === 'codex'
+        ? { block_key: toolUseId, which: which === 'input' ? 'call' : 'output' }
+        : { tool_use_id: toolUseId, which });
       const r = await fetch(url);
+      if (requestKeyRef.current !== startedFor) return;
       if (!r.ok) {
         // 410 = source JSONL rotated/deleted (the documented capped-cache
         // consequence); everything else (403 gate, 5xx, …) is generic.
@@ -49,13 +63,20 @@ export function useFullPayload(
         });
         return;
       }
+      const raw = await r.json() as FullPayload | Parameters<typeof adaptQualifiedPayload>[2];
+      const data = conversationRef.source === 'codex'
+        ? adaptQualifiedPayload(toolUseId, which, raw as Parameters<typeof adaptQualifiedPayload>[2])
+        : raw as FullPayload;
+      if (requestKeyRef.current !== startedFor) return;
       doneRef.current = true;
-      setState({ status: 'done', data: (await r.json()) as FullPayload });
+      setState({ status: 'done', data });
     } catch {
-      setState({ status: 'error', error: 'network error' });
+      if (requestKeyRef.current === startedFor) {
+        setState({ status: 'error', error: 'network error' });
+      }
     } finally {
-      inFlightRef.current = false;
+      if (requestKeyRef.current === startedFor) inFlightRef.current = false;
     }
-  }, [sessionId, toolUseId, which]);
+  }, [conversationRef, requestKey, toolUseId, which]);
   return { ...state, load };
 }

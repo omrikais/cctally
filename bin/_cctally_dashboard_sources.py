@@ -733,22 +733,33 @@ def _codex_conversation_metadata(
 
     ``state_5.sqlite.threads.title`` is Codex's persisted user-facing task name.
     Conversation rollup titles are derived from prompt text and therefore must
-    never be substituted for that name on the dashboard. Accounting remains
-    authoritative for totals; conversation rollups only decorate projects.
+    never be substituted for that name on the dashboard. Project attribution
+    is derived from the compact thread ``cwd``/``git_json`` retained in
+    ``cache.db`` so non-conversation panels never open ``conversations.db``.
     """
     metadata: dict[tuple[str, str], dict[str, object]] = {}
     try:
-        rows = tuple(cache_conn.execute(
+        core_rows = tuple(cache_conn.execute(
             "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
             "(SELECT e.session_id FROM codex_session_entries AS e "
             " WHERE e.source_root_key=t.source_root_key AND e.source_path=t.source_path "
             " ORDER BY e.id LIMIT 1) AS accounting_session_id, "
-            "r.project_key, r.project_label, r.started_utc "
+            "t.cwd, t.git_json, t.first_seen_utc, t.last_seen_utc "
             "FROM codex_conversation_threads AS t "
-            "LEFT JOIN codex_conversation_rollups AS r "
-            "ON r.conversation_key=t.conversation_key "
-            "ORDER BY r.last_activity_utc DESC, t.conversation_key DESC"
+            "ORDER BY t.last_seen_utc DESC, t.conversation_key DESC"
         ))
+        from _cctally_cache import _codex_conversation_project_attribution
+        rows = tuple(
+            (
+                root_key, source_path, native_thread_id, accounting_session_id,
+                *_codex_conversation_project_attribution(root_key, cwd, git_json),
+                first_seen_at,
+            )
+            for (
+                root_key, source_path, native_thread_id, accounting_session_id,
+                cwd, git_json, first_seen_at, _last_seen_at,
+            ) in core_rows
+        )
         file_aliases = tuple(cache_conn.execute(
             "SELECT source_root_key, path, last_native_thread_id, last_session_id "
             "FROM codex_session_files "

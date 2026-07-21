@@ -4254,6 +4254,67 @@ def build_per_migration_027_codex_fork_preamble_rebuild(
         lock.unlink()
 
 
+def build_per_migration_028_split_conversation_store(
+    scenario_dir: Path,
+) -> None:
+    """Build deterministic core-cache goldens for the #320 store split."""
+    import shutil
+    import tempfile
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "028_split_conversation_store"
+
+    with tempfile.TemporaryDirectory(prefix="cctally-migration-028-") as scratch:
+        seed_dir = Path(scratch) / "027"
+        build_per_migration_027_codex_fork_preamble_rebuild(seed_dir)
+        pre.unlink(missing_ok=True)
+        shutil.copy(seed_dir / "post.sqlite", pre)
+    register_fixture_db(pre)
+
+    post.unlink(missing_ok=True)
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    db = _load_db_module()
+    core = sys.modules["_cctally_core"]
+    fixture_data = scenario_dir / "runtime"
+    fixture_data.mkdir(parents=True, exist_ok=True)
+    old_paths = {
+        name: getattr(core, name)
+        for name in (
+            "APP_DIR", "CONVERSATIONS_DB_PATH", "CACHE_LOCK_PATH",
+            "CACHE_LOCK_CODEX_PATH", "CACHE_LOCK_MAINTENANCE_PATH",
+            "CONVERSATIONS_LOCK_PATH", "CONVERSATIONS_LOCK_CODEX_PATH",
+            "CONVERSATIONS_LOCK_MAINTENANCE_PATH",
+        )
+    }
+    core.APP_DIR = fixture_data
+    core.CONVERSATIONS_DB_PATH = fixture_data / "conversations.db"
+    core.CACHE_LOCK_PATH = fixture_data / "cache.db.lock"
+    core.CACHE_LOCK_CODEX_PATH = fixture_data / "cache.db.codex.lock"
+    core.CACHE_LOCK_MAINTENANCE_PATH = fixture_data / "cache.db.maintenance.lock"
+    core.CONVERSATIONS_LOCK_PATH = fixture_data / "conversations.db.lock"
+    core.CONVERSATIONS_LOCK_CODEX_PATH = fixture_data / "conversations.db.codex.lock"
+    core.CONVERSATIONS_LOCK_MAINTENANCE_PATH = fixture_data / "conversations.db.maintenance.lock"
+    try:
+        handler = next(
+            item.handler for item in db._CACHE_MIGRATIONS
+            if item.name == migration
+        )
+        conn = sqlite3.connect(post)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            db._stamp_applied(conn, migration, "2026-07-20T12:00:00Z")
+        finally:
+            conn.close()
+    finally:
+        for name, value in old_paths.items():
+            setattr(core, name, value)
+        shutil.rmtree(fixture_data, ignore_errors=True)
+
+
 def build_per_migration_023_conversation_sessions_enrichment_columns(
     scenario_dir: Path,
 ) -> None:
@@ -5060,6 +5121,9 @@ def main() -> int:
     )
     build_per_migration_027_codex_fork_preamble_rebuild(
         FIXTURES_ROOT / "per-migration" / "027_codex_fork_preamble_rebuild"
+    )
+    build_per_migration_028_split_conversation_store(
+        FIXTURES_ROOT / "per-migration" / "028_split_conversation_store"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

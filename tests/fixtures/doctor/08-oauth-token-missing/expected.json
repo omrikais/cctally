@@ -201,7 +201,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 27,
+                            "registry_size": 28,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -248,7 +248,8 @@
                                     "024_codex_fused_ingest_rebuild",
                                     "025_codex_conversation_normalization",
                                     "026_codex_conversation_key_backfill",
-                                    "027_codex_fork_preamble_rebuild"
+                                    "027_codex_fork_preamble_rebuild",
+                                    "028_split_conversation_store"
                                 ],
                                 "skipped": []
                             },
@@ -276,7 +277,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/40 applied",
+                    "summary": "0/41 applied",
                     "title": "Migrations"
                 },
                 {
@@ -441,20 +442,27 @@
                             [
                                 "cache.db",
                                 "027_codex_fork_preamble_rebuild"
+                            ],
+                            [
+                                "cache.db",
+                                "028_split_conversation_store"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "40 pending",
+                    "summary": "41 pending",
                     "title": "Pending migrations"
                 },
                 {
                     "details": {
                         "locks": {
                             "cache.db.codex.lock": false,
-                            "cache.db.lock": false
+                            "cache.db.lock": false,
+                            "conversations.db.codex.lock": false,
+                            "conversations.db.lock": false,
+                            "conversations.db.maintenance.lock": false
                         }
                     },
                     "id": "db.lock_state",
@@ -482,6 +490,18 @@
                     "severity": "ok",
                     "summary": "below threshold",
                     "title": "Reclaimable cache space"
+                },
+                {
+                    "details": {
+                        "conversations_db_free_ratio": null,
+                        "conversations_db_freelist_count": null,
+                        "conversations_db_page_count": null,
+                        "warn_ratio": 0.25
+                    },
+                    "id": "db.conversations_reclaimable",
+                    "severity": "ok",
+                    "summary": "below threshold",
+                    "title": "Reclaimable transcript space"
                 }
             ],
             "id": "db",
@@ -701,7 +721,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 30,
+            "ok": 31,
             "warn": 7
         },
         "severity": "fail"

@@ -1,12 +1,13 @@
 // Client-only URL deep-linking for the conversation reader (#169, closes B3).
 // Pure grammar here; the store<->URL glue is installUrlRouting below.
 //
-// Hash grammar (path-style, five states):
-//   ''                                  -> dashboard            (parseHash -> null)
-//   '#/conversations'                   -> conversations, no selection ({sessionId:null})
-//   '#/conversations/<sid>'             -> a selected conversation
-//   '#/conversations/<sid>/<turn>'      -> a specific turn
-//   '#/conversations/compare/<A>/<B>'   -> a session comparison (#217 S7 F10)
+// Canonical hash grammar (path-style):
+//   ''                                                        -> dashboard
+//   '#/conversations'                                         -> no selection
+//   '#/conversations/source/<source>/<key>[/<turn>]'           -> one conversation
+//   '#/conversations/compare/<source>/<key>/<source>/<key>'    -> comparison
+// Bare `/<sid>[/<turn>]` and `/compare/<A>/<B>` forms remain read-compatible
+// Claude aliases, but every production write uses the qualified grammar.
 // Segment values are encode/decode-wrapped so a future non-URL-safe id is safe;
 // decode∘encode is identity on today's tokens, so a dispatched jump uuid still
 // matches the raw data-uuid the reader scrolls to. The `compare` literal is the
@@ -19,13 +20,24 @@ import {
   dispatch as realDispatch,
 } from './store';
 import type { Action, UIState } from './store';
+import {
+  conversationJumpRef,
+  conversationRefKey,
+  isConversationRef,
+  legacyClaudeConversationRef,
+  normalizeConversationRef,
+  sameConversationRef,
+  type ConversationRef,
+} from '../types/conversation';
 
 export interface Route {
   sessionId: string | null;
+  conversationRef?: ConversationRef | null;
   turnUuid: string | null;
   // #217 S7 F10 — set ONLY for the compare route; null for every single-session
   // / dashboard route. A route never carries both a sessionId and a compare.
-  compare: { a: string; b: string } | null;
+  compare: { a: ConversationRef; b: ConversationRef } | null;
+  qualified?: boolean;
 }
 
 const PREFIX = '#/conversations';
@@ -47,12 +59,48 @@ export function parseHash(hash: string): Route | null {
   }
   if (!h.startsWith('/conversations/')) return null; // unknown route -> dashboard (optimistic)
   const segs = h.slice('/conversations/'.length).split('/').filter((s) => s.length > 0);
+  const source = (value: string | undefined): ConversationRef['source'] | null =>
+    value === 'claude' || value === 'codex' ? value : null;
+  // #321 Task A — canonical qualified single-conversation route. The key stays
+  // an opaque segment; decoding is solely URL transport, never key parsing.
+  if (segs[0] === 'source' && (segs.length === 3 || segs.length === 4)) {
+    const qualifiedSource = source(segs[1]);
+    if (!qualifiedSource || !segs[2]) return null;
+    const conversationRef = { source: qualifiedSource, key: decodeURIComponent(segs[2]) };
+    return {
+      sessionId: qualifiedSource === 'claude' ? conversationRef.key : null,
+      conversationRef,
+      turnUuid: segs[3] ? decodeURIComponent(segs[3]) : null,
+      compare: null,
+      qualified: true,
+    };
+  }
+  // Qualified comparison writer. Equal opaque keys remain distinct when their
+  // sources differ; no delimiter is interpreted inside either decoded key.
+  if (segs[0] === 'compare' && segs.length === 5) {
+    const aSource = source(segs[1]);
+    const bSource = source(segs[3]);
+    if (!aSource || !bSource || !segs[2] || !segs[4]) return null;
+    return {
+      sessionId: null,
+      conversationRef: null,
+      turnUuid: null,
+      compare: {
+        a: { source: aSource, key: decodeURIComponent(segs[2]) },
+        b: { source: bSource, key: decodeURIComponent(segs[4]) },
+      },
+      qualified: true,
+    };
+  }
   // #217 S7 F10 — compare route: `compare/<A>/<B>`. Matched BEFORE the
   // single-session arms so `compare` never reads as a session id.
   if (segs[0] === 'compare' && segs.length >= 3 && segs[1] && segs[2]) {
     return {
-      sessionId: null, turnUuid: null,
-      compare: { a: decodeURIComponent(segs[1]), b: decodeURIComponent(segs[2]) },
+      sessionId: null, conversationRef: null, turnUuid: null,
+      compare: {
+        a: legacyClaudeConversationRef(decodeURIComponent(segs[1])),
+        b: legacyClaudeConversationRef(decodeURIComponent(segs[2])),
+      },
     };
   }
   if (segs.length === 1) return { sessionId: decodeURIComponent(segs[0]), turnUuid: null, compare: null };
@@ -66,14 +114,23 @@ export function parseHash(hash: string): Route | null {
 // a compare) OR the legacy positional `(sessionId, turnUuid?)` form (permalink /
 // reflect / baseHash callers).
 export function formatHash(route: Route): string;
+export function formatHash(ref: ConversationRef, turnUuid?: string | null): string;
 export function formatHash(sessionId: string | null, turnUuid?: string | null): string;
-export function formatHash(arg: Route | string | null, turnUuid?: string | null): string {
+export function formatHash(arg: Route | ConversationRef | string | null, turnUuid?: string | null): string {
+  if (isConversationRef(arg)) {
+    const base = `${PREFIX}/source/${arg.source}/${encodeURIComponent(arg.key)}`;
+    return turnUuid ? `${base}/${encodeURIComponent(turnUuid)}` : base;
+  }
   if (arg !== null && typeof arg === 'object') {
     const route = arg;
     if (route.compare) {
-      return `${PREFIX}/compare/${encodeURIComponent(route.compare.a)}/${encodeURIComponent(route.compare.b)}`;
+      const a = normalizeConversationRef(route.compare.a);
+      const b = normalizeConversationRef(route.compare.b);
+      return `${PREFIX}/compare/${a.source}/${encodeURIComponent(a.key)}/${b.source}/${encodeURIComponent(b.key)}`;
     }
-    return formatHash(route.sessionId, route.turnUuid);
+    return route.conversationRef
+      ? formatHash(route.conversationRef, route.turnUuid)
+      : formatHash(route.sessionId, route.turnUuid);
   }
   const sessionId = arg;
   if (sessionId === null) return PREFIX; // '#/conversations'
@@ -85,10 +142,12 @@ export function formatHash(arg: Route | string | null, turnUuid?: string | null)
 export function permalinkUrl(
   origin: string,
   pathname: string,
-  sessionId: string,
+  conversation: string | ConversationRef,
   turnUuid: string,
 ): string {
-  return `${origin}${pathname}${formatHash(sessionId, turnUuid)}`;
+  return `${origin}${pathname}${isConversationRef(conversation)
+    ? formatHash(conversation, turnUuid)
+    : formatHash(conversation, turnUuid)}`;
 }
 
 export interface UrlRoutingDeps {
@@ -98,9 +157,9 @@ export interface UrlRoutingDeps {
 }
 
 // Conversation-level hash WITHOUT a turn segment.
-function baseHash(view: UIState['view'], sid: string | null): string {
+function baseHash(view: UIState['view'], ref: ConversationRef | null): string {
   if (view === 'dashboard') return '';
-  return formatHash(sid); // sid null -> '#/conversations'; sid -> '#/conversations/<sid>'
+  return ref ? formatHash(ref) : formatHash(null);
 }
 
 // The single write chokepoint. Idempotent (no-op when already there); always
@@ -115,8 +174,8 @@ function writeUrl(hash: string, mode: 'push' | 'replace'): void {
 
 // Used by the permalink button: reflect the address bar to a turn WITHOUT
 // dispatching a jump (no scroll/flash on a turn already under the cursor).
-export function reflectTurnUrl(sessionId: string, uuid: string): void {
-  writeUrl(formatHash(sessionId, uuid), 'replace');
+export function reflectTurnUrl(conversation: string | ConversationRef, uuid: string): void {
+  writeUrl(isConversationRef(conversation) ? formatHash(conversation, uuid) : formatHash(conversation, uuid), 'replace');
 }
 
 // Read path: parse the current hash and dispatch the matching action(s).
@@ -129,14 +188,20 @@ function applyHashToStore(deps: UrlRoutingDeps): void {
   // #217 S7 F10 — compare route: enter the comparison (A===B degrades to a plain
   // single-session open, matching the OPEN_COMPARE store guard).
   if (route.compare) {
-    if (route.compare.a === route.compare.b) {
-      deps.dispatch({ type: 'OPEN_CONVERSATION', sessionId: route.compare.a });
+    if (sameConversationRef(route.compare.a, route.compare.b)) {
+      deps.dispatch(route.qualified
+        ? { type: 'OPEN_CONVERSATION', conversationRef: route.compare.a }
+        : { type: 'OPEN_CONVERSATION', sessionId: route.compare.a.key });
     } else {
-      deps.dispatch({ type: 'OPEN_COMPARE', a: route.compare.a, b: route.compare.b });
+      deps.dispatch(route.qualified
+        ? { type: 'OPEN_COMPARE', aRef: route.compare.a, bRef: route.compare.b }
+        : { type: 'OPEN_COMPARE', a: route.compare.a.key, b: route.compare.b.key });
     }
     return;
   }
-  if (route.sessionId === null) {
+  const conversationRef = route.conversationRef
+    ?? (route.sessionId ? legacyClaudeConversationRef(route.sessionId) : null);
+  if (conversationRef === null) {
     // No single action sets view=conversations AND clears selection, so do both:
     // SET_VIEW preserves selection; SELECT_CONVERSATION doesn't touch view.
     deps.dispatch({ type: 'SET_VIEW', view: 'conversations' });
@@ -144,9 +209,11 @@ function applyHashToStore(deps: UrlRoutingDeps): void {
     return;
   }
   const jump = route.turnUuid
-    ? { session_id: route.sessionId, uuid: route.turnUuid }
+    ? { ...(route.qualified ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid: route.turnUuid }
     : undefined;
-  deps.dispatch({ type: 'OPEN_CONVERSATION', sessionId: route.sessionId, jump });
+  deps.dispatch(route.qualified
+    ? { type: 'OPEN_CONVERSATION', conversationRef, jump }
+    : { type: 'OPEN_CONVERSATION', sessionId: conversationRef.key, jump });
 }
 
 // Boot once, then wire the hashchange (URL->store) + subscribeStore (store->URL)
@@ -179,20 +246,24 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
 
   type Snap = {
     view: UIState['view'];
-    sid: string | null;
+    ref: ConversationRef | null;
+    refKey: string | null;
     jumpUuid: string | null;
-    // #217 S7 F10 — `${a}|${b}` while a comparison is open, else null. A simple
-    // change-detection key (the '|' separator never collides — session ids are
-    // url-encoded on the wire).
+    // Collision-safe serialized pair while a comparison is open, else null.
     cmp: string | null;
   };
   const snap = (): Snap => {
     const s = deps.getState();
+    const ref = s.selectedConversationRef
+      ?? (s.selectedConversationId ? legacyClaudeConversationRef(s.selectedConversationId) : null);
     return {
       view: s.view,
-      sid: s.selectedConversationId,
+      ref,
+      refKey: ref ? conversationRefKey(ref) : null,
       jumpUuid: s.conversationJump?.uuid ?? null,
-      cmp: s.compare ? `${s.compare.a}|${s.compare.b}` : null,
+      cmp: s.compare
+        ? JSON.stringify([conversationRefKey(s.compare.a), conversationRefKey(s.compare.b)])
+        : null,
     };
   };
   let prev: Snap = snap(); // initialize from post-boot state -> no echo write
@@ -205,7 +276,7 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
   const onStoreChange = () => {
     const s = deps.getState();
     const curr = snap();
-    const jumpTargetsSid = s.conversationJump?.session_id === curr.sid;
+    const jumpTargetsRef = !!s.conversationJump && sameConversationRef(conversationJumpRef(s.conversationJump), curr.ref);
     // #217 S7 F10 — comparison is the highest-priority URL state: while a
     // comparison is open, the hash is the compare route regardless of the
     // anchor sid OPEN_COMPARE also set. Push on entering/changing a comparison.
@@ -229,30 +300,30 @@ export function installUrlRouting(deps: UrlRoutingDeps = {
     // clear-write path — carry a jump if one rides along (e.g. an "open in reader"
     // that closes the comparison and lands on a specific turn).
     if (prev.cmp && !curr.cmp) {
-      let desired = baseHash(curr.view, curr.sid);
-      if (curr.view === 'conversations' && curr.sid && curr.jumpUuid && jumpTargetsSid) {
-        desired = formatHash(curr.sid, curr.jumpUuid);
+      let desired = baseHash(curr.view, curr.ref);
+      if (curr.view === 'conversations' && curr.ref && curr.jumpUuid && jumpTargetsRef) {
+        desired = formatHash(curr.ref, curr.jumpUuid);
       }
       writeUrl(desired, 'push');
       prev = curr;
       return;
     }
-    if (curr.view !== prev.view || curr.sid !== prev.sid) {
+    if (curr.view !== prev.view || curr.refKey !== prev.refKey) {
       // conversation-level change -> push (carry the turn if a jump rides along)
-      let desired = baseHash(curr.view, curr.sid);
-      if (curr.view === 'conversations' && curr.sid && curr.jumpUuid && jumpTargetsSid) {
-        desired = formatHash(curr.sid, curr.jumpUuid);
+      let desired = baseHash(curr.view, curr.ref);
+      if (curr.view === 'conversations' && curr.ref && curr.jumpUuid && jumpTargetsRef) {
+        desired = formatHash(curr.ref, curr.jumpUuid);
       }
       writeUrl(desired, 'push');
     } else if (
-      curr.sid &&
-      curr.sid === prev.sid &&
+      curr.ref &&
+      curr.refKey === prev.refKey &&
       curr.jumpUuid &&
       curr.jumpUuid !== prev.jumpUuid &&
-      jumpTargetsSid
+      jumpTargetsRef
     ) {
       // jump within the same conversation -> replace (covers u1 -> u2)
-      writeUrl(formatHash(curr.sid, curr.jumpUuid), 'replace');
+      writeUrl(formatHash(curr.ref, curr.jumpUuid), 'replace');
     }
     // else (jump-clear, search edits, unrelated state): no write.
     prev = curr;

@@ -506,6 +506,11 @@ def test_real_dispatch_keeps_the_unchanged_provider_object_across_owned_changes(
         ns["_cctally_cache"].sync_cache(cache)
     finally:
         cache.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        ns["_cctally_cache"].sync_claude_conversations(conversations)
+    finally:
+        conversations.close()
     monkeypatch.setitem(
         ns, "sync_cache", lambda _conn: SimpleNamespace(lock_contended=False),
     )

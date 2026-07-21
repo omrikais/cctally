@@ -7,9 +7,11 @@ process under a fake HOME.
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CCTALLY = REPO / "bin" / "cctally"
@@ -121,8 +123,8 @@ def test_gather_install_is_brew_true_when_keg(tmp_path):
 
 def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
                        msg_sessions: int, pending_flag: "str | None" = None):
-    """Build a cache.db at <home>/.local/share/cctally/cache.db (via the real
-    _apply_cache_schema) with `rollup_rows` conversation_sessions rows and
+    """Build conversations.db at <home>/.local/share/cctally/ (via the real
+    conversation schema) with `rollup_rows` conversation_sessions rows and
     `msg_sessions` distinct conversation_messages session_ids, optionally arming
     a `pending_flag` in cache_meta. Mirrors the path the gather reads."""
     import sqlite3
@@ -130,9 +132,9 @@ def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
     import _cctally_db as db  # noqa: PLC0415
     cdir = home / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(cdir / "cache.db"))
+    conn = sqlite3.connect(str(cdir / "conversations.db"))
     try:
-        db._apply_cache_schema(conn)
+        db._apply_conversations_schema(conn)
         for i in range(rollup_rows):
             conn.execute(
                 "INSERT INTO conversation_sessions(session_id, msg_count) "
@@ -245,7 +247,7 @@ def test_gather_rollup_in_progress_via_pending_flag(tmp_path):
 
 def test_gather_rollup_in_progress_via_held_lock(tmp_path):
     """#218 I-C.4: the NON-BLOCKING cache.db.lock flock probe — a writer holding
-    the lock (no pending flag) → in_progress True via the flock branch, NOT the
+    the transcript lock (no pending flag) → in_progress True via the flock branch, NOT the
     pending-flag branch. This is the mirror image of
     test_gather_rollup_mismatch_quiescent: the SAME seed (rollup != msgs, no
     flag) is in_progress False when the lock is FREE, so a held lock is the only
@@ -258,7 +260,9 @@ def test_gather_rollup_in_progress_via_held_lock(tmp_path):
     import fcntl
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     _seed_rollup_cache(tmp_path, rollup_rows=2, msg_sessions=4)  # no pending flag
-    lock_path = tmp_path / ".local" / "share" / "cctally" / "cache.db.lock"
+    lock_path = (
+        tmp_path / ".local" / "share" / "cctally" / "conversations.db.lock"
+    )
     fh = open(lock_path, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX)   # a writer mid-walk holds it
@@ -269,8 +273,34 @@ def test_gather_rollup_in_progress_via_held_lock(tmp_path):
         fh.close()
 
 
+def test_gather_rollup_probe_does_not_wait_on_exclusive_db_lock(tmp_path):
+    """#320: dashboard doctor precompute must not inherit SQLite's 5s timeout."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=2, msg_sessions=4)
+    db_path = (
+        tmp_path / ".local" / "share" / "cctally" / "conversations.db"
+    )
+    holder = sqlite3.connect(db_path)
+    try:
+        holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+        holder.execute("BEGIN EXCLUSIVE")
+        holder.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) "
+            "VALUES ('exclusive_probe','held')"
+        )
+        started = time.monotonic()
+        state = _run_gather(tmp_path)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"doctor transcript probe blocked for {elapsed:.2f}s"
+        assert state["conv_sessions_rollup_count"] is None
+        assert state["conv_messages_distinct_sessions"] is None
+    finally:
+        holder.rollback()
+        holder.close()
+
+
 def test_gather_rollup_none_when_cache_absent(tmp_path):
-    """No cache.db → both counts None, in_progress False (kernel degrades OK)."""
+    """No conversations.db → both counts None, in_progress False."""
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     st = _run_gather(tmp_path)
     assert st["conv_sessions_rollup_count"] is None

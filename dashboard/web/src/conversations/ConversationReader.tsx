@@ -47,7 +47,26 @@ import { fmt } from '../lib/fmt';
 import { abbreviateModel } from '../lib/modelName';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { loadReadingPos } from '../store/readingPosition';
-import type { ConversationItem, ConversationOutline, OpenIntent, SubagentMeta } from '../types/conversation';
+import {
+  conversationJumpRef,
+  conversationRefKey,
+  sameConversationRef,
+  type ConversationDetail,
+  type ConversationItem,
+  type ConversationJump,
+  type ConversationOutline,
+  type ConversationRef,
+  type OpenIntent,
+  type SubagentMeta,
+} from '../types/conversation';
+
+function readerJump(ref: ConversationRef, uuid: string, qualified: boolean): ConversationJump {
+  return {
+    ...(qualified ? { conversation_ref: ref } : {}),
+    session_id: ref.key,
+    uuid,
+  };
+}
 
 // #186 — belt-and-suspenders title-only skip predicate. Mirrors the server
 // `_CMD_FAMILY_RE` / `_looks_like_command_plumbing` (bin/_lib_conversation_query.py):
@@ -193,9 +212,56 @@ const ReaderItem = forwardRef<HTMLDivElement, Record<string, unknown>>(
 // toggle button can reflect open/closed state; Tasks 4/5 consume it further
 // (jump-to-next targets, token footer). The scroll-sync IntersectionObserver
 // below is independent of it (it observes the reader's own rendered turns).
-export function ConversationReader({ sessionId, mobileBack, outline, growthNonce, live }:
-  { sessionId: string; mobileBack?: boolean; outline?: ConversationOutline | null;
-    growthNonce?: number; live?: boolean }) {
+type ConversationReaderProps = {
+  conversationRef?: ConversationRef;
+  // Legacy Claude test/boundary input. Production callers pass conversationRef.
+  sessionId?: string;
+  mobileBack?: boolean;
+  outline?: ConversationOutline | null;
+  growthNonce?: number;
+  live?: boolean;
+};
+
+function ProviderThreadNav({ detail, conversationRef }: { detail: ConversationDetail; conversationRef: ConversationRef }) {
+  const meta = detail.provider_meta;
+  if (!meta) return null;
+  const open = (key: string) => dispatch({
+    type: 'SELECT_CONVERSATION',
+    conversationRef: { source: meta.source, key },
+  });
+  const tokens = meta.tokens;
+  return (
+    <div className="conv-provider-strip" aria-label={`${meta.source === 'codex' ? 'Codex' : 'Claude'} conversation context`}>
+      <span className={`conv-source-badge conv-source-badge--${meta.source}`}>{meta.source === 'codex' ? 'Codex' : 'Claude'}</span>
+      {meta.parent && (
+        <button type="button" className="conv-thread-link" onClick={() => open(meta.parent!.conversation_key)}>
+          ← Parent · {meta.parent.title || 'conversation'}
+        </button>
+      )}
+      {(meta.children ?? []).map((child) => (
+        <button key={child.conversation_key} type="button" className="conv-thread-link" onClick={() => open(child.conversation_key)}>
+          Child → {child.title || 'conversation'} · {fmt.usd2(child.cost_usd)}
+        </button>
+      ))}
+      {tokens?.source === 'codex' && (
+        <span className="conv-provider-tokens">
+          in {fmt.tokens(tokens.input)} · out {fmt.tokens(tokens.output)} · cached in {fmt.tokens(tokens.cached_input ?? 0)} · reasoning out {fmt.tokens(tokens.reasoning_output ?? 0)}
+        </span>
+      )}
+      {(meta.unattributed_cost_usd ?? 0) > 0 && (
+        <span className="conv-provider-unattributed">unattributed {fmt.usd2(meta.unattributed_cost_usd ?? 0)}</span>
+      )}
+      {meta.source === 'codex' && <span className="conv-provider-capability">media unavailable</span>}
+      <span className="sr-only">Qualified conversation {conversationRef.key}</span>
+    </div>
+  );
+}
+
+export function ConversationReader({ conversationRef: qualifiedRef, sessionId: legacySessionId, mobileBack, outline, growthNonce, live }: ConversationReaderProps) {
+  const conversationRef = qualifiedRef ?? { source: 'claude', key: legacySessionId! };
+  const qualifiedInput = qualifiedRef != null;
+  const sessionId = conversationRef.key;
+  const identityKey = conversationRefKey(conversationRef);
   // #217 S3 E2 — compute the open intent ONCE per session open so the hook's
   // FIRST request is precedence-correct (Codex P1; no head-fetch-then-redirect).
   // Precedence: (1) a deep-link / jump anchor for THIS session wins; (2) else a
@@ -209,12 +275,12 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   const openIntent = useMemo<OpenIntent | null>(() => {
     if (!sessionId) return null;
     const j = getState().conversationJump;
-    if (j && j.session_id === sessionId) return { kind: 'anchor', uuid: j.uuid };
-    const saved = loadReadingPos(sessionId);
+    if (j && sameConversationRef(conversationJumpRef(j), conversationRef)) return { kind: 'anchor', uuid: j.uuid };
+    const saved = loadReadingPos(conversationRef);
     if (saved) return { kind: 'restore', uuid: saved.uuid };
     return { kind: 'tail' };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [identityKey]);
   const jump = useSyncExternalStore(subscribeStore, () => getState().conversationJump);
   // #228 S3 B3 — read the protected-anchor sources BEFORE the hook so the
   // windowed-cap trim never drops the turn the user is on / navigating to. The
@@ -226,7 +292,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // `conversationJump` for THIS session), the keyboard current turn, and the
   // explicit pin. Memoized on the member uuids so identity is stable between
   // unrelated renders.
-  const jumpUuidForSession = jump && jump.session_id === sessionId ? jump.uuid : null;
+  const jumpUuidForSession = jump && sameConversationRef(conversationJumpRef(jump), conversationRef) ? jump.uuid : null;
   // #291 — a same-session jump is in flight (find / outline / restore / Latest /
   // landmark nav / deep-link — all flow through `conversationJump`). Suspend
   // react-virtuoso's raw-truthy resize-autoscroll-to-LAST watcher for the jump's
@@ -242,7 +308,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
     return s;
   }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(sessionId, { outlineTurns: outline?.turns, openIntent, protectedUuids, growthNonce, live });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(conversationRef, { outlineTurns: outline?.turns, openIntent, protectedUuids, growthNonce, live });
   // #232 — the imperative Virtuoso handle (scrollToIndex for jumps / keyboard
   // nav / the "↓ N new" pill) and a live mirror of the firstItemIndex so
   // `itemContent`'s array-index math (`virtualIndex − firstItemIndex`) reads the
@@ -261,7 +327,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // token lets each run own itself (a new jump bumps it via `beginProgrammaticRun`;
   // an older superseded run detects the mismatch via `isCurrentRun` after every
   // await and bails WITHOUT clearing a newer run's suppression).
-  const { gates, lifecycle, generation, followMode, follow } = useReaderMachine(sessionId);
+  const { gates, lifecycle, generation, followMode, follow } = useReaderMachine(identityKey);
   // #228 S1 (F3) — after CLOSE_COMPARE, return focus to the compare trigger
   // once the single reader has rendered. The reader loads async, so a single
   // rAF fired at close time can land during the loading branch and miss the
@@ -542,6 +608,10 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   focusModeRef.current = focusMode;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  const conversationRefRef = useRef(conversationRef);
+  conversationRefRef.current = conversationRef;
+  const qualifiedInputRef = useRef(qualifiedInput);
+  qualifiedInputRef.current = qualifiedInput;
   // #177 S6 — live mirror so the stable n/N keymap closures read the open flag
   // without re-registering the keymap array.
   const convFindOpenRef = useRef(convFindOpen);
@@ -729,13 +799,13 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
       atBottomRef.current = true;  // land at the bottom so live appends stick
       dispatch({
         type: 'OPEN_CONVERSATION',
-        sessionId: la.session_id,
-        jump: { session_id: la.session_id, uuid: la.uuid },
+        conversationRef,
+        jump: readerJump(conversationRef, la.uuid, qualifiedInput),
       });
     } finally {
       setJumpingLatest(false);
     }
-  }, [detail?.last_anchor, hookJumpToLatest]);
+  }, [detail?.last_anchor, hookJumpToLatest, identityKey]);
   // Live mirror so the stable `End` keymap closure calls the latest handler
   // without re-registering the `[]`-dep keymap array (the jumpNextRef pattern).
   const jumpToLatestRef = useRef(jumpToLatest);
@@ -768,7 +838,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // it so it only ever rises within a session (reset on session switch): "heaviest
   // turn seen this session" is the correct micro-bar denominator AND a stable
   // context that lets the memo hold across paging/trim commits.
-  const sessionMaxTurnCost = useMonotonicMax(sessionMaxTurnCostRaw, sessionId);
+  const sessionMaxTurnCost = useMonotonicMax(sessionMaxTurnCostRaw, identityKey);
   // #217 S6 F3 — cumulative cost through the topmost-visible turn for the header
   // chip. `approx` ≡ hasPrev: any unloaded earlier page makes the prefix-sum a
   // lower bound (the honesty marker, Codex P1).
@@ -899,8 +969,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // size itself from context (no per-item store subscription); the provider
   // identity flips when the session's heaviest loaded turn cost changes.
   const transcriptCtx = useMemo(
-    () => ({ sessionId, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost, anonMode }),
-    [sessionId, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode],
+    () => ({ sessionId, conversationRef, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost, anonMode }),
+    [identityKey, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode],
   );
 
   // #232 — the bottom sentinel observer, the top sentinel observer, and the
@@ -986,11 +1056,11 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     if (!cmd) return;
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId,
-      jump: { session_id: sessionId, uuid: cmd.uuid },
+      conversationRef,
+      jump: readerJump(conversationRef, cmd.uuid, qualifiedInput),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openIntent, sessionId, detail?.session_id]);
+  }, [openIntent, identityKey, detail?.session_id]);
 
   // #177 S5 §3 — scroll-sync. A deduped IntersectionObserver over the reader's
   // rendered turns writes the topmost-visible anchor uuid to the store, where
@@ -1056,7 +1126,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // (a paged-in target's ref attaches on the next commit) and when forcedOpenKeys
   // changes (a force-opened thread's member ref attaches in that commit).
   useEffect(() => {
-    if (!jump || jump.session_id !== sessionId) {
+    if (!jump || !sameConversationRef(conversationJumpRef(jump), conversationRef)) {
       // Jump cleared, or it now points at another session — release any force-pin
       // so a thread we expanded for it isn't left pinned (the user regains
       // collapse control). No loop: this re-fires on the forcedOpenKeys dep,
@@ -1422,7 +1492,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     refCallbacks.current.clear();
     cardRefCallbacks.current.clear();
     cardRefs.current.clear();
-  }, [sessionId]);
+  }, [identityKey]);
 
   // The reused reader must not carry a force-pin across sessions (subagent_key is
   // only an agent-file hash). Reset on every session change; no-op on first mount.
@@ -1431,7 +1501,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   useEffect(() => {
     setForcedOpenKeys(new Set());
     setBulkSweep({ rev: 0, open: false });
-  }, [sessionId]);
+  }, [identityKey]);
 
   // #175 — the reused reader must not carry the live-tail pill/scroll state across
   // sessions. Clearing `newCount` drops a stale "↓ N new" pill the instant we switch
@@ -1476,7 +1546,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     // reaches the bottom-state edge nor runs a jump). The unmount cleanup that
     // cancelled this timer now lives in `useReaderMachine` (`gates.dispose()`).
     gates.sessionOpened();
-  }, [sessionId, openIntent, gates, lifecycle, generation, follow]);
+  }, [identityKey, openIntent, gates, lifecycle, generation, follow]);
 
   // Load-in stagger bookkeeping. On a session change the reused reader must
   // forget which turns it has painted, so the new conversation's opening page
@@ -1490,7 +1560,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     // the next conversation doesn't carry the prior session's highlight.
     setJumpedUuid(null);
     if (highlightTimerRef.current != null) { window.clearTimeout(highlightTimerRef.current); highlightTimerRef.current = null; }
-  }, [sessionId]);
+  }, [identityKey]);
 
   // After each commit, mark every currently-rendered top-level group as seen.
   // Runs AFTER the render-time rise classifier has read the prior state
@@ -1545,7 +1615,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
       const cached = riseCacheRef.current.get(anchorUuid);
       if (cached) return cached;
       const isJumpTarget =
-        jump != null && jump.session_id === sessionId && memberUuids.includes(jump.uuid);
+        jump != null && sameConversationRef(conversationJumpRef(jump), conversationRef) && memberUuids.includes(jump.uuid);
       let result: [string, React.CSSProperties | undefined];
       if (reduced || isJumpTarget || seenRef.current.has(anchorUuid)) {
         result = ['', undefined];
@@ -1564,7 +1634,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
       if (!isJumpTarget) riseCacheRef.current.set(anchorUuid, result);
       return result;
     },
-    [reduced, jump, sessionId],
+    [reduced, jump, identityKey],
   );
 
   const getItemRef = useCallback((item: ConversationItem) => {
@@ -1628,7 +1698,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   // Reset the focused-turn cursor to the top on a session switch (the reused
   // reader carries no cursor across conversations). #232 — also clear the ring
   // uuid so a stale cursor turn from the prior conversation doesn't flash.
-  useEffect(() => { setFocusedIndex(0); setCursorUuid(null); }, [sessionId]);
+  useEffect(() => { setFocusedIndex(0); setCursorUuid(null); }, [identityKey]);
 
   // #232 — default the cursor to the FIRST real turn once content renders (the
   // pre-virtualization default was index 0). Only when no cursor is set yet (a
@@ -1865,8 +1935,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     }
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId: sessionIdRef.current,
-      jump: { session_id: sessionIdRef.current, uuid: turn.uuid },
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, turn.uuid, qualifiedInputRef.current),
     });
   }, [pulseClusterButton]);
   const jumpNextRef = useRef(jumpNext);
@@ -1893,8 +1963,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
     }
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId: sessionIdRef.current,
-      jump: { session_id: sessionIdRef.current, uuid: turn.uuid },
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, turn.uuid, qualifiedInputRef.current),
     });
   }, []);
   const jumpToLastRef = useRef(jumpToLast);
@@ -1906,8 +1976,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
   const jumpToCompletion = useCallback((uuid: string) => {
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId: sessionIdRef.current,
-      jump: { session_id: sessionIdRef.current, uuid },
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, uuid, qualifiedInputRef.current),
     });
   }, []);
 
@@ -2162,8 +2232,8 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
             dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
             dispatch({
               type: 'OPEN_CONVERSATION',
-              sessionId,
-              jump: { session_id: sessionId, uuid: g.firstUuid },
+              conversationRef,
+              jump: readerJump(conversationRef, g.firstUuid, qualifiedInput),
             });
           }}
         >· {g.count} hidden ·</button>
@@ -2343,7 +2413,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
         <div className="conv-reader-head conv-reader-head--mobile">
           <div className="conv-reader-row1">
             {mobileBack && (
-              <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
+              <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', conversationRef: null })}>← Back</button>
             )}
             <div className="conv-reader-headmain">
               <div className="conv-reader-title">{title || detail.session_id}</div>
@@ -2355,11 +2425,11 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
                 Expand-all, Collapse-all, plus the read-only completion + cost rows.
                 Built on the shared menu primitive (Escape-to-close, focus-return). */}
             <ReaderOverflowMenu
-              sessionId={sessionId}
+              sessionId={conversationRef}
               exportTitle={detail.title}
               anonMode={anonMode}
               onToggleAnon={toggleAnonMode}
-              onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+              onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchorRef: conversationRef })}
               onLatest={detail.last_anchor ? () => { void jumpToLatest(); } : null}
               latestBusy={jumpingLatest}
               onExpandAll={() => sweepDetails(true)}
@@ -2404,7 +2474,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
       ) : (
       <div className={`conv-reader-head${density === 'compact' ? ' conv-reader-head--folded' : ''}`}>
         {mobileBack && (
-          <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', sessionId: null })}>← Back</button>
+          <button type="button" className="conv-back" onClick={() => dispatch({ type: 'SELECT_CONVERSATION', conversationRef: null })}>← Back</button>
         )}
         {/* #177 S5 — flex row: title/meta block grows, controls right-align. The
             Task-3 `float: right` on the outline toggle is dropped (a reviewer
@@ -2449,11 +2519,11 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
                 onClick={toggleOutline}
               >☰ Outline</button>
               <ReaderOverflowMenu
-                sessionId={sessionId}
+                sessionId={conversationRef}
                 exportTitle={detail.title}
                 anonMode={anonMode}
                 onToggleAnon={toggleAnonMode}
-                onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+                onCompare={() => dispatch({ type: 'START_COMPARE_PICK', anchorRef: conversationRef })}
                 onLatest={detail.last_anchor ? () => { void jumpToLatest(); } : null}
                 latestBusy={jumpingLatest}
                 onExpandAll={() => sweepDetails(true)}
@@ -2581,7 +2651,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
             </button>
             {/* #217 S5 §4 — whole-session export menu (F1/F5). Local state with
                 its own Esc/outside-click close; fetches the new /export route. */}
-            <ExportMenu sessionId={sessionId} title={detail.title} anonMode={anonMode} />
+            <ExportMenu conversationRef={conversationRef} title={detail.title} anonMode={anonMode} />
             {/* #217 S7 F10 — "Compare with…" — enters rail pick-mode with this
                 session as the anchor (START_COMPARE_PICK). The rail then shows a
                 banner and rows pick the second session. #304 S3 (Codex F9) — the
@@ -2594,7 +2664,7 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
               data-hdr-role="compare"
               aria-label="Compare this session with another"
               title="Compare with another session"
-              onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchor: sessionId })}
+              onClick={() => dispatch({ type: 'START_COMPARE_PICK', anchorRef: conversationRef })}
             ><span className="conv-compare-with-glyph" aria-hidden="true">⟷ </span>Compare with…</button>
           </div>
           {/* BULK — ⤢⤡ moves from first to LAST action position (least-used
@@ -2645,12 +2715,13 @@ export function ConversationReader({ sessionId, mobileBack, outline, growthNonce
         </div>
       </div>
       )}
+      <ProviderThreadNav detail={detail} conversationRef={conversationRef} />
       {/* #177 S6 — the floating in-conversation find bar. Absolutely
           positioned top-right inside the reader column (zero layout shift). The
           stepRef wires its cursor to the reader's n/N bindings. */}
       {convFindOpen && (
         <FindBar
-          sessionId={sessionId}
+          sessionId={qualifiedInput ? conversationRef : sessionId}
           onClose={onFindClose}
           onTermsChange={onFindTermsChange}
           stepRef={findStepRef}

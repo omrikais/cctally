@@ -75,3 +75,20 @@ def test_reclaimable_check_is_registered_in_database_category():
     )
 
     assert ("db.reclaimable", "_check_db_reclaimable") in database
+    assert (
+        "db.conversations_reclaimable",
+        "_check_db_conversations_reclaimable",
+    ) in database
+
+
+def test_conversation_reclaimable_warns_with_targeted_remediation():
+    result = doctor._check_db_conversations_reclaimable(_state(
+        conversations_db_page_count=200,
+        conversations_db_freelist_count=50,
+    ))
+
+    assert result.id == "db.conversations_reclaimable"
+    assert result.severity == "warn"
+    assert result.summary == "high — 25.0% of conversations.db pages are free"
+    assert "cctally db vacuum --db conversations" in (result.remediation or "")
+    assert result.details["conversations_db_free_ratio"] == 0.25

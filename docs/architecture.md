@@ -39,16 +39,28 @@ Every JSONL-reading command goes through a delta cache:
    re-parsing JSONL.
 
 **Concurrency:** `fcntl.flock` on `cache.db.lock` (Claude) and
-`cache.db.codex.lock` (Codex) serializes writers. Losers read the existing
-cache without blocking.
+`cache.db.codex.lock` (Codex) serializes compact accounting writers. Transcript
+writers use the independent `conversations.db.lock`,
+`conversations.db.codex.lock`, and maintenance lock, so a large reingest never
+extends the core sync critical section.
 
 **Pricing freshness:** cost is **not** stored in the cache. It's computed
 at query time from `CLAUDE_MODEL_PRICING` / `CODEX_MODEL_PRICING`. Update
 the dict, and the next read sees the new prices — no invalidation.
 
-**Resilience:** the cache is fully re-derivable. `rm cache.db` or
-`cache-sync --rebuild` is always safe. If `cache.db` can't be opened (e.g.
+**Resilience:** both derived stores are fully re-derivable; use
+`cache-sync --rebuild` rather than unlinking a live SQLite family. If
+`cache.db` can't be opened (e.g.
 read-only fs), `get_entries()` falls back to direct JSONL parse.
+
+## The transcript/search store (`conversations.db`)
+
+`sync_claude_conversations()` and `sync_codex_conversations()` maintain their
+own source cursors, normalized rows, browse rollups, and FTS indexes. Conversation
+readers open this file as `main` and attach `cache.db` read-only for cost/token
+and compact Codex-thread metadata. Core accounting connections never attach the
+transcript store, so it can be missing, locked, or rebuilding without blanking
+the dashboard's accounting/quota panels.
 
 **JSONL dedup tiebreaker (v1.12.0+).** Two `type:assistant` rows in a
 single `~/.claude/projects/**/*.jsonl` can share the same

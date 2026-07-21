@@ -13,7 +13,7 @@ cctally db recover --db {cache,stats} [--yes]
 cctally db repair --db stats --yes
 cctally db backup --db {cache,stats} [--output <path>]
 cctally db checkpoint [--db {cache,stats}] [--json]
-cctally db vacuum [--db {cache,stats,all}]
+cctally db vacuum [--db {cache,conversations,stats,all}]
 ```
 
 ## Description
@@ -265,14 +265,14 @@ binary drains prod).
 `busy` / the WAL was not fully truncated through the timeout — an
 actionable "something is still holding it" signal.
 
-## `cctally db vacuum [--db {cache,stats,all}]`
+## `cctally db vacuum [--db {cache,conversations,stats,all}]`
 
-Reclaim disk space by rewriting the database file compactly (SQLite `VACUUM`).
+Reclaim disk space by rewriting the database file compactly (SQLite `VACUUM`). Use `--db conversations` for space freed by transcript retention; `--db all` includes `cache.db`, `conversations.db`, and `stats.db`.
 Deleting rows — for example the transcript retention prune (`cache-sync
 --prune-conversations`, or the dashboard's automatic once-a-day pass) — frees
 pages *inside* the file but never shrinks it on disk; `db vacuum` is what
 actually returns that space to the filesystem. `--db` selects `cache` (default),
-`stats`, or `all`.
+`conversations`, `stats`, or `all`.
 
 This is **never automatic** and always explicit. VACUUM needs exclusive access:
 the command drains the WAL and rewrites the file under a real SQLite

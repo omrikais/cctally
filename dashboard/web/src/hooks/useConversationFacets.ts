@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { fetchJson, isAbortError } from '../lib/fetchJson';
 import type { ConversationFacets } from '../types/conversation';
+import type { ConversationSource } from '../types/conversation';
+import { qualifiedFacetsUrl, type QualifiedFacetsEnvelope } from '../lib/conversationTransport';
 
 // Backoff before the single facets-fetch retry. The likeliest transient cause is
 // a startup race (server not yet serving) or a momentary hiccup during a heavy
@@ -18,17 +20,31 @@ const FACETS_RETRY_MS = 700;
 // empty immediately, leaving the popover option-less until it was reopened. It
 // now retries ONCE after a short backoff before settling empty (bounded so a
 // persistently-down endpoint can't spin). Helps the Project axis identically.
-export function useConversationFacets(): ConversationFacets {
+export function useConversationFacets(source: ConversationSource = 'claude'): ConversationFacets {
   const [facets, setFacets] = useState<ConversationFacets>({ projects: [], models: [] });
   useEffect(() => {
     const ctl = new AbortController();
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const load = (attempt: number): void => {
-      fetchJson<ConversationFacets>('/api/conversations/facets', ctl.signal)
+      fetchJson<ConversationFacets | QualifiedFacetsEnvelope>(
+        source === 'codex' ? qualifiedFacetsUrl('codex') : '/api/conversations/facets', ctl.signal)
         // #278 Theme C — normalize on the SUCCESS path, not just initial/error
         // state: an older or mocked response carrying only `{ projects }` would
         // otherwise set `models: undefined` and crash the popover's `.map`.
-        .then((r) => setFacets({ projects: r.projects ?? [], models: r.models ?? [] }))
+        .then((raw) => {
+          if (source === 'codex') {
+            const r = raw as QualifiedFacetsEnvelope;
+            setFacets({
+              projects: r.facets.projects.map((p) => ({
+                project_label: p.project_label ?? 'Unnamed project', count: p.count, filter_value: p.project_key,
+              })),
+              models: r.facets.models.map((m) => ({ family: m.model, count: m.count, filter_value: m.model })),
+            });
+          } else {
+            const r = raw as ConversationFacets;
+            setFacets({ projects: r.projects ?? [], models: r.models ?? [] });
+          }
+        })
         .catch((e) => {
           if (isAbortError(e)) return;
           if (attempt === 0) { retryTimer = setTimeout(() => load(1), FACETS_RETRY_MS); return; }
@@ -37,6 +53,6 @@ export function useConversationFacets(): ConversationFacets {
     };
     load(0);
     return () => { ctl.abort(); if (retryTimer) clearTimeout(retryTimer); };
-  }, []);
+  }, [source]);
   return facets;
 }

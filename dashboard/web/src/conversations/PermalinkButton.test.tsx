@@ -24,9 +24,9 @@ describe('PermalinkButton', () => {
     // from the runtime so the assertion is robust to jsdom's default host
     // (this version reports http://localhost:3000, pathname '/').
     expect(writeText).toHaveBeenCalledWith(
-      `${window.location.origin}/#/conversations/s/u`,
+      `${window.location.origin}/#/conversations/source/claude/s/u`,
     );
-    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/s/u');
+    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/s/u');
     await act(async () => {
       await Promise.resolve();
     });

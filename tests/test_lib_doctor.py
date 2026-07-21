@@ -67,6 +67,7 @@ def test_doctor_state_has_required_fields():
         "cache_db_wal_bytes",
         # #315: read-only cache.db free-page evidence.
         "cache_db_page_count", "cache_db_freelist_count",
+        "conversations_db_page_count", "conversations_db_freelist_count",
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",

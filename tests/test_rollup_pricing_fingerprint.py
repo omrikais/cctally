@@ -59,8 +59,13 @@ def _synced(tmp_path, monkeypatch):
     (projects / "a.jsonl").write_text(
         _asst_line("a1", "ma1", "ra1", "hi", session_id="s1",
                    ts="2026-06-01T00:00:00Z"))
-    conn = ns["open_cache_db"]()
-    cache.sync_cache(conn)
+    core = ns["open_cache_db"]()
+    try:
+        cache.sync_cache(core)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    cache.sync_claude_conversations(conn)
     return cache, conn
 
 
@@ -110,7 +115,7 @@ def test_sync_records_fingerprint_and_clears_flag(tmp_path, monkeypatch):
                      (FP, "STALE"))
         conn.commit()
 
-        cache.sync_cache(conn)  # no new JSONL bytes, but the fp is stale
+        cache.sync_claude_conversations(conn)
 
         assert _get_meta(conn, FLAG) is None, "backfill flag consumed"
         assert _get_meta(conn, FP) == cache.PRICING_SNAPSHOT_DATE

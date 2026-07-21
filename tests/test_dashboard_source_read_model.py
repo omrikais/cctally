@@ -808,6 +808,11 @@ def _seeded_context(tmp_path, monkeypatch):
     cache = ns["open_cache_db"]()
     stats = ns["open_db"]()
     ns["sync_codex_cache"](cache)
+    conversations = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conversations)
+    finally:
+        conversations.close()
     return ns, cache, stats
 
 
@@ -928,6 +933,56 @@ def _cache_root_key(cache: sqlite3.Connection) -> str:
     ).fetchone()
     assert row is not None
     return str(row[0])
+
+
+def test_codex_nonconversation_panels_never_open_conversation_store(
+    tmp_path, monkeypatch,
+):
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    _insert_incomplete_accounting_row(
+        cache,
+        source_path="/cached/active-cycle.jsonl",
+        line_offset=12_001,
+        session_id="active-cycle",
+        timestamp=NOW - dt.timedelta(hours=1),
+    )
+    cache.commit()
+    conversation_path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    for suffix in ("", "-wal", "-shm"):
+        pathlib.Path(str(conversation_path) + suffix).unlink(missing_ok=True)
+    real_connect = sqlite3.connect
+
+    def guarded_connect(database, *args, **kwargs):
+        if "conversations.db" in str(database):
+            raise AssertionError("non-conversation source model opened transcript store")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    try:
+        _install_active_native_cycle(
+            monkeypatch,
+            source_module,
+            reset=NOW + dt.timedelta(days=2),
+            root=_cache_root_key(cache),
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache,
+                stats_conn=stats,
+                range_start=START,
+                now_utc=NOW,
+                display_tz_name="UTC",
+            ),
+            data_version="conversation-store-missing-v1",
+        )
+        assert state.data["hero"]["total_tokens"] > 0
+        assert state.data["periods"]["weekly"]["rows"]
+        assert state.data["projects"]["rows"]
+        assert state.data["sessions"]["rows"]
+    finally:
+        cache.close()
+        stats.close()
 
 
 def _insert_incomplete_accounting_row(

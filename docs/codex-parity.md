@@ -11,9 +11,10 @@ normalization and assembly kernel layer (title, dedup, item/thread grouping,
 cost attribution, outline, browse/facets, search) behind a provider-neutral
 dispatch. S7 now exposes that layer through the dual-form conversation routes,
 the source-aware transcript CLI, qualified export/anonymization, payload
-readback, and the qualified live-tail with Codex child discovery. The native
-React conversation UI and reading position (S8) and later certification remain
-deferred.
+readback, and the qualified live-tail with Codex child discovery. S8 now ships
+the native React Claude/Codex/All conversation workspace, qualified reading
+position and navigation, and truthful mixed-provider comparison/export. Final
+S9 certification remains deferred.
 
 ## S3 provider-aware CLI analytics
 
@@ -139,7 +140,33 @@ untouched. Targeted Codex ingest (`only_paths` + `targeted_clean`) and the
 qualified live-tail SSE add new child threads mid-watch through a budgeted
 directory frontier. Codex media stays capability-gated until real renderable
 media is shown to exist. The React UI, reading position, and cross-source
-combined presentation remain S8.
+combined presentation are delivered by S8.
+
+## S8 qualified conversation workspace
+
+S8 gives Conversations its own `Claude | Codex | All` rail control over the
+persisted source selection. Claude and Codex browse and read through the same
+qualified client contract. `All` issues one strict collection request
+per provider and deterministically merges the results in the browser; it never
+asks the backend for `source=all`, never deduplicates distinct qualified keys,
+and source-labels every row. Because filters and sort are provider-local, the
+combined rail disables them and says so instead of implying a cross-provider
+server query.
+
+The shared reader preserves each provider's native blocks and token meanings,
+including Codex reasoning, cached input, tool events, thread links, payload
+readback, find, export, and live-tail. Qualified Claude references take the same
+neutral-envelope path, so permalinks, outline/find/prompt pagination, bookmarks,
+and reading positions key by the opaque `(source, v1 key)` identity. Colliding
+native UUIDs across providers or Codex roots therefore cannot share browser
+state or routes.
+
+Comparison labels both runs by source. Cost and prompt count remain directly
+comparable; tokens, errors, and files are displayed side by side as
+provider-specific rather than assigned a false delta, and duration is marked
+unavailable across providers. Copying a mixed comparison fetches each complete
+export independently and concatenates two source-labelled sections, never a
+blended transcript.
 
 ## Capability matrix
 
@@ -223,13 +250,13 @@ boundary for current-week output, and derive drift digests from Codex state.
 
 | Outcome | Claude | Codex | Owner | Truthful contract |
 | --- | --- | --- | --- | --- |
-| browse, search, and facets routes | supported | supported | S7 | The dual-form `v1.` entity routes and the strict `?source=` collection routes expose normalized conversations with opaque qualified keys; the React reader UI is S8. |
+| browse, search, and facets routes | supported | supported | S8 | The dual-form `v1.` entity routes and strict `?source=` collection routes expose normalized conversations with opaque qualified keys; the React rail consumes them for Claude, Codex, and locally composed All. |
 | title and outline | supported | supported | S6 | First meaningful user prompt is the initial Codex title fallback; the normalization/assembly kernels derive the title and outline. |
 | tools, reasoning, events | supported | supported | S6 | Preserve observed provider record distinctions in the normalized message rows and neutral detail blocks. |
 | thread nesting | supported | supported | S6 | Use `thread_source`/parent metadata, never an `agent-` filename convention. |
 | find | supported | supported | S7 | In-conversation find anchors both providers with one `item_key` contract and honest FTS/LIKE selection. |
-| comparison and navigation UI | supported | deferred | S8 | Session IDs alone are insufficient identities. |
-| reading position | supported | deferred | S8 | `readingPosition.ts` must store an opaque qualified key. |
+| comparison and navigation UI | supported | supported | S8 | Both runs retain source labels and opaque qualified identities; mixed-provider metrics are compared only where semantics are compatible. |
+| reading position | supported | supported | S8 | `readingPosition.ts` stores source plus opaque qualified key, keeping native-key collisions isolated. |
 | transcript CLI and anonymized/raw export | supported | supported | S7 | Qualified export anonymizes via `build_anon_plan_for_sources`, while `build_anon_plan_for_db` and every bare-Claude call site stay byte-frozen; CLI export byte-matches the HTTP export in both modes. |
 | payload readback and live-tail | supported | supported | S7 | The `block_key` payload selector, plus the qualified live-tail SSE with the budgeted directory-frontier child discovery, degrade only affected capabilities. |
 | media readback | supported | unavailable | S7 | Codex media returns an explicit `capability_unsupported` response until real renderable media is shown to exist in rollouts. |

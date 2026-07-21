@@ -633,7 +633,8 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
         normalized_cache_sql = [" ".join(statement.split()) for statement in cache_sql]
         accounting_queries = [
             statement for statement in normalized_cache_sql
-            if "FROM codex_session_entries AS entries" in statement
+            if statement.startswith("SELECT entries.timestamp_utc")
+            and "FROM codex_session_entries AS entries" in statement
         ]
         assert len(accounting_queries) == 4
         assert all("INDEXED BY idx_codex_entries_ts_root_conversation" in sql

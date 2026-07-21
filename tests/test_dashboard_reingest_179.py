@@ -51,8 +51,13 @@ def env(tmp_path, monkeypatch):
         p.write_text(_asst_line(f"u-{name}", f"m-{name}", f"r-{name}", f"hi {name}")
                      + _user_line(f"uu-{name}", f"ping {name}"))
         paths.append(p)
-    conn = ns["open_cache_db"]()
-    cache_mod.sync_cache(conn)                  # populate conversation_messages, no flag
+    core = ns["open_cache_db"]()
+    try:
+        cache_mod.sync_cache(core)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    cache_mod.sync_claude_conversations(conn)
     assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] >= 8
     yield cache_mod, conn, projects, paths
     try:
@@ -171,12 +176,12 @@ def test_generation_change_resets_cursor(env):
 def test_sync_cache_consumes_reingest_and_rebuild_clears_cursor(env):
     cache_mod, conn, projects, paths = env
     _set_meta(conn, ENRICH_FLAG, "1")
-    cache_mod.sync_cache(conn)                  # integration: flag consumed via new helper
+    cache_mod.sync_claude_conversations(conn)
     assert _get_meta(conn, ENRICH_FLAG) is None
     # rebuild must also clear a stray cursor/gen
     _set_meta(conn, CURSOR_KEY, str(paths[1]))
     _set_meta(conn, GEN_KEY, ENRICH_FLAG)
-    cache_mod.sync_cache(conn, rebuild=True)
+    cache_mod.sync_claude_conversations(conn, rebuild=True)
     assert _get_meta(conn, CURSOR_KEY) is None and _get_meta(conn, GEN_KEY) is None
 
 
@@ -362,6 +367,14 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
         def run(self):
             pass
     monkeypatch.setattr(dash, "_DashboardUpdateCheckThread", _NoopThread)
+    real_thread = threading.Thread
+
+    def _thread_factory(*args, **kwargs):
+        if kwargs.get("name") == "dashboard-conversations-sync":
+            return _NoopThread()
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(dash.threading, "Thread", _thread_factory)
 
     # Record the REAL bind, then stop cmd_dashboard before serve_forever.
     bound: dict = {}
@@ -387,7 +400,7 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
             rc["bind_reached"] = True
         except BaseException as exc:                # surface anything unexpected
             rc["err"] = repr(exc)
-    worker = threading.Thread(target=run_it, daemon=True)
+    worker = real_thread(target=run_it, daemon=True)
     worker.start()
     worker.join(timeout=10)
 
@@ -439,7 +452,7 @@ def _spawn_and_grandchild_lines():
 def _grandchild_links(ns):
     """True iff session s1's grandchild eeee5555 links into subagent_meta."""
     import _lib_conversation_query as cq
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     try:
         out = cq.get_conversation(conn, "s1")
     finally:
@@ -457,14 +470,17 @@ def test_017_flag_consumed_by_sync_and_shared_flag_untouched(tmp_path, monkeypat
     projects.mkdir(parents=True, exist_ok=True)
     (projects / "s1.jsonl").write_text(_spawn_and_grandchild_lines())
 
-    conn = ns["open_cache_db"]()
-    cache_mod.sync_cache(conn)                          # initial ingest
+    core = ns["open_cache_db"]()
+    cache_mod.sync_cache(core)
+    core.close()
+    conn = ns["open_conversations_db"]()
+    cache_mod.sync_claude_conversations(conn)
     # Arm ONLY the distinct 017 flag (simulating migration 017 having run).
     _set_meta(conn, NESTED_FLAG, "1")
     conn.close()
 
-    conn = ns["open_cache_db"]()
-    cache_mod.sync_cache(conn)                          # consumes the flag
+    conn = ns["open_conversations_db"]()
+    cache_mod.sync_claude_conversations(conn)
     assert _get_meta(conn, NESTED_FLAG) is None, "sync must clear the 017 flag"
     assert _get_meta(conn, SHARED_FLAG) is None, \
         "sync must NOT arm/leave the shared conversation_reingest_pending flag"
@@ -482,16 +498,19 @@ def test_017_grandchild_over_16kb_relinks_after_reingest(tmp_path, monkeypatch):
     projects.mkdir(parents=True, exist_ok=True)
     (projects / "s1.jsonl").write_text(_spawn_and_grandchild_lines())
 
-    conn = ns["open_cache_db"]()
-    cache_mod.sync_cache(conn)
+    core = ns["open_cache_db"]()
+    cache_mod.sync_cache(core)
+    core.close()
+    conn = ns["open_conversations_db"]()
+    cache_mod.sync_claude_conversations(conn)
     conn.close()
     assert _grandchild_links(ns), "grandchild must link after the initial ingest stamp"
 
     # Force the migration-017 reingest path: arm the flag, re-sync, confirm the
     # offset-0 re-parse re-derives the structured agent_id and the link survives.
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     _set_meta(conn, NESTED_FLAG, "1")
-    cache_mod.sync_cache(conn)
+    cache_mod.sync_claude_conversations(conn)
     assert _get_meta(conn, NESTED_FLAG) is None
     conn.close()
     assert _grandchild_links(ns), "grandchild must STILL link after the 017 reingest"

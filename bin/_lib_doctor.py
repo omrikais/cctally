@@ -206,6 +206,10 @@ class DoctorState:
     # cache was absent or unreadable; the check degrades to OK.
     cache_db_page_count: Optional[int] = None
     cache_db_freelist_count: Optional[int] = None
+    # #320: the independently large transcript store needs the same reclaim
+    # visibility, with remediation targeted at its own VACUUM surface.
+    conversations_db_page_count: Optional[int] = None
+    conversations_db_freelist_count: Optional[int] = None
     # #294 S2: root-qualified physical Codex quota freshness, per-root native
     # hook state, and lifecycle activity are gathered by _cctally_doctor.
     codex_quota_windows: Optional[list[dict]] = None
@@ -1235,21 +1239,22 @@ def _check_data_conversation_sessions_rollup(s: DoctorState) -> CheckResult:
     row per distinct ``conversation_messages.session_id`` (#217 S1 / U9).
 
     OK when the two counts are equal, when either is ``None`` (pre-rollup or an
-    unreadable cache.db — consistent with the kernel's graceful-degrade posture),
+    unreadable conversations.db — consistent with the kernel's graceful-degrade
+    posture),
     OR when a sync/reingest/backfill is in progress. WARN ONLY on a mismatch
     observed in a QUIESCENT cache.
 
-    False-WARN avoidance (Codex P2): ``sync_cache`` commits
+    False-WARN avoidance (Codex P2): ``sync_claude_conversations`` commits
     ``conversation_messages`` per file *before* the ``conversation_sessions``
     recompute, and resumable reingest commits per file before its rollup
     completes — so an unsynchronized read can transiently mismatch. The
     in-progress signal (``conv_rollup_sync_in_progress``) is set by
-    ``doctor_gather_state`` from a NON-BLOCKING ``cache.db.lock`` flock probe
+    ``doctor_gather_state`` from a NON-BLOCKING ``conversations.db.lock`` flock probe
     (lock held ⇒ a writer is mid-flight) AND the presence of any pending
     ``cache_meta`` reingest/split/backfill flag; if either says in-progress, this
     stays OK. Doctor remains read-only and never blocks on the lock.
 
-    Informational only (no remediation): the next full ``sync_cache`` re-derives
+    Informational only (no remediation): the next conversation sync re-derives
     the rollup via its incremental DELETE+INSERT.
     """
     rollup = s.conv_sessions_rollup_count
@@ -1773,6 +1778,49 @@ def _check_db_reclaimable(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
+    """Surface transcript-store free pages without mutating the DB (#320)."""
+    page_count = s.conversations_db_page_count
+    freelist_count = s.conversations_db_freelist_count
+    ratio = None
+    if (
+        isinstance(page_count, int)
+        and not isinstance(page_count, bool)
+        and page_count > 0
+        and isinstance(freelist_count, int)
+        and not isinstance(freelist_count, bool)
+        and 0 <= freelist_count <= page_count
+    ):
+        ratio = freelist_count / page_count
+    details = {
+        "conversations_db_page_count": page_count,
+        "conversations_db_freelist_count": freelist_count,
+        "conversations_db_free_ratio": ratio,
+        "warn_ratio": DOCTOR_RECLAIMABLE_WARN_RATIO,
+    }
+    if ratio is not None and ratio >= DOCTOR_RECLAIMABLE_WARN_RATIO:
+        return CheckResult(
+            id="db.conversations_reclaimable",
+            title="Reclaimable transcript space",
+            severity="warn",
+            summary=(
+                f"high — {ratio * 100:.1f}% of conversations.db pages are free"
+            ),
+            remediation=(
+                "Run `cctally db vacuum --db conversations` to reclaim disk space."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        id="db.conversations_reclaimable",
+        title="Reclaimable transcript space",
+        severity="ok",
+        summary="below threshold",
+        remediation=None,
+        details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1808,6 +1856,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.lock_state", "_check_db_lock_state"),
         ("db.wal_size", "_check_db_wal_size"),
         ("db.reclaimable", "_check_db_reclaimable"),
+        ("db.conversations_reclaimable", "_check_db_conversations_reclaimable"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),

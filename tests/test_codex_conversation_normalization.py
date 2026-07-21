@@ -25,6 +25,7 @@ if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
 import _cctally_db as db  # noqa: E402
+import _cctally_core as core  # noqa: E402
 import _lib_codex_conversation as kern  # noqa: E402
 import _lib_codex_conversation_export as cexport  # noqa: E402
 import _lib_codex_conversation_query as q  # noqa: E402
@@ -622,6 +623,42 @@ def test_derive_title_wrapper_window_and_null_case():
 # ── Task 4: ingest integration ───────────────────────────────────────────────
 
 
+def _split_namespace(ns):
+    """Expose the split stores through this legacy integration-test surface."""
+    open_core = ns["open_cache_db"]
+    sync_core = ns["sync_codex_cache"]
+    sync_claude_core = ns["sync_cache"]
+
+    def open_split():
+        core = open_core()
+        core.close()
+        return ns["open_conversations_db"]()
+
+    def sync_split(_conn, **kwargs):
+        core = open_core()
+        try:
+            stats = sync_core(core, **kwargs)
+        finally:
+            core.close()
+        ns["sync_codex_conversations"](_conn, **kwargs)
+        return stats
+
+    ns["open_cache_db"] = open_split
+    ns["sync_codex_cache"] = sync_split
+
+    def sync_claude_split(_conn, **kwargs):
+        core = open_core()
+        try:
+            stats = sync_claude_core(core, **kwargs)
+        finally:
+            core.close()
+        ns["sync_claude_conversations"](_conn, **kwargs)
+        return stats
+
+    ns["sync_cache"] = sync_claude_split
+    return ns
+
+
 def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
     """Stage one Codex provider root with the given scenarios as rollout files."""
     ns = load_script()
@@ -634,7 +671,7 @@ def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
         shutil.copyfile(CORPUS / "rollouts" / f"{scenario}.jsonl", rollout)
         rollouts[scenario] = rollout
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
-    return ns, provider_root, rollouts
+    return _split_namespace(ns), provider_root, rollouts
 
 
 def _codex_turn_records(tool_payloads, *, turn_id="turn-a"):
@@ -673,7 +710,7 @@ def _stage_codex_records(tmp_path, monkeypatch, records):
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
-    return ns, provider_root, rollout
+    return _split_namespace(ns), provider_root, rollout
 
 
 def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
@@ -713,18 +750,17 @@ def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
         ).fetchone()[0] == len(touches)
 
         assert conn.execute(
-            "SELECT last_turn_id FROM codex_session_files").fetchone()[0] == "turn-a"
+            "SELECT last_turn_id FROM codex_conversation_source_files"
+        ).fetchone()[0] == "turn-a"
     finally:
         conn.close()
 
 
-def test_ingest_normalized_batch_is_atomic_with_single_retry(tmp_path, monkeypatch):
-    """A late failure on the FIRST normalized-row insert rolls the whole file
-    batch back, then the buffered batch retries once and commits everything."""
+def test_ingest_normalized_batch_is_atomic_and_next_sync_retries(tmp_path, monkeypatch):
+    """A failed transcript batch rolls back and its independent cursor retries."""
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
     conn = ns["open_cache_db"]()
     denied = {"count": 0}
-    snapshots: list[int] = []
 
     def deny_first_msg_insert(action, arg1, _arg2, _db, _source):
         if action == sqlite3.SQLITE_INSERT and arg1 == "codex_conversation_messages":
@@ -733,16 +769,15 @@ def test_ingest_normalized_batch_is_atomic_with_single_retry(tmp_path, monkeypat
                 return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    def snapshot_after_rollback():
-        snapshots.append(
-            conn.execute("SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0])
-
     try:
         conn.set_authorizer(deny_first_msg_insert)
-        ns["sync_codex_cache"](conn, _on_first_file_rollback=snapshot_after_rollback)
+        ns["sync_codex_cache"](conn)
         conn.set_authorizer(None)
         assert denied == {"count": 1}
-        assert snapshots == [0], "no partial normalized rows after the first rollback"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages"
+        ).fetchone()[0] == 0
+        ns["sync_codex_cache"](conn)
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
         assert conn.execute(
@@ -1143,6 +1178,7 @@ def test_collision_shared_uuid_claude_codex_content_isolated(tmp_path, monkeypat
 def test_collision_two_roots_shared_uuid_distinct_conversations(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
+    ns = _split_namespace(ns)
     prov_a = tmp_path / "provA"
     prov_b = tmp_path / "provB"
     for prov, scenario in ((prov_a, "root-a-collision"), (prov_b, "root-b-collision")):
@@ -1274,6 +1310,7 @@ def test_browse_model_and_project_facets_and_filters(tmp_path, monkeypatch):
 def test_browse_project_facet_collision_safety_two_roots_same_label(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
+    ns = _split_namespace(ns)
     prov_a = tmp_path / "provA"
     prov_b = tmp_path / "provB"
     for prov in (prov_a, prov_b):
@@ -2023,12 +2060,15 @@ def _seed_codex_tool_call(conn, *, conversation_key, source_root_key, root_path,
     digest = kern.content_digest(ex.content_text)
     clen = kern.content_len(ex.content_text)
     capped, _ = kern._cap(ex.content_text)
-    conn.execute(
+    core_conn = sqlite3.connect(core.CACHE_DB_PATH)
+    core_conn.execute(
         "INSERT OR IGNORE INTO codex_source_roots "
         "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
         "VALUES (?,?,?,?)",
         (source_root_key, str(root_path), "2026-07-14T00:00:00+00:00",
          "2026-07-14T00:00:00+00:00"))
+    core_conn.commit()
+    core_conn.close()
     conn.execute(
         "INSERT INTO codex_conversation_messages "
         "(conversation_key, source_root_key, source_path, line_offset, timestamp_utc, "

@@ -55,6 +55,9 @@ def _sync(ns):
     conn = ns["open_cache_db"]()
     ns["sync_cache"](conn)
     conn.close()
+    conn = ns["open_conversations_db"]()
+    ns["sync_claude_conversations"](conn)
+    conn.close()
 
 
 def test_prune_of_non_max_row_bumps_generation_and_clears_caches(env):

@@ -1,6 +1,8 @@
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { BookmarkIcon, BookmarkFilledIcon } from './ConvIcons';
+import { useConversationRef } from './TranscriptContext';
+import { legacyClaudeConversationRef } from '../types/conversation';
 
 // #217 S6 F4 — per-turn ★ bookmark toggle + optional note. Reads bookmarked/note
 // via PRIMITIVE store selectors (boolean / string) so useSyncExternalStore stays
@@ -9,6 +11,7 @@ import { BookmarkIcon, BookmarkFilledIcon } from './ConvIcons';
 // (the reader's guard gates on inputMode === null); its keydown stopPropagation's
 // Esc/Enter so they don't bubble to the reader.
 export function BookmarkButton({ sessionId, uuid, className }: { sessionId: string; uuid: string; className?: string }) {
+  const conversationRef = useConversationRef() ?? legacyClaudeConversationRef(sessionId);
   // #217 S6 F4 (review) — the sessionId prop is now load-bearing: it's threaded
   // into both mutations so a bookmark always targets THIS button's session, even
   // if a future caller renders the button outside the selected-conversation path
@@ -25,7 +28,7 @@ export function BookmarkButton({ sessionId, uuid, className }: { sessionId: stri
 
   const openEditor = () => { setDraft(note); setEditing(true); dispatch({ type: 'SET_INPUT_MODE', mode: 'note' }); };
   const closeEditor = (save: boolean) => {
-    if (save) dispatch({ type: 'SET_BOOKMARK_NOTE', uuid, sessionId, note: draft.trim() });
+    if (save) dispatch({ type: 'SET_BOOKMARK_NOTE', uuid, conversationRef, note: draft.trim() });
     setEditing(false);
     dispatch({ type: 'SET_INPUT_MODE', mode: null });
   };
@@ -37,7 +40,7 @@ export function BookmarkButton({ sessionId, uuid, className }: { sessionId: stri
         className="conv-copy-btn conv-bookmark-btn"
         aria-pressed={bookmarked}
         aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this turn'}
-        onClick={(e) => { e.stopPropagation(); dispatch({ type: 'TOGGLE_BOOKMARK', uuid, sessionId }); }}
+        onClick={(e) => { e.stopPropagation(); dispatch({ type: 'TOGGLE_BOOKMARK', uuid, conversationRef }); }}
       >
         {bookmarked ? <BookmarkFilledIcon /> : <BookmarkIcon />}
       </button>

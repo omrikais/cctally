@@ -43,7 +43,7 @@ PER_MIGRATION_ROOT = (
 
 # Pinned registry sizes. Bump BOTH when a migration ships (see module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 27
+EXPECTED_CACHE_COUNT = 28
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -94,6 +94,7 @@ MANIFEST = {
     "025_codex_conversation_normalization": "test_cache_migration_025_codex_conversation_normalization",
     "026_codex_conversation_key_backfill": "test_cache_migration_026_codex_conversation_key_backfill",
     "027_codex_fork_preamble_rebuild": "test_cache_migration_027_codex_fork_preamble_rebuild",
+    "028_split_conversation_store": "test_cache_migration_028_split_conversation_store",
 }
 
 

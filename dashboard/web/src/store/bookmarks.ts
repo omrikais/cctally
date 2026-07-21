@@ -1,9 +1,16 @@
 // #217 S6 F4 — per-turn bookmarks/annotations: a bounded localStorage LRU keyed
-// by session_id, each value a map of bookmarked turn-uuid → { note, ts }. Mirrors
+// by qualified conversation identity, each value a map of bookmarked turn-uuid
+// → { note, ts }. Mirrors
 // readingPosition.ts (per-feature plain-function module, all localStorage calls
 // in try/catch). Unlike readingPosition, loadBookmarks VALIDATES each stored
 // value (note must be a string, ts finite) — notes are rendered, so a malformed
 // blob must not reach the UI (Codex P2).
+
+import {
+  conversationRefKey,
+  normalizeConversationRef,
+  type ConversationRefInput,
+} from '../types/conversation';
 
 export const BOOKMARKS_KEY = 'cctally.conv.bookmarks';
 export const BOOKMARKS_CAP = 50; // sessions kept; oldest (by max entry ts) evicted
@@ -63,40 +70,51 @@ function evictLru(map: BookmarksMap, cap: number): BookmarksMap {
   return map;
 }
 
-export function loadBookmarks(sessionId: string): SessionBookmarks {
-  if (!sessionId) return {};
-  return readMap()[sessionId] ?? {};
+export function loadBookmarks(refInput: ConversationRefInput): SessionBookmarks {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key) return {};
+  const map = readMap();
+  return map[conversationRefKey(ref)] ?? (ref.source === 'claude' ? map[ref.key] : undefined) ?? {};
 }
 
-export function toggleBookmark(sessionId: string, uuid: string, ts: number = Date.now()): void {
-  if (!sessionId || !uuid) return;
+export function toggleBookmark(refInput: ConversationRefInput, uuid: string, ts: number = Date.now()): void {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key || !uuid) return;
   const map = readMap();
-  const sess = map[sessionId] ?? {};
+  const identityKey = conversationRefKey(ref);
+  const sess = map[identityKey] ?? (ref.source === 'claude' ? map[ref.key] : undefined) ?? {};
   if (sess[uuid]) delete sess[uuid];
   else sess[uuid] = { note: '', ts };
-  if (Object.keys(sess).length) map[sessionId] = sess; else delete map[sessionId];
+  if (Object.keys(sess).length) map[identityKey] = sess; else delete map[identityKey];
+  if (ref.source === 'claude') delete map[ref.key];
   writeMap(evictLru(map, BOOKMARKS_CAP));
 }
 
-export function setBookmarkNote(sessionId: string, uuid: string, note: string, ts: number = Date.now()): void {
-  if (!sessionId || !uuid) return;
+export function setBookmarkNote(refInput: ConversationRefInput, uuid: string, note: string, ts: number = Date.now()): void {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key || !uuid) return;
   const map = readMap();
-  const sess = map[sessionId] ?? {};
+  const identityKey = conversationRefKey(ref);
+  const sess = map[identityKey] ?? (ref.source === 'claude' ? map[ref.key] : undefined) ?? {};
   sess[uuid] = { note, ts };
   // A note always implies a populated session, so we unconditionally keep
   // map[sessionId] here. That's why this lacks toggleBookmark's empty-session
   // prune (`else delete map[sessionId]`): setting a note never empties the map.
-  map[sessionId] = sess;
+  map[identityKey] = sess;
+  if (ref.source === 'claude') delete map[ref.key];
   writeMap(evictLru(map, BOOKMARKS_CAP));
 }
 
-export function removeBookmark(sessionId: string, uuid: string): void {
-  if (!sessionId || !uuid) return;
+export function removeBookmark(refInput: ConversationRefInput, uuid: string): void {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key || !uuid) return;
   const map = readMap();
-  const sess = map[sessionId];
+  const identityKey = conversationRefKey(ref);
+  const sess = map[identityKey] ?? (ref.source === 'claude' ? map[ref.key] : undefined);
   if (!sess || !sess[uuid]) return;
   delete sess[uuid];
-  if (Object.keys(sess).length) map[sessionId] = sess; else delete map[sessionId];
+  if (Object.keys(sess).length) map[identityKey] = sess; else delete map[identityKey];
+  if (ref.source === 'claude') delete map[ref.key];
   writeMap(map);
 }
 

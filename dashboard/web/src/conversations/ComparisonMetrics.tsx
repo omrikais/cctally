@@ -1,6 +1,7 @@
 import { fmt } from '../lib/fmt';
 import { deltaIntent, semanticState, type Polarity } from './semantics';
 import type { ComparisonMetrics as Metrics } from './comparisonMetricsCalc';
+import type { ConversationSource } from '../types/conversation';
 
 // #217 S7 F10 / #228 S5 E1 — the A-vs-B metrics-delta strip. Six cells (Cost,
 // Tokens, Prompts, Errors, Duration, Files), each "A → B" with a delta. Every
@@ -25,6 +26,7 @@ interface Row {
   lowerBetter: boolean;
   fmtVal: (v: number | null) => string;
   fmtDelta: (delta: number) => string;
+  comparable?: boolean;
 }
 
 const intDelta = (d: number): string => (d === 0 ? '±0' : d > 0 ? `+${d}` : `−${Math.abs(d)}`);
@@ -33,19 +35,25 @@ const tokensDelta = (d: number): string =>
 const durationDelta = (d: number): string =>
   d === 0 ? '±0' : `${d > 0 ? '+' : '−'}${fmt.durationCompact(Math.abs(d))}`;
 
-export function ComparisonMetrics({ a, b }: { a: Metrics; b: Metrics }) {
+export function ComparisonMetrics({ a, b, aSource = 'claude', bSource = 'claude' }: {
+  a: Metrics;
+  b: Metrics;
+  aSource?: ConversationSource;
+  bSource?: ConversationSource;
+}) {
+  const crossProvider = aSource !== bSource;
   const rows: Row[] = [
     { key: 'cost', label: 'Cost', a: a.cost, b: b.cost, lowerBetter: true,
       fmtVal: fmt.usd2, fmtDelta: fmt.usdSigned },
-    { key: 'tokens', label: 'Tokens', a: a.tokens, b: b.tokens, lowerBetter: false,
+    { key: 'tokens', label: crossProvider ? 'Tokens · provider-specific' : 'Tokens', a: a.tokens, b: b.tokens, lowerBetter: false, comparable: !crossProvider,
       fmtVal: fmt.tokens, fmtDelta: tokensDelta },
     { key: 'prompts', label: 'Prompts', a: a.prompts, b: b.prompts, lowerBetter: false,
       fmtVal: (v) => (v == null ? '—' : String(v)), fmtDelta: intDelta },
-    { key: 'errors', label: 'Errors', a: a.errors, b: b.errors, lowerBetter: true,
+    { key: 'errors', label: crossProvider ? 'Errors · provider-specific' : 'Errors', a: a.errors, b: b.errors, lowerBetter: true, comparable: !crossProvider,
       fmtVal: (v) => (v == null ? '—' : String(v)), fmtDelta: intDelta },
-    { key: 'duration', label: 'Duration', a: a.durationSeconds, b: b.durationSeconds, lowerBetter: true,
+    { key: 'duration', label: crossProvider ? 'Duration · unavailable' : 'Duration', a: crossProvider ? null : a.durationSeconds, b: crossProvider ? null : b.durationSeconds, lowerBetter: true, comparable: !crossProvider,
       fmtVal: fmt.durationCompact, fmtDelta: durationDelta },
-    { key: 'files', label: 'Files', a: a.files, b: b.files, lowerBetter: false,
+    { key: 'files', label: crossProvider ? 'Files · provider-specific' : 'Files', a: a.files, b: b.files, lowerBetter: false, comparable: !crossProvider,
       fmtVal: (v) => (v == null ? '—' : String(v)), fmtDelta: intDelta },
   ];
 
@@ -60,7 +68,7 @@ export function ComparisonMetrics({ a, b }: { a: Metrics; b: Metrics }) {
     <div className="conv-cmp-metrics-wrap">
       <div className="conv-cmp-metrics" role="group" aria-label="Comparison metrics">
         {rows.map((r) => {
-          const haveBoth = r.a != null && r.b != null;
+          const haveBoth = r.comparable !== false && r.a != null && r.b != null;
           const delta = haveBoth ? (r.b as number) - (r.a as number) : null;
           const polarity: Polarity = r.lowerBetter ? 'lower-better' : 'neutral';
           const { direction, intent } = deltaIntent(polarity, r.a, r.b);

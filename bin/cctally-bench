@@ -166,7 +166,7 @@ def _make_benchmarks(cctally, perf):
 
     # Shared read connection for the query families (read-only; reused across
     # iterations to isolate query cost from connection-open cost).
-    read_conn = cctally.open_cache_db()
+    read_conn = cctally.open_conversations_db()
 
     def _scalar(sql, params=()):
         row = read_conn.execute(sql, params).fetchone()
@@ -182,9 +182,10 @@ def _make_benchmarks(cctally, perf):
         "ORDER BY session_id LIMIT 1"
     )
     delta_path = _scalar(
-        "SELECT path FROM session_files ORDER BY size_bytes ASC, path LIMIT 1"
+        "SELECT path FROM cache_db.session_files "
+        "ORDER BY size_bytes ASC, path LIMIT 1"
     )
-    num_files = _scalar("SELECT COUNT(*) FROM session_files") or 0
+    num_files = _scalar("SELECT COUNT(*) FROM cache_db.session_files") or 0
 
     # ── family 1: snapshot spine ──
     def _snapshot():
@@ -390,7 +391,7 @@ def run_all(*, scale, seed, iterations, trace, root=None,
 
     cctally, perf = _pin_and_import(data_dir, claude_dir)
 
-    conn = cctally.open_cache_db()
+    conn = cctally.open_conversations_db()
     try:
         dcounts = gen.dataset_counts(conn)
     finally:
@@ -477,7 +478,7 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
     cq = cctally._load_sibling("_lib_conversation_query")
     token = gen._SEARCH_TOKEN
 
-    conn = cctally.open_cache_db()
+    conn = cctally.open_conversations_db()
     try:
         dcounts = gen.dataset_counts(conn)
         if ladder is not None:

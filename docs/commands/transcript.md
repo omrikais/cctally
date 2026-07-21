@@ -2,9 +2,14 @@
 
 Export or search conversation transcripts from the local cache. `transcript export` produces an **anonymized-by-default** Markdown copy of a whole session — the same scrub the dashboard's Export ▾ menu applies — so the natural "share this session" action is safe by default. `transcript search` is a scriptable front end to the dashboard's cross-session search.
 
-Both subcommands read the conversation cache (`~/.local/share/cctally/cache.db`, populated by the dashboard / status-line sync or `cctally cache-sync`); they do not re-ingest, so the transcript reflects the current cached state.
+Both subcommands read the conversation store (`~/.local/share/cctally/conversations.db`, populated by the dashboard or `cctally cache-sync`). Conversation readers attach compact accounting metadata from `cache.db` read-only when needed; core accounting never attaches the transcript store. The commands do not re-ingest, so the transcript reflects the current cached state.
 
 Both sources are addressable. `export` takes either a Claude `sessionId` **or** an opaque `v1.` conversation key (Codex conversations are only addressable by their `v1.` key); `search` picks the provider with `--source {claude,codex}` (default `claude`). Absent qualification, the Claude behavior is byte-identical to before.
+
+The CLI exports one resolved conversation at a time. The dashboard's
+mixed-source comparison copy action composes two such whole exports as separate
+source-labelled Run A / Run B sections; it does not merge provider transcript
+bodies or invent a combined CLI source.
 
 ## Synopsis
 

@@ -5,6 +5,9 @@
 // applier in lockstep (anonScrub.test.ts). Used only for per-card COPY; the
 // Export menu fetches the server-scrubbed body directly.
 
+import { conversationEntityUrl } from '../lib/conversationTransport';
+import { conversationRefKey, normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
+
 export interface AnonWirePlan {
   tokens: { text: string; replacement: string; bounded: boolean }[];
   patterns: { name: string; source: string; ignoreCase: boolean; keepGroup1: boolean }[];
@@ -51,10 +54,12 @@ function assertWirePlan(w: unknown): AnonWirePlan {
 // writes the clipboard (fail-closed against a stale response).
 const planCache = new Map<string, Promise<AnonWirePlan>>();
 
-export function fetchAnonPlan(sessionId: string): Promise<AnonWirePlan> {
-  let p = planCache.get(sessionId);
+export function fetchAnonPlan(rawRef: ConversationRefInput): Promise<AnonWirePlan> {
+  const conversationRef = normalizeConversationRef(rawRef);
+  const cacheKey = conversationRefKey(conversationRef);
+  let p = planCache.get(cacheKey);
   if (!p) {
-    p = fetch(`/api/conversation/${encodeURIComponent(sessionId)}/anon-map`).then(
+    p = fetch(conversationEntityUrl(conversationRef, 'anon-map')).then(
       async (res) => {
         if (!res.ok) throw new Error(`anon-map ${res.status}`);
         return assertWirePlan(await res.json());
@@ -62,9 +67,9 @@ export function fetchAnonPlan(sessionId: string): Promise<AnonWirePlan> {
     );
     p.catch(() => {
       // Evict only if this exact rejected promise is still the cached one.
-      if (planCache.get(sessionId) === p) planCache.delete(sessionId);
+      if (planCache.get(cacheKey) === p) planCache.delete(cacheKey);
     });
-    planCache.set(sessionId, p);
+    planCache.set(cacheKey, p);
   }
   return p;
 }

@@ -6,9 +6,7 @@
 # Every cctally invocation here runs under FULL isolation (spec §5): the scratch
 # CCTALLY_DATA_DIR / CLAUDE_CONFIG_DIR / CODEX_HOME plus the dev-autodetect and
 # telemetry suppressors, so the suite NEVER reads or writes the operator's real
-# ~/.claude, ~/.codex, or ~/.local/share/cctally*. CODEX_HOME must be pinned even
-# though we only sync `--source claude`: a stray `cache-sync` default would ingest
-# the real ~/.codex.
+# ~/.claude, ~/.codex, or ~/.local/share/cctally*.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # dashboard/web/e2e
@@ -22,12 +20,34 @@ mkdir -p "$RUNTIME"
 # 2) Isolation env — pinned before ANY cctally call.
 export CCTALLY_DATA_DIR="$RUNTIME/scratch/data"
 export CLAUDE_CONFIG_DIR="$RUNTIME/scratch/claude"
-export CODEX_HOME="$RUNTIME/scratch/codex"
+CODEX_ROOT_MAIN="$RUNTIME/scratch/codex-main"
+CODEX_ROOT_A="$RUNTIME/scratch/codex-a"
+CODEX_ROOT_B="$RUNTIME/scratch/codex-b"
+export CODEX_HOME="$CODEX_ROOT_MAIN,$CODEX_ROOT_A,$CODEX_ROOT_B"
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
 export CCTALLY_DISABLE_TELEMETRY=1
 
 # 3) Generate the synthetic transcripts + manifest.json under the runtime dir.
 python3 "$REPO_ROOT/bin/build-e2e-fixtures.py" --out "$RUNTIME"
+
+# Add the canonical S7 Codex reader corpus under the isolated Codex root. The
+# parent/child pair exercises qualified navigation; modern-full carries native
+# prompts, responses, reasoning, tools, events, files, tokens, and cost.
+mkdir -p "$CODEX_ROOT_MAIN/sessions/2026/07/20" "$CODEX_ROOT_A/sessions/2026/07/20" "$CODEX_ROOT_B/sessions/2026/07/20"
+cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/modern-full.jsonl" \
+   "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-parent.jsonl" \
+   "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-child.jsonl" \
+   "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
+cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/root-a-collision.jsonl" \
+   "$CODEX_ROOT_A/sessions/2026/07/20/"
+cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/root-b-collision.jsonl" \
+   "$CODEX_ROOT_B/sessions/2026/07/20/"
+
+# Shared native UUID across Claude, Codex root A, and Codex root B. The UI must
+# keep all three qualified identities distinct through open/persist/compare.
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-collision"
+cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/11111111-1111-4111-8111-111111111111.jsonl" \
+   "$CLAUDE_CONFIG_DIR/projects/-synthetic-collision/"
 
 # 4) Disable the dashboard's update-check thread. It consults CONFIG, not the
 #    environment (docs/updates-gotchas.md: `_should_show_update_banner` reads
@@ -36,9 +56,9 @@ python3 "$REPO_ROOT/bin/build-e2e-fixtures.py" --out "$RUNTIME"
 #    off any update banner.
 "$REPO_ROOT/bin/cctally" config set update.check.enabled false >/dev/null
 
-# 5) Pre-prime cache.db (claude only) so the per-session rollup is authoritative
+# 5) Pre-prime both providers so the per-session rollups are authoritative
 #    before the first request — no cold-sync in-flux reads, no "indexing" notes.
-"$REPO_ROOT/bin/cctally" cache-sync --source claude
+"$REPO_ROOT/bin/cctally" cache-sync --source all
 
 # 6) Serve. Sync stays ENABLED (no --no-sync) so the open reader live-tails via
 #    the targeted per-conversation ingest (scenario 3). exec so Playwright's

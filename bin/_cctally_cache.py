@@ -243,7 +243,14 @@ def _conv_row_tuple(m, path_str):
     )
 
 
-def _iter_sync_entries(fh, path_str, stats: "IngestStats | None" = None):
+def _iter_sync_entries(
+    fh,
+    path_str,
+    stats: "IngestStats | None" = None,
+    *,
+    include_cost: bool = True,
+    include_conversations: bool = True,
+):
     """Fused single-pass sync walker (#138). Yields
     ``(byte_offset, cost_or_None, msgrow_or_None, aititle_or_None)`` for each
     JSONL line from ``fh``'s current position that produces a cost entry, a
@@ -293,7 +300,7 @@ def _iter_sync_entries(fh, path_str, stats: "IngestStats | None" = None):
             if stats is not None:
                 stats.lines_malformed += 1
             continue
-        cost = _lib_jsonl.parse_cost_entry(obj, path_str)
+        cost = _lib_jsonl.parse_cost_entry(obj, path_str) if include_cost else None
         if cost is None and stats is not None:
             # Assistant-typed line rejected for a NON-deliberate reason
             # (schema-drift tripwire; <synthetic>/non-assistant are normal).
@@ -302,8 +309,14 @@ def _iter_sync_entries(fh, path_str, stats: "IngestStats | None" = None):
                 stats.assistant_lines_skipped += 1
                 stats.skip_reasons[reason] = \
                     stats.skip_reasons.get(reason, 0) + 1
-        mrow = _lib_conversation.parse_message_row(obj, offset)
-        ai = _lib_conversation.parse_ai_title(obj, offset)
+        mrow = (
+            _lib_conversation.parse_message_row(obj, offset)
+            if include_conversations else None
+        )
+        ai = (
+            _lib_conversation.parse_ai_title(obj, offset)
+            if include_conversations else None
+        )
         if cost is not None or mrow is not None or ai is not None:
             yield offset, cost, mrow, ai
 
@@ -792,13 +805,6 @@ def _delete_codex_file_derived_rows(
         "DELETE FROM codex_conversation_threads WHERE source_path = ?" + root_clause,
         params,
     )
-    # #294 S6: normalized rows + file touches for this file. This is a PARTIAL
-    # delete (one file), so it rides the per-row FTS delete trigger — surviving
-    # conversations keep their postings (§3.4 two-path policy). File touches have
-    # no source_root_key column; a source_path maps to exactly one file/root, so
-    # scoping them by source_path alone is exact. Rollups are repaired by the
-    # caller's _recompute_codex_rollups (§3.2), which needs the affected keys
-    # captured BEFORE this delete.
     conn.execute(
         "DELETE FROM codex_conversation_file_touches WHERE source_path = ?",
         (path_str,),
@@ -843,9 +849,6 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
     conn.execute("DELETE FROM codex_conversation_events")
     conn.execute("DELETE FROM codex_session_files")
     conn.execute("DELETE FROM codex_source_roots")
-    # #294 S6: FULL clear of the normalized derived tables (messages + touches +
-    # rollups) via the storm-free helper — this is a whole-corpus rebuild, so
-    # 'delete-all' resets the FTS shadow tables cleanly (§3.4 full-clear path).
     _codex_conversation_fts_full_clear(conn)
     # F3: this clears the Codex physical quota state, so any stored
     # quota-projection certificate would become stale-valid (its cache
@@ -1068,7 +1071,6 @@ def _collect_inactive_codex_paths_and_roots(
         "SELECT source_path, source_root_key FROM quota_window_snapshots "
         "WHERE source = 'codex'",
         "SELECT source_path, source_root_key FROM codex_conversation_threads",
-        "SELECT source_path, source_root_key FROM codex_conversation_events",
     )
     for query in family_queries:
         for source_path, root_key in conn.execute(query):
@@ -1138,10 +1140,7 @@ def _prune_inactive_codex_source_roots(
                   SELECT 1 FROM codex_conversation_threads AS threads
                   WHERE threads.source_root_key = roots.source_root_key
               )
-              AND NOT EXISTS (
-                  SELECT 1 FROM codex_conversation_events AS events
-                  WHERE events.source_root_key = roots.source_root_key
-              )""",
+              """,
         tuple(params),
     )
 
@@ -1166,9 +1165,6 @@ def _write_codex_file_batch(
     accounting_rows: list[tuple[Any, ...]],
     quota_rows: list[tuple[Any, ...]],
     thread_rows: list[tuple[Any, ...]],
-    event_rows: list[tuple[Any, ...]],
-    normalized_rows: list,
-    normalized_touches: list,
     active_root_keys: set[str],
     prune_roots: bool = True,
 ) -> int:
@@ -1179,15 +1175,7 @@ def _write_codex_file_batch(
     ``codex_source_roots`` row for a root it wasn't asked about (spec §5.1
     whole-tree bypass — ``active_root_keys`` then covers only the targets)."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    # #294 S6: rollups are recomputed-affected-or-deleted (§3.2), so capture the
-    # conversation keys this file's normalized rows touch BEFORE a reset delete
-    # removes them.
-    affected_keys: set = set()
     if reset_file:
-        affected_keys.update(
-            row[0] for row in conn.execute(
-                "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
-                "WHERE source_path = ?", (path_str,)) if row[0])
         _delete_codex_file_derived_rows(conn, path_str)
     conn.execute(
         """INSERT INTO codex_source_roots
@@ -1217,8 +1205,8 @@ def _write_codex_file_batch(
                (source, source_root_key, source_path, line_offset,
                 captured_at_utc, observed_slot, logical_limit_key, limit_id,
                 limit_name, window_minutes, used_percent, resets_at_utc,
-                plan_type, individual_limit_json, reached_type)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                plan_type, individual_limit_json, reached_type, observed_model)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             quota_rows,
         )
     if thread_rows:
@@ -1242,25 +1230,6 @@ def _write_codex_file_batch(
                  last_seen_utc=excluded.last_seen_utc""",
             [(*row, now_iso, now_iso) for row in thread_rows],
         )
-    if event_rows:
-        conn.executemany(
-            """INSERT OR IGNORE INTO codex_conversation_events
-               (source_path, line_offset, source_root_key, conversation_key,
-                native_thread_id, root_thread_id, parent_thread_id,
-                timestamp_utc, record_type, event_type, turn_id, call_id,
-                payload_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            event_rows,
-        )
-    # #294 S6: normalized rows + file touches ride the same per-file transaction
-    # as the events themselves. INSERT OR IGNORE on the physical key keeps a delta
-    # re-read idempotent; the per-row FTS triggers index them. Then recompute the
-    # rollup for every affected conversation (aggregating across all its files),
-    # deleting emptied rollups. Threads were inserted above, so project
-    # attribution can read them.
-    _insert_codex_normalized_rows(conn, normalized_rows, normalized_touches)
-    affected_keys.update(r.conversation_key for r in normalized_rows)
-    _recompute_codex_rollups(conn, affected_keys)
     conn.execute(
         """INSERT OR REPLACE INTO codex_session_files
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
@@ -1517,13 +1486,14 @@ def _reset_orphan_warning_throttle():
     _LAST_WARNED_ORPHAN_SET = frozenset()
 
 
-# Flags whose presence means the cache is mid-migration / mid-reingest. A
+# Flags whose presence means the conversation store is mid-migration /
+# mid-reingest. A
 # targeted (only_paths) ingest DECLINES when any is set and defers to the next
 # full background sync — inserting through a half-migrated FTS shape or skipping
 # a pending backfill would diverge from what a full sync produces (spec §
 # "Targeted ingest contract"). Enumerated against the flag-consumption blocks
-# guarded by the `if not rebuild and not targeted:` branch in sync_cache (the
-# full-sync-only `_consume_*` calls); keep this tuple in sync with those.
+# guarded by the full-sync-only maintenance path in
+# sync_claude_conversations; keep this tuple in sync with those consumers.
 _TARGETED_DECLINE_FLAGS = (
     "conversation_backfill_pending",
     "ai_titles_backfill_pending",
@@ -1595,23 +1565,32 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
          the same turn -> deleting P's deduped cost row would lose it).
     Anything failing A/B/C is left as residual (reported; for `--rebuild`).
 
-    Deletes the full derived surface for the safe set in ONE transaction
-    (conversation_file_touches -> conversation_messages [+FTS trigger] ->
-    conversation_ai_titles [+FTS trigger] -> session_entries -> session_files),
-    then recomputes the conversation_sessions rollup for exactly the pruned
-    session_ids (all their messages gone -> the stale rail rows drop). Does NOT
-    write the walk-complete marker: the next full sync_cache re-establishes it
-    on a clean walk. Acquires the cache.db.lock flock itself; a contended
-    lock_timeout returns a `contended` result without mutating.
+    Deletes the derived conversation rows first, then the core accounting rows
+    in a second transaction. The ordering is deliberately failure-safe: an
+    interruption may leave re-derivable transcript rows absent, but cannot
+    delete accounting evidence while its conversation coverage is still the
+    only proof that the orphan is safe. Recomputes conversation_sessions for
+    exactly the pruned session_ids. Does NOT write the walk-complete marker:
+    the next full sync_cache re-establishes it on a clean walk. Acquires both
+    provider flocks itself; contention returns a `contended` result without
+    mutating.
     """
     result = PruneResult()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CACHE_LOCK_PATH.touch()
     lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
+    conv_lock_fh = None
+    conv = None
     try:
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             result.contended = True
             return result
+        _cctally_core.CONVERSATIONS_LOCK_PATH.touch()
+        conv_lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_PATH, "w")
+        if not _acquire_cache_flock(conv_lock_fh, timeout=lock_timeout):
+            result.contended = True
+            return result
+        conv = open_conversations_db(attach_cache=False)
 
         tracked = conn.execute(
             "SELECT path, size_bytes, session_id FROM session_files").fetchall()
@@ -1635,14 +1614,14 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
                 (path,)).fetchall()
             ok = True
             for mid, rid in keys:
-                covered = conn.execute(                        # Gate B
+                covered = conv.execute(                        # Gate B
                     "SELECT 1 FROM conversation_messages "
                     "WHERE msg_id=? AND req_id=? AND source_path=? LIMIT 1",
                     (mid, rid, path)).fetchone() is not None
                 if not covered:
                     ok = False
                     break
-                shared = conn.execute(                         # Gate C
+                shared = conv.execute(                         # Gate C
                     "SELECT source_path FROM conversation_messages "
                     "WHERE msg_id=? AND req_id=?", (mid, rid)).fetchall()
                 if any(sp in on_disk for (sp,) in shared):
@@ -1661,30 +1640,44 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
         # handful of removed files), well under SQLite's variable limit;
         # _recompute_conversation_sessions chunks its own session-id list.
         ph = ",".join("?" * len(safe_paths))
-        result.pruned_messages = conn.execute(
+        result.pruned_messages = conv.execute(
             f"SELECT count(*) FROM conversation_messages WHERE source_path IN ({ph})",
             safe_paths).fetchone()[0]
-        conn.execute("BEGIN")
+        conv.execute("BEGIN")
         try:
-            conn.execute(
+            conv.execute(
                 f"DELETE FROM conversation_file_touches WHERE message_id IN "
                 f"(SELECT id FROM conversation_messages WHERE source_path IN ({ph}))",
                 safe_paths)
-            conn.execute(
+            conv.execute(
                 f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
-            conn.execute(
+            conv.execute(
                 f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
+            _recompute_conversation_sessions(conv, list(pruned_sids))
+            conv.commit()
+        except BaseException:
+            conv.rollback()
+            raise
+        conn.execute("BEGIN")
+        try:
             result.pruned_entries = conn.execute(
                 f"DELETE FROM session_entries WHERE source_path IN ({ph})", safe_paths).rowcount
             result.pruned_files = conn.execute(
                 f"DELETE FROM session_files WHERE path IN ({ph})", safe_paths).rowcount
-            _recompute_conversation_sessions(conn, list(pruned_sids))
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
         return result
     finally:
+        if conv is not None:
+            conv.close()
+        if conv_lock_fh is not None:
+            try:
+                fcntl.flock(conv_lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            conv_lock_fh.close()
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -1720,7 +1713,9 @@ def _bump_mutation_seq(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
-def _force_retention_prune_after_replay(conn: sqlite3.Connection) -> None:
+def _force_retention_prune_after_replay(
+    conn: "sqlite3.Connection | None" = None,
+) -> None:
     """#313 P3 (F9): run an UNTHROTTLED transcript retention prune after a
     from-zero replay (a ``--rebuild`` or a truncation/requalification re-ingest,
     both of which replay from offset 0 and restore >retention-day rows the
@@ -1734,12 +1729,18 @@ def _force_retention_prune_after_replay(conn: sqlite3.Connection) -> None:
         retention_days = resolve_retention_days(_cctally().load_config())
         if retention_days <= 0:
             return
-        retention._maybe_prune_conversation_retention(
-            conn,
-            now_utc=dt.datetime.now(dt.timezone.utc),
-            retention_days=retention_days,
-            force=True,
-        )
+        owned = conn is None
+        conv_conn = open_conversations_db(attach_cache=False) if owned else conn
+        try:
+            retention._maybe_prune_conversation_retention(
+                conv_conn,
+                now_utc=dt.datetime.now(dt.timezone.utc),
+                retention_days=retention_days,
+                force=True,
+            )
+        finally:
+            if owned:
+                conv_conn.close()
     except Exception:
         pass
 
@@ -2396,7 +2397,12 @@ def sync_cache(
                     # walk over the identical span — the "identical span"
                     # invariant is now structural (a single stop point) rather
                     # than a prose-enforced ``>= final_offset`` runtime break.
-                    for offset, cost, mrow, ai in _iter_sync_entries(fh, path_str, stats=stats):
+                    for offset, cost, mrow, ai in _iter_sync_entries(
+                        fh,
+                        path_str,
+                        stats=stats,
+                        include_conversations=False,
+                    ):
                         if cost is not None:
                             entry, msg_id, req_id = cost
                             usage = entry.usage
@@ -2696,19 +2702,12 @@ def sync_cache(
         # and the flock is still held, so the short busy_timeout keeps it from
         # stalling the lock under heavy-reader contention.
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
-        # #313 P3 (F9): a rebuild or a truncation escalation replays from offset
-        # 0 and restores >retention-day transcript rows. Force an unthrottled
-        # prune AFTER the flock releases below (early lock-contended / deferred
-        # returns above never reach here, so a no-op sync does not prune).
-        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
             pass
         lock_fh.close()
-    if did_from_zero_replay:
-        _force_retention_prune_after_replay(conn)
     return stats
 
 
@@ -3875,7 +3874,6 @@ def sync_codex_cache(
     """
     stats = CodexIngestStats()
     project_after_unlock = False
-    did_from_zero_replay = False
     # #313 P1 review (F4/F1): when the CACHE certificate is current we cannot
     # yet decide whether to skip the reconcile — reconcile's own short-circuit
     # ALSO requires the stats-side quota_projection_state signatures to match
@@ -4083,12 +4081,12 @@ def sync_codex_cache(
             initial_model: str | None = None
             initial_total_tokens = 0
             # #294 S6: the sticky-turn resume seed (parallel to initial_model).
-            initial_turn_id: str | None = None
             prev_total_tokens: int | None = None
             prev_native_thread_id: str | None = None
             prev_root_thread_id: str | None = None
             prev_parent_thread_id: str | None = None
             prev_conversation_key: str | None = None
+            prev_turn_id: str | None = None
             requalified = False
             if prev is not None:
                 (
@@ -4119,23 +4117,17 @@ def sync_codex_cache(
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
-                    initial_turn_id = prev_turn_id
                 else:
                     truncated = True
                     start_offset = 0
                     initial_session_id = None
                     initial_model = None
                     initial_total_tokens = 0
-                    initial_turn_id = None
                     prev_total_tokens = None
 
             accounting_rows: list[tuple[Any, ...]] = []
             quota_rows: list[tuple[Any, ...]] = []
             thread_rows: list[tuple[Any, ...]] = []
-            event_rows: list[tuple[Any, ...]] = []
-            # #294 S6: the physical event objects for this file window, fed to the
-            # normalization kernel after the drain (in offset order).
-            events_list: list = []
             final_offset = start_offset
             # Mutable tracker that the iterator updates on every
             # session_meta / turn_context record, regardless of whether a
@@ -4189,15 +4181,6 @@ def sync_codex_cache(
                         state=iter_state,
                     ):
                         event = emission.event
-                        events_list.append(event)
-                        event_rows.append((
-                            event.source_path, event.line_offset,
-                            event.source_root_key, event.conversation_key,
-                            event.native_thread_id, event.root_thread_id,
-                            event.parent_thread_id, event.timestamp_utc,
-                            event.record_type, event.event_type, event.turn_id,
-                            event.call_id, event.payload_json,
-                        ))
                         for quota in emission.quotas:
                             quota_rows.append((
                                 quota.source, quota.source_root_key,
@@ -4207,7 +4190,7 @@ def sync_codex_cache(
                                 quota.limit_name, quota.window_minutes,
                                 quota.used_percent, quota.resets_at_utc,
                                 quota.plan_type, quota.individual_limit_json,
-                                quota.reached_type,
+                                quota.reached_type, iter_state.model,
                             ))
                         if (thread := emission.thread) is not None and (
                             thread.conversation_key is not None
@@ -4298,28 +4281,11 @@ def sync_codex_cache(
                 if terminal_thread is not None else prev_conversation_key
             )
 
-            # #294 S6: normalize this file window's physical events into
-            # normalized rows + file touches, replaying sticky turn/model state
-            # seeded from the persisted resume seed. Buffered before the first DML
-            # (like every other family), so the single retry re-runs the same
-            # in-memory batch. The terminal sticky turn persists as last_turn_id.
-            try:
-                norm_result = _lib_codex_conversation.normalize_codex_events(
-                    events_list,
-                    initial=_lib_codex_conversation.CodexStickyState(
-                        turn_id=initial_turn_id, model=initial_model),
-                )
-            except Exception as exc:  # noqa: BLE001
-                # §5.1: a normalization exception during a targeted ingest is a
-                # per-file decline → the call is dirty (files_failed) but earlier
-                # commits stand. A full sync keeps its historical crash-loud
-                # behavior (there the whole walk is authoritative).
-                if not targeted:
-                    raise
-                eprint(f"[codex-cache] normalization failed for {jp}: {exc}")
-                stats.files_failed += 1
-                continue
-            new_last_turn_id = norm_result.terminal.turn_id
+            # Transcript normalization and its sticky turn cursor belong to the
+            # independent conversations.db pass. Preserve the legacy compact
+            # cursor column without advancing it here; sync_codex_conversations
+            # owns the authoritative transcript-local value.
+            new_last_turn_id = prev_turn_id
 
             # Every derived row above was buffered before the first DML. A
             # late database failure therefore rolls the whole file back and
@@ -4346,9 +4312,6 @@ def sync_codex_cache(
                         accounting_rows=accounting_rows,
                         quota_rows=quota_rows,
                         thread_rows=thread_rows,
-                        event_rows=event_rows,
-                        normalized_rows=norm_result.rows,
-                        normalized_touches=norm_result.touches,
                         active_root_keys={item.source_root_key for item in files},
                         # §5.1 whole-tree bypass: targeted mode never prunes
                         # codex_source_roots for roots outside its target set.
@@ -4441,7 +4404,7 @@ def sync_codex_cache(
         # reconciler (its observation load reconciles all roots at seconds-scale
         # cost). Quota projection is deferred to the next full sync, which the
         # ordinary hook cadence supplies. Skip the whole decision block so
-        # project_after_unlock / deferred_cert_* / did_from_zero_replay keep
+        # project_after_unlock / deferred_cert_* keep
         # their no-op defaults — the post-flock reconcile paths below then all
         # short-circuit for a targeted call.
         if not targeted:
@@ -4471,11 +4434,6 @@ def sync_codex_cache(
                         deferred_cert_sigs = dict(certificate[1])
                     else:
                         project_after_unlock = True
-            # #313 P3 (F9): a Codex rebuild or a truncation/requalification
-            # re-ingest replays from offset 0 and restores >retention-day
-            # codex_conversation_events. Force an unthrottled prune after the
-            # flock releases (below), so restored old rows don't persist for 24h.
-            did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -4504,8 +4462,6 @@ def sync_codex_cache(
     if project_after_unlock:
         from _cctally_quota import reconcile_codex_quota_projection
         reconcile_codex_quota_projection()
-    if did_from_zero_replay:
-        _force_retention_prune_after_replay(conn)
     return stats
 
 
@@ -4807,7 +4763,771 @@ def open_cache_db() -> sqlite3.Connection:
         conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
         recover_version_ahead=True,
     )
+    # Migration 028 removes the legacy transcript objects after arming the
+    # independent rebuild. Recreate EMPTY compatibility objects only so older
+    # migration/fixture probes remain valid; live core sync never populates
+    # them. Keeping this conditional avoids a second schema pass on normal
+    # opens while preserving the physical data split.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='conversation_messages'"
+    ).fetchone() is None:
+        _cctally_db_sib._apply_cache_schema(conn)
     return conn
+
+
+def _harden_conversation_sidecars() -> None:
+    """Best-effort 0600 on conversations.db and its WAL sidecars."""
+    base = str(_cctally_core.CONVERSATIONS_DB_PATH)
+    for path in (base, base + "-wal", base + "-shm"):
+        try:
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError as exc:
+            eprint(
+                f"[conversations] could not chmod {path} 0600 ({exc}); continuing"
+            )
+
+
+def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
+    """Open the independent transcript/search store (#320).
+
+    ``conversations.db`` is the main schema.  Conversation readers optionally
+    attach ``cache.db`` read-only as ``cache_db`` for cost/token and compact
+    Codex-thread metadata.  Core cache callers never take the inverse
+    dependency, so a missing or locked transcript store cannot block quota or
+    accounting refreshes.
+    """
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(_cctally_core.APP_DIR, 0o700)
+    except OSError as exc:
+        eprint(
+            f"[conversations] could not chmod data dir 0700 ({exc}); continuing"
+        )
+
+    path = _cctally_core.CONVERSATIONS_DB_PATH
+    conn: sqlite3.Connection | None = None
+    try:
+        # URI mode belongs to the connection, not only the later ATTACH value.
+        # Without it, some supported system-Python SQLite builds interpret the
+        # read-only ``file:...cache.db?mode=ro`` attachment as a literal path.
+        conn = sqlite3.connect(path, uri=True)
+        conn.execute("SELECT 1").fetchone()
+    except sqlite3.DatabaseError as exc:
+        if conn is not None:
+            conn.close()
+        # Do not unlink a live SQLite family from a reader path. The store is
+        # re-derivable, but safe replacement still requires excluding its
+        # independent writers; callers degrade this surface and leave core
+        # accounting/quota available. An explicit rebuild/delete can recover it.
+        eprint(f"[conversations] corrupt transcript DB ({exc}); unavailable")
+        raise
+
+    assert conn is not None
+
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        eprint(
+            f"[conversations] could not chmod conversations.db 0600 ({exc}); continuing"
+        )
+
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute(f"PRAGMA journal_size_limit={CACHE_WAL_SIZE_LIMIT_BYTES}")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    _cctally_db_sib._apply_conversations_schema(conn)
+    conn.commit()
+
+    if attach_cache:
+        # Ensure the compact schema exists before opening it read-only.  This
+        # call has no dependency on conversations.db (pinned by the split RED
+        # test), so the direction remains one-way.
+        cache = open_cache_db()
+        cache.close()
+        cache_uri = _cctally_core.CACHE_DB_PATH.resolve().as_uri() + "?mode=ro"
+        conn.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
+        _import_legacy_conversation_rows(conn)
+    _harden_conversation_sidecars()
+    return conn
+
+
+def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
+    """Bridge pre-028/compatibility rows into an empty conversation store.
+
+    Migration 028 normally arms a JSONL rebuild and clears the old rows. This
+    defensive bridge covers an interrupted upgrade and keeps historical test
+    fixtures readable without making core sync depend on the transcript DB.
+    It writes only the main conversation store; ``cache_db`` is attached RO.
+    """
+    tables = (
+        "conversation_messages",
+        "conversation_ai_titles",
+        "conversation_sessions",
+        "conversation_file_touches",
+        "codex_conversation_events",
+        "codex_conversation_messages",
+        "codex_conversation_file_touches",
+        "codex_conversation_rollups",
+    )
+    changed = False
+    for table in tables:
+        try:
+            if conn.execute(f"SELECT 1 FROM main.{table} LIMIT 1").fetchone():
+                continue
+            if not conn.execute(
+                f"SELECT 1 FROM cache_db.{table} LIMIT 1"
+            ).fetchone():
+                continue
+            main_cols = [
+                str(row[1]) for row in conn.execute(f"PRAGMA main.table_info({table})")
+            ]
+            source_cols = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA cache_db.table_info({table})")
+            }
+            cols = [col for col in main_cols if col in source_cols]
+            quoted = ",".join(f'"{col}"' for col in cols)
+            conn.execute(
+                f"INSERT OR IGNORE INTO main.{table} ({quoted}) "
+                f"SELECT {quoted} FROM cache_db.{table}"
+            )
+            changed = True
+        except sqlite3.Error:
+            continue
+    if changed:
+        conn.commit()
+
+
+def _prepare_claude_conversation_maintenance(
+    conn: sqlite3.Connection,
+    *,
+    rebuild: bool,
+    targeted: bool,
+) -> None:
+    """Consume transcript-only upgrade work under the conversation flock.
+
+    These consumers historically ran inside ``sync_cache`` because prose and
+    accounting shared one database.  Keeping them here is the load-bearing
+    half of the #320 split: schema upgrades may re-derive transcript state, but
+    they never extend the core-cache critical section.
+    """
+    if rebuild:
+        # The offset-zero walk below re-derives every transcript projection.
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key IN ("
+            "'conversation_backfill_pending',"
+            "'conversation_reingest_pending',"
+            "'conversation_source_tool_use_reingest_pending',"
+            "'conversation_reingest_enrichment_pending',"
+            "'conversation_media_reingest_pending',"
+            "'conversation_queued_prompt_reingest_pending',"
+            "'conversation_reingest_nested_agent_pending',"
+            "'conversation_reingest_file_touches_pending',"
+            "'conversation_file_touches_cursor',"
+            "'conversation_reingest_cursor',"
+            "'conversation_reingest_cursor_gen',"
+            "'conversation_promote_command_args_pending',"
+            "'conversation_promote_command_args_cursor',"
+            "'conversation_title_fts_backfill_pending',"
+            "'ai_titles_backfill_pending')"
+        )
+        split_pending = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_search_split_pending'"
+        ).fetchone() is not None
+        if split_pending:
+            fts_off = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
+            ).fetchone() is not None
+            if not fts_off and not _cctally_db_sib._conversation_fts_is_split(conn):
+                _cctally_db_sib._swap_conversation_fts_to_split(conn)
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key IN "
+            "('conversation_search_split_pending',"
+            " 'conversation_search_split_cursor')"
+        )
+        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+        conn.commit()
+        return
+
+    if targeted:
+        return
+
+    if conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
+    ).fetchone() is not None:
+        backfill_conversation_messages(conn)
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
+        )
+        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+        conn.commit()
+
+    if conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='ai_titles_backfill_pending'"
+    ).fetchone() is not None:
+        backfill_ai_titles(conn)
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key='ai_titles_backfill_pending'"
+        )
+        conn.commit()
+
+    reingest = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key IN ("
+        "'conversation_reingest_pending',"
+        "'conversation_source_tool_use_reingest_pending',"
+        "'conversation_reingest_enrichment_pending',"
+        "'conversation_media_reingest_pending',"
+        "'conversation_queued_prompt_reingest_pending',"
+        "'conversation_reingest_nested_agent_pending')"
+    ).fetchone() is not None
+    if reingest:
+        _resumable_reingest_conversation_messages(conn)
+        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+        conn.commit()
+
+    _consume_search_split(conn)
+    _consume_promote_command_args(conn)
+    _consume_title_fts(conn)
+    _consume_file_touches(conn)
+
+
+def sync_claude_conversations(
+    conn: sqlite3.Connection,
+    *,
+    rebuild: bool = False,
+    lock_timeout: "float | None" = None,
+    only_paths: "set[str] | None" = None,
+) -> IngestStats:
+    """Delta-sync Claude transcript/search rows into conversations.db (#320).
+
+    The transcript cursor is committed in the same conversations.db
+    transaction as its message/title rows.  No cache.db table is written, and
+    the core accounting cursor is neither read nor advanced.
+    """
+    stats = IngestStats()
+    did_from_zero_replay = False
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CONVERSATIONS_LOCK_PATH.touch()
+    lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_PATH, "w")
+    try:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+            stats.lock_contended = True
+            return stats
+
+        targeted = only_paths is not None
+        pending_rebuild = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_rebuild_claude_pending'"
+        ).fetchone() is not None
+        if pending_rebuild and targeted:
+            stats.deferred_reason = "rebuild_pending"
+            return stats
+        if targeted:
+            placeholders = ",".join("?" for _ in _TARGETED_DECLINE_FLAGS)
+            if conn.execute(
+                f"SELECT 1 FROM cache_meta WHERE key IN ({placeholders}) LIMIT 1",
+                _TARGETED_DECLINE_FLAGS,
+            ).fetchone() is not None:
+                stats.deferred_reason = "pending_global_flags"
+                return stats
+        rebuild = rebuild or pending_rebuild
+
+        _prepare_claude_conversation_maintenance(
+            conn, rebuild=rebuild, targeted=targeted
+        )
+
+        if rebuild:
+            clear_conversation_messages(conn)
+            conn.execute("DELETE FROM conversation_ai_titles")
+            conn.execute("DELETE FROM conversation_sessions")
+            conn.execute("DELETE FROM conversation_source_files")
+            conn.commit()
+
+        if only_paths is not None and rebuild:
+            raise ValueError(
+                "sync_claude_conversations: only_paths is incompatible with rebuild"
+            )
+        paths = (
+            [pathlib.Path(path) for path in sorted(only_paths)
+             if pathlib.Path(path).is_file()]
+            if only_paths is not None
+            else list(_iter_claude_jsonl_files())
+        )
+        stats.files_total = len(paths)
+        existing = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute(
+                "SELECT path,size_bytes,mtime_ns,last_byte_offset "
+                "FROM conversation_source_files"
+            )
+        }
+        if targeted:
+            for jp in paths:
+                prev = existing.get(str(jp))
+                if prev is None:
+                    continue
+                try:
+                    current_size = jp.stat().st_size
+                except OSError:
+                    continue
+                if current_size < prev[0]:
+                    stats.deferred_reason = "truncation"
+                    return stats
+        # Missing Claude paths are deliberately retained here. Their message
+        # rows are the evidence used by _prune_orphaned_cache_entries's
+        # coverage/disjointness gates before it deletes core accounting rows.
+        # Eager transcript cleanup would destroy that proof and turn every
+        # dashboard orphan heal into a residual. Explicit --rebuild may clear
+        # the whole re-derivable store; ordinary sync remains detect/retain.
+        touched_sessions: set[str] = set()
+
+        for jp in paths:
+            path_str = str(jp)
+            try:
+                st = jp.stat()
+            except OSError:
+                stats.files_failed += 1
+                continue
+            size, mtime_ns = st.st_size, st.st_mtime_ns
+            prev = existing.get(path_str)
+            if prev is not None and size == prev[0]:
+                stats.files_skipped_unchanged += 1
+                continue
+            truncated = prev is not None and size < prev[0]
+            if targeted and truncated:
+                stats.deferred_reason = "truncation"
+                return stats
+            start_offset = 0 if prev is None or truncated else prev[2]
+            conv_rows: list[tuple[Any, ...]] = []
+            ai_rows: list[tuple[Any, ...]] = []
+            final_offset = start_offset
+            try:
+                with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(start_offset)
+                    for _offset, _cost, mrow, ai in _iter_sync_entries(
+                        fh,
+                        path_str,
+                        include_cost=False,
+                    ):
+                        if mrow is not None:
+                            conv_rows.append(_conv_row_tuple(mrow, path_str))
+                        if ai is not None:
+                            ai_rows.append(
+                                (ai.session_id, ai.ai_title, path_str, ai.byte_offset)
+                            )
+                    final_offset = fh.tell()
+            except OSError as exc:
+                eprint(f"[conversations] could not read {jp}: {exc}")
+                stats.files_failed += 1
+                continue
+
+            try:
+                if truncated:
+                    touched_sessions.update(
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT DISTINCT session_id FROM conversation_messages "
+                            "WHERE source_path=? AND session_id IS NOT NULL",
+                            (path_str,),
+                        )
+                    )
+                    conn.execute(
+                        "DELETE FROM conversation_file_touches WHERE message_id IN "
+                        "(SELECT id FROM conversation_messages WHERE source_path=?)",
+                        (path_str,),
+                    )
+                    conn.execute(
+                        "DELETE FROM conversation_messages WHERE source_path=?",
+                        (path_str,),
+                    )
+                    conn.execute(
+                        "DELETE FROM conversation_ai_titles WHERE source_path=?",
+                        (path_str,),
+                    )
+                    stats.files_reset_truncated += 1
+                if conv_rows:
+                    conn.executemany(_CONV_INSERT_SQL, conv_rows)
+                    _fill_file_touches(
+                        conn, scope=[(row[3], row[4]) for row in conv_rows]
+                    )
+                if ai_rows:
+                    conn.executemany(_AI_TITLE_UPSERT_SQL, ai_rows)
+                conn.execute(
+                    "INSERT INTO conversation_source_files "
+                    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                    "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
+                    "last_byte_offset=excluded.last_byte_offset,"
+                    "last_ingested_at=excluded.last_ingested_at",
+                    (
+                        path_str,
+                        size,
+                        mtime_ns,
+                        final_offset,
+                        dt.datetime.now(dt.timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+                stats.files_processed += 1
+                touched_sessions.update(
+                    row[0] for row in conv_rows if row[0] is not None
+                )
+            except sqlite3.DatabaseError as exc:
+                conn.rollback()
+                eprint(f"[conversations] db error on {jp}: {exc}")
+                stats.files_failed += 1
+
+        _arm_rollup_backfill_on_pricing_change(conn)
+        if _conversation_sessions_backfill_pending(conn):
+            _recompute_conversation_sessions(conn)
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='conversation_sessions_backfill_pending'"
+            )
+            conn.commit()
+        elif touched_sessions:
+            _recompute_conversation_sessions(conn, touched_sessions)
+            conn.commit()
+        if only_paths is None and stats.files_failed == 0:
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='conversation_rebuild_claude_pending'"
+            )
+            conn.commit()
+        _harden_conversation_sidecars()
+        _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
+        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
+    if did_from_zero_replay:
+        _force_retention_prune_after_replay()
+    return stats
+
+
+def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
+    """Clear only the re-derivable Codex transcript families."""
+    conn.execute("DELETE FROM codex_conversation_events")
+    _codex_conversation_fts_full_clear(conn)
+    conn.execute("DELETE FROM codex_conversation_source_files")
+
+
+def sync_codex_conversations(
+    conn: sqlite3.Connection,
+    *,
+    rebuild: bool = False,
+    lock_timeout: "float | None" = None,
+    only_paths: "set[str] | None" = None,
+) -> CodexIngestStats:
+    """Delta-sync Codex events/search rows into conversations.db (#320)."""
+    stats = CodexIngestStats()
+    did_from_zero_replay = False
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
+    lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
+    try:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+            stats.lock_contended = True
+            return stats
+        targeted = only_paths is not None
+        pending_rebuild = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_rebuild_codex_pending'"
+        ).fetchone() is not None
+        if pending_rebuild and targeted:
+            stats.deferred_reason = "rebuild_pending"
+            return stats
+        rebuild = rebuild or pending_rebuild
+        if rebuild:
+            _clear_codex_conversation_store(conn)
+            conn.commit()
+
+        if only_paths is not None and rebuild:
+            raise ValueError(
+                "sync_codex_conversations: only_paths is incompatible with rebuild"
+            )
+        files = (
+            _qualify_codex_targets(only_paths)
+            if only_paths is not None
+            else _discover_codex_files_with_roots()
+        )
+        stats.files_total = len(files)
+        existing = {
+            row[0]: tuple(row[1:])
+            for row in conn.execute(
+                "SELECT path,size_bytes,mtime_ns,last_byte_offset,source_root_key,"
+                "last_session_id,last_model,last_total_tokens,"
+                "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
+                "last_conversation_key,last_turn_id "
+                "FROM codex_conversation_source_files"
+            )
+        }
+        if targeted:
+            for discovered in files:
+                prev = existing.get(str(discovered.source_path))
+                if prev is None:
+                    continue
+                if prev[3] != discovered.source_root_key:
+                    stats.deferred_reason = "requalification"
+                    return stats
+                try:
+                    current_size = discovered.source_path.stat().st_size
+                except OSError:
+                    continue
+                if current_size < prev[0]:
+                    stats.deferred_reason = "truncation"
+                    return stats
+        if only_paths is None:
+            active_paths = {str(item.source_path) for item in files}
+            for stale_path in sorted(set(existing) - active_paths):
+                affected = {
+                    row[0] for row in conn.execute(
+                        "SELECT DISTINCT conversation_key "
+                        "FROM codex_conversation_messages WHERE source_path=?",
+                        (stale_path,),
+                    ) if row[0]
+                }
+                conn.execute(
+                    "DELETE FROM codex_conversation_file_touches WHERE source_path=?",
+                    (stale_path,),
+                )
+                conn.execute(
+                    "DELETE FROM codex_conversation_messages WHERE source_path=?",
+                    (stale_path,),
+                )
+                conn.execute(
+                    "DELETE FROM codex_conversation_events WHERE source_path=?",
+                    (stale_path,),
+                )
+                conn.execute(
+                    "DELETE FROM codex_conversation_source_files WHERE path=?",
+                    (stale_path,),
+                )
+                _recompute_codex_rollups(conn, affected)
+            conn.commit()
+
+        for discovered in files:
+            jp = discovered.source_path
+            path_str = str(jp)
+            try:
+                st = jp.stat()
+            except OSError:
+                stats.files_failed += 1
+                continue
+            size, mtime_ns = st.st_size, st.st_mtime_ns
+            prev = existing.get(path_str)
+            if prev is not None and size == prev[0] and prev[3] == discovered.source_root_key:
+                stats.files_skipped_unchanged += 1
+                continue
+            reset_file = (
+                prev is not None
+                and (size < prev[0] or prev[3] != discovered.source_root_key)
+            )
+            if targeted and reset_file:
+                stats.deferred_reason = (
+                    "requalification"
+                    if prev is not None and prev[3] != discovered.source_root_key
+                    else "truncation"
+                )
+                return stats
+            start_offset = 0 if prev is None or reset_file else int(prev[2])
+            initial_session_id = prev[4] if prev else None
+            initial_model = prev[5] if prev else None
+            initial_total_tokens = (
+                int(prev[6]) if prev and prev[6] is not None else 0
+            )
+            initial_native = prev[7] if prev else None
+            initial_root = prev[8] if prev else None
+            initial_parent = prev[9] if prev else None
+            initial_conversation = prev[10] if prev else None
+            initial_turn = prev[11] if prev else None
+
+            state = _CodexIterState(
+                session_id=initial_session_id,
+                model=initial_model,
+                total_tokens=initial_total_tokens,
+            )
+            if initial_native and initial_root:
+                state.thread = _lib_jsonl.CodexThreadMetadata(
+                    source_root_key=discovered.source_root_key,
+                    source_path=path_str,
+                    native_thread_id=initial_native,
+                    root_thread_id=initial_root,
+                    parent_thread_id=initial_parent,
+                    conversation_key=initial_conversation,
+                    cwd=None,
+                    git_json=None,
+                    source_kind=None,
+                    thread_source_json=None,
+                    model_provider=None,
+                    context_window=None,
+                )
+            events = []
+            event_rows = []
+            yielded = 0
+            try:
+                with open(jp, "rb") as fh:
+                    fh.seek(start_offset)
+                    for emission in _iter_codex_fused_records_with_offsets(
+                        fh,
+                        path_str,
+                        initial_session_id=initial_session_id,
+                        initial_model=initial_model,
+                        initial_total_tokens=initial_total_tokens,
+                        source_root_key=discovered.source_root_key,
+                        state=state,
+                    ):
+                        event = emission.event
+                        events.append(event)
+                        event_rows.append((
+                            event.source_path,
+                            event.line_offset,
+                            event.source_root_key,
+                            event.conversation_key,
+                            event.native_thread_id,
+                            event.root_thread_id,
+                            event.parent_thread_id,
+                            event.timestamp_utc,
+                            event.record_type,
+                            event.event_type,
+                            event.turn_id,
+                            event.call_id,
+                            event.payload_json,
+                        ))
+                        if emission.accounting is not None:
+                            yielded += 1
+                    final_offset = fh.tell()
+            except OSError as exc:
+                eprint(f"[codex-conversations] could not read {jp}: {exc}")
+                stats.files_failed += 1
+                continue
+
+            try:
+                normalized = _lib_codex_conversation.normalize_codex_events(
+                    events,
+                    initial=_lib_codex_conversation.CodexStickyState(
+                        turn_id=initial_turn,
+                        model=initial_model,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not targeted:
+                    raise
+                eprint(
+                    f"[codex-conversations] normalization failed for {jp}: {exc}"
+                )
+                stats.files_failed += 1
+                continue
+            affected_keys = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT conversation_key "
+                    "FROM codex_conversation_messages WHERE source_path=?",
+                    (path_str,),
+                )
+                if row[0]
+            } if reset_file else set()
+            try:
+                if reset_file:
+                    conn.execute(
+                        "DELETE FROM codex_conversation_file_touches "
+                        "WHERE source_path=?",
+                        (path_str,),
+                    )
+                    conn.execute(
+                        "DELETE FROM codex_conversation_messages WHERE source_path=?",
+                        (path_str,),
+                    )
+                    conn.execute(
+                        "DELETE FROM codex_conversation_events WHERE source_path=?",
+                        (path_str,),
+                    )
+                    stats.files_reset_truncated += 1
+                if event_rows:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO codex_conversation_events "
+                        "(source_path,line_offset,source_root_key,conversation_key,"
+                        "native_thread_id,root_thread_id,parent_thread_id,"
+                        "timestamp_utc,record_type,event_type,turn_id,call_id,payload_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        event_rows,
+                    )
+                _insert_codex_normalized_rows(
+                    conn, normalized.rows, normalized.touches
+                )
+                affected_keys.update(
+                    row.conversation_key for row in normalized.rows
+                )
+                _recompute_codex_rollups(conn, affected_keys)
+                terminal = state.thread
+                conn.execute(
+                    "INSERT INTO codex_conversation_source_files "
+                    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+                    "source_root_key,last_session_id,last_model,last_total_tokens,"
+                    "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
+                    "last_conversation_key,last_turn_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET "
+                    "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
+                    "last_byte_offset=excluded.last_byte_offset,"
+                    "last_ingested_at=excluded.last_ingested_at,"
+                    "source_root_key=excluded.source_root_key,"
+                    "last_session_id=excluded.last_session_id,"
+                    "last_model=excluded.last_model,"
+                    "last_total_tokens=excluded.last_total_tokens,"
+                    "last_native_thread_id=excluded.last_native_thread_id,"
+                    "last_root_thread_id=excluded.last_root_thread_id,"
+                    "last_parent_thread_id=excluded.last_parent_thread_id,"
+                    "last_conversation_key=excluded.last_conversation_key,"
+                    "last_turn_id=excluded.last_turn_id",
+                    (
+                        path_str,
+                        size,
+                        mtime_ns,
+                        final_offset,
+                        dt.datetime.now(dt.timezone.utc).isoformat(),
+                        discovered.source_root_key,
+                        state.session_id or initial_session_id,
+                        state.model or initial_model,
+                        state.total_tokens if yielded else initial_total_tokens,
+                        terminal.native_thread_id if terminal else initial_native,
+                        terminal.root_thread_id if terminal else initial_root,
+                        terminal.parent_thread_id if terminal else initial_parent,
+                        terminal.conversation_key if terminal else initial_conversation,
+                        normalized.terminal.turn_id,
+                    ),
+                )
+                conn.commit()
+                stats.files_processed += 1
+            except sqlite3.DatabaseError as exc:
+                conn.rollback()
+                eprint(f"[codex-conversations] db error on {jp}: {exc}")
+                stats.files_failed += 1
+
+        if only_paths is None and stats.files_failed == 0:
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='conversation_rebuild_codex_pending'"
+            )
+            conn.commit()
+        _harden_conversation_sidecars()
+        _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
+        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
+    if did_from_zero_replay:
+        _force_retention_prune_after_replay()
+    return stats
 
 
 # === Region 7: cmd_cache_sync (was bin/cctally:11563-11616) ===
@@ -4878,12 +5598,16 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "(conversation.retention_days=0); nothing pruned."
             )
             return 0
-        result = retention._maybe_prune_conversation_retention(
-            conn,
-            now_utc=dt.datetime.now(dt.timezone.utc),
-            retention_days=retention_days,
-            force=True,
-        )
+        conv_conn = open_conversations_db(attach_cache=False)
+        try:
+            result = retention._maybe_prune_conversation_retention(
+                conv_conn,
+                now_utc=dt.datetime.now(dt.timezone.utc),
+                retention_days=retention_days,
+                force=True,
+            )
+        finally:
+            conv_conn.close()
         if result is None:
             eprint(
                 "[cache-sync] prune-conversations skipped: another process "
@@ -4896,7 +5620,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             f"{result.claude_messages} message(s), "
             f"codex {result.codex_conversations} conversation(s) / "
             f"{result.codex_events} event(s). "
-            f"Run `cctally db vacuum` to reclaim the freed space."
+            f"Run `cctally db vacuum --db conversations` to reclaim the freed space."
         )
         return 0
 
@@ -4962,6 +5686,57 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.lines_malformed} malformed, "
                 f"{stats.token_events_skipped} drift-skipped"
             )
+
+    # #320: transcript/search ingestion is a second physical database with its
+    # own cursors and flocks. Run it only after the core providers have
+    # committed so a slow/failed transcript pass can never roll back accounting
+    # or quota state.
+    try:
+        conversation_conn = open_conversations_db()
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(
+            f"[cache-sync] transcript store unavailable ({exc}); "
+            "core accounting/quota sync is complete"
+        )
+        _p_root.__exit__(None, None, None)
+        if _perf.enabled():
+            _perf.flush_stderr(_perf.current_root())
+        return 1 if args.rebuild else (1 if contended else 0)
+    try:
+        if source in ("claude", "all"):
+            conv_stats = sync_claude_conversations(
+                conversation_conn, rebuild=args.rebuild, lock_timeout=lt
+            )
+            if conv_stats.lock_contended:
+                eprint(
+                    "[cache-sync] transcript sync skipped (claude): "
+                    "another process holds the conversations lock"
+                )
+                contended = contended or bool(args.rebuild)
+            else:
+                eprint(
+                    f"[cache-sync] claude transcripts done: "
+                    f"{conv_stats.files_processed} processed, "
+                    f"{conv_stats.files_skipped_unchanged} skipped"
+                )
+        if source in ("codex", "all"):
+            conv_stats = sync_codex_conversations(
+                conversation_conn, rebuild=args.rebuild, lock_timeout=lt
+            )
+            if conv_stats.lock_contended:
+                eprint(
+                    "[cache-sync] transcript sync skipped (codex): "
+                    "another process holds the conversations lock"
+                )
+                contended = contended or bool(args.rebuild)
+            else:
+                eprint(
+                    f"[cache-sync] codex transcripts done: "
+                    f"{conv_stats.files_processed} processed, "
+                    f"{conv_stats.files_skipped_unchanged} skipped"
+                )
+    finally:
+        conversation_conn.close()
 
     _p_root.__exit__(None, None, None)
     # #276 perf: when tracing is enabled, flush the completed "cache-sync"

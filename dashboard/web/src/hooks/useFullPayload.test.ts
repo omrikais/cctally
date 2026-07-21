@@ -46,6 +46,31 @@ describe('useFullPayload', () => {
     expect(result.current.status).toBe('done');
   });
 
+  it('does not reuse a completed payload across same-key source identities', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ which: 'result', text: 'CLAUDE' }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', block_key: 't1', which: 'output', content: 'CODEX', truncated: false }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const { result, rerender } = renderHook(
+      ({ source }) => useFullPayload({ source, key: 'v1.same' }, 't1', 'result'),
+      { initialProps: { source: 'claude' as 'claude' | 'codex' } },
+    );
+    await act(async () => { await result.current.load(); });
+
+    rerender({ source: 'codex' as const });
+    await act(async () => { await result.current.load(); });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe('done');
+    if (result.current.status === 'done' && result.current.data.which === 'result') {
+      expect(result.current.data.text).toBe('CODEX');
+    }
+  });
+
   it('builds the route URL with encoded session/tool ids and the which discriminator', async () => {
     const fetchMock = vi
       .fn()

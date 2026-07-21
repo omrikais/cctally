@@ -75,6 +75,11 @@ describe('SourceSessionsGrid — Codex columns + vocabulary (§6.3)', () => {
     });
   });
 
+  it('does not expose a Codex conversation-reader affordance before Task B', () => {
+    render(<SessionsPanel />);
+    expect(screen.queryByRole('button', { name: 'Open conversation' })).not.toBeInTheDocument();
+  });
+
   it('shows the canonical empty marker when Codex has no persisted short name', () => {
     const env = bundleEnv();
     const codex = env.sources?.codex?.data as CodexSourceData;

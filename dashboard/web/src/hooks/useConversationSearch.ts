@@ -3,7 +3,9 @@ import { fetchJson, isAbortError } from '../lib/fetchJson';
 import { getState, subscribeStore } from '../store/store';
 import { useDebouncedValue } from './useDebouncedValue';
 import { filterParams } from './conversationFilterParams';
-import type { ConversationSearchResult, SearchHit, SearchKind } from '../types/conversation';
+import { adaptQualifiedSearch } from '../lib/conversationAdapters';
+import { qualifiedSearchUrl, type QualifiedSearchEnvelope } from '../lib/conversationTransport';
+import type { ConversationSearchResult, ConversationSource, SearchHit, SearchKind } from '../types/conversation';
 
 // Debounced cross-session search. Empty/whitespace needle -> no fetch, empty
 // hits. 200ms debounce (even on the first keystroke: the rail mounts this hook
@@ -36,6 +38,7 @@ export interface UseConversationSearch {
   filterDegraded: boolean;
   error: string | null;
   loadMore: () => void;
+  pending: boolean;
 }
 
 const DEBOUNCE_MS = 200;
@@ -43,7 +46,10 @@ const DEBOUNCE_MS = 200;
 export function useConversationSearch(
   query: string,
   kind: SearchKind = 'all',
+  source: ConversationSource = 'claude',
+  options: { qualified?: boolean } = {},
 ): UseConversationSearch {
+  const qualified = options.qualified === true || source === 'codex';
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [mode, setMode] = useState<'fts' | 'like' | null>(null);
   const [total, setTotal] = useState(0);
@@ -52,6 +58,8 @@ export function useConversationSearch(
   const [fetching, setFetching] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
   const q = query.trim();
   // #217 S4 / I-2.5 — the shared browse filters (auto-applied to search). A
   // stable JSON key folds into the `url` callback's deps so a filter change
@@ -77,12 +85,13 @@ export function useConversationSearch(
   loadingMoreRef.current = loadingMore;
 
   const url = useCallback(
-    (offset: number) =>
-      `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}${filterParams(filtersRef.current)}`,
+    (offset: number, nextCursor?: string | null) => qualified
+      ? qualifiedSearchUrl(source, { query: debouncedQ, kind, limit: 50, cursor: nextCursor ?? undefined })
+      : `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}${filterParams(filtersRef.current)}`,
     // filterKey is in the deps so a filter change re-creates `url` → re-fires the
     // keyed page-0 effect (reset/abort), even though the body reads filtersRef.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [debouncedQ, kind, filterKey],
+    [debouncedQ, kind, filterKey, source, qualified],
   );
 
   // Reset on an empty needle, and abort any in-flight fetch the instant the raw
@@ -104,13 +113,18 @@ export function useConversationSearch(
     ctlRef.current = ctl;
     setFetching(true);
     setLoadingMore(false);
-    fetchJson<ConversationSearchResult>(url(0), ctl.signal)
-      .then((body) => {
+    fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(0), ctl.signal)
+      .then((raw) => {
+        const body = qualified
+          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope)
+          : { ...(raw as ConversationSearchResult), cursor: null, pending: false };
         setHits(body.hits);
         setMode(body.mode);
         setTotal(body.total);
         setSearchDepth(body.search_depth ?? 'full');
         setFilterDegraded(body.filter_degraded === true);
+        setCursor(body.cursor);
+        setPending(body.pending);
         setError(null);
         setFetching(false);
       })
@@ -130,20 +144,25 @@ export function useConversationSearch(
     const ctl = new AbortController();
     ctlRef.current = ctl;
     setLoadingMore(true);
-    fetchJson<ConversationSearchResult>(url(offset), ctl.signal)
-      .then((body) => {
+    fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(offset, cursor), ctl.signal)
+      .then((raw) => {
+        const body = qualified
+          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope)
+          : { ...(raw as ConversationSearchResult), cursor: null, pending: false };
         setHits((prev) => [...prev, ...body.hits]);
         setTotal(body.total);
         setMode(body.mode);
         setSearchDepth(body.search_depth ?? 'full');
         setFilterDegraded(body.filter_degraded === true);
+        setCursor(body.cursor);
+        setPending(body.pending);
         setLoadingMore(false);
       })
       .catch((e) => {
         if (isAbortError(e)) return;   // stale append discarded on needle/kind change
         setError('Search failed.'); setLoadingMore(false);
       });
-  }, [url]);
+  }, [url, cursor, source, qualified]);
 
   // `loading` is DERIVED, not imperatively set: true while a non-empty needle's
   // results aren't ready — either the debounce hasn't caught up to the typed
@@ -153,5 +172,5 @@ export function useConversationSearch(
   // (debouncedQ never changes, so no fetch re-fires to clear an imperative flag).
   const loading = q !== '' && (q !== debouncedQ || fetching);
 
-  return { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore };
+  return { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending };
 }

@@ -19,16 +19,17 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 99 / 27 known
+  ✓ cache.db                 version 99 / 28 known
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            cache.db ahead (v99 > known v27) — auto-heals
+  ⚠ Version ahead            cache.db ahead (v99 > known v28) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
-  ✓ Migrations               0/40 applied
-  ⚠ Pending migrations       40 pending
+  ✓ Migrations               0/41 applied
+  ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
+  ✓ Reclaimable transcript space below threshold
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -52,4 +53,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 33 OK · 5 WARN · 0 FAIL
+Summary: 34 OK · 5 WARN · 0 FAIL

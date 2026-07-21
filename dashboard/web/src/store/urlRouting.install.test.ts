@@ -195,7 +195,7 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     dispose = installUrlRouting(deps);
     push.mockClear();
     set({ view: 'conversations', selectedConversationId: 'A' });
-    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/A');
+    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/A');
   });
 
   it('pushes #/conversations when mobile-Back clears the selection (Codex P1)', () => {
@@ -221,15 +221,15 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     dispose = installUrlRouting(deps);
     seed('#/conversations/A');
     push.mockClear();
-    set({ compare: { a: 'A', b: 'B' } });
-    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/compare/A/B');
+    set({ compare: { a: 'A', b: 'B' } as never });
+    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/compare/claude/A/claude/B');
   });
 
   it('does NOT overwrite the compare hash on a sibling tick (compare unchanged) (#217 S7 F10)', () => {
     const { deps, set } = makeStore({
       view: 'conversations',
       selectedConversationId: 'A',
-      compare: { a: 'A', b: 'B' },
+      compare: { a: 'A', b: 'B' } as never,
     });
     dispose = installUrlRouting(deps);
     seed('#/conversations/compare/A/B');
@@ -248,13 +248,13 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     const { deps, set } = makeStore({
       view: 'conversations',
       selectedConversationId: 'A',
-      compare: { a: 'A', b: 'B' },
+      compare: { a: 'A', b: 'B' } as never,
     });
     dispose = installUrlRouting(deps);
     seed('#/conversations/compare/A/B');
     push.mockClear();
     set({ compare: null }); // CLOSE_COMPARE
-    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/A');
+    expect(push).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/A');
   });
 
   it('replaces with the turn when a jump lands within the same conversation', () => {
@@ -263,7 +263,7 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     seed('#/conversations/A');
     replace.mockClear();
     set({ conversationJump: { session_id: 'A', uuid: 'u1' } });
-    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/A/u1');
+    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/A/u1');
   });
 
   it('replaces u1 -> u2 for a same-session jump before the first clears (Codex P2)', () => {
@@ -276,7 +276,7 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
     seed('#/conversations/A/u1');
     replace.mockClear();
     set({ conversationJump: { session_id: 'A', uuid: 'u2' } });
-    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/A/u2');
+    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/A/u2');
   });
 
   it('does NOT strip the turn when the jump clears (load-bearing)', () => {
@@ -297,7 +297,7 @@ describe('installUrlRouting — reflect path (store -> URL)', () => {
   it('is idempotent — no write when the desired hash already matches', () => {
     const { deps, set } = makeStore({ view: 'dashboard' });
     dispose = installUrlRouting(deps);
-    seed('#/conversations/A');
+    seed('#/conversations/source/claude/A');
     push.mockClear();
     set({ view: 'conversations', selectedConversationId: 'A' });
     expect(push).not.toHaveBeenCalled();

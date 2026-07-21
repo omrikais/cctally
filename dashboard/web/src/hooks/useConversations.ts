@@ -4,7 +4,9 @@ import { revalToken } from '../lib/revalToken';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
 import { filterParams } from './conversationFilterParams';
-import type { ConversationSummary, ConversationsPage } from '../types/conversation';
+import { adaptQualifiedBrowse } from '../lib/conversationAdapters';
+import { qualifiedBrowseUrl, type QualifiedBrowseEnvelope } from '../lib/conversationTransport';
+import { conversationSummaryRef, type ConversationSource, type ConversationSummary, type ConversationsPage } from '../types/conversation';
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
 // FIRST page when the shared change signal (`revalToken(env)` — the
@@ -47,15 +49,25 @@ export interface UseConversations {
   sortDegraded: boolean;
   // #205 S3 (F8) — user-initiated re-load of page 1 after a failed fetch.
   retry: () => void;
+  pending: boolean;
 }
 
 const PAGE = 50;
 
-export function useConversations(): UseConversations {
+export function useConversations(
+  source: ConversationSource = 'claude',
+  options: { qualified?: boolean } = {},
+): UseConversations {
+  const qualified = options.qualified === true || source === 'codex';
   const [rows, setRows] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [nextOffset, setNextOffset] = useState<number | null>(0);
+  const [nextOffset, setNextOffset] = useState<number | string | null>(0);
+  const [pending, setPending] = useState(false);
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  const qualifiedRef = useRef(qualified);
+  qualifiedRef.current = qualified;
   const [filterDegraded, setFilterDegraded] = useState(false);
   const [sortDegraded, setSortDegraded] = useState(false);
   // Active browse filters from the store (filters spec §4). A `filtersRef` mirror
@@ -112,12 +124,28 @@ export function useConversations(): UseConversations {
     ctlRef.current?.abort();
     const ctl = new AbortController();
     ctlRef.current = ctl;
-    fetchJson<ConversationsPage>(`/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`, ctl.signal)
-      .then((body) => {
-        setRows(body.conversations);
-        setNextOffset(body.page.next_offset);
-        setFilterDegraded(body.page.filter_degraded === true);
-        setSortDegraded(body.page.sort_degraded === true);
+    const activeSource = sourceRef.current;
+    const activeQualified = qualifiedRef.current;
+    const url = activeQualified
+      ? qualifiedBrowseUrl(activeSource, {
+          projectKey: filtersRef.current.projects[0], model: filtersRef.current.models[0], limit: PAGE,
+        })
+      : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`;
+    fetchJson<ConversationsPage | QualifiedBrowseEnvelope>(url, ctl.signal)
+      .then((raw) => {
+        if (sourceRef.current !== activeSource || qualifiedRef.current !== activeQualified) return;
+        if (activeQualified) {
+          const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope);
+          setRows(body.rows); setNextOffset(body.cursor); setPending(body.pending);
+          setFilterDegraded(false); setSortDegraded(false);
+        } else {
+          const body = raw as ConversationsPage;
+          setRows(body.conversations);
+          setNextOffset(body.page.next_offset);
+          setFilterDegraded(body.page.filter_degraded === true);
+          setSortDegraded(body.page.sort_degraded === true);
+          setPending(false);
+        }
         setError(null);
         setLoading(false);
       })
@@ -147,7 +175,7 @@ export function useConversations(): UseConversations {
   // effect below (now keyed on the `revalToken` change signal, #305) already
   // issues the initial page-1 load; double-firing here would re-fetch page 1
   // and, mid-paging, clobber the accumulated tail.
-  const queryKey = JSON.stringify({ filters, sort });
+  const queryKey = JSON.stringify({ source, qualified, filters, sort });
   const mountQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (mountQueryKeyRef.current === null) {
@@ -186,7 +214,7 @@ export function useConversations(): UseConversations {
     if (typeof document !== 'undefined' && document.hidden) return;
     loadFirstPage();
     return () => ctlRef.current?.abort();
-  }, [revalTok, loadFirstPage]);
+  }, [revalTok, source, loadFirstPage]);
 
   // Refetch once on the hidden→visible transition so a freshly-revealed tab is
   // current immediately (covers the case where the SSE stream was idle or
@@ -210,12 +238,26 @@ export function useConversations(): UseConversations {
     // fresh page-1 load.
     const gen = filterGenRef.current;
     try {
-      const body = await fetchJson<ConversationsPage>(`/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
+      const activeSource = sourceRef.current;
+      const activeQualified = qualifiedRef.current;
+      const raw = await fetchJson<ConversationsPage | QualifiedBrowseEnvelope>(activeQualified
+        ? qualifiedBrowseUrl(activeSource, {
+            projectKey: filtersRef.current.projects[0], model: filtersRef.current.models[0],
+            limit: PAGE, cursor: String(nextOffset),
+          })
+        : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
       if (filterGenRef.current !== gen) return; // filter/sort changed mid-flight — drop stale rows
-      setRows((prev) => [...prev, ...body.conversations]);
-      setNextOffset(body.page.next_offset);
-      setFilterDegraded(body.page.filter_degraded === true);
-      setSortDegraded(body.page.sort_degraded === true);
+      if (sourceRef.current !== activeSource || qualifiedRef.current !== activeQualified) return;
+      if (activeQualified) {
+        const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope);
+        setRows((prev) => [...prev, ...body.rows]); setNextOffset(body.cursor); setPending(body.pending);
+      } else {
+        const body = raw as ConversationsPage;
+        setRows((prev) => [...prev, ...body.conversations]);
+        setNextOffset(body.page.next_offset);
+        setFilterDegraded(body.page.filter_degraded === true);
+        setSortDegraded(body.page.sort_degraded === true);
+      }
     } catch {
       /* keep what we have; a transient blip shouldn't wipe the list */
     } finally {
@@ -231,8 +273,8 @@ export function useConversations(): UseConversations {
   // derived title without issuing its own browse fetch.
   useEffect(() => {
     if (rows.length === 0) return;
-    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: rows.map((r) => [r.session_id, r.title]) });
+    dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: rows.map((r) => [conversationSummaryRef(r), r.title]) });
   }, [rows]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending };
 }

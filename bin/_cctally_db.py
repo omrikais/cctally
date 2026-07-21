@@ -2648,6 +2648,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             plan_type             TEXT,
             individual_limit_json TEXT,
             reached_type          TEXT,
+            observed_model        TEXT,
             UNIQUE(source, source_path, line_offset, logical_limit_key),
             CHECK(source != 'codex' OR source_root_key IS NOT NULL)
         );
@@ -2893,6 +2894,12 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "conversation_sessions", "git_branch", "TEXT")
     add_column_if_missing(conn, "conversation_sessions", "models_json", "TEXT")
     add_column_if_missing(conn, "conversation_sessions", "title", "TEXT")
+    # #320: quota pool identity cannot depend on transcript events after the
+    # store split. Stamp the active model directly on each compact physical
+    # quota observation. Existing caches receive the nullable column here; 028
+    # backfills it from the still-present legacy event corpus before dropping
+    # that corpus.
+    add_column_if_missing(conn, "quota_window_snapshots", "observed_model", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -3012,6 +3019,72 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # so the migration dispatcher's subsequent ``conn.execute("BEGIN")`` starts
     # cleanly (mirrors the bootstrap-rename commit envelope rationale).
     conn.commit()
+
+
+def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
+    """Create the #320 transcript/search database schema.
+
+    The historical cache schema remains the migration-fixture source of truth.
+    Reuse it here, then remove the compact accounting families so conversation
+    queries can resolve those names through the read-only ``cache_db``
+    attachment. Empty compatibility tables may still exist in cache.db for old
+    migration handlers, but all live transcript rows belong here.
+    """
+    # The first open projects the historical monolithic schema into the new
+    # store. Avoid repeating that create-then-drop work on every conversation
+    # endpoint: it writes sqlite_schema and WAL pages even when no transcript
+    # data changed. Future conversation schema revisions must bump this marker.
+    try:
+        current = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='conversation_schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        current = None
+    if current is not None and current[0] == "1":
+        return
+
+    _apply_cache_schema(conn)
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS session_entries;
+        DROP TABLE IF EXISTS session_files;
+        DROP TABLE IF EXISTS codex_session_entries;
+        DROP TABLE IF EXISTS codex_session_files;
+        DROP TABLE IF EXISTS quota_window_snapshots;
+        DROP TABLE IF EXISTS codex_conversation_threads;
+        DROP TABLE IF EXISTS codex_source_roots;
+
+        CREATE TABLE IF NOT EXISTS conversation_source_files (
+            path             TEXT PRIMARY KEY,
+            size_bytes       INTEGER NOT NULL,
+            mtime_ns         INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS codex_conversation_source_files (
+            path                         TEXT PRIMARY KEY,
+            size_bytes                   INTEGER NOT NULL,
+            mtime_ns                     INTEGER NOT NULL,
+            last_byte_offset             INTEGER NOT NULL,
+            last_ingested_at             TEXT NOT NULL,
+            source_root_key              TEXT,
+            last_session_id              TEXT,
+            last_model                   TEXT,
+            last_total_tokens            INTEGER,
+            last_native_thread_id        TEXT,
+            last_root_thread_id          TEXT,
+            last_parent_thread_id        TEXT,
+            last_conversation_key        TEXT,
+            last_turn_id                 TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO cache_meta(key,value) VALUES "
+        "('conversation_schema_version','1') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
 
 
 def _fts5_available(conn: sqlite3.Connection) -> bool:
@@ -4728,6 +4801,118 @@ def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
             except OSError:
                 pass
             lock_fh.close()
+
+
+@cache_migration("028_split_conversation_store")
+def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
+    """Move the re-derivable transcript corpus out of cache.db (#320).
+
+    The upgrade deliberately does not copy gigabytes of prose/events. It creates
+    the independent current-schema store, arms provider-local byte-zero replay,
+    then drops the legacy transcript tables from the hot cache. Compact Codex
+    thread metadata stays in cache.db because accounting/project attribution
+    joins it directly.
+    """
+    core = _cctally_core
+    lock_paths = (
+        core.CACHE_LOCK_MAINTENANCE_PATH,
+        core.CACHE_LOCK_PATH,
+        core.CACHE_LOCK_CODEX_PATH,
+        core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
+        core.CONVERSATIONS_LOCK_PATH,
+        core.CONVERSATIONS_LOCK_CODEX_PATH,
+    )
+    held = []
+    try:
+        core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        for path in lock_paths:
+            fh = open(path, "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fh.close()
+                raise MigrationGateNotMet(
+                    "cache/conversation sync lock held; deferring cache 028 split"
+                )
+            held.append(fh)
+
+        conv = sqlite3.connect(core.CONVERSATIONS_DB_PATH)
+        try:
+            conv.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            conv.execute("PRAGMA journal_mode=WAL")
+            _apply_conversations_schema(conv)
+            _set_cache_meta(conv, "conversation_rebuild_claude_pending", "1")
+            _set_cache_meta(conv, "conversation_rebuild_codex_pending", "1")
+            conv.commit()
+        finally:
+            conv.close()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Preserve exact model-scoped quota-pool identity before discarding
+            # the legacy physical event corpus. The correlated lookup is the
+            # same nearest-prior context rule the quota reader used pre-split.
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='codex_conversation_events'"
+            ).fetchone() is not None:
+                conn.execute(
+                    "UPDATE quota_window_snapshots AS q SET observed_model=("
+                    " SELECT json_extract(e.payload_json, '$.payload.model')"
+                    " FROM codex_conversation_events AS e"
+                    " WHERE e.source_path=q.source_path"
+                    "   AND e.line_offset<=q.line_offset"
+                    "   AND e.record_type IN ('turn_context','session_meta')"
+                    "   AND json_valid(e.payload_json)"
+                    "   AND json_type(e.payload_json, '$.payload.model')='text'"
+                    " ORDER BY e.line_offset DESC LIMIT 1)"
+                    " WHERE q.source='codex' AND q.observed_model IS NULL"
+                )
+            for drop in (
+                "DROP TRIGGER IF EXISTS conv_fts_ai",
+                "DROP TRIGGER IF EXISTS conv_fts_ad",
+                "DROP TRIGGER IF EXISTS conv_fts_au",
+                "DROP TRIGGER IF EXISTS conv_fts_aux_ai",
+                "DROP TRIGGER IF EXISTS conv_fts_aux_ad",
+                "DROP TRIGGER IF EXISTS conv_fts_aux_au",
+                "DROP TRIGGER IF EXISTS conv_title_fts_ai",
+                "DROP TRIGGER IF EXISTS conv_title_fts_ad",
+                "DROP TRIGGER IF EXISTS conv_title_fts_au",
+                "DROP TRIGGER IF EXISTS codex_conv_fts_ai",
+                "DROP TRIGGER IF EXISTS codex_conv_fts_ad",
+                "DROP TRIGGER IF EXISTS codex_conv_fts_au",
+                "DROP TABLE IF EXISTS conversation_fts_aux",
+                "DROP TABLE IF EXISTS conversation_fts",
+                "DROP TABLE IF EXISTS conversation_title_fts",
+                "DROP TABLE IF EXISTS codex_conversation_fts",
+                "DROP TABLE IF EXISTS conversation_file_touches",
+                "DROP TABLE IF EXISTS conversation_sessions",
+                "DROP TABLE IF EXISTS conversation_ai_titles",
+                "DROP TABLE IF EXISTS conversation_messages",
+                "DROP TABLE IF EXISTS codex_conversation_file_touches",
+                "DROP TABLE IF EXISTS codex_conversation_rollups",
+                "DROP TABLE IF EXISTS codex_conversation_messages",
+                "DROP TABLE IF EXISTS codex_conversation_events",
+            ):
+                conn.execute(drop)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        try:
+            if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+                # Python 3.11/Linux may defer this zero-column PRAGMA until the
+                # cursor is exhausted; fetchall drives it to completion.
+                conn.execute("PRAGMA incremental_vacuum").fetchall()
+        except sqlite3.DatabaseError:
+            pass
+    finally:
+        for fh in reversed(held):
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
@@ -7006,7 +7191,12 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
     # Serialize against the retention prune and concurrent vacuums via the
     # dedicated maintenance flock (F13/F7), then the provider flocks for
     # cache.db. All non-blocking: fail promptly rather than hang.
-    maint_fh = open(core.CACHE_LOCK_MAINTENANCE_PATH, "w")
+    conversation_store = path == core.CONVERSATIONS_DB_PATH
+    maintenance_path = (
+        core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+        if conversation_store else core.CACHE_LOCK_MAINTENANCE_PATH
+    )
+    maint_fh = open(maintenance_path, "w")
     try:
         try:
             fcntl.flock(maint_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -7019,10 +7209,18 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
         held = []
         try:
             if provider_locked:
-                for lock_path, lname in (
-                    (core.CACHE_LOCK_PATH, "claude"),
-                    (core.CACHE_LOCK_CODEX_PATH, "codex"),
-                ):
+                provider_locks = (
+                    (
+                        (core.CONVERSATIONS_LOCK_PATH, "claude conversations"),
+                        (core.CONVERSATIONS_LOCK_CODEX_PATH, "codex conversations"),
+                    )
+                    if conversation_store else
+                    (
+                        (core.CACHE_LOCK_PATH, "claude"),
+                        (core.CACHE_LOCK_CODEX_PATH, "codex"),
+                    )
+                )
+                for lock_path, lname in provider_locks:
                     fh = open(lock_path, "w")
                     try:
                         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -7063,6 +7261,10 @@ def cmd_db_vacuum(args: argparse.Namespace) -> int:
     targets = []
     if which in ("cache", "all"):
         targets.append((_cctally_core.CACHE_DB_PATH, "cache.db", True))
+    if which in ("conversations", "all"):
+        targets.append((
+            _cctally_core.CONVERSATIONS_DB_PATH, "conversations.db", True,
+        ))
     if which in ("stats", "all"):
         targets.append((_cctally_core.DB_PATH, "stats.db", False))
     overall = 0

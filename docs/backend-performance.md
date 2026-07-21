@@ -11,7 +11,8 @@ cctally has three tiers of state. Knowing which tier owns a fact tells you wheth
 | Tier | Store | Owns | Re-derivable? |
 | --- | --- | --- | --- |
 | Authoritative | `stats.db` | User/runtime facts: weekly usage snapshots, percent milestones, week-reset events, weekly credit floors, budget milestones. | **No** — the source of truth. Losing it loses recorded history. |
-| Derived read model | `cache.db` | Everything computed from the on-disk JSONL: cost entries (`session_entries`), transcript rows (`conversation_messages`), the FTS search indices, the `conversation_sessions` browse rollup, file-touch axes, AI titles, the Codex parallel tables, and the `mutation_seq` change-signal counters. | **Yes** — fully re-derivable from `~/.claude/projects` JSONL. `rm cache.db`, `cache-sync --rebuild`, or a reader-side fallback all recover it. |
+| Core derived read model | `cache.db` | Compact Claude/Codex accounting entries and cursors, quota observations, Codex thread identity, and the `mutation_seq` change-signal counters. | **Yes** — re-derived from local JSONL by `cache-sync --rebuild`; direct readers may fall back to JSONL where documented. |
+| Transcript derived read model | `conversations.db` | Claude prose, Codex physical/normalized events, browse rollups, file-touch axes, AI titles, and FTS indexes. | **Yes** — independently re-derived from the same JSONL without blocking the core cache. |
 | Per-process accelerators | dashboard in-memory caches | Signature-keyed rebuild state in `bin/_lib_snapshot_cache.py`: the four reconcile caches (weekref cost, projects-envelope, Bug-K segment, cache-report per-day) plus the Group A/B bucket + session caches and the idle-dispatch `(signature, snapshot)` memo. | **Yes** — dropped on process exit; re-warmed on the next rebuild. Never persisted. |
 
 Above those stores sit the **endpoint groups** the dashboard serves: the snapshot/SSE spine (`/api/data`, `/api/events`); the conversation viewer (browse/search/reader/find/live-tail under `/api/conversation*`); share/export; and doctor/update. Each group reads the tiers above but never writes authoritative state on a GET.
@@ -31,13 +32,13 @@ The reconciles run **once per rebuild** (not once per SSE client): they refresh 
 
 ### Ingest (`sync_cache`)
 
-Ingest is the other hot path, shared by every JSONL-reading command through the read-through delta cache. Its coarse seams, under the `sync_cache` root: `flock` (acquire the exclusive `cache.db.lock`), `backfills` (the rare, upgrade-only reingest/backfill flags), `discover` (glob + stat, `count` = files), `walk` (the fused per-file parse-and-write loop as **one** phase, `count` = files processed — parse, session-entry writes, conversation-message inserts, file-touch maintenance, and AI-title upserts are fused into one per-file transaction, and FTS is trigger-driven behind the message inserts), and `recompute.conversation_sessions` (the post-walk browse-rollup re-derive). The `walk` loop is never instrumented per-row; volume is a `count`.
+Ingest is the other hot path, shared by every JSONL-reading command through the read-through delta cache. Under the `sync_cache` root, the core path acquires only `cache.db.lock`, discovers files, and writes compact accounting/cursor state. Transcript parsing, file touches, FTS triggers, and browse-rollup recompute run later through `sync_claude_conversations` / `sync_codex_conversations` on `conversations.db` and their independent locks. The core commit therefore remains available even when transcript work is slow or unavailable.
 
 As of #279 S2, `cctally cache-sync` traces one shared `cache-sync` root with `sync_cache` (the Claude ingest) and `sync_codex_cache` (the Codex ingest) as children, so a single flushed tree carries both vendors. The Codex sync now carries the same coarse `flock`/`discover`/`walk` seams as the Claude sync (its `walk` counts `files_processed`, never per-row).
 
 ### Cache-state diagnostics
 
-The signature legs, per-cache-table row counts, and pending reingest flags are all queryable from `cache.db` on demand — they are **not** timed phases. `/api/debug/backend` computes them at request time so they are available even when tracing is off.
+Core signature legs and accounting row counts are queryable from `cache.db`; transcript row counts and rebuild flags belong to `conversations.db`. They are **not** timed phases. `/api/debug/backend` computes the available diagnostics at request time even when tracing is off.
 
 ## 3. Invariants that cannot be broken
 
@@ -46,7 +47,7 @@ These hold regardless of performance work; a change that violates one is a bug e
 - **Privacy gate.** The `/api/debug/backend` diagnostic is loopback-only, always — its primary check is the unspoofable loopback TCP peer, with an IP-literal loopback `Host` as anti-DNS-rebinding defense-in-depth. It never consults `dashboard.expose_transcripts`. (The transcript endpoints have their own, deliberately more permissive, gate.)
 - **No transcript text in diagnostics.** The diagnostic surfaces leak only timings, counts, flag names, signature legs, and already-safe cache-table names — never prompt/prose/paths.
 - **Read-only, no-side-effect doctor.** `doctor` gathers and reports; it never heals, migrates, or writes.
-- **`cache.db` is re-derivable.** Any code may rebuild it from JSONL. It carries no authoritative state, so `--rebuild` and the reader-side fallback are always safe.
+- **Both derived stores are re-derivable.** `--rebuild` may reconstruct them from JSONL, but code must never unlink a live SQLite main/WAL/SHM family.
 - **Byte-identical CLI stdout.** Instrumentation and diagnostics change no command's stdout or `--json` output. `CCTALLY_PERF_TRACE` writes only to stderr. No golden moves.
 - **`mutation_seq` change-stamp correctness.** An id-stable in-place finalization UPSERT still advances the per-file `mutation_seq` leg, so the dashboard leaves the idle path and recomputes exactly the affected bucket. A signature that fails to move on a real data change silently serves stale rows.
 - **Leading-and-trailing-edge cache eviction.** Signature-keyed accelerator caches must evict at both edges of their window — a leading-edge-only eviction leaves stale trailing buckets that a later read wrongly reuses.
@@ -66,7 +67,7 @@ This doc is the qualitative contract. Concrete budgets — target warm-rebuild t
 
 ## 5. Conversation assembly: measured cost & materialization decision
 
-The conversation reader assembles a whole session from `conversation_messages` on **every** call — `_assemble_session` runs the full dedup → turn-grouping → fold → sweep → meta-classify → cost/usage-stamp pipeline over the entire session, and `get_conversation` (each page), `get_conversation_outline`, `get_conversation_export`, `get_conversation_prompts`, and `find_in_conversation` (after a non-empty match probe) all funnel through it. Nothing is materialized or cached across calls. M5's mandate was measurement-first: instrument that path (deep `assemble.*` seams, §4), sweep its cost across a synthetic size ladder, find the threshold where whole-session assembly becomes human-perceptible, and only then decide whether to materialize rendered turns in `cache.db`.
+The conversation reader assembles a whole session from `conversations.db`'s `conversation_messages` on **every** call — `_assemble_session` runs the full dedup → turn-grouping → fold → sweep → meta-classify → cost/usage-stamp pipeline over the entire session, and `get_conversation` (each page), `get_conversation_outline`, `get_conversation_export`, `get_conversation_prompts`, and `find_in_conversation` (after a non-empty match probe) all funnel through it. Nothing is materialized or cached across calls. M5's mandate was measurement-first: instrument that path (deep `assemble.*` seams, §4), sweep its cost across a synthetic size ladder, find the threshold where whole-session assembly becomes human-perceptible, and only then decide whether to materialize rendered turns in `conversations.db`.
 
 ### The measurement
 

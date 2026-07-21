@@ -586,7 +586,7 @@ describe('MessageItem (message-text copy, G2)', () => {
     // assistant.anchor = { session_id: 's', uuid: 'a1', id: 2 }. The origin is
     // derived from the runtime so the assertion is robust to jsdom's default host.
     expect(writeText).toHaveBeenCalledWith(
-      `${window.location.origin}/#/conversations/s/a1`,
+      `${window.location.origin}/#/conversations/source/claude/s/a1`,
     );
   });
 
@@ -792,7 +792,7 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
     // toolResult.anchor = { session_id: 's', uuid: 'tr1' }. Origin/pathname are
     // derived from the runtime so the assertion is robust to jsdom's host.
     expect(writeText).toHaveBeenCalledWith(
-      `${window.location.origin}/#/conversations/s/tr1`,
+      `${window.location.origin}/#/conversations/source/claude/s/tr1`,
     );
   });
 
@@ -811,7 +811,7 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
     render(<MessageItem item={systemMarker} />);
     fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
     expect(writeText).toHaveBeenCalledWith(
-      `${window.location.origin}/#/conversations/s/sm1`,
+      `${window.location.origin}/#/conversations/source/claude/s/sm1`,
     );
   });
 

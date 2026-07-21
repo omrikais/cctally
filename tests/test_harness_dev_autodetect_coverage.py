@@ -32,6 +32,12 @@ def test_preamble_exports_the_suppressor():
     assert "export CCTALLY_DISABLE_DEV_AUTODETECT=1" in preamble.read_text()
 
 
+def test_preamble_suppresses_detached_post_command_workers():
+    preamble = BIN / "_lib-harness-env.sh"
+    assert preamble.is_file()
+    assert "export CCTALLY_DISABLE_UPDATE_CHECK=1" in preamble.read_text()
+
+
 def test_fixture_lib_sources_the_preamble():
     lib = (BIN / "_lib-fixture-harness.sh").read_text()
     assert "_lib-harness-env.sh" in lib

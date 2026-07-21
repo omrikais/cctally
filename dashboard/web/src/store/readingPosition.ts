@@ -1,7 +1,13 @@
-import type { ReadingPos, ReadingPosMap } from '../types/conversation';
+import {
+  conversationRefKey,
+  normalizeConversationRef,
+  type ConversationRefInput,
+  type ReadingPos,
+  type ReadingPosMap,
+} from '../types/conversation';
 
 // #217 S3 E1 — anchor-based reading-position memory. A small persistence module
-// over localStorage that records the current-turn uuid per session as a bounded
+// over localStorage that records the current-turn uuid per qualified conversation as a bounded
 // LRU map so it cannot grow unbounded, and restores it on the next open. The
 // store wires `recordReadingPos` to the THROTTLED `SET_CONV_CURRENT_TURN`
 // (persist-before-reset, Codex P2 — a genuine switch resets convCurrentTurnUuid
@@ -67,32 +73,39 @@ function evictLru(map: ReadingPosMap, cap: number): ReadingPosMap {
   return map;
 }
 
-// Record (or refresh) the reading position for one session. `ts` defaults to
+// Record (or refresh) the reading position for one conversation. `ts` defaults to
 // `Date.now()` (the LRU recency key); pass an explicit `ts` in tests for
 // determinism. Re-writing an existing session refreshes its recency so it isn't
 // evicted as "old". Caller throttles the call cadence (the scroll-sync observer
 // fires often).
-export function recordReadingPos(sessionId: string, uuid: string, ts: number = Date.now()): void {
-  if (!sessionId || !uuid) return;
+export function recordReadingPos(refInput: ConversationRefInput, uuid: string, ts: number = Date.now()): void {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key || !uuid) return;
+  const identityKey = conversationRefKey(ref);
   // Leading-edge per-session throttle: drop a same-session write inside the
   // window (the first write of a burst already landed). The latest position
   // still survives a switch because a switch is preceded by at least one write
   // (Codex P2), and distinct sessions never throttle each other.
-  const prev = _lastWriteTs.get(sessionId);
+  const prev = _lastWriteTs.get(identityKey);
   if (prev !== undefined && ts - prev < READING_POS_THROTTLE_MS) return;
-  _lastWriteTs.set(sessionId, ts);
+  _lastWriteTs.set(identityKey, ts);
   const map = readMap();
-  map[sessionId] = { uuid, ts };
+  map[identityKey] = { uuid, ts };
+  // Legacy storage was keyed by the bare Claude session id. Production now
+  // passes a ConversationRef object, so source—not input syntax—controls the
+  // compatibility migration. Never probe/delete a bare key for Codex.
+  if (ref.source === 'claude') delete map[ref.key];
   writeMap(evictLru(map, READING_POS_CAP));
 }
 
-// Read the saved reading position for one session (open-precedence slot 2), or
+// Read the saved reading position for one conversation (open-precedence slot 2), or
 // null if none. Pure read — does NOT bump recency (a restore is a read, and the
 // next scroll-sync write refreshes recency anyway).
-export function loadReadingPos(sessionId: string): ReadingPos | null {
-  if (!sessionId) return null;
+export function loadReadingPos(refInput: ConversationRefInput): ReadingPos | null {
+  const ref = normalizeConversationRef(refInput);
+  if (!ref.key) return null;
   const map = readMap();
-  return map[sessionId] ?? null;
+  return map[conversationRefKey(ref)] ?? (ref.source === 'claude' ? map[ref.key] : undefined) ?? null;
 }
 
 // Test/maintenance helper — clear the entire map (and the throttle clock so a

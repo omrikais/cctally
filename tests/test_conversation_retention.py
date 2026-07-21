@@ -463,7 +463,7 @@ def test_orchestrator_skips_when_maintenance_flock_contended(tmp_path, monkeypat
     ns, conn, retention = _env(tmp_path, monkeypatch)
     _seed_msg(conn, "old1", OLD)
     conn.commit()
-    held = open(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, "w")
+    held = open(_cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, "w")
     fcntl.flock(held, fcntl.LOCK_EX)
     try:
         r = retention._maybe_prune_conversation_retention(
@@ -498,18 +498,18 @@ def test_rebuild_replay_triggers_force_prune_but_noop_sync_does_not(tmp_path, mo
 
     monkeypatch.setattr(retention, "_maybe_prune_conversation_retention", spy)
 
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"](attach_cache=False)
     try:
-        cache_mod.sync_cache(conn, rebuild=True)
+        cache_mod.sync_claude_conversations(conn, rebuild=True)
         assert calls == [True], "Claude rebuild must force-prune"
         calls.clear()
-        cache_mod.sync_cache(conn)
+        cache_mod.sync_claude_conversations(conn)
         assert calls == [], "a Claude no-op sync must not prune"
         calls.clear()
-        cache_mod.sync_codex_cache(conn, rebuild=True)
+        cache_mod.sync_codex_conversations(conn, rebuild=True)
         assert calls == [True], "Codex rebuild must force-prune"
         calls.clear()
-        cache_mod.sync_codex_cache(conn)
+        cache_mod.sync_codex_conversations(conn)
         assert calls == [], "a Codex no-op sync must not prune"
     finally:
         conn.close()
@@ -544,9 +544,9 @@ def test_truncation_replay_force_prunes_aged_transcripts_unthrottled(tmp_path, m
     # v1: two aged (well-before-cutoff) user messages — headroom to shrink.
     jsonl.write_text(_user_line("m-old-1", OLD) + _user_line("m-old-2", OLDER))
 
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"](attach_cache=False)
     try:
-        cache_mod.sync_cache(conn)
+        cache_mod.sync_claude_conversations(conn)
         # Precondition: the aged session ingested into conversation_messages and
         # the ordinary (non-replay) sync did NOT prune it.
         assert conn.execute(
@@ -567,7 +567,7 @@ def test_truncation_replay_force_prunes_aged_transcripts_unthrottled(tmp_path, m
         # truncation → escalation wipes + re-ingests conversation_messages from
         # offset 0 (RESTORING the aged row) → files_reset_truncated increments.
         jsonl.write_text(_user_line("m-old-1", OLD))
-        stats = cache_mod.sync_cache(conn)
+        stats = cache_mod.sync_claude_conversations(conn)
         assert stats.files_reset_truncated >= 1, (
             "rewriting the file smaller must trip the truncation escalation"
         )
@@ -786,9 +786,9 @@ def test_codex_forced_replay_prune_removes_rederived_derived_rows(tmp_path, monk
     rollout.write_text(aged)
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
 
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     try:
-        cache_mod.sync_codex_cache(conn)
+        cache_mod.sync_codex_conversations(conn)
         # Precondition: aged rows ingested + normalized; an ordinary sync did not prune.
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
@@ -807,7 +807,7 @@ def test_codex_forced_replay_prune_removes_rederived_derived_rows(tmp_path, monk
 
         # Rebuild = from-zero replay: clears + re-ingests + re-derives, then the
         # forced prune (F9) fires after the flock releases.
-        cache_mod.sync_codex_cache(conn, rebuild=True)
+        cache_mod.sync_codex_conversations(conn, rebuild=True)
 
         for table in ("codex_conversation_events", "codex_conversation_messages",
                       "codex_conversation_file_touches", "codex_conversation_rollups"):
@@ -832,9 +832,9 @@ def test_migration_025_replay_after_prune_does_not_resurrect(tmp_path, monkeypat
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
     retention = importlib.import_module("_lib_conversation_retention")
 
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     try:
-        cache_mod.sync_codex_cache(conn)
+        cache_mod.sync_codex_conversations(conn)
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
 

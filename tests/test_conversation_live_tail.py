@@ -89,7 +89,7 @@ def isolated(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     yield ns, conn, projects
     try:
         conn.close()
@@ -105,7 +105,7 @@ def _count(conn, path):
 
 def test_only_paths_ingests_only_the_named_file(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     b = projects / "b.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "answer A"))
@@ -118,7 +118,7 @@ def test_only_paths_ingests_only_the_named_file(isolated):
 
 def test_only_paths_withholds_walk_complete_marker(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "hi"))
     sync_cache(conn, only_paths={str(a)})
@@ -130,7 +130,7 @@ def test_only_paths_withholds_walk_complete_marker(isolated):
 
 def test_only_paths_does_not_orphan_other_tracked_files(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     b = projects / "b.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A"))
@@ -144,7 +144,7 @@ def test_only_paths_does_not_orphan_other_tracked_files(isolated):
 
 def test_only_paths_declines_on_shrink(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A") + _asst_line("a2", "m2", "r2", "AA"))
     sync_cache(conn, rebuild=True)
@@ -156,7 +156,7 @@ def test_only_paths_declines_on_shrink(isolated):
 
 def test_only_paths_declines_on_pending_global_flag(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A"))
     conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
@@ -178,7 +178,7 @@ def test_only_paths_per_file_failure_is_not_targeted_clean(isolated):
     # so the targeted ingest is NOT targeted_clean — the watch loop must NOT
     # advance `seen` for it.
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A"))
     os.chmod(a, 0o000)
@@ -192,7 +192,7 @@ def test_only_paths_per_file_failure_is_not_targeted_clean(isolated):
 
 def test_only_paths_with_rebuild_raises_value_error(isolated):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A"))
     with pytest.raises(ValueError):
@@ -201,7 +201,7 @@ def test_only_paths_with_rebuild_raises_value_error(isolated):
 
 def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monkeypatch):
     ns, conn, projects = isolated
-    sync_cache = ns["sync_cache"]
+    sync_cache = ns["sync_claude_conversations"]
     a = projects / "a.jsonl"
     a.write_text(_asst_line("a1", "m1", "r1", "A") + _asst_line("a2", "m2", "r2", "AA"))
     sync_cache(conn, only_paths={str(a)})
@@ -209,7 +209,7 @@ def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monk
         "SELECT uuid, entry_type, text, msg_id, model FROM conversation_messages "
         "WHERE source_path=? ORDER BY byte_offset", (str(a),)).fetchall()
     # Fresh cache, full rebuild, same file → identical rows for A.
-    conn2 = ns["open_cache_db"]()
+    conn2 = ns["open_conversations_db"]()
     try:
         sync_cache(conn2, rebuild=True)
         full = conn2.execute(

@@ -3,6 +3,7 @@ import { dispatch } from '../store/store';
 import { useConversationFind } from '../hooks/useConversationFind';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { loadFindRegex, saveFindRegex, loadFindCase, saveFindCase } from '../store/findPrefs';
+import { normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
 
 // #177 S6 — the floating in-conversation find bar (Cmd+F style pill, top-right
 // inside the reader column). Owns its needle + a 1-based match cursor, drives
@@ -28,7 +29,7 @@ export function FindBar({
   stepRef,
   tailRevision = 0,
 }: {
-  sessionId: string;
+  sessionId: ConversationRefInput;
   onClose: () => void;
   // (needle, caseSensitive, regex) — the reader builds the HighlightTerms value.
   // #223 supersedes S4 decision b: regex mode now reports its source for
@@ -42,13 +43,15 @@ export function FindBar({
   // re-runs the find query (debounced) against the grown corpus.
   tailRevision?: number;
 }) {
+  const qualifiedInput = typeof sessionId !== 'string';
+  const conversationRef = normalizeConversationRef(sessionId);
   const [needle, setNeedle] = useState('');
   const [cursor, setCursor] = useState(0);
   // Toggle state seeded from localStorage on mount, persisted on each flip.
   const [regex, setRegex] = useState(loadFindRegex);
   const [caseSensitive, setCaseSensitive] = useState(loadFindCase);
   const { anchors, total, truncated, mode, loading, error } = useConversationFind(
-    sessionId, needle, { regex, case: caseSensitive, tailRevision });
+    conversationRef, needle, { regex, case: caseSensitive, tailRevision });
   const inputRef = useRef<HTMLInputElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
@@ -98,8 +101,13 @@ export function FindBar({
     selectedUuidRef.current = a.uuid;   // remember the selection for cursor-preservation
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId,
-      jump: { session_id: sessionId, uuid: a.uuid, expand_details: a.match_kinds.length > 0 },
+      conversationRef,
+      jump: {
+        ...(qualifiedInput ? { conversation_ref: conversationRef } : {}),
+        session_id: conversationRef.key,
+        uuid: a.uuid,
+        expand_details: a.match_kinds.length > 0,
+      },
     });
   };
 

@@ -359,7 +359,9 @@ import _lib_log
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
-    get_entries, iter_entries, iter_entries_with_id, open_cache_db, sync_cache,
+    get_entries, iter_entries, iter_entries_with_id, open_cache_db,
+    open_conversations_db, sync_cache, sync_claude_conversations,
+    sync_codex_conversations,
     _prune_orphaned_cache_entries,
 )
 from _lib_snapshot_cache import (
@@ -1175,8 +1177,7 @@ def _dashboard_sync_loop(
 
 def _dashboard_maybe_prune_retention() -> None:
     """#313 P3 (F7): throttled transcript retention prune driven from the
-    dashboard sync thread. Runs once per iteration INSIDE the measured cooldown
-    work (Task 6), so its cost paces the deadline. Opens a dedicated cache
+    independent conversation sync thread. Opens a dedicated transcript
     connection (no provider flock, no open transaction) for the orchestrator.
     No-op when retention is disabled; never raises (a prune failure must not
     crash the sync thread)."""
@@ -1187,7 +1188,7 @@ def _dashboard_maybe_prune_retention() -> None:
         retention_days = resolve_retention_days(c.load_config())
         if retention_days <= 0:
             return
-        conn = c.open_cache_db()
+        conn = c.open_conversations_db(attach_cache=False)
         try:
             retention._maybe_prune_conversation_retention(
                 conn,
@@ -4100,10 +4101,6 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
 _DEBUG_CACHE_TABLES = (
     "session_entries",
     "session_files",
-    "conversation_messages",
-    "conversation_sessions",
-    "conversation_ai_titles",
-    "conversation_file_touches",
     "codex_session_entries",
     "codex_session_files",
 )
@@ -6769,11 +6766,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                         and _time.monotonic() - last_heal[0] >= 60.0):
                     last_heal[0] = _time.monotonic()
                     _dashboard_self_heal_orphans(skip_sync=self._skip_sync)
-                # #313 P3 (F7): throttled transcript retention prune, inside the
-                # measured iteration so its cost is in the cooldown work. Gated
-                # off under --no-sync (frozen mode makes no cache writes).
-                if not self._skip_sync:
-                    _dashboard_maybe_prune_retention()
 
             # Work-proportional cooldown (F10): sleep to t0 + max(interval, work)
             # so a slow rebuild cannot peg a full core. The manual POST /api/sync
@@ -6796,6 +6788,47 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
     if sync_thread is not None:
         sync_thread.start()
+
+    # #320: transcript/search ingestion runs on its own thread and SQLite file.
+    # A multi-GB first rebuild or a contended conversations.db therefore cannot
+    # delay `_run_sync_now`, its `last_sync_at` stamp, or core SSE publication.
+    conversation_sync_stop = threading.Event()
+
+    def _conversation_sync_loop() -> None:
+        interval = max(5.0, float(args.sync_interval))
+        while not conversation_sync_stop.is_set():
+            conn = None
+            try:
+                conn = open_conversations_db()
+                sync_claude_conversations(conn)
+                sync_codex_conversations(conn)
+                _dashboard_maybe_prune_retention()
+            except (OSError, sqlite3.DatabaseError) as exc:
+                eprint(f"[conversations] background sync unavailable: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                # Transcript parsing/normalization is deliberately outside the
+                # core freshness loop. Keep this worker alive so a later clean
+                # tick can self-heal instead of permanently stopping after one
+                # malformed provider record.
+                eprint(
+                    "[conversations] background sync failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                if conn is not None:
+                    conn.close()
+            conversation_sync_stop.wait(interval)
+
+    conversation_sync_thread = (
+        None if args.no_sync
+        else threading.Thread(
+            target=_conversation_sync_loop,
+            daemon=True,
+            name="dashboard-conversations-sync",
+        )
+    )
+    if conversation_sync_thread is not None:
+        conversation_sync_thread.start()
 
     # Spec §3.5 (codex review fix #5): update-check thread runs even
     # under --no-sync (frozen-data sessions still surface new versions).
@@ -6879,6 +6912,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     finally:
         if sync_thread is not None:
             sync_thread.stop()
+        conversation_sync_stop.set()
+        if conversation_sync_thread is not None:
+            conversation_sync_thread.join(timeout=2)
         update_check_stop.set()
         srv.shutdown()
         http_thread.join(timeout=2)

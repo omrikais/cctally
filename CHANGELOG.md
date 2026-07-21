@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.77.0] - 2026-07-21
+
+### Added
+- The dashboard Conversations workspace now browses and reads qualified Claude and Codex conversations through one source-aware reader, with a `Claude | Codex | All` rail selector, collision-safe permalinks and reading state, Codex-native reasoning/tool/thread/live-tail rendering, and source-labelled mixed-provider comparisons and exports that compare only compatible metrics. (#321)
+
+### Changed
+- Conversation prose, normalized Codex events, browse rollups, and full-text indexes now live in an independently synchronized `conversations.db`. Core Claude/Codex accounting and quota refreshes use only the compact `cache.db`, so a large, rebuilding, locked, or missing transcript store no longer delays dashboard accounting freshness. Existing transcript state is safely re-derived from local JSONL after upgrade. (#320)
+
+### Fixed
+- Read-only accounting attachment from `conversations.db` now enables SQLite URI handling explicitly, so conversation routes work on Python/SQLite builds that otherwise treat the `file:…?mode=ro` URI as a literal path. (#321)
+
 ## [1.76.0] - 2026-07-20
 
 ### Added

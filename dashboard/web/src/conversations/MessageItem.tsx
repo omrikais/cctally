@@ -177,7 +177,9 @@ function MessageItemImpl(
       [
         hasCost ? `$${(item.cost_usd as number).toFixed(4)}` : null,
         tok
-          ? `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}`
+          ? tok.source === 'codex'
+            ? `input ${tok.input} · output ${tok.output} · cached input ${tok.cached_input ?? 0} · reasoning output ${tok.reasoning_output ?? 0}`
+            : `input ${tok.input} · output ${tok.output} · cache create ${tok.cache_creation} · cache read ${tok.cache_read}`
           : null,
       ]
         .filter(Boolean)
@@ -239,7 +241,10 @@ function MessageItemImpl(
                 {hasCost && `$${(item.cost_usd as number).toFixed(4)}`}
                 {tok && (
                   <>
-                    {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)} · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}
+                    {hasCost ? ' · ' : ''}in {fmt.tokens(tok.input)} · out {fmt.tokens(tok.output)}
+                    {tok.source === 'codex'
+                      ? <> · cached in {fmt.tokens(tok.cached_input ?? 0)} · reasoning out {fmt.tokens(tok.reasoning_output ?? 0)}</>
+                      : <> · cache {fmt.tokens(tok.cache_creation + tok.cache_read)}</>}
                   </>
                 )}
               </span>

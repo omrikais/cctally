@@ -34,7 +34,7 @@ export function useFindHotkey(): void {
       if (s.view !== 'conversations') return;
       if (!_globalKeyGuard()) return;
       e.preventDefault();
-      if (s.selectedConversationId) {
+      if (s.selectedConversationRef) {
         dispatch({ type: 'OPEN_CONV_FIND' });
         // The find bar auto-focuses its input on mount; if it is ALREADY open,
         // re-focus the existing input so a repeat press lands the caret there.

@@ -20,7 +20,14 @@ import {
   ToolGenericIcon,
   WarningIcon,
 } from './ConvIcons';
-import type { CacheRebuild, ConversationOutline, OutlineStats, OutlineTurn } from '../types/conversation';
+import {
+  normalizeConversationRef,
+  type CacheRebuild,
+  type ConversationOutline,
+  type ConversationRefInput,
+  type OutlineStats,
+  type OutlineTurn,
+} from '../types/conversation';
 
 // The shared jump-target lists (built once in OutlinePanel from
 // buildOutlineTargets, passed to both the stats card and the jump cluster) — so
@@ -46,7 +53,7 @@ function JumpCluster({
   focusMode,
   markersEnabled,
 }: {
-  sessionId: string;
+  sessionId: ConversationRefInput;
   turns: OutlineTurn[];
   lists: JumpLists;
   currentUuid: string | null;
@@ -61,6 +68,8 @@ function JumpCluster({
   // even if flagged turns exist (the opt-out hides ALL marker surfaces).
   markersEnabled: boolean;
 }) {
+  const qualifiedInput = typeof sessionId !== 'string';
+  const conversationRef = normalizeConversationRef(sessionId);
   const { indexByUuid, memberIndex: _memberIndex, ...targets } = lists;
 
   // Dispatch the OPEN_CONVERSATION jump for a resolved target turn index, after
@@ -73,7 +82,11 @@ function JumpCluster({
     if (focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
       dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
     }
-    dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: turn.uuid } });
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      conversationRef,
+      jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid: turn.uuid },
+    });
   };
 
   const missPulse = (btn: HTMLElement) => {
@@ -214,8 +227,9 @@ function OutlineStatsCard({
   const totalTokens =
     stats.tokens.input +
     stats.tokens.output +
-    stats.tokens.cache_creation +
-    stats.tokens.cache_read;
+    (stats.tokens.source === 'codex'
+      ? (stats.tokens.cached_input ?? 0) + (stats.tokens.reasoning_output ?? 0)
+      : stats.tokens.cache_creation + stats.tokens.cache_read);
 
   // Tool histogram: top-3 by count (descending), then `+N more`. The full sorted
   // list goes into the title tooltip so nothing is lost at a glance.
@@ -247,6 +261,15 @@ function OutlineStatsCard({
         {' · '}
         <span className="conv-outline-stats-strong">{yours}</span> yours
       </div>
+      {stats.tokens.source === 'codex' && (
+        <div className="conv-outline-stat-kv conv-outline-stat-kv--tokens" title="Provider-native Codex token fields">
+          <span className="conv-outline-stat-kv-glyph" aria-hidden="true">#</span>
+          <span className="conv-outline-stat-kv-label">Tokens</span>
+          <span className="conv-outline-stat-kv-value">
+            in {fmt.tokens(stats.tokens.input)} · out {fmt.tokens(stats.tokens.output)} · cached in {fmt.tokens(stats.tokens.cached_input ?? 0)} · reasoning out {fmt.tokens(stats.tokens.reasoning_output ?? 0)}
+          </span>
+        </div>
+      )}
       <div className="conv-outline-stat-tiles">
         <div className="conv-outline-stat-tile">
           <span className="conv-outline-stat-tile-value">{fmt.hhmm(stats.duration_seconds)}</span>
@@ -318,12 +341,14 @@ function OutlineStatsCard({
 function OutlineCacheRebuilds({
   sessionId, rebuilds, turnByUuid, indexByUuid, fmtCtx,
 }: {
-  sessionId: string;
+  sessionId: ConversationRefInput;
   rebuilds: CacheRebuild[];
   turnByUuid: Map<string, OutlineTurn>;
   indexByUuid: Map<string, number>;
   fmtCtx: FmtCtx;
 }) {
+  const qualifiedInput = typeof sessionId !== 'string';
+  const conversationRef = normalizeConversationRef(sessionId);
   const [expanded, setExpanded] = useState(false);
   const CAP = 3;
   const shown = expanded ? rebuilds : rebuilds.slice(0, CAP);
@@ -342,7 +367,11 @@ function OutlineCacheRebuilds({
                 type="button"
                 className="conv-rebuild-jump"
                 aria-label={`Jump to cache rebuild: ~${fmt.usd2(r.est_wasted_usd)} wasted`}
-                onClick={() => dispatch({ type: 'OPEN_CONVERSATION', sessionId, jump: { session_id: sessionId, uuid: r.uuid } })}
+                onClick={() => dispatch({
+                  type: 'OPEN_CONVERSATION',
+                  conversationRef,
+                  jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid: r.uuid },
+                })}
               >
                 <span className="rb-cost">{fmt.usd2(r.est_wasted_usd)}</span>
                 <span className="rb-label">{label}</span>
@@ -366,9 +395,11 @@ export function OutlinePanel({
   sessionId,
   outline,
 }: {
-  sessionId: string;
+  sessionId: ConversationRefInput;
   outline: ConversationOutline | null;
 }) {
+  const qualifiedInput = typeof sessionId !== 'string';
+  const conversationRef = normalizeConversationRef(sessionId);
   // #184 — deliberate full-panel re-render per `convCurrentTurnUuid` tick (the
   // panel rows are trivial, so a subscription-driven render is far simpler than
   // mirroring the reader's imperative aria-current bookkeeping).
@@ -447,8 +478,8 @@ export function OutlinePanel({
     }
     dispatch({
       type: 'OPEN_CONVERSATION',
-      sessionId,
-      jump: { session_id: sessionId, uuid },
+      conversationRef,
+      jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid },
     });
   };
 
@@ -535,13 +566,17 @@ export function OutlinePanel({
             >
               Files
               <span className="conv-outline-tab-count" aria-hidden="true">
-                {(outline.files ?? []).length}
+                {(outline.files ?? []).length + (outline.provider_files ?? []).length}
               </span>
             </button>
           </div>
           {outlineTab === 'files' ? (
             <div className="conv-outline-files" role="tabpanel">
-              <FilesTab files={outline.files ?? []} onJump={jumpTo} />
+              <FilesTab
+                files={outline.files ?? []}
+                providerFiles={outline.provider_files ?? []}
+                onJump={jumpTo}
+              />
             </div>
           ) : (
           <ol className="conv-outline-list" ref={listRef}>

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Markdown } from '../components/Markdown';
 import {
   toolIcon,
@@ -15,6 +15,7 @@ import { specialToolRenderer } from './specialTools';
 import { TaskChecklistCard } from './TaskChecklistCard';
 import { parseMcpName } from './parseMcpName';
 import { MediaFigure } from './MediaFigure';
+import { LoadFull } from './LoadFull';
 import { useFocusMode } from './TranscriptContext';
 import type { ConversationBlock } from '../types/conversation';
 
@@ -217,6 +218,8 @@ function ToolResultBody({ result, name, preview }: { result: ToolResult; name: s
 // that expands. Collapsed by default.
 function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool_call' }> }) {
   const split = useFindSplit();
+  const [fullInput, setFullInput] = useState<string | null>(null);
+  const [fullResult, setFullResult] = useState<string | null>(null);
   if (call.skill_body != null) {
     return (
       <details className="conv-chip conv-chip--tool conv-chip--skill">
@@ -250,8 +253,19 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
       <div className="conv-chip-body conv-chip-body--io">
         <div className="conv-tool-io">
           <div className="conv-tool-io-label">request</div>
-          <CopyButton text={call.input_summary} />
-          <pre className="conv-code conv-code--hl">{highlightBody(call.input_summary, 'json', split)}</pre>
+          <CopyButton text={fullInput ?? call.input_summary} />
+          <pre className="conv-code conv-code--hl">{highlightBody(fullInput ?? call.input_summary, 'json', split)}</pre>
+          {call.payload_capable && call.tool_use_id && fullInput == null && (
+            <LoadFull
+              toolUseId={call.tool_use_id}
+              which="input"
+              fullLength={null}
+              label="load full request"
+              onLoaded={(payload) => {
+                if (payload.which === 'input') setFullInput(JSON.stringify(payload.input, null, 2));
+              }}
+            />
+          )}
         </div>
         {call.result ? (
           <div className="conv-tool-io">
@@ -259,8 +273,19 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
               result{call.result.is_error ? ' · error' : ' · ok'}
               {call.result.truncated ? ' · truncated' : ''}
             </div>
-            <CopyButton text={call.result.text} />
-            <ToolResultBody result={call.result} name={call.name} preview={call.preview} />
+            <CopyButton text={fullResult ?? call.result.text} />
+            <ToolResultBody result={{ ...call.result, text: fullResult ?? call.result.text }} name={call.name} preview={call.preview} />
+            {call.payload_capable && call.tool_use_id && fullResult == null && (
+              <LoadFull
+                toolUseId={call.tool_use_id}
+                which="result"
+                fullLength={null}
+                label="load full result"
+                onLoaded={(payload) => {
+                  if (payload.which === 'result') setFullResult(payload.text);
+                }}
+              />
+            )}
             {/* #177 S4 (Q7-A): tool-result screenshots render inline after the
                 text panel, in document order, addressed by this call's id. */}
             {call.result.media?.map((m) => (

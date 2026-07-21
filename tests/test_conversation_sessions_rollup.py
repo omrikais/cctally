@@ -96,17 +96,29 @@ def _enrichment_for(conn, session_id):
         "FROM conversation_sessions WHERE session_id=?", (session_id,)).fetchone()
 
 
+def _sync(cache_mod, conversations, *, rebuild=False):
+    """Advance compact accounting and transcript projections independently."""
+    core = cache_mod.open_cache_db()
+    try:
+        cache_mod.sync_cache(core, rebuild=rebuild)
+    finally:
+        core.close()
+    return cache_mod.sync_claude_conversations(
+        conversations, rebuild=rebuild
+    )
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Isolated cache.db + an empty Claude projects dir. Returns
+    """Isolated split stores + an empty Claude projects dir. Returns
     (cache_mod, conn, projects). Each test writes its own JSONL into ``projects``
-    then calls ``cache_mod.sync_cache(conn)``."""
+    then advances both independent syncs through ``_sync``."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_cache as cache_mod   # the module object load_script just loaded
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     yield cache_mod, conn, projects
     try:
         conn.close()
@@ -126,7 +138,7 @@ def test_fresh_ingest_populates_rollup(env):
     (projects / "b.jsonl").write_text(
         _asst_line("b1", "mb1", "rb1", "hi b", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     rollup = _rollup(conn)
     assert [r[0] for r in rollup] == ["s1", "s2"]
     assert _row_for(conn, "s1")[1] == 2          # two messages
@@ -147,7 +159,7 @@ def test_incremental_append_updates_only_touched(env):
     b.write_text(
         _asst_line("b1", "mb1", "rb1", "hi b", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     s1_before = _row_for(conn, "s1")
     s2_before = _row_for(conn, "s2")
     assert s1_before[1] == 1
@@ -156,7 +168,7 @@ def test_incremental_append_updates_only_touched(env):
     with open(a, "a") as fh:
         fh.write(_user_line("a2", "more", session_id="s1",
                             ts="2026-06-01T05:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
 
     s1_after = _row_for(conn, "s1")
     s2_after = _row_for(conn, "s2")
@@ -178,7 +190,7 @@ def test_rebuild_repopulates_rollup(env):
     (projects / "b.jsonl").write_text(
         _asst_line("b1", "mb1", "rb1", "hi b", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     # Seed a STALE rollup row for a session that no longer has any messages —
     # a rebuild must drop it.
     conn.execute(
@@ -187,7 +199,7 @@ def test_rebuild_repopulates_rollup(env):
         "VALUES ('ghost', 99, '1999-01-01T00:00:00Z', '1999-01-01T00:00:00Z')")
     conn.commit()
 
-    cache_mod.sync_cache(conn, rebuild=True)
+    _sync(cache_mod, conn, rebuild=True)
     assert _row_for(conn, "ghost") is None              # stale row dropped
     assert {r[0] for r in _rollup(conn)} == {"s1", "s2"}
     assert _get_meta(conn, FLAG) is None                # flag cleared
@@ -207,7 +219,7 @@ def test_truncation_escalation_repopulates(env):
     (projects / "b.jsonl").write_text(
         _asst_line("b1", "mb1", "rb1", "hi b", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert _row_for(conn, "s1")[1] == 2
 
     # Shrink a.jsonl on disk to a single (different) line -> truncation
@@ -215,7 +227,7 @@ def test_truncation_escalation_repopulates(env):
     a.write_text(
         _asst_line("a1b", "ma1b", "ra1b", "shrunk", session_id="s1",
                    ts="2026-06-03T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert _row_for(conn, "s1")[1] == 1                 # only the shrunk line
     assert _get_meta(conn, FLAG) is None                # flag cleared
     assert_rollup_matches_live(conn)
@@ -241,7 +253,7 @@ def test_migration013_flag_triggers_full_recompute(env):
     assert _rollup(conn) == []                           # rollup empty pre-flag
     _set_meta(conn, FLAG, "1")                           # migration 013 arms it
 
-    cache_mod.sync_cache(conn)                           # consumes the flag
+    _sync(cache_mod, conn)                           # consumes the flag
     assert {r[0] for r in _rollup(conn)} == {"s1", "s2"}
     assert _row_for(conn, "s1")[1] == 2
     assert _get_meta(conn, FLAG) is None                 # flag cleared
@@ -273,7 +285,7 @@ def test_crash_durability(env):
     conn.commit()
     _set_meta(conn, FLAG, "1")
 
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert _row_for(conn, "s1")[1] == 1                  # recomputed, not stale
     assert _row_for(conn, "s1")[2] == "2026-06-01T00:00:00Z"
     assert _row_for(conn, "s2")[1] == 2
@@ -294,14 +306,14 @@ def test_reingest_recompute(env):
     (projects / "b.jsonl").write_text(
         _asst_line("b1", "mb1", "rb1", "hi b", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert_rollup_matches_live(conn)
 
     # Arm a reingest flag (the #179 path), then sync — sync_cache consumes the
     # reingest (DELETE + re-insert every file's messages) and arms the rollup
     # backfill flag, which the post-walk recompute then consumes.
     _set_meta(conn, "conversation_reingest_enrichment_pending", "1")
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert {r[0] for r in _rollup(conn)} == {"s1", "s2"}
     assert _get_meta(conn, FLAG) is None
     assert _get_meta(conn, "conversation_reingest_enrichment_pending") is None
@@ -328,7 +340,7 @@ def test_fill_populates_enrichment_columns(env):
     (projects / "b.jsonl").write_text(
         _user_line("h2", "just a question", session_id="s2",
                    ts="2026-06-02T00:00:00Z"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
 
     branch, models_json, title, proj, cost = _enrichment_for(conn, "s1")
     assert branch == "main"
@@ -360,7 +372,7 @@ def test_scoped_append_replaces_stored_enrichment(env):
         + _asst_line("a1", "ma1", "ra1", "reply", session_id="s1",
                      ts="2026-06-01T00:01:00Z", model="claude-opus-4-8",
                      cwd="/home/u/proj", git_branch="main"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     assert _enrichment_for(conn, "s1")[0] == "main"
     assert json.loads(_enrichment_for(conn, "s1")[1]) == ["claude-opus-4-8"]
 
@@ -371,7 +383,7 @@ def test_scoped_append_replaces_stored_enrichment(env):
         fh.write(_asst_line("a2", "ma2", "ra2", "later", session_id="s1",
                             ts="2026-06-01T05:00:00Z", model="claude-haiku-4-5",
                             cwd="/home/u/proj", git_branch="feature-x"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
 
     branch, models_json, title, _, _ = _enrichment_for(conn, "s1")
     assert branch == "feature-x", "stored branch must be the latest non-null"
@@ -392,7 +404,7 @@ def test_full_backfill_replaces_stale_enrichment(env):
         + _asst_line("a1", "ma1", "ra1", "reply", session_id="s1",
                      ts="2026-06-01T00:01:00Z", model="claude-opus-4-8",
                      cwd="/home/u/proj", git_branch="main"))
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     # Corrupt the stored enrichment in place, then arm the backfill flag (023's
     # arm): the next sync full-recomputes and must OVERWRITE the stale values.
     conn.execute(
@@ -401,7 +413,7 @@ def test_full_backfill_replaces_stale_enrichment(env):
     conn.commit()
     _set_meta(conn, FLAG, "1")
 
-    cache_mod.sync_cache(conn)
+    _sync(cache_mod, conn)
     branch, models_json, title, _, _ = _enrichment_for(conn, "s1")
     assert branch == "main"
     assert json.loads(models_json) == ["claude-opus-4-8"]

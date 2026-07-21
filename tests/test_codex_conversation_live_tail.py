@@ -61,8 +61,14 @@ def _entries(conn, path):
 
 
 def _events(conn, path):
+    """Legacy helper name; targeted core tests now observe the core cursor.
+
+    Transcript-event targeting is covered against the independent store in
+    ``test_conversation_db_split``.
+    """
     return conn.execute(
-        "SELECT COUNT(*) FROM codex_conversation_events WHERE source_path=?",
+        "SELECT COALESCE(MAX(last_byte_offset), 0) FROM codex_session_files "
+        "WHERE path=?",
         (str(path),)).fetchone()[0]
 
 
@@ -377,24 +383,25 @@ def test_full_sync_still_invokes_reconciler(tmp_path, monkeypatch):
 def test_targeted_parity_with_full_sync_for_that_file(tmp_path, monkeypatch):
     ns, root = _setup(tmp_path, monkeypatch)
     a = _place(root, "a", "modern-full")
-    conn = ns["open_cache_db"]()
+    core = ns["open_cache_db"]()
     try:
-        ns["sync_codex_cache"](conn, only_paths={str(a)})
+        ns["sync_codex_cache"](core)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, only_paths={str(a)})
         targeted = conn.execute(
+            "SELECT line_offset, record_type, event_type, turn_id "
+            "FROM codex_conversation_events WHERE source_path=? ORDER BY line_offset",
+            (str(a),)).fetchall()
+        ns["sync_codex_conversations"](conn, rebuild=True)
+        full = conn.execute(
             "SELECT line_offset, record_type, event_type, turn_id "
             "FROM codex_conversation_events WHERE source_path=? ORDER BY line_offset",
             (str(a),)).fetchall()
     finally:
         conn.close()
-    conn2 = ns["open_cache_db"]()
-    try:
-        ns["sync_codex_cache"](conn2, rebuild=True)
-        full = conn2.execute(
-            "SELECT line_offset, record_type, event_type, turn_id "
-            "FROM codex_conversation_events WHERE source_path=? ORDER BY line_offset",
-            (str(a),)).fetchall()
-    finally:
-        conn2.close()
     assert targeted == full
 
 
@@ -405,13 +412,18 @@ def test_source_paths_own_plus_children(tmp_path, monkeypatch):
     ns, root = _setup(tmp_path, monkeypatch)
     parent = _place(root, "parent", "nested-parent")
     child = _place(root, "child", "nested-child")
-    conn = ns["open_cache_db"]()
+    core = ns["open_cache_db"]()
     try:
-        ns["sync_codex_cache"](conn, rebuild=True)
+        ns["sync_codex_cache"](core, rebuild=True)
         # Resolve the parent conversation key from its thread row.
-        parent_key = conn.execute(
+        parent_key = core.execute(
             "SELECT conversation_key FROM codex_conversation_threads "
             "WHERE native_thread_id='parent-thread-fixture'").fetchone()[0]
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
         paths = set(q.codex_conversation_source_paths(conn, parent_key))
         assert str(parent) in paths          # own file
         assert str(child) in paths           # child's file (widened set)
@@ -421,7 +433,7 @@ def test_source_paths_own_plus_children(tmp_path, monkeypatch):
 
 def test_source_paths_unknown_is_empty(tmp_path, monkeypatch):
     ns, root = _setup(tmp_path, monkeypatch)
-    conn = ns["open_cache_db"]()
+    conn = ns["open_conversations_db"]()
     try:
         assert q.codex_conversation_source_paths(conn, "v1.nope") == []
     finally:
@@ -431,9 +443,14 @@ def test_source_paths_unknown_is_empty(tmp_path, monkeypatch):
 def test_codex_conversation_exists(tmp_path, monkeypatch):
     ns, root = _setup(tmp_path, monkeypatch)
     _place(root, "a", "modern-full")
-    conn = ns["open_cache_db"]()
+    core = ns["open_cache_db"]()
     try:
-        ns["sync_codex_cache"](conn, rebuild=True)
+        ns["sync_codex_cache"](core, rebuild=True)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
         key = conn.execute(
             "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
             "LIMIT 1").fetchone()[0]

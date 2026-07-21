@@ -2,6 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { parseHash, formatHash, permalinkUrl } from './urlRouting';
 
 describe('parseHash', () => {
+  it('parses the qualified source/key route without decoding the opaque key', () => {
+    expect(parseHash('#/conversations/source/codex/v1.root%2Fopaque/turn%201')).toMatchObject({
+      conversationRef: { source: 'codex', key: 'v1.root/opaque' },
+      turnUuid: 'turn 1',
+      compare: null,
+    });
+  });
+
+  it('round-trips a qualified comparison without colliding equal opaque keys', () => {
+    const a = { source: 'claude', key: 'same/native' } as const;
+    const b = { source: 'codex', key: 'same/native' } as const;
+    const hash = formatHash({ sessionId: null, conversationRef: null, turnUuid: null, compare: { a, b } });
+    expect(hash).toBe('#/conversations/compare/claude/same%2Fnative/codex/same%2Fnative');
+    expect(parseHash(hash)?.compare).toEqual({ a, b });
+  });
+
   it('returns null for the dashboard (bare/empty/malformed)', () => {
     expect(parseHash('')).toBeNull();
     expect(parseHash('#')).toBeNull();
@@ -28,7 +44,8 @@ describe('parseHash', () => {
   // #217 S7 F10 — the compare route.
   it('parses a compare hash', () => {
     expect(parseHash('#/conversations/compare/AA/BB')).toEqual({
-      sessionId: null, turnUuid: null, compare: { a: 'AA', b: 'BB' },
+      sessionId: null, conversationRef: null, turnUuid: null,
+      compare: { a: { source: 'claude', key: 'AA' }, b: { source: 'claude', key: 'BB' } },
     });
   });
 
@@ -47,7 +64,8 @@ describe('parseHash', () => {
     expect(parseHash('#/conversation')).toEqual({ sessionId: null, turnUuid: null, compare: null });
     expect(parseHash('#/conversation/')).toEqual({ sessionId: null, turnUuid: null, compare: null });
     expect(parseHash('#/conversation/compare/AA/BB')).toEqual({
-      sessionId: null, turnUuid: null, compare: { a: 'AA', b: 'BB' },
+      sessionId: null, conversationRef: null, turnUuid: null,
+      compare: { a: { source: 'claude', key: 'AA' }, b: { source: 'claude', key: 'BB' } },
     });
   });
 
@@ -58,6 +76,16 @@ describe('parseHash', () => {
 });
 
 describe('formatHash', () => {
+  it('writes qualified source plus opaque key and round-trips colliding identities', () => {
+    const claude = { source: 'claude', key: 'same/native' } as const;
+    const codex = { source: 'codex', key: 'same/native' } as const;
+    const claudeHash = formatHash(claude as never, 'turn 1');
+    const codexHash = formatHash(codex as never, 'turn 1');
+    expect(claudeHash).toBe('#/conversations/source/claude/same%2Fnative/turn%201');
+    expect(codexHash).toBe('#/conversations/source/codex/same%2Fnative/turn%201');
+    expect(claudeHash).not.toBe(codexHash);
+  });
+
   it('formats the four shapes and round-trips with parseHash', () => {
     expect(formatHash(null)).toBe('#/conversations');
     expect(formatHash('abc')).toBe('#/conversations/abc');
@@ -74,9 +102,20 @@ describe('formatHash', () => {
   // #217 S7 F10 — formatHash also accepts a Route object (the write-back path),
   // so a compare route round-trips.
   it('round-trips a compare hash with encoding', () => {
-    const h = formatHash({ sessionId: null, turnUuid: null, compare: { a: 'a/x', b: 'b x' } });
-    expect(h).toBe('#/conversations/compare/a%2Fx/b%20x');
-    expect(parseHash(h)).toEqual({ sessionId: null, turnUuid: null, compare: { a: 'a/x', b: 'b x' } });
+    const h = formatHash({
+      sessionId: null,
+      conversationRef: null,
+      turnUuid: null,
+      compare: {
+        a: { source: 'claude', key: 'a/x' },
+        b: { source: 'claude', key: 'b x' },
+      },
+    });
+    expect(h).toBe('#/conversations/compare/claude/a%2Fx/claude/b%20x');
+    expect(parseHash(h)?.compare).toEqual({
+      a: { source: 'claude', key: 'a/x' },
+      b: { source: 'claude', key: 'b x' },
+    });
   });
 });
 

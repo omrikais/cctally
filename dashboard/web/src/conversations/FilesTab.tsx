@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { OutlineFile, OutlineFileTouch } from '../types/conversation';
+import type { OutlineFile, OutlineFileTouch, QualifiedOutlineFile } from '../types/conversation';
 
 // #217 S5 F2 — the Files tab inside the outline panel. Lists every file touched
 // by an Edit/MultiEdit/Write call (server-aggregated whole-session, document
@@ -94,12 +94,14 @@ function FileRow({
 
 export function FilesTab({
   files,
+  providerFiles = [],
   onJump,
 }: {
   files: OutlineFile[];
+  providerFiles?: QualifiedOutlineFile[];
   onJump: (uuid: string) => void;
 }) {
-  if (files.length === 0) {
+  if (files.length === 0 && providerFiles.length === 0) {
     return <div className="conv-files-empty">No files modified</div>;
   }
   return (
@@ -107,6 +109,21 @@ export function FilesTab({
       {files.map((f) => (
         <FileRow key={f.path} file={f} onJump={onJump} />
       ))}
+      {providerFiles.map((file) => {
+        const { dir, base } = splitPath(file.path);
+        return (
+          <li key={`${file.tool}:${file.path}`} className="conv-files-item">
+            <div className="conv-files-file" title={file.path}>
+              <span className="conv-files-name">
+                {dir && <span className="conv-files-dir">{dir}</span>}
+                <span className="conv-files-base">{base}</span>
+              </span>
+              <span className="conv-files-touch-op">{file.tool}</span>
+              <span className="conv-files-count">×{file.count}</span>
+            </div>
+          </li>
+        );
+      })}
     </ul>
   );
 }

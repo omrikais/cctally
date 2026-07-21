@@ -1,7 +1,17 @@
 import type { AlertEntry, DashboardSelection, Envelope, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
 import type { SourceResource } from '../hooks/useSourceDetail';
 import { seedFormsForRow, toastAlertId } from '../lib/alertIdentity';
-import type { ConversationFilters, ConversationJump, RailSortKey, SearchKind } from '../types/conversation';
+import {
+  conversationRefKey,
+  isConversationRef,
+  legacyClaudeConversationRef,
+  sameConversationRef,
+  type ConversationFilters,
+  type ConversationJump,
+  type ConversationRef,
+  type RailSortKey,
+  type SearchKind,
+} from '../types/conversation';
 import type { FocusMode } from '../conversations/applyFocusMode';
 import { EMPTY_FILTERS } from '../types/conversation';
 import { recordReadingPos } from './readingPosition';
@@ -332,6 +342,10 @@ export interface UIState {
   // — a reload always lands on the dashboard.
   view: 'dashboard' | 'conversations';
   selectedConversationId: string | null;
+  // #321 Task A — authoritative source-qualified selection. The legacy string
+  // mirror remains temporarily for stored/test compatibility only; production
+  // conversation code consumes this value.
+  selectedConversationRef: ConversationRef | null;
   conversationSearch: string;
   // #177 S6 — single-select kind facet for the rail search chips. Resets to
   // 'all' whenever the needle is cleared (SET_CONVERSATION_SEARCH with '').
@@ -401,8 +415,8 @@ export interface UIState {
   // — a reload lands on the dashboard. The reverse-clear discipline (below) wipes
   // both whenever a single-session action runs (OPEN_/SELECT_CONVERSATION,
   // SET_VIEW) so a stale comparison can never linger behind the reader.
-  compare: { a: string; b: string } | null;
-  comparePick: { anchor: string } | null;
+  compare: { a: ConversationRef; b: ConversationRef } | null;
+  comparePick: { anchor: ConversationRef } | null;
   // #228 S1 (F3) — one-shot: set by CLOSE_COMPARE, consumed+cleared by the
   // reader's focus-on-ready effect to return focus to #conv-compare-with.
   compareCloseFocusPending: boolean;
@@ -681,6 +695,7 @@ function loadInitial(): UIState {
     activeSource: loadActiveSource(),
     view: 'dashboard',
     selectedConversationId: null,
+    selectedConversationRef: null,
     conversationSearch: '',
     conversationSearchKind: 'all',
     conversationJump: null,
@@ -907,8 +922,8 @@ export type Action =
   // Conversation viewer (spec §4). View-mode + reader/search cross-cutting
   // state. None persist to localStorage (a reload lands on the dashboard).
   | { type: 'SET_VIEW'; view: 'dashboard' | 'conversations' }
-  | { type: 'OPEN_CONVERSATION'; sessionId: string; jump?: ConversationJump }
-  | { type: 'SELECT_CONVERSATION'; sessionId: string | null }
+  | { type: 'OPEN_CONVERSATION'; conversationRef?: ConversationRef; sessionId?: string; jump?: ConversationJump }
+  | { type: 'SELECT_CONVERSATION'; conversationRef?: ConversationRef | null; sessionId?: string | null }
   | { type: 'SET_CONVERSATION_SEARCH'; text: string }
   // #177 S6 — rail search kind facet (chips). Clearing the needle resets it.
   | { type: 'SET_CONVERSATION_SEARCH_KIND'; kind: SearchKind }
@@ -940,8 +955,8 @@ export type Action =
   // #217 S6 F4 (review) — optional sessionId targets a specific conversation;
   // when absent the reducer falls back to state.selectedConversationId (the
   // default in-reader path), so existing callers are unchanged.
-  | { type: 'TOGGLE_BOOKMARK'; uuid: string; sessionId?: string }
-  | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string; sessionId?: string }
+  | { type: 'TOGGLE_BOOKMARK'; uuid: string; conversationRef?: ConversationRef; sessionId?: string }
+  | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string; conversationRef?: ConversationRef; sessionId?: string }
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
@@ -960,9 +975,9 @@ export type Action =
   // SWAP flips the two sides; CLOSE returns to the single-session reader on the
   // anchor. OPEN_COMPARE is a no-op when a===b (a session never compares to
   // itself — the URL boot path routes that to a plain OPEN_CONVERSATION).
-  | { type: 'START_COMPARE_PICK'; anchor: string }
+  | { type: 'START_COMPARE_PICK'; anchorRef?: ConversationRef; anchor?: string }
   | { type: 'CANCEL_COMPARE_PICK' }
-  | { type: 'OPEN_COMPARE'; a: string; b: string }
+  | { type: 'OPEN_COMPARE'; aRef?: ConversationRef; bRef?: ConversationRef; a?: string; b?: string }
   | { type: 'SWAP_COMPARE' }
   | { type: 'CLOSE_COMPARE' }
   // #228 S1 (F3) — clear the transient focus-return flag once the reader has
@@ -970,7 +985,7 @@ export type Action =
   | { type: 'CLEAR_COMPARE_CLOSE_FOCUS' }
   // #227 — merge a batch of [session_id, title] pairs into the title cache. The
   // rail's useConversations dispatches it as pages land; non-empty titles only.
-  | { type: 'CACHE_CONVERSATION_TITLES'; titles: Array<[string, string]> }
+  | { type: 'CACHE_CONVERSATION_TITLES'; titles: Array<[string | ConversationRef, string]> }
   | { type: 'SET_FILTER'; text: string }
   | { type: 'SET_SEARCH'; text: string }
   | { type: 'SET_SEARCH_MATCHES'; matches: number[]; index: number }
@@ -1106,6 +1121,14 @@ const DISMISSED_ON_VIEW_SWITCH = {
   openSourceDetailSelection: null,
 } satisfies Partial<UIState>;
 
+function actionConversationRef(
+  ref: ConversationRef | null | undefined,
+  legacyId: string | null | undefined,
+): ConversationRef | null {
+  if (ref !== undefined) return ref;
+  return typeof legacyId === 'string' && legacyId ? legacyClaudeConversationRef(legacyId) : null;
+}
+
 export function dispatch(action: Action): void {
   switch (action.type) {
     case 'OPEN_MODAL':
@@ -1181,11 +1204,13 @@ export function dispatch(action: Action): void {
         // dashboard) never strands the flag for the next reader.
         compareCloseFocusPending: false,
         ...(action.view === 'dashboard'
-          ? { selectedConversationId: null, conversationJump: null, conversationSearch: '', conversationSearchKind: 'all' as const }
+          ? { selectedConversationId: null, selectedConversationRef: null, conversationJump: null, conversationSearch: '', conversationSearchKind: 'all' as const }
           : {}),
       };
       break;
     case 'OPEN_CONVERSATION': {
+      const conversationRef = actionConversationRef(action.conversationRef, action.sessionId);
+      if (!conversationRef) break;
       // A direct workspace switch into the conversations view (bypasses
       // SET_VIEW), so it dismisses transient modals the same way (#158) before
       // applying the selection it carries.
@@ -1204,7 +1229,7 @@ export function dispatch(action: Action): void {
       // convCurrentTurnUuid — the caller is the authority. Only a genuine
       // session switch (different sessionId) resets the transient outline
       // state; the persisted open flag is left alone in both cases.
-      const switched = action.sessionId !== state.selectedConversationId;
+      const switched = !sameConversationRef(conversationRef, state.selectedConversationRef);
       state = {
         ...state,
         view: 'conversations',
@@ -1217,7 +1242,8 @@ export function dispatch(action: Action): void {
         // #304 S2 (Codex F8) — a direct open makes any pending compare focus
         // return moot (mirrors SELECT_CONVERSATION's unconditional clear).
         compareCloseFocusPending: false,
-        selectedConversationId: action.sessionId,
+        selectedConversationId: conversationRef.source === 'claude' ? conversationRef.key : null,
+        selectedConversationRef: conversationRef,
         conversationJump: action.jump ?? null,
         // #177 S6 — a GENUINE session switch closes the find bar (its anchor
         // list is session-scoped + point-in-time, so it's stale for the new
@@ -1235,12 +1261,14 @@ export function dispatch(action: Action): void {
         // jump) keeps the live map (which may carry an unsaved-to-state mutation
         // mid-flight). action.sessionId is non-null for OPEN_CONVERSATION.
         ...(switched
-          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false, convBookmarks: loadBookmarks(action.sessionId) }
+          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false, convBookmarks: loadBookmarks(conversationRef) }
           : {}),
       };
       break;
     }
-    case 'SELECT_CONVERSATION':
+    case 'SELECT_CONVERSATION': {
+      const conversationRef = actionConversationRef(action.conversationRef, action.sessionId);
+      const changed = !sameConversationRef(conversationRef, state.selectedConversationRef);
       state = {
         ...state,
         // #205 S1 — close the mobile outline sheet on a genuine conversation
@@ -1256,7 +1284,7 @@ export function dispatch(action: Action): void {
         // Back). Rail-row clicks dispatch SELECT_CONVERSATION, so hydrating only
         // OPEN_CONVERSATION would leave the prior session's bookmarks showing
         // (Codex P1). A same-id reselect leaves the live map untouched.
-        ...(action.sessionId !== state.selectedConversationId ? { convOutlineMobileOpen: false, convFindOpen: false, convBookmarks: action.sessionId ? loadBookmarks(action.sessionId) : {} } : {}),
+        ...(changed ? { convOutlineMobileOpen: false, convFindOpen: false, convBookmarks: conversationRef ? loadBookmarks(conversationRef) : {} } : {}),
         // #217 S7 F10 — reverse-clear: selecting a rail row (single-session)
         // leaves any in-flight comparison + pick-mode.
         compare: null,
@@ -1268,7 +1296,8 @@ export function dispatch(action: Action): void {
         // A deselect-to-null OR select-to-other both make a pending compare-focus
         // moot; the intended in-reader compare-close return does no SELECT.
         compareCloseFocusPending: false,
-        selectedConversationId: action.sessionId,
+        selectedConversationId: conversationRef?.source === 'claude' ? conversationRef.key : null,
+        selectedConversationRef: conversationRef,
         conversationJump: null,
         // #177 S5 — same transient reset as OPEN_CONVERSATION (convOutlineOpen
         // is NOT touched). #217 S5 — convOutlineTab resets alongside.
@@ -1279,6 +1308,7 @@ export function dispatch(action: Action): void {
         convPinnedUuid: null,
       };
       break;
+    }
     case 'SET_CONVERSATION_SEARCH':
       // #177 S6 — clearing the needle snaps the kind facet back to 'all' so
       // re-opening search starts on the default facet (a non-empty edit leaves
@@ -1376,8 +1406,11 @@ export function dispatch(action: Action): void {
       // anchor reader). (Codex F7) — also close the ephemeral outline sheet:
       // restoring it after cancel would bury the remounted reader and obscure
       // the focus-return target behind the sheet backdrop.
-      if (action.anchor !== state.selectedConversationId) break;
-      state = { ...state, comparePick: { anchor: action.anchor }, convOutlineMobileOpen: false };
+      {
+        const anchor = actionConversationRef(action.anchorRef, action.anchor);
+        if (!anchor || !sameConversationRef(anchor, state.selectedConversationRef)) break;
+        state = { ...state, comparePick: { anchor }, convOutlineMobileOpen: false };
+      }
       break;
     case 'CANCEL_COMPARE_PICK':
       // #304 S2 — cancel returns to the anchor reader; arm the SAME focus-
@@ -1388,7 +1421,9 @@ export function dispatch(action: Action): void {
       state = { ...state, comparePick: null, convFiltersOpen: false, compareCloseFocusPending: true };
       break;
     case 'OPEN_COMPARE': {
-      if (action.a === action.b) break;               // guard: never A===B
+      const a = actionConversationRef(action.aRef, action.a);
+      const b = actionConversationRef(action.bRef, action.b);
+      if (!a || !b || sameConversationRef(a, b)) break; // guard: never A===B
       state = {
         ...state,
         ...DISMISSED_ON_VIEW_SWITCH,
@@ -1397,7 +1432,8 @@ export function dispatch(action: Action): void {
         // this a cold-boot OPEN_COMPARE (e.g. from a pasted compare URL) would
         // leave CLOSE_COMPARE with nothing to fall back to. Anchoring on A keeps
         // close → single-session-reader-on-A correct.
-        selectedConversationId: action.a,
+        selectedConversationId: a.source === 'claude' ? a.key : null,
+        selectedConversationRef: a,
         conversationJump: null,
         comparePick: null,
         // C2 (#238 S3, Codex gate #1) — entering a comparison must present a
@@ -1406,7 +1442,7 @@ export function dispatch(action: Action): void {
         // when the comparison opens would otherwise suppress Esc-to-close. Scoped
         // here, NOT in DISMISSED_ON_VIEW_SWITCH, to leave other transitions alone.
         convFiltersOpen: false,
-        compare: { a: action.a, b: action.b },
+        compare: { a, b },
       };
       break;
     }
@@ -1431,10 +1467,11 @@ export function dispatch(action: Action): void {
       // subscribers.
       let changed = false;
       const next = { ...state.conversationTitles };
-      for (const [sid, title] of action.titles) {
-        if (!sid || !title) continue;
-        if (next[sid] === title) continue;
-        next[sid] = title;
+      for (const [ref, title] of action.titles) {
+        if (!ref || !title) continue;
+        const key = isConversationRef(ref) ? conversationRefKey(ref) : ref;
+        if (next[key] === title) continue;
+        next[key] = title;
         changed = true;
       }
       if (changed) state = { ...state, conversationTitles: next };
@@ -1455,8 +1492,8 @@ export function dispatch(action: Action): void {
       // for an actually-selected session is recorded. recordReadingPos throttles
       // per session, so rapid distinct-uuid ticks don't hammer synchronous
       // localStorage.
-      if (action.uuid != null && state.selectedConversationId != null) {
-        recordReadingPos(state.selectedConversationId, action.uuid);
+      if (action.uuid != null && state.selectedConversationRef != null) {
+        recordReadingPos(state.selectedConversationRef, action.uuid);
       }
       state = { ...state, convCurrentTurnUuid: action.uuid };
       break;
@@ -1474,19 +1511,25 @@ export function dispatch(action: Action): void {
       // recordReadingPos write-through). The action's sessionId (when set) wins
       // over the selected conversation so the bookmark always lands on THIS
       // button's session; both absent → no-op.
-      const sid = action.sessionId ?? state.selectedConversationId;
-      if (!sid) break;
-      toggleBookmark(sid, action.uuid);
+      const conversationRef = actionConversationRef(action.conversationRef, action.sessionId)
+        ?? state.selectedConversationRef;
+      if (!conversationRef) break;
+      toggleBookmark(conversationRef, action.uuid);
       // Only re-hydrate the in-view convBookmarks when the target IS the open
       // conversation; a write to some other session must not clobber it.
-      if (sid === state.selectedConversationId) state = { ...state, convBookmarks: loadBookmarks(sid) };
+      if (sameConversationRef(conversationRef, state.selectedConversationRef)) {
+        state = { ...state, convBookmarks: loadBookmarks(conversationRef) };
+      }
       break;
     }
     case 'SET_BOOKMARK_NOTE': {
-      const sid = action.sessionId ?? state.selectedConversationId;
-      if (!sid) break;
-      setBookmarkNote(sid, action.uuid, action.note);
-      if (sid === state.selectedConversationId) state = { ...state, convBookmarks: loadBookmarks(sid) };
+      const conversationRef = actionConversationRef(action.conversationRef, action.sessionId)
+        ?? state.selectedConversationRef;
+      if (!conversationRef) break;
+      setBookmarkNote(conversationRef, action.uuid, action.note);
+      if (sameConversationRef(conversationRef, state.selectedConversationRef)) {
+        state = { ...state, convBookmarks: loadBookmarks(conversationRef) };
+      }
       break;
     }
     case 'SET_FILTER': {

@@ -277,7 +277,7 @@ def _maybe_prune_conversation_retention(
         core.APP_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    maint_fh = open(core.CACHE_LOCK_MAINTENANCE_PATH, "w")
+    maint_fh = open(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, "w")
     try:
         try:
             fcntl.flock(maint_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -285,13 +285,13 @@ def _maybe_prune_conversation_retention(
             return None  # another prune holds it; skip cleanly, do NOT stamp
         if not force and not _retention_due(conn, now_utc):
             return None
-        claude_fh = open(core.CACHE_LOCK_PATH, "w")
+        claude_fh = open(core.CONVERSATIONS_LOCK_PATH, "w")
         try:
             try:
                 fcntl.flock(claude_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (BlockingIOError, OSError):
                 return None  # a Claude sync is mid-flight; retry next cycle
-            codex_fh = open(core.CACHE_LOCK_CODEX_PATH, "w")
+            codex_fh = open(core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
             try:
                 try:
                     fcntl.flock(codex_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)

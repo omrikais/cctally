@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useFullPayload } from '../hooks/useFullPayload';
-import { useSessionId } from './TranscriptContext';
+import { useConversationRef } from './TranscriptContext';
 import { SpinnerIcon } from './ConvIcons';
 import type { FullPayload } from '../types/conversation';
 
@@ -24,8 +24,8 @@ export function LoadFull({
   label: string;
   onLoaded: (payload: FullPayload) => void;
 }) {
-  const sessionId = useSessionId();
-  const state = useFullPayload(sessionId, toolUseId, which);
+  const conversationRef = useConversationRef();
+  const state = useFullPayload(conversationRef, toolUseId, which);
 
   // Hand the loaded payload up exactly once when the fetch resolves. The hook
   // caches `done`, so this effect fires a single time per successful load.
@@ -67,7 +67,7 @@ export function LoadFull({
       <button
         type="button"
         className="conv-loadfull-btn"
-        disabled={!sessionId}
+        disabled={!conversationRef}
         onClick={() => state.load()}
       >
         {showing}

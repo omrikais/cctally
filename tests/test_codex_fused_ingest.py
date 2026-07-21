@@ -166,6 +166,7 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("plan_type", "TEXT", 0),
             ("individual_limit_json", "TEXT", 0),
             ("reached_type", "TEXT", 0),
+            ("observed_model", "TEXT", 0),
         ]
         assert _columns(conn, "codex_conversation_events") == [
             ("id", "INTEGER", 0),
@@ -461,7 +462,7 @@ def test_sync_codex_cache_fuses_all_physical_rows_and_skips_unchanged(
         assert conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM quota_window_snapshots WHERE source='codex'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM codex_conversation_threads").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == expected_events
+        assert conn.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM codex_source_roots").fetchone()[0] == 1
         assert conn.execute(
             "SELECT source_root_key, conversation_key FROM codex_session_entries"
@@ -475,9 +476,19 @@ def test_sync_codex_cache_fuses_all_physical_rows_and_skips_unchanged(
 
         second = ns["sync_codex_cache"](conn)
         assert second.files_skipped_unchanged == 1
-        assert conn.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == expected_events
     finally:
         conn.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        first = ns["sync_codex_conversations"](conversations)
+        assert first.files_processed == 1
+        assert conversations.execute(
+            "SELECT COUNT(*) FROM codex_conversation_events"
+        ).fetchone()[0] == expected_events
+        second = ns["sync_codex_conversations"](conversations)
+        assert second.files_skipped_unchanged == 1
+    finally:
+        conversations.close()
 
 
 def test_byte_zero_replay_backfills_conversation_key_when_both_ids_exist(
@@ -553,9 +564,8 @@ def test_sync_codex_cache_skips_exponent_overflow_and_continues_file(
         assert stats.lines_seen == 2
         assert stats.lines_malformed == 1
         assert conn.execute(
-            "SELECT record_type, payload_json FROM codex_conversation_events"
-        ).fetchall() == [("world_state", _canonical_json(valid))]
-        assert conn.execute("SELECT COUNT(*) FROM codex_session_files").fetchone()[0] == 1
+            "SELECT COUNT(*) FROM codex_session_files"
+        ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT last_byte_offset FROM codex_session_files WHERE path = ?",
             (str(rollout.resolve()),),
@@ -563,11 +573,20 @@ def test_sync_codex_cache_skips_exponent_overflow_and_continues_file(
 
         unchanged = ns["sync_codex_cache"](conn)
         assert unchanged.files_skipped_unchanged == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM codex_conversation_events"
-        ).fetchone()[0] == 1
     finally:
         conn.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        first = ns["sync_codex_conversations"](conversations)
+        assert first.files_processed == 1
+        assert conversations.execute(
+            "SELECT record_type, payload_json FROM codex_conversation_events"
+        ).fetchall() == [("world_state", _canonical_json(valid))]
+        assert ns["sync_codex_conversations"](
+            conversations
+        ).files_skipped_unchanged == 1
+    finally:
+        conversations.close()
 
 
 def test_codex_discovery_falls_back_to_absolute_paths_when_resolve_fails(
@@ -600,9 +619,14 @@ def test_sync_codex_cache_requalifies_when_overlapping_root_order_changes(
     qualified child instead of taking the unchanged-size fast path."""
     ns, provider_root, rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     conn = ns["open_cache_db"]()
+    conversations = None
     try:
         first = ns["sync_codex_cache"](conn)
         assert first.files_processed == 1
+        conversations = ns["open_conversations_db"]()
+        assert ns["sync_codex_conversations"](
+            conversations
+        ).files_processed == 1
         old_key = identity.source_root_key(str(provider_root.resolve()))
         new_provider_root = (provider_root / "sessions").resolve()
         new_key = identity.source_root_key(str(new_provider_root))
@@ -613,18 +637,21 @@ def test_sync_codex_cache_requalifies_when_overlapping_root_order_changes(
         # provider association changes because the direct sessions root wins.
         monkeypatch.setenv("CODEX_HOME", str(provider_root / "sessions"))
         second = ns["sync_codex_cache"](conn)
+        transcript_second = ns["sync_codex_conversations"](conversations)
 
         assert rollout.stat().st_size == size_before
         assert second.files_processed == 1
         assert second.files_skipped_unchanged == 0
         assert second.files_reset_truncated == 1
+        assert transcript_second.files_processed == 1
+        assert transcript_second.files_reset_truncated == 1
         assert conn.execute(
             "SELECT DISTINCT source_root_key FROM codex_session_entries"
         ).fetchall() == [(new_key,)]
         assert conn.execute(
             "SELECT DISTINCT source_root_key FROM quota_window_snapshots WHERE source='codex'"
         ).fetchall() == [(new_key,)]
-        assert conn.execute(
+        assert conversations.execute(
             "SELECT DISTINCT source_root_key FROM codex_conversation_events"
         ).fetchall() == [(new_key,)]
         assert conn.execute(
@@ -635,6 +662,8 @@ def test_sync_codex_cache_requalifies_when_overlapping_root_order_changes(
             "SELECT source_root_key FROM codex_source_roots"
         ).fetchall() == [(new_key,)]
     finally:
+        if conversations is not None:
+            conversations.close()
         conn.close()
 
 
@@ -671,8 +700,11 @@ def test_sync_codex_cache_append_reuses_terminal_thread_linkage(
     from the terminal source facts rather than rereading the prefix."""
     ns, _provider_root, rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     conn = ns["open_cache_db"]()
+    conversations = None
     try:
         ns["sync_codex_cache"](conn)
+        conversations = ns["open_conversations_db"]()
+        ns["sync_codex_conversations"](conversations)
         prior_key, prior_native, prior_root, prior_parent = conn.execute(
             """SELECT source_root_key, last_native_thread_id, last_root_thread_id,
                       last_parent_thread_id
@@ -699,19 +731,23 @@ def test_sync_codex_cache_append_reuses_terminal_thread_linkage(
                 fh.write(_canonical_json(record) + "\n")
 
         stats = ns["sync_codex_cache"](conn)
+        transcript_stats = ns["sync_codex_conversations"](conversations)
 
         assert stats.files_processed == 1
+        assert transcript_stats.files_processed == 1
         assert conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == (
+        assert conversations.execute("SELECT COUNT(*) FROM codex_conversation_events").fetchone()[0] == (
             len(_object_records("modern-full")) + len(append)
         )
-        assert conn.execute(
+        assert conversations.execute(
             """SELECT source_root_key, conversation_key, native_thread_id,
                       root_thread_id, parent_thread_id
                  FROM codex_conversation_events
                  ORDER BY id DESC LIMIT 1"""
         ).fetchone() == (prior_key, prior_conversation, prior_native, prior_root, prior_parent)
     finally:
+        if conversations is not None:
+            conversations.close()
         conn.close()
 
 
@@ -810,8 +846,8 @@ def test_sync_codex_cache_prunes_all_absolute_children_and_rebuilds_every_table(
     conn = ns["open_cache_db"]()
     tables = (
         "codex_session_entries", "quota_window_snapshots",
-        "codex_conversation_threads", "codex_conversation_events",
-        "codex_session_files", "codex_source_roots",
+        "codex_conversation_threads", "codex_session_files",
+        "codex_source_roots",
     )
     try:
         ns["sync_codex_cache"](conn)
@@ -824,7 +860,7 @@ def test_sync_codex_cache_prunes_all_absolute_children_and_rebuilds_every_table(
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 1, 1, 1, 1, 1]
+        ] == [1, 1, 1, 1, 1]
         assert conn.execute("SELECT path FROM codex_session_files").fetchall() == [
             ("fixtures/codex/synthetic.jsonl",)
         ]
@@ -834,7 +870,7 @@ def test_sync_codex_cache_prunes_all_absolute_children_and_rebuilds_every_table(
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [0, 0, 0, 0, 0, 0]
+        ] == [0, 0, 0, 0, 0]
     finally:
         conn.close()
 
@@ -848,14 +884,14 @@ def test_sync_codex_cache_rebuild_respects_held_flock_then_reingests_all_surface
     conn = ns["open_cache_db"]()
     tables = (
         "codex_session_entries", "quota_window_snapshots",
-        "codex_conversation_threads", "codex_conversation_events",
-        "codex_session_files", "codex_source_roots",
+        "codex_conversation_threads", "codex_session_files",
+        "codex_source_roots",
     )
     try:
         initial = ns["sync_codex_cache"](conn)
         assert initial.files_processed == 1
         expected_after_reingest = [
-            1, 2, 1, len(_object_records("modern-full")), 1, 1,
+            1, 2, 1, 1, 1,
         ]
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -901,8 +937,8 @@ def test_sync_codex_cache_prunes_incomplete_absolute_children_but_keeps_relative
     conn = ns["open_cache_db"]()
     tables = (
         "codex_session_entries", "quota_window_snapshots",
-        "codex_conversation_threads", "codex_conversation_events",
-        "codex_session_files", "codex_source_roots",
+        "codex_conversation_threads", "codex_session_files",
+        "codex_source_roots",
     )
     try:
         _insert_relative_codex_fixture_rows(conn)
@@ -917,7 +953,7 @@ def test_sync_codex_cache_prunes_incomplete_absolute_children_but_keeps_relative
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 1, 1, 1, 1, 1]
+        ] == [1, 1, 1, 1, 1]
         assert conn.execute("SELECT path FROM codex_session_files").fetchall() == [
             ("fixtures/codex/synthetic.jsonl",)
         ]
@@ -940,7 +976,6 @@ def test_sync_codex_cache_replaces_same_path_incomplete_old_root_children(
         ("codex_session_entries", "source_path"),
         ("quota_window_snapshots", "source_path"),
         ("codex_conversation_threads", "source_path"),
-        ("codex_conversation_events", "source_path"),
         ("codex_session_files", "path"),
     )
     try:
@@ -989,10 +1024,17 @@ def test_sync_codex_cache_replaces_same_path_incomplete_old_root_children(
             "SELECT COUNT(*) FROM codex_conversation_threads WHERE source_path = ?",
             (str(rollout),),
         ).fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM codex_conversation_events WHERE source_path = ?",
-            (str(rollout),),
-        ).fetchone()[0] == len(_object_records("modern-full"))
+        conversations = ns["open_conversations_db"]()
+        try:
+            assert ns["sync_codex_conversations"](
+                conversations
+            ).files_processed == 2
+            assert conversations.execute(
+                "SELECT COUNT(*) FROM codex_conversation_events WHERE source_path = ?",
+                (str(rollout),),
+            ).fetchone()[0] == len(_object_records("modern-full"))
+        finally:
+            conversations.close()
     finally:
         conn.close()
 
@@ -1000,7 +1042,7 @@ def test_sync_codex_cache_replaces_same_path_incomplete_old_root_children(
 def test_sync_codex_cache_retries_one_late_dml_failure_atomically(
     tmp_path, monkeypatch,
 ):
-    """A late event insert failure rolls accounting, quota, thread, and file
+    """A late accounting insert failure rolls quota, thread, and file
     state back together, then the already-buffered file batch retries once."""
     ns, _provider_root, _rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     conn = ns["open_cache_db"]()
@@ -1008,12 +1050,12 @@ def test_sync_codex_cache_retries_one_late_dml_failure_atomically(
     rollback_snapshots: list[list[int]] = []
     tables = (
         "codex_session_entries", "quota_window_snapshots",
-        "codex_conversation_threads", "codex_conversation_events",
-        "codex_session_files", "codex_source_roots",
+        "codex_conversation_threads", "codex_session_files",
+        "codex_source_roots",
     )
 
     def deny_first_event_insert(action, arg1, _arg2, _db, _source):
-        if action == sqlite3.SQLITE_INSERT and arg1 == "codex_conversation_events":
+        if action == sqlite3.SQLITE_INSERT and arg1 == "codex_session_entries":
             if denied["count"] == 0:
                 denied["count"] += 1
                 return sqlite3.SQLITE_DENY
@@ -1034,11 +1076,11 @@ def test_sync_codex_cache_retries_one_late_dml_failure_atomically(
 
         assert denied == {"count": 1}
         assert stats.files_processed == 1
-        assert rollback_snapshots == [[0, 0, 0, 0, 0, 0]]
+        assert rollback_snapshots == [[0, 0, 0, 0, 0]]
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 2, 1, len(_object_records("modern-full")), 1, 1]
+        ] == [1, 2, 1, 1, 1]
     finally:
         conn.set_authorizer(None)
         conn.close()
@@ -1054,12 +1096,12 @@ def test_sync_codex_cache_second_late_dml_failure_leaves_no_partial_batch(
     rollback_snapshots: list[list[int]] = []
     tables = (
         "codex_session_entries", "quota_window_snapshots",
-        "codex_conversation_threads", "codex_conversation_events",
-        "codex_session_files", "codex_source_roots",
+        "codex_conversation_threads", "codex_session_files",
+        "codex_source_roots",
     )
 
     def deny_every_event_insert(action, arg1, _arg2, _db, _source):
-        if action == sqlite3.SQLITE_INSERT and arg1 == "codex_conversation_events":
+        if action == sqlite3.SQLITE_INSERT and arg1 == "codex_session_entries":
             denied["count"] += 1
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
@@ -1080,11 +1122,11 @@ def test_sync_codex_cache_second_late_dml_failure_leaves_no_partial_batch(
         assert denied == {"count": 2}
         assert failed.files_processed == 0
         assert failed.rows_changed == 0
-        assert rollback_snapshots == [[0, 0, 0, 0, 0, 0]]
+        assert rollback_snapshots == [[0, 0, 0, 0, 0]]
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [0, 0, 0, 0, 0, 0]
+        ] == [0, 0, 0, 0, 0]
 
         clean = ns["sync_codex_cache"](conn)
 
@@ -1092,7 +1134,7 @@ def test_sync_codex_cache_second_late_dml_failure_leaves_no_partial_batch(
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 2, 1, len(_object_records("modern-full")), 1, 1]
+        ] == [1, 2, 1, 1, 1]
     finally:
         conn.set_authorizer(None)
         conn.close()

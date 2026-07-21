@@ -23,6 +23,9 @@ def _orphan(ns):
             "usage": {"input_tokens": 0, "output_tokens": 1,
                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}) + "\n")
     conn = ns["open_cache_db"](); ns["sync_cache"](conn); conn.close()
+    conn = ns["open_conversations_db"]()
+    ns["sync_claude_conversations"](conn)
+    conn.close()
     shutil.rmtree(p.parent)
 
 

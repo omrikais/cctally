@@ -2924,7 +2924,7 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
     )
     db_vacuum.add_argument(
         "--db",
-        choices=("cache", "stats", "all"),
+        choices=("cache", "conversations", "stats", "all"),
         default="cache",
         help="Which DB to VACUUM (default: cache)",
     )

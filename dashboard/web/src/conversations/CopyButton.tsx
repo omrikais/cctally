@@ -1,8 +1,9 @@
 import { useCallback, useRef, useState } from 'react';
 import { useCopy } from './useCopy';
 import { CopyIcon, CheckIcon } from './ConvIcons';
-import { useAnonMode, useSessionId } from './TranscriptContext';
+import { useAnonMode, useConversationRef } from './TranscriptContext';
 import { fetchAnonPlan, scrubText } from './anonScrub';
+import { conversationRefKey, sameConversationRef } from '../types/conversation';
 
 // Compact, icon-only copy button (G2 §5b). The clipboard glyph swaps to a
 // check while `copied`. aria-label carries the state (Copy → Copied) since the
@@ -19,27 +20,27 @@ import { fetchAnonPlan, scrubText } from './anonScrub';
 export function CopyButton({ text, className }: { text: string; className?: string }) {
   const { copied, copy } = useCopy();
   const anonMode = useAnonMode();
-  const sessionId = useSessionId();
+  const conversationRef = useConversationRef();
   const [errored, setErrored] = useState(false);
   const mountedRef = useRef(true);
-  const sessionIdRef = useRef(sessionId);
-  sessionIdRef.current = sessionId;
+  const conversationRefRef = useRef(conversationRef);
+  conversationRefRef.current = conversationRef;
 
   const onClick = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
       setErrored(false);
       // Mode OFF (or no session context) → today's raw copy, unchanged.
-      if (!anonMode || !sessionId) {
+      if (!anonMode || !conversationRef) {
         copy(text);
         return;
       }
-      const forSession = sessionId;
+      const forSession = conversationRef;
       void (async () => {
         try {
           const plan = await fetchAnonPlan(forSession);
           // Session switched mid-flight → discard the stale plan, never write.
-          if (sessionIdRef.current !== forSession) return;
+          if (!sameConversationRef(conversationRefRef.current, forSession)) return;
           const scrubbed = scrubText(text, plan); // may throw on a bad pattern
           copy(scrubbed);
         } catch {
@@ -48,7 +49,7 @@ export function CopyButton({ text, className }: { text: string; className?: stri
         }
       })();
     },
-    [anonMode, sessionId, text, copy],
+    [anonMode, conversationRef ? conversationRefKey(conversationRef) : null, text, copy],
   );
 
   // Track mount/unmount (stable ref callback: React calls it with the element on
@@ -58,7 +59,7 @@ export function CopyButton({ text, className }: { text: string; className?: stri
     mountedRef.current = el !== null;
   }, []);
 
-  const anonActive = anonMode && !!sessionId;
+  const anonActive = anonMode && !!conversationRef;
   const label = errored
     ? 'Copy failed'
     : copied

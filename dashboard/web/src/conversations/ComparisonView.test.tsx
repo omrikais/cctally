@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { _resetForTests, dispatch, getState } from '../store/store';
-import { ComparisonView } from './ComparisonView';
+import { ComparisonView, composeComparisonExport } from './ComparisonView';
 import type { ConversationOutline } from '../types/conversation';
 
 // A minimal outline whose turns include two main-thread human turns so the
@@ -56,6 +56,16 @@ describe('ComparisonView', () => {
   beforeEach(() => { _resetForTests(); });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  it('builds a source-labelled mixed export without blending provider bodies', () => {
+    const body = composeComparisonExport(
+      { source: 'claude', key: 'same' }, 'Claude run', 'claude body',
+      { source: 'codex', key: 'v1.same' }, 'Codex run', 'codex body',
+    );
+    expect(body).toContain('Run A · Claude · Claude run');
+    expect(body).toContain('Run B · Codex · Codex run');
+    expect(body).toContain('claude body\n\n---\n\n## Run B');
+  });
+
   it('renders the header + metrics + aligned prompts for two sessions', async () => {
     mockFetch();
     dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
@@ -87,7 +97,10 @@ describe('ComparisonView', () => {
     render(<ComparisonView a="A" b="B" />);
     await waitFor(() => expect(screen.getByText(/Comparing/i)).toBeInTheDocument());
     fireEvent.click(screen.getByLabelText(/swap/i));
-    expect(getState().compare).toEqual({ a: 'B', b: 'A' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'B' },
+      b: { source: 'claude', key: 'A' },
+    });
   });
 
   it('close dispatches CLOSE_COMPARE', async () => {

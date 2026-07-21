@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { scrubText, type AnonWirePlan } from './anonScrub';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { __clearAnonPlanCache, fetchAnonPlan, scrubText, type AnonWirePlan } from './anonScrub';
 
 // spec §8.4 — the cross-language parity fixture is GENERATED from the production
 // SECRET_PATTERNS + a fixed identity plan (bin/build-anon-parity-fixture.py) and
@@ -23,4 +23,26 @@ describe('anonScrub parity fixture (TS applier == Python kernel)', () => {
       expect(scrubText(c.input, fixture.plan)).toBe(c.expected);
     });
   }
+});
+
+describe('anon plan request cache identity', () => {
+  afterEach(() => {
+    __clearAnonPlanCache();
+    vi.unstubAllGlobals();
+  });
+
+  it('does not share an in-flight plan between same-key Claude and Codex refs', async () => {
+    const emptyPlan = { tokens: [], patterns: [] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => emptyPlan });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await Promise.all([
+      fetchAnonPlan({ source: 'claude', key: 'v1.same' }),
+      fetchAnonPlan({ source: 'codex', key: 'v1.same' }),
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/conversation/v1.same/anon-map');
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/conversation/v1.same/anon-map');
+  });
 });

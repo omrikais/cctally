@@ -297,13 +297,16 @@
     },
     {
       "capability": "conversation-reader-ui",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "modern-full",
         "nested-child"
       ],
       "futureTestTargets": [
-        "dashboard/web/src/conversations/CodexConversationReader.test.tsx"
+        "dashboard/web/src/conversations/ConversationRail.test.tsx",
+        "dashboard/web/src/conversations/ComparisonView.test.tsx",
+        "dashboard/web/src/hooks/useConversation.test.tsx",
+        "dashboard/web/e2e/codex-reader.spec.ts"
       ],
       "id": "native-codex-conversation-stack",
       "ownerSession": "S8",
@@ -793,13 +796,15 @@
     },
     {
       "capability": "reading-position",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "root-a-collision",
         "root-b-collision"
       ],
       "futureTestTargets": [
-        "dashboard/web/src/store/readingPosition.test.ts"
+        "dashboard/web/src/store/readingPosition.test.ts",
+        "dashboard/web/src/store/urlRouting.test.ts",
+        "dashboard/web/e2e/codex-reader.spec.ts"
       ],
       "id": "reading-position-qualified-key",
       "ownerSession": "S8",

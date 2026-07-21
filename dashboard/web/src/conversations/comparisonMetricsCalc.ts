@@ -31,10 +31,12 @@ export function metricsFromOutline(
   const t = o.stats.tokens;
   return {
     cost: o.stats.cost_usd ?? 0,
-    tokens: (t?.input ?? 0) + (t?.output ?? 0) + (t?.cache_creation ?? 0) + (t?.cache_read ?? 0),
+    tokens: t?.source === 'codex'
+      ? (t.input ?? 0) + (t.output ?? 0)
+      : (t?.input ?? 0) + (t?.output ?? 0) + (t?.cache_creation ?? 0) + (t?.cache_read ?? 0),
     prompts: promptSpineLength,
     errors: o.stats.error_count ?? 0,
     durationSeconds: o.stats.duration_seconds ?? null,
-    files: o.files?.length ?? 0,
+    files: o.provider_files?.length ?? o.files?.length ?? 0,
   };
 }

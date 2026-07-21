@@ -568,7 +568,7 @@ def test_conversations_display_and_filter_both_read_stored_cost(tmp_path, monkey
         # and the filter read this column (no message change / pricing change, so
         # a plain read does not re-derive it).
         skewed = 999.0
-        cache = ns["open_cache_db"]()
+        cache = ns["open_conversations_db"]()
         cache.execute(
             "UPDATE conversation_sessions SET cost_usd=? WHERE session_id=?",
             (skewed, "s1"))
@@ -668,7 +668,7 @@ def test_cache_open_failure_returns_500(tmp_path, monkeypatch):
         # (LOAD_GLOBAL in _cctally_dashboard's namespace). Seeding already
         # happened in _boot via ns["open_cache_db"], so this only affects
         # the live request path.
-        monkeypatch.setattr(_dash, "open_cache_db", _boom)
+        monkeypatch.setattr(_dash, "open_conversations_db", _boom)
         for route in ("/api/conversations",
                       "/api/conversation/s1",
                       "/api/conversation/search?q=token"):
@@ -778,7 +778,7 @@ def _seed_payload_rows(ns, tmp_path):
         fh.write(line0)
         fh.write(line1)
 
-    cache = ns["open_cache_db"]()
+    cache = ns["open_conversations_db"]()
     cache.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
@@ -861,7 +861,7 @@ def test_payload_route_source_gone_returns_410(tmp_path, monkeypatch):
     srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
     try:
         port = srv.server_address[1]
-        cache = ns["open_cache_db"]()
+        cache = ns["open_conversations_db"]()
         gone = str(tmp_path / "rotated-away.jsonl")          # never created
         cache.execute(
             "INSERT OR IGNORE INTO conversation_messages "
@@ -971,7 +971,7 @@ def _seed_media_rows(ns, tmp_path):
         fh.write(line0)
         fh.write(line1)
 
-    cache = ns["open_cache_db"]()
+    cache = ns["open_conversations_db"]()
     cache.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
@@ -1070,7 +1070,7 @@ def test_media_route_404_unknown_and_unsupported(tmp_path, monkeypatch):
         with open(p, "ab") as fh:
             off = p.stat().st_size
             fh.write(bmp_line)
-        cache = ns["open_cache_db"]()
+        cache = ns["open_conversations_db"]()
         cache.execute(
             "INSERT OR IGNORE INTO conversation_messages "
             "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
@@ -1183,7 +1183,7 @@ def test_media_route_413_too_large(tmp_path, monkeypatch):
                                          "data": big}}]}}) + "\n").encode()
         with open(p, "wb") as fh:
             fh.write(line)
-        cache = ns["open_cache_db"]()
+        cache = ns["open_conversations_db"]()
         cache.execute(
             "INSERT OR IGNORE INTO conversation_messages "
             "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
@@ -1216,7 +1216,7 @@ def test_session_cache_rebuild_count_matches_outline(tmp_path, monkeypatch):
     _seed_cache(ns)
     import importlib
     lq = importlib.import_module("_lib_conversation_query")
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         for sid in ("sess-clean", "sess-rebuild"):
             count = lq.session_cache_rebuild_count(conn, sid)
             outline = lq.get_conversation_outline(conn, sid)
@@ -1237,7 +1237,7 @@ def test_session_cache_rebuild_count_unknown_session(tmp_path, monkeypatch):
     _seed_cache(ns)
     import importlib
     lq = importlib.import_module("_lib_conversation_query")
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         assert lq.session_cache_rebuild_count(conn, "does-not-exist") == 0
 
 # === 1B: last_anchor on the conversation detail head =======================
@@ -1253,7 +1253,7 @@ def test_get_conversation_exposes_last_anchor(tmp_path, monkeypatch):
     _seed_cache(ns)
     import importlib
     lq = importlib.import_module("_lib_conversation_query")
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         detail = lq.get_conversation(conn, "sess-clean", after=None, limit=1)
         la = detail["last_anchor"]
         assert la is not None
@@ -1274,7 +1274,7 @@ def test_get_conversation_unknown_session_returns_none(tmp_path, monkeypatch):
     _seed_cache(ns)
     import importlib
     lq = importlib.import_module("_lib_conversation_query")
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         assert lq.get_conversation(conn, "does-not-exist") is None
 
 # === 1C: _recompute_conversation_sessions fills the filter columns =========
@@ -1289,7 +1289,7 @@ def test_recompute_fills_filter_columns(tmp_path, monkeypatch):
     _seed_cache(ns)
     import importlib
     cc = importlib.import_module("_cctally_cache")
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         cc._recompute_conversation_sessions(conn)  # full
         row = conn.execute(
             "SELECT project_label, cost_usd, cache_rebuild_count "
@@ -1491,7 +1491,7 @@ def test_filter_dual_branch_parity(tmp_path, monkeypatch):
     lq = importlib.import_module("_lib_conversation_query")
     f = {"date_from": "2026-06-02T00:00:00Z", "date_to": None,
          "projects": None, "cost_min": None, "cost_max": None, "rebuild_min": None}
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         roll = lq._list_session_rows_rollup(conn, lq._SORTS["recent"], 50, 0, f)
         live = lq._list_session_rows_live(conn, lq._SORTS_LIVE["recent"], 50, 0, f)
         assert [r[0] for r in roll] == [r[0] for r in live]
@@ -1528,7 +1528,7 @@ def _seed_boundary_rows(ns):
     boundary string under test (recompute preserves the raw string, but the
     UPDATE removes any ambiguity and still drives the real ``_rollup_where`` SQL
     and the real live ``HAVING`` for that row)."""
-    cache = ns["open_cache_db"]()
+    cache = ns["open_conversations_db"]()
     for i, (sid, (ts, _)) in enumerate(_BOUNDARY_SESSIONS.items()):
         cache.execute(
             "INSERT OR IGNORE INTO conversation_messages "
@@ -1596,7 +1596,7 @@ def test_filter_date_boundary_inclusion_live_branch_parity(tmp_path, monkeypatch
     f = {"date_from": df, "date_to": dtt, "projects": None,
          "cost_min": None, "cost_max": None, "rebuild_min": None}
     expected = {sid for sid, (_, keep) in _BOUNDARY_SESSIONS.items() if keep}
-    with ns["open_cache_db"]() as conn:
+    with ns["open_conversations_db"]() as conn:
         roll = lq._list_session_rows_rollup(conn, lq._SORTS["recent"], 200, 0, f)
         live = lq._list_session_rows_live(conn, lq._SORTS_LIVE["recent"], 200, 0, f)
         roll_bnd = {r[0] for r in roll if r[0].startswith("bnd-")}
@@ -1611,7 +1611,7 @@ def _arm_backfill_pending(ns):
     """Set the durable conversation_sessions_backfill_pending flag so
     _rollup_authoritative(conn) returns False and list_conversations takes the
     LIVE GROUP BY fallback (which cannot express the rollup-only axes)."""
-    cache = ns["open_cache_db"]()
+    cache = ns["open_conversations_db"](attach_cache=False)
     cache.execute(
         "INSERT OR REPLACE INTO cache_meta(key,value) "
         "VALUES('conversation_sessions_backfill_pending','1')")
@@ -1721,7 +1721,7 @@ def test_conversations_model_filter_and_facets(tmp_path, monkeypatch):
 def _seed_anon_session(ns):
     """Insert a session whose rendered prose carries an OBSERVED identity token
     (the seeded cwd) so the anonymized export visibly differs from raw."""
-    cache = ns["open_cache_db"]()
+    cache = ns["open_conversations_db"]()
     cache.execute(
         "INSERT OR IGNORE INTO conversation_messages "
         "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"

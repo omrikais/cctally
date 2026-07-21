@@ -56,6 +56,11 @@ def _seed_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full"):
             "WHERE source_path LIKE ?", (f"%/{scenario}.jsonl",)).fetchone()[0]
     finally:
         conn.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conversations, rebuild=True)
+    finally:
+        conversations.close()
     return key, rollout
 
 

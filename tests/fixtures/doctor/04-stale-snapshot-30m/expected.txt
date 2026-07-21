@@ -24,12 +24,13 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/40 applied
-  ⚠ Pending migrations       40 pending
+  ✓ Migrations               0/41 applied
+  ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
+  ✓ Reclaimable transcript space below threshold
 Data
   ⚠ Latest snapshot          1800s ago
       → Recent but not current. Check Claude Code session is active.
@@ -54,4 +55,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 30 OK · 8 WARN · 0 FAIL
+Summary: 31 OK · 8 WARN · 0 FAIL

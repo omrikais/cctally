@@ -383,7 +383,11 @@ describe('Conversations workspace integration', () => {
 
     fireEvent.click(hitRow);
     expect(getState().selectedConversationId).toBe('sess-1');
-    expect(getState().conversationJump).toEqual({ session_id: 'sess-1', uuid: 'a-uuid' });
+    expect(getState().conversationJump).toEqual({
+      conversation_ref: { source: 'claude', key: 'sess-1' },
+      session_id: 'sess-1',
+      uuid: 'a-uuid',
+    });
 
     // The reader pages to the target, direct-scrolls it into view, and flashes it.
     await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
@@ -852,7 +856,10 @@ describe('Conversations workspace integration', () => {
     expect(getState().convFiltersOpen).toBe(true);
     dispatch({ type: 'OPEN_COMPARE', a: 'sess-1', b: 'sess-2' });
     expect(getState().convFiltersOpen).toBe(false);
-    expect(getState().compare).toEqual({ a: 'sess-1', b: 'sess-2' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'sess-1' },
+      b: { source: 'claude', key: 'sess-2' },
+    });
   });
 
   // C2 (#238 S3) — Escape inside an open comparison closes it back to the reader
@@ -1108,7 +1115,7 @@ describe('#304 S2 compact comparison pick flow', () => {
     await waitFor(() => expect(document.querySelector('.conv-rail-pickbanner')).not.toBeNull());
     expect(document.querySelector('.conv-reader')).toBeNull();      // single-pane: rail took over
     expect(document.querySelector('.conv-back')).toBeNull();        // no Back in pick mode
-    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });
+    expect(getState().comparePick).toEqual({ anchor: { source: 'claude', key: 'sess-1' } });
     expect(getState().selectedConversationId).toBe('sess-1');       // anchor retained
   });
 
@@ -1120,10 +1127,16 @@ describe('#304 S2 compact comparison pick flow', () => {
     const target = rows.find((r) => !r.disabled)!;                  // anchor row is disabled
     fireEvent.click(target);
     await waitFor(() => expect(document.querySelector('.conv-cmp')).not.toBeNull());
-    expect(getState().compare).toEqual({ a: 'sess-1', b: 'sess-2' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'sess-1' },
+      b: { source: 'claude', key: 'sess-2' },
+    });
     expect(document.querySelector('.conv-rail')).toBeNull();        // full-width compact comparison
     fireEvent.click(screen.getByRole('button', { name: /swap the two sessions/i }));
-    expect(getState().compare).toEqual({ a: 'sess-2', b: 'sess-1' });
+    expect(getState().compare).toEqual({
+      a: { source: 'claude', key: 'sess-2' },
+      b: { source: 'claude', key: 'sess-1' },
+    });
     fireEvent.click(screen.getByRole('button', { name: /close comparison/i }));
     await waitFor(() => expect(document.querySelector('.conv-reader')).not.toBeNull());
     expect(getState().selectedConversationId).toBe('sess-1');       // anchor reader is back
@@ -1227,7 +1240,9 @@ describe('#304 S2 compact comparison pick flow', () => {
     fireEvent.focus(input);                                  // SET_INPUT_MODE 'search'
     fireEvent.change(input, { target: { value: 'abc' } });
     fireEvent.keyDown(input, { key: 'Escape' });
-    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });   // pick survives
+    expect(getState().comparePick).toEqual({
+      anchor: { source: 'claude', key: 'sess-1' },
+    });   // pick survives
     expect(getState().conversationSearch).toBe('');                 // input handled its Esc
     fireEvent.blur(input);                                   // (the real handler blurs; JSDOM needs the explicit event)
     fireEvent.keyDown(document, { key: 'Escape' });          // next Esc cancels the pick
@@ -1242,7 +1257,9 @@ describe('#304 S2 compact comparison pick flow', () => {
     await waitFor(() => expect(document.querySelector('.conv-rail-filters')).not.toBeNull());
     fireEvent.keyDown(document.querySelector('.conv-rail-filters') as HTMLElement, { key: 'Escape' });
     expect(getState().convFiltersOpen).toBe(false);
-    expect(getState().comparePick).toEqual({ anchor: 'sess-1' });   // pick survives
+    expect(getState().comparePick).toEqual({
+      anchor: { source: 'claude', key: 'sess-1' },
+    });   // pick survives
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(getState().comparePick).toBeNull();
   });

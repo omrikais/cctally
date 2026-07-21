@@ -278,6 +278,35 @@ def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
     assert state.cache_db_freelist_count == expected_freelist_count
 
 
+def test_gather_reads_conversation_page_and_freelist_counts(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+
+    conn = sqlite3.connect(str(_cctally_core.CONVERSATIONS_DB_PATH))
+    conn.execute("CREATE TABLE reclaimable_transcripts (payload BLOB)")
+    conn.executemany(
+        "INSERT INTO reclaimable_transcripts(payload) VALUES (?)",
+        [(b"x" * 8192,) for _ in range(64)],
+    )
+    conn.commit()
+    conn.execute("DELETE FROM reclaimable_transcripts")
+    conn.commit()
+    expected_page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    expected_freelist_count = int(
+        conn.execute("PRAGMA freelist_count").fetchone()[0]
+    )
+    conn.close()
+    assert expected_freelist_count > 0
+
+    state = ns["doctor_gather_state"](deep=False)
+
+    assert state.conversations_db_page_count == expected_page_count
+    assert state.conversations_db_freelist_count == expected_freelist_count
+
+
 def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
     ns = load_script()
     import _cctally_core
@@ -321,8 +350,14 @@ def test_gather_lock_probe_creates_no_files_on_fresh_dir(monkeypatch, tmp_path):
     state = ns["doctor_gather_state"](deep=True)
     assert not _cctally_core.CACHE_LOCK_PATH.exists()
     assert not _cctally_core.CACHE_LOCK_CODEX_PATH.exists()
+    assert not _cctally_core.CONVERSATIONS_LOCK_PATH.exists()
+    assert not _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.exists()
+    assert not _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.exists()
     assert state.locks_held == {"cache.db.lock": False,
-                                "cache.db.codex.lock": False}
+                                "cache.db.codex.lock": False,
+                                "conversations.db.lock": False,
+                                "conversations.db.codex.lock": False,
+                                "conversations.db.maintenance.lock": False}
 
 
 def test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority(

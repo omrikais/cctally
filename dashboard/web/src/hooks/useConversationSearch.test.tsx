@@ -19,6 +19,23 @@ beforeEach(() => { globalThis.fetch = vi.fn(); vi.useFakeTimers(); clearRailPref
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); clearRailPrefs(); _resetForTests(); });
 
 describe('useConversationSearch', () => {
+  it('uses the qualified Codex search cursor contract and item-key anchors', async () => {
+    mockFetchOnce({
+      status: 'ok', query: 'needle', total: 1, mode: 'fts', depth: 'full',
+      hits: [{ conversation_key: 'v1.root-a', item_key: 'civ1.item', title: 'Codex thread', snippet: 'needle', badges: ['thinking'], last_activity_utc: '2026-07-01T00:00:00Z', project_label: 'proj' }],
+      page: { returned: 1, cursor: null },
+    });
+    const { result } = renderHook(() => useConversationSearch('needle', 'all', 'codex'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.hits[0]).toMatchObject({
+      conversation_ref: { source: 'codex', key: 'v1.root-a' }, uuid: 'civ1.item',
+    });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(url).toContain('source=codex');
+    expect(url).not.toContain('offset=');
+  });
+
   it('does not fetch for an empty query', () => {
     const { result } = renderHook(() => useConversationSearch(''));
     act(() => { vi.advanceTimersByTime(500); });

@@ -279,33 +279,32 @@ def load_codex_quota_observations(
             }
             return required <= columns
 
-        has_conversation_events = has_columns(
-            "codex_conversation_events",
-            {"source_path", "line_offset", "record_type", "payload_json"},
-        )
         has_session_entries = has_columns(
             "codex_session_entries", {"source_path", "line_offset", "model"},
         )
-        if has_conversation_events:
-            model_expr = """
-                (SELECT json_extract(events.payload_json, '$.payload.model')
-                   FROM codex_conversation_events AS events
-                  WHERE events.source_path=quota_window_snapshots.source_path
-                    AND events.line_offset<=quota_window_snapshots.line_offset
-                    AND events.record_type IN ('turn_context','session_meta')
-                    AND json_type(events.payload_json, '$.payload.model')='text'
-                  ORDER BY events.line_offset DESC LIMIT 1) AS observed_model
-            """
-        elif has_session_entries:
-            model_expr = """
-                (SELECT entries.model
-                   FROM codex_session_entries AS entries
-                  WHERE entries.source_path=quota_window_snapshots.source_path
-                    AND entries.line_offset<=quota_window_snapshots.line_offset
-                  ORDER BY entries.line_offset DESC LIMIT 1) AS observed_model
-            """
-        else:
-            model_expr = "NULL AS observed_model"
+        has_observed_model = has_columns(
+            "quota_window_snapshots", {"observed_model"},
+        )
+        entry_lookup = (
+            "(SELECT entries.model FROM codex_session_entries AS entries "
+            "WHERE entries.source_path=quota_window_snapshots.source_path "
+            "AND entries.line_offset<=quota_window_snapshots.line_offset "
+            "ORDER BY entries.line_offset DESC LIMIT 1)"
+        )
+        # A file's terminal model is not evidence for an earlier quota sample:
+        # the model may change later in the rollout. Prefer the compact stamp,
+        # then only a nearest-prior accounting context for legacy rows. If
+        # neither exists, leave the pool unscoped rather than fabricating it.
+        fallback_model = entry_lookup if has_session_entries else "NULL"
+        selected_model = (
+            f"COALESCE(quota_window_snapshots.observed_model,{fallback_model})"
+            if has_observed_model and fallback_model != "NULL"
+            else (
+                "quota_window_snapshots.observed_model"
+                if has_observed_model else fallback_model
+            )
+        )
+        model_expr = f"{selected_model} AS observed_model"
         sql = """
             SELECT source, source_root_key, source_path, line_offset,
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,

@@ -1,3 +1,5 @@
+import type { ConversationSource } from '../types/conversation';
+
 // #217 S7 F10 — the comparison header bar: a "⟷ Comparing" title, the two
 // per-side column labels (each run's display title + date + model), and the
 // ⇄ swap / ✕ close controls. The per-side `{ title, date, model }` are derived
@@ -8,17 +10,22 @@ export interface SideHeader {
   title: string;
   date: string | null;
   model: string | null;
+  source?: ConversationSource;
 }
 
 export function ComparisonHeader({
   a,
   b,
   onSwap,
+  onExport,
+  exportBusy = false,
   onClose,
 }: {
   a: SideHeader;
   b: SideHeader;
   onSwap: () => void;
+  onExport?: () => void;
+  exportBusy?: boolean;
   onClose: () => void;
 }) {
   return (
@@ -32,6 +39,17 @@ export function ComparisonHeader({
         <Side side={b} label="Run B" tone="b" />
       </div>
       <div className="conv-cmp-head-controls">
+        {onExport && (
+          <button
+            type="button"
+            className="conv-cmp-export"
+            aria-label="Copy source-labelled comparison export"
+            disabled={exportBusy}
+            onClick={onExport}
+          >
+            {exportBusy ? 'Copying…' : 'Copy export'}
+          </button>
+        )}
         <button
           type="button"
           className="conv-cmp-swap"
@@ -63,6 +81,7 @@ function Side({ side, label, tone }: { side: SideHeader; label: string; tone: 'a
   return (
     <div className="conv-cmp-head-side">
       <span className={`conv-cmp-head-side-tag conv-cmp-head-side-tag--${tone}`}>{label}</span>
+      {side.source && <span className={`conv-source-badge conv-source-badge--${side.source}`}>{side.source === 'codex' ? 'Codex' : 'Claude'}</span>}
       <span className="conv-cmp-head-side-name">{side.title}</span>
       {meta && <span className="conv-cmp-head-side-meta">{meta}</span>}
     </div>

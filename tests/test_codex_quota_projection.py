@@ -145,14 +145,11 @@ def test_legacy_spark_quota_rows_are_reinterpreted_as_a_separate_pool(
     cache = ns["open_cache_db"]()
     try:
         cache.execute(
-            """INSERT INTO codex_conversation_events
-               (source_path, line_offset, source_root_key, timestamp_utc,
-                record_type, payload_json)
-               VALUES (?, 10, ?, ?, 'turn_context', ?)""",
-            (
-                source_path, root_key, _iso(10),
-                json.dumps({"payload": {"model": "gpt-5.3-codex-spark"}}),
-            ),
+            """INSERT INTO codex_session_entries
+               (source_path, line_offset, timestamp_utc, session_id, model,
+                source_root_key)
+               VALUES (?, 9, ?, 'spark-session', 'gpt-5.3-codex-spark', ?)""",
+            (source_path, _iso(9), root_key),
         )
         cache.commit()
     finally:

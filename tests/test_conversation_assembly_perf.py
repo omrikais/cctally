@@ -73,7 +73,7 @@ def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
         (source_path, line_offset, "t", model, msg_id, req_id, inp, out, cc, cr))
 
 
-def _seed_small_session(c, sid="s1", turns=3):
+def _seed_small_session(c, sid="s1", turns=3, *, entry_conn=None):
     """Direct-seed a small human+assistant session with cost rows, so a bare
     _assemble_session runs the WHOLE pipeline (all eight stages execute
     unconditionally — the tree carries every child even on a tiny session)."""
@@ -89,14 +89,20 @@ def _seed_small_session(c, sid="s1", turns=3):
              byte_offset=2 * t + 1, timestamp_utc=f"2026-06-01T00:{t:02d}:05Z",
              entry_type="assistant", text=f"benchmark reply {t}", model=_MODEL,
              msg_id=f"m{t}", req_id=f"r{t}")
-        _entry(c, source_path="a.jsonl", line_offset=2 * t + 1, model=_MODEL,
+        _entry(entry_conn or c, source_path="a.jsonl", line_offset=2 * t + 1, model=_MODEL,
                msg_id=f"m{t}", req_id=f"r{t}")
         prev = au
 
 
 def _conn():
     c = sqlite3.connect(":memory:")
-    _db._apply_cache_schema(c)
+    _db._apply_conversations_schema(c)
+    cache_uri = f"file:cctally-assembly-{id(c)}?mode=memory&cache=shared"
+    cache = sqlite3.connect(cache_uri, uri=True)
+    _db._apply_cache_schema(cache)
+    cache.commit()
+    c.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
+    cache.close()
     return c
 
 
@@ -236,9 +242,12 @@ def test_perf_scope_stashes_conversation_tree(tmp_path, monkeypatch):
     dperf = ns["_load_sibling"]("_lib_perf")
     dcq = ns["_load_sibling"]("_lib_conversation_query")
 
-    conn = ns["open_cache_db"]()
-    _seed_small_session(conn)
+    conn = ns["open_conversations_db"]()
+    core = ns["open_cache_db"]()
+    _seed_small_session(conn, entry_conn=core)
     conn.commit()
+    core.commit()
+    core.close()
 
     H = ns["DashboardHTTPHandler"]
     handler = H.__new__(H)     # _perf_scope only needs the staticmethod _perf_gate
@@ -277,8 +286,8 @@ def test_assembly_fixture_shape_deterministic(tmp_path):
     under two different roots) and each rung's msg_count == 2 * turns."""
     gen_a, data_a = _build_small_assembly_fixture(tmp_path / "a")
     gen_b, data_b = _build_small_assembly_fixture(tmp_path / "b")
-    ca = sqlite3.connect(str(pathlib.Path(data_a) / "cache.db"))
-    cb = sqlite3.connect(str(pathlib.Path(data_b) / "cache.db"))
+    ca = gen_a.open_fixture_db(data_a)
+    cb = gen_b.open_fixture_db(data_b)
     try:
         assert gen_a.semantic_hash(ca) == gen_b.semantic_hash(cb)
         ladder = gen_a.ASSEMBLY_TURN_LADDER_SMALL

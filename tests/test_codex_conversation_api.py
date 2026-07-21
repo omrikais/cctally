@@ -144,6 +144,14 @@ def _boot(ns, tmp_path, monkeypatch, *, codex_scenarios=("modern-full",),
                 codex_keys[scen] = row[0]
     finally:
         conn.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        if codex_scenarios:
+            ns["sync_codex_conversations"](conversations, rebuild=True)
+        if claude_sids:
+            ns["sync_claude_conversations"](conversations, rebuild=True)
+    finally:
+        conversations.close()
     srv = _wire_handler(ns, no_sync=no_sync)
     return srv, provider_root, codex_keys, rollouts
 
@@ -821,7 +829,7 @@ def test_codex_export_golden_and_no_staling_trigger_leak(tmp_path, monkeypatch):
     srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch, claude_sids=())
     key = keys["modern-full"]
     try:
-        conn = ns["open_cache_db"]()
+        conn = ns["open_conversations_db"]()
         try:
             disp2 = ns["_load_sibling"]("_lib_conversation_dispatch")
             env1 = disp2.neutral_export(conn, key, scope="all",

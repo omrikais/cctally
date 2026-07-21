@@ -27,6 +27,7 @@ import { transcriptsEnabled } from '../lib/transcripts';
 import { SourceChip, DegradedChip } from './sourcePanel';
 import type { DashboardSelection } from '../types/envelope';
 import { openShareModal } from '../store/shareSlice';
+import { legacyClaudeConversationRef } from '../types/conversation';
 
 // Provider-neutral Sessions grid for Claude, Codex, and All. It renders the
 // canonical provider-adapted display rows behind the canonical columns: Started /
@@ -265,7 +266,7 @@ export function SourceSessionsGrid() {
                     onClick={() => openSession(r)}
                   >
                     <td className="started recency" role="gridcell">
-                      {transcriptsOn && r.key && (
+                      {transcriptsOn && r.source === 'claude' && r.key && (
                         <button
                           type="button"
                           className="sess-open-conv"
@@ -274,7 +275,7 @@ export function SourceSessionsGrid() {
                           aria-label="Open conversation"
                           onClick={(e) => {
                             e.stopPropagation();
-                            dispatch({ type: 'OPEN_CONVERSATION', sessionId: r.key });
+                            dispatch({ type: 'OPEN_CONVERSATION', conversationRef: legacyClaudeConversationRef(r.key) });
                           }}
                         >
                           <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#file-text" /></svg>

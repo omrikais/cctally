@@ -20,9 +20,9 @@ What lives here (spec §6):
   (``_require_transcripts_allowed`` / ``_transcript_gate`` / …) STAY on the
   class and are reached via the ``handler`` parameter (spec §6).
 
-Late-binding (spec §6): the two bare ``open_cache_db`` calls (in
+Late-binding (spec §6): the conversation DB opener calls (in
 ``_run_conversation_query_impl`` + the events handler) reach
-``sys.modules["_cctally_dashboard"].open_cache_db(...)`` — patched on the
+``sys.modules["_cctally_dashboard"].open_conversations_db(...)`` — patched on the
 dashboard module object at ``tests/test_conversation_endpoints.py:674``.
 
 Cross-module reaches (spec §2.1 "fully-qualify cross-module refs"): the
@@ -44,7 +44,13 @@ import socket
 import sqlite3
 import sys
 
-from _cctally_cache import sync_cache, sync_codex_cache, _codex_provider_roots
+from _cctally_cache import (
+    open_cache_db,
+    sync_codex_cache,
+    sync_claude_conversations,
+    sync_codex_conversations,
+    _codex_provider_roots,
+)
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -91,7 +97,7 @@ class _BadConversationFilter(Exception):
 
 
 def _cached_file_sigs(conn, paths):
-    """{path: size_bytes} from session_files for the given paths — the cache's
+    """{path: size_bytes} from conversation_source_files for the given paths — the transcript cache's
     own view of how far each file is ingested. Size-only by design, matching the
     watch kernel's size-only signature (`file_sig`) and sync_cache's size-only
     delta signal: mtime is NOT consulted, because a size-unchanged ingest does
@@ -105,7 +111,7 @@ def _cached_file_sigs(conn, paths):
     placeholders = ",".join("?" for _ in paths)
     try:
         rows = conn.execute(
-            f"SELECT path, size_bytes FROM session_files "
+            f"SELECT path, size_bytes FROM conversation_source_files "
             f"WHERE path IN ({placeholders})", list(paths)).fetchall()
     except sqlite3.OperationalError:
         return out
@@ -115,7 +121,7 @@ def _cached_file_sigs(conn, paths):
 
 
 def _codex_cached_file_sigs(conn, paths):
-    """{path: size_bytes} from ``codex_session_files`` for the given paths — the
+    """{path: size_bytes} from ``codex_conversation_source_files`` for the given paths — the
     Codex analogue of ``_cached_file_sigs`` (spec §5.2). Size-only, matching the
     watch kernel's size-only signature and ``sync_codex_cache``'s size-only
     delta. Paths with no row are absent → treated as changed. Baselines the
@@ -129,7 +135,7 @@ def _codex_cached_file_sigs(conn, paths):
     placeholders = ",".join("?" for _ in paths)
     try:
         rows = conn.execute(
-            f"SELECT path, size_bytes FROM codex_session_files "
+            f"SELECT path, size_bytes FROM codex_conversation_source_files "
             f"WHERE path IN ({placeholders})", list(paths)).fetchall()
     except sqlite3.OperationalError:
         return out
@@ -144,7 +150,7 @@ def _codex_all_committed_sizes(conn):
     baseline. A plain SELECT (no lock), so it never widens the SSE lock scope."""
     try:
         rows = conn.execute(
-            "SELECT path, size_bytes FROM codex_session_files").fetchall()
+            "SELECT path, size_bytes FROM codex_conversation_source_files").fetchall()
     except sqlite3.OperationalError:
         return {}
     return {p: size for (p, size) in rows}
@@ -162,7 +168,7 @@ def _codex_classified_paths(conn, paths):
     placeholders = ",".join("?" for _ in paths)
     try:
         rows = conn.execute(
-            f"SELECT path FROM codex_session_files "
+            f"SELECT path FROM codex_conversation_source_files "
             f"WHERE path IN ({placeholders}) AND last_conversation_key IS NOT NULL",
             list(paths)).fetchall()
     except sqlite3.OperationalError:
@@ -444,12 +450,12 @@ def _run_conversation_query_impl(handler, kernel_call, log_label):
     has ALREADY been sent and the caller must just ``return``; ``ok=True``
     carries the kernel result (which may itself be ``None`` — the reader's
     404 sentinel — so the explicit flag, not ``body is None``, signals
-    failure). An ``open_cache_db`` failure is a ``cache unavailable:`` 500;
+    failure). An ``open_conversations_db`` failure is a ``cache unavailable:`` 500;
     a kernel exception is logged as ``<log_label> failed: %r`` and returned
     as a ``{type}: {msg}`` 500 — byte-identical to the inlined handlers.
     """
     try:
-        conn = sys.modules["_cctally_dashboard"].open_cache_db()  # late-binding: patched at test_conversation_endpoints.py:674
+        conn = sys.modules["_cctally_dashboard"].open_conversations_db()
     except (sqlite3.DatabaseError, OSError) as exc:
         handler._respond_json(500, {"error": f"cache unavailable: {exc}"})
         return False, None
@@ -785,7 +791,7 @@ def _bare_conversation_events(handler, session_id: str) -> None:
     _send_sse_headers(handler)
     passive = bool(type(handler).no_sync)
     try:
-        conn = sys.modules["_cctally_dashboard"].open_cache_db()  # late-binding: patched at test_conversation_endpoints.py:674
+        conn = sys.modules["_cctally_dashboard"].open_conversations_db()
     except (sqlite3.DatabaseError, OSError):
         # Cache unavailable — degrade to keep-alive only; client backstop
         # tick still surfaces turns. (Headers already sent; can't 500.)
@@ -796,7 +802,7 @@ def _bare_conversation_events(handler, session_id: str) -> None:
         return cq.session_source_paths(conn, session_id) if conn else []
 
     def _ingest(changed):
-        return sync_cache(conn, only_paths=set(changed))
+        return sync_claude_conversations(conn, only_paths=set(changed))
 
     try:
         _run_conversation_events_stream(
@@ -840,7 +846,24 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
         if not to_ingest:
             return files, False
         try:
-            sync_codex_cache(conn, only_paths=set(to_ingest))
+            # A newly discovered child has no compact thread row yet. Advance
+            # the independent core cursor first so transcript normalization can
+            # link the child through the read-only attached cache, then commit
+            # the transcript cursor. Neither lock is held across the other.
+            core = open_cache_db()
+            try:
+                core_stats = sync_codex_cache(
+                    core, only_paths=set(to_ingest)
+                )
+            finally:
+                core.close()
+            if not core_stats.targeted_clean:
+                return files, False
+            transcript_stats = sync_codex_conversations(
+                conn, only_paths=set(to_ingest)
+            )
+            if not transcript_stats.targeted_clean:
+                return files, False
         except sqlite3.DatabaseError:
             return files, False
         # Reap the now-classified candidates (child → already widened; non-child
@@ -866,7 +889,7 @@ def _qualified_conversation_events(handler, key: str) -> None:
     targeted ingest + the directory-frontier child discovery."""
     disp = _conversation_dispatch_impl()
     try:
-        conn = sys.modules["_cctally_dashboard"].open_cache_db()  # late-binding: patched at test_conversation_endpoints.py:674
+        conn = sys.modules["_cctally_dashboard"].open_conversations_db()
     except (sqlite3.DatabaseError, OSError):
         conn = None
 
@@ -921,7 +944,7 @@ def _qualified_conversation_events(handler, key: str) -> None:
             return cq_codex.codex_conversation_source_paths(conn, key)
 
         def _ingest(changed):
-            return sync_codex_cache(conn, only_paths=set(changed))
+            return sync_codex_conversations(conn, only_paths=set(changed))
 
         cached = lambda paths: _codex_cached_file_sigs(conn, paths)
         discovery = _make_codex_discovery_step(handler, conn, key, cq_codex)
@@ -932,7 +955,7 @@ def _qualified_conversation_events(handler, key: str) -> None:
             return cq.session_source_paths(conn, native)
 
         def _ingest(changed):
-            return sync_cache(conn, only_paths=set(changed))
+            return sync_claude_conversations(conn, only_paths=set(changed))
 
         cached = lambda paths: _cached_file_sigs(conn, paths)
         discovery = None
