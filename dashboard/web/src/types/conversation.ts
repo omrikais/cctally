@@ -18,6 +18,14 @@ export interface CacheFailure {
   est_wasted_usd: number;
 }
 
+export interface CodexLifecycleState {
+  schema_version: 1;
+  state: string;
+  started?: Record<string, unknown>;
+  completed?: Record<string, unknown>;
+  events: Array<{ event: string; payload_which: 'event'; block_key: string }>;
+}
+
 export type ConversationItem =
   | {
       // assistant turn
@@ -36,6 +44,9 @@ export type ConversationItem =
       // stamped when the turn key has a session_entries row. Absent (NOT
       // zero-filled) otherwise; the §6 footer reads it.
       tokens?: TokenUsage;
+      // #334 Task B — folded Codex lifecycle evidence stays attached to its
+      // owning logical response but does not create a standalone reader row.
+      lifecycle?: CodexLifecycleState;
       // cache-failure-markers spec §2/§3 — present only on a flagged assistant
       // turn; absent on healthy ones. The reader chip reads it.
       cache_failure?: CacheFailure;
@@ -63,6 +74,7 @@ export type ConversationItem =
       // resolves to the null-msg_id assistant fallback. Absent on human /
       // tool_result rows in practice.
       cache_failure?: CacheFailure;
+      lifecycle?: CodexLifecycleState;
     }
   | {
       // Injected harness content (isMeta) the user did NOT type — rendered as a
@@ -82,6 +94,11 @@ export type ConversationItem =
       parent_uuid: string | null;
       meta_kind: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
       skill_name: string | null;
+      // Qualified providers preserve the native semantic source instead of
+      // collapsing every injected row into generic context/notification copy.
+      // Optional so the established Claude envelope remains byte-compatible.
+      meta_label?: string | null;
+      meta_sections?: string[];
     };
 
 // #177 S1 backend / S5 client adoption — per-turn token usage, stamped on
@@ -117,6 +134,8 @@ export interface OutlineTurn {
   thinking?: string[];
   meta_kind?: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
   skill_name?: string | null;
+  meta_label?: string | null;
+  meta_sections?: string[];
   // cache-failure-markers spec §2/§4 — copied from the assembled item onto its
   // OutlineTurn where `tokens` is copied. Present only on a flagged turn.
   cache_failure?: CacheFailure;
@@ -229,9 +248,161 @@ export interface MediaRef {
   index: number;
 }
 
+export interface NativeTerminalCommand {
+  command: string;
+  workdir: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface NativeTerminalOutput {
+  schema_version: 1;
+  type: 'terminal_output';
+  status: string;
+  is_error: boolean;
+  parts: { type: 'text' | 'raw'; stream: 'stdout' | 'stderr' | 'output'; text: string }[];
+  truncated: boolean;
+}
+
+export interface NativePatchFile {
+  path?: string;
+  move_path?: string;
+  status?: string;
+  unified_diff?: string;
+  raw?: string;
+  raw_extra?: string;
+}
+
+export interface NativeResultEnvelope {
+  status: string;
+  value: unknown;
+  truncated: boolean;
+}
+
+export interface NativeWebSearchResult {
+  title: string;
+  url: string;
+  domain?: string;
+  snippet?: string;
+  ref_id?: string;
+  type?: string;
+}
+
+export type NativeAgentOperation =
+  | 'spawn_agent'
+  | 'wait_agent'
+  | 'send_message'
+  | 'list_agents'
+  | 'followup_task'
+  | 'interrupt_agent';
+
+export type NativeToolCard =
+  | {
+      schema_version: 1;
+      type: 'terminal';
+      status: string;
+      commands: NativeTerminalCommand[];
+      output?: NativeTerminalOutput;
+      truncated?: boolean;
+    }
+  | {
+      schema_version: 1;
+      type: 'patch';
+      source: string;
+      status: string;
+      files: NativePatchFile[];
+      patch?: string;
+      request_files?: NativePatchFile[];
+      success?: boolean | null;
+      stdout?: string | null;
+      stderr?: string | null;
+      has_diff?: boolean;
+      truncated?: boolean;
+      event_payload_key?: string;
+    }
+  | {
+      schema_version: 1;
+      type: 'plan';
+      source: 'update_plan';
+      call_status: string;
+      explanation: string | null;
+      items: { step: string; status: string }[];
+      result?: NativeResultEnvelope;
+    }
+  | {
+      schema_version: 1;
+      type: 'web_search';
+      source: 'web_search_call';
+      call_status: string;
+      query: string;
+      action: Record<string, unknown>;
+      completion: {
+        status: string;
+        query: string;
+        action: Record<string, unknown>;
+        results: NativeWebSearchResult[];
+        error?: string;
+        event_block_key?: string;
+      };
+    }
+  | {
+      schema_version: 1;
+      type: 'mcp';
+      source: 'function_call';
+      name: string;
+      call_status: string;
+      completion: {
+        status: string;
+        server: string;
+        tool: string;
+        arguments: Record<string, unknown>;
+        result: Record<string, unknown>;
+        duration: { secs: number; nanos: number };
+        event_block_key?: string;
+      };
+    }
+  | {
+      schema_version: 1;
+      type: 'agent';
+      operation: NativeAgentOperation;
+      call_status: string;
+      arguments: Record<string, unknown>;
+      result?: NativeResultEnvelope;
+      child_conversation?: {
+        conversation_key: string;
+        role?: string;
+        nickname?: string;
+      };
+    };
+
 export type ConversationBlock =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string }
+  | {
+      // #334 Task B — provider-native reasoning is deliberately distinct from
+      // Claude's Thinking disclosure. Every prose field is optional on the
+      // wire, but the adapter drops a block unless at least one is non-empty.
+      kind: 'codex_reasoning';
+      source: string;
+      title?: string;
+      summary?: string;
+      body?: string;
+    }
+  | {
+      kind: 'system_actions';
+      actions: Array<
+        | { type: 'git'; action: 'create_branch' | 'stage' | 'commit' | 'push' | 'create_pr'; draft?: boolean }
+        | { type: 'memory_citation'; citation_count: number; rollout_count: number }
+      >;
+      payload_key?: string;
+    }
+  | {
+      kind: 'codex_lifecycle';
+      event: 'task_started' | 'task_complete';
+      message?: string;
+      error?: string;
+      duration_ms?: number;
+      payload_key?: string;
+    }
   // 'tool_use' is the id-less degradation fallback ONLY (pre-migration rows the
   // kernel never paired): post-migration the kernel always emits 'tool_call'.
   | { kind: 'tool_use'; name: string | null; input_summary: string }
@@ -264,6 +435,11 @@ export type ConversationBlock =
       // opaque block_key payload route, even when the bounded detail projection
       // does not claim truncation.
       payload_capable?: boolean;
+      // #331 Session B — provider-native card projection. The provider tool
+      // name remains unchanged (`exec`, `apply_patch`, `patch_apply_end`); this
+      // additive shape selects presentation without relabelling the record.
+      native_card?: NativeToolCard;
+      payload_kind?: 'call' | 'event';
       // #177 S4 — `media` (tool-result media placeholders, render-ready) folds
       // into the result object on owned calls; absent when the result carried
       // no image/document items (and on pre-009-reingest rows).
@@ -287,7 +463,7 @@ export type ConversationBlock =
       // #177 S4 — folded by the kernel's name-keyed Phase-3 join; absent on
       // old rows (pre-009-reingest) and on every non-web tool. `code_text` is
       // omitted at capture when the HTTP status text was empty.
-      web_search?: { query: string; links: { title: string; url: string }[]; links_truncated?: boolean };
+      web_search?: { query: string; links: NativeWebSearchResult[]; links_truncated?: boolean };
       web_fetch?: { code: number; code_text?: string };
     }
   // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
@@ -552,6 +728,14 @@ export type FullPayload =
       input: Record<string, unknown>;
       full_length: number;
       truncated: boolean;
+    }
+  | {
+      which: 'event';
+      tool_use_id: string;
+      text: string;
+      full_length: number;
+      truncated: boolean;
+      card?: NativeToolCard;
     };
 
 // #217 S3 E1 — anchor-based reading-position memory. The persistence module

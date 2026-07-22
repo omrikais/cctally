@@ -109,6 +109,9 @@ export type InputMode = null | 'filter' | 'search' | 'note';
 // connection-error semantics — the frontend treats `error_event` as a
 // terminal failure event identical to a non-zero `exit`.
 export type UpdateMethod = 'brew' | 'npm' | 'unknown';
+// Beta-channel (spec 2026-07-21 §3): the configured RELEASE channel that
+// `cctally update` tracks. Distinct from the preview `channel` (prod|preview).
+export type UpdateChannel = 'stable' | 'beta';
 export type UpdateRunStatus = 'idle' | 'running' | 'success' | 'failed';
 export type UpdateCheckStatus =
   | 'ok'
@@ -127,6 +130,10 @@ export interface UpdateState {
   check_status: UpdateCheckStatus | null;
   checked_at_utc: string | null;
   prerelease_note: string | null;
+  // Beta-channel (spec 2026-07-21 §3): the configured release channel. Drives
+  // the `(beta)` badge/modal marker; `update_command` is already the
+  // channel-correct exact-version command when beta.
+  configured_channel: UpdateChannel;
 }
 
 export interface UpdateRemindAfter {
@@ -790,6 +797,14 @@ export function selectMarkersEnabled(s: UIState = state): boolean {
 // EventSource, so the defaulting lives in one place.
 export function selectLiveTailEnabled(s: UIState = state): boolean {
   return s.dashboardPrefs.live_tail !== false;
+}
+
+// Beta-channel (spec 2026-07-21 §3) — the single defaulting path for the
+// configured release channel that seeds the settings toggle. Reads the
+// SSE-mirrored update slice; an absent/unknown value reads as "stable"
+// (older server / first tick before bootstrap).
+export function selectConfiguredChannel(s: UIState = state): UpdateChannel {
+  return s.update.state?.configured_channel === 'beta' ? 'beta' : 'stable';
 }
 
 // a11y focus management (#207 A1) — the highest STORE-TRACKED open focus layer,

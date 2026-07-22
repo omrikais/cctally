@@ -682,6 +682,24 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 }
 .badge-update-arrow { display: inline-block; }
 .badge-update-version { display: inline-block; }
+/* Beta-channel (spec 2026-07-21 §3): a small "beta" tag on the update badge +
+   idle modal when the configured release channel is beta. */
+.badge-update-channel {
+  display: inline-block;
+  margin-left: 0.35em;
+  padding: 0 0.35em;
+  border-radius: var(--radius-pill);
+  font-size: 0.78em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: rgba(255, 255, 255, 0.18);
+}
+.update-channel-tag {
+  font-size: 0.85em;
+  font-weight: 600;
+  opacity: 0.75;
+}
 
 /* Preview-channel marker pill (maintainer-local). Sibling of .badge-update —
    reuses the same amber pill surface (accent-amber wash + border, mono, meta
@@ -1882,6 +1900,18 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 
 .mcw-mshead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .mcw-ms-sub { color: var(--text-dim); font-size: var(--fs-eyebrow); }
+
+/* Hero-modal history navigation: week chip + block navigator ‹/› buttons.
+   Reuse the m-pill vocabulary; reset the native <button> chrome and add a
+   pointer cursor + a dim disabled state at the ends of the navigable range. */
+.mcw-weeknav, .mcw-blocknav { display: flex; align-items: center; gap: 8px; }
+button.mcw-weeknav-btn, button.mcw-blocknav-btn {
+  border: none; cursor: pointer; font: inherit; line-height: 1;
+  padding: 2px 8px;
+}
+button.mcw-weeknav-btn:disabled, button.mcw-blocknav-btn:disabled {
+  opacity: 0.35; cursor: default;
+}
 
 .mcw-table .pct-cell {
   display: inline-block; min-width: 26px; text-align: center;
@@ -9696,6 +9726,140 @@ mark.current {
   font-style: normal;
 }
 
+/* #334 Task B — Codex reasoning has title/body semantics, not Claude's
+   summary-style Thinking disclosure. Keep it quiet and readable, render the
+   title Markdown inline, and expose body/summary labels only when retained. */
+.conv-codex-reasoning {
+  min-width: 0;
+  border-inline-start: 2px solid color-mix(in srgb, var(--accent-indigo) 60%, transparent);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--accent-indigo) 4%, transparent);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+.conv-codex-reasoning--line,
+.conv-codex-reasoning > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: 5px 10px;
+}
+.conv-codex-reasoning > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.conv-codex-reasoning > summary::-webkit-details-marker { display: none; }
+.conv-codex-reasoning[open] > summary .conv-chev { transform: rotate(45deg); }
+.conv-codex-reasoning-label {
+  flex: 0 0 auto;
+  color: var(--accent-indigo);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.conv-codex-reasoning-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+}
+.conv-codex-reasoning-title .md,
+.conv-codex-reasoning-title .md p {
+  display: inline;
+  margin: 0;
+}
+.conv-codex-reasoning-title .md p {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-codex-reasoning-content {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2) 12px 10px;
+  border-top: 1px solid var(--border-soft);
+  font-family: var(--font-body);
+  font-size: var(--fs-body);
+}
+.conv-codex-reasoning-summary > span,
+.conv-codex-reasoning-body > span {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--reader-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.conv-codex-reasoning-summary .md > :first-child,
+.conv-codex-reasoning-body .md > :first-child { margin-top: 0; }
+.conv-codex-reasoning-summary .md > :last-child,
+.conv-codex-reasoning-body .md > :last-child { margin-bottom: 0; }
+
+/* Closed-grammar harness markers become bounded, privacy-safe action chrome.
+   The authoritative raw event stays behind the existing payload control. */
+.conv-system-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px dashed color-mix(in srgb, var(--accent-cyan) 35%, var(--border-soft));
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+.conv-system-actions-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent-cyan);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.conv-system-actions-list { display: contents; }
+.conv-system-action {
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.conv-system-actions .conv-native-raw-btn { margin-inline-start: auto; }
+
+.conv-codex-lifecycle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  align-items: center;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+.conv-codex-lifecycle-head,
+.conv-codex-lifecycle-message,
+.conv-codex-lifecycle-error { min-width: 0; overflow-wrap: anywhere; }
+.conv-codex-lifecycle-head { display: inline-flex; align-items: center; gap: 5px; color: var(--reader-faint); }
+.conv-codex-lifecycle-message,
+.conv-codex-lifecycle-error { grid-column: 1 / -1; }
+.conv-codex-lifecycle-error { color: var(--accent-red); }
+.conv-codex-lifecycle-duration { color: var(--reader-faint); }
+.conv-codex-lifecycle .conv-native-raw-btn { justify-self: start; }
+
+@media (max-width: 640px) {
+  .conv-codex-reasoning--line,
+  .conv-codex-reasoning > summary { align-items: flex-start; }
+  .conv-system-actions { align-items: flex-start; }
+  .conv-system-actions .conv-native-raw-btn { margin-inline-start: 0; }
+}
+
 /* Chevron expand affordance (#164, C4): a rotated border triangle that
    turns down when the disclosure opens. Cheap transform transition only —
    no grid-template-rows open/close animation (that's Phase 7). */
@@ -10089,6 +10253,27 @@ mark.current {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.conv-term-raw {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: var(--space-2) 10px;
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  border: 1px dashed var(--border-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conv-term-raw-label,
+.conv-term-workdir {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+.conv-term-command { display: flex; flex-direction: column; gap: 3px; }
+.conv-term-workdir::before { content: "cwd "; color: var(--accent-cyan); }
 .conv-term-out { background: var(--bg); color: var(--text-dim); border: 1px solid var(--border-soft); }
 .conv-term-stderr {
   background: rgba(239, 68, 68, 0.08);
@@ -10111,6 +10296,82 @@ mark.current {
   font-size: var(--fs-eyebrow);
   color: var(--text-dim);
   font-family: var(--font-mono);
+}
+
+/* ---- Native Codex patch card (#331 Session B) -------------------- */
+.conv-native-patch-body {
+  position: relative;
+  padding: var(--space-2) 10px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.conv-native-patch-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-native-patch-file { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.conv-native-patch-filehead {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.conv-native-patch-status {
+  flex: 0 0 auto;
+  color: var(--accent-cyan);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.conv-native-patch-nodiff {
+  padding: var(--space-2) 10px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.conv-native-patch-note,
+.conv-native-patch-truncated {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--fs-eyebrow);
+}
+.conv-native-raw-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.conv-native-raw-btn {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+  color: var(--accent-blue);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  padding: 3px var(--space-2);
+}
+.conv-native-raw-btn:hover { border-color: var(--accent-blue); }
+.conv-native-raw-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.conv-native-raw-btn:disabled { cursor: default; opacity: .45; }
+.conv-native-raw-loading,
+.conv-native-raw-error { color: var(--text-dim); font-family: var(--font-mono); font-size: var(--fs-eyebrow); }
+.conv-native-raw-loading .conv-ico { animation: cctally-icon-spin 1.2s linear infinite; }
+.conv-native-raw > summary { color: var(--text-dim); cursor: pointer; font-family: var(--font-mono); font-size: var(--fs-eyebrow); }
+.conv-native-raw > pre {
+  margin: var(--space-1) 0 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: var(--space-2);
+  border: 1px dashed var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .conv-term[open] > summary .conv-term-collapsed-hint { display: none; }
 
@@ -10155,7 +10416,8 @@ mark.current {
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: freeze the load-full spinner (parity with the reader's
      other reduced-motion gates). */
-  .conv-loadfull-spinner .conv-ico { animation: none; }
+  .conv-loadfull-spinner .conv-ico,
+  .conv-native-raw-loading .conv-ico { animation: none; }
 }
 
 /* ---- Copy affordances (G2) ---------------------------------------- */
@@ -11058,6 +11320,28 @@ mark.current {
        white-space:pre and keep their own scroll boxes, unaffected. */
     overflow-wrap: anywhere;
   }
+  /* #335 Session E — the item-level long-token guard above is correct for prose,
+     but provider labels are semantic units. Keep them on one bounded line and
+     expose the complete text through the title/accessibility tree. */
+  #root .conv-meta--notification .conv-meta-label {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 48%;
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: normal;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* The provider strip is a flex child of the height-bounded reader. It must
+     size to its wrapped content instead of shrinking below scrollHeight; the
+     token sentence may wrap only at its truthful field separators. */
+  #root .conv-provider-strip { flex: 0 0 auto; }
+  #root .conv-provider-tokens {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: normal;
+  }
   #root .view-switcher {
     padding: 2px;
     gap: 2px;
@@ -11142,6 +11426,8 @@ mark.current {
   #root .conv-new-pill { min-height: 44px; }
   #root .conv-hidden-run { min-height: 44px; }
   #root .conv-loadfull-btn { min-height: 44px; }
+  #root .conv-native-raw-btn,
+  #root .conv-native-raw > summary { min-height: 44px; display: flex; align-items: center; }
   #root .conv-chip > summary,
   #root .conv-meta > summary,
   #root .conv-system-marker > summary { min-height: 44px; box-sizing: border-box; }
@@ -11348,7 +11634,27 @@ mark.current {
 .conv-web-more button:hover { background: rgba(34,211,238,.06); }
 .conv-web-link { margin: 6px 0; }
 .conv-web-link-domain { display: block; font-size: 11.5px; color: var(--text-dim); }
+.conv-web-link-snippet { display: block; color: var(--text-dim); line-height: 1.4; }
+.conv-web-link-ref { display: block; color: var(--text-faint); font-family: var(--font-mono); font-size: var(--fs-eyebrow); }
 .conv-web-copy { position: absolute; top: 8px; right: 8px; }
+
+/* #332 Task B — provider-native plan, MCP, orchestration, and local-media cards. */
+.conv-native-plan > .conv-native-raw-actions { padding: 0 10px 8px; }
+.conv-native-plan-explanation { margin: 2px 6px 8px; color: var(--text-dim); line-height: 1.45; }
+.conv-native-plan-result { margin: 8px 6px 0; padding-top: 7px; border-top: 1px solid var(--border-soft);
+  color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; }
+.conv-native-mcp { border-left: 2px solid var(--accent-cyan); }
+.conv-native-agent { border-left: 2px solid var(--accent-purple); }
+.conv-native-card--error { border-left-color: var(--accent-red); }
+.conv-native-agent-child { display: inline-flex; margin: 2px 0 8px; }
+.conv-local-media-unavailable { display: inline-flex; align-items: center; border: 1px solid var(--border-soft);
+  border-radius: 999px; padding: 2px 8px; color: var(--text-faint); background: var(--panel-bg-2);
+  font-family: var(--font-mono); font-size: var(--fs-eyebrow); }
+@media (max-width: 640px) {
+  .conv-native-plan .conv-chip-name { flex: 0 0 auto; overflow: visible; }
+  .conv-native-plan .conv-todo-preview { display: none; }
+  .conv-native-plan .conv-todo-minibar { width: 42px; }
+}
 
 /* ── Codex card (mcp__codex__codex / -reply) ───────────────────────────── */
 .conv-codex { border-left: 3px solid var(--accent-codex); }

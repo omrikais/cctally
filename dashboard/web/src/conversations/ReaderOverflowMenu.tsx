@@ -3,7 +3,7 @@ import { nextRovingIndex } from './menuKeyboard';
 import { useOutsideDismiss } from './useOutsideDismiss';
 import { ExportMenu } from './ExportMenu';
 import { fmt } from '../lib/fmt';
-import type { ConversationRefInput } from '../types/conversation';
+import { conversationRefKey, type ConversationRefInput } from '../types/conversation';
 
 // #228 S3 C2 — the mobile (≤640px) reader-header "⋯" overflow menu. Collapses
 // the secondary reader actions — Export, Compare with…, Latest ↓, Expand-all,
@@ -118,11 +118,16 @@ export function ReaderOverflowMenu({
   }, []);
 
   // The reader is not keyed by session, so an open menu would otherwise persist
-  // across a session switch; close it when the conversation changes (mirrors
-  // ExportMenu).
+  // across a session switch. Skip the initial effect: an unconditional initial
+  // setOpen(false) can race with an immediate first click when passive effects
+  // are delayed under load, closing the menu the user just opened.
+  const sessionKey = conversationRefKey(sessionId);
+  const previousSessionKeyRef = useRef(sessionKey);
   useEffect(() => {
+    if (previousSessionKeyRef.current === sessionKey) return;
+    previousSessionKeyRef.current = sessionKey;
     setOpen(false);
-  }, [sessionId]);
+  }, [sessionKey]);
 
   const close = useCallback(() => {
     setOpen(false);

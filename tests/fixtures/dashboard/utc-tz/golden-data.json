@@ -340,6 +340,7 @@
             },
             "quota": {
               "blocks": [],
+              "cycle_index": [],
               "histories": [],
               "milestones": [],
               "summary": {
@@ -640,6 +641,7 @@
         },
         "quota": {
           "blocks": [],
+          "cycle_index": [],
           "histories": [],
           "milestones": [],
           "summary": {

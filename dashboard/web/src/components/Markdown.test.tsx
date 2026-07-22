@@ -30,6 +30,22 @@ describe('Markdown', () => {
     expect(a.getAttribute('rel')).toBe('noopener noreferrer');
   });
 
+  it('degrades local and placeholder image targets without mounting an image request', () => {
+    const { container } = render(
+      <Markdown>{'![private](/synthetic/private/screenshot.png) ![file](file:///Users/test/secret.png) ![placeholder](url:0)'}</Markdown>,
+    );
+    expect(container.querySelector('img')).toBeNull();
+    expect(screen.getAllByText('local screenshot unavailable')).toHaveLength(3);
+    expect(container.innerHTML).not.toContain('/synthetic/private');
+    expect(container.innerHTML).not.toContain('/Users/test');
+    expect(container.innerHTML).not.toContain('url:0');
+  });
+
+  it('keeps ordinary remote Markdown images renderable', () => {
+    const { container } = render(<Markdown>{'![chart](https://example.com/chart.png)'}</Markdown>);
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('https://example.com/chart.png');
+  });
+
   it('renders a no-language fence as a plain <pre><code> block (no codeblock chrome)', () => {
     const { container } = render(<Markdown>{'```\nconst x = 1;\n```'}</Markdown>);
     expect(container.querySelector('pre code')).not.toBeNull();

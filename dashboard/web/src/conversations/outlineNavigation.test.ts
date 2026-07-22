@@ -224,6 +224,8 @@ describe('outlineTurnVisible', () => {
       expect(outlineTurnVisible(turn({ tools: [{ name: 'Edit', is_error: false }] }), 'edits')).toBe(true);
       expect(outlineTurnVisible(turn({ tools: [{ name: 'MultiEdit', is_error: false }] }), 'edits')).toBe(true);
       expect(outlineTurnVisible(turn({ tools: [{ name: 'Write', is_error: false }] }), 'edits')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'apply_patch', is_error: false }] }), 'edits')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'patch_apply_end', is_error: true }] }), 'edits')).toBe(true);
     });
     it('hides Bash / Read / prose-only turns', () => {
       expect(outlineTurnVisible(turn({ tools: [{ name: 'Bash', is_error: false }] }), 'edits')).toBe(false);
@@ -235,6 +237,7 @@ describe('outlineTurnVisible', () => {
   describe('bash mode (twin)', () => {
     it('shows Bash turns and hides edit turns', () => {
       expect(outlineTurnVisible(turn({ tools: [{ name: 'Bash', is_error: false }] }), 'bash')).toBe(true);
+      expect(outlineTurnVisible(turn({ tools: [{ name: 'exec', is_error: false }] }), 'bash')).toBe(true);
       expect(outlineTurnVisible(turn({ tools: [{ name: 'Edit', is_error: false }] }), 'bash')).toBe(false);
       expect(outlineTurnVisible(turn({ kind: 'human', label: 'hi' }), 'bash')).toBe(false);
     });

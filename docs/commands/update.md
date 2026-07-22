@@ -116,7 +116,12 @@ All under `~/.local/share/cctally/`:
 
 - `update-state.json` — version-check cache (current/latest version,
   install method, last-known-good values across rate-limits).
-  Schema-versioned (`_schema: 1`).
+  Schema-versioned (`_schema: 1`). Three additive channel fields (absent →
+  `stable`): `last_attempt_channel` (the channel of the last check attempt,
+  stamped from config **before** the throttle marker + fetch — drives
+  channel-flip cache invalidation and the `(beta)` banner marker),
+  `latest_version_channel` + `resolved_dist_tag` (written only on a successful
+  complete resolution — record what produced `latest_version`).
 - `update-suppress.json` — user dismissals (`skipped_versions[]`,
   `remind_after`). Schema-versioned (`_schema: 1`).
 - `update.log` — append-only run log (one line per event, ISO-8601 UTC
@@ -127,13 +132,16 @@ All under `~/.local/share/cctally/`:
   command. Stale-lock recovery via `kill(pid, 0)` + `ProcessLookupError`.
 - `update-check.last-fetch` — zero-byte mtime sentinel for the TTL gate.
   Touched **before** the network fetch so a crash mid-check doesn't
-  trigger immediate retry storms.
+  trigger immediate retry storms. A channel flip (config `update.channel`
+  differing from `last_attempt_channel`) treats the TTL as expired and forces
+  one immediate refresh regardless of the marker's age.
 
 ## Configuration
 
 ```json
 {
   "update": {
+    "channel": "stable",
     "check": {
       "enabled": true,
       "ttl_hours": 24
@@ -144,12 +152,24 @@ All under `~/.local/share/cctally/`:
 
 | Key | Default | Range | Description |
 |---|---|---|---|
+| `update.channel` | `stable` | `stable` \| `beta` | Which release channel `cctally update` tracks (see [Beta channel](#beta-channel)). Install-method-independent: the method is detected, the channel is chosen. An invalid value exits 2. |
 | `update.check.enabled` | `true` | bool | Set to `false` to disable both the background version check and the auto-suggest banner. The `cctally update` subcommand itself still works (you can run it manually). |
 | `update.check.ttl_hours` | `24` | `[1, 720]` | How often to refresh the cached version. `1` is hourly; `720` is monthly. Outside the range exits 2 (cross-field validation, mirrors the `oauth_usage` validation pattern). |
 
-Set via `cctally config set update.check.enabled false` or
+Set via `cctally config set update.channel beta`,
+`cctally config set update.check.enabled false`, or
 `cctally config set update.check.ttl_hours 168`. The dashboard mirrors
 these via `POST /api/settings`.
+
+## Beta channel
+
+Every cctally release is published to the **beta** channel first (npm dist-tag `beta`, GitHub Release marked prerelease); the maintainer later promotes a chosen release to **stable** (npm `latest`, GitHub "Latest", the Homebrew tap). Stable is the default and only sees promoted releases; beta sees every release as it ships. Opt in with `cctally config set update.channel beta` (opt back out with `stable`).
+
+- **Which version beta tracks.** The beta target is **SemVer-max(dist-tags.beta, dist-tags.latest)** — beta never regresses below the current stable. During the transition window before any beta dist-tag exists, an exact 404 on the beta leg falls back to `latest`; any other beta-leg failure (5xx, timeout, malformed / non-SemVer payload) preserves the prior cached target (last-known-good), never a silent bad target.
+- **Install pins the exact version.** On the beta channel, npm installs the **exact resolved version** — `npm install -g cctally@X.Y.Z` — never bare `@beta` (whose registry target can disagree with the advertised max, and which doesn't exist in the transition window). The CLI `--check` output, the `--json` envelope, and the dashboard badge/modal all present the same resolved target and command. Stable keeps `cctally@latest`. A pinned `--version X.Y.Z` remains the deliberate override on either channel.
+- **No silent downgrade.** A bare `cctally update` refuses as a no-op (exit 0, explanatory line) when the resolved target is not SemVer-newer than the installed version — this makes a beta→stable flip-back safe (it won't quietly reinstall an older `@latest`). Use `--version X.Y.Z` to install a specific version anyway.
+- **Homebrew is stable only.** Homebrew tracks the stable channel; a beta opt-in on a brew install prints "beta channel unavailable for brew installs — use npm or source" and proceeds as a stable upgrade. `cctally doctor` WARNs on the same mismatch.
+- **Banner marker.** On the beta channel the auto-suggest banner reads `↑ cctally X.Y.Z (beta) available …`; the stable banner is unchanged.
 
 ## Dashboard integration
 
@@ -158,7 +178,11 @@ header renders an amber `Update available` badge. Clicking it opens an
 **Update modal** that:
 
 - Shows current vs. latest, the install method, and the install command
-  that will run.
+  that will run. On the beta channel the latest version carries a `(beta)`
+  marker and the command is the exact-version form (`cctally@X.Y.Z`).
+- The settings modal (`s`) carries an **Update channel** toggle (Stable /
+  Beta), seeded from the SSE envelope's `update.configured_channel` and
+  persisted via `POST /api/settings` like the other mirrored keys.
 - Streams stdout / stderr live from the install subprocess via SSE
   (`/api/update/stream/<run_id>`), the same way the install logs to
   `update.log`.

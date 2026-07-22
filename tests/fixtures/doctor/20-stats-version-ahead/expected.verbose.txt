@@ -7,6 +7,9 @@ Install
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
         channel: prod
+  ✓ Update channel           stable
+      details:
+        channel: stable
   ✓ Symlinks                 15/15 available
       details:
         present: 15
@@ -174,4 +177,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 33 OK · 5 WARN · 1 FAIL
+Summary: 34 OK · 5 WARN · 1 FAIL

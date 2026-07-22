@@ -16,6 +16,15 @@
                 },
                 {
                     "details": {
+                        "channel": "stable"
+                    },
+                    "id": "install.update_channel",
+                    "severity": "ok",
+                    "summary": "stable",
+                    "title": "Update channel"
+                },
+                {
+                    "details": {
                         "missing": [
                             "cctally",
                             "cctally-alerts",
@@ -719,7 +728,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 33,
+            "ok": 34,
             "warn": 6
         },
         "severity": "warn"

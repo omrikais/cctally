@@ -1073,6 +1073,261 @@
       "variant": "response-item"
     },
     {
+      "path": "payload.input",
+      "recordSelector": {
+        "payload.call_id": "exec-ok",
+        "payload.type": "custom_tool_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item-exec"
+    },
+    {
+      "path": "payload.output",
+      "recordSelector": {
+        "payload.call_id": "exec-ok",
+        "payload.type": "custom_tool_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item-exec-output-array"
+    },
+    {
+      "path": "payload.output",
+      "recordSelector": {
+        "payload.call_id": "exec-string",
+        "payload.type": "custom_tool_call_output",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item-exec-output-string"
+    },
+    {
+      "path": "payload.arguments",
+      "recordSelector": {
+        "payload.call_id": "plan-ok",
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item-update-plan"
+    },
+    {
+      "path": "payload.action",
+      "recordSelector": {
+        "payload.id": "web-ok",
+        "payload.type": "web_search_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "object"
+      ],
+      "variant": "response-item-web-search"
+    },
+    {
+      "path": "payload.arguments",
+      "recordSelector": {
+        "payload.call_id": "spawn-proven",
+        "payload.type": "function_call",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "string"
+      ],
+      "variant": "response-item-agent-op"
+    },
+    {
+      "path": "payload.summary",
+      "recordSelector": {
+        "payload.type": "reasoning",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-d-reasoning-lifecycle-markers",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item-reasoning-summary"
+    },
+    {
+      "path": "payload.content",
+      "recordSelector": {
+        "payload.role": "assistant",
+        "payload.type": "message",
+        "type": "response_item"
+      },
+      "required": true,
+      "scenario": "session-d-reasoning-lifecycle-markers",
+      "types": [
+        "array"
+      ],
+      "variant": "response-item-marker-message"
+    },
+    {
+      "path": "payload.agent_path",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "session-c-child-proven",
+      "types": [
+        "string"
+      ],
+      "variant": "session-meta-agent-path"
+    },
+    {
+      "path": "payload.parent_thread_id",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "session-c-child-proven",
+      "types": [
+        "string"
+      ],
+      "variant": "session-meta-agent-parent"
+    },
+    {
+      "path": "payload.agent_role",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "session-c-child-proven",
+      "types": [
+        "string"
+      ],
+      "variant": "session-meta-agent-role"
+    },
+    {
+      "path": "payload.agent_nickname",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "session-c-child-proven",
+      "types": [
+        "string"
+      ],
+      "variant": "session-meta-agent-nickname"
+    },
+    {
+      "path": "payload.source",
+      "recordSelector": {
+        "type": "session_meta"
+      },
+      "required": true,
+      "scenario": "session-c-child-proven",
+      "types": [
+        "object"
+      ],
+      "variant": "session-meta-agent-source"
+    },
+    {
+      "path": "payload.results",
+      "recordSelector": {
+        "payload.call_id": "web-ok",
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "array"
+      ],
+      "variant": "event-web-search-completion"
+    },
+    {
+      "path": "payload.action",
+      "recordSelector": {
+        "payload.call_id": "web-ok",
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "object"
+      ],
+      "variant": "event-web-search-action"
+    },
+    {
+      "path": "payload.error",
+      "recordSelector": {
+        "payload.call_id": "web-error",
+        "payload.type": "web_search_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "string"
+      ],
+      "variant": "event-web-search-error"
+    },
+    {
+      "path": "payload.invocation",
+      "recordSelector": {
+        "payload.call_id": "mcp-ok",
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "object"
+      ],
+      "variant": "event-mcp-invocation"
+    },
+    {
+      "path": "payload.result",
+      "recordSelector": {
+        "payload.call_id": "mcp-ok",
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "object"
+      ],
+      "variant": "event-mcp-result"
+    },
+    {
+      "path": "payload.duration",
+      "recordSelector": {
+        "payload.call_id": "mcp-ok",
+        "payload.type": "mcp_tool_call_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-c-secondary-tools",
+      "types": [
+        "object"
+      ],
+      "variant": "event-mcp-duration"
+    },
+    {
       "path": "payload.type",
       "recordSelector": {
         "payload.type": "agent_message",
@@ -1502,6 +1757,141 @@
       "variant": "event-taxonomy"
     },
     {
+      "path": "payload.status",
+      "recordSelector": {
+        "payload.call_id": "direct-patch",
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "string"
+      ],
+      "variant": "event-patch-detail"
+    },
+    {
+      "path": "payload.stdout",
+      "recordSelector": {
+        "payload.call_id": "direct-patch",
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "string"
+      ],
+      "variant": "event-patch-detail"
+    },
+    {
+      "path": "payload.stderr",
+      "recordSelector": {
+        "payload.call_id": "direct-patch",
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "string"
+      ],
+      "variant": "event-patch-detail"
+    },
+    {
+      "path": "payload.success",
+      "recordSelector": {
+        "payload.call_id": "direct-patch",
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "boolean"
+      ],
+      "variant": "event-patch-detail"
+    },
+    {
+      "path": "payload.changes",
+      "recordSelector": {
+        "payload.call_id": "direct-patch",
+        "payload.type": "patch_apply_end",
+        "type": "event_msg"
+      },
+      "required": true,
+      "scenario": "session-b-card-wire",
+      "types": [
+        "array"
+      ],
+      "variant": "event-patch-detail"
+    },
+    {
+      "path": "payload.state",
+      "recordSelector": {
+        "payload.full": true,
+        "type": "world_state"
+      },
+      "required": true,
+      "scenario": "session-e-native-families",
+      "types": [
+        "object"
+      ],
+      "variant": "session-e-world-state-full"
+    },
+    {
+      "path": "payload.state",
+      "recordSelector": {
+        "payload.full": false,
+        "type": "world_state"
+      },
+      "required": true,
+      "scenario": "session-e-native-families",
+      "types": [
+        "object"
+      ],
+      "variant": "session-e-world-state-delta"
+    },
+    {
+      "path": "payload.trigger_turn",
+      "recordSelector": {
+        "type": "inter_agent_communication_metadata"
+      },
+      "required": true,
+      "scenario": "session-e-native-families",
+      "types": [
+        "boolean"
+      ],
+      "variant": "session-e-inter-agent"
+    },
+    {
+      "path": "payload.future_context_field",
+      "recordSelector": {
+        "payload.future_context_field": {
+          "preserve": true
+        },
+        "type": "turn_context"
+      },
+      "required": true,
+      "scenario": "session-e-native-families",
+      "types": [
+        "object"
+      ],
+      "variant": "session-e-malformed-turn-context"
+    },
+    {
+      "path": "payload.opaque_id",
+      "recordSelector": {
+        "type": "future_record_v100"
+      },
+      "required": true,
+      "scenario": "session-e-native-families",
+      "types": [
+        "string"
+      ],
+      "variant": "session-e-unknown-future"
+    },
+    {
       "path": "payload",
       "recordSelector": {
         "type": "world_state"
@@ -1536,6 +1926,31 @@
       "change": "#294 S6 conversation normalization: content-bearing collision roots and nested parent/child, new mirror-pairing / unturned-event-prose / title-wrapper-window scenarios, and a genuine Claude-format seed sharing SHARED_ID.",
       "date": "2026-07-17",
       "version": 2
+    },
+    {
+      "change": "#330 Task A canonical Codex conversation-turn and injected-content contract scenario.",
+      "date": "2026-07-21",
+      "version": 3
+    },
+    {
+      "change": "#331 Task A card-ready Codex conversation exec, output, and patch wire scenario.",
+      "date": "2026-07-21",
+      "version": 4
+    },
+    {
+      "change": "#332 Task A conversation plan, web, MCP, agent-operation, exact child-link, ambiguous-link rejection, and local-image-reference fixture family.",
+      "date": "2026-07-22",
+      "version": 5
+    },
+    {
+      "change": "#334 Task A conversation reasoning title/body/absence, lifecycle correlation/rejection, and closed trailing Git/memory marker fixture family.",
+      "date": "2026-07-22",
+      "version": 6
+    },
+    {
+      "change": "#335 Session E conversation fixtures for retained world-state, inter-agent metadata, turn-context, unknown-family, and compact reader privacy/presentation coverage.",
+      "date": "2026-07-22",
+      "version": 7
     }
   ],
   "identityFields": [
@@ -1546,13 +1961,15 @@
     "nativeKey",
     "parentKey"
   ],
-  "observedAsOf": "2026-07-14",
+  "observedAsOf": "2026-07-22",
   "observedRecordTypes": [
     "session_meta",
     "turn_context",
     "event_msg",
     "response_item",
     "world_state",
+    "inter_agent_communication_metadata",
+    "future_record_v100",
     "record_type"
   ],
   "quotaWindowFields": [
@@ -1597,6 +2014,14 @@
     "root-a-collision": "rollouts/root-a-collision.jsonl",
     "root-b-collision": "rollouts/root-b-collision.jsonl",
     "secret-canary": "rollouts/secret-canary.jsonl",
+    "session-a-turn-contract": "rollouts/session-a-turn-contract.jsonl",
+    "session-b-card-wire": "rollouts/session-b-card-wire.jsonl",
+    "session-c-child-ambiguous-a": "rollouts/session-c-child-ambiguous-a.jsonl",
+    "session-c-child-ambiguous-b": "rollouts/session-c-child-ambiguous-b.jsonl",
+    "session-c-child-proven": "rollouts/session-c-child-proven.jsonl",
+    "session-c-secondary-tools": "rollouts/session-c-secondary-tools.jsonl",
+    "session-d-reasoning-lifecycle-markers": "rollouts/session-d-reasoning-lifecycle-markers.jsonl",
+    "session-e-native-families": "rollouts/session-e-native-families.jsonl",
     "stale-cache": "rollouts/stale-cache.jsonl",
     "title-wrapper-window": "rollouts/title-wrapper-window.jsonl",
     "unknown-records": "rollouts/unknown-records.jsonl",

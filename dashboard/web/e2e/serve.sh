@@ -41,6 +41,8 @@ mkdir -p "$CODEX_ROOT_MAIN/sessions/2026/07/20" "$CODEX_ROOT_A/sessions/2026/07/
 cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/modern-full.jsonl" \
    "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-parent.jsonl" \
    "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/nested-child.jsonl" \
+   "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/session-d-reasoning-lifecycle-markers.jsonl" \
+   "$REPO_ROOT/tests/fixtures/codex-parity/v1/rollouts/session-e-native-families.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 cp "$RUNTIME/codex-task-a/root-a-collision.jsonl" \
    "$CODEX_ROOT_A/sessions/2026/07/20/"
@@ -48,12 +50,20 @@ cp "$RUNTIME/codex-task-a/root-b-collision.jsonl" \
    "$CODEX_ROOT_B/sessions/2026/07/20/"
 cp "$RUNTIME/codex-task-a/rollout-2026-07-07T12-00-00-32900000-0000-4000-8000-000000000001.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
+cp "$RUNTIME/codex-task-b/session-b-card-wire.jsonl" \
+   "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 
 # Shared native UUID across Claude, Codex root A, and Codex root B. The UI must
 # keep all three qualified identities distinct through open/persist/compare.
 mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-collision"
 cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/11111111-1111-4111-8111-111111111111.jsonl" \
    "$CLAUDE_CONFIG_DIR/projects/-synthetic-collision/"
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-claude-reference"
+cp "$RUNTIME/codex-task-b/claude-card-reference.jsonl" \
+   "$CLAUDE_CONFIG_DIR/projects/-synthetic-claude-reference/"
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference"
+cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/334-claude-thinking-reference.jsonl" \
+   "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference/"
 
 # 4) Disable the dashboard's update-check thread. It consults CONFIG, not the
 #    environment (docs/updates-gotchas.md: `_should_show_update_banner` reads

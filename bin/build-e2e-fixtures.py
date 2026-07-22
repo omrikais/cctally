@@ -479,6 +479,95 @@ def build_codex_task_a(out: pathlib.Path) -> dict:
     }
 
 
+def build_codex_task_b(out: pathlib.Path) -> dict:
+    """Build #331 Task B's browser-only shell and patch-card corpus.
+
+    Task A's checked-in wire fixture remains the canonical decoder contract.
+    The browser copy adds only a deterministic long terminal result so the
+    client's collapsed-output behavior is exercised without widening Task A's
+    backend-owned fixture.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    source = repo / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts" / "session-b-card-wire.jsonl"
+    target = out / "codex-task-b"
+    target.mkdir(parents=True, exist_ok=True)
+    values = [json.loads(line) for line in source.read_text().splitlines() if line]
+    long_output = "".join(f"synthetic long output line {line:02d}\n" for line in range(1, 26))
+    values.extend([
+        {
+            "payload": {
+                "call_id": "exec-long",
+                "input": "const r = await tools.exec_command({\n  cmd: \"seq 1 25\",\n  workdir: \"/synthetic/root-a/project-red\"\n});\ntext(r.output);",
+                "name": "exec",
+                "status": "completed",
+                "type": "custom_tool_call",
+            },
+            "timestamp": "2026-07-21T11:00:26Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "exec-long",
+                "output": [
+                    {"text": "Script completed\nWall time 0.1 seconds\n\nOutput:", "type": "input_text"},
+                    {"text": long_output, "type": "input_text"},
+                ],
+                "type": "custom_tool_call_output",
+            },
+            "timestamp": "2026-07-21T11:00:27Z",
+            "type": "response_item",
+        },
+    ])
+    path = target / "session-b-card-wire.jsonl"
+    path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in values))
+    claude_rows = [
+        {
+            "type": "user", "uuid": "331-ref-user", "parentUuid": None,
+            "sessionId": "331-claude-reference", "timestamp": "2026-07-21T10:00:00Z",
+            "cwd": "/synthetic/claude/reference",
+            "message": {"role": "user", "content": "Synthetic Claude terminal and edit reference"},
+        },
+        {
+            "type": "assistant", "uuid": "331-ref-bash", "parentUuid": "331-ref-user",
+            "sessionId": "331-claude-reference", "timestamp": "2026-07-21T10:00:01Z",
+            "cwd": "/synthetic/claude/reference", "requestId": "req-331-bash",
+            "message": {
+                "id": "msg-331-bash", "role": "assistant", "model": MODEL,
+                "content": [{"type": "tool_use", "id": "toolu-331-bash", "name": "Bash", "input": {"command": "printf 'alpha\\n'", "description": "Print synthetic output"}}],
+                "usage": {"input_tokens": 10, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        },
+        {
+            "type": "user", "uuid": "331-ref-bash-result", "parentUuid": "331-ref-bash",
+            "sessionId": "331-claude-reference", "timestamp": "2026-07-21T10:00:02Z",
+            "cwd": "/synthetic/claude/reference", "toolUseResult": {"stdout": "alpha\n", "stderr": "", "interrupted": False},
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-331-bash", "content": [{"type": "text", "text": "alpha\n"}], "is_error": False}]},
+        },
+        {
+            "type": "assistant", "uuid": "331-ref-edit", "parentUuid": "331-ref-bash-result",
+            "sessionId": "331-claude-reference", "timestamp": "2026-07-21T10:00:03Z",
+            "cwd": "/synthetic/claude/reference", "requestId": "req-331-edit",
+            "message": {
+                "id": "msg-331-edit", "role": "assistant", "model": MODEL,
+                "content": [{"type": "tool_use", "id": "toolu-331-edit", "name": "Edit", "input": {"file_path": "synthetic-edit.txt", "old_string": "old\n", "new_string": "new\n"}}],
+                "usage": {"input_tokens": 10, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        },
+        {
+            "type": "user", "uuid": "331-ref-edit-result", "parentUuid": "331-ref-edit",
+            "sessionId": "331-claude-reference", "timestamp": "2026-07-21T10:00:04Z",
+            "cwd": "/synthetic/claude/reference",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-331-edit", "content": "Updated synthetic-edit.txt", "is_error": False}]},
+        },
+    ]
+    claude_path = target / "claude-card-reference.jsonl"
+    claude_path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in claude_rows))
+    return {
+        "codex_task_b_file": str(path.resolve()),
+        "claude_task_b_file": str(claude_path.resolve()),
+    }
+
+
 def build(out: pathlib.Path) -> dict:
     scratch = out / "scratch"
     data = scratch / "data"
@@ -496,6 +585,7 @@ def build(out: pathlib.Path) -> dict:
     manifest.update(build_live(projects, rng))
     manifest.update(build_second_model(projects, rng))
     manifest.update(build_codex_task_a(out))
+    manifest.update(build_codex_task_b(out))
     manifest["project_dir"] = PROJECT_DIR
     manifest["cwd"] = CWD
     manifest["page_size"] = PAGE

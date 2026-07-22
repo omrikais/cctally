@@ -171,6 +171,52 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(container.textContent).toContain('pondering deeply');
   });
 
+  it('renders Codex reasoning as distinct title/body chrome while Claude Thinking stays unchanged', () => {
+    const blocks = [
+      { kind: 'codex_reasoning', title: '**Inspecting synthetic state**', source: 'response_item' },
+      {
+        kind: 'codex_reasoning', summary: 'Synthetic provider summary.',
+        body: 'Detailed **synthetic** reasoning body.', source: 'response_item',
+      },
+      { kind: 'thinking', text: 'Claude thinking body.' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+
+    const codex = container.querySelectorAll('.conv-codex-reasoning');
+    expect(codex).toHaveLength(2);
+    expect(codex[0].textContent).toContain('Reasoning');
+    expect(codex[0].textContent).toContain('Inspecting synthetic state');
+    expect(codex[0].textContent).not.toContain('**');
+    expect(codex[1].querySelector('.conv-codex-reasoning-summary')?.textContent).toContain('Synthetic provider summary.');
+    expect(codex[1].querySelector('.conv-codex-reasoning-body')?.textContent).toContain('Detailed synthetic reasoning body.');
+    expect(container.querySelectorAll('.conv-chip--thinking')).toHaveLength(1);
+    expect(container.querySelector('.conv-chip--thinking .conv-chip-name')?.textContent).toBe('Thinking');
+  });
+
+  it('renders safe system actions and provider-labelled lifecycle fallback with raw payload controls', () => {
+    const blocks = [
+      { kind: 'system_actions', actions: [
+        { type: 'git', action: 'stage' },
+        { type: 'git', action: 'create_pr', draft: false },
+        { type: 'memory_citation', citation_count: 1, rollout_count: 2 },
+      ], payload_key: 'cbk.markers' },
+      {
+        kind: 'codex_lifecycle', event: 'task_complete', message: 'Unique completion message.',
+        error: 'Synthetic lifecycle failure', duration_ms: 2000, payload_key: 'cbk.lifecycle',
+      },
+    ] as unknown as ConversationBlock[];
+    const { container } = withSession(<MessageBlocks blocks={blocks} />, 'v1.session-d');
+
+    expect(container.querySelector('.conv-system-actions')?.textContent).toContain('Changes staged');
+    expect(container.querySelector('.conv-system-actions')?.textContent).toContain('Pull request created');
+    expect(container.querySelector('.conv-system-actions')?.textContent).toContain('Memory references attached · 1 citation · 2 rollouts');
+    expect(container.querySelector('.conv-codex-lifecycle')?.textContent).toContain('Codex task complete');
+    expect(container.querySelector('.conv-codex-lifecycle')?.textContent).toContain('Unique completion message.');
+    expect(container.querySelector('.conv-codex-lifecycle')?.textContent).toContain('Synthetic lifecycle failure');
+    expect(screen.getAllByRole('button', { name: 'Load raw event payload' })).toHaveLength(2);
+    expect(container.textContent).not.toMatch(/::git-|<oai-mem-citation>|\/synthetic/);
+  });
+
   // #228 S3 B1 — the "quiet reasoning" CSS hook. The expanded thinking body must
   // stay `.conv-chip--thinking > .conv-chip-body > .md` (the indigo wash /
   // dimmed-italic prose rules key on exactly this chain), and a NON-thinking

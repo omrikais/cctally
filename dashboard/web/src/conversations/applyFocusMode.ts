@@ -22,8 +22,8 @@ export type FilteredNode =
 // The three named edit tools — DELIBERATELY narrower than the kernel's
 // `_FILE_TOUCH_TOOLS` (which also includes NotebookEdit; out of scope, Codex
 // P2-4). Lower-cased for case-insensitive block-name matching.
-const EDIT_TOOLS = new Set(['edit', 'multiedit', 'write']);
-const BASH_TOOLS = new Set(['bash']);
+const EDIT_TOOLS = new Set(['edit', 'multiedit', 'write', 'apply_patch', 'patch_apply_end']);
+const BASH_TOOLS = new Set(['bash', 'exec']);
 
 function itemHasError(it: ConversationItem): boolean {
   return it.blocks.some((b: ConversationBlock) =>

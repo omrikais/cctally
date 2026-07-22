@@ -386,6 +386,111 @@ def test_payload_v1_codex_disambiguates_pairs(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_payload_v1_codex_patch_event_is_full_and_structured(tmp_path, monkeypatch):
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=("session-b-card-wire",))
+    try:
+        port = srv.server_address[1]
+        key = keys["session-b-card-wire"]
+        _status, detail, _ctype = _get_json(port, _entity_path(key))
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        direct = next(block for block in blocks if block.get("call_id") == "direct-patch")
+        event_key = direct["detail"]["card"]["completion"]["event_block_key"]
+        status, body, _ = _get_json(
+            port, _entity_path(key, "/payload")
+            + f"?block_key={_u.quote(event_key)}&which=event")
+        assert status == 200 and body["status"] == "ok"
+        assert body["card"]["has_diff"] is True
+        assert body["card"]["files"][3]["move_path"] == "synthetic-new.txt"
+        assert body["card"]["files"][0]["unified_diff"].startswith("--- /dev/null")
+    finally:
+        srv.shutdown()
+
+
+def test_session_c_qualified_detail_and_payload_keep_exact_child_proof(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    scenarios = (
+        "session-c-secondary-tools", "session-c-child-proven",
+        "session-c-child-ambiguous-a", "session-c-child-ambiguous-b",
+    )
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=scenarios)
+    try:
+        port = srv.server_address[1]
+        parent = keys["session-c-secondary-tools"]
+        child = keys["session-c-child-proven"]
+        status, detail, _ = _get_json(port, _entity_path(parent))
+        assert status == 200 and detail["status"] == "ok"
+        calls = {
+            block.get("call_id"): block
+            for item in detail["items"] for block in item["blocks"]
+            if block["kind"] == "tool_call"
+        }
+        assert calls["spawn-proven"]["detail"]["card"]["child_conversation"] == {
+            "conversation_key": child,
+            "role": "cctally_reviewer",
+            "nickname": "Synthetic Child",
+        }
+        assert "child_conversation" not in \
+            calls["spawn-ambiguous"]["detail"]["card"]
+        web = calls["web-ok"]
+        event_key = web["detail"]["card"]["completion"]["event_block_key"]
+        event_status, event, _ = _get_json(
+            port, _entity_path(parent, "/payload")
+            + f"?block_key={_u.quote(event_key)}&which=event")
+        assert event_status == 200 and event["status"] == "ok"
+        assert event["card"]["results"][0]["url"] == "https://example.test/result"
+        call_status, call, _ = _get_json(
+            port, _entity_path(parent, "/payload")
+            + f"?block_key={_u.quote(web['block_key'])}&which=call")
+        assert call_status == 200 and call["status"] == "ok"
+        assert "synthetic web query" in call["content"]
+    finally:
+        srv.shutdown()
+
+
+def test_session_d_qualified_wire_and_raw_marker_payload(
+    tmp_path, monkeypatch,
+):
+    scenario = "session-d-reasoning-lifecycle-markers"
+    ns = load_script()
+    srv, _root, keys, _rollouts = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=(scenario,))
+    try:
+        port = srv.server_address[1]
+        key = keys[scenario]
+        status, detail, _ = _get_json(port, _entity_path(key))
+        assert status == 200 and detail["status"] == "ok"
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        marker = next(block for block in blocks
+                      if (block.get("detail") or {}).get("markers"))
+        assert marker["text"] == "Synthetic closeout prose remains visible."
+        assert "/synthetic/project" not in json.dumps(marker)
+        payload_status, payload, _ = _get_json(
+            port, _entity_path(key, "/payload")
+            + f"?block_key={_u.quote(marker['block_key'])}&which=event")
+        assert payload_status == 200 and payload["status"] == "ok"
+        assert "::git-create-pr" in payload["content"]
+
+        outline_status, outline, _ = _get_json(
+            port, _entity_path(key, "/outline"))
+        assert outline_status == 200
+        assert outline["stats"]["items"] == detail["page"]["total"]
+        find_status, found, _ = _get_json(
+            port, _entity_path(key, "/find")
+            + "?q=Inspecting%20synthetic%20state&kind=thinking")
+        assert find_status == 200 and found["total"] == 2
+        export_status, export_bytes, _ = _get(
+            port, _entity_path(key, "/export"))
+        assert export_status == 200
+        assert "::git-create-branch" in export_bytes.decode("utf-8")
+    finally:
+        srv.shutdown()
+
+
 def test_payload_gone_on_structural_mutation_is_410(tmp_path, monkeypatch):
     """A structural-only mutation of the source line (call_id changed, extracted
     content identical) → 410 gone at the route (validated against the stored full

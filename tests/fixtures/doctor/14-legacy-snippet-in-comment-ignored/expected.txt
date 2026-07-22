@@ -2,6 +2,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
   ✓ Mode                     installed
+  ✓ Update channel           stable
   ✓ Symlinks                 15/15 available
   ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected
@@ -52,4 +53,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 34 OK · 5 WARN · 0 FAIL
+Summary: 35 OK · 5 WARN · 0 FAIL

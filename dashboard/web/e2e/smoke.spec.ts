@@ -13,14 +13,14 @@ test('dashboard renders its panel grid', async ({ page }) => {
   await expect(page.locator('#main-content .panel-host').first()).toBeVisible();
 });
 
-test('conversations rail lists the six fixture conversations', async ({ page }) => {
+test('conversations rail lists the seven fixture conversations', async ({ page }) => {
   // #293 S2 added a fifth fixture — a minimal second-model (sonnet) session —
   // so the served Sessions table is mixed-model (Model column present) for the
   // 7-column SESS-1 tight case. #321 added the sixth Claude identity seed used
   // by the mixed-source reader coverage.
   await page.goto('/#/conversations');
   await expect(page.locator('.conv-rail')).toBeVisible();
-  await expect(page.locator('.conv-rail-row')).toHaveCount(6);
+  await expect(page.locator('.conv-rail-row')).toHaveCount(8);
 });
 
 test('opening the long conversation mounts the reader with content', async ({ page }) => {

@@ -800,13 +800,27 @@ def doctor_gather_state(
     # on corruption — both behaviors would hide diagnostic state
     # (codex H1).
     config_json_error = None
+    config_parsed: dict = {}
     try:
         if _cctally_core.CONFIG_PATH.exists():
-            json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+            config_parsed = json.loads(
+                _cctally_core.CONFIG_PATH.read_text(encoding="utf-8")
+            )
     except json.JSONDecodeError as exc:
         config_json_error = f"{type(exc).__name__}: {exc}"
     except OSError as exc:
         config_json_error = f"OSError: {exc}"
+
+    # Configured update (release) channel (beta-channel, spec 2026-07-21 §3):
+    # derived from the SAME raw read (never load_config, which auto-creates on
+    # first run). Fail-soft to "stable" — resolve_update_channel already
+    # tolerates a non-dict block / junk value.
+    try:
+        update_channel = c.resolve_update_channel(
+            config_parsed if isinstance(config_parsed, dict) else {}
+        )
+    except Exception:
+        update_channel = "stable"
 
     update_state = None
     update_state_error = None
@@ -880,6 +894,7 @@ def doctor_gather_state(
         codex_jsonl_present=codex_jsonl_present,
         codex_project_metadata_health=codex_project_metadata_health,
         codex_project_metadata_error=codex_project_metadata_error,
+        update_channel=update_channel,
         dashboard_bind_stored=dashboard_bind_stored,
         runtime_bind=runtime_bind,
         # Conversation viewer (Plan 2, spec §5): only consulted on a LAN bind.

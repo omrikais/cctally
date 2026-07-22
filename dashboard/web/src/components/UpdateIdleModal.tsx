@@ -27,13 +27,21 @@ export function UpdateIdleModal() {
   const methodLabel = METHOD_LABEL[method] ?? method;
   const cmd = state.update_command ?? '';
   const isManual = method === 'unknown' || !cmd;
+  // Beta-channel (spec 2026-07-21 §3): a `(beta)` marker next to Latest, and
+  // the "Update now" button installs the EXACT resolved version on beta (the
+  // update_command already shows `cctally@X.Y.Z`); stable stays `@latest`.
+  const isBeta = state.configured_channel === 'beta';
+  const startVersion = isBeta ? state.latest_version : undefined;
   return (
     <div className="update-modal-body">
       <div className="update-kv">
         <span className="k">Current</span>
         <span className="v">{state.current_version ?? '—'}</span>
         <span className="k">Latest</span>
-        <span className="v">{state.latest_version ?? '—'}</span>
+        <span className="v">
+          {state.latest_version ?? '—'}
+          {isBeta ? <span className="update-channel-tag"> (beta)</span> : null}
+        </span>
         <span className="k">Method</span>
         <span className="v">
           {methodLabel}
@@ -82,7 +90,7 @@ export function UpdateIdleModal() {
           type="button"
           className="update-btn update-btn-primary"
           disabled={isManual}
-          onClick={() => updateActions.start()}
+          onClick={() => updateActions.start(startVersion)}
         >
           Update now
         </button>

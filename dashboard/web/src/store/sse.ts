@@ -191,7 +191,9 @@ function ingestAlerts(snap: Envelope): void {
 function ingestUpdate(snap: Envelope): void {
   if (!snap.update) return;
   const suppress = coerceUpdateSuppress(snap.update.suppress);
-  const state = coerceUpdateState(snap.update.state, suppress);
+  const state = coerceUpdateState(
+    snap.update.state, suppress, snap.update.configured_channel,
+  );
   dispatch({ type: 'SET_UPDATE_STATE', state, suppress });
 }
 

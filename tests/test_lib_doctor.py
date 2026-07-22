@@ -75,6 +75,8 @@ def test_doctor_state_has_required_fields():
         "statusline_refresh_state",
         # #318: passive statusline candidate/selected pipeline evidence.
         "statusline_pipeline",
+        # Beta-channel (spec 2026-07-21 §3): configured update (release) channel.
+        "update_channel",
     }
     assert fields == expected, fields ^ expected
 
@@ -553,6 +555,41 @@ def test_install_path_warn_remediation_is_channel_aware():
     assert src.severity == "warn"
     assert ".local/bin" in src.remediation
     assert "cctally setup" in src.remediation
+
+
+# ── Beta-channel (spec 2026-07-21 §3): install.update_channel ────────
+
+
+def test_update_channel_default_stable_is_ok():
+    r = L._check_install_update_channel(_state())
+    assert r.id == "install.update_channel"
+    assert r.severity == "ok"
+    assert r.summary == "stable"
+    assert r.details["channel"] == "stable"
+
+
+def test_update_channel_beta_on_npm_is_ok():
+    r = L._check_install_update_channel(
+        _state(update_channel="beta", install_is_brew=False)
+    )
+    assert r.severity == "ok"
+    assert r.summary == "beta"
+
+
+def test_update_channel_beta_on_brew_warns():
+    r = L._check_install_update_channel(
+        _state(update_channel="beta", install_is_brew=True)
+    )
+    assert r.severity == "warn"
+    assert r.details == {"channel": "beta", "method": "brew"}
+    assert "stable" in r.remediation.lower()
+
+
+def test_update_channel_stable_on_brew_is_ok():
+    r = L._check_install_update_channel(
+        _state(update_channel="stable", install_is_brew=True)
+    )
+    assert r.severity == "ok"
 
 
 # ── Issue #119: install.symlinks consumes the `stale` state ──────────

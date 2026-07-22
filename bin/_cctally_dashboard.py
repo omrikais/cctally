@@ -4435,6 +4435,7 @@ _GET_ROUTES = (
     ("prefix", "/api/session/", "_handle_get_session_detail", None, True),
     ("prefix", "/api/project/", "_handle_get_project_detail", None, False),
     ("prefix", "/api/block/", "_handle_get_block_detail", None, True),
+    ("prefix", "/api/milestones/", "_handle_get_milestones_week", None, True),
     ("exact", "/api/update/status", "_handle_get_update_status", None, False),
     ("prefix", "/api/update/stream/", "_handle_get_update_stream", None, True),
     ("exact", "/api/share/templates", "_handle_share_templates_get", None, False),
@@ -5228,6 +5229,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # compatible. `enabled` must be a JSON bool; `ttl_hours` an int
         # (bools rejected — see _validate_update_check_ttl_hours_value).
         update_check_validated: "dict | None" = None
+        update_channel_validated: "str | None" = None
         if "update" in payload:
             update_in = payload["update"]
             if not isinstance(update_in, dict):
@@ -5236,11 +5238,26 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
             for inner in update_in.keys():
-                if inner != "check":
+                if inner not in ("check", "channel"):
                     self._respond_json(
                         400,
                         {"error": f"unknown update settings key: {inner}",
                          "field": f"update.{inner}"},
+                    )
+                    return
+            # Release channel opt-in (beta-channel, spec 2026-07-21 §3). Enum
+            # {stable,beta}; 400 on invalid. Mirrors the config-key validator.
+            if "channel" in update_in:
+                try:
+                    update_channel_validated = (
+                        _cctally()._validate_update_channel_value(
+                            update_in["channel"]
+                        )
+                    )
+                except ValueError as exc:
+                    self._respond_json(
+                        400,
+                        {"error": str(exc), "field": "update.channel"},
                     )
                     return
             check_in = update_in.get("check", {})
@@ -5398,7 +5415,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     self._respond_json(400, {"error": str(exc)})
                     return
 
-            if update_check_validated is not None:
+            if (
+                update_check_validated is not None
+                or update_channel_validated is not None
+            ):
                 # Same hand-edited-junk guard as alerts: a non-dict
                 # `update` or `update.check` block in config.json should
                 # surface as a recoverable 400, not a 500.
@@ -5412,18 +5432,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     )
                     return
                 merged_update = dict(existing_update or {})
-                existing_check = merged_update.get("check")
-                if existing_check is not None and not isinstance(
-                    existing_check, dict
-                ):
-                    self._respond_json(
-                        400, {"error": "update.check must be an object",
-                              "field": "update.check"}
-                    )
-                    return
-                merged_check = dict(existing_check or {})
-                merged_check.update(update_check_validated)
-                merged_update["check"] = merged_check
+                if update_check_validated is not None:
+                    existing_check = merged_update.get("check")
+                    if existing_check is not None and not isinstance(
+                        existing_check, dict
+                    ):
+                        self._respond_json(
+                            400, {"error": "update.check must be an object",
+                                  "field": "update.check"}
+                        )
+                        return
+                    merged_check = dict(existing_check or {})
+                    merged_check.update(update_check_validated)
+                    merged_update["check"] = merged_check
+                if update_channel_validated is not None:
+                    # Partial-PUT: preserve the sibling `update.check` block.
+                    merged_update["channel"] = update_channel_validated
                 merged["update"] = merged_update
 
             if cache_report_validated is not None:
@@ -5531,11 +5555,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 _cctally()._reconcile_codex_budget_on_config_write(
                     validated_budget
                 )
-        if update_check_validated is not None:
-            # Echo the full merged check block (cooked defaults included)
-            # so the SettingsOverlay can repaint without a follow-up GET.
-            out["update"] = {
-                "check": {
+        if (
+            update_check_validated is not None
+            or update_channel_validated is not None
+        ):
+            # Echo the touched update leaves (cooked defaults included) so the
+            # SettingsOverlay can repaint without a follow-up GET. The channel
+            # echo uses the read-surface name `configured_channel` (spec §3
+            # naming), mirrored from the merged config via the single resolver.
+            out_update: dict = {}
+            if update_check_validated is not None:
+                out_update["check"] = {
                     "enabled": _config_known_value(
                         merged, "update.check.enabled"
                     ),
@@ -5543,7 +5573,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         merged, "update.check.ttl_hours"
                     ),
                 }
-            }
+            if update_channel_validated is not None:
+                out_update["configured_channel"] = (
+                    _cctally().resolve_update_channel(merged)
+                )
+            out["update"] = out_update
         if cache_report_validated is not None:
             # Echo the full cooked block (resolved defaults included) so
             # the dashboard composer can repaint without a follow-up GET
@@ -6272,6 +6306,117 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_milestones_json(self, status: int, body: dict) -> None:
+        payload = encode_dashboard_json_bytes(body, ensure_ascii=False)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _handle_get_milestones_week(self, path: str) -> None:
+        """GET /api/milestones/<source>/week/<key> — one week's/cycle's
+        complete milestone-history payload (spec §2, hero-modal history).
+
+        Dedicated route (deliberately NOT the /api/source/ family, whose
+        not-found semantics are scoped to the current frozen bundle). Wire is
+        snake_case via ``encode_dashboard_json_bytes`` (the dashboard
+        convention — NOT the CLI camelCase envelope). Read-only, per-request
+        connections, no sync/migration writes from the assembly; the multi-read
+        assembly runs inside one transaction per DB. 400 malformed key/source;
+        404 ``{code: "unknown_key", reason}`` for keys that don't resolve.
+        """
+        import re as _re
+        import types as _types
+        import urllib.parse as _urlparse
+        from _cctally_cache import open_cache_db
+
+        tail = path[len("/api/milestones/"):]
+        parts = tail.split("/week/", 1)
+        if len(parts) != 2 or not parts[1]:
+            self._send_milestones_json(400, {"error": "invalid path"})
+            return
+        source, raw_key = parts[0], parts[1]
+        if source not in ("claude", "codex"):
+            self._send_milestones_json(400, {"error": "invalid source"})
+            return
+        key = _urlparse.unquote(raw_key)
+        c = sys.modules["cctally"]
+        try:
+            if source == "claude":
+                # Claude key is a week_start_date (YYYY-MM-DD).
+                if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
+                    self._send_milestones_json(400, {"error": "invalid week key"})
+                    return
+                conn = open_db()
+                try:
+                    conn.execute("BEGIN")
+                    detail = c.build_claude_week_detail(conn, key)
+                    conn.commit()
+                finally:
+                    conn.close()
+                if detail is None:
+                    self._send_milestones_json(404, {
+                        "error": "unknown week", "code": "unknown_key",
+                        "reason": "unknown",
+                    })
+                    return
+                self._send_milestones_json(200, {**detail, "source": "claude", "key": key})
+                return
+
+            # Codex: opaque server-issued cycle key. Resolve across all codex
+            # roots (keys are unique per cycle, so a client-supplied index key
+            # matches its exact cycle without needing the hero-cycle identity —
+            # this also keeps a just-closed former-current cycle fetchable when
+            # the live hero cycle is momentarily unavailable, spec §2).
+            from _cctally_dashboard_sources import resolve_dashboard_source_semantics
+            speed = resolve_dashboard_source_semantics(
+                load_config(), display_tz_name="UTC",
+            ).speed
+            now_utc = _command_as_of()
+            stats_conn = open_db()
+            cache_conn = open_cache_db()
+            try:
+                # Stable read across BOTH DBs for a single response (spec §2):
+                # the cache conn supplies the physical cost correlation, so it
+                # gets the same BEGIN/commit envelope as the stats conn.
+                stats_conn.execute("BEGIN")
+                cache_conn.execute("BEGIN")
+                roots = tuple(sorted({
+                    str(r[0]) for r in stats_conn.execute(
+                        "SELECT DISTINCT source_root_key FROM quota_window_blocks "
+                        "WHERE source='codex'"
+                    )
+                }))
+                identity = _types.SimpleNamespace(source_root_keys=roots, resets_at=None)
+                result = c.build_codex_cycle_detail(
+                    stats_conn, cache_conn, identity=identity, key=key,
+                    speed=speed, now_utc=now_utc,
+                )
+                stats_conn.commit()
+                cache_conn.commit()
+            finally:
+                stats_conn.close()
+                cache_conn.close()
+            if isinstance(result, tuple):
+                _none, reason = result
+                self._send_milestones_json(404, {
+                    "error": "unknown cycle", "code": "unknown_key",
+                    "reason": reason,
+                })
+                return
+            if result is None:
+                self._send_milestones_json(404, {
+                    "error": "unknown cycle", "code": "unknown_key",
+                    "reason": "unknown",
+                })
+                return
+            self._send_milestones_json(200, {**result, "source": "codex", "key": key})
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/milestones failed: %r", exc)
+            self.send_error(500, "milestones detail failed")
+
     def _serve_api_events(self) -> None:
         import queue as _queue
         self.send_response(200)
@@ -6496,9 +6641,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             _w.status() if _w is not None
             else {"current_run_id": None}
         )
+        # Beta-channel (spec 2026-07-21 §3): carry the configured release
+        # channel (from config, not cached state) so the badge/modal keep the
+        # `(beta)` marker + exact-version command after an execvp refresh, when
+        # the client polls /api/update/status instead of the SSE envelope.
+        try:
+            _c = _cctally()
+            configured_channel = _c.resolve_update_channel(_c.load_config())
+        except Exception:
+            configured_channel = "stable"
         body = {
             "state": state,
             "suppress": suppress,
+            "configured_channel": configured_channel,
             **worker_status,
         }
         self._respond_json(200, body)

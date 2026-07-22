@@ -451,6 +451,45 @@ print("ok")
             ok=0
         fi
 
+        # Beta-channel (spec 2026-07-21 §3): update.channel mirrors like the
+        # other dashboard-writable keys. The /api/data normalizer sentinelizes
+        # the whole `update` block, so assert on the RAW envelope + POST echo.
+        local chan_env chan_echo chan_bad
+        chan_env=$(curl -s --max-time 5 "$base/api/data" | python3 -c '
+import json, sys
+print((json.load(sys.stdin).get("update") or {}).get("configured_channel"))')
+        if [ "$chan_env" != "stable" ]; then
+            echo "FAIL $name: envelope update.configured_channel baseline != stable: $chan_env"
+            ok=0
+        fi
+        chan_echo=$(curl -s --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"update":{"channel":"beta"}}' "$base/api/settings" | python3 -c '
+import json, sys
+print((json.load(sys.stdin).get("update") or {}).get("configured_channel"))')
+        if [ "$chan_echo" != "beta" ]; then
+            echo "FAIL $name: POST update.channel echo configured_channel != beta: $chan_echo"
+            ok=0
+        fi
+        # The POST triggers run_sync_now → the SSE envelope reflects the flip.
+        chan_env=$(curl -s --max-time 5 "$base/api/data" | python3 -c '
+import json, sys
+print((json.load(sys.stdin).get("update") or {}).get("configured_channel"))')
+        if [ "$chan_env" != "beta" ]; then
+            echo "FAIL $name: envelope update.configured_channel after POST != beta: $chan_env"
+            ok=0
+        fi
+        # Invalid channel value → 400 (no partial write).
+        chan_bad=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"update":{"channel":"nightly"}}' "$base/api/settings")
+        if [ "$chan_bad" != "400" ]; then
+            echo "FAIL $name: POST invalid update.channel returned $chan_bad (expected 400)"
+            ok=0
+        fi
+
         # Phase B (Task 4): notifier round-trip. Setting a valid notifier
         # persists + echoes it back, and the echo carries command_configured
         # (never the raw command_template). This fixture stores no template,
@@ -710,6 +749,53 @@ print(label)
                 echo "FAIL $name: GET /api/block label='$block_label' suggests Tokyo zone leaked through (--tz utc override should win)"
                 ok=0
             fi
+        fi
+    fi
+
+    # GET /api/milestones/<source>/week/<key> — hero-modal history route
+    # (spec §2). The envelope's current_week.week_index feeds the client's
+    # week chip; probe the route for a real week (dynamic first key), an
+    # unknown week (404 code), and a bad source (400). Runs on every
+    # scenario with a current_week (skipped on no-data).
+    local wk_key
+    wk_key=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+cw = d.get("current_week")
+if cw is None:
+    print(""); raise SystemExit(0)
+idx = cw.get("week_index")
+if not isinstance(idx, list):
+    raise SystemExit("current_week.week_index missing or not a list")
+print(idx[0]["key"] if idx else "")
+')
+    if [ $? -ne 0 ]; then
+        echo "FAIL $name: /api/data current_week.week_index missing/malformed"
+        ok=0
+    elif [ -n "$wk_key" ]; then
+        local mw_body m404 mbad
+        mw_body=$(curl -s --max-time 5 "$base/api/milestones/claude/week/$wk_key")
+        printf '%s' "$mw_body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("source", "key", "segments", "dividers", "blocks", "detail_stamp"):
+    if k not in d:
+        raise SystemExit("missing " + k)
+if d["source"] != "claude":
+    raise SystemExit("source != claude")
+' || { echo "FAIL $name: /api/milestones claude 200 body malformed (raw: $mw_body)"; ok=0; }
+        m404=$(curl -s --max-time 5 "$base/api/milestones/claude/week/1999-01-01")
+        printf '%s' "$m404" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("code") != "unknown_key":
+    raise SystemExit("404 body code != unknown_key: " + repr(d))
+' || { echo "FAIL $name: /api/milestones claude unknown-week 404 body missing code (raw: $m404)"; ok=0; }
+        mbad=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            "$base/api/milestones/nope/week/2026-01-01")
+        if [ "$mbad" != "400" ]; then
+            echo "FAIL $name: /api/milestones bad-source returned $mbad (expected 400)"
+            ok=0
         fi
     fi
 

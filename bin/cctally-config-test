@@ -715,6 +715,61 @@ assert_eq "budget.codex.* --json (get-all) nested shape" \
 rm -rf "$home"
 
 # ---------------------------------------------------------------------------
+# update.channel (beta-channel opt-in, spec 2026-07-21 Section 3). Enum key
+# {stable,beta}, default stable. Mirrors the display.tz / dashboard.bind
+# enum-key branches: get default → set → get → invalid rejection → unset →
+# default; nested `--json` shape; sibling update.check preserved.
+# ---------------------------------------------------------------------------
+home=$(mktemp -d)
+
+# default get → stable.
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel 2>&1)
+assert_eq "update.channel get default" "update.channel=stable" "$out"
+
+# set beta → get beta round-trip.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.channel beta >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel)
+assert_eq "update.channel set beta" "update.channel=beta" "$out"
+
+# set stable → get stable.
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.channel stable >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel)
+assert_eq "update.channel set stable" "update.channel=stable" "$out"
+
+# invalid value → exit 2, stderr names the bad value.
+err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set update.channel nightly 2>&1 >/dev/null)
+ec=$?
+assert_eq "update.channel invalid exit" "2" "$ec"
+assert_contains "update.channel invalid stderr" "nightly" "$err"
+
+# update.channel unset restores default-stable behavior; sibling
+# update.check.enabled is preserved (both live under the `update` block).
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.channel beta >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.check.enabled false >/dev/null
+HOME="$home" TZ=Etc/UTC "$BIN" config unset update.channel >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel)
+assert_eq "update.channel unset returns default" "update.channel=stable" "$out"
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled)
+assert_eq "update.check.enabled preserved across channel-unset" "update.check.enabled=false" "$out"
+
+# idempotent unset on a store with no channel key.
+HOME="$home" TZ=Etc/UTC "$BIN" config unset update.channel >/dev/null
+ec=$?
+assert_eq "update.channel idempotent unset exit" "0" "$ec"
+
+# nested `--json` shape: {"update": {"channel": "beta"}}.
+rm -f "$home/.local/share/cctally/config.json"
+HOME="$home" TZ=Etc/UTC "$BIN" config set update.channel beta >/dev/null
+out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel --json)
+shape=$(printf "%s" "$out" | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("update", {}).get("channel"))
+')
+assert_eq "update.channel --json nested shape" "beta" "$shape"
+
+rm -rf "$home"
+
+# ---------------------------------------------------------------------------
 # budget.* config keys (spec 2026-05-29 Task 1). Validates set/get/unset for
 # weekly_usd / alerts_enabled / alert_thresholds: round-trip, rejection of
 # bad values (no partial write), threshold sort/dedup, sibling-preservation

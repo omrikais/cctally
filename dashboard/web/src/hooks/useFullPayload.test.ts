@@ -84,6 +84,24 @@ describe('useFullPayload', () => {
     expect(url).toBe('/api/conversation/s%2F1/payload?tool_use_id=toolu_01&which=input');
   });
 
+  it('loads a qualified Codex patch event through the event payload discriminator', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({ status: 'ok', block_key: 'cbk.event', which: 'event', content: '{"type":"patch_apply_end"}', truncated: false }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useFullPayload(
+      { source: 'codex', key: 'v1.patch' }, 'cbk.event', 'event' as never,
+    ));
+    await act(async () => { await result.current.load(); });
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/conversation/v1.patch/payload?block_key=cbk.event&which=event');
+    expect(result.current.status).toBe('done');
+    if (result.current.status === 'done') {
+      expect(result.current.data).toMatchObject({ which: 'event', text: '{"type":"patch_apply_end"}' });
+    }
+  });
+
   it('surfaces 410 as a friendly "source no longer available" error', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 410, json: async () => ({}) });
     vi.stubGlobal('fetch', fetchMock);

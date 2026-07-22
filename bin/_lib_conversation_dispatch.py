@@ -787,13 +787,13 @@ def neutral_payload(
 
     Provider-specific selectors: Claude keeps its existing contract (``tool_use_id``
     + ``which ∈ {input, result}``), Codex uses ``block_key`` + ``which ∈ {call,
-    output}``. Statuses: ``ok`` | ``not_found`` (404) | ``gone`` (410 — the physical
+    output, event}``. Statuses: ``ok`` | ``not_found`` (404) | ``gone`` (410 — the physical
     record moved/mutated)."""
     cref = resolve_conversation_ref(ref)
     if cref is None:
         return {"status": "not_found", "conversation_key": ref}
     if cref.source == "codex":
-        if not block_key or which not in ("call", "output"):
+        if not block_key or which not in ("call", "output", "event"):
             return {"status": "not_found", "block_key": block_key, "which": which}
         return q.read_codex_payload(conn, cref.conversation_key, block_key, which)
     # Claude: tool_use_id + which={input,result}, contract unchanged.

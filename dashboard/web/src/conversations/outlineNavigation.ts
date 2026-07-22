@@ -26,7 +26,8 @@ import type { OutlineTurn } from '../types/conversation';
 // OutlineTurn skeleton (Codex P1-5 twin): `edits`/`bash` match turn.tools by
 // (lower-cased) name; `subagent:<key>` matches turn.subagent_key. Kept lower-
 // cased here to match applyFocusMode's EDIT_TOOLS/BASH_TOOLS sets.
-const TWIN_EDIT_TOOLS = new Set(['edit', 'multiedit', 'write']);
+const TWIN_EDIT_TOOLS = new Set(['edit', 'multiedit', 'write', 'apply_patch', 'patch_apply_end']);
+const TWIN_BASH_TOOLS = new Set(['bash', 'exec']);
 
 export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean {
   if (mode === 'all') return true;
@@ -38,7 +39,7 @@ export function outlineTurnVisible(turn: OutlineTurn, mode: FocusMode): boolean 
   const turnHasTool = (names: Set<string>) =>
     (turn.tools ?? []).some((x) => !!x.name && names.has(x.name.toLowerCase()));
   if (mode === 'edits') return turnHasTool(TWIN_EDIT_TOOLS);
-  if (mode === 'bash') return turnHasTool(new Set(['bash']));
+  if (mode === 'bash') return turnHasTool(TWIN_BASH_TOOLS);
   const hasError = (turn.tools ?? []).some((x) => x.is_error);
   // Sidechain turns ride inside subagent / tool_result_run nodes: visible only
   // in errors-mode, and only when the turn itself carries an error.

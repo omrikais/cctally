@@ -72,7 +72,11 @@ def _get_canonical_boundary_for_date(
     return None, None
 
 
-def get_recent_weeks(conn: sqlite3.Connection, limit: int) -> list[WeekRef]:
+def get_recent_weeks(conn: sqlite3.Connection, limit: "int | None") -> list[WeekRef]:
+    # ``limit=None`` → SQL ``LIMIT -1`` (unbounded): the milestone-history
+    # index (#hero-milestone-history) enumerates EVERY navigable week with no
+    # depth cap. Existing callers pass a concrete int and are unaffected.
+    limit_sql = -1 if limit is None else int(limit)
     rows = conn.execute(
         """
         SELECT week_start_date, MAX(week_end_date) AS week_end_date
@@ -85,7 +89,7 @@ def get_recent_weeks(conn: sqlite3.Connection, limit: int) -> list[WeekRef]:
         ORDER BY week_start_date DESC
         LIMIT ?
         """,
-        (limit,),
+        (limit_sql,),
     ).fetchall()
 
     refs: list[WeekRef] = []

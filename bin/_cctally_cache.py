@@ -1044,6 +1044,52 @@ def _replay_codex_normalization(conn: sqlite3.Connection) -> None:
     _recompute_codex_rollups(conn, affected)
 
 
+def _repair_codex_turn_ids_for_source(
+    conn: sqlite3.Connection, source_path: str,
+) -> set[str]:
+    """Reconcile stored normalized rows after a late native turn anchor arrives.
+
+    Active Codex streams can emit the response before a later completion, patch,
+    or abort record exposes its turn id. Run this bounded per-file repair only
+    when such a native proof arrives; ordinary append ticks remain delta-only.
+    The physical log stays authoritative.
+    """
+    events = [
+        _lib_jsonl.CodexPhysicalEvent(*row)
+        for row in conn.execute(
+            "SELECT source_path, line_offset, source_root_key, conversation_key, "
+            "native_thread_id, root_thread_id, parent_thread_id, timestamp_utc, "
+            "record_type, event_type, turn_id, call_id, payload_json "
+            "FROM codex_conversation_events WHERE source_path=? ORDER BY line_offset",
+            (source_path,),
+        )
+    ]
+    inferred, _terminal = _lib_codex_conversation.infer_codex_event_turns(events)
+    expected = {event.line_offset: turn for event, turn in zip(events, inferred)}
+    affected = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
+            "WHERE source_path=?",
+            (source_path,),
+        )
+        if row[0]
+    }
+    for line_offset, stored_turn in conn.execute(
+        "SELECT line_offset, turn_id FROM codex_conversation_messages "
+        "WHERE source_path=?",
+        (source_path,),
+    ):
+        inferred_turn = expected.get(line_offset)
+        if stored_turn != inferred_turn:
+            conn.execute(
+                "UPDATE codex_conversation_messages SET turn_id=? "
+                "WHERE source_path=? AND line_offset=?",
+                (inferred_turn, source_path, line_offset),
+            )
+    return affected
+
+
 def _collect_inactive_codex_paths_and_roots(
     conn: sqlite3.Connection,
     current_file_identities: set[tuple[str, str]],
@@ -4849,6 +4895,7 @@ def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
         cache_uri = _cctally_core.CACHE_DB_PATH.resolve().as_uri() + "?mode=ro"
         conn.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
         _import_legacy_conversation_rows(conn)
+        _ensure_codex_conversation_contract(conn)
     _harden_conversation_sidecars()
     return conn
 
@@ -4898,6 +4945,68 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
             continue
     if changed:
         conn.commit()
+
+
+def _ensure_codex_conversation_contract(conn: sqlite3.Connection) -> bool:
+    """Converge retained Codex events on first read after a contract bump.
+
+    Qualified CLI reads and ``dashboard --no-sync`` intentionally do not ingest
+    JSONL. They still must remain usable after an upgrade, so replay only the
+    already-retained physical events under the provider-local conversation lock.
+    Empty stores keep their existing rebuild marker for the next real sync.
+    """
+    current = _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION
+
+    def needs_replay() -> bool:
+        version = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_conversation_contract_version'"
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_rebuild_codex_pending'"
+        ).fetchone() is not None
+        has_events = conn.execute(
+            "SELECT 1 FROM codex_conversation_events LIMIT 1"
+        ).fetchone() is not None
+        return has_events and (pending or version is None or version[0] != current)
+
+    if not needs_replay():
+        return False
+
+    _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
+    lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
+    try:
+        if not _acquire_cache_flock(lock_fh, timeout=15.0):
+            return False
+        if not needs_replay():
+            return False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _codex_conversation_fts_full_clear(conn)
+            _replay_codex_normalization(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("codex_conversation_contract_version", current),
+            )
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='conversation_rebuild_codex_pending'"
+            )
+            conn.commit()
+            return True
+        except (sqlite3.DatabaseError, OSError, ValueError) as exc:
+            conn.rollback()
+            eprint(
+                f"[codex-conversations] retained-event contract replay failed: {exc}"
+            )
+            return False
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
 
 
 def _prepare_claude_conversation_maintenance(
@@ -5240,10 +5349,25 @@ def sync_codex_conversations(
             "SELECT 1 FROM cache_meta "
             "WHERE key='conversation_rebuild_codex_pending'"
         ).fetchone() is not None
-        if pending_rebuild and targeted:
+        contract_row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_conversation_contract_version'"
+        ).fetchone()
+        has_contract_state = conn.execute(
+            "SELECT 1 FROM codex_conversation_events LIMIT 1"
+        ).fetchone() is not None
+        contract_rebuild = (
+            has_contract_state
+            and (
+                contract_row is None
+                or contract_row[0]
+                != _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION
+            )
+        )
+        if (pending_rebuild or contract_rebuild) and targeted:
             stats.deferred_reason = "rebuild_pending"
             return stats
-        rebuild = rebuild or pending_rebuild
+        rebuild = rebuild or pending_rebuild or contract_rebuild
         if rebuild:
             _clear_codex_conversation_store(conn)
             conn.commit()
@@ -5464,6 +5588,13 @@ def sync_codex_conversations(
                 affected_keys.update(
                     row.conversation_key for row in normalized.rows
                 )
+                if any(
+                    _lib_codex_conversation.codex_event_is_late_turn_anchor(event)
+                    for event in events
+                ):
+                    affected_keys.update(
+                        _repair_codex_turn_ids_for_source(conn, path_str)
+                    )
                 _recompute_codex_rollups(conn, affected_keys)
                 terminal = state.thread
                 conn.execute(
@@ -5511,6 +5642,13 @@ def sync_codex_conversations(
                 stats.files_failed += 1
 
         if only_paths is None and stats.files_failed == 0:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                (
+                    "codex_conversation_contract_version",
+                    _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION,
+                ),
+            )
             conn.execute(
                 "DELETE FROM cache_meta "
                 "WHERE key='conversation_rebuild_codex_pending'"

@@ -64,6 +64,23 @@ _SEARCH_BADGE = {
     "tool_call": "tools",
     "tool_output": "tools",
     "event": "event",
+    "meta": "context",
+}
+
+_META_LABEL_TEXT = {
+    "agents": "Project instructions",
+    "context_bundle": "Session context",
+    "delegation": "Delegation context",
+    "environment": "Environment context",
+    "heartbeat": "Harness heartbeat",
+    "instructions": "User instructions",
+    "memory": "Memory context",
+    "mode": "Agent mode",
+    "model_switch": "Model switch",
+    "permissions": "Permissions",
+    "plugins": "Available plugins",
+    "role": "Harness role",
+    "skill": "Skill context",
 }
 
 
@@ -87,7 +104,15 @@ def codex_normalization_authoritative(conn: sqlite3.Connection) -> bool:
                 "SELECT 1 FROM cache_meta "
                 "WHERE key='conversation_rebuild_codex_pending'"
             ).fetchone() is not None
-            return not pending
+            version = conn.execute(
+                "SELECT value FROM cache_meta "
+                "WHERE key='codex_conversation_contract_version'"
+            ).fetchone()
+            return (
+                not pending
+                and version is not None
+                and version[0] == kern.CODEX_CONVERSATION_CONTRACT_VERSION
+            )
     except sqlite3.OperationalError:
         pass
     try:
@@ -155,6 +180,14 @@ def _item_key_for_item(conversation_key: str, item: dict) -> str:
         content_digest=anchor.content_digest)
 
 
+def _member_item_keys(conversation_key: str, item: dict) -> list[str]:
+    """Durable aliases for logical items folded by a later contract version."""
+    return [
+        _item_key_for_item(conversation_key, folded)
+        for folded in item.get("folded_items", [])
+    ]
+
+
 def codex_block_key(
     conversation_key: str,
     *,
@@ -203,6 +236,35 @@ def _load_conversation_rows(conn: sqlite3.Connection, conversation_key: str) -> 
     ]
 
 
+def _load_row_payloads(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> dict[tuple[str, int], tuple[str | None, dict]]:
+    """Retained physical payloads for query-time card shaping.
+
+    The retained payload remains the authoritative source used for full-payload
+    readback and a defensive read-time re-shape; contract v3 also persists the
+    same bounded card so replay-derived rollups and logical item counts converge.
+    """
+    result: dict[tuple[str, int], tuple[str | None, dict]] = {}
+    for source_path, line_offset, record_type, payload_json in conn.execute(
+        "SELECT source_path,line_offset,record_type,payload_json "
+        "FROM codex_conversation_events WHERE conversation_key = ?",
+        (conversation_key,),
+    ):
+        try:
+            obj = json.loads(payload_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        payload = obj.get("payload") if isinstance(obj, dict) else None
+        if isinstance(payload, dict):
+            result[(source_path, line_offset)] = (record_type, payload)
+    return result
+
+
+def _row_payload(row, payloads: dict) -> tuple[str | None, dict] | None:
+    return payloads.get((row.source_path, row.line_offset))
+
+
 def _row_display(row) -> str:
     """The row's display/search text from whichever column carries it."""
     return row.text or row.search_thinking or row.search_tool or ""
@@ -217,6 +279,12 @@ def _parse_detail(detail_json: str | None):
         return None
 
 
+def _public_detail(detail):
+    if not isinstance(detail, dict):
+        return detail
+    return {key: value for key, value in detail.items() if not key.startswith("_")}
+
+
 def _item_kind(item: dict) -> str:
     klass = item["klass"]
     if klass == "prompt":
@@ -225,10 +293,31 @@ def _item_kind(item: dict) -> str:
         return "assistant"
     if klass == "event":
         return "event"
+    if klass == "meta":
+        return "meta"
     return item["anchor_row"].kind  # unturned: the row's own provider kind
 
 
-def _item_blocks_with_rows(item: dict) -> list[list]:
+def _item_meta(item: dict) -> dict | None:
+    if item["klass"] != "meta":
+        return None
+    detail = _parse_detail(item["anchor_row"].detail_json)
+    if not isinstance(detail, dict):
+        return {"meta_kind": "context", "meta_label": "role", "skill_name": None}
+    meta = {
+        "meta_kind": detail.get("meta_kind") or "context",
+        "meta_label": detail.get("meta_label") or "role",
+        "skill_name": detail.get("skill_name"),
+    }
+    sections = detail.get("meta_sections")
+    if isinstance(sections, list) and all(isinstance(value, str) for value in sections):
+        meta["meta_sections"] = sections
+    return meta
+
+
+def _item_blocks_with_rows(
+    item: dict, payloads: dict | None = None, *, preserve_marker_text: bool = False,
+) -> list[list]:
     """Assemble an item's blocks (the historical ``_build_item_blocks`` behaviour)
     AND expose each block's underlying rows, so the detail renderer and the payload
     locator (§3.4) share ONE folding rule. Each entry is a 3-list
@@ -240,6 +329,12 @@ def _item_blocks_with_rows(item: dict) -> list[list]:
     Every ``tool_call`` block additionally carries an opaque ``block_key`` (§3.4) —
     the payload-capable anchor. Non-tool blocks carry no ``block_key``."""
     rows = item["rows"]
+    payloads = payloads or {}
+    lifecycle_positions = {
+        (row.source_path, row.line_offset) for row in item.get("lifecycle_rows", [])
+    }
+    row_order = {(row.source_path, row.line_offset): index
+                 for index, row in enumerate(rows)}
     call_owner_count: dict[str, int] = {}
     for r in rows:
         if r.kind == "tool_call" and r.call_id:
@@ -247,33 +342,234 @@ def _item_blocks_with_rows(item: dict) -> list[list]:
     entries: list[list] = []
     tool_entry_by_call: dict[str, int] = {}
     for r in rows:
+        if (r.source_path, r.line_offset) in lifecycle_positions:
+            continue
         text = _row_display(r)
-        detail = _parse_detail(r.detail_json)
+        stored_detail = _parse_detail(r.detail_json)
+        detail = _public_detail(stored_detail)
+        retained = _row_payload(r, payloads)
+        payload = retained[1] if retained is not None else None
+        if (preserve_marker_text and isinstance(stored_detail, dict)
+                and stored_detail.get("markers") and isinstance(payload, dict)):
+            if retained[0] == "response_item":
+                text = kern._join_content_texts(payload.get("content"))
+            elif retained[0] == "event_msg":
+                text = kern._stringify(payload.get("message"))
+        if r.kind == "tool_call" and isinstance(payload, dict):
+            card = kern.decode_tool_call_card(payload)
+            if card is None:
+                card = kern.decode_secondary_tool_call_card(payload)
+            if card is not None:
+                detail = dict(detail) if isinstance(detail, dict) else {}
+                detail["card"] = card
+        output_card = (kern.decode_tool_output_card(payload)
+                       if r.kind == "tool_output" and isinstance(payload, dict)
+                       else None)
+        if output_card is not None:
+            card, text = output_card
+            detail = dict(detail) if isinstance(detail, dict) else {}
+            detail["card"] = card
+        if r.kind == "event" and isinstance(payload, dict):
+            card = kern.decode_patch_event_card(payload)
+            if card is None:
+                card = kern.decode_secondary_event_card(payload)
+            if card is not None:
+                detail = dict(detail) if isinstance(detail, dict) else {}
+                detail["card"] = card
         if (r.kind == "tool_output" and r.call_id
                 and call_owner_count.get(r.call_id, 0) == 1
                 and r.call_id in tool_entry_by_call):
             owner = entries[tool_entry_by_call[r.call_id]]
+            if isinstance(detail, dict) and isinstance(detail.get("card"), dict):
+                call_card = (owner[0].get("detail") or {}).get("card")
+                if (detail["card"].get("status") == "unknown"
+                        and isinstance(call_card, dict)
+                        and isinstance(call_card.get("status"), str)):
+                    detail["card"]["status"] = call_card["status"]
+                    detail["card"]["is_error"] = call_card["status"] in {
+                        "failed", "error"}
             owner[0]["output"] = {"text": text, "detail": detail}
+            owner_card = (owner[0].get("detail") or {}).get("card")
+            if isinstance(owner_card, dict) and owner_card.get("type") in {
+                    "plan", "agent"} and isinstance(payload, dict):
+                result = kern.decode_secondary_tool_result(payload)
+                if result is not None:
+                    owner_card["result"] = result
             owner[2] = r
             continue
         block = {
             "kind": r.kind, "text": text, "detail": detail,
             "call_id": r.call_id, "timestamp_utc": r.timestamp_utc,
         }
+        if (r.kind == "event" and r.event_type in {
+                "web_search_end", "mcp_tool_call_end", "task_started", "task_complete"}
+                or isinstance(stored_detail, dict) and stored_detail.get("markers")):
+            block["block_key"] = _block_key_for_row(r)
+            block["payload_which"] = "event"
         if r.kind == "tool_call":
             block["block_key"] = _block_key_for_row(r)
             if r.call_id and call_owner_count.get(r.call_id, 0) == 1:
                 tool_entry_by_call[r.call_id] = len(entries)
         entries.append([block, r, None])
+
+    # A native patch completion may carry an inner call id distinct from the
+    # outer custom-tool call. Correlate only on unique same-id ownership, or on
+    # one strictly bracketed single-patch call (call < event < its output).
+    # Anything ambiguous remains its own event card.
+    patch_calls = [
+        (index, call_owner_count.get(entry[1].call_id, 0))
+        for index, entry in enumerate(entries)
+        if entry[1].kind == "tool_call"
+        and isinstance((entry[0].get("detail") or {}).get("card"), dict)
+        and entry[0]["detail"]["card"].get("type") == "patch"
+    ]
+    matched_calls: set[int] = set()
+    suppress_events: set[int] = set()
+    for event_index, event_entry in enumerate(entries):
+        event_block, event_row, _unused = event_entry
+        event_card = (event_block.get("detail") or {}).get("card")
+        if not (event_row.kind == "event" and isinstance(event_card, dict)
+                and event_card.get("source") == "patch_apply_end"):
+            continue
+        event_key = _block_key_for_row(event_row)
+        event_block["block_key"] = event_key
+        event_block["payload_which"] = "event"
+        same_id = [
+            index for index, owner_count in patch_calls
+            if index not in matched_calls and event_row.call_id
+            and owner_count == 1
+            and entries[index][1].call_id == event_row.call_id
+        ]
+        candidates = same_id if len(same_id) == 1 else []
+        if not candidates:
+            event_pos = row_order[(event_row.source_path, event_row.line_offset)]
+            candidates = []
+            for index, _owner_count in patch_calls:
+                if index in matched_calls:
+                    continue
+                _call_block, call_row, output_row = entries[index]
+                call_pos = row_order[(call_row.source_path, call_row.line_offset)]
+                output_pos = (row_order.get((output_row.source_path, output_row.line_offset))
+                              if output_row is not None else None)
+                if (call_row.source_path == event_row.source_path
+                        and output_row is not None
+                        and output_row.source_path == event_row.source_path
+                        and call_pos < event_pos and output_pos is not None
+                        and event_pos < output_pos):
+                    candidates.append(index)
+        if len(candidates) != 1:
+            continue
+        owner_index = candidates[0]
+        owner_card = entries[owner_index][0]["detail"]["card"]
+        completion = dict(event_card)
+        completion["event_block_key"] = event_key
+        owner_card["completion"] = completion
+        matched_calls.add(owner_index)
+        suppress_events.add(event_index)
+    if suppress_events:
+        entries = [entry for index, entry in enumerate(entries)
+                   if index not in suppress_events]
+
+    # Web/MCP completion events fold only by one exact same-turn call id. The
+    # kernel already uses this proof for logical item count; repeat it here to
+    # produce the additive card body while preserving payload selectors.
+    calls_by_id: dict[str, list[int]] = {}
+    for index, entry in enumerate(entries):
+        row = entry[1]
+        if row.kind == "tool_call" and row.call_id:
+            calls_by_id.setdefault(row.call_id, []).append(index)
+    suppress_secondary: set[int] = set()
+    matched_secondary: set[int] = set()
+    for event_index, event_entry in enumerate(entries):
+        event_block, event_row, _unused = event_entry
+        event_card = (event_block.get("detail") or {}).get("card")
+        if not (event_row.kind == "event" and event_row.call_id
+                and isinstance(event_card, dict)
+                and event_card.get("type") in {
+                    "web_search_completion", "mcp_completion"}):
+            continue
+        candidates = [
+            index for index in calls_by_id.get(event_row.call_id, [])
+            if index not in matched_secondary
+            and entries[index][1].turn_id == event_row.turn_id
+        ]
+        if event_card.get("type") == "web_search_completion":
+            candidates = [
+                index for index in candidates
+                if ((entries[index][0].get("detail") or {}).get("name")
+                    == "web_search_call")
+            ]
+        if len(candidates) != 1:
+            event_block["block_key"] = _block_key_for_row(event_row)
+            event_block["payload_which"] = "event"
+            continue
+        owner_index = candidates[0]
+        owner_block = entries[owner_index][0]
+        owner_detail = owner_block.get("detail")
+        if not isinstance(owner_detail, dict):
+            owner_detail = {}
+            owner_block["detail"] = owner_detail
+        owner_card = owner_detail.get("card")
+        if event_card.get("type") == "mcp_completion":
+            if not isinstance(owner_card, dict) or owner_card.get("type") != "mcp":
+                owner_card = {
+                    "schema_version": kern.CODEX_CARD_SCHEMA_VERSION,
+                    "type": "mcp", "source": "function_call",
+                    "call_status": "requested",
+                    "name": owner_detail.get("name"),
+                }
+                owner_retained = _row_payload(entries[owner_index][1], payloads)
+                owner_payload = owner_retained[1] if owner_retained is not None else None
+                if isinstance(owner_payload, dict) and isinstance(
+                        owner_payload.get("status"), str):
+                    owner_card["call_status"] = owner_payload["status"]
+                owner_detail["card"] = owner_card
+        if not isinstance(owner_card, dict):
+            event_block["block_key"] = _block_key_for_row(event_row)
+            event_block["payload_which"] = "event"
+            continue
+        owner_card["completion"] = {
+            key: value for key, value in event_card.items()
+            if key not in {"schema_version", "type", "source"}
+        }
+        owner_card["completion"]["event_block_key"] = _block_key_for_row(event_row)
+        matched_secondary.add(owner_index)
+        suppress_secondary.add(event_index)
+    if suppress_secondary:
+        entries = [entry for index, entry in enumerate(entries)
+                   if index not in suppress_secondary]
     return entries
 
 
-def _build_item_blocks(item: dict) -> list[dict]:
+def _build_item_blocks(
+    item: dict, payloads: dict | None = None, *, preserve_marker_text: bool = False,
+) -> list[dict]:
     """Assemble an item's blocks, folding each ``tool_output`` into its
     ``tool_call`` block via ``call_id`` when that call_id has exactly one owner
     (§5.2). Physical order within the item is preserved. Thin projection of
     ``_item_blocks_with_rows`` — the single source of truth for the folding rule."""
-    return [entry[0] for entry in _item_blocks_with_rows(item)]
+    return [entry[0] for entry in _item_blocks_with_rows(
+        item, payloads, preserve_marker_text=preserve_marker_text)]
+
+
+def _item_lifecycle(item: dict) -> dict | None:
+    lifecycle = item.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return None
+    result = {
+        key: (dict(value) if isinstance(value, dict) else value)
+        for key, value in lifecycle.items()
+    }
+    result["events"] = [
+        {
+            "event": (_parse_detail(row.detail_json) or {}).get(
+                "lifecycle", {}).get("event"),
+            "payload_which": "event",
+            "block_key": _block_key_for_row(row),
+        }
+        for row in item.get("lifecycle_rows", [])
+    ]
+    return result
 
 
 # ── tokens union (§5.6) ───────────────────────────────────────────────────────
@@ -305,44 +601,27 @@ def _tokens_union(tokens: dict) -> dict:
 # ── cost attribution (§5.4) ───────────────────────────────────────────────────
 
 
-def _file_boundaries(conn: sqlite3.Connection, source_path: str) -> list[tuple[int, str | None]]:
-    """Ordered ``(line_offset, active_turn)`` boundaries for one file — a
-    ``turn_context`` sets the effective turn, a ``session_meta`` resets it to
-    ``None`` (a new un-turned segment). Read from the retained physical events so
-    an accounting row that precedes the first normalized message still attributes
-    to the turn ``turn_context`` already opened (§5.4)."""
-    boundaries: list[tuple[int, str | None]] = []
-    for off, rtype, tid, payload_json in conn.execute(
-        "SELECT line_offset, record_type, turn_id, payload_json "
-        "FROM codex_conversation_events "
-        "WHERE source_path = ? AND record_type IN ('turn_context','session_meta') "
-        "ORDER BY line_offset",
-        (source_path,),
-    ):
-        if rtype == "session_meta":
-            boundaries.append((off, None))
-            continue
-        turn = tid
-        if turn is None:
-            try:
-                payload = (json.loads(payload_json or "{}").get("payload") or {})
-                turn = payload.get("turn_id")
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                turn = None
-        boundaries.append((off, turn))
-    return boundaries
+def _file_turn_map(conn: sqlite3.Connection, source_path: str) -> dict[int, str | None]:
+    """Exact physical-offset → canonical logical turn for one retained file.
 
+    Cost attribution and normalized prose use the same pure lifecycle inference,
+    including resumed segments whose native proof arrives on task completion.
+    """
+    from _lib_jsonl import CodexPhysicalEvent
 
-def _turn_at(boundaries: list[tuple[int, str | None]], offset: int) -> str | None:
-    """Nearest preceding turn boundary by file offset (§5.4); ``None`` when the
-    row precedes any turn (or sits in an un-turned segment)."""
-    turn: str | None = None
-    for boff, bturn in boundaries:
-        if boff <= offset:
-            turn = bturn
-        else:
-            break
-    return turn
+    events = [
+        CodexPhysicalEvent(*row)
+        for row in conn.execute(
+            "SELECT source_path, line_offset, source_root_key, conversation_key, "
+            "native_thread_id, root_thread_id, parent_thread_id, timestamp_utc, "
+            "record_type, event_type, turn_id, call_id, payload_json "
+            "FROM codex_conversation_events WHERE source_path = ? "
+            "ORDER BY line_offset",
+            (source_path,),
+        )
+    ]
+    turns, _terminal = kern.infer_codex_event_turns(events)
+    return {event.line_offset: turn for event, turn in zip(events, turns)}
 
 
 def _attribute_costs(conn: sqlite3.Connection, conversation_key: str, effective_speed: str):
@@ -358,9 +637,9 @@ def _attribute_costs(conn: sqlite3.Connection, conversation_key: str, effective_
         "WHERE conversation_key = ? ORDER BY source_path, line_offset",
         (conversation_key,),
     ).fetchall()
-    boundaries: dict[str, list] = {}
+    turn_maps: dict[str, dict[int, str | None]] = {}
     for source_path in {e[0] for e in entries}:
-        boundaries[source_path] = _file_boundaries(conn, source_path)
+        turn_maps[source_path] = _file_turn_map(conn, source_path)
     turn_cost: dict[str, float] = {}
     turn_tokens: dict[str, dict] = {}
     unattr_cost = 0.0
@@ -372,7 +651,7 @@ def _attribute_costs(conn: sqlite3.Connection, conversation_key: str, effective_
             model or "", inp or 0, cin or 0, out or 0, rout or 0, speed=effective_speed)
         total += priced
         _add_tokens(conv_tokens, inp, out, cin, rout)
-        turn = _turn_at(boundaries.get(source_path, []), offset)
+        turn = turn_maps.get(source_path, {}).get(offset)
         if turn is not None:
             turn_cost[turn] = turn_cost.get(turn, 0.0) + priced
             _add_tokens(turn_tokens.setdefault(turn, _zero_tokens()), inp, out, cin, rout)
@@ -547,6 +826,109 @@ def _parent_of(conn: sqlite3.Connection, conversation_key: str):
     return {"conversation_key": parent_ck, "title": _conversation_display_title(conn, parent_ck)}
 
 
+def _consistent_meta_value(direct, nested):
+    present = [value for value in (direct, nested) if value is not None]
+    if any(not isinstance(value, str) or not value for value in present):
+        return False
+    values = present
+    if not values:
+        return None
+    return values[0] if len(set(values)) == 1 else False
+
+
+def _agent_session_meta(payload: dict) -> dict | None:
+    """Extract current retained child facts without persisting or exposing paths."""
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    spawn = spawn if isinstance(spawn, dict) else {}
+    parent = _consistent_meta_value(
+        payload.get("parent_thread_id"), spawn.get("parent_thread_id"))
+    agent_path = _consistent_meta_value(payload.get("agent_path"), spawn.get("agent_path"))
+    if parent is False or agent_path is False or not parent or not agent_path:
+        return None
+    return {
+        "parent_thread_id": parent,
+        "agent_path": agent_path,
+        "role": _consistent_meta_value(payload.get("agent_role"), spawn.get("agent_role")),
+        "nickname": _consistent_meta_value(
+            payload.get("agent_nickname"), spawn.get("agent_nickname")),
+    }
+
+
+def _safe_agent_label(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())
+    if not value or len(value) > 120 or "/" in value or "\\" in value:
+        return None
+    return value
+
+
+def _spawn_child_link(
+    conn: sqlite3.Connection, conversation_key: str, canonical_task_name: str,
+) -> dict | None:
+    """Return one opaque same-root child only on exact retained identity proof."""
+    thread = _thread_facts(conn, conversation_key)
+    if thread is None:
+        return None
+    native, _root, _parent, source_root_key, _cwd, _git = thread
+    if not native or not source_root_key:
+        return None
+    matches: dict[str, list[dict]] = {}
+    for child_key, payload_json in conn.execute(
+        "SELECT conversation_key,payload_json FROM codex_conversation_events "
+        "WHERE source_root_key=? AND record_type='session_meta' "
+        "AND conversation_key IS NOT NULL AND conversation_key != ?",
+        (source_root_key, conversation_key),
+    ):
+        try:
+            record = json.loads(payload_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        payload = record.get("payload") if isinstance(record, dict) else None
+        facts = _agent_session_meta(payload) if isinstance(payload, dict) else None
+        if not (facts and facts["parent_thread_id"] == native
+                and facts["agent_path"] == canonical_task_name):
+            continue
+        if not codex_conversation_exists(conn, child_key):
+            continue
+        matches.setdefault(child_key, []).append(facts)
+    if len(matches) != 1:
+        return None
+    child_key, facts_list = next(iter(matches.items()))
+    link = {"conversation_key": child_key}
+    for field in ("role", "nickname"):
+        labels = {_safe_agent_label(facts.get(field)) for facts in facts_list}
+        labels.discard(None)
+        if len(labels) == 1:
+            link[field] = next(iter(labels))
+    return link
+
+
+def _attach_spawn_child_links(
+    conn: sqlite3.Connection, conversation_key: str, items: list[dict],
+) -> None:
+    cache: dict[str, dict | None] = {}
+    for item in items:
+        for block in item.get("blocks", []):
+            detail = block.get("detail")
+            card = detail.get("card") if isinstance(detail, dict) else None
+            if not (isinstance(card, dict) and card.get("type") == "agent"
+                    and card.get("operation") == "spawn_agent"):
+                continue
+            result = card.get("result")
+            value = result.get("value") if isinstance(result, dict) else None
+            task_name = value.get("task_name") if isinstance(value, dict) else None
+            if not isinstance(task_name, str) or not task_name:
+                continue
+            if task_name not in cache:
+                cache[task_name] = _spawn_child_link(
+                    conn, conversation_key, task_name)
+            if cache[task_name] is not None:
+                card["child_conversation"] = cache[task_name]
+
+
 def codex_conversation_exists(conn: sqlite3.Connection, conversation_key: str) -> bool:
     """Cheap existence probe (spec §5.2) — True iff any normalized
     ``codex_conversation_messages`` row carries ``conversation_key``. Used by the
@@ -611,11 +993,20 @@ def codex_conversation_source_paths(
 
 def _paginate_items(items: list[dict], *, after, before, tail, limit):
     keys = [it["item_key"] for it in items]
+    aliases = {
+        alias: index
+        for index, item in enumerate(items)
+        for alias in item.get("member_item_keys", [])
+    }
     lo, hi = 0, len(items)
     if after is not None and after in keys:
         lo = keys.index(after) + 1
+    elif after is not None and after in aliases:
+        lo = aliases[after] + 1
     if before is not None and before in keys:
         hi = keys.index(before)
+    elif before is not None and before in aliases:
+        hi = aliases[before]
     window = items[lo:hi]
     if tail is not None:
         cap = min(tail, limit) if limit else tail
@@ -644,6 +1035,7 @@ def get_codex_conversation(
     before: str | None = None,
     tail: int | None = None,
     limit: int = 200,
+    legacy_export: bool = False,
 ) -> dict:
     """Detail envelope (§5.6): status ``ok`` | ``normalization_pending`` |
     ``not_found``. ``ok`` carries canonical items (mirror-paired, tool-folded),
@@ -656,7 +1048,23 @@ def get_codex_conversation(
     if not rows:
         return {"status": "not_found", "conversation_key": conversation_key}
     kept, _suppressed = kern.pair_mirrors(rows)
-    items = kern.canonical_items(kept)
+    items = kern.canonical_items(
+        kept, fold_patch_completions=not legacy_export)
+    # Detail/API callers receive the exact card display projection from retained
+    # provider payloads. Export deliberately renders the byte-frozen legacy text
+    # while retaining the same additive card metadata.
+    payloads = _load_row_payloads(conn, conversation_key)
+    if legacy_export:
+        marker_positions = {
+            (row.source_path, row.line_offset)
+            for row in rows
+            if isinstance(_parse_detail(row.detail_json), dict)
+            and bool(_parse_detail(row.detail_json).get("markers"))
+        }
+        payloads = {
+            position: retained for position, retained in payloads.items()
+            if position in marker_positions
+        }
     turn_cost, turn_tokens, unattr_cost, unattr_tokens, total, conv_tokens = _attribute_costs(
         conn, conversation_key, effective_speed)
     # Carrier item per turn: prefer the response item, else the first item of the
@@ -682,15 +1090,25 @@ def get_codex_conversation(
         if turn is not None and carriers.get(turn) == idx and turn in turn_cost:
             cost = turn_cost[turn]
             tokens = _tokens_union(turn_tokens[turn])
-        built.append({
+        item = {
             "item_key": _item_key_for_item(conversation_key, it),
+            "member_item_keys": _member_item_keys(conversation_key, it),
             "kind": _item_kind(it),
             "timestamp_utc": it["anchor_row"].timestamp_utc,
             "model": it["anchor_row"].model,
-            "blocks": _build_item_blocks(it),
+            "blocks": _build_item_blocks(
+                it, payloads, preserve_marker_text=legacy_export),
             "cost_usd": cost,
             "tokens": tokens,
-        })
+        }
+        meta = _item_meta(it)
+        if meta is not None:
+            item.update(meta)
+        lifecycle = _item_lifecycle(it)
+        if lifecycle is not None:
+            item["lifecycle"] = lifecycle
+        built.append(item)
+    _attach_spawn_child_links(conn, conversation_key, built)
     page_items, page = _paginate_items(built, after=after, before=before, tail=tail, limit=limit)
     return {
         "status": "ok",
@@ -737,18 +1155,26 @@ def get_codex_conversation_outline(
     turns: list[dict] = []
     kind_totals: dict[str, int] = {}
     for it in items:
+        meta = _item_meta(it)
         anchor_text = _row_display(it["anchor_row"])
-        label = _first_nonblank_line(_strip_ansi(anchor_text)) if anchor_text else ""
+        if meta is not None:
+            label = _META_LABEL_TEXT.get(meta["meta_label"], "Harness context")
+        else:
+            label = _first_nonblank_line(_strip_ansi(anchor_text)) if anchor_text else ""
         kinds: dict[str, int] = {}
         for r in it["rows"]:
             kinds[r.kind] = kinds.get(r.kind, 0) + 1
             kind_totals[r.kind] = kind_totals.get(r.kind, 0) + 1
-        turns.append({
+        turn = {
             "item_key": _item_key_for_item(conversation_key, it),
+            "member_item_keys": _member_item_keys(conversation_key, it),
             "label": label,
             "timestamp_utc": it["anchor_row"].timestamp_utc,
             "kinds": kinds,
-        })
+        }
+        if meta is not None:
+            turn.update(meta)
+        turns.append(turn)
     return {
         "status": "ok",
         "conversation_key": conversation_key,
@@ -1359,9 +1785,29 @@ def _reread_codex_full_content(conn: sqlite3.Connection, row):
     extracted = kern._extract(record_type, payload)
     if extracted is None:
         return None
-    content = extracted.content_text or ""
+    card = None
+    if record_type == "event_msg" and payload.get("type") in {
+            "patch_apply_end", "web_search_end", "mcp_tool_call_end",
+            "task_started", "task_complete"}:
+        content = kern._canonical_json(payload)
+        card = (kern.decode_patch_event_card(
+            payload, text_cap=_FULL_PAYLOAD_CEILING)
+            or kern.decode_secondary_event_card(
+                payload, text_cap=_FULL_PAYLOAD_CEILING))
+    else:
+        content = (extracted.identity_text if extracted.identity_text is not None
+                   else extracted.content_text or "")
+        if record_type == "response_item" and payload.get("type") in kern._RESPONSE_TOOL_CALLS:
+            card = (kern.decode_tool_call_card(
+                payload, text_cap=_FULL_PAYLOAD_CEILING)
+                or kern.decode_secondary_tool_call_card(
+                    payload, text_cap=_FULL_PAYLOAD_CEILING))
+        elif record_type == "response_item" and payload.get("type") in kern._RESPONSE_TOOL_OUTPUTS:
+            shaped = kern.decode_tool_output_card(
+                payload, text_cap=_FULL_PAYLOAD_CEILING)
+            card = shaped[0] if shaped is not None else None
     truncated = len(content) > _FULL_PAYLOAD_CEILING
-    return content[:_FULL_PAYLOAD_CEILING], truncated
+    return content[:_FULL_PAYLOAD_CEILING], truncated, card
 
 
 def _locate_payload_block(conn: sqlite3.Connection, conversation_key: str, block_key: str):
@@ -1372,14 +1818,27 @@ def _locate_payload_block(conn: sqlite3.Connection, conversation_key: str, block
     rows = _load_conversation_rows(conn, conversation_key)
     if not rows:
         return None
+    # Event/marker payload keys are row-scoped and remain addressable even when
+    # their bounded presentation folds into a proven owning interaction.
+    for row in rows:
+        detail = _parse_detail(row.detail_json)
+        payload_addressable = (
+            row.kind == "event" and row.event_type in {
+                "patch_apply_end", "web_search_end", "mcp_tool_call_end",
+                "task_started", "task_complete"}
+            or isinstance(detail, dict) and bool(detail.get("markers"))
+        )
+        if payload_addressable and _block_key_for_row(row) == block_key:
+            return {"event": row}
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(kept)
+    payloads = _load_row_payloads(conn, conversation_key)
     for item in items:
-        for _block, call_row, output_row in _item_blocks_with_rows(item):
+        for _block, call_row, output_row in _item_blocks_with_rows(item, payloads):
             if call_row.kind != "tool_call":
                 continue
             if _block_key_for_row(call_row) == block_key:
-                return call_row, output_row
+                return {"call": call_row, "output": output_row}
     return None
 
 
@@ -1388,22 +1847,22 @@ def read_codex_payload(
 ) -> dict:
     """Locate + full re-read for a Codex detail payload block (§3.4).
 
-    Selector: ``block_key`` (required) + ``which ∈ {call, output}``. A call-id-less
+    Selector: ``block_key`` (required) + ``which ∈ {call, output, event}``. A call-id-less
     (or unpaired) call is call-only — ``which=output`` for it → ``not_found`` (no
     adjacency pairing is introduced). Success envelope (pinned):
     ``{"status":"ok","block_key","which","content","truncated"}`` where ``content``
-    is the selected side's full text from the re-read record and ``truncated``
-    reflects ``_FULL_PAYLOAD_CEILING``. ``gone`` (→ HTTP 410) means the physical
+    is the selected side's full text from the re-read record, patch events add a
+    full bounded ``card``, and ``truncated`` reflects ``_FULL_PAYLOAD_CEILING``.
+    ``gone`` (→ HTTP 410) means the physical
     record moved/mutated; ``not_found`` (→ 404) means no such block, no output
     partner, or a containment miss (a read is never attempted outside the root)."""
     miss = {"status": "not_found", "block_key": block_key, "which": which}
-    if which not in ("call", "output"):
+    if which not in ("call", "output", "event"):
         return miss
     located = _locate_payload_block(conn, conversation_key, block_key)
     if located is None:
         return miss
-    call_row, output_row = located
-    target = call_row if which == "call" else output_row
+    target = located.get(which)
     if target is None:  # which=output for a call-id-less / unpaired call
         return miss
     # Containment guard (Codex-only; the Claude path has no equivalent) BEFORE any
@@ -1414,9 +1873,12 @@ def read_codex_payload(
     outcome = _reread_codex_full_content(conn, target)
     if outcome is None:
         return {"status": "gone", "block_key": block_key, "which": which}
-    content, truncated = outcome
-    return {"status": "ok", "block_key": block_key, "which": which,
-            "content": content, "truncated": truncated}
+    content, truncated, card = outcome
+    response = {"status": "ok", "block_key": block_key, "which": which,
+                "content": content, "truncated": truncated}
+    if card is not None:
+        response["card"] = card
+    return response
 
 
 # ── whole-conversation export (§3.3) ──────────────────────────────────────────
@@ -1430,7 +1892,8 @@ def get_codex_conversation_export(
     module. Status-tagged: ``ok`` (carries ``markdown``) | ``normalization_pending``
     | ``not_found`` — the dispatch/transport layers map those to bytes/HTTP."""
     detail = get_codex_conversation(
-        conn, conversation_key, effective_speed=effective_speed, limit=0)
+        conn, conversation_key, effective_speed=effective_speed, limit=0,
+        legacy_export=True)
     if detail.get("status") != "ok":
         return {"status": detail.get("status"), "conversation_key": conversation_key}
     from _lib_codex_conversation_export import render_codex_conversation_markdown

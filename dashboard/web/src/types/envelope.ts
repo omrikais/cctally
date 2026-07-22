@@ -180,6 +180,11 @@ export interface UpdateEnvelope {
   // the coercer returns a defensive null-state slice in that case.
   state: unknown;
   suppress: unknown;
+  // Beta-channel (spec 2026-07-21 §3): the configured release channel,
+  // derived DIRECTLY from config (never cached state). Seeds the settings
+  // toggle and drives the `(beta)` badge/modal marker + exact-version install
+  // command. Absent (older Python) → treated as "stable".
+  configured_channel?: string;
 }
 
 // ---- Threshold-actions alerts (T5/T8) --------------------------------
@@ -355,6 +360,53 @@ export interface CurrentWeekEnvelope {
   // post-credit segments included. Optional for backward compat with
   // older envelopes that predate v1.7.x.
   five_hour_milestones?: FiveHourMilestone[];
+  // Hero-modal historical-milestone navigation index (spec §3). Newest-first
+  // per-week entries the week chip steps through; additive/optional (older
+  // envelopes omit it). Historical milestone rows are fetched on demand via
+  // GET /api/milestones/claude/week/<key>, never carried on the envelope.
+  week_index?: WeekIndexEntry[];
+}
+
+// ── Hero-modal historical milestones (spec §1a/§1c/§2/§3) ──────────────
+
+export interface WeekIndexEntry {
+  key: string;
+  start_at_utc: string | null;
+  end_at_utc: string | null;
+  resets_at_utc?: string | null;   // Codex only
+  label: string;
+  is_current: boolean;
+  milestone_count: number;
+  block_count: number;
+  segment_count?: number;          // Claude only
+  detail_stamp: string;
+}
+
+export interface WeekDetailBlock {
+  five_hour_window_key?: number;   // Claude
+  key?: string;                    // Codex opaque block key
+  block_start_at: string;
+  five_hour_resets_at: string;
+  final_five_hour_percent: number | null;
+  total_cost_usd: number | null;
+  crossed_seven_day_reset: boolean;
+  is_closed: boolean;
+  milestones: FiveHourMilestone[] | CodexQuotaMilestoneRow[];
+  credits?: FiveHourCredit[];
+}
+
+export interface WeekDetailPayload {
+  source: 'claude' | 'codex';
+  key: string;
+  label: string;
+  start_at_utc: string | null;
+  end_at_utc: string | null;
+  resets_at_utc?: string | null;   // Codex only
+  is_current: boolean;
+  detail_stamp: string;
+  segments: { reset_event_id: number; milestones: Milestone[] | CodexQuotaMilestoneRow[] }[];
+  dividers: { effective_at_utc: string; prior_percent: number | null }[];
+  blocks: WeekDetailBlock[];
 }
 
 export interface Milestone {
@@ -902,6 +954,10 @@ export interface CodexQuotaDomain {
   histories: CodexQuotaHistoryRow[];
   milestones: CodexQuotaMilestoneRow[];
   blocks: CodexQuotaBlockRow[];
+  // Hero-modal historical-cycle navigation index (spec §3). Newest-first
+  // per-cycle entries the Codex week chip steps through; additive/optional.
+  // Detail rows fetched via GET /api/milestones/codex/week/<key>.
+  cycle_index?: WeekIndexEntry[];
 }
 
 export interface CodexBudgetPace {

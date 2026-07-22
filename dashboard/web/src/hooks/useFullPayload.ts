@@ -20,7 +20,7 @@ type State =
 export function useFullPayload(
   rawRef: ConversationRefInput | null,
   toolUseId: string,
-  which: 'result' | 'input',
+  which: 'result' | 'input' | 'event',
 ) {
   const conversationRef = rawRef ? normalizeConversationRef(rawRef) : null;
   const identityKey = conversationRef ? conversationRefKey(conversationRef) : null;
@@ -50,7 +50,7 @@ export function useFullPayload(
     setState({ status: 'loading' });
     try {
       const url = conversationEntityUrl(conversationRef, 'payload', conversationRef.source === 'codex'
-        ? { block_key: toolUseId, which: which === 'input' ? 'call' : 'output' }
+        ? { block_key: toolUseId, which: which === 'input' ? 'call' : which === 'event' ? 'event' : 'output' }
         : { tool_use_id: toolUseId, which });
       const r = await fetch(url);
       if (requestKeyRef.current !== startedFor) return;

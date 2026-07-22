@@ -13,7 +13,13 @@ function norm(s: string): Status {
 // Task* family) are thin adapters around this; only the chip label differs.
 // `todos` is already normalized to the {content, status, activeForm?} shape by
 // the adapter, so the renderer stays a pure function of its props.
-export function ChecklistCard({ todos, label }: { todos: ChecklistTodo[]; label: string }) {
+export function ChecklistCard({ todos, label, description, statusText, resultText }: {
+  todos: ChecklistTodo[];
+  label: string;
+  description?: string | null;
+  statusText?: string;
+  resultText?: string;
+}) {
   const n = todos.length;
   const done = todos.filter((t) => norm(t.status) === 'completed').length;
   const current = todos.find((t) => norm(t.status) === 'in_progress')
@@ -34,6 +40,7 @@ export function ChecklistCard({ todos, label }: { todos: ChecklistTodo[]; label:
         <span className="conv-todo-preview">{preview}</span>
         <span className="conv-todo-minibar" aria-hidden="true"><i style={{ width: `${pct}%` }} /></span>
         <span className="conv-todo-frac">{done} / {n}</span>
+        {statusText && <span className="conv-chip-status">· {statusText}</span>}
       </summary>
       <div className="conv-todo-body">
         <div className="conv-todo-head">
@@ -41,6 +48,7 @@ export function ChecklistCard({ todos, label }: { todos: ChecklistTodo[]; label:
           <CopyButton text={copyText} />
         </div>
         <div className="conv-todo-bar" aria-hidden="true"><i style={{ width: `${pct}%` }} /></div>
+        {description && <p className="conv-native-plan-explanation">{description}</p>}
         <ul className="conv-todo-items">
           {todos.map((t, i) => {
             const s = norm(t.status);
@@ -57,6 +65,7 @@ export function ChecklistCard({ todos, label }: { todos: ChecklistTodo[]; label:
             );
           })}
         </ul>
+        {resultText && <div className="conv-native-plan-result">{resultText}</div>}
       </div>
     </details>
   );

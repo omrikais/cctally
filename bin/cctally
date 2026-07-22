@@ -1131,6 +1131,10 @@ _UPDATE_CHECK_TTL_HOURS_MIN = _cctally_update._UPDATE_CHECK_TTL_HOURS_MIN
 _UPDATE_CHECK_TTL_HOURS_MAX = _cctally_update._UPDATE_CHECK_TTL_HOURS_MAX
 _normalize_update_check_enabled_value = _cctally_update._normalize_update_check_enabled_value
 _validate_update_check_ttl_hours_value = _cctally_update._validate_update_check_ttl_hours_value
+UPDATE_CHANNELS = _cctally_update.UPDATE_CHANNELS
+UPDATE_CHANNEL_DEFAULT = _cctally_update.UPDATE_CHANNEL_DEFAULT
+_validate_update_channel_value = _cctally_update._validate_update_channel_value
+resolve_update_channel = _cctally_update.resolve_update_channel
 _UPDATE_STATE_SCHEMA_MAX = _cctally_update._UPDATE_STATE_SCHEMA_MAX
 _UPDATE_SUPPRESS_SCHEMA_MAX = _cctally_update._UPDATE_SUPPRESS_SCHEMA_MAX
 _load_update_state = _cctally_update._load_update_state
@@ -1153,6 +1157,9 @@ _BREW_VERSION_RE_LIST = _cctally_update._BREW_VERSION_RE_LIST
 _update_user_agent = _cctally_update._update_user_agent
 _fetch_url = _cctally_update._fetch_url
 _check_npm_latest_version = _cctally_update._check_npm_latest_version
+_fetch_npm_dist_tag_version = _cctally_update._fetch_npm_dist_tag_version
+_resolve_npm_channel_target = _cctally_update._resolve_npm_channel_target
+_semver_or_parse_error = _cctally_update._semver_or_parse_error
 _check_brew_latest_version = _cctally_update._check_brew_latest_version
 _is_update_check_due = _cctally_update._is_update_check_due
 _do_update_check = _cctally_update._do_update_check
@@ -1162,6 +1169,9 @@ _spawn_background_telemetry_beat = _cctally_update._spawn_background_telemetry_b
 cmd_telemetry_beat_internal = _cctally_update.cmd_telemetry_beat_internal
 SKIP_USE_STATE_LATEST = _cctally_update.SKIP_USE_STATE_LATEST
 _format_update_command = _cctally_update._format_update_command
+BREW_BETA_ADVISORY = _cctally_update.BREW_BETA_ADVISORY
+_resolved_install_target = _cctally_update._resolved_install_target
+_resolved_update_command = _cctally_update._resolved_update_command
 _prerelease_note = _cctally_update._prerelease_note
 _format_update_check_json = _cctally_update._format_update_check_json
 _UPDATE_METHOD_HUMAN_LABEL = _cctally_update._UPDATE_METHOD_HUMAN_LABEL
@@ -1630,6 +1640,14 @@ UPDATE_LOG_ROTATE_BYTES   = 1024 * 1024  # 1 MB; spec §1.5
 UPDATE_NPM_REGISTRY_URL = os.environ.get(
     "CCTALLY_TEST_UPDATE_NPM_URL",
     "https://registry.npmjs.org/cctally/latest",
+)
+# Beta dist-tag endpoint (beta-channel, spec 2026-07-21 §3). The client
+# resolves the beta target as SemVer-max(dist-tags.beta, dist-tags.latest);
+# an exact 404 here means the `beta` dist-tag is not yet published
+# (transition window → fall back to latest). Env-overridable for fixtures.
+UPDATE_NPM_BETA_REGISTRY_URL = os.environ.get(
+    "CCTALLY_TEST_UPDATE_NPM_BETA_URL",
+    "https://registry.npmjs.org/cctally/beta",
 )
 UPDATE_BREW_FORMULA_URL = os.environ.get(
     "CCTALLY_TEST_UPDATE_BREW_URL",
@@ -2936,6 +2954,18 @@ _RESET_ZERO_MIN_DROP_PCT            = _cctally_weekrefs._RESET_ZERO_MIN_DROP_PCT
 _is_reset_drop                      = _cctally_weekrefs._is_reset_drop
 
 
+# Eager re-export of bin/_cctally_milestone_history.py — the hero-modal
+# historical milestone navigation glue (week/cycle index + week/cycle detail).
+# Reached via `c.` from the envelope build, the source build, and the
+# /api/milestones route handler. Refs get their impure cctally symbols via the
+# module's own call-time _cctally() accessor, so load order is irrelevant.
+_cctally_milestone_history = _load_sibling("_cctally_milestone_history")
+build_claude_week_index  = _cctally_milestone_history.build_claude_week_index
+build_claude_week_detail = _cctally_milestone_history.build_claude_week_detail
+build_codex_cycle_index  = _cctally_milestone_history.build_codex_cycle_index
+build_codex_cycle_detail = _cctally_milestone_history.build_codex_cycle_detail
+
+
 # Eager re-export of bin/_cctally_percent_breakdown.py — the percent-breakdown
 # handler (C8, #125 Batch B). Parser dispatch reaches c.cmd_percent_breakdown.
 _cctally_percent_breakdown = _load_sibling("_cctally_percent_breakdown")
@@ -3080,6 +3110,7 @@ _tui_sparkline_big = _cctally_tui._tui_sparkline_big
 _tui_width_bucket = _cctally_tui._tui_width_bucket
 # Snapshot builders (per-panel + orchestrator + empty)
 _tui_build_percent_milestones = _cctally_tui._tui_build_percent_milestones
+_tui_build_five_hour_milestones = _cctally_tui._tui_build_five_hour_milestones  # milestone-history week detail c.
 _tui_build_current_week = _cctally_tui._tui_build_current_week
 _tui_build_forecast = _cctally_tui._tui_build_forecast
 _tui_build_trend = _cctally_tui._tui_build_trend

@@ -261,9 +261,9 @@ const editBlock = (name = 'Edit'): ConversationBlock => ({
   tool_use_id: 't',
   result: { text: 'ok', truncated: false, is_error: false },
 });
-const bashBlock = (): ConversationBlock => ({
+const bashBlock = (name = 'Bash'): ConversationBlock => ({
   kind: 'tool_call',
-  name: 'Bash',
+  name,
   input_summary: '{}',
   preview: 'ls',
   tool_use_id: 't',
@@ -281,6 +281,12 @@ const writeAssistant = itemNode(
 );
 const bashAssistant = itemNode(
   item({ uuid: 'ba', kind: 'assistant', text: 'bash', blocks: [bashBlock()] } as never),
+);
+const codexExecAssistant = itemNode(
+  item({ uuid: 'cx', kind: 'assistant', text: 'exec', blocks: [bashBlock('exec')] } as never),
+);
+const codexPatchAssistant = itemNode(
+  item({ uuid: 'cp', kind: 'assistant', text: 'patch', blocks: [editBlock('apply_patch')] } as never),
 );
 const readAssistant = itemNode(
   item({ uuid: 'rd', kind: 'assistant', text: 'read', blocks: [okToolBlock()] } as never),
@@ -302,6 +308,10 @@ describe('applyFocusMode — edits mode', () => {
     expect(kept(nodes, 'edits')).toEqual(['ed', 'me', 'wr']);
   });
 
+  it('classifies provider-native Codex patch calls as edits without renaming them', () => {
+    expect(kept([codexPatchAssistant, codexExecAssistant], 'edits')).toEqual(['cp']);
+  });
+
   it('keeps a subagent whose descendant has an edit tool', () => {
     expect(kept([subagentWithEdit, subagentOk], 'edits')).toEqual(['sue']);
   });
@@ -315,6 +325,10 @@ describe('applyFocusMode — bash mode', () => {
   it('keeps Bash turns only', () => {
     const nodes = [human, bashAssistant, editAssistant, readAssistant];
     expect(kept(nodes, 'bash')).toEqual(['ba']);
+  });
+
+  it('classifies provider-native Codex exec calls as bash without renaming them', () => {
+    expect(kept([codexExecAssistant, codexPatchAssistant], 'bash')).toEqual(['cx']);
   });
 });
 

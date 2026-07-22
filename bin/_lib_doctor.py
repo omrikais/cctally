@@ -234,6 +234,13 @@ class DoctorState:
     # retained corpus from unreadable metadata.
     codex_project_metadata_health: Optional[dict] = None
     codex_project_metadata_error: Optional[str] = None
+    # Beta-channel (spec 2026-07-21 §3): the configured RELEASE channel
+    # (stable|beta) that `cctally update` tracks — DISTINCT from the preview
+    # `channel` (prod|preview) above. Populated by doctor_gather_state from a
+    # raw config read (fail-soft to "stable"). Drives the `install.update_channel`
+    # check (WARN on beta+brew, else OK). Defaulted (placed last) so existing
+    # constructors stay valid and default to the stable posture.
+    update_channel: str = "stable"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -442,6 +449,36 @@ def _check_install_dev_mode(s: DoctorState) -> CheckResult:
             "app_dir": s.app_dir,
             "channel": s.channel,
         },
+    )
+
+
+def _check_install_update_channel(s: DoctorState) -> CheckResult:
+    """Report the configured update (release) channel alongside the install
+    method (beta-channel, spec 2026-07-21 §3).
+
+    DISTINCT from the preview `channel` in install.mode: this reports the
+    `update.channel` config leaf (stable|beta) that `cctally update` tracks.
+    WARN on the brew+beta mismatch — Homebrew IS the stable channel (Q2), so
+    a beta opt-in on brew silently resolves stable; the WARN makes that
+    explicit and actionable. Otherwise always OK (a diagnostic surface, never
+    a hard failure — doctor exits 2 only on FAIL)."""
+    channel = s.update_channel or "stable"
+    if channel == "beta" and s.install_is_brew:
+        return CheckResult(
+            id="install.update_channel", title="Update channel",
+            severity="warn",
+            summary="beta (unavailable on Homebrew — installs track stable)",
+            remediation=(
+                "Homebrew tracks stable only. Install via npm or source to "
+                "receive beta releases, or run "
+                "`cctally config set update.channel stable`."
+            ),
+            details={"channel": channel, "method": "brew"},
+        )
+    return CheckResult(
+        id="install.update_channel", title="Update channel",
+        severity="ok", summary=channel, remediation=None,
+        details={"channel": channel},
     )
 
 
@@ -1830,6 +1867,7 @@ def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
 _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("install", "Install", (
         ("install.mode", "_check_install_dev_mode"),
+        ("install.update_channel", "_check_install_update_channel"),
         ("install.symlinks", "_check_install_symlinks"),
         ("install.path", "_check_install_path"),
         ("install.legacy_snippet", "_check_install_legacy_snippet"),

@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import {
   toolIcon, ThinkingIcon, FileSearchIcon, TerminalIcon, ToolGenericIcon, LinkIcon,
   SpinnerIcon, QuestionIcon, PlanIcon, GlobeIcon, SearchIcon, PlugIcon,
-  BrowserWindowIcon, ChromeIcon, CodexIcon, MonitorIcon, mcpServerIcon,
+  BrowserWindowIcon, ChromeIcon, CodexIcon, MonitorIcon, PencilIcon, mcpServerIcon,
 } from './ConvIcons';
 
 function svgOf(el: ReactNode) {
@@ -25,6 +25,9 @@ describe('ConvIcons', () => {
     expect(svgOf(toolIcon('Read'))!.outerHTML).toBe(svgOf(<FileSearchIcon />)!.outerHTML);
     expect(svgOf(toolIcon('grep'))!.outerHTML).toBe(svgOf(<FileSearchIcon />)!.outerHTML);
     expect(svgOf(toolIcon('BASH'))!.outerHTML).toBe(svgOf(<TerminalIcon />)!.outerHTML);
+    expect(svgOf(toolIcon('exec'))!.outerHTML).toBe(svgOf(<TerminalIcon />)!.outerHTML);
+    expect(svgOf(toolIcon('apply_patch'))!.outerHTML).toBe(svgOf(<PencilIcon />)!.outerHTML);
+    expect(svgOf(toolIcon('patch_apply_end'))!.outerHTML).toBe(svgOf(<PencilIcon />)!.outerHTML);
   });
 
   it('toolIcon falls back to the generic glyph for unknown tools', () => {

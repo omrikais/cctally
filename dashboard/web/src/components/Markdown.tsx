@@ -22,6 +22,22 @@ export function MdLink({ href, children, ...rest }: ComponentPropsWithoutRef<'a'
   );
 }
 
+function isUnavailableLocalImage(src: string | undefined): boolean {
+  if (!src) return true;
+  const value = src.trim();
+  return value.startsWith('/')
+    || value.toLowerCase().startsWith('file:')
+    || /^[a-z]:[\\/]/i.test(value)
+    || value.toLowerCase() === 'url:0';
+}
+
+function MdImage({ src, alt: _alt, title: _title, ...rest }: ComponentPropsWithoutRef<'img'>) {
+  if (isUnavailableLocalImage(src)) {
+    return <span className="conv-local-media-unavailable" role="note">local screenshot unavailable</span>;
+  }
+  return <img {...rest} src={src} alt={_alt ?? ''} title={_title} loading="lazy" />;
+}
+
 // Pull the raw text out of a react-markdown <code> child's hast node. Its
 // children are hast text nodes; concatenating their values yields the fence
 // body verbatim (no markup), which CodeBlock then tokenizes.
@@ -66,7 +82,7 @@ export function Markdown({ children, components }: { children: string; component
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={rehypePlugins}
-        components={{ a: MdLink, pre: PreBlock, ...components }}
+        components={{ a: MdLink, img: MdImage, pre: PreBlock, ...components }}
       >
         {children}
       </ReactMarkdown>

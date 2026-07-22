@@ -55,7 +55,9 @@ export function WebSearchCard({ call }: { call: Call }) {
                 ) : (
                   <span>{l.title}</span>
                 )}
-                <span className="conv-web-link-domain">{domainOf(l.url) || l.url}</span>
+                <span className="conv-web-link-domain">{domainOf(l.url) || l.domain || l.url}</span>
+                {l.snippet && <span className="conv-web-link-snippet">{l.snippet}</span>}
+                {l.ref_id && <span className="conv-web-link-ref">{l.ref_id}</span>}
               </div>
             ))}
             {!showAll && links.length > INITIAL_LINKS && (

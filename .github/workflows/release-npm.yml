@@ -39,11 +39,16 @@ jobs:
 
       - name: Derive dist-tag
         id: tag
+        # Beta-channel model (spec 2026-07-21-beta-channel-design.md §1):
+        # every stable-form cut publishes under the `beta` dist-tag — the
+        # cut lands in the beta channel, and nothing at cut time moves
+        # `latest` (promotion owns that). `-id.N` prerelease forms keep the
+        # `next` escape-hatch tag (Q3 rc lane).
         run: |
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             echo "dist=next" >> "$GITHUB_OUTPUT"
           else
-            echo "dist=latest" >> "$GITHUB_OUTPUT"
+            echo "dist=beta" >> "$GITHUB_OUTPUT"
           fi
 
       - name: npm publish

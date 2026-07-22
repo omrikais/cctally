@@ -1057,7 +1057,7 @@ def _handle_get_conversation_payload_impl(handler, path: str) -> None:
     q = _u.parse_qs(handler.path.partition("?")[2])
     if session_id.startswith("v1."):
         # Qualified payload readback (§3.4): Codex uses block_key + which={call,
-        # output}; a v1.claude key keeps the tool_use_id + which={input,result}
+        # output,event}; a v1.claude key keeps the tool_use_id + which={input,result}
         # selector. neutral_payload picks per the resolved source; gone → 410.
         which_q = _qs_str(q, "which", "")
         tool_use_id_q = _qs_str(q, "tool_use_id", "") or None

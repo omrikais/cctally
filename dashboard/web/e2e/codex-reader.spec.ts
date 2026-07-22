@@ -11,7 +11,7 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
 
   const sourceSwitch = page.locator('.conv-rail-source');
   await sourceSwitch.getByRole('button', { name: 'Codex', exact: true }).click();
-  await expect(page.locator('.conv-rail-row')).toHaveCount(5);
+  await expect(page.locator('.conv-rail-row')).toHaveCount(8);
 
   const modern = page.locator('.conv-rail-row').filter({ hasText: 'Synthetic first meaningful user prompt' });
   await modern.click();
@@ -19,9 +19,9 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
   await expect(page.locator('.conv-provider-strip')).toContainText('cached in 300');
   await expect(page.locator('.conv-provider-strip')).toContainText('reasoning out 100');
   await expect(page.locator('.conv-provider-strip')).toContainText('media unavailable');
-  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(9);
-  await expect(page.locator('.conv-chip--thinking summary .conv-chip-preview').filter({ hasText: 'Synthetic agent reasoning' })).toBeVisible();
-  await expect(page.locator('.conv-meta-preview').filter({ hasText: 'patch_apply synthetic.txt' })).toBeVisible();
+  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(8);
+  await expect(page.locator('.conv-codex-reasoning').filter({ hasText: 'Synthetic agent reasoning' })).toBeVisible();
+  await expect(page.locator('.conv-native-patch').filter({ hasText: 'synthetic.txt' })).toBeVisible();
 
   const outlineToggle = page.getByRole('button', { name: 'Toggle session outline' });
   if (await outlineToggle.getAttribute('aria-pressed') === 'false') await outlineToggle.click();
@@ -58,7 +58,7 @@ test('qualified Codex live-tail appends without duplicating the retained window'
   await page.goto('/#/conversations');
   await page.locator('.conv-rail-source').getByRole('button', { name: 'Codex', exact: true }).click();
   await page.locator('.conv-rail-row').filter({ hasText: 'Synthetic first meaningful user prompt' }).click();
-  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(9);
+  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(8);
 
   appendFileSync(MODERN_ROLLOUT, `${JSON.stringify({
     payload: {
@@ -69,7 +69,7 @@ test('qualified Codex live-tail appends without duplicating the retained window'
   })}\n`);
 
   await expect(page.locator('.conv-reader-body p').filter({ hasText: 'Synthetic live-tail event' })).toBeVisible({ timeout: 12_000 });
-  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(10);
+  await expect(page.locator('.conv-reader-item[data-item-index]')).toHaveCount(9);
 });
 
 test('All composes qualified sources locally and collision state stays isolated', async ({ page }) => {
@@ -86,7 +86,7 @@ test('All composes qualified sources locally and collision state stays isolated'
   await page.goto('/#/conversations');
   await page.locator('.conv-rail-source').getByRole('button', { name: 'All', exact: true }).click();
 
-  await expect(page.locator('.conv-rail-row')).toHaveCount(11);
+  await expect(page.locator('.conv-rail-row')).toHaveCount(16);
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root A red prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root B blue prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Claude seed user prompt distinct from codex' })).toBeVisible();

@@ -7,6 +7,7 @@ import { LoadFull } from './LoadFull';
 import { highlightBody } from './CodeBlock';
 import { useFindSplit } from './findMark';
 import { useCopy } from './useCopy';
+import { NativePayloadDisclosure } from './NativePayloadDisclosure';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -71,18 +72,38 @@ export function BashCard({ call }: { call: Call }) {
   // load-full (it's precisely when the user asked to see MORE).
   const [full, setFull] = useState<{ text: string; stderr: string | null | undefined } | null>(null);
 
-  const command = commandOf(call);
+  const native = call.native_card?.type === 'terminal' ? call.native_card : null;
+  const commands = native?.commands ?? [{
+    command: commandOf(call),
+    workdir: typeof (call.input as { workdir?: unknown } | null | undefined)?.workdir === 'string'
+      ? (call.input as { workdir: string }).workdir
+      : null,
+    metadata: {},
+  }];
+  const command = commands.map((entry) => entry.command).join('\n');
   const result = call.result;
-  const isError = result?.is_error === true;
-  const interrupted = call.interrupted === true;
+  const nativeOutput = native?.output;
+  const isError = nativeOutput?.is_error === true || result?.is_error === true;
+  const interrupted = call.interrupted === true || native?.status === 'interrupted';
 
   // After load-full, re-split the LOADED text against the LOADED stderr (same
   // splitStreams contract as the bounded path); before, split the capped
   // result.text against the block-level call.stderr.
   const rawText = full?.text ?? result?.text ?? '';
-  const { stdout, stderr } = full == null
+  const nativeStdout = nativeOutput?.parts
+    .filter((part) => part.type === 'text' && part.stream !== 'stderr')
+    .map((part) => part.text).join('');
+  const nativeStderr = nativeOutput?.parts
+    .filter((part) => part.type === 'text' && part.stream === 'stderr')
+    .map((part) => part.text).join('');
+  const rawParts = nativeOutput?.parts.filter((part) => part.type === 'raw') ?? [];
+  const legacyStreams = full == null
     ? splitStreams(rawText, call.stderr)
     : splitStreams(rawText, full.stderr);
+  const stdout = full == null && nativeOutput ? nativeStdout ?? '' : legacyStreams.stdout;
+  const stderr = full == null && nativeOutput
+    ? (nativeStderr && nativeStderr.length > 0 ? nativeStderr : null)
+    : legacyStreams.stderr;
 
   const badge = isError ? (
     <span className="conv-term-badge conv-term-badge--err">● error</span>
@@ -102,7 +123,8 @@ export function BashCard({ call }: { call: Call }) {
     result == null
       ? 0
       : (stdout.length > 0 ? stdout.split('\n').length : 0) +
-        (stderr != null && stderr.length > 0 ? stderr.split('\n').length : 0);
+        (stderr != null && stderr.length > 0 ? stderr.split('\n').length : 0) +
+        rawParts.reduce((total, part) => total + Math.max(1, part.text.split('\n').length), 0);
   const collapseLong = outputLineCount > COLLAPSE_LINE_THRESHOLD;
 
   return (
@@ -110,7 +132,7 @@ export function BashCard({ call }: { call: Call }) {
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         <TerminalIcon />
-        <span className="conv-chip-name">Bash</span>
+        <span className="conv-chip-name">{native ? call.name ?? 'exec' : 'Bash'}</span>
         <span className="conv-chip-preview">{descriptionOf(call) ?? call.preview}</span>
         {badge}
         {/* #217 S3 E9 — collapsed-by-default hint; the disclosure arrow already
@@ -145,12 +167,17 @@ export function BashCard({ call }: { call: Call }) {
             {copiedFull ? '✓ full' : 'copy full'}
           </button>
         </div>
-        <pre className="conv-term-cmd conv-code--hl">
-          <span className="conv-term-prompt" aria-hidden="true">
-            ${' '}
-          </span>
-          {highlightBody(command, 'bash', split)}
-        </pre>
+        {commands.map((entry, index) => (
+          <div className="conv-term-command" key={`${index}-${entry.command}`}>
+            {entry.workdir && <div className="conv-term-workdir">{entry.workdir}</div>}
+            <pre className="conv-term-cmd conv-code--hl">
+              <span className="conv-term-prompt" aria-hidden="true">
+                ${' '}
+              </span>
+              {highlightBody(entry.command, 'bash', split)}
+            </pre>
+          </div>
+        ))}
         {result && (
           <>
             {/* Empty stdout + interrupted → the badge is the whole story; skip an
@@ -165,6 +192,12 @@ export function BashCard({ call }: { call: Call }) {
                 <AnsiText text={stderr} />
               </pre>
             )}
+            {full == null && rawParts.map((part, index) => (
+              <pre className="conv-term-raw" key={`${index}-${part.text.slice(0, 24)}`}>
+                <span className="conv-term-raw-label">unparsed output</span>{'\n'}
+                {part.text}
+              </pre>
+            ))}
             {result.truncated && full == null && (
               <LoadFull
                 toolUseId={call.tool_use_id ?? ''}
@@ -178,7 +211,18 @@ export function BashCard({ call }: { call: Call }) {
                 }}
               />
             )}
+            {native && call.tool_use_id && (
+              <div className="conv-native-raw-actions">
+                <NativePayloadDisclosure blockKey={call.tool_use_id} which="input" label="request" />
+                <NativePayloadDisclosure blockKey={call.tool_use_id} which="result" label="output" />
+              </div>
+            )}
           </>
+        )}
+        {native && result == null && call.tool_use_id && (
+          <div className="conv-native-raw-actions">
+            <NativePayloadDisclosure blockKey={call.tool_use_id} which="input" label="request" />
+          </div>
         )}
       </div>
     </details>

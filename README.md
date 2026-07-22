@@ -49,6 +49,8 @@ cctally dashboard          # opens http://127.0.0.1:8789
 
 For status-line integration and tuning, see [docs/installation.md](docs/installation.md) and [docs/configuration.md](docs/configuration.md).
 
+**Beta channel (opt-in).** Every release ships to a beta channel first; the maintainer promotes the ones that prove out to stable, which is the default. To ride along with the newest builds as they land, opt in with `cctally config set update.channel beta` (npm or source installs — Homebrew tracks stable). `cctally update` then installs the exact latest beta version, and `cctally config set update.channel stable` flips you back cleanly with no silent downgrade. See [docs/commands/update.md](docs/commands/update.md#beta-channel).
+
 ## The live dashboard
 
 `cctally dashboard` serves a web app at `localhost:8789` that updates live as you work - no refresh, no polling. Eleven panels cover the whole picture: **current week**, **forecast**, **$/1% trend**, **recent sessions**, **weekly**, **monthly**, **5-hour blocks**, **daily heatmap**, **projects**, **cache report**, and **recent alerts**. Any panel expands into a focused view, sessions are filterable and searchable, and a settings drawer tunes alerts and display options on the fly. It runs only on your own machine by default; one flag opens it to the other devices on your network when you want that.

@@ -1287,6 +1287,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     update_envelope = {
         "state":    _update_state_envelope,
         "suppress": _update_suppress_envelope,
+        # Beta-channel (spec 2026-07-21 §3): the configured release channel,
+        # derived DIRECTLY from config (never from cached state — a cached
+        # producer field can't seed the settings toggle after a failed fetch
+        # or on brew). The resolved-target fields (latest_version /
+        # resolved_dist_tag / latest_version_channel) ride inside `state`.
+        "configured_channel": sys.modules["cctally"].resolve_update_channel(config),
     }
 
     # Doctor aggregate block (spec §5.5). Only the small severity tree
@@ -1427,6 +1433,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                 # bound or the data source crashed during sync
                 # (recorded on ``last_sync_error``).
                 "five_hour_milestones":     getattr(snap, "five_hour_milestones", []) or [],
+                # Hero-modal historical-milestone navigation index (spec §3).
+                # Additive/optional: newest-first per-week entries built on the
+                # non-idle rebuild and stored on the snapshot; ``getattr``
+                # default keeps legacy/positional fixture snapshots serializing
+                # (they emit ``[]``). Historical rows never ride the envelope.
+                "week_index":               getattr(snap, "week_index", []) or [],
             },
 
         "forecast":

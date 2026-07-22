@@ -88,7 +88,20 @@
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
     "spent_usd": 0.0,
-    "used_pct": 12.0
+    "used_pct": 12.0,
+    "week_index": [
+      {
+        "block_count": 1,
+        "detail_stamp": "8f095767bd1f1d6e",
+        "end_at_utc": "2026-04-20T14:00:00Z",
+        "is_current": true,
+        "key": "2026-04-13",
+        "label": "Apr 13\u2013Apr 20",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-04-13T14:00:00Z"
+      }
+    ]
   },
   "daily": {
     "peak": null,
@@ -363,7 +376,20 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 7200,
                 "spent_usd": 0.0,
-                "used_pct": 12.0
+                "used_pct": 12.0,
+                "week_index": [
+                  {
+                    "block_count": 1,
+                    "detail_stamp": "8f095767bd1f1d6e",
+                    "end_at_utc": "2026-04-20T14:00:00Z",
+                    "is_current": true,
+                    "key": "2026-04-13",
+                    "label": "Apr 13\u2013Apr 20",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-04-13T14:00:00Z"
+                  }
+                ]
               },
               "forecast": {
                 "budget_100_per_day_usd": 0.0,
@@ -543,7 +569,20 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 7200,
                 "spent_usd": 0.0,
-                "used_pct": 12.0
+                "used_pct": 12.0,
+                "week_index": [
+                  {
+                    "block_count": 1,
+                    "detail_stamp": "8f095767bd1f1d6e",
+                    "end_at_utc": "2026-04-20T14:00:00Z",
+                    "is_current": true,
+                    "key": "2026-04-13",
+                    "label": "Apr 13\u2013Apr 20",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-04-13T14:00:00Z"
+                  }
+                ]
               },
               "five_hour_milestones": [],
               "milestones": []
@@ -640,6 +679,7 @@
             },
             "quota": {
               "blocks": [],
+              "cycle_index": [],
               "histories": [],
               "milestones": [],
               "summary": {
@@ -816,7 +856,20 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 7200,
             "spent_usd": 0.0,
-            "used_pct": 12.0
+            "used_pct": 12.0,
+            "week_index": [
+              {
+                "block_count": 1,
+                "detail_stamp": "8f095767bd1f1d6e",
+                "end_at_utc": "2026-04-20T14:00:00Z",
+                "is_current": true,
+                "key": "2026-04-13",
+                "label": "Apr 13\u2013Apr 20",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-04-13T14:00:00Z"
+              }
+            ]
           },
           "forecast": {
             "budget_100_per_day_usd": 0.0,
@@ -996,7 +1049,20 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 7200,
             "spent_usd": 0.0,
-            "used_pct": 12.0
+            "used_pct": 12.0,
+            "week_index": [
+              {
+                "block_count": 1,
+                "detail_stamp": "8f095767bd1f1d6e",
+                "end_at_utc": "2026-04-20T14:00:00Z",
+                "is_current": true,
+                "key": "2026-04-13",
+                "label": "Apr 13\u2013Apr 20",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-04-13T14:00:00Z"
+              }
+            ]
           },
           "five_hour_milestones": [],
           "milestones": []
@@ -1142,6 +1208,7 @@
         },
         "quota": {
           "blocks": [],
+          "cycle_index": [],
           "histories": [],
           "milestones": [],
           "summary": {

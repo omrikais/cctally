@@ -67,10 +67,6 @@ Synthetic agent message
 
 _Cost: $MONEY · input 1200 · output 400 · cached_input 300 · reasoning_output 100_
 
-## 🗓 Event  ·  2026-07-14T12:07:00Z
-
-> 🗓 task_started
-
 ## 🗓 Event  ·  2026-07-14T12:08:00Z
 
 > 🗓 task_complete done

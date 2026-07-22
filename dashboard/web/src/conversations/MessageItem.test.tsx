@@ -710,6 +710,32 @@ describe('MessageItem (message-text copy, G2)', () => {
     expect(container.querySelector('.conv-meta-preview')!.textContent).toContain('## Git Context');
   });
 
+  it('renders provider-qualified context and event labels instead of blanket fallback copy', () => {
+    const role = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'codex-role', id: 21 }, member_uuids: ['codex-role'], ts: 't',
+      text: 'You are /root.', blocks: [{ kind: 'text', text: 'You are /root.' }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'context', skill_name: null, meta_label: 'role', meta_sections: ['agents'],
+    } as ConversationItem;
+    const started = {
+      ...role,
+      anchor: { session_id: 's', uuid: 'codex-started', id: 22 }, member_uuids: ['codex-started'],
+      text: 'task_started', blocks: [{ kind: 'text', text: 'task_started' }],
+      meta_kind: 'notification', meta_label: 'task_started', meta_sections: undefined,
+    } as ConversationItem;
+
+    const roleRender = render(<MessageItem item={role} />);
+    expect(roleRender.container.textContent).toContain('Role instructions');
+    expect(roleRender.container.textContent).toContain('agents');
+    expect(roleRender.container.textContent).not.toContain('Injected context');
+    roleRender.unmount();
+
+    const eventRender = render(<MessageItem item={started} />);
+    expect(eventRender.container.textContent).toContain('Task started');
+    expect(eventRender.container.textContent).not.toContain('Background task');
+  });
+
   it('gives a meta row no spine role-dot class (--human/--assistant only)', () => {
     const { container } = render(<MessageItem item={metaSkill} />);
     expect(container.querySelector('.conv-item--human')).toBeNull();
@@ -1003,6 +1029,7 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
     expect(container.querySelector('details.conv-meta--notification')).not.toBeNull();
     expect(container.textContent).toContain('Background task');
     expect(container.textContent).toContain('Run tests completed (exit code 0)');
+    expect(container.querySelector('.conv-meta-label')).toHaveAttribute('title', 'Background task');
   });
 });
 

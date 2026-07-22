@@ -6,9 +6,11 @@ import {
   defaultPrefs,
   selectMarkersEnabled,
   selectLiveTailEnabled,
+  selectConfiguredChannel,
   subscribeStore,
   SESSION_SORT_KEYS,
   type SessionSortKey,
+  type UpdateChannel,
 } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
@@ -181,6 +183,15 @@ export function SettingsOverlay() {
     selectLiveTailEnabled(getState()),
   );
   const [liveTail, setLiveTail] = useState<boolean>(liveTailServer);
+  // Beta-channel (spec 2026-07-21 §3): the configured release channel toggle.
+  // Same plumbing as liveTail — seeds from the SSE-mirrored update slice,
+  // dirties independently, and travels in its OWN `update` block on the
+  // combined Save POST. selectConfiguredChannel does the absent-field
+  // defaulting so the toggle never reads undefined.
+  const channelServer = useSyncExternalStore(subscribeStore, () =>
+    selectConfiguredChannel(getState()),
+  );
+  const [updateChannel, setUpdateChannel] = useState<UpdateChannel>(channelServer);
   const [testSubmitting, setTestSubmitting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   // #207 D4: inline success confirmation for the happy path (dispatch ===
@@ -217,6 +228,7 @@ export function SettingsOverlay() {
   const lastSeenNotifier = useRef<NotifierKind>(alertsConfig.notifier ?? 'auto');
   const lastSeenMarkers = useRef<boolean>(markersEnabledServer);
   const lastSeenLiveTail = useRef<boolean>(liveTailServer);
+  const lastSeenChannel = useRef<UpdateChannel>(channelServer);
   const wasOpen = useRef<boolean>(false);
 
   // #258 — the current TZ *target* the two local states encode, mirrored into a
@@ -276,6 +288,11 @@ export function SettingsOverlay() {
     reconcile(setLiveTail, lastSeenLiveTail, liveTailServer);
   }, [liveTailServer]);
 
+  // Beta-channel — guarded update-channel re-seed (same posture as liveTail).
+  useEffect(() => {
+    reconcile(setUpdateChannel, lastSeenChannel, channelServer);
+  }, [channelServer]);
+
   useKeymap([
     // Parity with main's settings.js#152: don't stack Settings under an
     // open modal. Without this guard, pressing `s` over a modal opens
@@ -332,6 +349,7 @@ export function SettingsOverlay() {
       setNotifier(alertsConfig.notifier ?? 'auto');
       setCacheMarkers(markersEnabledServer);
       setLiveTail(liveTailServer);
+      setUpdateChannel(channelServer);
       setTestError(null);
       setTestOk(false);
       setTestAxis('weekly');
@@ -352,6 +370,7 @@ export function SettingsOverlay() {
       lastSeenNotifier.current = alertsConfig.notifier ?? 'auto';
       lastSeenMarkers.current = markersEnabledServer;
       lastSeenLiveTail.current = liveTailServer;
+      lastSeenChannel.current = channelServer;
     }
     wasOpen.current = open;
   }, [
@@ -369,6 +388,7 @@ export function SettingsOverlay() {
     alertsConfig.notifier,
     markersEnabledServer,
     liveTailServer,
+    channelServer,
   ]);
 
   // a11y focus management (#207 A1). Settings is a local-state surface; it is
@@ -447,6 +467,9 @@ export function SettingsOverlay() {
   // live-tail spec §4.2 — dirty against the SSE-mirrored server value. Rides the
   // SAME `dashboard` block as cacheMarkers (both leaves, one block).
   const liveTailDirty = liveTail !== liveTailServer;
+  // Beta-channel (spec 2026-07-21 §3): dirty against the SSE-mirrored channel.
+  // Rides its OWN `update` block on the combined Save POST.
+  const channelDirty = updateChannel !== channelServer;
   // Notifier (Phase B): dirty against the mirrored value (default 'auto').
   // `commandConfigured` gates the "Custom command" option — when the server
   // has no `command_template`, picking 'command' would dispatch nothing, so
@@ -472,7 +495,7 @@ export function SettingsOverlay() {
   const dirtyFlags = [
     tzDirty, alertsDirty, projectedWeeklyDirty, notifierDirty,
     projectedBudgetDirty, projectAlertsDirty, codexBudgetAlertsDirty, codexProjectedDirty,
-    cacheMarkersDirty, liveTailDirty, sortDirty, perPageDirty, filterDirty,
+    cacheMarkersDirty, liveTailDirty, channelDirty, sortDirty, perPageDirty, filterDirty,
     resetTableSortStaged, resetCardOrderStaged,
   ];
   const dirtyCount = dirtyFlags.filter(Boolean).length;
@@ -555,6 +578,12 @@ export function SettingsOverlay() {
         ...(cacheMarkersDirty ? { cache_failure_markers: cacheMarkers } : {}),
         ...(liveTailDirty ? { live_tail: liveTail } : {}),
       };
+    }
+    // Beta-channel (spec 2026-07-21 §3): the release channel rides its OWN
+    // `update` block (sibling of the server's update.check leaves). Sent only
+    // when dirty; the server echoes back `update.configured_channel`.
+    if (channelDirty) {
+      body.update = { channel: updateChannel };
     }
     if (Object.keys(body).length > 0) {
       setTzSubmitting(true);
@@ -1055,6 +1084,37 @@ export function SettingsOverlay() {
             <p className="settings-hint">
               Fetch new turns the instant the session's file changes (instead of
               waiting for the periodic refresh). On by default.
+            </p>
+          </fieldset>
+          {/* Beta-channel (spec 2026-07-21 §3): the release channel `cctally
+              update` tracks. Beta gets every release as it ships; stable only
+              the maintainer-promoted ones. Rides its own `update` block on the
+              combined Save POST. Homebrew tracks stable only (Q2). */}
+          <fieldset className={`settings-fs${channelDirty ? ' is-changed' : ''}`}>
+            <legend>Update channel{changedMark(channelDirty)}</legend>
+            <label>
+              <input
+                type="radio"
+                name="update-channel"
+                value="stable"
+                checked={updateChannel === 'stable'}
+                onChange={() => setUpdateChannel('stable')}
+              />{' '}
+              Stable
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="update-channel"
+                value="beta"
+                checked={updateChannel === 'beta'}
+                onChange={() => setUpdateChannel('beta')}
+              />{' '}
+              Beta
+            </label>
+            <p className="settings-hint">
+              Beta receives every release as it ships; stable only the
+              maintainer-promoted ones. Homebrew installs always track stable.
             </p>
           </fieldset>
           <fieldset className={`settings-fs${sortDirty ? ' is-changed' : ''}`}>

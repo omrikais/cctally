@@ -54,7 +54,12 @@ function _prereleaseNote(current: string | null | undefined): string | null {
 export function coerceUpdateState(
   raw: unknown,
   suppress: UpdateSuppress,
+  configuredChannel?: string,
 ): UpdateState | null {
+  // Beta-channel (spec 2026-07-21 §3): the configured release channel is a
+  // SIBLING of `state` in the envelope (never inside the raw state), passed
+  // in here. Absent / any non-"beta" value → "stable".
+  const channel: 'stable' | 'beta' = configuredChannel === 'beta' ? 'beta' : 'stable';
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
   // `_error` sentinel from the server when load failed — surface
@@ -70,6 +75,7 @@ export function coerceUpdateState(
       check_status: 'unavailable',
       checked_at_utc: null,
       prerelease_note: null,
+      configured_channel: channel,
     };
   }
   const current = typeof obj.current_version === 'string' ? obj.current_version : null;
@@ -92,16 +98,25 @@ export function coerceUpdateState(
   const checked_at_utc = typeof obj.checked_at_utc === 'string' ? obj.checked_at_utc : null;
   const release_notes_url = typeof obj.latest_version_url === 'string' ? obj.latest_version_url : null;
   const available = _cookAvailable(current, latest, suppress);
+  // Beta-channel (spec 2026-07-21 §3): on an npm beta channel the install
+  // command pins the EXACT resolved version (state.latest_version, the
+  // resolved max(beta, latest)), never bare @beta/@latest — mirrors the Python
+  // `_resolved_update_command`. Stable/brew stay byte-identical (@latest).
+  const update_command =
+    method === 'npm' && channel === 'beta' && latest
+      ? _formatUpdateCommand('npm', latest)
+      : _formatUpdateCommand(method, null);
   return {
     current_version: current,
     latest_version: latest,
     available,
     method,
-    update_command: _formatUpdateCommand(method, null),
+    update_command,
     release_notes_url,
     check_status,
     checked_at_utc,
     prerelease_note: _prereleaseNote(current),
+    configured_channel: channel,
   };
 }
 
@@ -178,7 +193,7 @@ export async function refreshUpdateState(): Promise<void> {
     if (!r.ok) return;
     const body = await r.json();
     const suppress = coerceUpdateSuppress(body?.suppress);
-    const state = coerceUpdateState(body?.state, suppress);
+    const state = coerceUpdateState(body?.state, suppress, body?.configured_channel);
     dispatch({ type: 'SET_UPDATE_STATE', state, suppress });
     // Auto-close the running/success modal when the post-execvp refresh
     // shows current_version === latest_version (success completed).

@@ -161,6 +161,23 @@ and reading positions key by the opaque `(source, v1 key)` identity. Colliding
 native UUIDs across providers or Codex roots therefore cannot share browser
 state or routes.
 
+The reader also maps validated Codex Card v1 plans, web searches, MCP
+completions, and orchestration operations into shared native cards without
+renaming provider facts. The cards retain ordered plan state, safe result links,
+MCP server/tool/duration/error identity, agent operation state, and raw-payload
+access. Child navigation is derived only from the server-issued opaque
+`child_conversation` proof; ambiguous or absent proof cannot create a link.
+Local/placeholder Markdown image targets are explicitly unavailable and make
+no request, while normal provider-addressed media capabilities remain unchanged.
+
+Qualified items keep the normalization kernel's semantic roles at the React
+boundary: reasoning and tool calls remain assistant activity, standalone tool
+outputs remain results, and injected context, skills, and lifecycle events keep
+their provider labels. The detail reader retains every item, while its outline
+is intentionally navigational—real prompts, logical assistant responses, and
+compactions only. A leading Codex skill-link prompt is displayed as the skill
+name plus prompt text without exposing the local `SKILL.md` target.
+
 Comparison labels both runs by source. Cost and prompt count remain directly
 comparable; tokens, errors, and files are displayed side by side as
 provider-specific rather than assigned a false delta, and duration is marked
@@ -258,7 +275,7 @@ boundary for current-week output, and derive drift digests from Codex state.
 | comparison and navigation UI | supported | supported | S8 | Both runs retain source labels and opaque qualified identities; mixed-provider metrics are compared only where semantics are compatible. |
 | reading position | supported | supported | S8 | `readingPosition.ts` stores source plus opaque qualified key, keeping native-key collisions isolated. |
 | transcript CLI and anonymized/raw export | supported | supported | S7 | Qualified export anonymizes via `build_anon_plan_for_sources`, while `build_anon_plan_for_db` and every bare-Claude call site stay byte-frozen; CLI export byte-matches the HTTP export in both modes. |
-| payload readback and live-tail | supported | supported | S7 | The `block_key` payload selector, plus the qualified live-tail SSE with the budgeted directory-frontier child discovery, degrade only affected capabilities. |
+| payload readback and live-tail | supported | supported | S7 / #331 A-B | The `block_key` selector supports Codex call/output/event payloads (including full structured patch cards); the dashboard consumes validated Card v1 terminal/patch detail while retaining raw payload access and generic future-wrapper fallback. Qualified live-tail SSE uses budgeted directory-frontier child discovery; affected capabilities degrade independently. |
 | media readback | supported | unavailable | S7 | Codex media returns an explicit `capability_unsupported` response until real renderable media is shown to exist in rollouts. |
 
 ### Lifecycle and governance

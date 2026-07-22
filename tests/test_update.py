@@ -1192,6 +1192,333 @@ class TestVersionCheckPipeline:
         assert state["install"]["method"] == "unknown"
 
 
+class TestBetaChannelCheck:
+    """Channel-aware check pipeline (beta-channel, spec 2026-07-21 §3).
+
+    On the npm vector, ``update.channel=beta`` resolves the target as
+    SemVer-max(dist-tags.beta, dist-tags.latest); an exact beta-leg 404
+    means "absent" (transition-window fallback to latest), while ANY other
+    beta-leg failure fails the whole resolution and preserves the prior
+    cached ``latest_version``. ``last_attempt_channel`` is stamped from
+    config BEFORE the marker touch (no retry storm, no mis-attribution);
+    ``latest_version_channel`` + ``resolved_dist_tag`` are written only on
+    a successful complete resolution. Channel flips invalidate the TTL
+    cache. The stable path stays byte-identical.
+    """
+
+    def _drive_npm_check(
+        self, ns, tmp_path, monkeypatch, *, channel, dist_tags,
+        prior_state=None,
+    ):
+        """Run `_do_update_check` on the npm vector with a stubbed
+        dist-tag fetcher. ``dist_tags`` maps tag → version-str, a
+        callable (called for side effects/raises), or ``None`` (404).
+        """
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config",
+            lambda *a, **k: {"update": {"channel": channel}},
+        )
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+
+        def _fake_fetch(tag):
+            v = dist_tags.get(tag, "__missing__")
+            if callable(v):
+                return v()
+            return v
+
+        monkeypatch.setitem(ns, "_fetch_npm_dist_tag_version", _fake_fetch)
+        if prior_state is not None:
+            ns["_save_update_state"](prior_state)
+        ns["_do_update_check"]()
+        return ns["_load_update_state"]()
+
+    def test_beta_resolves_max_when_beta_newer(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta", dist_tags={"latest": "1.7.0", "beta": "1.9.0"},
+        )
+        assert state["latest_version"] == "1.9.0"
+        assert state["latest_version_channel"] == "beta"
+        assert state["resolved_dist_tag"] == "beta"
+        assert state["last_attempt_channel"] == "beta"
+        assert state["check_status"] == "ok"
+
+    def test_beta_resolves_max_when_latest_newer(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta", dist_tags={"latest": "1.9.0", "beta": "1.7.0"},
+        )
+        # latest wins the max, but the channel CONTEXT is still beta.
+        assert state["latest_version"] == "1.9.0"
+        assert state["latest_version_channel"] == "beta"
+        assert state["resolved_dist_tag"] == "latest"
+
+    def test_beta_404_falls_back_to_latest(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta", dist_tags={"latest": "1.7.0", "beta": None},
+        )
+        assert state["latest_version"] == "1.7.0"
+        assert state["resolved_dist_tag"] == "latest"
+        assert state["check_status"] == "ok"
+
+    def test_beta_leg_network_failure_preserves_prior(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        marker = update_paths / "update-check.last-fetch"
+
+        def _boom():
+            raise ns["UpdateCheckNetworkError"]("beta leg 503")
+
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta",
+            dist_tags={"latest": "1.7.0", "beta": _boom},
+            prior_state={
+                "_schema": 1, "current_version": "1.5.0",
+                "latest_version": "1.6.0", "latest_version_channel": "stable",
+                "resolved_dist_tag": "latest", "check_status": "ok",
+            },
+        )
+        # Whole resolution failed → last-known-good preserved.
+        assert state["latest_version"] == "1.6.0"
+        assert state["check_status"] == "fetch_failed"
+        # Marker still touched FIRST (crash safety / no retry storm).
+        assert marker.exists()
+        # Attempted channel recorded even though the fetch failed.
+        assert state["last_attempt_channel"] == "beta"
+
+    def test_beta_leg_non_semver_preserves_prior(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta",
+            dist_tags={"latest": "1.7.0", "beta": "not-a-version"},
+            prior_state={
+                "_schema": 1, "current_version": "1.5.0",
+                "latest_version": "1.6.0", "check_status": "ok",
+            },
+        )
+        assert state["latest_version"] == "1.6.0"
+        assert state["check_status"] == "parse_failed"
+
+    def test_failed_fetch_after_flip_does_not_misattribute(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        def _boom():
+            raise ns["UpdateCheckNetworkError"]("beta leg down")
+
+        state = self._drive_npm_check(
+            ns, tmp_path, monkeypatch,
+            channel="beta",
+            dist_tags={"latest": "1.7.0", "beta": _boom},
+            prior_state={
+                "_schema": 1, "current_version": "1.5.0",
+                "latest_version": "1.6.0",
+                "latest_version_channel": "stable",  # OLD producer
+                "resolved_dist_tag": "latest",
+                "last_attempt_channel": "stable",
+                "check_status": "ok",
+            },
+        )
+        # last_attempt names the NEW channel; the producer field still
+        # names the OLD channel (written only on success).
+        assert state["last_attempt_channel"] == "beta"
+        assert state["latest_version_channel"] == "stable"
+
+    def test_stable_path_writes_channel_fields(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})  # default stable
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.5.0", "2026-05-09"),
+        )
+        monkeypatch.setitem(ns, "_check_npm_latest_version", lambda: "1.8.0")
+        ns["_do_update_check"]()
+        state = ns["_load_update_state"]()
+        assert state["latest_version"] == "1.8.0"
+        assert state["latest_version_channel"] == "stable"
+        assert state["resolved_dist_tag"] == "latest"
+        assert state["last_attempt_channel"] == "stable"
+
+    def test_channel_flip_makes_check_due_despite_fresh_marker(
+        self, ns, update_paths, monkeypatch
+    ):
+        marker = update_paths / "update-check.last-fetch"
+        marker.touch()  # fresh marker → would normally be not-due
+        ns["_save_update_state"]({
+            "_schema": 1, "last_attempt_channel": "stable",
+            "latest_version": "1.6.0",
+        })
+        config = {"update": {"channel": "beta", "check": {"ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is True
+
+    def test_no_flip_defers_to_marker(self, ns, update_paths, monkeypatch):
+        marker = update_paths / "update-check.last-fetch"
+        marker.touch()
+        ns["_save_update_state"]({
+            "_schema": 1, "last_attempt_channel": "beta",
+        })
+        config = {"update": {"channel": "beta", "check": {"ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is False
+
+    def test_back_compat_state_missing_channel_fields(
+        self, ns, update_paths, monkeypatch
+    ):
+        # Pre-feature state file: no channel fields at all. Stable config →
+        # last_attempt defaults to "stable" → no spurious refresh.
+        marker = update_paths / "update-check.last-fetch"
+        marker.touch()
+        ns["_save_update_state"]({
+            "_schema": 1, "current_version": "1.5.0", "latest_version": "1.6.0",
+        })
+        config = {"update": {"check": {"ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is False
+
+
+class TestBetaChannelInstallAndBanner:
+    """Beta-channel install target + downgrade refusal + banner marker
+    (beta-channel, spec 2026-07-21 §3, step B3)."""
+
+    def test_resolved_install_target(self, ns):
+        npm_beta = {"install": {"method": "npm"}, "latest_version": "1.9.0"}
+        assert ns["_resolved_install_target"](npm_beta, "beta") == "1.9.0"
+        # Stable / brew never pin a bare version here.
+        assert ns["_resolved_install_target"](npm_beta, "stable") is None
+        brew = {"install": {"method": "brew"}, "latest_version": "1.9.0"}
+        assert ns["_resolved_install_target"](brew, "beta") is None
+
+    def test_resolved_update_command_channel_aware(self, ns):
+        npm_state = {"install": {"method": "npm"}, "latest_version": "1.9.0"}
+        # Stable → byte-identical @latest.
+        assert ns["_resolved_update_command"](npm_state, {}) == (
+            "npm install -g cctally@latest"
+        )
+        # Beta → exact resolved version, never bare @beta.
+        beta_cmd = ns["_resolved_update_command"](
+            npm_state, {"update": {"channel": "beta"}}
+        )
+        assert beta_cmd == "npm install -g cctally@1.9.0"
+
+    def test_bare_update_refuses_downgrade_no_op(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        # Beta channel, resolved target NOT newer than installed → refuse.
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        monkeypatch.setitem(ns, "_save_update_state", lambda s: None)
+        monkeypatch.setitem(
+            ns, "_load_update_state",
+            lambda: {"install": {"method": "npm"},
+                     "current_version": "1.9.0", "latest_version": "1.8.0"},
+        )
+        # Lock must NOT be taken on the no-op path.
+        monkeypatch.setitem(
+            ns, "_acquire_update_lock",
+            lambda: (_ for _ in ()).throw(AssertionError("lock must not be taken")),
+        )
+        rc = ns["_do_update_install"](
+            version=None, dry_run=False, output_json=False
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "up to date" in out.lower()
+        assert "1.8.0" in out  # names the resolved target
+
+    def test_explicit_version_pin_overrides_downgrade_refusal(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        monkeypatch.setitem(
+            ns, "_load_update_state",
+            lambda: {"install": {"method": "npm"},
+                     "current_version": "1.9.0", "latest_version": "1.8.0"},
+        )
+        # dry_run so no subprocess: a --version pin is the deliberate override.
+        rc = ns["_do_update_install"](
+            version="1.6.4", dry_run=True, output_json=False
+        )
+        assert rc == 0
+
+    def test_beta_dry_run_pins_exact_version(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        monkeypatch.setitem(
+            ns, "_load_update_state",
+            lambda: {"install": {"method": "npm"},
+                     "current_version": "1.5.0", "latest_version": "1.9.0"},
+        )
+        rc = ns["_do_update_install"](
+            version=None, dry_run=True, output_json=False
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cctally@1.9.0" in out
+        assert "cctally@latest" not in out
+
+    def test_banner_beta_marker_and_stable_byte_identical(self, ns):
+        base = {"current_version": "1.5.0", "latest_version": "1.9.0"}
+        stable = ns["_format_update_banner"](dict(base))
+        assert stable == (
+            "↑ cctally 1.9.0 available (you're on 1.5.0). "
+            "Run `cctally update`. Skip: cctally update --skip 1.9.0"
+        )
+        beta = ns["_format_update_banner"](
+            dict(base, last_attempt_channel="beta")
+        )
+        assert beta == (
+            "↑ cctally 1.9.0 (beta) available (you're on 1.5.0). "
+            "Run `cctally update`. Skip: cctally update --skip 1.9.0"
+        )
+
+    def test_check_human_beta_will_run_and_brew_advisory(self, ns):
+        npm_state = {
+            "install": {"method": "npm"},
+            "current_version": "1.5.0", "latest_version": "1.9.0",
+            "check_status": "ok",
+        }
+        out = ns["_format_update_check_human"](
+            npm_state, {}, {"update": {"channel": "beta"}}
+        )
+        assert "cctally@1.9.0" in out
+        brew_state = {
+            "install": {"method": "brew"},
+            "current_version": "1.5.0", "latest_version": "1.9.0",
+            "check_status": "ok",
+        }
+        brew_out = ns["_format_update_check_human"](
+            brew_state, {}, {"update": {"channel": "beta"}}
+        )
+        assert ns["BREW_BETA_ADVISORY"] in brew_out
+
+
 # ============================================================
 # Task 4 — banner predicate, cmd_update dispatch, --check rendering
 # ============================================================

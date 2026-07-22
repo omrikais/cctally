@@ -45,6 +45,7 @@ function seedUpdateState(): UpdateState {
     check_status: 'ok',
     checked_at_utc: '2026-06-19T00:00:00Z',
     prerelease_note: null,
+    configured_channel: 'stable',
   };
 }
 

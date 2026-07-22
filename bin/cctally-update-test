@@ -165,6 +165,11 @@ _run_scenario_inner () {
     # unset to fall through to the default registry).
     local CCTALLY_TEST_UPDATE_NPM_URL=""
     local CCTALLY_TEST_UPDATE_BREW_URL=""
+    # Beta-channel (spec 2026-07-21 §3): the beta dist-tag fixture URL and an
+    # optional forced HTTP status for the beta leg (file:// fixtures cannot
+    # emit a real 404/5xx — the status hook simulates it).
+    local CCTALLY_TEST_UPDATE_NPM_BETA_URL=""
+    local CCTALLY_TEST_UPDATE_NPM_BETA_STATUS=""
     # Shim behaviour env vars (consumed by bin/brew + bin/npm shims).
     local BREW_UPDATE_EXIT="${BREW_UPDATE_EXIT:-0}"
     local BREW_UPGRADE_EXIT="${BREW_UPGRADE_EXIT:-0}"
@@ -379,6 +384,9 @@ LOCKBODY
     if [ -z "$CCTALLY_TEST_UPDATE_BREW_URL" ] && [ -f "$fix/registry/brew-formula.rb" ]; then
         CCTALLY_TEST_UPDATE_BREW_URL="file://$fix/registry/brew-formula.rb"
     fi
+    if [ -z "$CCTALLY_TEST_UPDATE_NPM_BETA_URL" ] && [ -f "$fix/registry/npm-beta.json" ]; then
+        CCTALLY_TEST_UPDATE_NPM_BETA_URL="file://$fix/registry/npm-beta.json"
+    fi
 
     # Tier-A short-circuit for `_resolve_npm_prefix`: setting
     # npm_config_prefix tells cctally where the npm install tree lives
@@ -446,6 +454,8 @@ LOCKBODY
             CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
             CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
             CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+            CCTALLY_TEST_UPDATE_NPM_BETA_URL="$CCTALLY_TEST_UPDATE_NPM_BETA_URL" \
+            CCTALLY_TEST_UPDATE_NPM_BETA_STATUS="$CCTALLY_TEST_UPDATE_NPM_BETA_STATUS" \
             CCTALLY_DISABLE_UPDATE_CHECK="$disable_update_hooks" \
             CCTALLY_DISABLE_TELEMETRY=1 \
             BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \
@@ -470,6 +480,8 @@ LOCKBODY
         CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
         CCTALLY_TEST_UPDATE_NPM_URL="$CCTALLY_TEST_UPDATE_NPM_URL" \
         CCTALLY_TEST_UPDATE_BREW_URL="$CCTALLY_TEST_UPDATE_BREW_URL" \
+        CCTALLY_TEST_UPDATE_NPM_BETA_URL="$CCTALLY_TEST_UPDATE_NPM_BETA_URL" \
+        CCTALLY_TEST_UPDATE_NPM_BETA_STATUS="$CCTALLY_TEST_UPDATE_NPM_BETA_STATUS" \
         CCTALLY_DISABLE_UPDATE_CHECK="$disable_update_hooks" \
         CCTALLY_DISABLE_TELEMETRY=1 \
         BREW_UPDATE_EXIT="$BREW_UPDATE_EXIT" \

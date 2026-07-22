@@ -35,6 +35,50 @@ afterEach(() => {
 });
 
 describe('BashCard', () => {
+  it('renders native Codex exec commands, workdirs, and exact output streams without harness noise', () => {
+    const call = base({
+      name: 'exec',
+      input_summary: '{"commands":[]}',
+      preview: "printf 'alpha\\n'",
+      input: { command: "printf 'alpha\\n'", workdir: '/synthetic/project' },
+      stderr: undefined,
+      result: { text: 'alpha\nsynthetic stderr\n{"future":true}', truncated: false, is_error: true },
+      native_card: {
+        schema_version: 1,
+        type: 'terminal',
+        status: 'failed',
+        commands: [
+          { command: "printf 'alpha\\n'", workdir: '/synthetic/project', metadata: { yield_time_ms: 10000 } },
+          { command: 'pwd', workdir: '/synthetic/other', metadata: {} },
+        ],
+        output: {
+          schema_version: 1,
+          type: 'terminal_output',
+          status: 'failed',
+          is_error: true,
+          parts: [
+            { type: 'text', stream: 'stdout', text: 'alpha\n' },
+            { type: 'text', stream: 'stderr', text: 'synthetic stderr\n' },
+            { type: 'raw', stream: 'output', text: '{"future":true}' },
+          ],
+          truncated: false,
+        },
+      },
+    });
+
+    const { container } = renderCard(call);
+    expect(container.querySelector('.conv-chip-name')?.textContent).toBe('exec');
+    expect(container.querySelectorAll('.conv-term-command')).toHaveLength(2);
+    expect(container.textContent).toContain('/synthetic/project');
+    expect(container.textContent).toContain('/synthetic/other');
+    expect(container.querySelector('.conv-term-out')?.textContent).toContain('alpha');
+    expect(container.querySelector('.conv-term-stderr')?.textContent).toContain('synthetic stderr');
+    expect(container.querySelector('.conv-term-raw')?.textContent).toContain('{"future":true}');
+    expect(container.textContent).not.toContain('tools.exec_command');
+    expect(container.querySelector('button[aria-label="Load raw request payload"]')).toBeTruthy();
+    expect(container.querySelector('button[aria-label="Load raw output payload"]')).toBeTruthy();
+  });
+
   it('renders the command as $ <command>, bash-highlighted', () => {
     const { container } = renderCard(base());
     const cmd = container.querySelector('.conv-term-cmd');

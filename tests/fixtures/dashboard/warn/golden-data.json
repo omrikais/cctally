@@ -910,7 +910,86 @@
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
     "spent_usd": 31.900000000000006,
-    "used_pct": 67.0
+    "used_pct": 67.0,
+    "week_index": [
+      {
+        "block_count": 0,
+        "detail_stamp": "c159c76cc428bf8e",
+        "end_at_utc": "2026-04-20T14:00:00Z",
+        "is_current": true,
+        "key": "2026-04-13",
+        "label": "Apr 13\u2013Apr 20",
+        "milestone_count": 67,
+        "segment_count": 1,
+        "start_at_utc": "2026-04-13T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "1095cec9d25a7cd4",
+        "end_at_utc": "2026-04-13T14:00:00Z",
+        "is_current": false,
+        "key": "2026-04-06",
+        "label": "Apr 06\u2013Apr 13",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-04-06T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "0e515571b527fad1",
+        "end_at_utc": "2026-04-06T14:00:00Z",
+        "is_current": false,
+        "key": "2026-03-30",
+        "label": "Mar 30\u2013Apr 06",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-03-30T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "977aa78064e4ba32",
+        "end_at_utc": "2026-03-30T14:00:00Z",
+        "is_current": false,
+        "key": "2026-03-23",
+        "label": "Mar 23\u2013Mar 30",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-03-23T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "ada0dbe91f7fabf8",
+        "end_at_utc": "2026-03-23T14:00:00Z",
+        "is_current": false,
+        "key": "2026-03-16",
+        "label": "Mar 16\u2013Mar 23",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-03-16T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "8a93827b86d1d822",
+        "end_at_utc": "2026-03-16T14:00:00Z",
+        "is_current": false,
+        "key": "2026-03-09",
+        "label": "Mar 09\u2013Mar 16",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-03-09T14:00:00Z"
+      },
+      {
+        "block_count": 0,
+        "detail_stamp": "c9e9237bdf779c59",
+        "end_at_utc": "2026-03-09T14:00:00Z",
+        "is_current": false,
+        "key": "2026-03-02",
+        "label": "Mar 02\u2013Mar 09",
+        "milestone_count": 0,
+        "segment_count": 0,
+        "start_at_utc": "2026-03-02T14:00:00Z"
+      }
+    ]
   },
   "daily": {
     "peak": {
@@ -2695,7 +2774,86 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 151200,
                 "spent_usd": 31.900000000000006,
-                "used_pct": 67.0
+                "used_pct": 67.0,
+                "week_index": [
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "c159c76cc428bf8e",
+                    "end_at_utc": "2026-04-20T14:00:00Z",
+                    "is_current": true,
+                    "key": "2026-04-13",
+                    "label": "Apr 13\u2013Apr 20",
+                    "milestone_count": 67,
+                    "segment_count": 1,
+                    "start_at_utc": "2026-04-13T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "1095cec9d25a7cd4",
+                    "end_at_utc": "2026-04-13T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-04-06",
+                    "label": "Apr 06\u2013Apr 13",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-04-06T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "0e515571b527fad1",
+                    "end_at_utc": "2026-04-06T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-30",
+                    "label": "Mar 30\u2013Apr 06",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-30T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "977aa78064e4ba32",
+                    "end_at_utc": "2026-03-30T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-23",
+                    "label": "Mar 23\u2013Mar 30",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-23T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "ada0dbe91f7fabf8",
+                    "end_at_utc": "2026-03-23T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-16",
+                    "label": "Mar 16\u2013Mar 23",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-16T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "8a93827b86d1d822",
+                    "end_at_utc": "2026-03-16T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-09",
+                    "label": "Mar 09\u2013Mar 16",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-09T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "c9e9237bdf779c59",
+                    "end_at_utc": "2026-03-09T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-02",
+                    "label": "Mar 02\u2013Mar 09",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-02T14:00:00Z"
+                  }
+                ]
               },
               "forecast": {
                 "budget_100_per_day_usd": 8.978251599147123,
@@ -4259,7 +4417,86 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 151200,
                 "spent_usd": 31.900000000000006,
-                "used_pct": 67.0
+                "used_pct": 67.0,
+                "week_index": [
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "c159c76cc428bf8e",
+                    "end_at_utc": "2026-04-20T14:00:00Z",
+                    "is_current": true,
+                    "key": "2026-04-13",
+                    "label": "Apr 13\u2013Apr 20",
+                    "milestone_count": 67,
+                    "segment_count": 1,
+                    "start_at_utc": "2026-04-13T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "1095cec9d25a7cd4",
+                    "end_at_utc": "2026-04-13T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-04-06",
+                    "label": "Apr 06\u2013Apr 13",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-04-06T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "0e515571b527fad1",
+                    "end_at_utc": "2026-04-06T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-30",
+                    "label": "Mar 30\u2013Apr 06",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-30T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "977aa78064e4ba32",
+                    "end_at_utc": "2026-03-30T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-23",
+                    "label": "Mar 23\u2013Mar 30",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-23T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "ada0dbe91f7fabf8",
+                    "end_at_utc": "2026-03-23T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-16",
+                    "label": "Mar 16\u2013Mar 23",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-16T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "8a93827b86d1d822",
+                    "end_at_utc": "2026-03-16T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-09",
+                    "label": "Mar 09\u2013Mar 16",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-09T14:00:00Z"
+                  },
+                  {
+                    "block_count": 0,
+                    "detail_stamp": "c9e9237bdf779c59",
+                    "end_at_utc": "2026-03-09T14:00:00Z",
+                    "is_current": false,
+                    "key": "2026-03-02",
+                    "label": "Mar 02\u2013Mar 09",
+                    "milestone_count": 0,
+                    "segment_count": 0,
+                    "start_at_utc": "2026-03-02T14:00:00Z"
+                  }
+                ]
               },
               "five_hour_milestones": [],
               "milestones": [
@@ -5181,6 +5418,7 @@
             },
             "quota": {
               "blocks": [],
+              "cycle_index": [],
               "histories": [],
               "milestones": [],
               "summary": {
@@ -5824,7 +6062,86 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 151200,
             "spent_usd": 31.900000000000006,
-            "used_pct": 67.0
+            "used_pct": 67.0,
+            "week_index": [
+              {
+                "block_count": 0,
+                "detail_stamp": "c159c76cc428bf8e",
+                "end_at_utc": "2026-04-20T14:00:00Z",
+                "is_current": true,
+                "key": "2026-04-13",
+                "label": "Apr 13\u2013Apr 20",
+                "milestone_count": 67,
+                "segment_count": 1,
+                "start_at_utc": "2026-04-13T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "1095cec9d25a7cd4",
+                "end_at_utc": "2026-04-13T14:00:00Z",
+                "is_current": false,
+                "key": "2026-04-06",
+                "label": "Apr 06\u2013Apr 13",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-04-06T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "0e515571b527fad1",
+                "end_at_utc": "2026-04-06T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-30",
+                "label": "Mar 30\u2013Apr 06",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-30T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "977aa78064e4ba32",
+                "end_at_utc": "2026-03-30T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-23",
+                "label": "Mar 23\u2013Mar 30",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-23T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "ada0dbe91f7fabf8",
+                "end_at_utc": "2026-03-23T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-16",
+                "label": "Mar 16\u2013Mar 23",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-16T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "8a93827b86d1d822",
+                "end_at_utc": "2026-03-16T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-09",
+                "label": "Mar 09\u2013Mar 16",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-09T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "c9e9237bdf779c59",
+                "end_at_utc": "2026-03-09T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-02",
+                "label": "Mar 02\u2013Mar 09",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-02T14:00:00Z"
+              }
+            ]
           },
           "forecast": {
             "budget_100_per_day_usd": 8.978251599147123,
@@ -7388,7 +7705,86 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 151200,
             "spent_usd": 31.900000000000006,
-            "used_pct": 67.0
+            "used_pct": 67.0,
+            "week_index": [
+              {
+                "block_count": 0,
+                "detail_stamp": "c159c76cc428bf8e",
+                "end_at_utc": "2026-04-20T14:00:00Z",
+                "is_current": true,
+                "key": "2026-04-13",
+                "label": "Apr 13\u2013Apr 20",
+                "milestone_count": 67,
+                "segment_count": 1,
+                "start_at_utc": "2026-04-13T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "1095cec9d25a7cd4",
+                "end_at_utc": "2026-04-13T14:00:00Z",
+                "is_current": false,
+                "key": "2026-04-06",
+                "label": "Apr 06\u2013Apr 13",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-04-06T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "0e515571b527fad1",
+                "end_at_utc": "2026-04-06T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-30",
+                "label": "Mar 30\u2013Apr 06",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-30T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "977aa78064e4ba32",
+                "end_at_utc": "2026-03-30T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-23",
+                "label": "Mar 23\u2013Mar 30",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-23T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "ada0dbe91f7fabf8",
+                "end_at_utc": "2026-03-23T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-16",
+                "label": "Mar 16\u2013Mar 23",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-16T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "8a93827b86d1d822",
+                "end_at_utc": "2026-03-16T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-09",
+                "label": "Mar 09\u2013Mar 16",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-09T14:00:00Z"
+              },
+              {
+                "block_count": 0,
+                "detail_stamp": "c9e9237bdf779c59",
+                "end_at_utc": "2026-03-09T14:00:00Z",
+                "is_current": false,
+                "key": "2026-03-02",
+                "label": "Mar 02\u2013Mar 09",
+                "milestone_count": 0,
+                "segment_count": 0,
+                "start_at_utc": "2026-03-02T14:00:00Z"
+              }
+            ]
           },
           "five_hour_milestones": [],
           "milestones": [
@@ -8359,6 +8755,7 @@
         },
         "quota": {
           "blocks": [],
+          "cycle_index": [],
           "histories": [],
           "milestones": [],
           "summary": {

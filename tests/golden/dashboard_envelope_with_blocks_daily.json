@@ -211,7 +211,8 @@
     "suppress": {
       "remind_after": null,
       "skipped_versions": []
-    }
+    },
+    "configured_channel": "stable"
   },
   "weekly": {
     "rows": [],

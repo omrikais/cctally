@@ -37,6 +37,8 @@ REQUIRED_ACCEPTANCE_IDS = {
     "s4-dashboard-share-backend-contract",
     "reading-position-qualified-key", "dashboard-s5-after-293-s4",
     "conversation-phase-independently-deferrable",
+    "codex-reasoning-lifecycle-marker-wire",
+    "codex-native-family-disposition",
 }
 
 
@@ -603,6 +605,68 @@ def test_s6_mirror_pairing_scenario_shapes_are_present():
     assert ("response_item", "message") in families
     assert ("event_msg", "agent_message") in families
     assert any(r.get("type") == "turn_context" for r in records)
+
+
+def test_session_d_reasoning_lifecycle_marker_fixture_is_non_vacuous():
+    manifest = _json(CORPUS / "manifest.json")
+    records = _records(
+        CORPUS, manifest, "session-d-reasoning-lifecycle-markers")
+    payloads = [record.get("payload", {}) for record in records]
+
+    reasoning = [payload for payload in payloads
+                 if payload.get("type") == "reasoning"]
+    assert any(payload.get("summary") and not payload.get("content")
+               for payload in reasoning)
+    assert any(payload.get("summary") and payload.get("content")
+               for payload in reasoning)
+    assert any(not payload.get("summary") and payload.get("content")
+               for payload in reasoning)
+    assert any(not payload.get("summary") and not payload.get("content")
+               for payload in reasoning)
+
+    lifecycle = [payload for payload in payloads
+                 if payload.get("type") in {"task_started", "task_complete"}]
+    assert sum(payload.get("turn_id") == "lifecycle-ambiguous"
+               and payload.get("type") == "task_started"
+               for payload in lifecycle) == 2
+    assert any(payload.get("error") for payload in lifecycle)
+    assert any(payload.get("last_agent_message") == "Unique completion message."
+               for payload in lifecycle)
+
+    assistant_text = "\n".join(
+        part.get("text", "")
+        for payload in payloads
+        if payload.get("type") == "message" and payload.get("role") == "assistant"
+        for part in payload.get("content", []) if isinstance(part, dict)
+    )
+    assert all(name in assistant_text for name in (
+        "git-create-branch", "git-stage", "git-commit", "git-push",
+        "git-create-pr", "oai-mem-citation", "git-unknown",
+    ))
+    assert "```text" in assistant_text
+
+
+def test_session_e_native_family_fixture_is_non_vacuous():
+    manifest = _json(CORPUS / "manifest.json")
+    records = _records(CORPUS, manifest, "session-e-native-families")
+
+    world = [record for record in records if record.get("type") == "world_state"]
+    assert {record.get("payload", {}).get("full") for record in world} == {True, False}
+    assert world[0]["payload"]["state"]["agents_md"]["body"] \
+        == "SESSION_E_PRIVATE_INSTRUCTION_CANARY"
+
+    inter_agent = [record for record in records
+                   if record.get("type") == "inter_agent_communication_metadata"]
+    assert {record.get("payload", {}).get("trigger_turn")
+            for record in inter_agent} == {True, False}
+
+    contexts = [record for record in records if record.get("type") == "turn_context"]
+    assert len(contexts) >= 3
+    assert any(isinstance(record.get("payload", {}).get("turn_id"), dict)
+               for record in contexts)
+    assert any(record.get("payload", {}).get("future_context_field")
+               for record in contexts)
+    assert any(record.get("type") == "future_record_v100" for record in records)
 
 
 def test_s6_title_wrapper_window_pushes_meaningful_prompt_past_physical_row_12():

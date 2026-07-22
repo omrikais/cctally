@@ -54,6 +54,56 @@ describe('specialToolRenderer dispatch (#177 S3)', () => {
     expect(specialToolRenderer(call({ name: null, input: null }))).toBeNull();
   });
 
+  it('dispatches structurally card-ready Codex terminal and patch calls without renaming provider tools', () => {
+    const terminal = call({
+      name: 'exec', input: { command: 'printf alpha', workdir: '/synthetic' }, result: { text: 'alpha', truncated: false, is_error: false },
+      native_card: {
+        schema_version: 1, type: 'terminal', status: 'completed',
+        commands: [{ command: 'printf alpha', workdir: '/synthetic', metadata: {} }],
+        output: { schema_version: 1, type: 'terminal_output', status: 'completed', is_error: false, truncated: false, parts: [{ type: 'text', stream: 'stdout', text: 'alpha' }] },
+      },
+    } as Partial<Call>);
+    const patch = call({
+      name: 'apply_patch', input: null, result: { text: 'Done!', truncated: false, is_error: false },
+      native_card: {
+        schema_version: 1, type: 'patch', source: 'patch_apply_end', status: 'completed', success: true,
+        has_diff: true, stdout: 'Done!', stderr: '', truncated: false,
+        files: [{ path: 'src/a.ts', status: 'modified', unified_diff: '--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n' }],
+      },
+    } as Partial<Call>);
+
+    expect(specialToolRenderer(terminal)).toBeTruthy();
+    expect(specialToolRenderer(patch)).toBeTruthy();
+    expect(terminal.name).toBe('exec');
+    expect(patch.name).toBe('apply_patch');
+  });
+
+  it('dispatches all structurally card-ready Codex Session C calls', () => {
+    const cards = [
+      {
+        schema_version: 1, type: 'plan', source: 'update_plan', call_status: 'requested',
+        explanation: 'Ship native cards', items: [{ step: 'Render plan', status: 'in_progress' }],
+        result: { status: 'returned', truncated: false, value: 'Plan updated' },
+      },
+      {
+        schema_version: 1, type: 'web_search', source: 'web_search_call', call_status: 'completed', query: 'safe links', action: {},
+        completion: { status: 'returned', query: 'safe links', action: {}, results: [{ title: 'Safe', url: 'https://example.com', snippet: 'result' }] },
+      },
+      {
+        schema_version: 1, type: 'mcp', source: 'function_call', name: 'fixture_search_issues', call_status: 'completed',
+        completion: { server: 'fixture', tool: 'search_issues', arguments: { query: '332' }, duration: { secs: 0, nanos: 12 }, result: { Ok: { content: [] } }, status: 'ok' },
+      },
+      {
+        schema_version: 1, type: 'agent', operation: 'spawn_agent', call_status: 'requested', arguments: { task_name: 'child' },
+        result: { status: 'returned', truncated: false, value: { agent_id: 'child-id' } },
+        child_conversation: { conversation_key: 'v1.child', role: 'cctally_reviewer', nickname: 'Synthetic Child' },
+      },
+    ];
+    for (const native_card of cards) {
+      expect(specialToolRenderer(call({ name: native_card.type, native_card } as Partial<Call>))).toBeTruthy();
+    }
+  });
+
   it('preserves the existing Session-2 cases', () => {
     expect(specialToolRenderer(call({ name: 'AskUserQuestion', input: { questions: [] } }))).toBeTruthy();
     expect(specialToolRenderer(call({ name: 'TodoWrite', input: { todos: [] } }))).toBeTruthy();

@@ -760,6 +760,77 @@
       ]
     },
     {
+      "capability": "conversation-tool-cards",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "session-b-card-wire"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "codex-native-shell-patch-card-wire",
+      "ownerSession": "S6",
+      "requirement": "Bounded non-executing harness decoding exposes provider-truthful terminal/output/patch cards, evidence-gated patch correlation, raw fallbacks, and full event payload readback.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-secondary-tools",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "session-c-secondary-tools",
+        "session-c-child-proven",
+        "session-c-child-ambiguous-a",
+        "session-c-child-ambiguous-b"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "codex-secondary-tool-agent-link-wire",
+      "ownerSession": "S6",
+      "requirement": "Bounded plan, web, MCP, and agent cards preserve native vocabulary and results; exact same-root parent plus canonical task-name/agent-path proof exposes only an opaque child key, while ambiguous or unsupported shapes remain raw and unlinked.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-reasoning-lifecycle-markers",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "session-d-reasoning-lifecycle-markers"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py"
+      ],
+      "id": "codex-reasoning-lifecycle-marker-wire",
+      "ownerSession": "S6",
+      "requirement": "Reasoning title, provider summary, body, and absence remain distinct; only uniquely owned redundant lifecycle rows fold; closed trailing Git and memory markers become privacy-safe metadata while authored lookalikes and raw payloads remain available.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
+      "capability": "conversation-native-family-disposition",
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "session-e-native-families"
+      ],
+      "futureTestTargets": [
+        "tests/test_codex_conversation_normalization.py",
+        "dashboard/web/e2e/session-e-polish.spec.ts"
+      ],
+      "id": "codex-native-family-disposition",
+      "ownerSession": "S6",
+      "requirement": "World state and inter-agent metadata remain replay-safe physical control-plane evidence; turn context supplies only sticky turn/model attribution; unknown native families remain physical-only without search, outline, export, or reader noise.",
+      "sources": [
+        "codex"
+      ]
+    },
+    {
       "capability": "anon-plan",
       "contractState": "supported",
       "fixtureScenarios": [

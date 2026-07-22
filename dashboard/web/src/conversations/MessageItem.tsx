@@ -56,6 +56,32 @@ function notificationSummary(s: string): string {
   return m ? metaPreview(m[1]) : metaPreview(s);
 }
 
+const QUALIFIED_META_LABELS: Record<string, string> = {
+  role: 'Role instructions',
+  mode: 'Agent mode',
+  context_bundle: 'Session context',
+  environment: 'Environment context',
+  permissions: 'Permissions',
+  delegation: 'Delegation context',
+  agents: 'Agent instructions',
+  heartbeat: 'Heartbeat',
+  task_started: 'Task started',
+  task_complete: 'Task complete',
+  task_completed: 'Task completed',
+  codex_task_started: 'Codex task started',
+  codex_task_complete: 'Codex task complete',
+  patch_apply: 'Patch applied',
+  patch_apply_end: 'Patch applied',
+  mcp_tool_call: 'MCP call complete',
+  web_search: 'Web search complete',
+};
+
+function qualifiedMetaLabel(label: string | null | undefined): string | null {
+  if (!label) return null;
+  if (QUALIFIED_META_LABELS[label]) return QUALIFIED_META_LABELS[label];
+  return label.replace(/[_-]+/g, ' ').replace(/^./, (char) => char.toUpperCase());
+}
+
 // A single reader message. forwardRef exposes the container div so the
 // reader can scrollIntoView on a jump.
 //
@@ -276,6 +302,9 @@ function MessageItemImpl(
   // targets --human/--assistant.
   if (item.kind === 'meta') {
     const mk = item.meta_kind;
+    const providerLabel = qualifiedMetaLabel(item.meta_label);
+    const notificationLabel = providerLabel ?? 'Background task';
+    const sections = item.meta_sections?.filter(Boolean).join(', ');
     const head =
       mk === 'skill' ? (
         <>
@@ -292,12 +321,13 @@ function MessageItemImpl(
         </>
       ) : mk === 'notification' ? (
         <>
-          <SystemIcon /> <span className="conv-meta-label">Background task</span>
+          <SystemIcon /> <span className="conv-meta-label" title={notificationLabel}>{notificationLabel}</span>
           <span className="conv-meta-preview">{notificationSummary(item.text)}</span>
         </>
       ) : (
         <>
-          <SystemIcon /> <span className="conv-meta-label">Injected context</span>
+          <SystemIcon /> <span className="conv-meta-label">{providerLabel ?? 'Injected context'}</span>
+          {sections && <span className="conv-meta-name">· {sections}</span>}
           <span className="conv-meta-preview">{metaPreview(item.text)}</span>
         </>
       );

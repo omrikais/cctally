@@ -46,6 +46,22 @@ _ITEM_HEADER = {
     "event": "## 🗓 Event",
 }
 
+_META_LABEL_TEXT = {
+    "agents": "Project instructions",
+    "context_bundle": "Session context",
+    "delegation": "Delegation context",
+    "environment": "Environment context",
+    "heartbeat": "Harness heartbeat",
+    "instructions": "User instructions",
+    "memory": "Memory context",
+    "mode": "Agent mode",
+    "model_switch": "Model switch",
+    "permissions": "Permissions",
+    "plugins": "Available plugins",
+    "role": "Harness role",
+    "skill": "Skill context",
+}
+
 
 def _render_block(b: dict) -> str:
     bk = b.get("kind")
@@ -75,7 +91,11 @@ def _render_block(b: dict) -> str:
 
 def _render_item(it: dict) -> str:
     kind = it.get("kind")
-    header = _ITEM_HEADER.get(kind, f"## {kind}")
+    if kind == "meta":
+        label = _META_LABEL_TEXT.get(it.get("meta_label"), "Harness context")
+        header = f"## 🧩 Context: {label}"
+    else:
+        header = _ITEM_HEADER.get(kind, f"## {kind}")
     ts = it.get("timestamp_utc") or ""
     if ts:
         header += f"  ·  {ts}"

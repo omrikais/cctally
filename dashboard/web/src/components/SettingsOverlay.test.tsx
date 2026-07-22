@@ -1385,3 +1385,71 @@ describe('<SettingsOverlay /> re-seed conflict guard (#258)', () => {
     expect(select.value).toBe('notify-send');
   });
 });
+
+// Beta-channel (spec 2026-07-21 §3): the Update-channel toggle seeds from the
+// SSE-mirrored update.configured_channel and POSTs `update.channel` on Save.
+function seedChannel(channel: 'stable' | 'beta') {
+  act(() => {
+    dispatch({
+      type: 'SET_UPDATE_STATE',
+      state: {
+        current_version: '1.5.0',
+        latest_version: '1.9.0',
+        available: true,
+        method: 'npm',
+        update_command:
+          channel === 'beta'
+            ? 'npm install -g cctally@1.9.0'
+            : 'npm install -g cctally@latest',
+        release_notes_url: null,
+        check_status: 'ok',
+        checked_at_utc: null,
+        prerelease_note: null,
+        configured_channel: channel,
+      },
+      suppress: { skipped_versions: [], remind_after: null },
+    });
+  });
+}
+
+describe('<SettingsOverlay /> update channel toggle', () => {
+  it('seeds the toggle from the envelope configured_channel', () => {
+    render(<SettingsOverlay />);
+    seedChannel('beta');
+    openSettings();
+    const beta = screen.getByRole('radio', { name: 'Beta' }) as HTMLInputElement;
+    expect(beta.checked).toBe(true);
+  });
+
+  it('POSTs update.channel when the toggle flips to beta', async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit): Promise<Response> =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsOverlay />);
+    seedChannel('stable');
+    openSettings();
+
+    const beta = screen.getByRole('radio', { name: 'Beta' }) as HTMLInputElement;
+    expect(beta.checked).toBe(false); // seeded stable
+    fireEvent.click(beta);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/api/settings');
+    expect(call).toBeTruthy();
+    const [, init] = call as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    const parsed = JSON.parse(init.body as string) as {
+      update?: { channel?: string };
+    };
+    // Binding assertion: the flipped channel travels in the update block.
+    expect(parsed.update?.channel).toBe('beta');
+  });
+});

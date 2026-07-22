@@ -7,6 +7,7 @@ classes to the same file.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -457,6 +458,28 @@ def test_digest_known_vectors_and_canonicalization():
     # unicode over UTF-8 bytes.
     u = "héllo — 日本語"
     assert kern.content_digest(u) == hashlib.sha256(dom + u.encode("utf-8")).hexdigest()[:32]
+
+
+def test_harness_marker_parser_is_closed_trailing_and_privacy_safe():
+    clean, markers = kern._segment_harness_markers(
+        "Visible prose.\n\n::git-push{cwd=\"/private/synthetic\" branch=\"feat/x\"}")
+    assert clean == "Visible prose."
+    assert markers == [
+        {"schema_version": 1, "type": "git", "action": "push"}]
+    assert "/private" not in json.dumps(markers)
+
+    lookalikes = (
+        "Inline ::git-stage{cwd=\"/private/inline\"} prose.\n"
+        "```text\n::git-stage{cwd=\"/private/fenced\"}\n```\n"
+        "::git-stage{cwd=\"/private/bad\" extra=\"unknown\"}")
+    assert kern._segment_harness_markers(lookalikes) == (lookalikes, [])
+    assert kern._parse_marker_directive(
+        "::git-unknown{cwd=\"/private/unknown\"}") is None
+    assert kern._parse_memory_citation([
+        "<oai-mem-citation>", "<citation_entries>", "not a citation",
+        "</citation_entries>", "<rollout_ids>", "</rollout_ids>",
+        "</oai-mem-citation>",
+    ]) is None
     # content_len is UTF-8 byte length of the canonical text.
     assert kern.content_len("日本") == len("日本".encode("utf-8")) == 6
     assert kern.content_len("x\r\ny") == kern.content_len("x\ny") == 3
@@ -620,6 +643,103 @@ def test_derive_title_wrapper_window_and_null_case():
     assert kern.derive_title(_normalize("unturned-event-prose").rows) is None
 
 
+def test_session_a_injected_taxonomy_and_turn_correlation_kernel():
+    rows = _normalize("session-a-turn-contract").rows
+    meta = [r for r in rows if r.kind == "meta"]
+    assert len(meta) == 9
+    labels = {
+        json.loads(r.detail_json)["meta_label"]
+        for r in meta
+    }
+    assert labels == {
+        "permissions", "role", "mode", "plugins", "agents", "skill",
+        "model_switch", "context_bundle",
+    }
+    assert any(json.loads(r.detail_json)["meta_kind"] == "skill" for r in meta)
+    assert all(r.text for r in meta), "meta bodies stay available for detail/export"
+
+    # The resumed portion has no turn_context before its response rows. The
+    # later explicit patch/task-complete anchor proves they belong to turn-a.
+    resumed = [
+        r for r in rows
+        if r.timestamp_utc and "10:00:22" <= r.timestamp_utc[11:19] <= "10:00:26"
+    ]
+    assert resumed and {r.turn_id for r in resumed} == {"turn-a"}
+
+    # Unknown user-authored markup is not hidden by a loose XML heuristic.
+    ev = lj.CodexPhysicalEvent(
+        source_path="/synthetic/root-a/user.jsonl", line_offset=1,
+        source_root_key="root-a", conversation_key="conv-user",
+        native_thread_id="native", root_thread_id="root", parent_thread_id=None,
+        timestamp_utc="2026-07-21T11:00:00Z", record_type="response_item",
+        event_type="message", turn_id="turn-user", call_id=None,
+        payload_json=json.dumps({"payload": {"type": "message", "role": "user",
+                                              "content": [{"text": "<future_harness>user-authored</future_harness>"}]}}),
+    )
+    unknown = kern.normalize_codex_events(
+        [ev], initial=kern.CodexStickyState()).rows[0]
+    assert unknown.kind == "user"
+
+    agentish_ev = dataclasses.replace(
+        ev,
+        line_offset=2,
+        payload_json=json.dumps({"payload": {
+            "type": "message", "role": "user",
+            "content": [{"text": (
+                "# AGENTS.md instructions for /synthetic/project\n\n"
+                "<INSTRUCTIONS>synthetic policy</INSTRUCTIONS>\n"
+                "This trailing prompt must remain user content."
+            )}],
+        }}),
+    )
+    agentish = kern.normalize_codex_events(
+        [agentish_ev], initial=kern.CodexStickyState()).rows[0]
+    assert agentish.kind == "user"
+
+    bundle_text = (
+        "<recommended_plugins>synthetic plugins</recommended_plugins>\n"
+        "# AGENTS.md instructions for /synthetic/project\n\n"
+        "<INSTRUCTIONS>synthetic project policy</INSTRUCTIONS>\n"
+        "<environment_context>synthetic environment</environment_context>"
+    )
+    bundle_ev = dataclasses.replace(
+        ev,
+        line_offset=3,
+        payload_json=json.dumps({"payload": {
+            "type": "message", "role": "user",
+            "content": [{"text": bundle_text}],
+        }}),
+    )
+    bundle = kern.normalize_codex_events(
+        [bundle_ev], initial=kern.CodexStickyState()).rows[0]
+    assert bundle.kind == "meta"
+    bundle_detail = json.loads(bundle.detail_json)
+    assert bundle_detail == {
+        "meta_kind": "context",
+        "meta_label": "context_bundle",
+        "meta_sections": ["plugins", "agents", "environment"],
+    }
+
+    agents_env_text = (
+        "# AGENTS.md instructions for /synthetic/project\n\n"
+        "<INSTRUCTIONS>synthetic project policy</INSTRUCTIONS>\n"
+        "<environment_context>synthetic environment</environment_context>"
+    )
+    agents_env_ev = dataclasses.replace(
+        ev,
+        line_offset=4,
+        payload_json=json.dumps({"payload": {
+            "type": "message", "role": "user",
+            "content": [{"text": agents_env_text}],
+        }}),
+    )
+    agents_env = kern.normalize_codex_events(
+        [agents_env_ev], initial=kern.CodexStickyState()).rows[0]
+    assert agents_env.kind == "meta"
+    assert json.loads(agents_env.detail_json)["meta_sections"] == [
+        "agents", "environment"]
+
+
 # ── Task 4: ingest integration ───────────────────────────────────────────────
 
 
@@ -734,7 +854,7 @@ def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
         ).fetchall()
         assert len(rollup) == 1
         _ck, item_count, title, project_key, models_json, started, last = rollup[0]
-        assert item_count == 9
+        assert item_count == 8
         assert title == "Synthetic first meaningful user prompt"
         assert project_key and project_key.startswith("project:")
         assert MODEL in (models_json or "")
@@ -937,13 +1057,14 @@ def test_detail_items_grouping_and_distinct_keys(tmp_path, monkeypatch):
         d = q.get_codex_conversation(conn, ck, effective_speed="standard")
         assert d["status"] == "ok"
         assert d["conversation_key"] == ck
-        assert d["page"]["total"] == 9
+        assert d["page"]["total"] == 8
         keys = [it["item_key"] for it in d["items"]]
-        assert len(keys) == len(set(keys)) == 9    # every canonical item distinct
+        assert len(keys) == len(set(keys)) == 8    # every canonical item distinct
         prompts = [it for it in d["items"] if it["kind"] == "user"]
         responses = [it for it in d["items"] if it["kind"] == "assistant"]
         events = [it for it in d["items"] if it["kind"] == "event"]
-        assert len(prompts) == 2 and len(responses) == 1 and len(events) == 6
+        assert len(prompts) == 2 and len(responses) == 1 and len(events) == 5
+        assert responses[0]["lifecycle"]["state"] == "started"
         # prompt + response share turn-a yet key differently.
         assert {it["item_key"] for it in prompts}.isdisjoint(
             {responses[0]["item_key"]})
@@ -1106,8 +1227,8 @@ def test_outline_ok_over_modern_full(tmp_path, monkeypatch):
         ck = _single_ck(conn)
         o = q.get_codex_conversation_outline(conn, ck, effective_speed="standard")
         assert o["status"] == "ok"
-        assert o["stats"]["items"] == 9
-        assert len(o["turns"]) == 9
+        assert o["stats"]["items"] == 8
+        assert len(o["turns"]) == 8
         labels = [t["label"] for t in o["turns"]]
         assert "Synthetic first meaningful user prompt" in labels
         assert {"file_path": "synthetic.txt", "tool": "apply_patch",
@@ -1115,6 +1236,1191 @@ def test_outline_ok_over_modern_full(tmp_path, monkeypatch):
         # item keys align with the detail assembly.
         d = q.get_codex_conversation(conn, ck, effective_speed="standard")
         assert [t["item_key"] for t in o["turns"]] == [it["item_key"] for it in d["items"]]
+    finally:
+        conn.close()
+
+
+def test_session_a_detail_outline_export_search_and_cost_contract(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-a-turn-contract"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=0)
+        assert detail["status"] == "ok"
+        assert detail["title"] == "Build the synthetic widget"
+
+        prompts = [item for item in detail["items"] if item["kind"] == "user"]
+        responses = [item for item in detail["items"] if item["kind"] == "assistant"]
+        metas = [item for item in detail["items"] if item["kind"] == "meta"]
+        assert len(prompts) == 2
+        assert [item["blocks"][0]["text"] for item in prompts] == [
+            "Build the synthetic widget", "Build the synthetic widget"]
+        assert len({item["item_key"] for item in prompts}) == 2
+        assert len(responses) == 2
+        assert len(metas) == 9
+        assert all(item["meta_kind"] in {
+            "context", "skill", "notification"} for item in metas)
+        assert all(item["meta_label"] for item in metas)
+        bundle = next(item for item in metas
+                      if item["meta_label"] == "context_bundle")
+        assert bundle["meta_sections"] == ["plugins", "agents", "environment"]
+
+        turn_a = next(item for item in responses
+                      if any(b["text"] == "First distinct answer" for b in item["blocks"]))
+        block_texts = [block["text"] for block in turn_a["blocks"]]
+        assert block_texts.index("Plan the widget") < block_texts.index("synthetic_tool\n{\"q\":\"widget\"}")
+        assert block_texts.index("First distinct answer") < block_texts.index("Continue widget reasoning")
+        assert block_texts.count("Repeated legitimate note") == 2
+        assert "Second distinct answer" in block_texts
+
+        per_item = sum(item["cost_usd"] or 0.0 for item in detail["items"])
+        assert abs(per_item + detail["unattributed_cost_usd"] - detail["total_cost_usd"]) < 1e-9
+        assert abs(detail["unattributed_cost_usd"]) < 1e-12
+        assert all(item["cost_usd"] is not None for item in responses)
+
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert outline["status"] == "ok"
+        assert [turn["item_key"] for turn in outline["turns"]] == [
+            item["item_key"] for item in detail["items"]]
+        assert all("<permissions" not in turn["label"] for turn in outline["turns"])
+        assert {turn.get("meta_label") for turn in outline["turns"] if turn.get("meta_kind")} >= {
+            "permissions", "role", "plugins", "agents", "skill", "context_bundle"}
+
+        prompt_search = q.search_codex_conversations(
+            conn, "Build", kind="prompts", effective_speed="standard")
+        assert prompt_search["total"] == 2
+        assert q.search_codex_conversations(
+            conn, "synthetic permissions", kind="prompts",
+            effective_speed="standard")["total"] == 0
+        found = q.find_in_codex_conversation(
+            conn, ck, "Second distinct answer", kind="assistant")
+        assert found["total"] == 1
+        assert found["anchors"][0]["item_key"] == turn_a["item_key"]
+
+        exported = q.get_codex_conversation_export(
+            conn, ck, effective_speed="standard")
+        assert exported["status"] == "ok"
+        assert "# Build the synthetic widget" in exported["markdown"]
+        assert "Context: Permissions" in exported["markdown"]
+        assert "Context: Session context" in exported["markdown"]
+        assert "Second distinct answer" in exported["markdown"]
+    finally:
+        conn.close()
+
+
+def test_session_b_card_ready_detail_and_guarded_replay_contract(
+    tmp_path, monkeypatch,
+):
+    """#331 A: supported native shell/patch records become card-ready while
+    malformed shapes stay raw, and guarded v3 replay keeps rollups coherent."""
+    assert int(kern.CODEX_CONVERSATION_CONTRACT_VERSION) >= 3
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-b-card-wire"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        rows_before = conn.execute(
+            "SELECT source_path,line_offset,kind,detail_json,content_digest "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall()
+        events_before = conn.execute(
+            "SELECT source_path,line_offset,payload_json FROM codex_conversation_events "
+            "ORDER BY source_path,line_offset"
+        ).fetchall()
+
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=0)
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        by_call = {block.get("call_id"): block for block in blocks
+                   if block["kind"] == "tool_call"}
+
+        terminal = by_call["exec-ok"]
+        assert terminal["detail"]["name"] == "exec"
+        assert terminal["detail"]["card"] == {
+            "schema_version": 1,
+            "type": "terminal",
+            "status": "completed",
+            "commands": [{
+                "command": "printf 'alpha\\n'",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {"max_output_tokens": 12000, "yield_time_ms": 10000},
+            }],
+        }
+        assert terminal["output"]["text"] == "alpha\n"
+        assert terminal["output"]["detail"]["card"] == {
+            "schema_version": 1,
+            "type": "terminal_output",
+            "status": "completed",
+            "is_error": False,
+            "parts": [{"stream": "output", "text": "alpha\n", "type": "text"}],
+            "truncated": False,
+        }
+        assert by_call["exec-string"]["output"]["text"] == "plain string output\n"
+        failed = by_call["exec-failed"]["output"]["detail"]["card"]
+        assert failed["status"] == "failed" and failed["is_error"] is True
+        assert failed["parts"] == [{
+            "stream": "output", "text": "synthetic stderr\n", "type": "text"}]
+
+        malformed = by_call["exec-malformed"]
+        assert "card" not in malformed["detail"]
+        assert "tools.exec_command" in malformed["detail"]["args"]
+        assert malformed["output"]["detail"]["card"]["parts"][0]["type"] == "raw"
+        assert "inspectable" in malformed["output"]["text"]
+        blank = by_call["exec-blank"]
+        assert blank["output"]["text"] == ""
+        assert blank["output"]["detail"]["card"]["parts"] == [{
+            "stream": "output", "text": "", "type": "text"}]
+
+        direct_patch = by_call["direct-patch"]
+        patch_card = direct_patch["detail"]["card"]
+        assert patch_card["type"] == "patch"
+        assert patch_card["source"] == "apply_patch"
+        assert patch_card["files"] == [{
+            "path": "synthetic-added.txt", "status": "added"}]
+        completion = patch_card["completion"]
+        assert completion["success"] is True
+        assert completion["stdout"] == "patch ok\n" and completion["stderr"] == ""
+        assert completion["has_diff"] is True
+        assert [entry["status"] for entry in completion["files"]] == [
+            "added", "modified", "deleted", "moved"]
+        assert completion["files"][3]["move_path"] == "synthetic-new.txt"
+        assert completion["files"][1]["unified_diff"].endswith("-old\n+new\n")
+        assert completion["event_block_key"].startswith("cbk1_")
+        owner_item = next(item for item in detail["items"]
+                          if direct_patch in item["blocks"])
+        assert len(owner_item["member_item_keys"]) >= 1
+        folded_key = owner_item["member_item_keys"][0]
+        after_folded = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", after=folded_key, limit=1)
+        assert after_folded["status"] == "ok"
+        # The proven completion is folded into the call exactly once.
+        assert not any(block.get("call_id") == "direct-patch" and block["kind"] == "event"
+                       for block in blocks)
+
+        bracketed = by_call["exec-patch"]["detail"]["card"]
+        assert bracketed["type"] == "patch" and bracketed["source"] == "tools.apply_patch"
+        assert bracketed["completion"]["files"][0]["path"] == "synthetic-edit.txt"
+        heredoc = by_call["heredoc-patch"]["detail"]["card"]
+        assert heredoc["type"] == "patch" and heredoc["source"] == "exec_apply_patch"
+        assert heredoc["files"] == [{
+            "path": "synthetic-delete.txt", "status": "deleted"}]
+        repeated = [by_call["repeat-patch-1"], by_call["repeat-patch-2"]]
+        assert len({block["block_key"] for block in repeated}) == 2
+        assert len({block["detail"]["card"]["completion"]["event_block_key"]
+                    for block in repeated}) == 2
+        assert all(block["detail"]["card"]["completion"]["files"][0]["path"]
+                   == "synthetic-repeat.txt" for block in repeated)
+
+        diff_less = next(block for block in blocks
+                         if block["kind"] == "event" and block.get("call_id") == "diff-less")
+        assert diff_less["detail"]["card"]["has_diff"] is False
+        assert diff_less["detail"]["card"]["files"] == [{
+            "path": "synthetic-summary.txt", "status": "modified"}]
+        assert diff_less["detail"]["card"]["success"] is False
+        assert diff_less["block_key"].startswith("cbk1_")
+        assert diff_less["payload_which"] == "event"
+
+        full_event = q.read_codex_payload(
+            conn, ck, completion["event_block_key"], "event")
+        assert full_event["status"] == "ok"
+        assert full_event["card"]["files"] == completion["files"]
+        assert '"unified_diff"' in full_event["content"]
+
+        # The v3-derived view is stable: a second ordinary sync is a
+        # physical/derived no-op and never changes retained events.
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT source_path,line_offset,kind,detail_json,content_digest "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall() == rows_before
+        assert conn.execute(
+            "SELECT source_path,line_offset,payload_json FROM codex_conversation_events "
+            "ORDER BY source_path,line_offset"
+        ).fetchall() == events_before
+    finally:
+        conn.close()
+
+
+def test_session_b_export_search_and_outline_preserve_existing_contracts(
+    tmp_path, monkeypatch,
+):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-b-card-wire"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert outline["status"] == "ok"
+        assert {row["file_path"] for row in outline["files"]} >= {
+            "synthetic-added.txt", "synthetic-edit.txt", "synthetic-summary.txt"}
+        assert any(turn["member_item_keys"] for turn in outline["turns"])
+        search = q.search_codex_conversations(
+            conn, "alpha", kind="tools", effective_speed="standard")
+        assert search["status"] == "ok" and search["hits"]
+        export = q.get_codex_conversation_export(
+            conn, ck, effective_speed="standard")
+        assert export["status"] == "ok"
+        assert "alpha" in export["markdown"]
+        # Card-ready detail is additive; byte-frozen export retains the
+        # provider's canonical output wrapper instead of adopting card text.
+        assert '"type":"input_text"' in export["markdown"]
+        assert "patch_apply synthetic-added.txt" in export["markdown"]
+        assert "patch_apply synthetic-edit.txt" in export["markdown"]
+    finally:
+        conn.close()
+
+
+def test_session_b_v3_replays_bounded_cards_and_logical_patch_items(
+    tmp_path, monkeypatch,
+):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-b-card-wire"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        physical_before = conn.execute(
+            "SELECT source_path,line_offset,payload_json FROM codex_conversation_events "
+            "ORDER BY source_path,line_offset"
+        ).fetchall()
+        # Simulate the v2 derived shape over unchanged retained physical rows.
+        conn.execute(
+            "UPDATE codex_conversation_messages SET detail_json = CASE "
+            "WHEN kind='tool_call' THEN '{\"name\":\"exec\",\"args\":\"raw\"}' "
+            "WHEN kind='event' THEN '{\"event\":\"patch_apply_end\"}' "
+            "ELSE NULL END WHERE kind IN ('tool_call','tool_output','event')"
+        )
+        conn.execute(
+            "UPDATE cache_meta SET value='2' "
+            "WHERE key='codex_conversation_contract_version'"
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages "
+            "WHERE detail_json LIKE '%\"card\"%'"
+        ).fetchone() == (0,)
+
+        ns["sync_codex_cache"](conn)
+        assert q.codex_normalization_authoritative(conn) is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages "
+            "WHERE detail_json LIKE '%\"card\"%'"
+        ).fetchone()[0] > 0
+        rows = q._load_conversation_rows(conn, ck)
+        kept, _suppressed = kern.pair_mirrors(rows)
+        logical_count = len(kern.canonical_items(kept))
+        assert conn.execute(
+            "SELECT item_count FROM codex_conversation_rollups "
+            "WHERE conversation_key=?", (ck,)
+        ).fetchone() == (logical_count,)
+        assert conn.execute(
+            "SELECT source_path,line_offset,payload_json FROM codex_conversation_events "
+            "ORDER BY source_path,line_offset"
+        ).fetchall() == physical_before
+    finally:
+        conn.close()
+
+
+def test_session_b_harness_parser_is_closed_bounded_and_non_executing():
+    supported = (
+        'const r = await tools.exec_command({cmd: "printf ok", '
+        'workdir: "/synthetic", yield_time_ms: 10000}); text(r.output);'
+    )
+    payload = {"type": "custom_tool_call", "name": "exec",
+               "status": "completed", "input": supported}
+    assert kern.decode_tool_call_card(payload)["commands"][0]["command"] == "printf ok"
+
+    unsupported = [
+        'text("tools.exec_command({cmd: \\\"inside string\\\"})");',
+        '// tools.exec_command({cmd: "inside comment"})',
+        'const pattern = /tools.exec_command({cmd: "inside regex"})/;',
+        'const r = await tools.exec_command({cmd: process.env.SECRET}); text(r.output);',
+        supported + ' /* unclosed',
+        'const r = await tools.exec_command({cmd: `template`}); text(r.output);',
+        'evil(); ' + supported,
+        supported + ' sendSecret();',
+        'const r = await evil.tools.exec_command({cmd: "nope"}); text(r.output);',
+        ('const r = await tools.exec_command({cmd: "ok", max_output_tokens: '
+         + "9" * 5000 + '}); text(r.output);'),
+    ]
+    for raw in unsupported:
+        bad = dict(payload, input=raw)
+        assert kern.decode_tool_call_card(bad) is None, raw
+
+    too_many = "\n".join(
+        f'const r{i} = await tools.exec_command({{cmd: "cmd-{i}"}}); '
+        f'text(r{i}.output);'
+        for i in range(9)
+    )
+    assert kern.decode_tool_call_card(dict(payload, input=too_many)) is None
+
+    malformed_patch = {
+        "type": "custom_tool_call", "name": "apply_patch",
+        "status": "completed",
+        "input": "*** Begin Patch\n*** Add File: incomplete.txt\n+missing end",
+    }
+    assert kern.decode_tool_call_card(malformed_patch) is None
+
+
+def test_session_b_oversized_numeric_literal_falls_back_without_blocking_replay(
+    tmp_path, monkeypatch,
+):
+    program = (
+        'const r = await tools.exec_command({cmd: "ok", max_output_tokens: '
+        + "9" * 5000
+        + '}); text(r.output);'
+    )
+    records = _codex_turn_records([
+        {"call_id": "huge-number", "input": program, "name": "exec",
+         "status": "completed", "type": "custom_tool_call"},
+        {"call_id": "huge-number", "output": "raw",
+         "type": "custom_tool_call_output"},
+    ])
+    ns, _root, _path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        assert q.codex_normalization_authoritative(conn) is True
+        detail = q.get_codex_conversation(
+            conn, _single_ck(conn), effective_speed="standard", limit=0)
+        call = next(block for item in detail["items"] for block in item["blocks"]
+                    if block.get("call_id") == "huge-number")
+        assert "card" not in call["detail"]
+        assert "max_output_tokens" in call["detail"]["args"]
+    finally:
+        conn.close()
+
+
+def test_session_b_patch_correlation_requires_global_owner_and_same_file_bracket():
+    rows = _normalize("session-b-card-wire").rows
+    direct_call = next(row for row in rows
+                       if row.kind == "tool_call" and row.call_id == "direct-patch")
+    direct_event = next(row for row in rows
+                        if row.kind == "event" and row.call_id == "direct-patch")
+    direct_output = next(row for row in rows
+                         if row.kind == "tool_output" and row.call_id == "direct-patch")
+    terminal = next(row for row in rows
+                    if row.kind == "tool_call" and row.call_id == "exec-ok")
+    reused_owner = dataclasses.replace(
+        terminal, call_id="direct-patch",
+        timestamp_utc="2026-07-21T11:00:11.500000+00:00",
+        line_offset=direct_call.line_offset + 1,
+    )
+    reused_items = kern.canonical_items([
+        direct_call, reused_owner, direct_event, direct_output])
+    assert any(item["klass"] == "event" for item in reused_items)
+    assert not any(item.get("folded_items") for item in reused_items)
+
+    bracket_call = next(row for row in rows
+                        if row.kind == "tool_call" and row.call_id == "exec-patch")
+    bracket_event = next(row for row in rows
+                         if row.kind == "event" and row.call_id == "inner-exec-patch")
+    bracket_output = next(row for row in rows
+                          if row.kind == "tool_output" and row.call_id == "exec-patch")
+    cross_file_output = dataclasses.replace(
+        bracket_output, source_path=bracket_output.source_path + ".other")
+    cross_file_items = kern.canonical_items([
+        bracket_call, bracket_event, cross_file_output])
+    assert any(item["klass"] == "event" for item in cross_file_items)
+    assert not any(item.get("folded_items") for item in cross_file_items)
+
+
+def test_session_b_card_caps_defer_to_full_payload(tmp_path, monkeypatch):
+    long_command = "x" * (kern.CODEX_TEXT_CAP + 50)
+    long_patch = (
+        "*** Begin Patch\n*** Add File: synthetic-long.txt\n+"
+        + "y" * (kern.CODEX_TEXT_CAP + 50)
+        + "\n*** End Patch"
+    )
+    exec_program = (
+        "const r = await tools.exec_command({cmd: "
+        + json.dumps(long_command)
+        + "}); text(r.output);"
+    )
+    records = _codex_turn_records([
+        {"call_id": "long-exec", "input": exec_program, "name": "exec",
+         "status": "completed", "type": "custom_tool_call"},
+        {"call_id": "long-exec", "output": "", "type": "custom_tool_call_output"},
+        {"call_id": "long-patch", "input": long_patch, "name": "apply_patch",
+         "status": "completed", "type": "custom_tool_call"},
+        {"call_id": "long-patch", "output": "", "type": "custom_tool_call_output"},
+    ])
+    ns, _root, _path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=0)
+        calls = {block["call_id"]: block for item in detail["items"]
+                 for block in item["blocks"] if block["kind"] == "tool_call"}
+        assert calls["long-exec"]["detail"]["card"]["truncated"] is True
+        assert calls["long-patch"]["detail"]["card"]["truncated"] is True
+        full_exec = q.read_codex_payload(
+            conn, ck, calls["long-exec"]["block_key"], "call")
+        full_patch = q.read_codex_payload(
+            conn, ck, calls["long-patch"]["block_key"], "call")
+        assert full_exec["card"]["commands"][0]["command"] == long_command
+        assert full_patch["card"]["patch"] == long_patch
+        assert full_exec["card"].get("truncated") is not True
+        assert full_patch["card"]["truncated"] is False
+    finally:
+        conn.close()
+
+
+def test_session_c_secondary_tool_wire_is_structured_and_completion_folded(
+    tmp_path, monkeypatch,
+):
+    """#332 A RED: retained plan/web/MCP/agent records must not remain a
+    generic argument dump plus detached provider completion events."""
+    records = _codex_turn_records([
+        {"type": "function_call", "name": "update_plan", "call_id": "plan-1",
+         "arguments": json.dumps({
+             "explanation": "Synthetic explanation",
+             "plan": [
+                 {"step": "First synthetic step", "status": "completed"},
+                 {"step": "Second synthetic step", "status": "in_progress"},
+             ],
+         })},
+        {"type": "function_call_output", "call_id": "plan-1",
+         "output": "Plan updated"},
+        {"type": "web_search_call", "id": "web-1", "status": "completed",
+         "action": {"type": "search", "query": "synthetic query",
+                    "queries": ["synthetic query"]}},
+        {"type": "function_call", "name": "fixture_search_issues",
+         "call_id": "mcp-1", "arguments": "{\"state\":\"open\"}"},
+        {"type": "function_call_output", "call_id": "mcp-1",
+         "output": "synthetic MCP wrapper output"},
+        {"type": "function_call", "name": "spawn_agent", "call_id": "agent-1",
+         "arguments": "{\"task_name\":\"child\",\"message\":\"Do synthetic work\","
+                      "\"agent_type\":\"cctally_reviewer\",\"fork_turns\":\"none\"}"},
+        {"type": "function_call_output", "call_id": "agent-1",
+         "output": "{\"task_name\":\"/root/child\"}"},
+        {"type": "function_call", "name": "wait_agent", "call_id": "agent-2",
+         "arguments": "{\"timeout_ms\":30000}"},
+        {"type": "function_call_output", "call_id": "agent-2",
+         "output": "{\"message\":\"synthetic update\",\"timed_out\":false}"},
+    ])
+    records.insert(5, {
+        "timestamp": "2026-07-14T12:04:30Z", "type": "event_msg",
+        "payload": {
+            "type": "web_search_end", "call_id": "web-1",
+            "query": "synthetic query",
+            "action": {"type": "search", "query": "synthetic query"},
+            "results": [{
+                "type": "computer_initialize_state", "domain": "example.test",
+                "ref_id": "turn0search0", "snippet": "Synthetic result",
+                "title": "Synthetic title", "url": "https://example.test/result",
+            }],
+        },
+    })
+    records.insert(8, {
+        "timestamp": "2026-07-14T12:05:30Z", "type": "event_msg",
+        "payload": {
+            "type": "mcp_tool_call_end", "call_id": "mcp-1",
+            "duration": {"secs": 1, "nanos": 250000000},
+            "invocation": {"server": "fixture", "tool": "search_issues",
+                           "arguments": {"state": "open"}},
+            "result": {"Ok": {"content": [{"type": "text", "text": "synthetic"}]}},
+        },
+    })
+    ns, _root, _path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        detail = q.get_codex_conversation(
+            conn, _single_ck(conn), effective_speed="standard", limit=0)
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        calls = {block.get("call_id"): block for block in blocks
+                 if block["kind"] == "tool_call"}
+
+        assert calls["plan-1"]["detail"]["card"] == {
+            "schema_version": 1, "type": "plan", "source": "update_plan",
+            "call_status": "requested", "explanation": "Synthetic explanation",
+            "items": [
+                {"step": "First synthetic step", "status": "completed"},
+                {"step": "Second synthetic step", "status": "in_progress"},
+            ],
+            "result": {"status": "returned", "value": "Plan updated",
+                       "truncated": False},
+        }
+        web = calls["web-1"]["detail"]["card"]
+        assert web["type"] == "web_search" and web["query"] == "synthetic query"
+        assert web["completion"]["results"][0]["url"] == "https://example.test/result"
+        assert not any(block["kind"] == "event"
+                       and (block.get("detail") or {}).get("event") == "web_search_end"
+                       for block in blocks)
+        mcp = calls["mcp-1"]["detail"]["card"]
+        assert mcp["type"] == "mcp" and mcp["completion"]["server"] == "fixture"
+        assert mcp["completion"]["duration"] == {"secs": 1, "nanos": 250000000}
+        assert not any(block["kind"] == "event"
+                       and (block.get("detail") or {}).get("event") == "mcp_tool_call_end"
+                       for block in blocks)
+        spawn = calls["agent-1"]["detail"]["card"]
+        assert spawn["type"] == "agent" and spawn["operation"] == "spawn_agent"
+        assert spawn["arguments"]["message"] == "Do synthetic work"
+        assert spawn["result"]["value"] == {"task_name": "/root/child"}
+        wait = calls["agent-2"]["detail"]["card"]
+        assert wait["arguments"] == {"timeout_ms": 30000}
+        assert wait["result"]["value"]["timed_out"] is False
+    finally:
+        conn.close()
+
+
+def test_session_c_fixture_contract_links_only_exact_same_root_child(
+    tmp_path, monkeypatch,
+):
+    scenarios = [
+        "session-c-secondary-tools", "session-c-child-proven",
+        "session-c-child-ambiguous-a", "session-c-child-ambiguous-b",
+    ]
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, scenarios)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        keys = dict(conn.execute(
+            "SELECT native_thread_id,conversation_key "
+            "FROM codex_conversation_threads"))
+        parent_key = keys["cccccccc-cccc-4ccc-8ccc-cccccccccccc"]
+        child_key = keys["c1111111-1111-4111-8111-111111111111"]
+        physical_before = conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall()
+        derived_before = conn.execute(
+            "SELECT source_path,line_offset,call_id,detail_json "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall()
+
+        detail = q.get_codex_conversation(
+            conn, parent_key, effective_speed="standard", limit=0)
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        calls = {block.get("call_id"): block for block in blocks
+                 if block["kind"] == "tool_call"}
+        assert kern.CODEX_CONVERSATION_CONTRACT_VERSION == "5"
+        assert [item["status"] for item in
+                calls["plan-ok"]["detail"]["card"]["items"]] == [
+                    "pending", "in_progress", "completed"]
+        assert "card" not in calls["plan-malformed"]["detail"]
+        assert "card" not in calls["agent-malformed"]["detail"]
+
+        web = calls["web-ok"]["detail"]["card"]
+        assert web["completion"]["status"] == "returned"
+        assert web["completion"]["results"][0]["ref_id"] == "turn0search0"
+        web_error = calls["web-error"]["detail"]["card"]["completion"]
+        assert web_error["status"] == "error"
+        assert web_error["error"] == "synthetic search failure"
+        assert len({calls["web-repeat-a"]["block_key"],
+                    calls["web-repeat-b"]["block_key"]}) == 2
+        assert calls["mcp-ok"]["detail"]["card"]["completion"]["status"] == "ok"
+        mcp_error = calls["mcp-error"]["detail"]["card"]["completion"]
+        assert mcp_error["status"] == "error"
+        assert mcp_error["result"] == {"Err": "synthetic MCP failure"}
+
+        agent_cards = [
+            block["detail"]["card"] for block in calls.values()
+            if (block.get("detail") or {}).get("card", {}).get("type") == "agent"
+        ]
+        assert {card["operation"] for card in agent_cards} == {
+            "spawn_agent", "wait_agent", "send_message", "list_agents",
+            "followup_task", "interrupt_agent",
+        }
+        assert len([card for card in agent_cards
+                    if card["operation"] == "wait_agent"]) == 2
+        assert calls["wait-b"]["detail"]["card"]["result"]["value"] == {
+            "message": "synthetic timeout", "timed_out": True}
+        assert calls["send"]["detail"]["card"]["arguments"] == {
+            "message": "Synthetic message", "target": "/root/session_c_child"}
+        assert calls["list"]["detail"]["card"]["result"]["value"] \
+            ["agents"][0]["status"] == "completed"
+        assert calls["followup"]["detail"]["card"]["arguments"]["message"] \
+            == "Synthetic follow-up"
+        assert calls["interrupt"]["detail"]["card"]["result"]["value"] == {
+            "previous_status": "running"}
+        proven = calls["spawn-proven"]["detail"]["card"]
+        assert proven["child_conversation"] == {
+            "conversation_key": child_key,
+            "role": "cctally_reviewer",
+            "nickname": "Synthetic Child",
+        }
+        assert "agent_path" not in json.dumps(proven["child_conversation"])
+        assert "child_conversation" not in calls["spawn-ambiguous"]["detail"]["card"]
+        assert "child_conversation" not in calls["spawn-unmatched"]["detail"]["card"]
+
+        assert not any(
+            block["kind"] == "event"
+            and (block.get("detail") or {}).get("event") in {
+                "web_search_end", "mcp_tool_call_end"}
+            and block.get("call_id") in {
+                "web-ok", "web-repeat-a", "web-repeat-b", "web-error",
+                "mcp-ok", "mcp-error",
+            }
+            for block in blocks
+        )
+        raw_events = [block for block in blocks if block["kind"] == "event"]
+        malformed_web = next(block for block in raw_events
+                             if block.get("call_id") == "web-malformed")
+        malformed_mcp = next(block for block in raw_events
+                             if block.get("call_id") == "mcp-malformed")
+        assert "card" not in (malformed_web.get("detail") or {})
+        assert "card" not in (malformed_mcp.get("detail") or {})
+        for malformed in (malformed_web, malformed_mcp):
+            raw = q.read_codex_payload(
+                conn, parent_key, malformed["block_key"], "event")
+            assert raw["status"] == "ok" and raw["content"]
+            assert "card" not in raw
+        assert any("/synthetic/private/screenshot.png" in block["text"]
+                   and "url:0" in block["text"] for block in blocks)
+
+        outline = q.get_codex_conversation_outline(
+            conn, parent_key, effective_speed="standard")
+        assert outline["status"] == "ok"
+        assert outline["stats"]["items"] == detail["page"]["total"]
+        found = q.find_in_codex_conversation(
+            conn, parent_key, "Synthetic message", kind="tools")
+        assert found["status"] == "ok" and found["total"] >= 1
+        searched = q.search_codex_conversations(
+            conn, "synthetic web query", kind="tools", effective_speed="standard")
+        assert searched["status"] == "ok" and searched["hits"]
+        exported = q.get_codex_conversation_export(
+            conn, parent_key, effective_speed="standard")
+        assert exported["status"] == "ok" and "spawn_agent" in exported["markdown"]
+        payload = q.read_codex_payload(
+            conn, parent_key, calls["web-ok"]["block_key"], "call")
+        assert payload["status"] == "ok" and "synthetic web query" in payload["content"]
+
+        # A verbatim child meta in another source root is not linkable even if
+        # parent id and canonical task path still match.
+        source_root_key = conn.execute(
+            "SELECT source_root_key FROM codex_conversation_threads "
+            "WHERE conversation_key=?", (parent_key,)).fetchone()[0]
+        conn.execute(
+            "UPDATE codex_conversation_events SET source_root_key='other-root' "
+            "WHERE conversation_key=?", (child_key,))
+        unlinked = q.get_codex_conversation(
+            conn, parent_key, effective_speed="standard", limit=0)
+        unlinked_calls = {block.get("call_id"): block
+                          for item in unlinked["items"] for block in item["blocks"]
+                          if block["kind"] == "tool_call"}
+        assert "child_conversation" not in \
+            unlinked_calls["spawn-proven"]["detail"]["card"]
+        conn.execute(
+            "UPDATE codex_conversation_events SET source_root_key=? "
+            "WHERE conversation_key=?", (source_root_key, child_key))
+
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall() == physical_before
+        assert conn.execute(
+            "SELECT source_path,line_offset,call_id,detail_json "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall() == derived_before
+    finally:
+        conn.close()
+
+
+def test_session_c_completion_correlation_rejects_reused_ids_and_cross_turns():
+    rows = _normalize("session-c-secondary-tools").rows
+    web_call = next(row for row in rows
+                    if row.kind == "tool_call" and row.call_id == "web-ok")
+    web_event = next(row for row in rows
+                     if row.kind == "event" and row.call_id == "web-ok")
+    reused = dataclasses.replace(
+        web_call, source_path=web_call.source_path + ".duplicate",
+        line_offset=web_call.line_offset + 1,
+    )
+    ambiguous = kern.canonical_items([web_call, reused, web_event])
+    assert any(item["klass"] == "event" for item in ambiguous)
+    assert not any(item.get("folded_items") for item in ambiguous)
+
+    other_turn = dataclasses.replace(web_event, turn_id="turn-other")
+    cross_turn = kern.canonical_items([web_call, other_turn])
+    assert any(item["klass"] == "event" for item in cross_turn)
+    assert not any(item.get("folded_items") for item in cross_turn)
+
+    assert q._agent_session_meta({
+        "parent_thread_id": "parent", "agent_path": "/root/child",
+        "source": {"subagent": {"thread_spawn": {
+            "parent_thread_id": "parent", "agent_path": "/root/other",
+        }}},
+    }) is None
+    nonfinite = kern.decode_secondary_tool_call_card({
+        "type": "web_search_call", "action": {
+            "type": "search", "query": "synthetic", "score": float("nan")},
+    })
+    assert nonfinite["action"]["score"] is None
+    assert nonfinite["truncated"] is True
+    assert kern._canonical_json(nonfinite)
+
+
+def test_session_c_secondary_cards_survive_v5_replay_without_physical_rewrite(
+    tmp_path, monkeypatch,
+):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-c-secondary-tools"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conversation_key = _single_ck(conn)
+        physical_before = conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall()
+
+        # Simulate the v3 derived store over unchanged retained physical rows.
+        conn.execute(
+            "UPDATE codex_conversation_messages SET detail_json='{}' "
+            "WHERE conversation_key=? AND call_id IN ('plan-ok','web-ok','mcp-ok')",
+            (conversation_key,),
+        )
+        conn.execute(
+            "UPDATE cache_meta SET value='3' "
+            "WHERE key='codex_conversation_contract_version'"
+        )
+        conn.commit()
+
+        ns["sync_codex_cache"](conn)
+        detail = q.get_codex_conversation(
+            conn, conversation_key, effective_speed="standard", limit=0)
+        calls = {block.get("call_id"): block
+                 for item in detail["items"] for block in item["blocks"]
+                 if block["kind"] == "tool_call"}
+        assert calls["plan-ok"]["detail"]["card"]["type"] == "plan"
+        assert calls["web-ok"]["detail"]["card"]["completion"]["query"] \
+            == "synthetic web query"
+        assert calls["mcp-ok"]["detail"]["card"]["completion"]["server"] \
+            == "fixture"
+        assert calls["mcp-ok"]["detail"]["card"]["completion"]["tool"] \
+            == "search_issues"
+        assert conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_conversation_contract_version'"
+        ).fetchone() == ("5",)
+        assert conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall() == physical_before
+    finally:
+        conn.close()
+
+
+def test_session_d_reasoning_lifecycle_and_marker_wire_contract(
+    tmp_path, monkeypatch,
+):
+    scenario = "session-d-reasoning-lifecycle-markers"
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, [scenario])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conversation_key = _single_ck(conn)
+        physical_reasoning = sum(
+            json.loads(payload_json).get("payload", {}).get("type")
+            in {"reasoning", "agent_reasoning"}
+            for (payload_json,) in conn.execute(
+                "SELECT payload_json FROM codex_conversation_events "
+                "WHERE conversation_key=?", (conversation_key,))
+        )
+        normalized_reasoning = conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages "
+            "WHERE conversation_key=? AND kind='reasoning'",
+            (conversation_key,),
+        ).fetchone()[0]
+        assert physical_reasoning == 7
+        assert normalized_reasoning == 5
+
+        detail = q.get_codex_conversation(
+            conn, conversation_key, effective_speed="standard", limit=0)
+        assert detail["status"] == "ok"
+        blocks = [block for item in detail["items"] for block in item["blocks"]]
+        reasoning = [block for block in blocks if block["kind"] == "reasoning"]
+        assert [block["detail"]["reasoning"] for block in reasoning] == [
+            {"schema_version": 1, "source": "response_item",
+             "title": "Inspecting synthetic state"},
+            {"schema_version": 1, "source": "response_item",
+             "summary": "Synthetic provider summary.",
+             "body": "Detailed synthetic reasoning body."},
+            {"schema_version": 1, "source": "response_item",
+             "body": "Body-only synthetic reasoning."},
+            {"schema_version": 1, "source": "agent_reasoning",
+             "title": "Inspecting synthetic state"},
+        ]
+
+        folded = next(item for item in detail["items"]
+                      if item.get("lifecycle", {}).get("state") == "completed")
+        assert folded["lifecycle"] == {
+            "schema_version": 1,
+            "state": "completed",
+            "started": {
+                "at": 1784700301000,
+                "collaboration_mode_kind": "default",
+                "model_context_window": 272000,
+            },
+            "completed": {
+                "at": 1784700303000,
+                "duration_ms": 2000,
+            },
+            "events": [
+                {"event": "task_started", "payload_which": "event",
+                 "block_key": folded["lifecycle"]["events"][0]["block_key"]},
+                {"event": "task_complete", "payload_which": "event",
+                 "block_key": folded["lifecycle"]["events"][1]["block_key"]},
+            ],
+        }
+        assert len(folded["member_item_keys"]) == 2
+        assert not any((block.get("detail") or {}).get("lifecycle", {}).get("event")
+                       in {"task_started", "task_complete"}
+                       for block in folded["blocks"])
+
+        lifecycle_fallbacks = [
+            block for block in blocks
+            if (block.get("detail") or {}).get("lifecycle", {}).get("event")
+            in {"task_started", "task_complete"}
+        ]
+        assert len(lifecycle_fallbacks) == 5
+        assert all(block.get("payload_which") == "event"
+                   and block.get("block_key") for block in lifecycle_fallbacks)
+        assert any(block["detail"]["lifecycle"].get("message")
+                   == "Unique completion message."
+                   for block in lifecycle_fallbacks)
+        assert any(block["detail"]["lifecycle"].get("error")
+                   == "Synthetic lifecycle failure"
+                   for block in lifecycle_fallbacks)
+
+        marker_block = next(
+            block for block in blocks
+            if (block.get("detail") or {}).get("markers"))
+        assert marker_block["text"] == "Synthetic closeout prose remains visible."
+        assert marker_block["detail"]["markers"] == [
+            {"schema_version": 1, "type": "git", "action": "create_branch"},
+            {"schema_version": 1, "type": "git", "action": "stage"},
+            {"schema_version": 1, "type": "git", "action": "commit"},
+            {"schema_version": 1, "type": "git", "action": "push"},
+            {"schema_version": 1, "type": "git", "action": "create_pr",
+             "draft": False},
+            {"schema_version": 1, "type": "memory_citation",
+             "citation_count": 1, "rollout_count": 1},
+        ]
+        primary_json = json.dumps(marker_block, sort_keys=True)
+        assert "/synthetic/project" not in primary_json
+        assert "MEMORY.md" not in primary_json
+        assert "11111111-2222-4333-8444-555555555555" not in primary_json
+        raw = q.read_codex_payload(
+            conn, conversation_key, marker_block["block_key"], "event")
+        assert raw["status"] == "ok"
+        assert "/synthetic/project" in raw["content"]
+        assert "MEMORY.md:10-12" in raw["content"]
+        lifecycle_raw = q.read_codex_payload(
+            conn, conversation_key,
+            lifecycle_fallbacks[0]["block_key"], "event")
+        assert lifecycle_raw["status"] == "ok"
+        assert '"type":"task_' in lifecycle_raw["content"]
+
+        authored = "\n".join(block["text"] for block in blocks)
+        assert "User-authored ::git-stage" in authored
+        assert "::git-unknown" in authored
+        assert "::git-stage{cwd=\"/synthetic/malformed\" extra=\"nope\"}" in authored
+        assert "<oai-mem-citation><citation_entries>lookalike" in authored
+        assert "::git-stage{cwd=\"/synthetic/fenced\"}" in authored
+
+        outline = q.get_codex_conversation_outline(
+            conn, conversation_key, effective_speed="standard")
+        assert outline["status"] == "ok"
+        assert outline["stats"]["items"] == detail["page"]["total"]
+        thinking = q.find_in_codex_conversation(
+            conn, conversation_key, "Inspecting synthetic state", kind="thinking")
+        assert thinking["status"] == "ok" and thinking["total"] == 2
+        empty = q.find_in_codex_conversation(
+            conn, conversation_key, "encrypted-empty", kind="thinking")
+        assert empty["status"] == "ok" and empty["total"] == 0
+        exported = q.get_codex_conversation_export(
+            conn, conversation_key, effective_speed="standard")
+        assert exported["status"] == "ok"
+        assert "::git-create-branch" in exported["markdown"]
+        assert "<oai-mem-citation>" in exported["markdown"]
+        assert exported["markdown"].count("task_started") == 3
+        assert "Unique completion message." in exported["markdown"]
+    finally:
+        conn.close()
+
+
+def test_session_d_contract_v5_replays_without_rewriting_physical_rows(
+    tmp_path, monkeypatch,
+):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-d-reasoning-lifecycle-markers"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conversation_key = _single_ck(conn)
+        physical_before = conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall()
+        conn.execute(
+            "UPDATE codex_conversation_messages SET detail_json=NULL "
+            "WHERE conversation_key=? AND kind IN ('reasoning','assistant','event')",
+            (conversation_key,),
+        )
+        conn.execute(
+            "UPDATE cache_meta SET value='4' "
+            "WHERE key='codex_conversation_contract_version'"
+        )
+        conn.commit()
+
+        ns["sync_codex_cache"](conn)
+        assert kern.CODEX_CONVERSATION_CONTRACT_VERSION == "5"
+        assert conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_conversation_contract_version'"
+        ).fetchone() == ("5",)
+        assert conn.execute(
+            "SELECT source_path,line_offset,payload_json "
+            "FROM codex_conversation_events ORDER BY source_path,line_offset"
+        ).fetchall() == physical_before
+        detail = q.get_codex_conversation(
+            conn, conversation_key, effective_speed="standard", limit=0)
+        assert any((block.get("detail") or {}).get("markers")
+                   for item in detail["items"] for block in item["blocks"])
+
+        derived_once = conn.execute(
+            "SELECT source_path,line_offset,kind,detail_json "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall()
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT source_path,line_offset,kind,detail_json "
+            "FROM codex_conversation_messages ORDER BY source_path,line_offset"
+        ).fetchall() == derived_once
+    finally:
+        conn.close()
+
+
+def test_session_e_native_families_are_physical_only_and_privacy_safe(
+    tmp_path, monkeypatch,
+):
+    scenario = "session-e-native-families"
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, [scenario])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conversation_key = _single_ck(conn)
+        physical = conn.execute(
+            "SELECT record_type,payload_json FROM codex_conversation_events "
+            "WHERE conversation_key=? ORDER BY line_offset", (conversation_key,)
+        ).fetchall()
+        physical_types = [record_type for record_type, _payload in physical]
+        assert physical_types.count("world_state") == 3
+        assert physical_types.count("inter_agent_communication_metadata") == 3
+        assert physical_types.count("turn_context") == 3
+        assert "future_record_v100" in physical_types
+
+        normalized = conn.execute(
+            "SELECT kind,event_type,turn_id,model FROM codex_conversation_messages "
+            "WHERE conversation_key=? ORDER BY line_offset", (conversation_key,)
+        ).fetchall()
+        assert len(normalized) == 4
+        assert not ({"world_state", "inter_agent_communication_metadata",
+                     "turn_context", "future_record_v100"}
+                    & {event_type for _kind, event_type, _turn, _model in normalized})
+        assert [turn for _kind, _event, turn, _model in normalized] == [
+            "session-e-turn-a", "session-e-turn-a",
+            "session-e-turn-b", "session-e-turn-b",
+        ]
+        assert normalized[-1][3] == "gpt-synthetic-codex-b"
+
+        detail = q.get_codex_conversation(
+            conn, conversation_key, effective_speed="standard", limit=0)
+        outline = q.get_codex_conversation_outline(
+            conn, conversation_key, effective_speed="standard")
+        exported = q.get_codex_conversation_export(
+            conn, conversation_key, effective_speed="standard")
+        searched = q.search_codex_conversations(
+            conn, "SESSION_E_PRIVATE_INSTRUCTION_CANARY",
+            effective_speed="standard")
+        primary = json.dumps(
+            {"detail": detail, "outline": outline, "export": exported},
+            sort_keys=True,
+        )
+        for canary in (
+            "SESSION_E_PRIVATE_INSTRUCTION_CANARY",
+            "/synthetic/private/session-e/workspace",
+            "native-secret-opaque-335",
+        ):
+            assert canary in "\n".join(payload for _kind, payload in physical)
+            assert canary not in primary
+        assert searched["status"] == "ok" and searched["hits"] == []
+        assert outline["stats"]["items"] == detail["page"]["total"] == 4
+        assert exported["status"] == "ok"
+        assert all(text in exported["markdown"] for text in (
+            "Session E visible prompt A", "Session E visible answer A",
+            "Session E visible prompt B", "Session E visible answer B",
+        ))
+    finally:
+        conn.close()
+
+
+def test_session_e_malformed_turn_context_does_not_poison_delta_sticky_state():
+    events = _events("session-e-native-families")
+    result = kern.normalize_codex_events(
+        events, initial=kern.CodexStickyState())
+    assert result.terminal.turn_id == "session-e-turn-b"
+    assert result.terminal.model is None
+    assert all(isinstance(row.turn_id, (str, type(None))) for row in result.rows)
+
+
+def test_session_a_contract_version_replays_existing_derived_store(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-a-turn-contract"])
+    conn = ns["open_cache_db"]()
+    try:
+        first = ns["sync_codex_cache"](conn)
+        assert first.files_processed == 1
+        assert conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_conversation_contract_version'"
+        ).fetchone() == (kern.CODEX_CONVERSATION_CONTRACT_VERSION,)
+
+        # Simulate an older derived store on unchanged source bytes. The next
+        # ordinary sync must replay rather than skip the file as unchanged.
+        conn.execute(
+            "UPDATE codex_conversation_messages SET kind='user' WHERE kind='meta'"
+        )
+        conn.execute(
+            "UPDATE cache_meta SET value='1' "
+            "WHERE key='codex_conversation_contract_version'"
+        )
+        conn.commit()
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages WHERE kind='meta'"
+        ).fetchone() == (9,)
+        assert q.codex_normalization_authoritative(conn) is True
+    finally:
+        conn.close()
+
+
+def test_session_a_contract_version_converges_on_first_read_open(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-a-turn-contract"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conn.execute(
+            "UPDATE codex_conversation_messages SET kind='user' WHERE kind='meta'"
+        )
+        conn.execute(
+            "UPDATE cache_meta SET value='1' "
+            "WHERE key='codex_conversation_contract_version'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Qualified export/search and dashboard --no-sync only open the retained
+    # store. That first read must converge the re-derivable contract without a
+    # JSONL ingest or an explicit cache-sync command.
+    reopened = ns["open_cache_db"]()
+    try:
+        assert reopened.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages WHERE kind='meta'"
+        ).fetchone() == (9,)
+        assert q.codex_normalization_authoritative(reopened) is True
+    finally:
+        reopened.close()
+
+
+def test_session_a_late_task_complete_repairs_delta_turn_ids(tmp_path, monkeypatch):
+    ns, _root, rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-a-turn-contract"])
+    rollout = rollouts["session-a-turn-contract"]
+    all_lines = rollout.read_text(encoding="utf-8").splitlines(keepends=True)
+    # Stop immediately after the resumed turn's token_count, before its first
+    # explicit native turn anchor (patch/task_complete).
+    split = next(
+        index for index, line in enumerate(all_lines)
+        if '"timestamp":"2026-07-21T10:00:27Z"' in line
+    ) + 1
+    rollout.write_text("".join(all_lines[:split]), encoding="utf-8")
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        before = conn.execute(
+            "SELECT turn_id FROM codex_conversation_messages "
+            "WHERE text='Second distinct answer'"
+        ).fetchone()
+        assert before == (None,)
+
+        with rollout.open("a", encoding="utf-8") as fh:
+            fh.write("".join(all_lines[split:]))
+        ns["sync_codex_cache"](conn)
+        after = conn.execute(
+            "SELECT turn_id FROM codex_conversation_messages "
+            "WHERE text='Second distinct answer'"
+        ).fetchone()
+        assert after == ("turn-a",)
+        detail = q.get_codex_conversation(
+            conn, _single_ck(conn), effective_speed="standard", limit=0)
+        assert abs(detail["unattributed_cost_usd"]) < 1e-12
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("late_anchor", ["patch_apply_end", "turn_aborted"])
+def test_session_a_every_late_anchor_repairs_delta_turn_ids(
+        tmp_path, monkeypatch, late_anchor):
+    ns, _root, rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-a-turn-contract"])
+    rollout = rollouts["session-a-turn-contract"]
+    all_lines = rollout.read_text(encoding="utf-8").splitlines(keepends=True)
+    split = next(
+        index for index, line in enumerate(all_lines)
+        if '"timestamp":"2026-07-21T10:00:27Z"' in line
+    ) + 1
+    rollout.write_text("".join(all_lines[:split]), encoding="utf-8")
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT turn_id FROM codex_conversation_messages "
+            "WHERE text='Second distinct answer'"
+        ).fetchone() == (None,)
+
+        if late_anchor == "patch_apply_end":
+            anchor_line = next(
+                line for line in all_lines if '"type":"patch_apply_end"' in line)
+        else:
+            anchor_line = json.dumps({
+                "payload": {
+                    "reason": "synthetic cancellation",
+                    "turn_id": "turn-a",
+                    "type": "turn_aborted",
+                },
+                "timestamp": "2026-07-21T10:00:28Z",
+                "type": "event_msg",
+            }, separators=(",", ":")) + "\n"
+        with rollout.open("a", encoding="utf-8") as fh:
+            fh.write(anchor_line)
+        ns["sync_codex_cache"](conn)
+
+        assert conn.execute(
+            "SELECT turn_id FROM codex_conversation_messages "
+            "WHERE text='Second distinct answer'"
+        ).fetchone() == ("turn-a",)
+        detail = q.get_codex_conversation(
+            conn, _single_ck(conn), effective_speed="standard", limit=0)
+        assert abs(detail["unattributed_cost_usd"]) < 1e-12
     finally:
         conn.close()
 
@@ -1895,7 +3201,9 @@ def _detail_response_item(conn, ck):
 # ── A1: block_key on payload-capable detail blocks ────────────────────────────
 
 
-def test_block_key_on_tool_calls_distinct_and_absent_on_prose(tmp_path, monkeypatch):
+def test_block_key_on_payload_blocks_distinct_and_absent_on_prose(
+    tmp_path, monkeypatch,
+):
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
     conn = ns["open_cache_db"]()
     try:
@@ -1906,10 +3214,15 @@ def test_block_key_on_tool_calls_distinct_and_absent_on_prose(tmp_path, monkeypa
         keys = [b["block_key"] for b in tool_blocks]
         assert all(k and k.startswith("cbk1_") for k in keys)
         assert len(keys) == len(set(keys))  # unique per tool_call physical row
-        # non-tool blocks never carry a block_key.
+        # Native patch events are additively payload-capable. Ordinary prose
+        # and every other non-tool block remain keyless.
         for it in d["items"]:
             for b in it["blocks"]:
-                if b["kind"] != "tool_call":
+                card = (b.get("detail") or {}).get("card")
+                if b["kind"] == "event" and b.get("payload_which") == "event":
+                    assert b["block_key"].startswith("cbk1_")
+                    assert b["payload_which"] == "event"
+                elif b["kind"] != "tool_call":
                     assert "block_key" not in b
         # block keys are a DISTINCT family from item keys (different domain/prefix).
         assert not any(k in {it["item_key"] for it in d["items"]} for k in keys)

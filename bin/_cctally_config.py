@@ -309,6 +309,7 @@ ALLOWED_CONFIG_KEYS = (
     "dashboard.live_tail",
     "update.check.enabled",
     "update.check.ttl_hours",
+    "update.channel",
     "statusline.visual_burn_rate",
     "statusline.cost_source",
     "statusline.cctally_extensions",
@@ -883,6 +884,12 @@ def _config_known_value(config: dict, key: str) -> "object":
             return c._validate_update_check_ttl_hours_value(stored)
         except ValueError:
             return c.UPDATE_DEFAULT_TTL_HOURS
+    if key == "update.channel":
+        # Release channel opt-in (beta-channel, spec 2026-07-21 §3). Default
+        # "stable"; hand-edited junk surfaces the default — mirrors
+        # dashboard.bind / update.check.*. The single resolver keeps the CLI,
+        # check pipeline, doctor, and dashboard envelope in lockstep.
+        return c.resolve_update_channel(config)
     if key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
         return _config_codex_leaf_value(config, key)
     if key in (
@@ -1564,6 +1571,35 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 rendered = str(normalized)
             print(f"{key}={rendered}")
         return 0
+    if key == "update.channel":
+        # Release channel opt-in (beta-channel, spec 2026-07-21 §3). Enum
+        # {stable,beta}; validate first so rejection short-circuits before
+        # lock acquisition. Read-modify-write preserving the sibling
+        # `update.check` block (mirrors update.check.* preserving nothing it
+        # doesn't own).
+        try:
+            canonical = c._validate_update_channel_value(raw)
+        except ValueError as exc:
+            print(f"cctally config: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_update = config.get("update")
+            if existing_update is not None and not isinstance(existing_update, dict):
+                print(
+                    "cctally: update config error: update must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            update_block = dict(existing_update or {})
+            update_block["channel"] = canonical
+            config["update"] = update_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"update": {"channel": canonical}}, indent=2))
+        else:
+            print(f"update.channel={canonical}")
+        return 0
     if key in (
         "budget.weekly_usd",
         "budget.alerts_enabled",
@@ -1988,6 +2024,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                     if not update_block:
                         config.pop("update", None)
                     save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "update.channel":
+        # Drop the channel leaf; preserve a sibling update.check block, and
+        # prune an empty `update` so config.json stays tidy. Mirrors the
+        # update.check.* unset branch above.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            update_block = config.get("update")
+            if isinstance(update_block, dict) and "channel" in update_block:
+                del update_block["channel"]
+                if not update_block:
+                    config.pop("update", None)
+                save_config(config)
             # idempotent: silent on missing key
         return 0
     if key in (

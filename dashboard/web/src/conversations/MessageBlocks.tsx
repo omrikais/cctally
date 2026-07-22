@@ -5,6 +5,7 @@ import {
   ThinkingIcon,
   ResultIcon,
   ReferenceIcon,
+  SystemIcon,
 } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { highlightBody } from './CodeBlock';
@@ -17,6 +18,7 @@ import { parseMcpName } from './parseMcpName';
 import { MediaFigure } from './MediaFigure';
 import { LoadFull } from './LoadFull';
 import { useFocusMode } from './TranscriptContext';
+import { NativePayloadDisclosure } from './NativePayloadDisclosure';
 import type { ConversationBlock } from '../types/conversation';
 
 // #177 S4 (Q5-A): MCP chips show `action [server-pill]`; the full original
@@ -309,11 +311,99 @@ function firstLine(s: string): string {
   return t.length > 80 ? `${t.slice(0, 80).trimEnd()}…` : t;
 }
 
+const GIT_ACTION_LABELS = {
+  create_branch: 'Branch created',
+  stage: 'Changes staged',
+  commit: 'Commit created',
+  push: 'Branch pushed',
+  create_pr: 'Pull request created',
+} as const;
+
+function plural(count: number, one: string, many = `${one}s`): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+function CodexReasoningBlock({ block }: {
+  block: Extract<ConversationBlock, { kind: 'codex_reasoning' }>;
+}) {
+  const headline = block.title ?? block.summary ?? block.body ?? '';
+  const expandable = block.body != null;
+  const summary = (
+    <>
+      {expandable && <span className="conv-chev" aria-hidden="true" />}
+      <ThinkingIcon />
+      <span className="conv-codex-reasoning-label">Reasoning</span>
+      <span className="conv-codex-reasoning-title"><Markdown>{headline}</Markdown></span>
+    </>
+  );
+  if (!expandable) {
+    return <div className="conv-codex-reasoning conv-codex-reasoning--line" role="note">{summary}</div>;
+  }
+  return (
+    <details className="conv-codex-reasoning conv-codex-reasoning--expandable">
+      <summary>{summary}</summary>
+      <div className="conv-codex-reasoning-content">
+        {block.summary && (
+          <div className="conv-codex-reasoning-summary">
+            <span>Summary</span><Markdown>{block.summary}</Markdown>
+          </div>
+        )}
+        <div className="conv-codex-reasoning-body">
+          <span>Body</span><Markdown>{block.body ?? ''}</Markdown>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function SystemActionsBlock({ block }: {
+  block: Extract<ConversationBlock, { kind: 'system_actions' }>;
+}) {
+  return (
+    <div className="conv-system-actions" role="note" aria-label="System actions">
+      <span className="conv-system-actions-label"><SystemIcon /> System actions</span>
+      <span className="conv-system-actions-list">
+        {block.actions.map((action, index) => action.type === 'git' ? (
+          <span className="conv-system-action" key={`${action.type}-${action.action}-${index}`}>
+            {GIT_ACTION_LABELS[action.action]}{action.action === 'create_pr' && action.draft ? ' · draft' : ''}
+          </span>
+        ) : (
+          <span className="conv-system-action" key={`${action.type}-${index}`}>
+            Memory references attached · {plural(action.citation_count, 'citation')} · {plural(action.rollout_count, 'rollout')}
+          </span>
+        ))}
+      </span>
+      {block.payload_key && <NativePayloadDisclosure blockKey={block.payload_key} which="event" label="event" />}
+    </div>
+  );
+}
+
+function CodexLifecycleBlock({ block }: {
+  block: Extract<ConversationBlock, { kind: 'codex_lifecycle' }>;
+}) {
+  const label = block.event === 'task_started' ? 'Codex task started' : 'Codex task complete';
+  return (
+    <div className={`conv-codex-lifecycle${block.error ? ' is-error' : ''}`} role="note">
+      <div className="conv-codex-lifecycle-head"><SystemIcon /> <strong>{label}</strong></div>
+      {block.message && <div className="conv-codex-lifecycle-message">{block.message}</div>}
+      {block.error && <div className="conv-codex-lifecycle-error">{block.error}</div>}
+      {block.duration_ms != null && <div className="conv-codex-lifecycle-duration">{(block.duration_ms / 1000).toFixed(1)}s</div>}
+      {block.payload_key && <NativePayloadDisclosure blockKey={block.payload_key} which="event" label="event" />}
+    </div>
+  );
+}
+
 // Single non-text, non-tool_call block: thinking chip, the tool_use degradation
 // fallback, an orphan tool_result chip, or an inline media/reference span.
 function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid?: string | null }) {
   const split = useFindSplit();
   switch (block.kind) {
+    case 'codex_reasoning':
+      return <CodexReasoningBlock block={block} />;
+    case 'system_actions':
+      return <SystemActionsBlock block={block} />;
+    case 'codex_lifecycle':
+      return <CodexLifecycleBlock block={block} />;
     case 'thinking':
       return (
         <details className="conv-chip conv-chip--thinking">

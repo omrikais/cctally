@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, within } from '@testing-library/react';
-import { useState } from 'react';
+import { useLayoutEffect, useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReaderOverflowMenu } from './ReaderOverflowMenu';
 import { ANON_MODE_KEY, loadAnonMode, saveAnonMode } from '../store/anonPrefs';
@@ -34,6 +34,25 @@ function openMenu() {
 }
 
 describe('ReaderOverflowMenu', () => {
+  it('keeps an immediate first-open interaction after the initial commit', () => {
+    function ImmediateOpenHarness() {
+      useLayoutEffect(() => {
+        document.querySelector<HTMLButtonElement>('.conv-overflow-toggle')?.click();
+      }, []);
+      return <ReaderOverflowMenu {...baseProps} />;
+    }
+
+    render(<ImmediateOpenHarness />);
+    expect(screen.getByRole('menu', { name: /more actions/i })).not.toBeNull();
+  });
+
+  it('still closes an open menu when the qualified conversation changes', () => {
+    const { rerender } = render(<ReaderOverflowMenu {...baseProps} />);
+    openMenu();
+    rerender(<ReaderOverflowMenu {...baseProps} sessionId={{ source: 'codex', key: 'v1.next' }} />);
+    expect(screen.queryByRole('menu', { name: /more actions/i })).toBeNull();
+  });
+
   it('the trigger opens a menu listing the secondary actions', () => {
     render(<ReaderOverflowMenu {...baseProps} onCompare={vi.fn()} onLatest={vi.fn()} onExpandAll={vi.fn()} onCollapseAll={vi.fn()} />);
     const menu = openMenu();

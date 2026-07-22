@@ -316,7 +316,16 @@ class UpdateCheckRateLimited(UpdateError):
 
 
 class UpdateCheckHTTPError(UpdateError):
-    """Non-200, non-429 HTTP status from a version-check endpoint."""
+    """Non-200, non-429 HTTP status from a version-check endpoint.
+
+    Carries the numeric ``status_code`` (when known) so the channel-aware
+    dist-tag fetch can distinguish an exact 404 (dist-tag absent →
+    transition-window fallback) from any other HTTP failure (which fails
+    the whole resolution, preserving last-known-good)."""
+
+    def __init__(self, message: str, *, status_code: "int | None" = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class UpdateCheckParseError(UpdateError):
@@ -385,6 +394,58 @@ def _validate_update_check_ttl_hours_value(raw) -> int:
             f"{_UPDATE_CHECK_TTL_HOURS_MAX}])"
         )
     return n
+
+
+# === update.channel config (beta-channel opt-in, spec 2026-07-21 §3) ======
+# Distinct from the preview `channel` (prod|preview) in doctor / install.mode:
+# this is the RELEASE channel the client tracks (stable|latest dist-tag vs the
+# beta dist-tag). Internal name is `update_channel`; the config leaf is
+# `update.channel`; API/SSE payloads expose `configured_channel`.
+UPDATE_CHANNELS = ("stable", "beta")
+UPDATE_CHANNEL_DEFAULT = "stable"
+
+
+def _validate_update_channel_value(raw) -> str:
+    """Validate the `update.channel` config value.
+
+    Accepts a string (whitespace-trimmed, case-insensitive) in
+    :data:`UPDATE_CHANNELS`; returns the canonical lower-case form. Any
+    other value raises :class:`ValueError` so the CLI (`_cmd_config_set`)
+    and the dashboard (`_handle_post_settings`) can map it to their own
+    exit-code / HTTP-status semantics — mirrors the update.check
+    validators above.
+    """
+    if isinstance(raw, str):
+        v = raw.strip().lower()
+        if v in UPDATE_CHANNELS:
+            return v
+    raise ValueError(
+        f"invalid update.channel: {raw!r} "
+        f"(expected {'|'.join(UPDATE_CHANNELS)})"
+    )
+
+
+def resolve_update_channel(config: dict) -> str:
+    """Return the configured release channel from `config`, defaulting to
+    ``"stable"``.
+
+    Fail-soft: a missing/non-dict `update` block, an absent `channel`
+    leaf, or a hand-edited junk value all surface the default (mirrors
+    the `dashboard.bind` / `update.check.*` read posture in
+    `_config_known_value`). The single source of truth for "which channel
+    is configured" across the check pipeline, install path, banner,
+    doctor, and the dashboard envelope.
+    """
+    block = config.get("update") if isinstance(config, dict) else None
+    if not isinstance(block, dict):
+        return UPDATE_CHANNEL_DEFAULT
+    stored = block.get("channel")
+    if stored is None:
+        return UPDATE_CHANNEL_DEFAULT
+    try:
+        return _validate_update_channel_value(stored)
+    except ValueError:
+        return UPDATE_CHANNEL_DEFAULT
 
 
 # === update-subcommand state-file / lock / log helpers (spec §1) =========
@@ -973,7 +1034,7 @@ def _fetch_url(url: str, *, timeout: float | None = None) -> tuple[int, bytes]:
     except urllib.error.HTTPError as e:
         if e.code == 429:
             raise UpdateCheckRateLimited(str(e))
-        raise UpdateCheckHTTPError(f"HTTP {e.code}: {e}")
+        raise UpdateCheckHTTPError(f"HTTP {e.code}: {e}", status_code=e.code)
     except (urllib.error.URLError, TimeoutError) as e:
         # URLError covers connection-setup failures; TimeoutError
         # (socket.timeout's alias since 3.10) covers stalls during
@@ -999,6 +1060,98 @@ def _check_npm_latest_version() -> str:
         return data["version"]
     except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
         raise UpdateCheckParseError(f"npm registry parse failed: {e}")
+
+
+def _fetch_npm_dist_tag_version(tag: str) -> "str | None":
+    """Fetch the version bound to an npm dist-tag (`latest`/`beta`).
+
+    Returns the manifest's ``version`` field, or ``None`` **iff** the
+    registry returns an exact HTTP 404 for the tag — i.e. the dist-tag
+    does not exist (the beta-channel transition window). Any OTHER failure
+    (5xx, 429, timeout, network, malformed JSON, missing `version`) raises
+    the matching ``UpdateCheck*`` exception so the caller preserves the
+    prior cached `latest_version` (last-known-good).
+
+    Endpoints: `latest` → :data:`UPDATE_NPM_REGISTRY_URL`; any other tag →
+    :data:`UPDATE_NPM_BETA_REGISTRY_URL`. The per-tag env hook
+    ``CCTALLY_TEST_UPDATE_NPM_<TAG>_STATUS`` (e.g. ``..._BETA_STATUS=404``)
+    simulates a bare HTTP status for the golden harness, which serves
+    `file://` fixtures and therefore cannot emit a genuine 404/5xx —
+    mirrors the ``CCTALLY_TEST_UPDATE_NPM_URL`` fixture-URL hook.
+    """
+    c = _cctally()
+    forced = os.environ.get(f"CCTALLY_TEST_UPDATE_NPM_{tag.upper()}_STATUS")
+    if forced:
+        try:
+            code = int(forced.strip())
+        except ValueError:
+            code = 500
+        if code == 404:
+            return None
+        if code == 429:
+            raise UpdateCheckRateLimited(f"HTTP 429 (forced): dist-tag {tag}")
+        raise UpdateCheckHTTPError(
+            f"HTTP {code} (forced): dist-tag {tag}", status_code=code
+        )
+    url = (
+        c.UPDATE_NPM_REGISTRY_URL if tag == "latest"
+        else c.UPDATE_NPM_BETA_REGISTRY_URL
+    )
+    try:
+        status, body = c._fetch_url(url)
+    except UpdateCheckHTTPError as e:
+        if getattr(e, "status_code", None) == 404:
+            return None
+        raise
+    try:
+        data = json.loads(body.decode("utf-8"))
+        return data["version"]
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+        raise UpdateCheckParseError(f"npm dist-tag {tag} parse failed: {e}")
+
+
+def _resolve_npm_channel_target(channel: str) -> "tuple[str, str]":
+    """Resolve the npm install target for ``channel`` → ``(version, dist_tag)``.
+
+    Stable: the `latest` dist-tag verbatim (byte-identical to today).
+    Beta: **SemVer-max(dist-tags.beta, dist-tags.latest)** — an absent
+    `beta` tag (exact 404) falls back to `latest` (transition window);
+    any other beta-leg failure propagates and fails the whole resolution.
+    Both legs are SemVer-validated before the max so a malformed/non-SemVer
+    payload raises :class:`UpdateCheckParseError` (preserving last-known-
+    good), never a silent bad target. ``dist_tag`` is which tag actually
+    produced the returned version (`beta` only when beta strictly wins).
+    """
+    c = _cctally()
+    latest = c._fetch_npm_dist_tag_version("latest")
+    if latest is None:
+        # `latest` should always exist; a 404 here is a real failure.
+        raise UpdateCheckHTTPError(
+            "npm dist-tag latest returned 404", status_code=404
+        )
+    c._semver_or_parse_error(latest)
+    if channel != "beta":
+        return (latest, "latest")
+    beta = c._fetch_npm_dist_tag_version("beta")
+    if beta is None:
+        # Transition window: beta dist-tag not yet published → track latest.
+        return (latest, "latest")
+    c._semver_or_parse_error(beta)
+    if c._semver_gt(beta, latest):
+        return (beta, "beta")
+    return (latest, "latest")
+
+
+def _semver_or_parse_error(version: str) -> str:
+    """Validate ``version`` as SemVer, mapping a parse failure to
+    :class:`UpdateCheckParseError` so it flows through the check
+    pipeline's last-known-good preservation instead of escaping as a bare
+    ``ValueError``."""
+    try:
+        _release_parse_semver(version)
+    except ValueError:
+        raise UpdateCheckParseError(f"non-SemVer version from npm: {version!r}")
+    return version
 
 
 def _check_brew_latest_version() -> str:
@@ -1035,6 +1188,25 @@ def _is_update_check_due(config: dict) -> bool:
     enabled = check_cfg.get("enabled", True)
     if not enabled:
         return False
+    # Channel-flip invalidation (beta-channel, spec 2026-07-21 §3): a
+    # configured channel that differs from the last-attempted channel means
+    # the cached `latest_version` was resolved for the wrong channel — treat
+    # the TTL as expired and refresh immediately. `last_attempt_channel` is
+    # stamped from config BEFORE the marker touch in `_do_update_check`, so
+    # after one refresh it matches config again — no retry storm. Absent
+    # field defaults to "stable" (back-compat with pre-feature state files).
+    try:
+        configured_channel = c.resolve_update_channel(config)
+        prior_state = c._load_update_state()
+        last_attempt = (prior_state or {}).get(
+            "last_attempt_channel", "stable"
+        )
+        if configured_channel != last_attempt:
+            return True
+    except Exception:
+        # Never let a state-read hiccup turn the TTL gate into a hard error;
+        # fall through to the marker check.
+        pass
     ttl_hours = check_cfg.get("ttl_hours", c.UPDATE_DEFAULT_TTL_HOURS)
     try:
         mtime = _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH.stat().st_mtime
@@ -1056,8 +1228,30 @@ def _do_update_check() -> None:
     typed exception to a `check_status` enum (`rate_limited` /
     `fetch_failed` / `parse_failed`); never lose the prior
     `latest_version`. State is saved unconditionally on the way out.
+
+    Channel-aware (beta-channel, spec 2026-07-21 §3): reads the configured
+    release channel and stamps ``last_attempt_channel`` from config BEFORE
+    the marker touch + fetch (so a failed channel-switch fetch neither
+    retry-storms — marker-first holds — nor mis-attributes stale data). On
+    the npm vector, ``channel="beta"`` resolves SemVer-max(beta, latest);
+    on a successful complete resolution ``latest_version_channel`` +
+    ``resolved_dist_tag`` record what produced ``latest_version``. Brew is
+    always stable (Q2). The stable-npm path is byte-identical to before.
     """
     c = _cctally()
+    config = load_config()
+    channel = c.resolve_update_channel(config)
+
+    # Stamp `last_attempt_channel` from config and PERSIST it BEFORE the
+    # marker touch + network fetch. Even if the fetch then crashes, the
+    # attempted channel is on disk, so `_is_update_check_due`'s channel-flip
+    # bypass sees config==last_attempt and defers to the (now-touched)
+    # marker — no retry storm; `latest_version_channel` (written only on
+    # success) still names the OLD producer, so no mis-attribution.
+    state = c._load_update_state() or {"_schema": 1}
+    state["last_attempt_channel"] = channel
+    c._save_update_state(state)
+
     # Touch marker FIRST — crash safety: a dead process mid-fetch must
     # not trigger another fetch within the TTL window.
     _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,6 +1260,9 @@ def _do_update_check() -> None:
     method = c._detect_install_method(mutate=True)
 
     state = c._load_update_state() or {"_schema": 1}
+    # Belt-and-suspenders: detection preserves other fields, but keep the
+    # attempted channel authoritative on the object we save at the end.
+    state["last_attempt_channel"] = channel
     cur = _release_read_latest_release_version()
     if cur:
         state["current_version"] = cur[0]
@@ -1077,12 +1274,25 @@ def _do_update_check() -> None:
 
     try:
         if method.method == "npm":
-            latest = c._check_npm_latest_version()
-            state["latest_version"] = latest
+            if channel == "beta":
+                latest, dist_tag = c._resolve_npm_channel_target("beta")
+                state["latest_version"] = latest
+                state["latest_version_channel"] = "beta"
+                state["resolved_dist_tag"] = dist_tag
+            else:
+                latest = c._check_npm_latest_version()
+                state["latest_version"] = latest
+                state["latest_version_channel"] = "stable"
+                state["resolved_dist_tag"] = "latest"
             state["source"] = "npm-registry"
         elif method.method == "brew":
+            # Brew tracks stable only (Q2) — no dist-tag concept. The
+            # beta+brew advisory rides on the CLI --check / doctor surfaces,
+            # not here.
             latest = c._check_brew_latest_version()
             state["latest_version"] = latest
+            state["latest_version_channel"] = "stable"
+            state["resolved_dist_tag"] = None
             state["source"] = "github-formula"
         else:
             # Unknown install method — no remote check possible
@@ -1233,6 +1443,48 @@ def _format_update_command(method: str, version: str | None) -> str:
     return ""
 
 
+# Advisory shown on the beta channel for a brew install: brew IS the stable
+# channel (Q2), so a beta opt-in on brew resolves stable + this line.
+BREW_BETA_ADVISORY = (
+    "beta channel unavailable for brew installs — use npm or source"
+)
+
+
+def _resolved_install_target(state: dict, channel: str) -> "str | None":
+    """The exact version a bare (unpinned) beta-channel npm install targets.
+
+    On the beta channel, npm installs the EXACT resolved version
+    (`npm install -g cctally@X.Y.Z`), never bare `@beta` — whose registry
+    target can disagree with the advertised SemVer-max(beta, latest) and
+    which doesn't exist in the transition window. Returns the cached
+    `latest_version` (the resolved max, written by the check pipeline) for
+    an npm beta channel, else ``None`` (stable → `@latest`; brew has no
+    versioned formulae). Callers pass the explicit `--version` pin ahead of
+    this — the pin always wins.
+    """
+    method = (state.get("install") or {}).get("method", "unknown")
+    if method == "npm" and channel == "beta":
+        return state.get("latest_version")
+    return None
+
+
+def _resolved_update_command(state: dict, config: "dict | None") -> str:
+    """Channel-aware install command for the `--check` renderers / envelope.
+
+    Stable and brew are byte-identical to `_format_update_command(method,
+    None)`. On an npm beta channel it pins the exact resolved version
+    (`cctally@X.Y.Z`) so every surface — CLI `--check`, `--json`, dashboard
+    badge/modal — advertises the same target and command.
+    """
+    c = _cctally()
+    method = (state.get("install") or {}).get("method", "unknown")
+    channel = c.resolve_update_channel(config or {})
+    target = _resolved_install_target(state, channel)
+    if target:
+        return c._format_update_command(method, target)
+    return c._format_update_command(method, None)
+
+
 def _prerelease_note(current: str) -> str | None:
     """Spec §1.8 — prerelease users get a one-shot informational note in
     `--check` output. Returns the canned two-line message verbatim per
@@ -1247,9 +1499,15 @@ def _prerelease_note(current: str) -> str | None:
 
 
 def _format_update_check_json(
-    state: dict[str, Any], suppress: dict[str, Any]
+    state: dict[str, Any], suppress: dict[str, Any],
+    config: "dict | None" = None,
 ) -> dict[str, Any]:
-    """JSON shape for `cctally update --check --json` (spec §4.4)."""
+    """JSON shape for `cctally update --check --json` (spec §4.4).
+
+    ``config`` is optional and defaults to stable — passing ``None`` keeps
+    the stable envelope byte-identical to before. On an npm beta channel,
+    ``update_command`` pins the exact resolved version (spec 2026-07-21 §3).
+    """
     c = _cctally()
     cur = state.get("current_version")
     lat = state.get("latest_version")
@@ -1281,7 +1539,7 @@ def _format_update_check_json(
         "latest_version": lat,
         "available": available,
         "method": method,
-        "update_command": c._format_update_command(method, None),
+        "update_command": c._resolved_update_command(state, config),
         "release_notes_url": state.get("latest_version_url"),
         "check_status": state.get("check_status"),
         "check_error": state.get("check_error"),
@@ -1304,7 +1562,8 @@ _UPDATE_METHOD_HUMAN_LABEL = {
 
 
 def _format_update_check_human(
-    state: dict[str, Any], suppress: dict[str, Any]
+    state: dict[str, Any], suppress: dict[str, Any],
+    config: "dict | None" = None,
 ) -> str:
     """Multi-line plaintext block for `cctally update --check` (spec §4.4).
 
@@ -1312,8 +1571,14 @@ def _format_update_check_human(
     (`Will run` is the longest at 8 chars + 2-space gutter). Method row
     appends `  (auto-detected)` per spec example. Up-to-date / unknown
     variants append a fallback line below the table.
+
+    ``config`` is optional and defaults to stable — passing ``None`` keeps
+    the stable output byte-identical. On an npm beta channel the `Will run`
+    line pins the exact resolved version; a beta opt-in on brew appends the
+    ``BREW_BETA_ADVISORY`` line (brew tracks stable only, Q2).
     """
     c = _cctally()
+    channel = c.resolve_update_channel(config or {})
     cur = state.get("current_version") or "unknown"
     lat = state.get("latest_version") or "unknown"
     method = (state.get("install") or {}).get("method", "unknown")
@@ -1334,7 +1599,7 @@ def _format_update_check_human(
         f"{'Latest':<10}{lat}",
         f"{'Method':<10}{method_label}  (auto-detected)",
     ]
-    will_run = c._format_update_command(method, None)
+    will_run = c._resolved_update_command(state, config)
     if will_run:
         lines.append(f"{'Will run':<10}{will_run}")
     if url:
@@ -1342,6 +1607,10 @@ def _format_update_check_human(
     if status and status != "ok":
         status_value = status + (f" ({err})" if err else "")
         lines.append(f"{'Status':<10}{status_value}")
+    if channel == "beta" and method == "brew":
+        # Brew IS the stable channel (Q2). Surface the advisory so a beta
+        # opt-in on brew explains why it resolves stable.
+        lines.append(f"{'Channel':<10}{c.BREW_BETA_ADVISORY}")
     lines.append("")
     if method == "unknown":
         # No remote check is possible for source / dev installs; render
@@ -1486,9 +1755,11 @@ def _do_update_check_user(*, force: bool, output_json: bool) -> int:
         return 0
     suppress = c._load_update_suppress()
     if output_json:
-        print(json.dumps(c._format_update_check_json(state, suppress), indent=2))
+        print(json.dumps(
+            c._format_update_check_json(state, suppress, config), indent=2
+        ))
     else:
-        print(c._format_update_check_human(state, suppress))
+        print(c._format_update_check_human(state, suppress, config))
     return 0
 
 
@@ -1649,11 +1920,54 @@ def _do_update_install(
     / write-perm-denied; :class:`UpdateValidationError` (rc=2) for
     invalid --version / --version+brew. The boundary distinction is
     enforced by :func:`cmd_update`'s try/except below.
+
+    Channel-aware (beta-channel, spec 2026-07-21 §3): a bare (unpinned)
+    npm install on the beta channel targets the EXACT resolved version
+    (`cctally@X.Y.Z`), never bare `@beta`; a bare install (either channel)
+    refuses as a no-op (exit 0) when the resolved target is not SemVer-newer
+    than the installed version — this makes a beta→stable flip-back safe
+    (no silent downgrade to `@latest`). An explicit `--version` pin always
+    overrides both. Brew tracks stable only (Q2): a beta opt-in on brew
+    prints the advisory and proceeds as a stable upgrade.
     """
     c = _cctally()
     method = c._detect_install_method(mutate=not dry_run)
-    c._preflight_install(method, version)
-    steps = c._build_update_steps(method, version)
+    config = load_config()
+    channel = c.resolve_update_channel(config)
+    state = c._load_update_state() or {}
+
+    # Beta resolves the exact target from the cached max(beta, latest); an
+    # explicit --version pin always wins (the deliberate override).
+    resolved_version = version
+    if resolved_version is None:
+        resolved_version = c._resolved_install_target(state, channel)
+
+    # Downgrade refusal for a BARE (unpinned) install: no-op + exit 0 when
+    # the resolved target is not SemVer-newer than the installed version.
+    if version is None and method.method in ("npm", "brew"):
+        target = resolved_version or state.get("latest_version")
+        current = state.get("current_version")
+        if target and current:
+            try:
+                newer = c._semver_gt(target, current)
+            except ValueError:
+                newer = True  # can't compare → don't block a real upgrade
+            if not newer:
+                print(
+                    f"cctally is already up to date on the {channel} channel "
+                    f"(installed {current}, latest {target}). Nothing to do.\n"
+                    "To install a specific version anyway, run "
+                    "`cctally update --version X.Y.Z`."
+                )
+                return 0
+
+    # Brew tracks stable only (Q2): surface the advisory, then proceed as a
+    # normal (stable) brew upgrade.
+    if channel == "beta" and method.method == "brew":
+        print(f"Note: {c.BREW_BETA_ADVISORY}.")
+
+    c._preflight_install(method, resolved_version)
+    steps = c._build_update_steps(method, resolved_version)
     if dry_run:
         for name, cmd in steps:
             if output_json:
@@ -1679,7 +1993,9 @@ def _do_update_install(
                 if rc != 0:
                     return 1
             _log_update_event(log_fd, "INSTALL_SUCCESS")
-            c._stamp_install_success_to_state(version, method)
+            # Stamp the EXACT installed version (the beta-resolved target
+            # when unpinned on beta; else the pin / fresh-CHANGELOG fallback).
+            c._stamp_install_success_to_state(resolved_version, method)
             return 0
     finally:
         c._release_update_lock(lock_fd)
@@ -2234,10 +2550,17 @@ def _format_update_banner(state: dict[str, Any]) -> str:
 
     Includes the dismissal recipe inline so the user never has to
     consult docs to silence it.
+
+    Channel marker (beta-channel, spec 2026-07-21 §3): a ``(beta)`` marker
+    lands after the version when the last-attempted channel was beta —
+    ``↑ cctally 1.77.0 (beta) available…``. Gating stays in
+    ``_should_show_update_banner`` (unchanged); this formatter only adds the
+    marker, so the stable banner is byte-identical.
     """
     cur = state["current_version"]
     lat = state["latest_version"]
+    marker = " (beta)" if state.get("last_attempt_channel") == "beta" else ""
     return (
-        f"↑ cctally {lat} available (you're on {cur}). "
+        f"↑ cctally {lat}{marker} available (you're on {cur}). "
         f"Run `cctally update`. Skip: cctally update --skip {lat}"
     )

@@ -16,6 +16,15 @@
                 },
                 {
                     "details": {
+                        "channel": "stable"
+                    },
+                    "id": "install.update_channel",
+                    "severity": "ok",
+                    "summary": "stable",
+                    "title": "Update channel"
+                },
+                {
+                    "details": {
                         "missing": [],
                         "present": 15,
                         "stale": [],
@@ -702,7 +711,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 34,
+            "ok": 35,
             "warn": 5
         },
         "severity": "warn"

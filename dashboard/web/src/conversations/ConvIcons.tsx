@@ -345,8 +345,9 @@ export function toolIcon(name?: string | null): ReactNode {
   if (mcp) return mcpServerIcon(mcp.kind);
   const n = (name ?? '').toLowerCase();
   if (n === 'read' || n === 'grep' || n === 'glob' || n === 'ls') return <FileSearchIcon />;
-  if (n === 'edit' || n === 'write' || n === 'notebookedit' || n === 'multiedit') return <PencilIcon />;
-  if (n === 'bash') return <TerminalIcon />;
+  if (n === 'edit' || n === 'write' || n === 'notebookedit' || n === 'multiedit'
+      || n === 'apply_patch' || n === 'patch_apply_end') return <PencilIcon />;
+  if (n === 'bash' || n === 'exec') return <TerminalIcon />;
   if (n === 'task' || n === 'agent') return <SubagentIcon />;
   if (n === 'skill') return <SkillIcon />;
   if (n === 'webfetch') return <GlobeIcon />;

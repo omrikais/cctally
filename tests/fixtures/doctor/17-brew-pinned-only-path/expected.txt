@@ -2,6 +2,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 
 Install
   ✓ Mode                     installed
+  ✓ Update channel           stable
   ⚠ Symlinks                 0/15 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update
       → cctally is reachable only through a legacy ~/.local/bin link to a Homebrew keg. Put <prefix>/bin on your PATH (e.g. `eval "$(brew shellenv)"`), then run `cctally setup` to remove the legacy link.
   ✓ PATH                     cctally reachable on $PATH
@@ -53,4 +54,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 33 OK · 6 WARN · 0 FAIL
+Summary: 34 OK · 6 WARN · 0 FAIL

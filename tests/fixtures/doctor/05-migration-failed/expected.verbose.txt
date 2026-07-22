@@ -7,6 +7,9 @@ Install
         is_dev_checkout: False
         app_dir: $HOME/.local/share/cctally
         channel: prod
+  ✓ Update channel           stable
+      details:
+        channel: stable
   ⚠ Symlinks                 0/15 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update
       → Run `cctally setup`
       details:
@@ -177,4 +180,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 31 OK · 7 WARN · 1 FAIL
+Summary: 32 OK · 7 WARN · 1 FAIL

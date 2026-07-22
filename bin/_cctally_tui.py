@@ -1066,6 +1066,13 @@ class DataSnapshot:
     # at sync-thread time so ``snapshot_to_envelope`` stays a pure
     # renderer; empty list when no current 5h block is bound.
     five_hour_milestones: list[dict] = field(default_factory=list)
+    # ---- hero-modal historical milestones (spec §1a/§3) ----
+    # Compact per-week navigation index for the CurrentWeekModal's week
+    # chip (build_claude_week_index). Built ONLY on the non-idle rebuild
+    # and stored here so ``snapshot_to_envelope`` stays a pure serializer;
+    # the idle path carries it forward via ``dataclasses.replace``. Empty
+    # list on first paint / when the DB read fails.
+    week_index: list[dict] = field(default_factory=list)
     # ---- view-model unification (Bundle 1): pre-computed totals ----
     # Populated by the sync thread as sum-over-visible-rows over the
     # panel rows ``_dashboard_build_{daily,monthly,weekly}_periods``
@@ -3180,6 +3187,18 @@ def _tui_build_snapshot(
                 fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
             except Exception as exc:
                 errors.append(f"five-hour-milestones: {exc}")
+        # ---- hero-modal historical milestones week index (spec §1a/§3) ----
+        # Built ONLY here on the non-idle rebuild (the idle short-circuit
+        # returns before this phase and carries the prior index forward via
+        # ``dataclasses.replace``), so an idle dashboard issues NONE of the
+        # index queries. Reached via the ``cctally`` namespace so tests can
+        # monkeypatch it (a call-counter drives the hot-path guard).
+        week_index: list[dict] = []
+        with _perf.phase("build.week_index"):
+            try:
+                week_index = sys.modules["cctally"].build_claude_week_index(conn)
+            except Exception as exc:
+                errors.append(f"week-index: {exc}")
         # ---- Projects panel + modal envelope (spec §5.2, plan Task 1) -----
         # Per-tick aggregation lives on the sync thread; the dashboard's
         # pure ``snapshot_to_envelope`` reads ``snap.projects_envelope``
@@ -3376,6 +3395,7 @@ def _tui_build_snapshot(
             daily_panel=daily_panel,
             alerts=alerts,
             five_hour_milestones=fh_milestones,
+            week_index=week_index,
             daily_total_cost_usd=daily_total_cost_usd,
             daily_total_tokens=daily_total_tokens,
             monthly_total_cost_usd=monthly_total_cost_usd,
@@ -4165,6 +4185,9 @@ class _TuiSyncThread:
                     last_sync_error=f"sync crashed: {exc}",
                     generated_at=dt.datetime.now(dt.timezone.utc),
                     percent_milestones=prev.percent_milestones,
+                    # Carry the navigation index forward on a sync crash so the
+                    # hero modal's week chip stays usable (spec §3 idle-carry).
+                    week_index=prev.week_index,
                     weekly_history=prev.weekly_history,
                     weekly_periods=prev.weekly_periods,
                     monthly_periods=prev.monthly_periods,

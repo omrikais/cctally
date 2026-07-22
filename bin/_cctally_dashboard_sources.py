@@ -2080,7 +2080,21 @@ def build_codex_source_state(
         now_utc=context.now_utc,
         display_tz_name=context.display_tz_name,
     )
-    quota = {**quota, "blocks": quota_blocks}
+    # Hero-modal historical-milestone navigation index (spec §1c, §3). Built
+    # here on the non-idle codex source rebuild (idle ticks reuse the stored
+    # bundle) over the durable projection — a pure serializer never touches it.
+    # Guarded: an index failure must never fail the codex source build.
+    cycle_index: tuple = ()
+    if cycle is not None and not hero_failure:
+        try:
+            cycle_index = tuple(
+                sys.modules["cctally"].build_codex_cycle_index(
+                    context.stats_conn, identity=cycle, now_utc=context.now_utc,
+                )
+            )
+        except sqlite3.Error:
+            cycle_index = ()
+    quota = {**quota, "blocks": quota_blocks, "cycle_index": cycle_index}
     budget_rows = _budget_wire(context.stats_conn)
     projected_budget_rows = _projected_budget_wire(context.stats_conn)
     budget_cost_events = _codex_budget_cost_events(context, budget_entries)
