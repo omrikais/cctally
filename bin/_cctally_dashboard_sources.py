@@ -38,6 +38,7 @@ from _lib_dashboard_sources import (
     dashboard_resource_key,
 )
 from _lib_quota import (
+    QuotaWindowIdentity,
     build_blocks,
     build_history,
     forecast_quota,
@@ -94,6 +95,9 @@ class CodexCycleBoundary:
     # Root provenance is server-only accounting input, never public wire data.
     source_root_keys: tuple[str, ...]
     used_percent: float | None = None
+    # Exact server-side quota identity selected for the hero. It is never
+    # serialized; milestone-history keys hash it opaquely.
+    quota_identity: QuotaWindowIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,7 @@ def _resolve_codex_weekly_cycle(
     now_utc: dt.datetime,
 ) -> CodexCycleBoundary:
     """Select exactly one active account-level 10,080-minute native cycle."""
-    boundaries: dict[tuple[int, dt.datetime], dict[str, object]] = {}
+    boundaries: dict[tuple[int, dt.datetime], list[tuple[object, object]]] = {}
     stale_weekly_evidence = False
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
@@ -140,23 +144,33 @@ def _resolve_codex_weekly_cycle(
             stale_weekly_evidence = True
             continue
         boundary = (history.identity.window_minutes, baseline.resets_at)
-        item = boundaries.setdefault(boundary, {"roots": set(), "used": []})
-        item["roots"].add(history.identity.source_root_key)
-        if baseline.used_percent is not None:
-            item["used"].append(float(baseline.used_percent))
+        boundaries.setdefault(boundary, []).append((history, baseline))
     if len(boundaries) != 1:
         if not boundaries:
             raise CodexCycleUnavailable("stale" if stale_weekly_evidence else "missing")
         raise CodexCycleUnavailable("conflicting")
-    (window_minutes, resets_at), boundary_data = next(iter(boundaries.items()))
-    root_keys = boundary_data["roots"]
-    used_values = boundary_data["used"]
+    (window_minutes, resets_at), candidates = next(iter(boundaries.items()))
+    # Preserve the existing hero's max-used-percent choice, then pin every
+    # remaining tie deterministically. The selected full identity—not the
+    # union of sibling roots/slots/limits—owns the hero cycle.
+    history, baseline = max(
+        candidates,
+        key=lambda item: (
+            float(item[1].used_percent),
+            item[1].captured_at.astimezone(UTC),
+            item[0].identity.source_root_key,
+            item[0].identity.logical_limit_key,
+            item[0].identity.observed_slot,
+        ),
+    )
+    selected_identity = history.identity
     return CodexCycleBoundary(
         window_minutes=window_minutes,
         start_at=resets_at - dt.timedelta(minutes=window_minutes),
         resets_at=resets_at,
-        source_root_keys=tuple(sorted(root_keys)),
-        used_percent=max(used_values) if used_values else None,
+        source_root_keys=(selected_identity.source_root_key,),
+        used_percent=float(baseline.used_percent),
+        quota_identity=selected_identity,
     )
 
 

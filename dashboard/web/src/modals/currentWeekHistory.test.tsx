@@ -2,10 +2,10 @@
 // (stepping, fetch policy, credit divider, embedded keymap suppression,
 // Share visibility, vanish). Focus/real-keyboard/scroll are the browser gate.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CurrentWeekModal } from './CurrentWeekModal';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
-import { registeredBindings } from '../store/keymap';
+import { installGlobalKeydown, registeredBindings, uninstallGlobalKeydown } from '../store/keymap';
 import { clearMilestoneHistoryCacheForTests } from './milestoneHistory';
 import codexFixture from '../../__tests__/fixtures/envelope.json';
 import type { Envelope, WeekIndexEntry } from '../types/envelope';
@@ -13,7 +13,7 @@ import type { Envelope, WeekIndexEntry } from '../types/envelope';
 function idxEntry(key: string, opts: Partial<WeekIndexEntry> = {}): WeekIndexEntry {
   return {
     key,
-    start_at_utc: `${key}T00:00:00Z`,
+    start_at_utc: null,
     end_at_utc: null,
     label: `Wk ${key}`,
     is_current: false,
@@ -26,9 +26,15 @@ function idxEntry(key: string, opts: Partial<WeekIndexEntry> = {}): WeekIndexEnt
 }
 
 const INDEX: WeekIndexEntry[] = [
-  idxEntry('2026-05-15', { is_current: true }),
-  idxEntry('2026-05-08'),
-  idxEntry('2026-05-01'),
+  idxEntry('milestone_cycle:current', { is_current: true, label: 'Jul 18–Jul 25' }),
+  idxEntry('milestone_cycle:post-reset', {
+    start_at_utc: '2026-07-16T05:00:00Z', end_at_utc: '2026-07-18T05:00:00Z',
+    label: 'Jul 15–Jul 17',
+  }),
+  idxEntry('milestone_cycle:pre-reset', {
+    start_at_utc: '2026-07-11T05:00:00Z', end_at_utc: '2026-07-16T05:00:00Z',
+    label: 'Jul 10–Jul 15',
+  }),
 ];
 
 function makeEnv(weekIndex: WeekIndexEntry[], generatedAt = '2026-05-18T12:00:00Z'): Envelope {
@@ -55,19 +61,18 @@ function makeEnv(weekIndex: WeekIndexEntry[], generatedAt = '2026-05-18T12:00:00
   } as unknown as Envelope;
 }
 
-const CREDIT_SPLIT_PAYLOAD = {
+const HISTORIC_CYCLE_PAYLOAD = {
   source: 'claude',
-  key: '2026-05-08',
-  label: 'Wk 2026-05-08',
-  start_at_utc: '2026-05-08T00:00:00Z',
-  end_at_utc: '2026-05-15T00:00:00Z',
+  key: 'milestone_cycle:post-reset',
+  label: 'Jul 16–Jul 18',
+  start_at_utc: '2026-07-16T05:00:00Z',
+  end_at_utc: '2026-07-18T05:00:00Z',
   is_current: false,
-  detail_stamp: 'st-2026-05-08',
+  detail_stamp: 'st-milestone_cycle:post-reset',
   segments: [
-    { reset_event_id: 0, milestones: [{ percent: 1, crossed_at_utc: '2026-05-09T10:00:00Z', cumulative_usd: 1, marginal_usd: 1, five_hour_pct_at_cross: null }] },
-    { reset_event_id: 5, milestones: [{ percent: 1, crossed_at_utc: '2026-05-11T10:00:00Z', cumulative_usd: 0.5, marginal_usd: null, five_hour_pct_at_cross: null }] },
+    { key: 'milestone_segment:post-reset', milestones: [{ percent: 1, crossed_at_utc: '2026-07-16T10:00:00Z', cumulative_usd: 1, marginal_usd: 1, five_hour_pct_at_cross: null }] },
   ],
-  dividers: [{ effective_at_utc: '2026-05-10T12:00:00Z', prior_percent: 40 }],
+  dividers: [],
   blocks: [],
 };
 
@@ -85,6 +90,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  uninstallGlobalKeydown();
   vi.restoreAllMocks();
 });
 
@@ -99,27 +105,19 @@ describe('week nav chip', () => {
   });
 });
 
-describe('fetch policy + credit divider', () => {
-  it('fetches on stepping to a historic week and renders the credit divider', async () => {
-    const spy = mockFetch(CREDIT_SPLIT_PAYLOAD);
+describe('fetch policy + reset-defined cycle wire', () => {
+  it('fetches one opaque historic cycle and renders only its ledger', async () => {
+    const spy = mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
     fireEvent.click(screen.getByLabelText('Older week'));
-    await screen.findByText(/CREDIT/);
-    expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/2026-05-08');
-    expect(screen.getByText(/from 40%/)).toBeTruthy();
-  });
-
-  it('fetches the current week on mount when its entry is multi-segment', async () => {
-    const spy = mockFetch({ ...CREDIT_SPLIT_PAYLOAD, key: '2026-05-15' });
-    const multi = [idxEntry('2026-05-15', { is_current: true, segment_count: 2 }), idxEntry('2026-05-08')];
-    updateSnapshot(makeEnv(multi));
-    render(<CurrentWeekModal />);
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/2026-05-15'));
+    await screen.findByText('Jul 16–Jul 18');
+    expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Apost-reset');
+    expect(screen.queryByText(/CREDIT/)).toBeNull();
   });
 
   it('does NOT fetch on mount for a single-segment current week', () => {
-    const spy = mockFetch(CREDIT_SPLIT_PAYLOAD);
+    const spy = mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
     expect(spy).not.toHaveBeenCalled();
@@ -150,24 +148,24 @@ describe('keyboard registration (embedded suppression)', () => {
 
 describe('Share visibility + vanish', () => {
   it('hides the Share icon on a historic week', async () => {
-    mockFetch(CREDIT_SPLIT_PAYLOAD);
+    mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
     expect(screen.queryByLabelText('Share Current week report')).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Older week'));
-    await screen.findByText(/CREDIT/);
+    await waitFor(() => expect(screen.queryByLabelText('Share Current week report')).toBeNull());
     expect(screen.queryByLabelText('Share Current week report')).toBeNull();
   });
 
   it('shows a vanished state with return-to-current when the selected key disappears', async () => {
-    mockFetch(CREDIT_SPLIT_PAYLOAD);
+    mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week')); // select 2026-05-08
-    await screen.findByText(/CREDIT/);
-    // A later snapshot drops the selected week from the index.
-    const shrunk = [idxEntry('2026-05-15', { is_current: true })];
-    updateSnapshot(makeEnv(shrunk, '2026-05-18T12:05:00Z'));
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await screen.findByText('Jul 16–Jul 18');
+    // A later snapshot drops the selected cycle from the index.
+    const shrunk = [idxEntry('milestone_cycle:current', { is_current: true })];
+    act(() => updateSnapshot(makeEnv(shrunk, '2026-05-18T12:05:00Z')));
     await screen.findByText(/no longer available/i);
     fireEvent.click(screen.getByText('Back to current'));
     await waitFor(() => expect(screen.queryByText(/no longer available/i)).toBeNull());
@@ -178,8 +176,7 @@ describe('Share visibility + vanish', () => {
 // P1-A — the herobar override (big number / spent / $-per-% / reset) is
 // spec §4 tied to HISTORIC weeks only; the CURRENT week's herobar must stay
 // envelope-driven (live fractional `used_pct` / `spent_usd`) even while its
-// tables render from a fetched detail payload (credit-split fetch-on-open or
-// after a block-step).
+// tables render from a fetched detail payload after a block-step.
 describe('current-week herobar stays envelope-driven (P1-A)', () => {
   function withHero(env: Envelope, usedPct: number, spentUsd: number): Envelope {
     const cw = env.current_week as unknown as { used_pct: number; spent_usd: number };
@@ -188,26 +185,12 @@ describe('current-week herobar stays envelope-driven (P1-A)', () => {
     return env;
   }
 
-  it('keeps the big number + spent envelope-driven on a multi-segment current week (fetch-on-open)', async () => {
-    mockFetch({ ...CREDIT_SPLIT_PAYLOAD, key: '2026-05-15', is_current: true });
-    updateSnapshot(withHero(
-      makeEnv([idxEntry('2026-05-15', { is_current: true, segment_count: 2 }), idxEntry('2026-05-08')]),
-      42.7, 3,
-    ));
-    render(<CurrentWeekModal />);
-    // The credit-split ledger renders from the fetched payload …
-    await screen.findByText(/CREDIT/);
-    // … but the herobar stays on the envelope's live fractional value.
-    expect(document.querySelector('#mcw-bignum .int')?.textContent).toBe('42');
-    expect(document.querySelector('#mcw-spent')?.textContent).toContain('3.00');
-  });
-
   it('keeps the herobar envelope-driven after a first block-step on a single-segment current week', async () => {
     const payload = {
-      source: 'claude', key: '2026-05-15', label: 'Wk 2026-05-15',
+      source: 'claude', key: 'milestone_cycle:current', label: 'Jul 18–Jul 25',
       start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
-      is_current: true, detail_stamp: 'st-2026-05-15',
-      segments: [{ reset_event_id: 0, milestones: [
+      is_current: true, detail_stamp: 'st-milestone_cycle:current',
+      segments: [{ key: 'milestone_segment:current', milestones: [
         { percent: 5, crossed_at_utc: '2026-05-16T10:00:00Z', cumulative_usd: 2, marginal_usd: 1, five_hour_pct_at_cross: null },
       ] }],
       dividers: [],
@@ -220,13 +203,14 @@ describe('current-week herobar stays envelope-driven (P1-A)', () => {
     };
     mockFetch(payload);
     updateSnapshot(withHero(
-      makeEnv([idxEntry('2026-05-15', { is_current: true, segment_count: 1, block_count: 2 }), idxEntry('2026-05-08')]),
+      makeEnv([idxEntry('milestone_cycle:current', { is_current: true, segment_count: 1, block_count: 2 }), INDEX[1]]),
       42.7, 3,
     ));
     render(<CurrentWeekModal />);
     fireEvent.click(await screen.findByText(/‹ blocks/));
-    // The fetched block navigator renders …
-    await screen.findByText(/Block 2 of 2/);
+    // One action both hydrates the cycle detail and applies the requested
+    // direction from the active/default last block.
+    await screen.findByText(/Block 1 of 2/);
     // … while the herobar stays envelope-driven.
     expect(document.querySelector('#mcw-bignum .int')?.textContent).toBe('42');
     expect(document.querySelector('#mcw-spent')?.textContent).toContain('3.00');
@@ -244,10 +228,10 @@ describe('current-week herobar stays envelope-driven (P1-A)', () => {
 // section entirely on a historic week whose only block had no milestones.
 describe('empty-stream block keeps the navigator mounted (P1)', () => {
   const HISTORIC_EMPTY_BLOCK = {
-    source: 'claude', key: '2026-05-08', label: 'Wk 2026-05-08',
-    start_at_utc: '2026-05-08T00:00:00Z', end_at_utc: '2026-05-15T00:00:00Z',
-    is_current: false, detail_stamp: 'st-2026-05-08',
-    segments: [{ reset_event_id: 0, milestones: [
+    source: 'claude', key: 'milestone_cycle:post-reset', label: 'Jul 16–Jul 18',
+    start_at_utc: '2026-07-16T05:00:00Z', end_at_utc: '2026-07-18T05:00:00Z',
+    is_current: false, detail_stamp: 'st-milestone_cycle:post-reset',
+    segments: [{ key: 'milestone_segment:historic-empty', milestones: [
       { percent: 1, crossed_at_utc: '2026-05-09T10:00:00Z', cumulative_usd: 1, marginal_usd: 1, five_hour_pct_at_cross: null },
     ] }],
     dividers: [],
@@ -272,10 +256,10 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
 
   it('keeps the navigator mounted after stepping onto an empty-stream block on the current week, and can step back', async () => {
     const payload = {
-      source: 'claude', key: '2026-05-15', label: 'Wk 2026-05-15',
+      source: 'claude', key: 'milestone_cycle:current', label: 'Jul 18–Jul 25',
       start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
-      is_current: true, detail_stamp: 'st-2026-05-15',
-      segments: [{ reset_event_id: 0, milestones: [
+      is_current: true, detail_stamp: 'st-milestone_cycle:current',
+      segments: [{ key: 'milestone_segment:current', milestones: [
         { percent: 5, crossed_at_utc: '2026-05-16T10:00:00Z', cumulative_usd: 2, marginal_usd: 1, five_hour_pct_at_cross: null },
       ] }],
       dividers: [],
@@ -287,20 +271,22 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
       ],
     };
     mockFetch(payload);
-    updateSnapshot(makeEnv([idxEntry('2026-05-15', { is_current: true, segment_count: 1, block_count: 2 }), idxEntry('2026-05-08')]));
+    updateSnapshot(makeEnv([idxEntry('milestone_cycle:current', { is_current: true, segment_count: 1, block_count: 2 }), INDEX[1]]));
     render(<CurrentWeekModal />);
-    // First block-step lazily fetches the current week and lands on the last
-    // block, whose stream is empty — the navigator must survive.
+    // First block-step lazily fetches the current week AND moves one position
+    // older from the active/default last block.
     fireEvent.click(await screen.findByText(/‹ blocks/));
-    const label = await screen.findByText(/Block 2 of 2/);
-    expect(label.textContent).toContain('⚡'); // straddler
-    expect(screen.getByText('No integer-percent crossings in this block.')).toBeTruthy();
-    expect(document.querySelector('#mcw-5h-table')).toBeNull();
-    // Stepping back reaches the non-empty block and its table.
-    fireEvent.click(screen.getByLabelText('Older block'));
     await screen.findByText(/Block 1 of 2/);
     expect(document.querySelector('#mcw-5h-table')).toBeTruthy();
     expect(screen.queryByText('No integer-percent crossings in this block.')).toBeNull();
+    // Stepping newer reaches the empty straddler without unmounting nav.
+    fireEvent.click(screen.getByLabelText('Newer block'));
+    const label = await screen.findByText(/Block 2 of 2/);
+    expect(label.textContent).toContain('⚡');
+    expect(screen.getByText('No integer-percent crossings in this block.')).toBeTruthy();
+    expect(document.querySelector('#mcw-5h-table')).toBeNull();
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await screen.findByText(/Block 1 of 2/);
   });
 });
 
@@ -309,8 +295,8 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
 // current cycle carries no per-block envelope stream, so its block view is
 // fully detail-driven: the first block-step lazily fetches the cycle detail.
 const CODEX_IDX: WeekIndexEntry[] = [
-  { key: 'cyc-current', start_at_utc: '2026-04-23T00:00:00Z', end_at_utc: '2026-04-30T00:00:00Z', resets_at_utc: '2026-04-30T00:00:00Z', label: 'Cyc current', is_current: true, milestone_count: 1, block_count: 2, detail_stamp: 'st-cur' },
-  { key: 'cyc-prev', start_at_utc: '2026-04-16T00:00:00Z', end_at_utc: '2026-04-23T00:00:00Z', resets_at_utc: '2026-04-23T00:00:00Z', label: 'Cyc prev', is_current: false, milestone_count: 1, block_count: 1, detail_stamp: 'st-prev' },
+  { key: 'milestone_cycle:codex-current', start_at_utc: '2026-04-23T00:00:00Z', end_at_utc: '2026-04-30T00:00:00Z', resets_at_utc: '2026-04-30T00:00:00Z', label: 'Cyc current', is_current: true, milestone_count: 1, block_count: 3, detail_stamp: 'st-cur' },
+  { key: 'milestone_cycle:codex-prev', start_at_utc: '2026-04-16T00:00:00Z', end_at_utc: '2026-04-23T00:00:00Z', resets_at_utc: '2026-04-23T00:00:00Z', label: 'Cyc prev', is_current: false, milestone_count: 1, block_count: 3, detail_stamp: 'st-prev' },
 ];
 
 function codexEnvWithIndex(cycleIndex: WeekIndexEntry[]): Envelope {
@@ -326,16 +312,17 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
   }
 
-  it('shows the block-nav affordance on the current cycle when block_count > 0 and fetches on first step', async () => {
+  it('shows the block-nav affordance and one click fetches then lands on the immediately older block', async () => {
     const payload = {
-      source: 'codex', key: 'cyc-current', label: 'Cyc current',
+      source: 'codex', key: 'milestone_cycle:codex-current', label: 'Cyc current',
       start_at_utc: '2026-04-23T00:00:00Z', end_at_utc: '2026-04-30T00:00:00Z',
       resets_at_utc: '2026-04-30T00:00:00Z', is_current: true, detail_stamp: 'st-cur',
-      segments: [{ reset_event_id: 0, milestones: [] }],
+      segments: [{ key: 'milestone_segment:codex-current', milestones: [] }],
       dividers: [],
       blocks: [
         { key: 'blk-1', block_start_at: '2026-04-24T00:00:00Z', five_hour_resets_at: '2026-04-24T05:00:00Z', final_five_hour_percent: 10, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
         { key: 'blk-2', block_start_at: '2026-04-24T05:00:00Z', five_hour_resets_at: '2026-04-24T10:00:00Z', final_five_hour_percent: 20, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+        { key: 'blk-3', block_start_at: '2026-04-24T10:00:00Z', five_hour_resets_at: '2026-04-24T15:00:00Z', final_five_hour_percent: 30, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: false, milestones: [] },
       ],
     };
     const spy = mockFetch(payload);
@@ -343,8 +330,66 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     updateSnapshot(codexEnvWithIndex(CODEX_IDX));
     render(<CurrentWeekModal />);
     fireEvent.click(screen.getByLabelText('Older block'));
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/cyc-current'));
-    await screen.findByText(/Block 2 of 2/);
+    await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/milestone_cycle%3Acodex-current'));
+    await screen.findByText(/Block 2 of 3/);
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await screen.findByText(/Block 1 of 3/);
+    expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText('Newer block'));
+    await screen.findByText(/Block 2 of 3/);
+    fireEvent.click(screen.getByLabelText('Newer block'));
+    await screen.findByText(/Block 3 of 3/);
+    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('preserves an ArrowLeft step across lazy current-cycle detail fetch', async () => {
+    const payload = {
+      source: 'codex', key: 'milestone_cycle:codex-current', label: 'Cyc current',
+      start_at_utc: '2026-04-23T00:00:00Z', end_at_utc: '2026-04-30T00:00:00Z',
+      resets_at_utc: '2026-04-30T00:00:00Z', is_current: true, detail_stamp: 'st-cur',
+      segments: [{ key: 'milestone_segment:codex-current', milestones: [] }],
+      dividers: [],
+      blocks: [
+        { key: 'blk-1', block_start_at: '2026-04-24T00:00:00Z', five_hour_resets_at: '2026-04-24T05:00:00Z', final_five_hour_percent: 10, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+        { key: 'blk-2', block_start_at: '2026-04-24T05:00:00Z', five_hour_resets_at: '2026-04-24T10:00:00Z', final_five_hour_percent: 20, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: false, milestones: [] },
+        { key: 'blk-3', block_start_at: '2026-04-24T10:00:00Z', five_hour_resets_at: '2026-04-24T15:00:00Z', final_five_hour_percent: 30, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: false, milestones: [] },
+      ],
+    };
+    const spy = mockFetch(payload);
+    openCodex();
+    updateSnapshot(codexEnvWithIndex(CODEX_IDX));
+    render(<CurrentWeekModal />);
+    installGlobalKeydown();
+    fireEvent.keyDown(document, { key: 'ArrowLeft' });
+    await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/milestone_cycle%3Acodex-current'));
+    await screen.findByText(/Block 2 of 3/);
+  });
+
+  it('defaults a historic retained-5h cycle to its last block and traverses the complete list', async () => {
+    const payload = {
+      source: 'codex', key: 'milestone_cycle:codex-prev', label: 'Cyc prev',
+      start_at_utc: '2026-04-16T00:00:00Z', end_at_utc: '2026-04-23T00:00:00Z',
+      resets_at_utc: '2026-04-23T00:00:00Z', is_current: false, detail_stamp: 'st-prev',
+      segments: [{ key: 'milestone_segment:codex-prev', milestones: [] }],
+      dividers: [],
+      blocks: [
+        { key: 'prev-1', block_start_at: '2026-04-17T00:00:00Z', five_hour_resets_at: '2026-04-17T05:00:00Z', final_five_hour_percent: 10, total_cost_usd: 1, crossed_seven_day_reset: true, is_closed: true, milestones: [] },
+        { key: 'prev-2', block_start_at: '2026-04-17T05:00:00Z', five_hour_resets_at: '2026-04-17T10:00:00Z', final_five_hour_percent: 20, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+        { key: 'prev-3', block_start_at: '2026-04-17T10:00:00Z', five_hour_resets_at: '2026-04-17T15:00:00Z', final_five_hour_percent: 30, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+      ],
+    };
+    const spy = mockFetch(payload);
+    openCodex();
+    updateSnapshot(codexEnvWithIndex(CODEX_IDX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/milestone_cycle%3Acodex-prev'));
+    await screen.findByText(/Block 3 of 3/);
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await screen.findByText(/Block 2 of 3/);
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await screen.findByText(/Block 1 of 3/);
+    expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('hides the block navigator on the current cycle when block_count === 0', () => {
@@ -353,5 +398,38 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     updateSnapshot(codexEnvWithIndex([{ ...CODEX_IDX[0], block_count: 0 }, CODEX_IDX[1]]));
     render(<CurrentWeekModal />);
     expect(screen.queryByLabelText('Older block')).toBeNull();
+    expect(screen.getByText('No 5h data retained for this cycle.')).toBeTruthy();
+  });
+
+  it('keeps Claude and Codex cycle selection independent in All', async () => {
+    const codexHistoric = {
+      source: 'codex', key: 'milestone_cycle:codex-prev', label: 'Cyc prev',
+      start_at_utc: '2026-04-16T00:00:00Z', end_at_utc: '2026-04-23T00:00:00Z',
+      resets_at_utc: '2026-04-23T00:00:00Z', is_current: false, detail_stamp: 'st-prev',
+      segments: [{ key: 'milestone_segment:codex-prev', milestones: [] }],
+      dividers: [], blocks: [],
+    };
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => ({
+      ok: true,
+      json: async () => String(input).includes('/claude/')
+        ? HISTORIC_CYCLE_PAYLOAD
+        : codexHistoric,
+    })) as unknown as typeof fetch;
+    const env = codexEnvWithIndex(CODEX_IDX);
+    env.current_week = makeEnv(INDEX).current_week;
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
+    updateSnapshot(env);
+    const { container } = render(<CurrentWeekModal />);
+    const claude = container.querySelector<HTMLElement>('[data-provider-section="claude"]')!;
+    const codex = container.querySelector<HTMLElement>('[data-provider-section="codex"]')!;
+
+    fireEvent.click(within(claude).getByLabelText('Older week'));
+    await within(claude).findByText('Jul 16–Jul 18');
+    expect(within(codex).queryByText('Cyc prev')).toBeNull();
+
+    fireEvent.click(within(codex).getByLabelText('Older week'));
+    await within(codex).findByText('Apr 16–Apr 23');
+    expect(within(claude).getByText('Jul 16–Jul 18')).toBeTruthy();
   });
 });

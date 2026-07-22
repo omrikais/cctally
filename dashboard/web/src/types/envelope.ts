@@ -404,7 +404,7 @@ export interface WeekDetailPayload {
   resets_at_utc?: string | null;   // Codex only
   is_current: boolean;
   detail_stamp: string;
-  segments: { reset_event_id: number; milestones: Milestone[] | CodexQuotaMilestoneRow[] }[];
+  segments: { key: string; milestones: Milestone[] | CodexQuotaMilestoneRow[] }[];
   dividers: { effective_at_utc: string; prior_percent: number | null }[];
   blocks: WeekDetailBlock[];
 }

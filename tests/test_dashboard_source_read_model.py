@@ -36,18 +36,20 @@ def _quota_observation(
     captured_at: dt.datetime = NOW - dt.timedelta(minutes=10),
     limit_name: str | None = None,
     logical_limit_key: str = "limit",
+    observed_slot: str = "primary",
+    used_percent: float = 25.0,
 ) -> QuotaObservation:
     return QuotaObservation(
         identity=QuotaWindowIdentity(
             source="codex",
             source_root_key=root,
             logical_limit_key=logical_limit_key,
-            observed_slot="primary",
+            observed_slot=observed_slot,
             window_minutes=window_minutes,
             limit_name=limit_name,
         ),
         captured_at=captured_at,
-        used_percent=25.0,
+        used_percent=used_percent,
         resets_at=resets_at,
         source_path=f"/private/{root}.jsonl",
         line_offset=1,
@@ -345,17 +347,30 @@ def test_codex_cycle_rejects_stale_weekly_evidence_even_before_its_reset():
         ), NOW)
 
 
-def test_codex_cycle_collapses_duplicate_root_observations_for_one_boundary():
+def test_codex_cycle_selects_one_full_identity_for_one_boundary():
     source_module = sys.modules["_cctally_dashboard_sources"]
     reset = NOW + dt.timedelta(days=2)
 
     cycle = source_module._resolve_codex_weekly_cycle((
-        _quota_observation(root="root-a", window_minutes=10_080, resets_at=reset),
-        _quota_observation(root="root-b", window_minutes=10_080, resets_at=reset),
+        _quota_observation(
+            root="root-a", window_minutes=10_080, resets_at=reset,
+            logical_limit_key="limit-a", used_percent=25.0,
+        ),
+        _quota_observation(
+            root="root-b", window_minutes=10_080, resets_at=reset,
+            logical_limit_key="limit-b", observed_slot="secondary",
+            used_percent=61.0,
+        ),
     ), NOW)
 
     assert cycle.resets_at == reset
-    assert cycle.source_root_keys == ("root-a", "root-b")
+    assert cycle.source_root_keys == ("root-b",)
+    assert cycle.used_percent == 61.0
+    assert cycle.quota_identity == QuotaWindowIdentity(
+        source="codex", source_root_key="root-b",
+        logical_limit_key="limit-b", observed_slot="secondary",
+        window_minutes=10_080,
+    )
 
 
 @pytest.mark.parametrize(
@@ -678,7 +693,7 @@ def test_cycle_accounting_excludes_a_non_supporting_root(tmp_path, monkeypatch):
         stats.close()
 
 
-def test_cycle_accounting_includes_each_duplicate_supporting_root_once(tmp_path, monkeypatch):
+def test_cycle_accounting_uses_only_the_selected_full_identity_root(tmp_path, monkeypatch):
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     reset = NOW + dt.timedelta(days=2)
@@ -704,15 +719,21 @@ def test_cycle_accounting_includes_each_duplicate_supporting_root_once(tmp_path,
             )
         cache.commit()
         expected = cache.execute(
-            "SELECT SUM(total_tokens) FROM codex_session_entries WHERE source_root_key IN (?, ?)",
-            (root_a, root_b),
+            "SELECT SUM(total_tokens) FROM codex_session_entries WHERE source_root_key=?",
+            (root_b,),
         ).fetchone()[0]
         monkeypatch.setattr(
             source_module,
             "load_codex_quota_observations",
             lambda **_kwargs: (
-                _quota_observation(root=root_a, window_minutes=10_080, resets_at=reset),
-                _quota_observation(root=root_b, window_minutes=10_080, resets_at=reset),
+                _quota_observation(
+                    root=root_a, window_minutes=10_080, resets_at=reset,
+                    used_percent=25.0,
+                ),
+                _quota_observation(
+                    root=root_b, window_minutes=10_080, resets_at=reset,
+                    used_percent=61.0,
+                ),
             ),
         )
 

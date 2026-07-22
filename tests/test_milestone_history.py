@@ -291,12 +291,17 @@ def test_claude_week_index_enumerates_newest_first_with_counts(ns):
     finally:
         conn.close()
 
-    keys = [e["key"] for e in idx]
-    # Newest-first, cost-only 2026-04-24 excluded.
-    assert keys == ["2026-05-15", "2026-05-08", "2026-05-01"]
+    starts = [e["start_at_utc"] for e in idx]
+    # Newest-first, cost-only 2026-04-24 excluded, reset split retained.
+    assert starts == [
+        "2026-05-15T00:00:00Z",
+        "2026-05-08T00:00:00Z",
+        "2026-05-04T12:00:00Z",
+        "2026-05-01T00:00:00Z",
+    ]
 
-    by_key = {e["key"]: e for e in idx}
-    a = by_key["2026-05-15"]
+    by_start = {e["start_at_utc"]: e for e in idx}
+    a = by_start["2026-05-15T00:00:00Z"]
     assert a["is_current"] is True
     assert a["milestone_count"] == 3
     assert a["segment_count"] == 1
@@ -317,14 +322,14 @@ def test_claude_week_index_usage_only_week_zero_milestones(ns):
     finally:
         conn.close()
 
-    b = {e["key"]: e for e in idx}["2026-05-08"]
+    b = {e["start_at_utc"]: e for e in idx}["2026-05-08T00:00:00Z"]
     assert b["milestone_count"] == 0
     assert b["segment_count"] == 0
     assert b["is_current"] is False
     assert b["block_count"] == 1  # straddler intersects week B too
 
 
-def test_claude_credited_week_one_entry_two_segments(ns):
+def test_claude_reset_defined_week_emits_two_opaque_cycle_entries(ns):
     import _cctally_milestone_history as mh
 
     conn = ns["open_db"]()
@@ -334,40 +339,155 @@ def test_claude_credited_week_one_entry_two_segments(ns):
     finally:
         conn.close()
 
-    c_entries = [e for e in idx if e["key"] == "2026-05-01"]
-    assert len(c_entries) == 1  # coalesced same-key credit refs
-    assert c_entries[0]["segment_count"] == 2
+    c_entries = [
+        e for e in idx
+        if e["start_at_utc"] < "2026-05-08T00:00:00Z"
+        and e["end_at_utc"] > "2026-05-01T00:00:00Z"
+    ]
+    assert len(c_entries) == 2
+    assert len({e["key"] for e in c_entries}) == 2
+    assert all(e["key"].startswith("milestone_cycle:") for e in c_entries)
+    assert all("2026-05-01" not in e["key"] for e in c_entries)
+    assert [(e["start_at_utc"], e["end_at_utc"]) for e in c_entries] == [
+        ("2026-05-04T12:00:00Z", "2026-05-08T00:00:00Z"),
+        ("2026-05-01T00:00:00Z", "2026-05-04T12:00:00Z"),
+    ]
+    assert [e["milestone_count"] for e in c_entries] == [2, 2]
+    assert all(e["segment_count"] == 1 for e in c_entries)
 
 
 # ── Task 1: Claude week detail ─────────────────────────────────────────
 
 
-def test_claude_week_detail_credit_split_segments_and_divider(ns):
+def test_claude_cycle_detail_selects_only_its_reset_cohort(ns):
     import _cctally_milestone_history as mh
 
     conn = ns["open_db"]()
     try:
-        event_id = _seed_full(conn)
-        detail = mh.build_claude_week_detail(conn, "2026-05-01")
+        _seed_full(conn)
+        entries = [
+            e for e in mh.build_claude_week_index(conn)
+            if e["start_at_utc"] < "2026-05-08T00:00:00Z"
+            and e["end_at_utc"] > "2026-05-01T00:00:00Z"
+        ]
+        post = mh.build_claude_week_detail(conn, entries[0]["key"])
+        pre = mh.build_claude_week_detail(conn, entries[1]["key"])
     finally:
         conn.close()
 
-    assert detail is not None
-    assert detail["key"] == "2026-05-01"
-    segs = detail["segments"]
-    assert len(segs) == 2
-    # Segments ordered chronologically: pre-credit (0) first, post (event_id).
-    assert segs[0]["reset_event_id"] == 0
-    assert segs[1]["reset_event_id"] == event_id
-    assert [m["percent"] for m in segs[0]["milestones"]] == [1, 2]
-    assert [m["percent"] for m in segs[1]["milestones"]] == [1, 2]
-    # Cumulative restarts in the post-credit segment.
-    assert segs[1]["milestones"][0]["cumulative_usd"] == 0.5
+    assert post is not None and pre is not None
+    assert post["key"] != pre["key"]
+    assert len(post["segments"]) == len(pre["segments"]) == 1
+    assert [m["percent"] for m in post["segments"][0]["milestones"]] == [1, 2]
+    assert [m["percent"] for m in pre["segments"][0]["milestones"]] == [1, 2]
+    assert post["segments"][0]["milestones"][0]["cumulative_usd"] == 0.5
+    assert post["dividers"] == pre["dividers"] == []
+    assert post["segments"][0]["key"].startswith("milestone_segment:")
+    assert "reset_event_id" not in post["segments"][0]
 
-    dividers = detail["dividers"]
-    assert len(dividers) == 1
-    assert dividers[0]["prior_percent"] == 40.0
-    assert dividers[0]["effective_at_utc"].startswith("2026-05-04T12:00:00")
+
+def test_claude_production_shaped_98_rows_split_43_55_with_exact_blocks(ns):
+    import _cctally_milestone_history as mh
+
+    start = "2026-07-11T05:00:00+00:00"
+    reset = "2026-07-16T05:00:00+00:00"
+    end = "2026-07-18T05:00:00+00:00"
+    conn = ns["open_db"]()
+    try:
+        _seed_usage(
+            conn, captured_at_utc="2026-07-17T12:00:00Z",
+            week_start_date="2026-07-11", week_start_at=start,
+            week_end_at=end, weekly_percent=55.0,
+        )
+        event_id = _seed_reset_event(
+            conn, old_week_end_at=reset, new_week_end_at=end,
+            effective=reset, observed_pre_credit_pct=43.0,
+        )
+        for pct in range(1, 44):
+            _seed_percent_milestone(
+                conn, week_start_date="2026-07-11", week_end_date="2026-07-18",
+                percent_threshold=pct, captured_at_utc="2026-07-12T12:00:00Z",
+                cumulative_cost_usd=float(pct), reset_event_id=0,
+            )
+        for pct in range(1, 56):
+            _seed_percent_milestone(
+                conn, week_start_date="2026-07-11", week_end_date="2026-07-18",
+                percent_threshold=pct, captured_at_utc="2026-07-17T12:00:00Z",
+                cumulative_cost_usd=float(pct), reset_event_id=event_id,
+            )
+        _seed_block(
+            conn, window_key=711, block_start_at="2026-07-12T00:00:00Z",
+            five_hour_resets_at="2026-07-12T05:00:00Z",
+        )
+        _seed_block(
+            conn, window_key=716, block_start_at="2026-07-16T03:00:00Z",
+            five_hour_resets_at="2026-07-16T08:00:00Z", crossed=1,
+        )
+        _seed_block(
+            conn, window_key=717, block_start_at="2026-07-17T00:00:00Z",
+            five_hour_resets_at="2026-07-17T05:00:00Z",
+        )
+        conn.commit()
+
+        entries = mh.build_claude_week_index(conn)
+        details = [mh.build_claude_week_detail(conn, entry["key"]) for entry in entries]
+    finally:
+        conn.close()
+
+    assert [entry["milestone_count"] for entry in entries] == [55, 43]
+    assert [len(detail["segments"][0]["milestones"]) for detail in details] == [55, 43]
+    assert [[b["five_hour_window_key"] for b in detail["blocks"]] for detail in details] == [
+        [716, 717],
+        [711, 716],
+    ]
+    assert [entry["block_count"] for entry in entries] == [2, 2]
+
+
+def test_claude_early_reanchor_same_storage_bucket_emits_post_cycle(ns):
+    import _cctally_milestone_history as mh
+
+    start = "2026-04-13T14:00:00+00:00"
+    old_end = "2026-04-17T14:00:00+00:00"
+    reset = "2026-04-17T13:00:00+00:00"
+    new_end = "2026-04-20T14:00:00+00:00"
+    conn = ns["open_db"]()
+    try:
+        _seed_usage(
+            conn, captured_at_utc="2026-04-16T12:00:00Z",
+            week_start_date="2026-04-13", week_start_at=start,
+            week_end_at=old_end, weekly_percent=60.0,
+        )
+        _seed_usage(
+            conn, captured_at_utc=reset,
+            week_start_date="2026-04-13", week_start_at=start,
+            week_end_at=new_end, weekly_percent=0.0,
+        )
+        event_id = _seed_reset_event(
+            conn, old_week_end_at=old_end, new_week_end_at=new_end,
+            effective=reset, observed_pre_credit_pct=60.0,
+        )
+        _seed_percent_milestone(
+            conn, week_start_date="2026-04-13", week_end_date="2026-04-20",
+            percent_threshold=1, captured_at_utc="2026-04-17T15:00:00Z",
+            cumulative_cost_usd=1.0, reset_event_id=event_id,
+        )
+        conn.commit()
+        entries = [
+            e for e in mh.build_claude_week_index(conn)
+            if e["start_at_utc"] >= "2026-04-13T14:00:00Z"
+        ]
+        post = mh.build_claude_week_detail(conn, entries[0]["key"])
+    finally:
+        conn.close()
+
+    assert [(e["start_at_utc"], e["end_at_utc"]) for e in entries] == [
+        ("2026-04-17T13:00:00Z", "2026-04-20T14:00:00Z"),
+        ("2026-04-13T14:00:00Z", "2026-04-17T13:00:00Z"),
+    ]
+    assert [e["milestone_count"] for e in entries] == [1, 0]
+    assert entries[0]["is_current"] is True
+    assert post is not None
+    assert [m["percent"] for m in post["segments"][0]["milestones"]] == [1]
 
 
 def test_claude_week_detail_unknown_key_returns_none(ns):
@@ -376,7 +496,7 @@ def test_claude_week_detail_unknown_key_returns_none(ns):
     conn = ns["open_db"]()
     try:
         _seed_full(conn)
-        assert mh.build_claude_week_detail(conn, "2099-01-01") is None
+        assert mh.build_claude_week_detail(conn, "milestone_cycle:unknown") is None
     finally:
         conn.close()
 
@@ -387,8 +507,11 @@ def test_claude_week_detail_straddling_block_in_both_weeks(ns):
     conn = ns["open_db"]()
     try:
         _seed_full(conn)
-        detail_a = mh.build_claude_week_detail(conn, "2026-05-15")
-        detail_b = mh.build_claude_week_detail(conn, "2026-05-08")
+        idx = mh.build_claude_week_index(conn)
+        entry_a = next(e for e in idx if e["start_at_utc"] == "2026-05-15T00:00:00Z")
+        entry_b = next(e for e in idx if e["start_at_utc"] == "2026-05-08T00:00:00Z")
+        detail_a = mh.build_claude_week_detail(conn, entry_a["key"])
+        detail_b = mh.build_claude_week_detail(conn, entry_b["key"])
     finally:
         conn.close()
 
@@ -412,20 +535,24 @@ def test_claude_detail_stamp_moves_when_milestone_added(ns):
     conn = ns["open_db"]()
     try:
         _seed_full(conn)
-        before = {e["key"]: e["detail_stamp"] for e in mh.build_claude_week_index(conn)}
+        before_entries = mh.build_claude_week_index(conn)
+        before = {e["start_at_utc"]: e["detail_stamp"] for e in before_entries}
         _seed_percent_milestone(
             conn, week_start_date="2026-05-15", week_end_date="2026-05-22",
             percent_threshold=4, captured_at_utc="2026-05-16T20:00:00+00:00",
             cumulative_cost_usd=4.0, reset_event_id=0,
         )
         conn.commit()
-        after = {e["key"]: e["detail_stamp"] for e in mh.build_claude_week_index(conn)}
+        after = {
+            e["start_at_utc"]: e["detail_stamp"]
+            for e in mh.build_claude_week_index(conn)
+        }
     finally:
         conn.close()
 
-    assert after["2026-05-15"] != before["2026-05-15"]
+    assert after["2026-05-15T00:00:00Z"] != before["2026-05-15T00:00:00Z"]
     # unrelated weeks' stamps unchanged
-    assert after["2026-05-08"] == before["2026-05-08"]
+    assert after["2026-05-08T00:00:00Z"] == before["2026-05-08T00:00:00Z"]
 
 
 def test_get_recent_weeks_none_is_unbounded(ns):
@@ -590,7 +717,7 @@ def test_codex_cycle_index_early_reanchor_clips_end(ns):
     assert early["start_at_utc"] == "2026-03-01T00:00:00Z"
 
 
-def test_codex_cycle_index_same_reset_multi_identity_distinct_keys(ns):
+def test_codex_cycle_index_same_boundary_selects_one_full_identity(ns):
     import _cctally_milestone_history as mh
 
     reset = "2026-03-08T00:00:00+00:00"
@@ -599,11 +726,11 @@ def test_codex_cycle_index_same_reset_multi_identity_distinct_keys(ns):
     try:
         _seed_quota_block(
             conn, source_root_key="root-a", window_minutes=10080,
-            resets_at_utc=reset, nominal_start_at_utc=start,
+            resets_at_utc=reset, nominal_start_at_utc=start, current_percent=30,
         )
         _seed_quota_block(
             conn, source_root_key="root-b", window_minutes=10080,
-            resets_at_utc=reset, nominal_start_at_utc=start,
+            resets_at_utc=reset, nominal_start_at_utc=start, current_percent=60,
         )
         # root-a has 3 milestones, root-b has 1 — distinguishes the identities.
         for pct in (1, 2, 3):
@@ -623,23 +750,17 @@ def test_codex_cycle_index_same_reset_multi_identity_distinct_keys(ns):
         )
         now = _dt("2026-03-05T00:00:00+00:00")
         idx = mh.build_codex_cycle_index(conn, identity=identity, now_utc=now)
-        keys = [e["key"] for e in idx]
-        key_a = next(e["key"] for e in idx if e["milestone_count"] == 3)
-        key_b = next(e["key"] for e in idx if e["milestone_count"] == 1)
-        detail_a = mh.build_codex_cycle_detail(
-            conn, None, identity=identity, key=key_a, speed="auto", now_utc=now,
-        )
-        detail_b = mh.build_codex_cycle_detail(
-            conn, None, identity=identity, key=key_b, speed="auto", now_utc=now,
+        detail = mh.build_codex_cycle_detail(
+            conn, None, identity=identity, key=idx[0]["key"], speed="auto",
+            now_utc=now,
         )
     finally:
         conn.close()
 
-    assert len(idx) == 2
-    assert len(set(keys)) == 2  # same reset, distinct identity keys
-    assert isinstance(detail_a, dict) and detail_a["key"] == key_a
-    assert isinstance(detail_b, dict) and detail_b["key"] == key_b
-    assert detail_a["dividers"] == []  # Codex has no credit dividers
+    assert len(idx) == 1
+    assert idx[0]["milestone_count"] == 1  # max-percent root-b identity won
+    assert isinstance(detail, dict) and detail["key"] == idx[0]["key"]
+    assert detail["dividers"] == []
 
 
 def test_codex_cycle_no_five_hour_rows_block_count_zero(ns):
@@ -711,7 +832,9 @@ def test_codex_cycle_with_five_hour_rows_block_count(ns):
         )
         # a 5h block inside the cycle (same root/slot/limit_id NULL)
         _seed_quota_block(
-            conn, source_root_key="root-a", window_minutes=300,
+            conn, source_root_key="root-a", logical_limit_key="five-hour",
+            observed_slot="secondary", limit_id="independent-5h",
+            window_minutes=300,
             resets_at_utc="2026-03-02T05:00:00+00:00",
             nominal_start_at_utc="2026-03-02T00:00:00+00:00",
         )
@@ -731,6 +854,87 @@ def test_codex_cycle_with_five_hour_rows_block_count(ns):
     assert idx[0]["block_count"] == 1
     assert len(detail["blocks"]) == 1
     assert detail["blocks"][0]["key"].startswith("block:")
+
+
+def test_codex_cycle_sequence_selects_one_identity_and_never_overlaps(ns):
+    import _cctally_milestone_history as mh
+
+    conn = ns["open_db"]()
+    try:
+        rows = (
+            ("root-a", "weekly-a", "primary", 40, "2026-03-01", "2026-03-08"),
+            ("root-b", "weekly-b", "secondary", 60, "2026-03-01", "2026-03-08"),
+            ("root-b", "weekly-b", "secondary", 20, "2026-03-04", "2026-03-11"),
+            ("root-a", "weekly-a", "primary", 50, "2026-03-06", "2026-03-13"),
+        )
+        for root, limit, slot, pct, start_day, reset_day in rows:
+            _seed_quota_block(
+                conn, source_root_key=root, logical_limit_key=limit,
+                observed_slot=slot, window_minutes=10080, current_percent=pct,
+                nominal_start_at_utc=f"{start_day}T00:00:00+00:00",
+                resets_at_utc=f"{reset_day}T00:00:00+00:00",
+            )
+        conn.commit()
+        identity = types.SimpleNamespace(
+            source_root_keys=("root-a", "root-b"),
+            resets_at=_dt("2026-03-13T00:00:00+00:00"),
+        )
+        idx = mh.build_codex_cycle_index(
+            conn, identity=identity, now_utc=_dt("2026-03-10T00:00:00+00:00"),
+        )
+    finally:
+        conn.close()
+
+    assert [(e["start_at_utc"], e["end_at_utc"]) for e in reversed(idx)] == [
+        ("2026-03-01T00:00:00Z", "2026-03-04T00:00:00Z"),
+        ("2026-03-04T00:00:00Z", "2026-03-06T00:00:00Z"),
+        ("2026-03-06T00:00:00Z", "2026-03-13T00:00:00Z"),
+    ]
+    assert all(
+        older["end_at_utc"] <= newer["start_at_utc"]
+        for older, newer in zip(reversed(idx), list(reversed(idx))[1:])
+    )
+
+
+def test_codex_boundary_straddling_block_belongs_to_both_cycles(ns):
+    import _cctally_milestone_history as mh
+
+    conn = ns["open_db"]()
+    try:
+        for start, reset in (
+            ("2026-03-01T00:00:00+00:00", "2026-03-08T00:00:00+00:00"),
+            ("2026-03-08T00:00:00+00:00", "2026-03-15T00:00:00+00:00"),
+        ):
+            _seed_quota_block(
+                conn, source_root_key="root-a", window_minutes=10080,
+                nominal_start_at_utc=start, resets_at_utc=reset,
+            )
+        _seed_quota_block(
+            conn, source_root_key="root-a", logical_limit_key="five-hour",
+            observed_slot="secondary", window_minutes=300,
+            nominal_start_at_utc="2026-03-07T22:00:00+00:00",
+            resets_at_utc="2026-03-08T03:00:00+00:00",
+        )
+        conn.commit()
+        identity = types.SimpleNamespace(
+            source_root_keys=("root-a",),
+            resets_at=_dt("2026-03-15T00:00:00+00:00"),
+        )
+        now = _dt("2026-03-10T00:00:00+00:00")
+        idx = mh.build_codex_cycle_index(conn, identity=identity, now_utc=now)
+        details = [
+            mh.build_codex_cycle_detail(
+                conn, None, identity=identity, key=e["key"], speed="auto",
+                now_utc=now,
+            )
+            for e in idx
+        ]
+    finally:
+        conn.close()
+
+    assert [e["block_count"] for e in idx] == [1, 1]
+    assert [len(detail["blocks"]) for detail in details] == [1, 1]
+    assert details[0]["blocks"][0]["key"] == details[1]["blocks"][0]["key"]
 
 
 # ── Codex cycle-index jitter canonicalization (ui-qa P2 real-data fix) ──
@@ -828,8 +1032,14 @@ def test_codex_cycle_detail_unions_member_milestones(ns, monkeypatch):
                 output_tokens=0, reasoning_output_tokens=0, total_tokens=0,
             )
         if abs((reset - r0).total_seconds()) < 1:
-            return (mk(1, "2026-03-02T00:00:00+00:00"),)
-        return (mk(2, "2026-03-02T01:00:00+00:00"),)
+            return (
+                mk(1, "2026-03-02T00:00:00+00:00"),
+                mk(2, "2026-03-02T02:00:00+00:00"),
+            )
+        return (
+            mk(1, "2026-03-02T01:00:00+00:00"),
+            mk(2, "2026-03-02T02:00:00+00:00"),
+        )
 
     monkeypatch.setattr(mh, "codex_quota_breakdown", fake_breakdown)
 
@@ -855,8 +1065,11 @@ def test_codex_cycle_detail_unions_member_milestones(ns, monkeypatch):
     assert isinstance(detail, dict)
     assert len(detail["segments"]) == 1
     percents = [m["percent"] for m in detail["segments"][0]["milestones"]]
-    # Unions the crossings recorded under BOTH jittered sibling resets.
+    # Jitter siblings contribute evidence but one physical ledger has exactly
+    # one earliest crossing per integer threshold.
     assert percents == [1, 2]
+    assert len(percents) == len(set(percents))
+    assert "reset_event_id" not in detail["segments"][0]
 
 
 def test_codex_cycle_index_two_real_resets_7d_apart_two_entries(ns):
@@ -1092,10 +1305,20 @@ def test_api_milestones_claude_week_200(tmp_path, monkeypatch):
     ns = load_script()
     srv = _boot_milestones_server(ns, tmp_path, monkeypatch, seed=_seed_full)
     try:
-        status, body = _get(srv, "/api/milestones/claude/week/2026-05-15")
+        conn = ns["open_db"]()
+        try:
+            key = next(
+                e["key"] for e in ns["build_claude_week_index"](conn)
+                if e["start_at_utc"] == "2026-05-15T00:00:00Z"
+            )
+        finally:
+            conn.close()
+        status, body = _get(
+            srv, "/api/milestones/claude/week/" + _urlparse.quote(key, safe="")
+        )
         assert status == 200, (status, body)
         assert body["source"] == "claude"
-        assert body["key"] == "2026-05-15"
+        assert body["key"] == key
         assert "segments" in body and "dividers" in body and "blocks" in body
         assert body["detail_stamp"]
         assert {b["five_hour_window_key"] for b in body["blocks"]} >= {5155, 5149}
@@ -1104,15 +1327,28 @@ def test_api_milestones_claude_week_200(tmp_path, monkeypatch):
         srv.server_close()
 
 
-def test_api_milestones_claude_credit_split_week_200(tmp_path, monkeypatch):
+def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkeypatch):
     ns = load_script()
     srv = _boot_milestones_server(ns, tmp_path, monkeypatch, seed=_seed_full)
     try:
-        status, body = _get(srv, "/api/milestones/claude/week/2026-05-01")
-        assert status == 200, (status, body)
-        assert len(body["segments"]) == 2
-        assert len(body["dividers"]) == 1
-        assert body["dividers"][0]["prior_percent"] == 40.0
+        conn = ns["open_db"]()
+        try:
+            keys = [
+                e["key"] for e in ns["build_claude_week_index"](conn)
+                if e["start_at_utc"] < "2026-05-08T00:00:00Z"
+                and e["end_at_utc"] > "2026-05-01T00:00:00Z"
+            ]
+        finally:
+            conn.close()
+        bodies = []
+        for key in keys:
+            status, body = _get(
+                srv, "/api/milestones/claude/week/" + _urlparse.quote(key, safe="")
+            )
+            assert status == 200, (status, body)
+            bodies.append(body)
+        assert [len(body["segments"][0]["milestones"]) for body in bodies] == [2, 2]
+        assert all(body["dividers"] == [] for body in bodies)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -1144,7 +1380,13 @@ def test_api_milestones_claude_unknown_week_404(tmp_path, monkeypatch):
     ns = load_script()
     srv = _boot_milestones_server(ns, tmp_path, monkeypatch, seed=_seed_full)
     try:
-        status, body = _get(srv, "/api/milestones/claude/week/2099-01-01")
+        from _lib_dashboard_sources import dashboard_resource_key
+        unknown = dashboard_resource_key(
+            "milestone_cycle", "claude", "2099-01-01", "start", "end"
+        )
+        status, body = _get(
+            srv, "/api/milestones/claude/week/" + _urlparse.quote(unknown, safe="")
+        )
         assert status == 404
         assert body["code"] == "unknown_key"
         assert body["reason"] == "unknown"

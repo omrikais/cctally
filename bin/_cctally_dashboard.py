@@ -6345,9 +6345,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         c = sys.modules["cctally"]
         try:
             if source == "claude":
-                # Claude key is a week_start_date (YYYY-MM-DD).
-                if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
-                    self._send_milestones_json(400, {"error": "invalid week key"})
+                # Reset-defined Claude cycles use the same opaque server-issued
+                # resource-key contract as Codex; the storage date never rides
+                # the route.
+                if not _re.fullmatch(r"milestone_cycle:[A-Za-z0-9_-]{43}", key):
+                    self._send_milestones_json(400, {"error": "invalid cycle key"})
                     return
                 conn = open_db()
                 try:

@@ -784,7 +784,8 @@ for k in ("source", "key", "segments", "dividers", "blocks", "detail_stamp"):
 if d["source"] != "claude":
     raise SystemExit("source != claude")
 ' || { echo "FAIL $name: /api/milestones claude 200 body malformed (raw: $mw_body)"; ok=0; }
-        m404=$(curl -s --max-time 5 "$base/api/milestones/claude/week/1999-01-01")
+        m404=$(curl -s --max-time 5 \
+            "$base/api/milestones/claude/week/milestone_cycle:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         printf '%s' "$m404" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)

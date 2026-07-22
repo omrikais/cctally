@@ -118,10 +118,10 @@
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "d01072b55b53b573",
+        "detail_stamp": "169c5df519d2b40f",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "is_current": true,
-        "key": "2026-04-13",
+        "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
         "label": "Apr 13\u2013Apr 20",
         "milestone_count": 0,
         "segment_count": 0,
@@ -897,10 +897,10 @@
                 "week_index": [
                   {
                     "block_count": 0,
-                    "detail_stamp": "d01072b55b53b573",
+                    "detail_stamp": "169c5df519d2b40f",
                     "end_at_utc": "2026-04-20T14:00:00Z",
                     "is_current": true,
-                    "key": "2026-04-13",
+                    "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                     "label": "Apr 13\u2013Apr 20",
                     "milestone_count": 0,
                     "segment_count": 0,
@@ -1607,10 +1607,10 @@
                 "week_index": [
                   {
                     "block_count": 0,
-                    "detail_stamp": "d01072b55b53b573",
+                    "detail_stamp": "169c5df519d2b40f",
                     "end_at_utc": "2026-04-20T14:00:00Z",
                     "is_current": true,
-                    "key": "2026-04-13",
+                    "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                     "label": "Apr 13\u2013Apr 20",
                     "milestone_count": 0,
                     "segment_count": 0,
@@ -1902,10 +1902,10 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "d01072b55b53b573",
+                "detail_stamp": "169c5df519d2b40f",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "is_current": true,
-                "key": "2026-04-13",
+                "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                 "label": "Apr 13\u2013Apr 20",
                 "milestone_count": 0,
                 "segment_count": 0,
@@ -2612,10 +2612,10 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "d01072b55b53b573",
+                "detail_stamp": "169c5df519d2b40f",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "is_current": true,
-                "key": "2026-04-13",
+                "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                 "label": "Apr 13\u2013Apr 20",
                 "milestone_count": 0,
                 "segment_count": 0,

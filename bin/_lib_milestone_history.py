@@ -9,22 +9,12 @@ in ``_cctally_milestone_history.py``:
   rows move (spec §2 caching/invalidation).
 * ``intersects`` — half-open interval intersection on epoch seconds
   (a block appears in every week it intersects, spec §1b dual membership).
-* ``coalesce_week_refs`` — collapse same-``key`` ``WeekRef`` segments
-  produced by reset correction for an in-place-credited week into ONE
-  navigation entry spanning the outer cycle boundary (spec §1a); the
-  per-segment structure lives in the detail payload, never as duplicate
-  chips.
-
 No imports of the cctally namespace or ``_cctally_core`` — these are pure
-functions. ``coalesce_week_refs`` is generic over any frozen dataclass
-carrying ``key`` / ``week_start_at`` / ``week_end_at`` string fields
-(the ``WeekRef`` shape) via ``dataclasses.replace``.
+functions.
 """
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
-from dataclasses import replace
 
 
 # Codex ``quota_window_blocks`` rows carry second-level capture jitter in their
@@ -89,70 +79,3 @@ def intersects(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
     block straddling a week boundary is reported in every week it intersects.
     """
     return start_a < end_b and start_b < end_a
-
-
-def _parse_epoch(value: "str | None") -> "int | None":
-    """Parse a canonical ISO-8601 timestamp to an epoch int, or ``None``.
-
-    Accepts a trailing ``Z`` or an explicit offset; a naive value is treated
-    as UTC. Returns ``None`` on empty / unparseable input so callers can skip
-    boundary-less refs.
-    """
-    if not value:
-        return None
-    try:
-        s = value.replace("Z", "+00:00")
-        parsed = dt.datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return int(parsed.timestamp())
-
-
-def coalesce_week_refs(refs: list) -> list:
-    """Collapse same-``key`` refs into one ref spanning the outer boundary.
-
-    Input is the ``get_recent_weeks`` ``WeekRef`` list (newest-first). An
-    in-place-credited week is represented there as TWO same-``key`` refs
-    (a pre-credit segment ``[orig_start, effective)`` and a post-credit
-    segment ``[effective, orig_end)``); every other week is a single ref.
-
-    The result preserves the newest-first order of each key's FIRST
-    occurrence, and for a multi-ref key emits one ref whose
-    ``week_start_at`` is the earliest segment start and ``week_end_at`` the
-    latest segment end (the outer cycle boundary). The original ISO strings
-    are carried through unchanged (no reformatting drift); comparison is on
-    parsed epochs so mixed ``Z``/offset forms order correctly.
-    """
-    order: list = []  # keys in first-occurrence order
-    groups: dict = {}  # key -> list of refs
-    for ref in refs:
-        k = ref.key
-        if k not in groups:
-            groups[k] = []
-            order.append(k)
-        groups[k].append(ref)
-
-    out: list = []
-    for k in order:
-        members = groups[k]
-        if len(members) == 1:
-            out.append(members[0])
-            continue
-        # Pick earliest start / latest end across the same-key segments.
-        earliest = members[0]
-        earliest_e = _parse_epoch(members[0].week_start_at)
-        latest_end_iso = members[0].week_end_at
-        latest_e = _parse_epoch(members[0].week_end_at)
-        for m in members[1:]:
-            se = _parse_epoch(m.week_start_at)
-            if se is not None and (earliest_e is None or se < earliest_e):
-                earliest, earliest_e = m, se
-            ee = _parse_epoch(m.week_end_at)
-            if ee is not None and (latest_e is None or ee > latest_e):
-                latest_e, latest_end_iso = ee, m.week_end_at
-        # Base on the earliest-start ref (its start_at/start date are the
-        # outer start), widen its end to the latest segment end.
-        out.append(replace(earliest, week_end_at=latest_end_iso))
-    return out

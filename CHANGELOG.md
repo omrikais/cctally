@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.79.1] - 2026-07-22
+
+### Fixed
+- Dashboard hero history now steps through actual provider reset/re-anchor cycles with one milestone ledger per cycle, exposes every retained 5-hour block overlapping the selected cycle, and preserves the requested block direction across lazy detail loading for both Claude and Codex. (#338)
+
 ## [1.79.0] - 2026-07-22
 
 ### Added

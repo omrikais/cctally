@@ -54,6 +54,12 @@ function formatWeekWindow(
   return '—';
 }
 
+function formatCycleRange(entry: WeekIndexEntry, ctx: FmtCtx): string {
+  const start = fmt.dateShort(entry.start_at_utc, ctx);
+  const end = fmt.dateShort(entry.end_at_utc, ctx);
+  return start && end ? `${start}–${end}` : entry.label;
+}
+
 // Split a percent float into integer and ".decimal%" tail so the modal
 // can style them as two spans (<span class="int">17</span><span
 // class="unit">.4%</span>).
@@ -145,7 +151,9 @@ interface MilestoneNav {
   error: { status?: number; code?: string } | null;
   vanished: boolean;
   wantDetail: boolean;
-  requestCurrentDetail: () => void;    // lazy fetch of the current week
+  pendingBlockStep: -1 | 1 | null;
+  requestCurrentDetail: (dir: -1 | 1) => void;
+  clearPendingBlockStep: () => void;
   retry: () => void;
   blockSel: string | number | null;
   setBlockSel: (b: string | number | null) => void;
@@ -158,6 +166,7 @@ function useMilestoneNav(
   const [weekKey, setWeekKeyRaw] = useState<string | null>(null);
   const [blockSel, setBlockSel] = useState<string | number | null>(null);
   const [wantDetail, setWantDetail] = useState(false);
+  const [pendingBlockStep, setPendingBlockStep] = useState<-1 | 1 | null>(null);
   const [detail, setDetail] = useState<WeekDetailPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<{ status?: number; code?: string } | null>(null);
@@ -175,9 +184,14 @@ function useMilestoneNav(
     setWeekKeyRaw(k);
     setBlockSel(null);
     setWantDetail(false);
+    setPendingBlockStep(null);
     setError(null);
   }, []);
-  const requestCurrentDetail = useCallback(() => setWantDetail(true), []);
+  const requestCurrentDetail = useCallback((dir: -1 | 1) => {
+    setPendingBlockStep(dir);
+    setWantDetail(true);
+  }, []);
+  const clearPendingBlockStep = useCallback(() => setPendingBlockStep(null), []);
 
   // Fetch policy (spec §4): historic selection always fetches; the current
   // week fetches when its entry is multi-segment (envelope is
@@ -227,7 +241,8 @@ function useMilestoneNav(
 
   return {
     index, weekKey, setWeekKey, selectedEntry, currentEntry, detail, loading,
-    error, vanished, wantDetail, requestCurrentDetail, retry, blockSel, setBlockSel,
+    error, vanished, wantDetail, pendingBlockStep, requestCurrentDetail,
+    clearPendingBlockStep, retry, blockSel, setBlockSel,
   };
 }
 
@@ -375,7 +390,7 @@ function flattenClaudeWeekly(detail: WeekDetailPayload): { rows: WeeklyRow[]; co
       }
     }
     (seg.milestones as Milestone[]).forEach((m) => {
-      rows.push({ kind: 'ms', m, key: `ms-${seg.reset_event_id}-${m.percent}` });
+      rows.push({ kind: 'ms', m, key: `ms-${seg.key}-${m.percent}` });
     });
   });
   const count = detail.segments.reduce((n, s) => n + s.milestones.length, 0);
@@ -400,7 +415,8 @@ function CodexCurrentCycleModal({
   const nav = useMilestoneNav('codex', cycleIndex);
   const {
     weekKey, setWeekKey, selectedEntry, detail, loading, error, vanished,
-    blockSel, setBlockSel, requestCurrentDetail, wantDetail,
+    blockSel, setBlockSel, requestCurrentDetail, wantDetail, pendingBlockStep,
+    clearPendingBlockStep,
   } = nav;
   const isHistoric = weekKey != null;
 
@@ -479,7 +495,12 @@ function CodexCurrentCycleModal({
   const blocksReady = detail != null && (isHistoric || wantDetail);
   const blocks: WeekDetailBlock[] = blocksReady ? detail!.blocks : [];
   const hasBlocks = blocks.length > 0;
-  const defaultBlockIndex = hasBlocks ? blocks.length - 1 : -1;
+  const activeBlockIndex = !isHistoric
+    ? blocks.reduce((found, block, index) => (!block.is_closed ? index : found), -1)
+    : -1;
+  const defaultBlockIndex = activeBlockIndex >= 0
+    ? activeBlockIndex
+    : (hasBlocks ? blocks.length - 1 : -1);
   const selectedBlockIndex = (() => {
     if (!hasBlocks) return -1;
     if (blockSel != null) {
@@ -488,10 +509,24 @@ function CodexCurrentCycleModal({
     }
     return defaultBlockIndex;
   })();
+  useEffect(() => {
+    if (pendingBlockStep == null || !blocksReady) return;
+    if (hasBlocks) {
+      const next = defaultBlockIndex + pendingBlockStep;
+      if (next >= 0 && next < blocks.length) {
+        const b = blocks[next];
+        setBlockSel(b.key ?? b.five_hour_window_key ?? null);
+      }
+    }
+    clearPendingBlockStep();
+  }, [
+    blocks, blocksReady, clearPendingBlockStep, defaultBlockIndex, hasBlocks,
+    pendingBlockStep, setBlockSel,
+  ]);
   const stepBlock = (dir: -1 | 1) => {
     // The current cycle's first block-step fetches the cycle payload once; the
     // effect then re-renders with the nav (spec Q2-A).
-    if (!isHistoric && !blocksReady) { requestCurrentDetail(); return; }
+    if (!isHistoric && !blocksReady) { requestCurrentDetail(dir); return; }
     if (!hasBlocks) return;
     const next = selectedBlockIndex + dir;
     if (next < 0 || next >= blocks.length) return;
@@ -500,7 +535,7 @@ function CodexCurrentCycleModal({
   };
 
   const pill = isHistoric && selectedEntry
-    ? selectedEntry.label
+    ? formatCycleRange(selectedEntry, ctx)
     : (cycle
       ? `${fmt.dateShort(cycle.start_at, ctx)} → ${fmt.dateShort(cycle.resets_at, ctx)}`
       : 'Native 7-day cycle unavailable');
@@ -628,7 +663,7 @@ function CodexCurrentCycleModal({
         </table>
         )}
 
-        {!loading && !error && (isHistoric || currentHasBlocks) && (
+        {!loading && !error && (
           hasBlocks ? (
             <>
               <h3 className="m-sec sec-ms sec-5h">
@@ -644,9 +679,7 @@ function CodexCurrentCycleModal({
                 accentClass="accent-orange"
               />
             </>
-          ) : isHistoric ? (
-            <p className="mcw-ms-sub">No 5h data retained for this cycle.</p>
-          ) : (
+          ) : currentHasBlocks ? (
             // Current cycle with retained blocks (block_count > 0) but no
             // fetched payload yet: a block-nav affordance whose first step
             // lazily fetches the cycle detail (spec Q2-A).
@@ -666,6 +699,8 @@ function CodexCurrentCycleModal({
                 </button>
               </div>
             </>
+          ) : (
+            <p className="mcw-ms-sub">No 5h data retained for this cycle.</p>
           )
         )}
       </section>
@@ -690,7 +725,8 @@ function ClaudeCurrentWeekModal({
   const nav = useMilestoneNav('claude', index);
   const {
     weekKey, setWeekKey, selectedEntry, detail, loading, error, vanished,
-    blockSel, setBlockSel, requestCurrentDetail, wantDetail,
+    blockSel, setBlockSel, requestCurrentDetail, wantDetail, pendingBlockStep,
+    clearPendingBlockStep,
   } = nav;
   const isHistoric = weekKey != null;
 
@@ -736,7 +772,7 @@ function ClaudeCurrentWeekModal({
   const pct = clamp0_100(heroPct);
   const [bigInt, bigUnit] = splitBigNum(heroPct);
   const weekPillText = isHistoric && selectedEntry
-    ? selectedEntry.label
+    ? formatCycleRange(selectedEntry, ctx)
     : (cw ? formatWeekWindow(header?.week_label, cw.reset_at_utc, ctx) : '—');
   const ticks = dedupeTicks(
     weeklyRows.filter((r): r is Extract<WeeklyRow, { kind: 'ms' }> => r.kind === 'ms').map((r) => r.m),
@@ -764,11 +800,24 @@ function ClaudeCurrentWeekModal({
     }
     return defaultBlockIndex;
   })();
+  useEffect(() => {
+    if (pendingBlockStep == null || !useDetail) return;
+    if (hasPayloadBlocks) {
+      const next = defaultBlockIndex + pendingBlockStep;
+      if (next >= 0 && next < payloadBlocks.length) {
+        setBlockSel(payloadBlocks[next].five_hour_window_key ?? null);
+      }
+    }
+    clearPendingBlockStep();
+  }, [
+    clearPendingBlockStep, defaultBlockIndex, hasPayloadBlocks,
+    payloadBlocks, pendingBlockStep, setBlockSel, useDetail,
+  ]);
   const selectedBlock = selectedBlockIndex >= 0 ? payloadBlocks[selectedBlockIndex] : null;
   const stepBlock = (dir: -1 | 1) => {
     // On the current week before the payload is fetched, the first block-step
     // fetches the full week payload; the effect then re-renders with the nav.
-    if (!isHistoric && !useDetail) { requestCurrentDetail(); return; }
+    if (!isHistoric && !useDetail) { requestCurrentDetail(dir); return; }
     if (!hasPayloadBlocks) return;
     const next = selectedBlockIndex + dir;
     if (next < 0 || next >= payloadBlocks.length) return;
