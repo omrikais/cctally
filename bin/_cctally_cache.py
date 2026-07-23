@@ -4812,6 +4812,19 @@ def _cache_open_guarded() -> sqlite3.Connection:
         # Force a real header/schema read. SELECT 1 is constant-folded and can
         # report success without touching a malformed database file.
         conn.execute("PRAGMA schema_version").fetchone()
+        # The v1.80.2 production incident left the schema and left edge of
+        # session_entries readable while its interior root page pointed past
+        # EOF on the right. Probe that right-most path explicitly: O(log N), so
+        # every short-lived hook can afford it, unlike PRAGMA quick_check's
+        # whole-database scan.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_schema "
+            "WHERE type='table' AND name='session_entries'"
+        ).fetchone() is not None:
+            conn.execute(
+                "SELECT rowid FROM session_entries "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
         if marker.exists():
             conn.close()
             conn = None

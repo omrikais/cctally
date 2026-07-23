@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sqlite3
+import struct
 import sys
 
 import pytest
@@ -101,3 +102,60 @@ def test_cache_repair_marker_blocks_new_open(tmp_path, monkeypatch):
         ns["open_cache_db"]()
 
     assert path.stat().st_ino == inode
+
+
+def test_guarded_open_detects_schema_readable_session_tree_corruption(
+    tmp_path, monkeypatch,
+):
+    _ns, core, _store = _load(tmp_path, monkeypatch)
+    cache_mod = sys.modules["_cctally_cache"]
+    path = pathlib.Path(core.CACHE_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA page_size=512")
+        conn.execute(
+            "CREATE TABLE session_entries "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO session_entries(payload) VALUES (?)",
+            [("x" * 200,) for _ in range(300)],
+        )
+        conn.commit()
+        root_page = conn.execute(
+            "SELECT rootpage FROM sqlite_schema "
+            "WHERE type='table' AND name='session_entries'"
+        ).fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+    finally:
+        conn.close()
+
+    # Interior table B-tree pages store their right-most child at header +8.
+    # Point it past EOF: schema_version and the left edge remain readable, while
+    # the exact descending-rowid probe needed for the production failure raises
+    # SQLITE_CORRUPT ("invalid page number").
+    with path.open("r+b") as fh:
+        header = (root_page - 1) * page_size
+        fh.seek(header)
+        assert fh.read(1) == b"\x05", "fixture root must be an interior table page"
+        fh.seek(header + 8)
+        fh.write(struct.pack(">I", page_count + 100))
+
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("PRAGMA schema_version").fetchone() is not None
+        assert raw.execute(
+            "SELECT rowid FROM session_entries ORDER BY rowid LIMIT 1"
+        ).fetchone() == (1,)
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            raw.execute(
+                "SELECT rowid FROM session_entries ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        raw.close()
+
+    with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+        cache_mod._cache_open_guarded()

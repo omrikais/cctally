@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.80.3] - 2026-07-23
+
+### Fixed
+- Cache recovery now detects a damaged `session_entries` B-tree even when `cache.db` still has a readable schema, allowing dashboard startup and `cache-sync --rebuild` to quarantine and recreate the already-corrupt v1.80.1/v1.80.2 cache instead of surfacing a persistent sync error.
+
 ## [1.80.2] - 2026-07-23
 
 ### Fixed
