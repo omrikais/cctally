@@ -411,6 +411,34 @@ def test_busy_error_does_not_trigger_heal(ns):
     assert not qdir.exists(), "a BUSY error must never quarantine"
 
 
+def test_locked_recheck_rejects_lazy_open_corruption(monkeypatch, tmp_path):
+    """Linux SQLite may answer SELECT 1 without reading a corrupt DB header."""
+    import _cctally_store as st
+
+    path = tmp_path / "stats.db"
+    path.write_bytes(b"not a database")
+
+    class LazyCorruptConnection:
+        def execute(self, sql):
+            if sql == "SELECT 1":
+                return self
+            raise sqlite3.DatabaseError("file is not a database")
+
+        def fetchone(self):
+            return (1,)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        st.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: LazyCorruptConnection(),
+    )
+
+    assert st._probe_stats_ok(path) is False
+
+
 # --- concurrent heal serialization (spawn multiprocess) ---
 
 def _corrupt_and_open_worker(bin_dir, home_dir, data_dir, q):

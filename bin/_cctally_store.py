@@ -363,7 +363,10 @@ def _probe_stats_ok(path) -> bool:
     try:
         c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            c.execute("SELECT 1").fetchone()
+            # Force SQLite to read the database header.  A constant-only
+            # ``SELECT 1`` can succeed on Linux without touching a corrupt file,
+            # falsely reporting that a sibling already healed the index.
+            c.execute("PRAGMA schema_version").fetchone()
         finally:
             c.close()
         return True

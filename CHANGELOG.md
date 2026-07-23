@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.80.1] - 2026-07-23
+
+### Fixed
+- Corrupted `stats.db` indexes now auto-heal correctly on Linux: the locked re-check reads the SQLite header instead of accepting a constant-only query that could succeed without touching the damaged file.
+
 ## [1.80.0] - 2026-07-23
 
 ### Added
