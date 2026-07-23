@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.80.2] - 2026-07-23
+
+### Fixed
+- The dashboard no longer crashes with a native SQLite `SIGBUS` when a corrupt `cache.db` is detected while another dashboard or hook reader is active. Cache recovery now blocks new opens, refuses to replace a file family with live handles, preserves the complete family in quarantine, and retries recreation only after replacement is safe.
+- Re-reading the same retained Codex quota observation now produces a byte-identical journal record instead of a new command-time identity. A compact natural-key index also recognizes records already written by v1.80.1, preventing cache recovery from multiplying historical quota records and making subsequent rebuilds progressively slower.
+
 ## [1.80.1] - 2026-07-23
 
 ### Fixed

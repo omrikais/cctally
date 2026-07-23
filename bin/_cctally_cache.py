@@ -1211,26 +1211,25 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
     lock is a LEAF — legal to take inside a provider flock, spec §4.3) and BEFORE
     the cache write / offset advance, so a crash re-reads the same bytes and
     re-appends (idempotent at the QUOTA_APPLIER's natural-key INSERT OR IGNORE)
-    rather than losing the observation. ``at`` is the detection clock
-    (``_command_as_of()``-aware, honoring the CCTALLY_AS_OF test hook); the raw
-    row (incl. its own ``captured_at_utc``) rides the payload (spec §4.2 raw
-    capture — no derivation baked into the stored line). $CODEX_HOME multi-root
-    scoping is preserved: each row carries its own ``source_root_key`` and roots
-    are never combined."""
+    rather than losing the observation. ``at`` is the observation's retained
+    ``captured_at_utc`` rather than the later sync clock, so re-reading the same
+    rollout bytes emits the same content id and byte-identical journal record.
+    $CODEX_HOME multi-root scoping is preserved: each row carries its own
+    ``source_root_key`` and roots are never combined."""
     if not quota_rows:
         return
     import _cctally_journal as _jr
     import _lib_journal as _jl
-    at = (
-        _cctally_core._command_as_of()
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
     for row in quota_rows:
         (source, source_root_key, source_path, line_offset, captured_at_utc,
          observed_slot, logical_limit_key, limit_id, limit_name, window_minutes,
          used_percent, resets_at_utc, plan_type, individual_limit_json,
          reached_type, observed_model) = row
+        at = captured_at_utc or (
+            _cctally_core._command_as_of()
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         try:
             _jr.append_record(_jl.make_obs(
                 at=at, src="codex-quota", provider="codex",
@@ -1246,7 +1245,7 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
                     "plan_type": plan_type,
                     "individual_limit_json": individual_limit_json,
                     "reached_type": reached_type, "observed_model": observed_model,
-                }))
+                }), dedupe_codex_quota=True)
         except Exception as exc:  # best-effort; a journal append must not break sync
             eprint(f"[codex-cache] quota obs journal append failed: {exc}")
 
@@ -4789,12 +4788,113 @@ def _harden_cache_sidecars() -> None:
 # === Region 6: open_cache_db (was bin/cctally:9040-9155) ===
 
 
+def _cache_open_guarded() -> sqlite3.Connection:
+    """Open cache.db while excluding a destructive recovery handshake.
+
+    The shared maintenance flock covers both marker checks and the SQLite
+    connect/probe. A repair owns the exclusive side; after it claims the marker,
+    no new cctally opener can escape into the live family while it verifies that
+    all pre-marker handles have drained.
+    """
+    path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    marker = _cctally_db_sib._repair_marker_path(path)
+    lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "a+")
+    conn = None
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_SH)
+        if marker.exists():
+            raise sqlite3.DatabaseError(
+                f"cache.db maintenance is in progress ({marker})"
+            )
+        conn = _cctally_store.open_index("cache")
+        # Force a real header/schema read. SELECT 1 is constant-folded and can
+        # report success without touching a malformed database file.
+        conn.execute("PRAGMA schema_version").fetchone()
+        if marker.exists():
+            conn.close()
+            conn = None
+            raise sqlite3.DatabaseError(
+                f"cache.db maintenance is in progress ({marker})"
+            )
+        return conn
+    except Exception:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        finally:
+            lock_fh.close()
+
+
+def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
+    """Quarantine a corrupt cache family only after every reader has drained.
+
+    Returns True after a safe quarantine, so the caller may create a fresh
+    re-derivable cache. Raises a guided DatabaseError when recovery cannot prove
+    exclusivity; callers then use their established direct-JSONL fallback.
+    """
+    if not _cctally_db_sib._is_sqlite_corruption_error(exc):
+        return False
+
+    path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    try:
+        claimed, reason = _cctally_db_sib._claim_repair_marker(path)
+    except OSError as marker_exc:
+        raise sqlite3.DatabaseError(
+            f"cache.db recovery could not claim maintenance: {marker_exc}"
+        ) from exc
+    if not claimed:
+        raise sqlite3.DatabaseError(
+            f"cache.db maintenance is in progress: {reason}"
+        ) from exc
+
+    lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        open_pids = _cctally_db_sib._db_family_open_pids(path)
+        if open_pids is None:
+            raise sqlite3.DatabaseError(
+                "cache.db recovery cannot verify that the database family has "
+                "no open handles; leaving it untouched"
+            ) from exc
+        if open_pids:
+            raise sqlite3.DatabaseError(
+                "cache.db is still open in process(es) "
+                + ", ".join(str(pid) for pid in sorted(open_pids))
+                + "; leaving the live family untouched"
+            ) from exc
+
+        _cctally_db_sib.write_corruption_forensics(path, db_label="cache")
+        incident = _cctally_db_sib.quarantine_db_family(path)
+        eprint(
+            f"[cache] corrupt cache DB ({exc}); quarantined its file family "
+            f"under {incident} and recreating from source JSONL"
+        )
+        return True
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        finally:
+            lock_fh.close()
+        _cctally_db_sib._release_repair_marker(path)
+
+
 def open_cache_db() -> sqlite3.Connection:
     """Open (or create) the session-entry cache DB.
 
     Enables WAL mode so queries can run concurrently with an in-progress
-    ingest. On sqlite3.DatabaseError (corruption) the file is unlinked and
-    recreated — the cache is fully re-derivable from JSONL, so this is safe.
+    ingest. On positively classified corruption, the whole file family is
+    quarantined and recreated only after a marker + maintenance flock + active
+    handle check prove replacement cannot invalidate a live WAL reader.
     """
     c = _cctally()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -4807,22 +4907,13 @@ def open_cache_db() -> sqlite3.Connection:
     except OSError as exc:
         eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
     try:
-        # Connect + install row factory / test trace hook via the unified
-        # opener (spec §6.1). PRAGMAs are applied AFTER the corruption probe so
-        # a mode-change never writes a WAL onto a DB we are about to unlink.
-        conn = _cctally_store.open_index("cache")
-        conn.execute("SELECT 1").fetchone()
+        conn = _cache_open_guarded()
     except sqlite3.DatabaseError as exc:
-        eprint(f"[cache] corrupt cache DB ({exc}); recreating")
-        try:
-            conn.close()
-        except Exception:
-            pass
-        try:
-            _cctally_core.CACHE_DB_PATH.unlink()
-        except FileNotFoundError:
-            pass
-        conn = _cctally_store.open_index("cache")
+        if not _recover_corrupt_cache(exc):
+            raise
+        # One retry only. A second failure surfaces to the existing direct-JSONL
+        # fallback instead of looping through destructive recovery.
+        conn = _cache_open_guarded()
 
     # Best-effort 0600 on cache.db itself (the 0700 dir above backstops the
     # sidecars until the first write hardens them in sync_cache).

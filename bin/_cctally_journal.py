@@ -45,6 +45,15 @@ import _lib_record
 _TAIL_WINDOW = 64 * 1024
 _MAX_LINE_BYTES = _TAIL_WINDOW
 
+# Process-local acceleration for the durable Codex-quota dedupe index. The
+# compact index is re-derivable from the journal and lets short-lived hook
+# processes load ~20-byte natural-key digests instead of rescanning every full
+# JSONL segment.
+_QUOTA_DEDUP_INDEX_NAME = ".quota-observation-keys"
+_QUOTA_DEDUP_DIR: str | None = None
+_QUOTA_DEDUP_KEYS: set[str] = set()
+_QUOTA_DEDUP_LOADED = False
+
 
 class JournalError(Exception):
     """A structural journal-append failure (line too long, unrepairable tail)."""
@@ -134,17 +143,136 @@ def _repair_torn_tail(fd: int) -> None:
 # public append surface
 # --------------------------------------------------------------------------
 
-def append_record(record: dict, *, now_utc: dt.datetime | None = None) -> tuple[str, int]:
+def _is_codex_quota_obs(record: dict) -> bool:
+    return (
+        record.get("t") == "obs"
+        and record.get("provider") == "codex"
+        and (record.get("payload") or {}).get("kind") == "quota_window_snapshot"
+    )
+
+
+def _codex_quota_natural_key(record: dict) -> str | None:
+    """Digest the cache table's stable UNIQUE key for one quota observation."""
+    if not _is_codex_quota_obs(record):
+        return None
+    payload = record.get("payload") or {}
+    source = payload.get("source")
+    source_path = payload.get("source_path")
+    line_offset = payload.get("line_offset")
+    logical_limit_key = payload.get("logical_limit_key")
+    if (
+        not isinstance(source, str)
+        or not isinstance(source_path, str)
+        or not isinstance(line_offset, int)
+        or not isinstance(logical_limit_key, str)
+    ):
+        return None
+    return _lib_journal.content_id({
+        "t": "quota-natural-key",
+        "payload": {
+            "source": source,
+            "source_path": source_path,
+            "line_offset": line_offset,
+            "logical_limit_key": logical_limit_key,
+        },
+    })
+
+
+def _load_quota_dedup_keys() -> None:
+    """Load or atomically rebuild the re-derivable quota natural-key index.
+
+    Caller owns journal.lock, so an initial full scan observes one stable
+    journal prefix and only one process can publish the compact index. Normal
+    quota appends fsync the journal first and this index second; a crash in
+    between can cause at most one harmless duplicate on retry, never a skipped
+    durable observation.
+    """
+    global _QUOTA_DEDUP_DIR, _QUOTA_DEDUP_LOADED
+    journal_dir = _cctally_core.JOURNAL_DIR
+    dir_key = str(journal_dir)
+    if _QUOTA_DEDUP_DIR != dir_key:
+        _QUOTA_DEDUP_DIR = dir_key
+        _QUOTA_DEDUP_KEYS.clear()
+        _QUOTA_DEDUP_LOADED = False
+    if _QUOTA_DEDUP_LOADED:
+        return
+
+    index_path = journal_dir / _QUOTA_DEDUP_INDEX_NAME
+    try:
+        raw_keys = index_path.read_text(encoding="ascii").splitlines()
+        if any(not item.startswith("o:") or len(item) != 18 for item in raw_keys):
+            raise ValueError("invalid quota dedupe index")
+        _QUOTA_DEDUP_KEYS.update(raw_keys)
+        _QUOTA_DEDUP_LOADED = True
+        return
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        _QUOTA_DEDUP_KEYS.clear()
+
+    for name in list_segments():
+        with (journal_dir / name).open("rb") as fh:
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break
+                decoded = _lib_journal.decode_line(raw)
+                if decoded is not None:
+                    natural_key = _codex_quota_natural_key(decoded)
+                    if natural_key is not None:
+                        _QUOTA_DEDUP_KEYS.add(natural_key)
+
+    tmp = index_path.with_name(
+        f"{index_path.name}.tmp-{os.getpid()}-{time.monotonic_ns()}"
+    )
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            payload = "".join(
+                f"{natural_key}\n" for natural_key in sorted(_QUOTA_DEDUP_KEYS)
+            ).encode("ascii")
+            _write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(index_path))
+        _fsync_dir(journal_dir)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    _QUOTA_DEDUP_LOADED = True
+
+
+def _append_quota_dedup_key(natural_key: str) -> None:
+    """Journal-first second leg: append+fsync one key to the compact index."""
+    index_path = _cctally_core.JOURNAL_DIR / _QUOTA_DEDUP_INDEX_NAME
+    fd = os.open(str(index_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _write_all(fd, f"{natural_key}\n".encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _QUOTA_DEDUP_KEYS.add(natural_key)
+
+
+def append_record(
+    record: dict,
+    *,
+    now_utc: dt.datetime | None = None,
+    dedupe_codex_quota: bool = False,
+) -> tuple[str, int] | None:
     """Append one encoded line to the current UTC month's segment.
 
     Implements spec §4.3 exactly: ``O_RDWR|O_APPEND|O_CREAT`` (0o600) → blocking
     leaf flock → torn-tail repair → loop-write the full line → ``fsync(fd)`` →
     parent-dir fsync on first segment/dir creation → unlock.
 
-    ``now_utc`` selects the segment (defaults to the current UTC time). Returns
-    ``(segment_basename, end_offset)`` where ``end_offset`` is the file size
-    just past the appended line — the byte position the ingest cursor advances
-    to when it consumes this line."""
+    ``now_utc`` selects the segment (defaults to the current UTC time).
+    ``dedupe_codex_quota`` skips a retained Codex quota obs whose table natural
+    key already exists in any segment; this is the cache-recovery replay path
+    and returns ``None`` on a skip. Otherwise returns ``(segment_basename,
+    end_offset)`` where ``end_offset`` is the file size just past the appended
+    line — the byte position the ingest cursor advances to when it consumes
+    this line."""
     if now_utc is None:
         now_utc = dt.datetime.now(dt.timezone.utc)
     data = _lib_journal.encode_line(record)
@@ -167,6 +295,20 @@ def append_record(record: dict, *, now_utc: dt.datetime | None = None) -> tuple[
 
     lock_fd = _acquire_leaf_lock()
     try:
+        if dedupe_codex_quota:
+            if not _is_codex_quota_obs(record):
+                raise ValueError(
+                    "dedupe_codex_quota is valid only for Codex quota obs"
+                )
+            _load_quota_dedup_keys()
+            natural_key = _codex_quota_natural_key(record)
+            if natural_key is None:
+                raise ValueError(
+                    "dedupe_codex_quota requires a complete quota natural key"
+                )
+            if natural_key in _QUOTA_DEDUP_KEYS:
+                return None
+
         seg_created = not seg_path.exists()
         fd = os.open(str(seg_path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
         try:
@@ -181,6 +323,8 @@ def append_record(record: dict, *, now_utc: dt.datetime | None = None) -> tuple[
             end_offset = os.fstat(fd).st_size
         finally:
             os.close(fd)
+        if dedupe_codex_quota:
+            _append_quota_dedup_key(natural_key)
         # Durably record new directory entries (spec §4.3: fsync the parent
         # directory on first creation of a segment or the journal dir).
         if seg_created:

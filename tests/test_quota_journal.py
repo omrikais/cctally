@@ -249,6 +249,78 @@ def test_sync_codex_cache_appends_quota_obs(tmp_path, monkeypatch):
     assert obs_keys == {(r[0], r[1]) for r in cache_rows}
 
 
+def test_quota_obs_replay_has_stable_identity(tmp_path, monkeypatch):
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    cache_mod = importlib.import_module("_cctally_cache")
+    row = (
+        "codex", "root-a", "/codex/root-a/r.jsonl", 10, _iso(10),
+        "primary", "limit-primary", "native-primary", "Primary", 300,
+        42.0, RESET, "pro", None, None, "gpt-5.3-codex",
+    )
+
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T12:00:00Z")
+    cache_mod._append_codex_quota_obs([row])
+    core = importlib.import_module("_cctally_core")
+    dedupe_index = core.JOURNAL_DIR / ".quota-observation-keys"
+    assert dedupe_index.exists()
+
+    # Simulate the next short-lived hook process: it must reload the compact
+    # durable index, not rescan the potentially multi-gigabyte journal.
+    jr._QUOTA_DEDUP_DIR = None
+    jr._QUOTA_DEDUP_KEYS.clear()
+    jr._QUOTA_DEDUP_LOADED = False
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T13:00:00Z")
+    cache_mod._append_codex_quota_obs([row])
+
+    obs = [
+        line for line in _journal_lines(jr, jl)
+        if line.get("t") == "obs"
+        and (line.get("payload") or {}).get("kind") == "quota_window_snapshot"
+    ]
+    assert len(obs) == 1, (
+        "re-reading the same rollout bytes must not grow the durable journal"
+    )
+    assert obs[0]["at"] == _iso(10)
+
+
+def test_quota_obs_upgrade_dedupes_legacy_command_time_identity(
+    tmp_path, monkeypatch,
+):
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    cache_mod = importlib.import_module("_cctally_cache")
+    row = (
+        "codex", "root-a", "/codex/root-a/r.jsonl", 10, _iso(10),
+        "primary", "limit-primary", "native-primary", "Primary", 300,
+        42.0, RESET, "pro", None, None, "gpt-5.3-codex",
+    )
+
+    # v1.80.1 used the later sync command clock as `at`, so the same retained
+    # source row had a different content id from the stable-clock form.
+    legacy = _codex_quota_obs(
+        jl,
+        source_root_key="root-a",
+        source_path="/codex/root-a/r.jsonl",
+        line_offset=10,
+        captured_at_utc=_iso(10),
+        used_percent=42.0,
+        at="2026-07-15T12:00:00Z",
+    )
+    jr.append_record(legacy, now_utc=FIXED)
+
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T13:00:00Z")
+    cache_mod._append_codex_quota_obs([row])
+
+    obs = [
+        line for line in _journal_lines(jr, jl)
+        if line.get("t") == "obs"
+        and (line.get("payload") or {}).get("kind") == "quota_window_snapshot"
+    ]
+    assert len(obs) == 1, (
+        "the upgrade must recognize an existing quota row by its table natural "
+        "key even though v1.80.1 gave it a command-time content id"
+    )
+
+
 # ==========================================================================
 # Item 5 — quota_alert_arming journaled state + replay honored
 # ==========================================================================

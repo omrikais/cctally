@@ -6695,7 +6695,7 @@ def _db_backup_timestamp() -> str:
 
 
 def _repair_marker_path(path: pathlib.Path) -> pathlib.Path:
-    return path.with_name("stats.db.repairing")
+    return path.with_name(f"{path.name}.repairing")
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -6722,7 +6722,9 @@ def _claim_repair_marker(path: pathlib.Path) -> "tuple[bool, str]":
             except (OSError, ValueError):
                 owner = -1
             if _pid_is_alive(owner):
-                return False, f"another stats.db repair owns {marker} (pid {owner})"
+                return False, (
+                    f"another {path.name} repair owns {marker} (pid {owner})"
+                )
             try:
                 marker.unlink()
             except FileNotFoundError:
