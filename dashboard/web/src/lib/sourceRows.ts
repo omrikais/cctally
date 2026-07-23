@@ -119,7 +119,7 @@ export function adaptCodexSessionRows(rows: CodexSessionRow[]): SessionDisplayRo
     source: 'codex',
     key: row.key,
     title: row.label?.trim() ?? '',
-    recencyUtc: row.started_at ?? row.last_activity,
+    recencyUtc: row.last_activity,
     models: [...(row.models ?? [])],
     costUsd: row.cost_usd,
     durationMin: row.duration_min ?? null,

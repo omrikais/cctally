@@ -757,12 +757,19 @@ def _codex_conversation_metadata(
     metadata: dict[tuple[str, str], dict[str, object]] = {}
     try:
         core_rows = tuple(cache_conn.execute(
+            "WITH accounting AS ("
+            " SELECT source_root_key, source_path, MIN(id) AS first_id,"
+            " MIN(timestamp_utc) AS started_at"
+            " FROM codex_session_entries"
+            " GROUP BY source_root_key, source_path"
+            ") "
             "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
-            "(SELECT e.session_id FROM codex_session_entries AS e "
-            " WHERE e.source_root_key=t.source_root_key AND e.source_path=t.source_path "
-            " ORDER BY e.id LIMIT 1) AS accounting_session_id, "
-            "t.cwd, t.git_json, t.first_seen_utc, t.last_seen_utc "
+            "e.session_id AS accounting_session_id, "
+            "t.cwd, t.git_json, a.started_at, t.last_seen_utc "
             "FROM codex_conversation_threads AS t "
+            "LEFT JOIN accounting AS a "
+            "ON a.source_root_key=t.source_root_key AND a.source_path=t.source_path "
+            "LEFT JOIN codex_session_entries AS e ON e.id=a.first_id "
             "ORDER BY t.last_seen_utc DESC, t.conversation_key DESC"
         ))
         from _cctally_cache import _codex_conversation_project_attribution
@@ -778,16 +785,20 @@ def _codex_conversation_metadata(
             ) in core_rows
         )
         file_aliases = tuple(cache_conn.execute(
-            "SELECT source_root_key, path, last_native_thread_id, last_session_id "
-            "FROM codex_session_files "
-            "WHERE last_native_thread_id IS NOT NULL AND last_native_thread_id != '' "
-            "ORDER BY last_ingested_at DESC, path DESC"
+            "SELECT f.source_root_key, f.path, f.last_native_thread_id, "
+            "f.last_session_id, MIN(e.timestamp_utc) "
+            "FROM codex_session_files AS f "
+            "LEFT JOIN codex_session_entries AS e "
+            "ON e.source_root_key=f.source_root_key AND e.source_path=f.path "
+            "WHERE f.last_native_thread_id IS NOT NULL AND f.last_native_thread_id != '' "
+            "GROUP BY f.source_root_key, f.path, f.last_native_thread_id, f.last_session_id "
+            "ORDER BY f.last_ingested_at DESC, f.path DESC"
         ))
         native_ids = tuple(sorted({
             str(native_thread_id) for _, _, native_thread_id, *_ in rows
             if isinstance(native_thread_id, str) and native_thread_id
         } | {
-            str(native_thread_id) for _, _, native_thread_id, _ in file_aliases
+            str(native_thread_id) for _, _, native_thread_id, *_ in file_aliases
             if isinstance(native_thread_id, str) and native_thread_id
         }))
         provider_roots = {
@@ -858,7 +869,10 @@ def _codex_conversation_metadata(
         # persists the rooted native thread id. Inherit only presentation
         # metadata from that rooted task; the child's accounting path and
         # session id remain its own identity and totals are never merged.
-        for root_key, source_path, native_thread_id, accounting_session_id in file_aliases:
+        for (
+            root_key, source_path, native_thread_id, accounting_session_id,
+            started_at,
+        ) in file_aliases:
             identity = (str(root_key or ""), str(source_path or ""))
             if not all(identity) or identity in metadata:
                 continue
@@ -871,7 +885,7 @@ def _codex_conversation_metadata(
                 "root_path": str(provider_roots.get(identity[0]) or ""),
                 "project_key": (inherited or {}).get("project_key"),
                 "project_label": (inherited or {}).get("project_label"),
-                "started_at": (inherited or {}).get("started_at"),
+                "started_at": started_at or (inherited or {}).get("started_at"),
             }
     except sqlite3.Error:
         return {}

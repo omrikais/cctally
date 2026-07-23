@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.80.4] - 2026-07-23
+
+### Fixed
+- Codex Recent Sessions now keeps MCP-invoked sessions in true last-activity order and derives each Started time and duration from retained accounting events, so a cache rebuild no longer gives historical conversations one shared date or `0m` durations.
+
 ## [1.80.3] - 2026-07-23
 
 ### Fixed

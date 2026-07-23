@@ -92,7 +92,7 @@ describe('session display-row adapters (§6.3)', () => {
     expect(adaptCodexSessionRows([row])[0]).toMatchObject({
       title: 'Implement dashboard parity',
       project: 'cctally-dev',
-      recencyUtc: '2026-04-24T12:00:00Z',
+      recencyUtc: row.last_activity,
       durationMin: 30,
     });
   });

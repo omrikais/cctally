@@ -892,6 +892,58 @@ def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
         stats.close()
 
 
+def test_codex_session_start_comes_from_accounting_not_rebuild_observation(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root_key = _cache_root_key(cache)
+    try:
+        source_path, expected_started_at = cache.execute(
+            "SELECT source_path, MIN(timestamp_utc) "
+            "FROM codex_session_entries WHERE source_root_key=?",
+            (root_key,),
+        ).fetchone()
+        rebuild_at = NOW.isoformat()
+        cache.execute(
+            "UPDATE codex_conversation_threads "
+            "SET first_seen_utc=?, last_seen_utc=? "
+            "WHERE source_root_key=? AND source_path=?",
+            (rebuild_at, rebuild_at, root_key, source_path),
+        )
+
+        mcp_path = "/cached/mcp-rollout.jsonl"
+        mcp_started_at = (NOW - dt.timedelta(hours=2)).isoformat()
+        cache.execute(
+            "INSERT INTO codex_session_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            "last_session_id, source_root_key, last_native_thread_id) "
+            "VALUES (?, 1, 1, 1, ?, ?, ?, ?)",
+            (
+                mcp_path, rebuild_at, "mcp-accounting-session", root_key,
+                "mcp-native-thread",
+            ),
+        )
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path=mcp_path,
+            line_offset=11_000,
+            session_id="mcp-accounting-session",
+            conversation_key=None,
+            source_root_key=root_key,
+            timestamp=NOW - dt.timedelta(hours=2),
+        )
+        cache.commit()
+
+        metadata = source_module._codex_conversation_metadata(cache)
+
+        assert metadata[(root_key, source_path)]["started_at"] == expected_started_at
+        assert metadata[(root_key, mcp_path)]["started_at"] == mcp_started_at
+    finally:
+        cache.close()
+        stats.close()
+
+
 def test_codex_subagent_accounting_inherits_root_task_and_project_metadata(
     tmp_path, monkeypatch,
 ):
