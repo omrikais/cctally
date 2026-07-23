@@ -289,23 +289,29 @@ function WeekNavChip({
   );
 }
 
-function BlockNavHeader({
-  blocks,
+interface BlockNavWindow {
+  block_start_at?: string | null;
+  five_hour_resets_at?: string | null;
+  crossed_seven_day_reset?: boolean;
+}
+
+function BlockNavHeaderFrame({
+  blockCount,
   selectedIndex,
+  block,
   onStep,
   ctx,
   singleId,
   accentClass,
 }: {
-  blocks: WeekDetailBlock[];
+  blockCount: number;
   selectedIndex: number;
+  block: BlockNavWindow | null;
   onStep: (dir: -1 | 1) => void;
   ctx: FmtCtx;
   singleId: (v: string) => string | undefined;
   accentClass: string;
 }) {
-  const n = blocks.length;
-  const block = blocks[selectedIndex];
   const crossed = !!block?.crossed_seven_day_reset;
   const startShort = fmt.startedShort(block?.block_start_at, ctx, { noSuffix: true });
   const endShort = fmt.startedShort(block?.five_hour_resets_at, ctx, { noSuffix: true });
@@ -321,20 +327,83 @@ function BlockNavHeader({
         ‹
       </button>
       <span className={`m-pill ${accentClass}`}>
-        {crossed ? '⚡ ' : ''}Block {selectedIndex + 1} of {n}
+        {crossed ? '⚡ ' : ''}Block {selectedIndex + 1} of {blockCount}
       </span>
       <span className="mcw-ms-sub">{startShort} → {endShort}</span>
       <button
         type="button"
         className={`m-pill ${accentClass} mcw-blocknav-btn`}
         aria-label="Newer block"
-        disabled={selectedIndex >= n - 1}
+        disabled={selectedIndex >= blockCount - 1}
         onClick={() => onStep(1)}
       >
         ›
       </button>
     </div>
   );
+}
+
+function BlockNavHeader({
+  blocks,
+  selectedIndex,
+  onStep,
+  ctx,
+  singleId,
+  accentClass,
+}: {
+  blocks: WeekDetailBlock[];
+  selectedIndex: number;
+  onStep: (dir: -1 | 1) => void;
+  ctx: FmtCtx;
+  singleId: (v: string) => string | undefined;
+  accentClass: string;
+}) {
+  return (
+    <BlockNavHeaderFrame
+      blockCount={blocks.length}
+      selectedIndex={selectedIndex}
+      block={blocks[selectedIndex] ?? null}
+      onStep={onStep}
+      ctx={ctx}
+      singleId={singleId}
+      accentClass={accentClass}
+    />
+  );
+}
+
+function CurrentBlockNavHeader({
+  blockCount,
+  block,
+  onStep,
+  ctx,
+  singleId,
+  accentClass,
+}: {
+  blockCount: number;
+  block: BlockNavWindow | null;
+  onStep: (dir: -1 | 1) => void;
+  ctx: FmtCtx;
+  singleId: (v: string) => string | undefined;
+  accentClass: string;
+}) {
+  return (
+    <BlockNavHeaderFrame
+      blockCount={blockCount}
+      selectedIndex={blockCount - 1}
+      block={block}
+      onStep={onStep}
+      ctx={ctx}
+      singleId={singleId}
+      accentClass={accentClass}
+    />
+  );
+}
+
+function fiveHoursAfter(startAt: string | null | undefined): string | null {
+  const startMs = Date.parse(startAt ?? '');
+  return Number.isFinite(startMs)
+    ? new Date(startMs + 5 * 60 * 60 * 1000).toISOString()
+    : null;
 }
 
 function VanishedState({ onBack }: { onBack: () => void }) {
@@ -454,6 +523,22 @@ function CodexCurrentCycleModal({
       && inCycle(row))
     .sort((a, b) => a.percent - b.percent || a.captured_at.localeCompare(b.captured_at));
   const fiveHourHistory = codex?.quota.histories.find((row) => row.window_minutes === 300);
+  const currentFiveHourBlock = codex?.quota.blocks.find((row) =>
+    row.window_minutes === 300
+    && row.is_active
+    && !row.orphaned
+    && (
+      fiveHourHistory?.forecast.resets_at == null
+      || row.resets_at === fiveHourHistory.forecast.resets_at
+    )
+  ) ?? null;
+  const currentBlockPreview: BlockNavWindow | null = currentFiveHourBlock
+    ? {
+      block_start_at: currentFiveHourBlock.start_at,
+      five_hour_resets_at: currentFiveHourBlock.end_at,
+      crossed_seven_day_reset: false,
+    }
+    : null;
   const envFiveHourMilestones = allMilestones
     .filter((row) => row.window_minutes === 300
       && row.quota_key === fiveHourHistory?.key
@@ -680,24 +765,23 @@ function CodexCurrentCycleModal({
               />
             </>
           ) : currentHasBlocks ? (
-            // Current cycle with retained blocks (block_count > 0) but no
-            // fetched payload yet: a block-nav affordance whose first step
-            // lazily fetches the cycle detail (spec Q2-A).
+            // Current cycle with retained blocks but no fetched payload yet:
+            // render the same complete navigator as historic cycles from the
+            // compact index + active-block envelope. The first older step
+            // still lazily fetches detail before applying its direction.
             <>
               <h3 className="m-sec sec-ms sec-5h">
                 <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg>
                 5h blocks
               </h3>
-              <div className="mcw-mshead">
-                <button
-                  type="button"
-                  className="m-pill accent-orange mcw-blocknav-btn"
-                  aria-label="Older block"
-                  onClick={() => stepBlock(-1)}
-                >
-                  ‹ blocks
-                </button>
-              </div>
+              <CurrentBlockNavHeader
+                blockCount={selectedEntry?.block_count ?? 0}
+                block={currentBlockPreview}
+                onStep={stepBlock}
+                ctx={ctx}
+                singleId={singleId}
+                accentClass="accent-orange"
+              />
             </>
           ) : (
             <p className="mcw-ms-sub">No 5h data retained for this cycle.</p>
@@ -837,12 +921,20 @@ function ClaudeCurrentWeekModal({
       ))
     : fhStream;
 
-  // Show the block navigator when there is a fetched block list; on the
-  // current default (no payload) keep the live fhStream section, plus a nav
-  // affordance when the week has more than one block.
+  // Show the full navigator from compact index/live-block facts on the current
+  // default; fetching detail remains lazy until the first step.
   const showBlockNav = hasPayloadBlocks;
-  const currentHasMoreBlocks = !isHistoric && !useDetail
-    && (selectedEntry?.block_count ?? 0) > 1;
+  const currentBlockCount = !isHistoric && !useDetail
+    ? (selectedEntry?.block_count ?? 0)
+    : 0;
+  const currentHasBlocks = currentBlockCount > 0;
+  const currentBlockPreview: BlockNavWindow | null = cw?.five_hour_block
+    ? {
+      block_start_at: cw.five_hour_block.block_start_at,
+      five_hour_resets_at: fiveHoursAfter(cw.five_hour_block.block_start_at),
+      crossed_seven_day_reset: cw.five_hour_block.crossed_seven_day_reset,
+    }
+    : null;
 
   const bindings = useMemo<Binding[]>(() => {
     const isTopmost = () =>
@@ -1019,9 +1111,9 @@ function ClaudeCurrentWeekModal({
             The section stays mounted whenever the effective block list has ≥1
             block (`showBlockNav`) — so stepping onto a milestone-less block (a
             cross-reset straddler) never unmounts the navigator — and equally
-            for the current-default affordance (`currentHasMoreBlocks`) or a
+            for the current-default navigator (`currentHasBlocks`) or a
             non-empty live stream; only the TABLE below varies (spec §4). */}
-        {!loading && !error && (showBlockNav || currentHasMoreBlocks || selectedBlockStream.length > 0) && (
+        {!loading && !error && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
           <>
             <h3 className="m-sec sec-ms sec-5h">
               <svg className="icon" aria-hidden="true">
@@ -1038,21 +1130,20 @@ function ClaudeCurrentWeekModal({
                 singleId={singleId}
                 accentClass="accent-purple"
               />
+            ) : currentHasBlocks ? (
+              <CurrentBlockNavHeader
+                blockCount={currentBlockCount}
+                block={currentBlockPreview}
+                onStep={stepBlock}
+                ctx={ctx}
+                singleId={singleId}
+                accentClass="accent-purple"
+              />
             ) : (
               <div className="mcw-mshead">
                 <span className="m-pill accent-purple" id={singleId('mcw-5h-count')}>
                   {fhMs.length} crossed
                 </span>
-                {currentHasMoreBlocks && (
-                  <button
-                    type="button"
-                    className="m-pill accent-purple mcw-blocknav-btn"
-                    aria-label="Older block"
-                    onClick={() => stepBlock(-1)}
-                  >
-                    ‹ blocks
-                  </button>
-                )}
               </div>
             )}
             {selectedBlockStream.length === 0 ? (

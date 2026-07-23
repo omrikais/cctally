@@ -207,7 +207,7 @@ describe('current-week herobar stays envelope-driven (P1-A)', () => {
       42.7, 3,
     ));
     render(<CurrentWeekModal />);
-    fireEvent.click(await screen.findByText(/‹ blocks/));
+    fireEvent.click(screen.getByLabelText('Older block'));
     // One action both hydrates the cycle detail and applies the requested
     // direction from the active/default last block.
     await screen.findByText(/Block 1 of 2/);
@@ -217,13 +217,42 @@ describe('current-week herobar stays envelope-driven (P1-A)', () => {
   });
 });
 
+describe('current-period block navigator is immediately complete', () => {
+  it('shows the active Claude block position and both boundary controls before fetching detail', () => {
+    const spy = mockFetch({});
+    const env = makeEnv([
+      idxEntry('milestone_cycle:current', {
+        is_current: true,
+        segment_count: 1,
+        block_count: 2,
+      }),
+      INDEX[1],
+    ]);
+    env.current_week!.five_hour_block = {
+      block_start_at: '2026-05-16T05:00:00Z',
+      five_hour_window_key: 901,
+      seven_day_pct_at_block_start: 19,
+      seven_day_pct_delta_pp: 1,
+      crossed_seven_day_reset: false,
+      credits: [],
+    };
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    expect(screen.getByText('Block 2 of 2')).toBeTruthy();
+    expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
 // P1 (spec §4) — the 5h block navigator (heading + BlockNavHeader) must stay
 // mounted whenever the selected week's effective block list has ≥1 block; only
 // the milestone TABLE varies. A selected block whose stream is empty (e.g. a
 // cross-reset straddler with no integer-percent crossing) renders a compact
 // empty-state line in place of the table, and the ⚡ position marker stays
 // visible. Previously the outer guard gated the whole section on
-// `selectedBlockStream.length > 0 || currentHasMoreBlocks`, which unmounted the
+// `selectedBlockStream.length > 0 || currentHasBlocks`, which unmounted the
 // navigator on empty-stream blocks (trapping mouse users) and dropped the
 // section entirely on a historic week whose only block had no milestones.
 describe('empty-stream block keeps the navigator mounted (P1)', () => {
@@ -273,9 +302,10 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
     mockFetch(payload);
     updateSnapshot(makeEnv([idxEntry('milestone_cycle:current', { is_current: true, segment_count: 1, block_count: 2 }), INDEX[1]]));
     render(<CurrentWeekModal />);
-    // First block-step lazily fetches the current week AND moves one position
-    // older from the active/default last block.
-    fireEvent.click(await screen.findByText(/‹ blocks/));
+    // The complete navigator is present from the compact current-week facts;
+    // its first older step lazily fetches detail AND moves one position from
+    // the active/default last block.
+    fireEvent.click(screen.getByLabelText('Older block'));
     await screen.findByText(/Block 1 of 2/);
     expect(document.querySelector('#mcw-5h-table')).toBeTruthy();
     expect(screen.queryByText('No integer-percent crossings in this block.')).toBeNull();
@@ -329,6 +359,9 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     openCodex();
     updateSnapshot(codexEnvWithIndex(CODEX_IDX));
     render(<CurrentWeekModal />);
+    expect(screen.getByText('Block 3 of 3')).toBeTruthy();
+    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByLabelText('Older block'));
     await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/milestone_cycle%3Acodex-current'));
     await screen.findByText(/Block 2 of 3/);

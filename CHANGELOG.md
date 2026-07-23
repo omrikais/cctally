@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.79.2] - 2026-07-23
+
+### Fixed
+- The dashboard's current-period five-hour milestone section now shows the complete block position and both navigation controls immediately, matching historic periods while keeping older block details lazy-loaded. Claude receives the fix now, and Codex uses the same behavior whenever native 300-minute blocks are retained.
+
 ## [1.79.1] - 2026-07-22
 
 ### Fixed
