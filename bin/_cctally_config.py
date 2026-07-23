@@ -1050,8 +1050,11 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         except _BudgetConfigError as exc:
             eprint(f"cctally config: {exc}")
             return 2
-        # Deliberately outside the config lock: this helper opens and locks DBs.
-        c._reconcile_codex_budget_on_config_write({"codex": configured})
+        # Deliberately outside the config lock. 6f writer reroute: routed THROUGH
+        # the ingest cycle (opportunistic + exception-wrapped) so the latched
+        # Codex crossings are journaled and rebuild-replayable.
+        import _cctally_journal as _jr
+        _jr.reconcile_budget_config({"codex": configured}, axes={"codex_budget"})
         leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
         value = configured[leaf]
         if getattr(args, "emit_json", False):
@@ -1765,21 +1768,32 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         # forward-only-from-set reconcile prevents (`budget set --period` already
         # reconciles via the same helper). Both run OUTSIDE config_writer_lock
         # (each helper has its own open_db lock).
+        # 6f writer reroute: the conditional per-leaf axis mapping is UNCHANGED,
+        # but the reconciles now run THROUGH the ingest cycle (opportunistic +
+        # exception-wrapped) so their latched crossings are journaled and
+        # rebuild-replayable. A leaf that feeds two axes (`alert_thresholds`
+        # feeds both budget + project_budget) reconciles both in ONE cycle via
+        # the axes union. `touched_projects=None` = reconcile every configured
+        # project (a `config set` write is wholesale, not project-scoped).
+        _reconcile_axes: set = set()
         if inner_key in (
             "weekly_usd", "alerts_enabled", "alert_thresholds", "period"
         ):
-            c._reconcile_budget_on_config_write(validated)
+            _reconcile_axes.add("budget")
         if inner_key in (
             "projects", "project_alerts_enabled", "alert_thresholds"
         ):
-            c._reconcile_project_budget_milestones_on_write(validated)
+            _reconcile_axes.add("project_budget")
         # Codex budget axis (spec §6): the nested budget.codex block is set
         # wholesale via `config set budget.codex '<json>'`, so the only key that
         # touches it is `codex` itself. Gated on the codex block carrying
         # alerts_enabled + thresholds (the helper re-checks); records nothing
         # otherwise.
         if inner_key == "codex":
-            c._reconcile_codex_budget_on_config_write(validated)
+            _reconcile_axes.add("codex_budget")
+        if _reconcile_axes:
+            import _cctally_journal as _jr
+            _jr.reconcile_budget_config(validated, axes=_reconcile_axes)
         out_val = validated[inner_key]
         if getattr(args, "emit_json", False):
             print(json.dumps({"budget": {inner_key: out_val}}, indent=2))
@@ -1843,8 +1857,11 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
             return 2
         # An optional leaf leaves a configured block, even when it already
         # held its default; the forward-only state must be reconciled once.
+        # 6f writer reroute: routed THROUGH the ingest cycle (opportunistic +
+        # exception-wrapped) so the latched Codex crossings are journaled.
         assert configured is not None
-        c._reconcile_codex_budget_on_config_write({"codex": configured})
+        import _cctally_journal as _jr
+        _jr.reconcile_budget_config({"codex": configured}, axes={"codex_budget"})
         return 0
     if key == "display.tz":
         with config_writer_lock():

@@ -1112,7 +1112,19 @@ def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
         five_hour_resets_at=None if plan.five_hour is None else plan.five_hour.raw_resets_at,
         source="statusline",
     )
-    if _cctally().cmd_record_usage(args) != 0:
+    # 6f mode wiring (P2 exit-code fix): the statusline persist fork's publish
+    # step ingests OPPORTUNISTICALLY. A render tick must NEVER crash on a
+    # derivation error — the opportunistic path swallows a cycle exception
+    # (loud log only) instead of propagating, whereas the authoritative default
+    # would re-raise out of this unwrapped persist fork. In the uncontended
+    # common case opportunistic still consumes the just-appended obs
+    # synchronously (the ingest lock is free), so `after` reflects the write
+    # exactly as before; only under a concurrent-ingester storm does it skip and
+    # let the winner consume the line (the next tick then observes it). The
+    # statusline's AUTHORITATIVE publication step (`_authoritative_record_usage`)
+    # keeps the default authoritative mode — it is already try/except-wrapped to
+    # "record_failed".
+    if _cctally().cmd_record_usage(args, ingest_mode="opportunistic") != 0:
         return decision
     after = _read_db_projection_stable()
     if _projection_changed(projection, after):

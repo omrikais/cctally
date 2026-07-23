@@ -1907,16 +1907,30 @@ def cmd_budget(args: argparse.Namespace) -> int:
             or getattr(args, "format", None)
         )
         if interactive_status and codex_cfg.get("alerts_enabled"):
-            c.maybe_record_codex_budget_milestone({})
-            # #135: the opportunistic Codex PROJECTED-pace backstop, scoped to
-            # the codex_budget_usd metric so it never pops a weekly_pct / Claude
-            # budget_usd notification from a bare `cctally budget`. The projected
-            # leg self-syncs (skip_sync=False); since codex_inputs was just
-            # built above, that delta-sync is a no-op here — correct and cheap.
-            if codex_cfg.get("projected_enabled"):
-                c.maybe_record_projected_alert(
-                    {}, only_metrics={"codex_budget_usd"}
-                )
+            # Task 7 Item 4: the interactive on-demand Codex budget (+ #135
+            # projected) backstop routes through the single-flight ingest cycle
+            # (the `codex_apply` seam) instead of opening its own stats
+            # connection — so its `budget_milestones`/`projected_milestones`
+            # (vendor=codex) crossings are journaled by the harvest and their
+            # alerts dispatch post-commit (set-then-dispatch). OPPORTUNISTIC +
+            # cycle-swallowed, preserving "never raises into the status render".
+            # The passed-conn helpers re-raise on error (invariant ii), which the
+            # opportunistic cycle catches. The #135 projected leg stays scoped to
+            # the codex_budget_usd metric so a bare `cctally budget` never pops a
+            # weekly_pct / Claude budget_usd notification.
+            import _cctally_journal as _jr_codex
+            projected_on = codex_cfg.get("projected_enabled")
+
+            def _codex_backstop_leg(ictx):
+                c.maybe_record_codex_budget_milestone(
+                    {}, conn=ictx.conn, alert_sink=ictx.pending_alerts)
+                if projected_on:
+                    c.maybe_record_projected_alert(
+                        {}, only_metrics={"codex_budget_usd"},
+                        conn=ictx.conn, alert_sink=ictx.pending_alerts)
+
+            _jr_codex.run_stats_ingest(
+                mode="opportunistic", codex_apply=_codex_backstop_leg)
 
     if target is None:
         # Global Claude budget unset → friendly message, then (if configured)
@@ -2119,9 +2133,12 @@ def _cmd_budget_set_project(args: argparse.Namespace) -> int:
     # budget mid-week (already over) doesn't storm. Scoped to the TOUCHED
     # project so it never latches a sibling's already-crossed-but-not-yet-
     # dispatched threshold (which would permanently suppress that alert).
-    c._reconcile_project_budget_milestones_on_write(
-        validated, touched_projects={root}
-    )
+    # 6f writer reroute: routed THROUGH the ingest cycle (opportunistic +
+    # exception-wrapped) so the latched crossings are journaled (rebuild-
+    # replayable) instead of written on a bespoke stats.db connection.
+    import _cctally_journal as _jr
+    _jr.reconcile_budget_config(
+        validated, axes={"project_budget"}, touched_projects={root})
 
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):
@@ -2179,9 +2196,11 @@ def _cmd_budget_unset_project(args: argparse.Namespace) -> int:
     # the map, so this is a no-op for `root` — and it must NOT scan the
     # remaining projects: scanning them would latch a sibling's already-crossed-
     # but-not-yet-dispatched threshold, permanently suppressing its real alert.
-    c._reconcile_project_budget_milestones_on_write(
-        validated, touched_projects={root}
-    )
+    # 6f writer reroute: routed THROUGH the ingest cycle (opportunistic +
+    # exception-wrapped) so the latched crossings are journaled.
+    import _cctally_journal as _jr
+    _jr.reconcile_budget_config(
+        validated, axes={"project_budget"}, touched_projects={root})
 
     basename = os.path.basename(root) or root
     if getattr(args, "json", False):
@@ -2258,7 +2277,10 @@ def _cmd_budget_set(args: argparse.Namespace, period=None) -> int:
     # Shared with `config set budget.*` + dashboard POST /api/settings via
     # _reconcile_budget_on_config_write (gated on _budget_alerts_active — a
     # budget with alerts off or no thresholds records nothing).
-    c._reconcile_budget_on_config_write(validated)
+    # 6f writer reroute: routed THROUGH the ingest cycle (opportunistic +
+    # exception-wrapped) so the latched crossings are journaled.
+    import _cctally_journal as _jr
+    _jr.reconcile_budget_config(validated, axes={"budget"})
     if getattr(args, "json", False):
         print(json.dumps({
             "schemaVersion": _BUDGET_JSON_SCHEMA_VERSION,
@@ -2363,7 +2385,10 @@ def _cmd_budget_set_codex(args: argparse.Namespace, period=None) -> int:
     # Runs OUTSIDE the config_writer_lock (open_db has its own locking). Gated on
     # codex alerts_enabled + thresholds — a Codex budget with alerts off records
     # nothing.
-    c._reconcile_codex_budget_on_config_write(validated)
+    # 6f writer reroute: routed THROUGH the ingest cycle (opportunistic +
+    # exception-wrapped) so the latched crossings are journaled.
+    import _cctally_journal as _jr
+    _jr.reconcile_budget_config(validated, axes={"codex_budget"})
 
     codex = validated["codex"]
     amount_usd = codex["amount_usd"]

@@ -50,6 +50,19 @@ def ns(monkeypatch, tmp_path):
 # ── helpers ────────────────────────────────────────────────────────────
 
 
+def _stamp_journal_id(conn, table: str, rowid: int) -> None:
+    """Stamp the cutover-scheme ``journal_id = 'b:<table>:<rowid>'`` on a
+    directly-seeded row so it mirrors post-cutover reality (spec §8: no NULL
+    ``journal_id`` survives cutover). Without it, the ingest cycle's harvest
+    reverse-refs a milestone FK to a NULL-``journal_id`` snapshot/reset and
+    raises ``JournalError`` (a harvest-order violation the loud production
+    failure is correct about — the fixture, not the code, is wrong)."""
+    conn.execute(
+        f"UPDATE {table} SET journal_id = ? WHERE id = ?",
+        (f"b:{table}:{rowid}", rowid),
+    )
+
+
 def _record_usage_args(
     *,
     percent: float,
@@ -91,7 +104,9 @@ def _seed_usage_snapshot(
         (captured_at_utc, week_start_date, week_end_date,
          week_start_at, week_end_at, weekly_percent, "test", "{}"),
     )
-    return int(cur.lastrowid)
+    rowid = int(cur.lastrowid)
+    _stamp_journal_id(conn, "weekly_usage_snapshots", rowid)
+    return rowid
 
 
 def _seed_reset_event(
@@ -111,8 +126,10 @@ def _seed_reset_event(
         " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
         (detected_at_utc, old_week_end_at, new_week_end_at, effective),
     )
+    rowid = int(cur.lastrowid)
+    _stamp_journal_id(conn, "week_reset_events", rowid)
     conn.commit()
-    return int(cur.lastrowid)
+    return rowid
 
 
 def _epoch(iso: str) -> int:
@@ -1112,7 +1129,9 @@ def _seed_cost_snapshot(
         (captured_at_utc, week_start_date, week_end_date,
          week_start_at, week_end_at, cost_usd, "auto"),
     )
-    return int(cur.lastrowid)
+    rowid = int(cur.lastrowid)
+    _stamp_journal_id(conn, "weekly_cost_snapshots", rowid)
+    return rowid
 
 
 def test_milestone_segment_zero_when_no_event(ns):
@@ -1656,7 +1675,7 @@ def test_self_heal_probe_scoped_to_active_segment(ns, monkeypatch):
     try:
         # Pre-credit milestones up to threshold 67.
         for pct in (1, 2, 67):
-            conn.execute(
+            mcur = conn.execute(
                 "INSERT INTO percent_milestones "
                 "(captured_at_utc, week_start_date, week_end_date, "
                 " week_start_at, week_end_at, percent_threshold, "
@@ -1666,6 +1685,10 @@ def test_self_heal_probe_scoped_to_active_segment(ns, monkeypatch):
                 ("2026-05-12T10:00:00Z", week_start_date, week_end_date,
                  week_start_at, end_iso, pct, 10.0 * pct, None, pct, pct, 0),
             )
+            # Stamp so the harvest skips these pre-seeded rows (their fabricated
+            # usage/cost FKs point at non-existent rows and would be an
+            # unresolvable reverse-ref if scanned as this-cycle inserts).
+            _stamp_journal_id(conn, "percent_milestones", int(mcur.lastrowid))
         _seed_reset_event(
             conn,
             new_week_end_at=end_iso,

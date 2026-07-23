@@ -45,6 +45,9 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 29 / 29 known
   ✓ 027_codex_fork_preamble_rebuild                applied <REDACTED>
   ✓ 028_split_conversation_store                   applied <REDACTED>
   ✓ 029_test_cache_migration                       applied <REDACTED>
+
+conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 1 known
+  · 001_adopt_schema_version_marker                pending
 ## stderr
 
 ## exit

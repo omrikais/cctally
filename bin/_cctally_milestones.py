@@ -22,6 +22,7 @@ import sys
 from dataclasses import dataclass
 
 from _cctally_core import (
+    _as_of_or_command,
     _budget_alerts_active,
     _canonicalize_optional_iso,
     _command_as_of,
@@ -126,11 +127,56 @@ def insert_cost_snapshot(
     cost_usd: float,
     mode: str,
     project: str | None,
+    *,
+    commit: bool = True,
+    as_of: "str | None" = None,
+    journal: "tuple | None" = None,
 ) -> int:
+    """Insert a ``weekly_cost_snapshots`` row and return its rowid.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``commit=False`` skips the inner ``conn.commit()`` so the ingester can bundle
+    this insert into its single cycle transaction; ``as_of`` (ISO-Z) overrides
+    the ``captured_at_utc`` wall-clock stamp with the record's capture time.
+    Both defaults keep legacy callers bit-identical.
+
+    Design A (DB journal redesign §5.3, Model-A ``weekly_cost_snapshot``):
+    ``journal=(ctx, id_base)`` routes the insert THROUGH ``emit_model_a`` — the
+    computed cost rides in the journaled ``columns`` so replay reads it back
+    verbatim and NEVER recomputes from provider JSONL (which Claude Code prunes).
+    ``id_base`` is the triggering record's logical id (the obs line id on the
+    record-usage path, the op line id on the sync-week op path); the evt id is
+    ``wcs:<id_base>:<week_start_date>``. Default ``None`` is today's bare insert
+    and must never append an evt. Returns the target rowid (fresh or converged
+    crash-replay) exactly as the direct path returns ``lastrowid``.
+    """
     start_at = _canonicalize_optional_iso(week_start_at, "weekStartAt")
     end_at = _canonicalize_optional_iso(week_end_at, "weekEndAt")
     range_start = parse_iso_datetime(range_start_iso, "rangeStartIso").isoformat(timespec="seconds")
     range_end = parse_iso_datetime(range_end_iso, "rangeEndIso").isoformat(timespec="seconds")
+    captured = as_of or now_utc_iso()
+    if journal is not None:
+        ctx, id_base = journal
+        import _cctally_journal
+        return _cctally_journal.emit_model_a(
+            ctx,
+            kind="weekly_cost_snapshot",
+            evt_id=f"wcs:{id_base}:{week_start.isoformat()}",
+            table="weekly_cost_snapshots",
+            columns={
+                "captured_at_utc": captured,
+                "week_start_date": week_start.isoformat(),
+                "week_end_date": week_end.isoformat(),
+                "week_start_at": start_at,
+                "week_end_at": end_at,
+                "range_start_iso": range_start,
+                "range_end_iso": range_end,
+                "cost_usd": cost_usd,
+                "mode": mode,
+                "project": project,
+            },
+            at=captured,
+        )
     cur = conn.execute(
         """
         INSERT INTO weekly_cost_snapshots
@@ -149,7 +195,7 @@ def insert_cost_snapshot(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            now_utc_iso(),
+            captured,
             week_start.isoformat(),
             week_end.isoformat(),
             start_at,
@@ -161,7 +207,8 @@ def insert_cost_snapshot(
             project,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)
 
 
@@ -257,8 +304,13 @@ def insert_percent_milestone(
     *,
     commit: bool = True,
     reset_event_id: int = 0,
+    as_of: "str | None" = None,
 ) -> int:
     """Insert a percent_milestones row idempotently.
+
+    ``as_of`` (DB journal redesign §5.2.3): overrides the ``captured_at_utc``
+    wall-clock stamp with the record's capture time when the ingester drives
+    this at fold time; ``None`` keeps the legacy ``now_utc_iso()`` behavior.
 
     Returns the SQLite rowcount: 1 on a genuinely new crossing, 0 if a row
     for (week_start_date, percent_threshold, reset_event_id) already exists.
@@ -309,7 +361,7 @@ def insert_percent_milestone(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            now_utc_iso(),
+            as_of or now_utc_iso(),
             week_start_date,
             week_end_date,
             week_start_at,
@@ -339,6 +391,7 @@ def insert_budget_milestone(
     spent_usd: float,
     consumption_pct: float,
     commit: bool = True,
+    as_of: "str | None" = None,
 ) -> int:
     """INSERT OR IGNORE a budget threshold crossing into the unified vendor-tagged
     table (#143). Returns ``cur.rowcount`` (1 = genuinely new crossing, 0 =
@@ -374,7 +427,7 @@ def insert_budget_milestone(
             float(budget_usd),
             float(spent_usd),
             float(consumption_pct),
-            now_utc_iso(),
+            as_of or now_utc_iso(),
         ),
     )
     if commit:
@@ -392,6 +445,7 @@ def insert_project_budget_milestone(
     spent_usd: float,
     consumption_pct: float,
     commit: bool = True,
+    as_of: "str | None" = None,
 ) -> int:
     """INSERT OR IGNORE a per-project budget threshold crossing. Returns
     ``cur.rowcount`` (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a
@@ -420,7 +474,7 @@ def insert_project_budget_milestone(
             float(budget_usd),
             float(spent_usd),
             float(consumption_pct),
-            now_utc_iso(),
+            as_of or now_utc_iso(),
         ),
     )
     if commit:
@@ -438,6 +492,7 @@ def insert_projected_milestone(
     projected_value: float,
     denominator: float,
     commit: bool = True,
+    as_of: "str | None" = None,
 ) -> int:
     """INSERT OR IGNORE a projected-pace crossing. Returns ``cur.rowcount``
     (1 = genuinely new crossing, 0 = INSERT OR IGNORE no-op on a pre-existing
@@ -466,7 +521,7 @@ def insert_projected_milestone(
             int(threshold),
             float(projected_value),
             float(denominator),
-            now_utc_iso(),
+            as_of or now_utc_iso(),
         ),
     )
     if commit:
@@ -562,6 +617,7 @@ def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc) -> float:
 
 def _reconcile_budget_milestones_on_set(
     conn, *, vendor, target, thresholds, now_utc, period, config=None, tz=None,
+    as_of=None, commit=True,
 ):
     """Forward-only-from-set reconcile for the budget axis (both vendors, #143):
     on `budget set`, every threshold ALREADY crossed for the current
@@ -605,6 +661,7 @@ def _reconcile_budget_milestones_on_set(
                 spent_usd=spent,
                 consumption_pct=consumption_pct,
                 commit=False,
+                as_of=as_of,
             )
             # alerted_at UPDATE keys on the CONCRETE (vendor, period) (not the
             # wildcard): only the row we just inserted is stamped, never a
@@ -613,9 +670,10 @@ def _reconcile_budget_milestones_on_set(
                 "UPDATE budget_milestones SET alerted_at = ? "
                 "WHERE vendor = ? AND period_start_at = ? AND period = ? "
                 "  AND threshold = ? AND alerted_at IS NULL",
-                (now_utc_iso(), vendor, period_key, period, t),
+                (as_of or now_utc_iso(), vendor, period_key, period, t),
             )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _resolve_codex_budget_period_window(period, now_utc, config, tz):
@@ -631,7 +689,8 @@ def _resolve_codex_budget_period_window(period, now_utc, config, tz):
 
 
 def _budget_crossings(
-    conn, *, vendor, period_key, period=None, thresholds, target, spent, now_utc
+    conn, *, vendor, period_key, period=None, thresholds, target, spent, now_utc,
+    as_of=None,
 ):
     """Shared INSERT-and-arm core for the budget axis (both vendors, #143): for
     every STILL-pending threshold that's been crossed at ``spent``, ``INSERT OR
@@ -667,9 +726,10 @@ def _budget_crossings(
                 spent_usd=spent,
                 consumption_pct=consumption_pct,
                 commit=False,
+                as_of=as_of,
             )
             if inserted == 1:
-                crossed_at = now_utc_iso()
+                crossed_at = as_of or now_utc_iso()
                 # alerted_at UPDATE keys on the CONCRETE (vendor, period) (#137 /
                 # #143): only the row just inserted is stamped, never a pre-011
                 # NULL-period sibling or another vendor's row.
@@ -683,13 +743,18 @@ def _budget_crossings(
     return fired
 
 
-def _reconcile_codex_budget_on_config_write(validated_budget):
+def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_of=None):
     """Forward-only reconcile shared by the Codex-budget config write paths
     (`budget set --vendor codex`, `config set budget.codex`). Gated +
     best-effort: a Codex budget with alerts off or no thresholds records
     nothing; a stats.db failure never fails the write. Runs OUTSIDE any
     config_writer_lock (open_db has its own locking). Mirrors
-    :func:`_reconcile_budget_on_config_write`."""
+    :func:`_reconcile_budget_on_config_write`.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``conn`` runs the reconcile on the caller's connection (no internal
+    open/commit/close); ``as_of`` (ISO-Z) injects the capture time. Both
+    defaults keep the legacy own-connection, wall-clock behavior."""
     codex = (validated_budget or {}).get("codex")
     if not codex:
         return
@@ -697,57 +762,72 @@ def _reconcile_codex_budget_on_config_write(validated_budget):
     if not (codex.get("alerts_enabled") and codex.get("amount_usd") and thresholds):
         return
     c = _cctally()
+    own_conn = conn is None
     try:
         import argparse
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
-        conn = open_db()
+        if own_conn:
+            conn = open_db()
         try:
             _reconcile_budget_milestones_on_set(
                 conn,
                 vendor="codex",
                 target=codex["amount_usd"],
                 thresholds=thresholds,
-                now_utc=_command_as_of(),
+                now_utc=_as_of_or_command(as_of),
                 period=codex["period"],
                 config=config,
                 tz=tz,
+                as_of=as_of,
+                commit=own_conn,
             )
         finally:
-            conn.close()
+            if own_conn:
+                conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(f"[codex-budget-milestone] reconcile on set failed: {exc}")
 
 
-def _reconcile_budget_on_config_write(validated_budget):
+def _reconcile_budget_on_config_write(validated_budget, *, conn=None, as_of=None):
     """Forward-only reconcile shared by all three budget-config write
     paths (`budget set`, `config set budget.*`, dashboard POST
     /api/settings). Gated + best-effort: a budget with alerts off or no
     thresholds records nothing; a stats.db failure never fails the write.
-    Runs OUTSIDE any config_writer_lock (open_db has its own locking)."""
+    Runs OUTSIDE any config_writer_lock (open_db has its own locking).
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``conn`` runs the reconcile on the caller's connection (no internal
+    open/commit/close); ``as_of`` (ISO-Z) injects the capture time. Both
+    defaults keep the legacy own-connection, wall-clock behavior."""
     thresholds = validated_budget.get("alert_thresholds") or []
     if not (_budget_alerts_active(validated_budget) and thresholds):
         return
     c = _cctally()
     period = validated_budget.get("period", "subscription-week")
+    own_conn = conn is None
     try:
         import argparse
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
-        conn = open_db()
+        if own_conn:
+            conn = open_db()
         try:
             _reconcile_budget_milestones_on_set(
                 conn,
                 vendor="claude",
                 target=validated_budget["weekly_usd"],
                 thresholds=thresholds,
-                now_utc=_command_as_of(),
+                now_utc=_as_of_or_command(as_of),
                 period=period,
                 config=config,
                 tz=tz,
+                as_of=as_of,
+                commit=own_conn,
             )
         finally:
-            conn.close()
+            if own_conn:
+                conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
 
@@ -770,9 +850,14 @@ def _project_crossings(items, thresholds, by_proj):
 
 
 def _reconcile_project_budget_milestones_on_write(
-    validated_budget, touched_projects=None
+    validated_budget, touched_projects=None, *, conn=None, as_of=None
 ):
     """Forward-only-from-write reconcile for PER-PROJECT budgets (spec §6.8).
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``conn`` runs the reconcile on the caller's connection (no internal
+    open/commit/close); ``as_of`` (ISO-Z) injects the capture time. Both
+    defaults keep the legacy own-connection, wall-clock behavior.
 
     Shared by all four per-project write surfaces: ``budget set --project`` /
     ``unset --project`` (call sites in ``_cmd_budget_set_project`` /
@@ -818,10 +903,12 @@ def _reconcile_project_budget_milestones_on_write(
     ):
         return
     c = _cctally()
+    own_conn = conn is None
     try:
-        conn = open_db()
+        if own_conn:
+            conn = open_db()
         try:
-            now_utc = _command_as_of()
+            now_utc = _as_of_or_command(as_of)
             window = c._resolve_current_budget_window(conn, now_utc)
             if window is None:
                 return
@@ -852,16 +939,19 @@ def _reconcile_project_budget_milestones_on_write(
                     spent_usd=spent,
                     consumption_pct=consumption_pct,
                     commit=False,
+                    as_of=as_of,
                 )
                 conn.execute(
                     "UPDATE project_budget_milestones SET alerted_at = ? "
                     "WHERE week_start_at = ? AND project_key = ? "
                     "  AND threshold = ? AND alerted_at IS NULL",
-                    (now_utc_iso(), week_key, project_key, t),
+                    (as_of or now_utc_iso(), week_key, project_key, t),
                 )
-            conn.commit()
+            if own_conn:
+                conn.commit()
         finally:
-            conn.close()
+            if own_conn:
+                conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(
             f"[project-budget-milestone] reconcile on write failed: {exc}"

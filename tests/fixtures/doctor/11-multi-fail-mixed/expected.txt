@@ -35,6 +35,11 @@ Database
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
   ✓ Reclaimable transcript space below threshold
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+  ✓ Journal integrity        no journal
+  ✓ Journal index            no cursor yet
+  ✓ Auto-heal                no auto-heal incidents
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
@@ -59,4 +64,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 29 OK · 8 WARN · 3 FAIL
+Summary: 33 OK · 8 WARN · 3 FAIL

@@ -622,8 +622,18 @@ def _arming_row(conn: sqlite3.Connection, identity: QuotaWindowIdentity) -> sqli
 
 def _activate_quota_rule(
     conn: sqlite3.Connection, identity: QuotaWindowIdentity, fingerprint: str, now_iso: str,
+    *, journal_emit=None,
 ) -> tuple[bool, dt.datetime]:
-    """Persist one identity's resolved rule boundary, returning (changed, at)."""
+    """Persist one identity's resolved rule boundary, returning (changed, at).
+
+    Task 7 Item 5: on a genuine activation (a new/changed boundary) the arming
+    state is journaled — its ``activated_at_utc`` is a forward-only alert
+    boundary that must survive a stats.db rebuild so the reconcile honors it
+    (no historical re-fires, spec §5.3 "state"). ``journal_emit`` (set only on
+    the LIVE ingest-cycle path; ``None`` for a rebuild re-materialization, which
+    must not append) appends the ``quota_alert_arming`` evt. The row is still
+    written directly here; the evt is the additional durable record, and its
+    fold applier's natural-key upsert converges with this write on replay."""
     row = _arming_row(conn, identity)
     if row is not None and row["rule_fingerprint"] == fingerprint:
         return False, _parse_utc(str(row["activated_at_utc"]), "activated_at_utc")
@@ -641,6 +651,8 @@ def _activate_quota_rule(
             identity.observed_slot, identity.window_minutes, fingerprint, now_iso,
         ),
     )
+    if journal_emit is not None:
+        journal_emit(identity, fingerprint, now_iso)
     return True, _parse_utc(now_iso, "activated_at_utc")
 
 
@@ -705,7 +717,7 @@ def _quota_alert_payload(
 def _evaluate_quota_alerts(
     conn: sqlite3.Connection,
     *, observations: tuple[QuotaObservation, ...], alert_eligible_roots: set[str],
-    now: dt.datetime, now_iso: str,
+    now: dt.datetime, now_iso: str, journal_emit=None,
 ) -> list[dict]:
     """Arm or claim quota alerts within the caller's stats transaction.
 
@@ -742,7 +754,8 @@ def _evaluate_quota_alerts(
             identity, resolved, global_enabled=global_enabled,
             quota_enabled=quota_enabled,
         )
-        changed, activated_at = _activate_quota_rule(conn, identity, fingerprint, now_iso)
+        changed, activated_at = _activate_quota_rule(
+            conn, identity, fingerprint, now_iso, journal_emit=journal_emit)
 
         # Future evidence is never a threshold qualifier (including a first
         # activation backfill). A later well-clocked observation creates the
@@ -812,6 +825,112 @@ def _evaluate_quota_alerts(
     return queued
 
 
+def _apply_quota_projection_rows(
+    conn, *, observations, active_roots, now, now_iso,
+    sink, alert_eligible_roots, journal_emit=None, holder=None,
+):
+    """Transaction-neutral quota projection apply (spec §5.3 "projection").
+
+    Materializes the interpreted ``quota_*`` rows on ``conn`` (no ``BEGIN`` /
+    ``commit`` — the caller owns the transaction), queues alerts into ``sink``
+    (``None`` → none), and journals arming state changes via ``journal_emit``
+    (``None`` → none). ONE shared body drives both the live ingest ``codex_apply``
+    leg (``sink`` = the cycle's pending-alerts, ``journal_emit`` = the arming evt
+    emitter) AND the rebuild re-materialization pass (``sink=None``,
+    ``journal_emit=None``, ``alert_eligible_roots`` empty) so the two never drift.
+    ``holder`` (optional) captures the certificate signatures + result for the
+    live caller; rebuild passes ``None``."""
+    historic_roots = _historic_root_keys(conn)
+    roots_to_reconcile = active_roots | historic_roots
+    if not roots_to_reconcile:
+        return
+    generation = secrets.token_hex(16)
+    blocks = build_blocks(observations)
+    for block in blocks:
+        conn.execute(_BLOCK_UPSERT, _block_params(block, generation))
+        for milestone in percent_milestones(block):
+            conn.execute(
+                _MILESTONE_UPSERT,
+                _milestone_params(block, milestone, generation),
+            )
+    blocks_orphaned, milestones_orphaned = _orphan_unseen(
+        conn, roots_to_reconcile, generation, now_iso,
+    )
+    queued = _evaluate_quota_alerts(
+        conn, observations=observations,
+        alert_eligible_roots=alert_eligible_roots & active_roots,
+        now=now, now_iso=now_iso, journal_emit=journal_emit,
+    )
+    # The completion stamp is intentionally the final DML in the stats
+    # transaction.  A pre-commit failure rolls all projection updates back;
+    # a retry sees the prior complete generation or rederives it.
+    for root_key in sorted(active_roots):
+        conn.execute(
+            """INSERT INTO quota_projection_state
+               (source_root_key, generation, physical_signature, completed_at_utc)
+               VALUES (?,?,?,?)
+               ON CONFLICT(source_root_key) DO UPDATE SET
+                 generation=excluded.generation,
+                 physical_signature=excluded.physical_signature,
+                 completed_at_utc=excluded.completed_at_utc""",
+            (root_key, generation, _signature(observations, root_key), now_iso),
+        )
+    if sink is not None:
+        # Set-then-dispatch: all claims committed with the cycle before the
+        # cycle's post-commit ALERT_DISPATCHER fires them (spec §5.2 step 6).
+        sink.extend(queued)
+    if holder is not None:
+        holder["signatures"] = {
+            root_key: _signature(observations, root_key) for root_key in active_roots
+        }
+        holder["result"] = QuotaProjectionResult(
+            generation=generation,
+            blocks_upserted=len(blocks),
+            milestones_upserted=sum(len(percent_milestones(b)) for b in blocks),
+            blocks_orphaned=blocks_orphaned,
+            milestones_orphaned=milestones_orphaned,
+            roots_stamped=len(active_roots),
+            alerts_dispatched=len(queued),
+        )
+
+
+def rematerialize_quota_projection_for_rebuild(stats_conn, *, now=None) -> None:
+    """Rebuild path (spec §5.4 / §5.3 "projection"): re-run the Codex quota
+    projection over the materialized cache.db ``quota_window_snapshots`` directly
+    onto the fresh rebuilt ``stats_conn``, side-effect-free.
+
+    Called by ``rebuild_stats_index`` AFTER the ``quota_alert_arming`` evts have
+    folded (order 45), so ``_evaluate_quota_alerts`` honors the replayed
+    activation boundary and re-fires nothing. NO alerts (``sink=None``), NO arming
+    journaling (``journal_emit=None``), NO alert-eligible roots. Opens no stats
+    connection of its own — writes on the caller's rebuild transaction. Uses the
+    SAME ``active_roots`` source as the live reconcile (``_cache_root_keys`` over
+    the cache) so the materialized projection matches live. A missing cache.db is
+    a clean no-op (the journal quota obs remain the durable source; a later
+    ``cache-sync`` + reconcile re-materializes)."""
+    if now is None:
+        now = dt.datetime.now(UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now_iso = _utc_iso(now)
+    try:
+        cache = _cache_connection()
+    except (FileNotFoundError, sqlite3.Error):
+        return
+    try:
+        active_roots = _cache_root_keys(cache)
+        observations = load_codex_quota_observations(
+            source_root_keys=None, cache_conn=cache,
+        )
+    finally:
+        cache.close()
+    _apply_quota_projection_rows(
+        stats_conn, observations=observations, active_roots=active_roots,
+        now=now, now_iso=now_iso, sink=None,
+        alert_eligible_roots=frozenset(), journal_emit=None, holder=None,
+    )
+
+
 def reconcile_codex_quota_projection(
     *,
     source_root_keys: Iterable[str] | None = None,
@@ -875,81 +994,81 @@ def reconcile_codex_quota_projection(
     finally:
         cache.close()
 
-    # No configured roots and no existing interpreted history means there is no
-    # stats work.  This preserves the existing empty-Codex sync fast path.
-    stats = _cctally_core.open_db()
-    try:
-        historic_roots = _historic_root_keys(stats)
-        roots_to_reconcile = active_roots | historic_roots
-        if not roots_to_reconcile:
-            return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+    # ── Apply phase (Task 7 Item 3) ─────────────────────────────────────────
+    # The stats.db writes route through the single-flight ingest cycle instead
+    # of this function opening its own stats connection + BEGIN IMMEDIATE. The
+    # nested `_apply_projection(conn, sink)` is the transaction-neutral chokepoint
+    # (writes on `conn`, no BEGIN/commit; alerts to `sink`) — the ingest cycle's
+    # `codex_apply` seam drives it on the cycle's conn, AFTER the codex flock has
+    # released (the existing after-flock-release rule). The interpreted `quota_*`
+    # tables are mutable projections re-materialized here (spec §5.3), and each
+    # genuine arming activation journals a `quota_alert_arming` evt so the
+    # forward-only boundary survives a stats.db rebuild (Item 5).
+    holder: dict = {
+        "result": QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0),
+        "signatures": None,
+    }
 
-        generation = secrets.token_hex(16)
-        blocks = build_blocks(observations)
-        queued_alerts: list[dict] = []
-        stats.execute("BEGIN IMMEDIATE")
-        try:
-            for block in blocks:
-                stats.execute(_BLOCK_UPSERT, _block_params(block, generation))
-                for milestone in percent_milestones(block):
-                    stats.execute(
-                        _MILESTONE_UPSERT,
-                        _milestone_params(block, milestone, generation),
-                    )
-            blocks_orphaned, milestones_orphaned = _orphan_unseen(
-                stats, roots_to_reconcile, generation, now_iso,
-            )
-            queued_alerts = _evaluate_quota_alerts(
-                stats, observations=observations,
-                alert_eligible_roots=alert_eligible_roots & active_roots,
-                now=now, now_iso=now_iso,
-            )
-            # The completion stamp is intentionally the final DML in the stats
-            # transaction.  A pre-commit failure rolls all projection updates
-            # back; a retry sees the prior complete generation or rederives it.
-            for root_key in sorted(active_roots):
-                stats.execute(
-                    """INSERT INTO quota_projection_state
-                       (source_root_key, generation, physical_signature, completed_at_utc)
-                       VALUES (?,?,?,?)
-                       ON CONFLICT(source_root_key) DO UPDATE SET
-                         generation=excluded.generation,
-                         physical_signature=excluded.physical_signature,
-                         completed_at_utc=excluded.completed_at_utc""",
-                    (root_key, generation, _signature(observations, root_key), now_iso),
-                )
-            if _before_stats_commit is not None:
-                _before_stats_commit()
-            stats.commit()
-        except Exception:
-            stats.rollback()
-            raise
-    finally:
-        stats.close()
+    def _apply_projection(conn, sink, *, journal_emit=None):
+        # No configured roots and no existing interpreted history means there is
+        # no stats work.  This preserves the existing empty-Codex fast path.
+        # Delegates to the shared module-level apply so the live leg and the
+        # rebuild re-materialization pass (Task 8) never drift.
+        _apply_quota_projection_rows(
+            conn, observations=observations, active_roots=active_roots,
+            now=now, now_iso=now_iso, sink=sink,
+            alert_eligible_roots=alert_eligible_roots,
+            journal_emit=journal_emit, holder=holder,
+        )
 
-    if _after_stats_commit is not None:
-        _after_stats_commit()
-    _store_codex_quota_projection_certificate(
-        sequence=physical_sequence,
-        signatures={root_key: _signature(observations, root_key) for root_key in active_roots},
+    import _cctally_journal as _jr
+    import _lib_journal as _jl
+
+    def _codex_leg(ctx):
+        def _emit_arming(identity, fingerprint, activated_at):
+            # Item 5: journal the arming state change (`quota_alert_arming` evt).
+            eid = _jl.evt_id(
+                "qaa", identity.source, identity.source_root_key,
+                identity.logical_limit_key, identity.observed_slot,
+                identity.window_minutes,
+            )
+            _jr.append_record(_jl.make_evt(
+                kind="quota_alert_arming", id=eid, at=activated_at,
+                payload={
+                    "source": identity.source,
+                    "source_root_key": identity.source_root_key,
+                    "logical_limit_key": identity.logical_limit_key,
+                    "observed_slot": identity.observed_slot,
+                    "window_minutes": identity.window_minutes,
+                    "rule_fingerprint": fingerprint,
+                    "activated_at_utc": activated_at,
+                },
+            ))
+            ctx.events_emitted += 1
+
+        _apply_projection(ctx.conn, ctx.pending_alerts, journal_emit=_emit_arming)
+        # `_before_stats_commit` fires INSIDE the cycle txn, before COMMIT — a
+        # raise rolls the whole cycle back, so the projection updates undo
+        # together (the crash-consistency contract the callers test).
+        if _before_stats_commit is not None:
+            _before_stats_commit()
+
+    # AUTHORITATIVE: the reconcile must observe its own write + return the
+    # materialized result synchronously; the cycle dispatches the queued alerts
+    # post-commit via the ALERT_DISPATCHER, and `post_commit` runs the
+    # `_after_stats_commit` seam after the commit (before dispatch).
+    _jr.run_stats_ingest(
+        mode="authoritative", codex_apply=_codex_leg,
+        post_commit=_after_stats_commit,
     )
-    # Set-then-dispatch: all alert claims committed before this best-effort I/O.
-    # The dispatch helper never raises on notifier/FS failures; retain the
-    # defensive guard so an injected test double cannot reopen a refire path.
-    for payload in queued_alerts:
-        try:
-            _cctally()._dispatch_alert_notification(payload, mode="real")
-        except Exception:
-            pass
-    return QuotaProjectionResult(
-        generation=generation,
-        blocks_upserted=len(blocks),
-        milestones_upserted=sum(len(percent_milestones(block)) for block in blocks),
-        blocks_orphaned=blocks_orphaned,
-        milestones_orphaned=milestones_orphaned,
-        roots_stamped=len(active_roots),
-        alerts_dispatched=len(queued_alerts),
-    )
+
+    # Finalize: the cache-side certificate (self-healing no-op optimization) is
+    # stored only when the apply actually materialized a projection.
+    if holder["signatures"] is not None:
+        _store_codex_quota_projection_certificate(
+            sequence=physical_sequence, signatures=holder["signatures"],
+        )
+    return holder["result"]
 
 
 def _load_active_milestones(

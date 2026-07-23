@@ -102,6 +102,40 @@ def _add_alerted_at_columns(stats_db: Path) -> None:
         conn.commit()
 
 
+# DB journal redesign (spec §4.2): the tables an ingest fold materializes carry
+# a stable `journal_id`. A directly-seeded fixture row has none until stamped —
+# and post-cutover (spec §8) NO NULL `journal_id` survives, so the ingest
+# harvest correctly REFUSES to reverse-ref a milestone FK to a NULL-`journal_id`
+# snapshot/reset. `_stamp_journal_ids` makes each fixture mirror that
+# post-cutover reality so `cctally record-usage` against it drives a clean cycle.
+_JOURNAL_COVERED_TABLES = (
+    "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
+    "five_hour_reset_events", "five_hour_blocks", "weekly_credit_floors",
+    "percent_milestones", "five_hour_milestones", "budget_milestones",
+    "projected_milestones", "project_budget_milestones",
+)
+
+
+def _stamp_journal_ids(stats_db: Path) -> None:
+    """Stamp ``journal_id = 'b:<table>:<rowid>'`` (the cutover scheme) on every
+    seeded row in the journal-covered tables, so the fixture matches
+    post-cutover reality (spec §8). The shared ``create_stats_db`` schema
+    predates the redesign; prod's ``open_db()`` adds the column at open, so we
+    add it here first (idempotent) to have a column to stamp."""
+    with sqlite3.connect(stats_db) as conn:
+        for table in _JOURNAL_COVERED_TABLES:
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if not cols:
+                continue  # table absent in this fixture
+            if "journal_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN journal_id TEXT")
+            conn.execute(
+                f"UPDATE {table} SET journal_id = 'b:{table}:' || id "
+                "WHERE journal_id IS NULL"
+            )
+        conn.commit()
+
+
 def _seed_week_costs(stats_conn: sqlite3.Connection, *, captured_at: dt.datetime,
                      cost_usd: float) -> int:
     """Insert one weekly_cost_snapshots row; return its id."""
@@ -820,6 +854,12 @@ def main() -> int:
     for name, fn in SCENARIOS:
         fn(out)
         print(f"built: {name}", file=sys.stderr)
+    # DB journal redesign (spec §8): stamp every seeded stats.db row's
+    # journal_id so each fixture mirrors post-cutover reality — `cctally
+    # record-usage` against a fixture must drive a clean ingest cycle, whose
+    # harvest reverse-refs milestone FKs to their snapshot/reset journal_id.
+    for stats_db in sorted(out.glob("*/.local/share/cctally/stats.db")):
+        _stamp_journal_ids(stats_db)
     # Top-level .gitignore for the alerts/ tree (matches dashboard/).
     if out == DEFAULT_FIXTURES_DIR:
         toplevel = out / ".gitignore"

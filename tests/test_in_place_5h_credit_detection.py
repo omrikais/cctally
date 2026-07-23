@@ -67,6 +67,18 @@ def ns(monkeypatch, tmp_path):
 # ── helpers ────────────────────────────────────────────────────────────
 
 
+def _stamp_journal_id(conn, table: str, rowid: int) -> None:
+    """Stamp the cutover-scheme ``journal_id = 'b:<table>:<rowid>'`` on a
+    directly-seeded row so it mirrors post-cutover reality (spec §8: no NULL
+    ``journal_id`` survives cutover) and the ingest harvest never reverse-refs
+    a milestone FK to a NULL-``journal_id`` snapshot/reset (a ``JournalError``
+    harvest-order violation the production loud-failure is correct about)."""
+    conn.execute(
+        f"UPDATE {table} SET journal_id = ? WHERE id = ?",
+        (f"b:{table}:{rowid}", rowid),
+    )
+
+
 def _record_usage_args(
     *,
     percent: float,
@@ -122,7 +134,9 @@ def _seed_5h_snapshot(
          five_hour_percent, five_hour_resets_at_iso, five_hour_window_key,
          "test", "{}"),
     )
-    return int(cur.lastrowid)
+    rowid = int(cur.lastrowid)
+    _stamp_journal_id(conn, "weekly_usage_snapshots", rowid)
+    return rowid
 
 
 def _future_5h_block_window():
@@ -992,6 +1006,7 @@ def test_5h_self_heal_probe_scoped_to_active_segment(ns, tmp_path):
              8.0, now_iso, now_iso),
         )
         block_id = int(block_cur.lastrowid)
+        _stamp_journal_id(conn, "five_hour_blocks", block_id)
 
         # 2. Pre-credit segment-0 milestones 1..28 (the high MAX that
         # would mask the post-credit heal under a non-segment-aware
@@ -1009,7 +1024,7 @@ def test_5h_self_heal_probe_scoped_to_active_segment(ns, tmp_path):
             week_end_date=week_end_date,
         )
         for pct in (1, 5, 10, 28):
-            conn.execute(
+            fhm_cur = conn.execute(
                 "INSERT INTO five_hour_milestones "
                 "(block_id, five_hour_window_key, percent_threshold, "
                 " captured_at_utc, usage_snapshot_id, "
@@ -1018,6 +1033,7 @@ def test_5h_self_heal_probe_scoped_to_active_segment(ns, tmp_path):
                 (block_id, window_key, pct, "2026-05-14T09:00:00Z",
                  seed_usage_id, 1.0 * pct, 0),
             )
+            _stamp_journal_id(conn, "five_hour_milestones", int(fhm_cur.lastrowid))
 
         # 3. Five-hour reset event (segment positive id).
         ev_cur = conn.execute(
@@ -1030,7 +1046,8 @@ def test_5h_self_heal_probe_scoped_to_active_segment(ns, tmp_path):
         )
         # Implicit: ev_id > 0 (AUTOINCREMENT). Heal probe should
         # scope MAX to reset_event_id = ev_id and find no rows.
-        _ = int(ev_cur.lastrowid)
+        ev_id = int(ev_cur.lastrowid)
+        _stamp_journal_id(conn, "five_hour_reset_events", ev_id)
 
         # 4. Latest snapshot at 10% (post-credit) — but NO milestone
         # row yet in the post-credit segment. The live record-usage

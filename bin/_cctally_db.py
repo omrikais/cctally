@@ -196,6 +196,10 @@ class Migration:
 
 _STATS_MIGRATIONS: list[Migration] = []
 _CACHE_MIGRATIONS: list[Migration] = []
+# conversations.db joins the framework (DB journal redesign spec §7.2). Shared
+# list object — re-exported by ``bin/cctally`` + ``bin/_cctally_cache`` the same
+# way as ``_CACHE_MIGRATIONS`` (mutate in place, never rebind).
+_CONVERSATIONS_MIGRATIONS: list[Migration] = []
 
 
 class DowngradeDetected(Exception):
@@ -265,6 +269,15 @@ class StatsDbMaintenanceError(sqlite3.OperationalError):
         super().__init__(
             "stats.db repair is in progress; retry after the repair command exits"
         )
+
+
+class StatsEpochMismatchError(sqlite3.DatabaseError):
+    """A stats.db at a version-mismatched index epoch that CANNOT be rebuilt
+    (DB journal redesign §7.1). Raised when ``user_version`` is neither legacy
+    (<= 13) nor the current ``STATS_INDEX_EPOCH`` AND no journal is present to
+    rebuild from — a hard error with guidance, never a silent rebuild-to-empty.
+    Subclasses ``sqlite3.DatabaseError`` so graceful-degrade sites treat it as a
+    DB failure; ``main()`` maps it to a staged exit 3."""
 
 
 _SQLITE_CORRUPTION_MESSAGES = (
@@ -486,6 +499,22 @@ def cache_migration(name: str):
     return _make_migration_decorator(_CACHE_MIGRATIONS, "cache.db", name)
 
 
+def conversations_migration(name: str):
+    """Register a conversations.db migration (DB journal redesign spec §7.2).
+    Use as @conversations_migration("NNN_descriptive_name").
+
+    HANDLER CONTRACT — idempotency is MANDATORY. See ``stats_migration`` above
+    for the full statement: the dispatcher's handler-commit → marker-stamp
+    two-transaction window means a crash (or a ``MigrationGateNotMet`` deferral)
+    re-invokes the handler on its own output, so every handler must be safe to
+    re-run (probe-then-return / ``INSERT OR IGNORE`` / not-yet-migrated guards).
+    conversations.db is re-derivable from provider JSONL, so ``open_conversations_db``
+    runs the dispatcher with ``recover_version_ahead=True`` (like cache.db).
+    """
+    return _make_migration_decorator(
+        _CONVERSATIONS_MIGRATIONS, "conversations.db", name)
+
+
 # Pre-framework migration markers were stored under unprefixed names;
 # the dispatcher's bootstrap rename rewrites them to NNN_ form on the
 # first open_db() that runs the framework. Raw-sqlite3 db commands
@@ -585,6 +614,253 @@ def _would_block_prod_migration(conn: sqlite3.Connection) -> bool:
         return db_dir == _cctally_core._real_prod_data_dir().resolve()
     except OSError:
         return False
+
+
+def _would_block_prod_stats(path: pathlib.Path) -> bool:
+    """Path-based sibling of ``_would_block_prod_migration`` for the stats.db
+    classifier-gated auto-heal + ``db rebuild --db stats`` (spec §6.3, issue
+    #146): True iff a git-checkout binary would quarantine+rebuild a stats.db that
+    physically lives in the REAL prod data dir. Password-DB-resolved (HOME-faking
+    immune), suppressor-independent raw ``.git`` check. Escape:
+    ``CCTALLY_ALLOW_PROD_MIGRATION``."""
+    if _cctally_core._truthy_env("CCTALLY_ALLOW_PROD_MIGRATION"):
+        return False
+    if not (_cctally_core._repo_root() / ".git").exists():
+        return False
+    try:
+        return (
+            pathlib.Path(path).resolve().parent
+            == _cctally_core._real_prod_data_dir().resolve()
+        )
+    except OSError:
+        return False
+
+
+# Known external cloud-sync / backup daemons that hold a DB file open and are the
+# leading suspects for the region-shifting prod corruption (#336 defense 2). The
+# forensics scan flags any running process whose name matches, so the auto-heal
+# incident finally captures the culprit rather than only the damage.
+_CORRUPTION_HOLDER_HINTS = (
+    "backupd", "bird", "cloudd", "Dropbox", "GoogleDrive", "OneDrive",
+    "FileProvider", "CloudDocs", "Box", "pCloud",
+)
+
+
+def _forensics_iso(epoch_or_now) -> str:
+    if isinstance(epoch_or_now, (int, float)):
+        d = dt.datetime.fromtimestamp(epoch_or_now, dt.timezone.utc)
+    else:
+        d = epoch_or_now
+    return d.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def write_corruption_forensics(
+    db_path, *, db_label: str = "stats",
+) -> "pathlib.Path | None":
+    """Write the #336-defense-2 corruption forensics bundle FIRST — before any
+    quarantine/rebuild disturbs the evidence (spec §6.3). Captures the file family
+    sizes+mtimes, a best-effort ``PRAGMA integrity_check``, an ``lsof`` of the
+    family, and a scan of running processes for known cloud-sync/backup holders.
+    Every leg degrades to a captured error string rather than raising, so a heal
+    never fails because forensics could not fully run. Returns the bundle path (or
+    None if it could not be written). Shared by the auto-heal HEAL_HOOK and
+    ``db rebuild`` (and, later, doctor's incident leg)."""
+    db_path = pathlib.Path(db_path)
+    ts = _db_backup_timestamp()
+    try:
+        _cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    out = _cctally_core.LOG_DIR / f"{db_path.name}-corruption-forensics-{ts}.json"
+    bundle: dict = {
+        "schemaVersion": 1,
+        "capturedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+        "db": db_label,
+        "path": str(db_path),
+        "family": {},
+        "integrityCheck": None,
+        "lsof": None,
+        "holders": [],
+    }
+    for suffix in ("", "-wal", "-shm"):
+        p = pathlib.Path(str(db_path) + suffix)
+        try:
+            st = p.stat()
+            bundle["family"][p.name] = {
+                "bytes": st.st_size, "mtimeUtc": _forensics_iso(st.st_mtime),
+            }
+        except OSError:
+            bundle["family"][p.name] = None
+    try:
+        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            c.execute("PRAGMA busy_timeout=2000")
+            bundle["integrityCheck"] = [
+                r[0] for r in c.execute("PRAGMA integrity_check").fetchall()
+            ]
+        finally:
+            c.close()
+    except Exception as exc:
+        bundle["integrityCheck"] = f"error: {exc}"
+    try:
+        cp = subprocess.run(
+            ["lsof", "--", str(db_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        bundle["lsof"] = cp.stdout or cp.stderr or ""
+    except Exception as exc:
+        bundle["lsof"] = f"error: {exc}"
+    try:
+        cp = subprocess.run(
+            ["ps", "-Axo", "pid=,comm="],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in (cp.stdout or "").splitlines():
+            low = line.lower()
+            if any(h.lower() in low for h in _CORRUPTION_HOLDER_HINTS):
+                bundle["holders"].append(line.strip())
+    except Exception as exc:
+        bundle["holders"] = [f"error: {exc}"]
+    try:
+        out.write_text(json.dumps(bundle, indent=2, sort_keys=True))
+        try:
+            os.chmod(out, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        return None
+    return out
+
+
+def quarantine_db_family(db_path, *, ts: "str | None" = None) -> pathlib.Path:
+    """Move a damaged DB + its ``-wal``/``-shm`` sidecars into a single
+    timestamped incident directory under ``quarantine/`` with a manifest (spec
+    §6.3). NEVER deletes evidence — three renames under the caller's exclusion
+    locks, not pretending to be one atomic op. ``0o700`` dir / ``0o600`` files.
+    Returns the incident directory (which may be empty if nothing was present)."""
+    db_path = pathlib.Path(db_path)
+    ts = ts or _db_backup_timestamp()
+    root = _cctally_core.APP_DIR / "quarantine"
+    incident = root / f"{db_path.name}-{ts}"
+    incident.mkdir(parents=True, exist_ok=True)
+    for d in (root, incident):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    moved: list = []
+    for suffix in ("", "-wal", "-shm"):
+        src = pathlib.Path(str(db_path) + suffix)
+        if not src.exists():
+            continue
+        dst = incident / src.name
+        try:
+            os.replace(str(src), str(dst))
+            try:
+                os.chmod(dst, 0o600)
+            except OSError:
+                pass
+            moved.append(src.name)
+        except OSError as exc:
+            eprint(f"[quarantine] could not move {src}: {exc}")
+    manifest = {
+        "schemaVersion": 1,
+        "quarantinedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+        "originalPath": str(db_path),
+        "movedFiles": moved,
+    }
+    try:
+        (incident / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True))
+    except OSError:
+        pass
+    return incident
+
+
+def cmd_db_rebuild(args: argparse.Namespace) -> int:
+    """``db rebuild --db stats`` — explicit journal replay into a fresh index
+    (spec §9). Forensics-quarantines the current stats.db the SAME forensics-first
+    way auto-heal does (even when the DB is healthy — this is an operator's
+    deliberate reset), then rebuilds from the journal and reports counts +
+    duration. Held under the stats maintenance lock so it serializes with a
+    concurrent auto-heal. #146 prod guard: a dev/worktree binary refuses to
+    rebuild the real prod stats.db unless ``CCTALLY_ALLOW_PROD_MIGRATION=1``.
+    Exit 0 on success, 2 for the prod guard, 3 for a rebuild failure."""
+    from _lib_json_envelope import stamp_schema_version
+    import _cctally_journal
+
+    as_json = bool(getattr(args, "json", False))
+    path = _cctally_core.DB_PATH
+    if _would_block_prod_stats(path):
+        eprint(
+            "cctally: refusing to rebuild the prod stats.db "
+            "(~/.local/share/cctally) from a dev checkout. Run the installed "
+            "binary, or override with CCTALLY_ALLOW_PROD_MIGRATION=1."
+        )
+        return 2
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    maint_fd = os.open(
+        str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),
+        os.O_RDWR | os.O_CREAT, 0o600,
+    )
+    forensics = None
+    incident = None
+    try:
+        fcntl.flock(maint_fd, fcntl.LOCK_EX)
+        import _cctally_store
+        # Symmetry with the auto-heal path (Task-8 P3-3): take the bounded ingest
+        # lock so a concurrent ingest cycle can't write into the stats.db we are
+        # about to quarantine + rebuild. Journal-is-truth makes this
+        # correctness-neutral, but keeping the two rebuild paths identical avoids
+        # a latent write-into-quarantined-inode surprise.
+        ingest_fd = _cctally_store._heal_flock_bounded(
+            _cctally_core.JOURNAL_INGEST_LOCK_PATH, 5.0)
+        try:
+            if path.exists():
+                forensics = write_corruption_forensics(path, db_label="stats")
+                incident = quarantine_db_family(path)
+            result = _cctally_journal.rebuild_stats_index()
+        except Exception as exc:
+            eprint(f"cctally: stats.db rebuild failed: {exc}")
+            return 3
+        finally:
+            _cctally_store._heal_release_flock(ingest_fd)
+    finally:
+        try:
+            fcntl.flock(maint_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(maint_fd)
+
+    total_rows = sum(result.rows_by_table.values())
+    if as_json:
+        payload = {
+            "db": "stats",
+            "segmentsRead": result.segments_read,
+            "linesFolded": result.lines_folded,
+            "malformed": result.malformed,
+            "durationSeconds": round(result.duration_s, 3),
+            "rowsByTable": result.rows_by_table,
+            "totalRows": total_rows,
+            "quarantineDir": str(incident) if incident else None,
+            "forensicsPath": str(forensics) if forensics else None,
+        }
+        print(json.dumps(stamp_schema_version(payload, version=1)))
+    else:
+        print(
+            f"cctally: rebuilt stats.db from {result.segments_read} journal "
+            f"segment(s) — {result.lines_folded} lines folded, "
+            f"{result.malformed} malformed, {total_rows} rows, "
+            f"{result.duration_s:.2f}s."
+        )
+        for tbl, n in result.rows_by_table.items():
+            if n:
+                print(f"  {tbl}: {n}")
+        if incident is not None:
+            print(f"  previous stats.db quarantined -> {incident}")
+        if forensics is not None:
+            print(f"  forensics -> {forensics}")
+    return 0
 
 
 def _first_pending_migration_name(
@@ -933,6 +1209,15 @@ def _run_pending_migrations(
             "cache.db": (
                 "session_entries", "conversation_messages", "codex_session_entries",
                 "codex_conversation_events",
+            ),
+            # conversations.db (spec §7.2): a transcript-bearing store written
+            # before the framework existed carries the marker but no
+            # schema_migrations. Probing its data tables classifies it NON-fresh
+            # so migration 001's handler runs (adopts the marker) instead of
+            # being stamped without it — the difference between adopt and skip.
+            "conversations.db": (
+                "conversation_messages", "conversation_source_files",
+                "codex_conversation_source_files",
             ),
         }.get(db_label, ())
         for probe_table in probe_tables:
@@ -3104,6 +3389,28 @@ def _set_cache_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("INSERT INTO cache_meta(key, value) VALUES(?, ?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+@conversations_migration("001_adopt_schema_version_marker")
+def _conv_001_adopt_schema_version_marker(conn: sqlite3.Connection) -> None:
+    """Bring conversations.db under the migration framework (spec §7.2).
+
+    Adoption, not migration: ``_apply_conversations_schema`` (run before the
+    dispatcher in ``open_conversations_db``) already owns the physical schema and
+    the ``cache_meta['conversation_schema_version']`` marker. On an EXISTING
+    populated DB the store's version gate keeps ``_apply_conversations_schema``
+    from re-running the schema (its own marker short-circuit), and the
+    dispatcher's data-emptiness probe (``conversation_messages`` /
+    ``conversation_source_files``) classifies the DB as NON-fresh so this handler
+    runs and the dispatcher stamps the marker + advances ``user_version`` to 1
+    WITHOUT touching a single transcript row. On a FRESH DB the dispatcher's
+    fresh-install path stamps the marker without invoking this handler at all.
+
+    The handler is a self-contained, idempotent no-op-equivalent: it re-asserts
+    the ``conversation_schema_version`` marker (an ``INSERT … ON CONFLICT`` upsert)
+    so it is safe to re-run on its own output (handler-idempotency contract)."""
+    _set_cache_meta(conn, "conversation_schema_version", "1")
+    conn.commit()
 
 
 # #177 S6: the consolidated multi-column external-content FTS5 table that
@@ -5911,6 +6218,22 @@ def _migration_codex_quota_projection_state(conn: sqlite3.Connection) -> None:
     _cctally_core._apply_quota_projection_schema(conn)
 
 
+# ── Stats registry FROZEN at the legacy head (DB journal redesign §7.1) ──
+# stats.db moved to epoch-rebuild versioning (STATS_INDEX_EPOCH); NO stats
+# migration is ever written again — a schema change bumps the epoch instead. This
+# module-load assertion fires if a 14th @stats_migration lands, mirroring the
+# import-time contiguity check in `_make_migration_decorator`. It runs BEFORE the
+# test-injection block below (which registers a 14th ONLY under
+# CCTALLY_MIGRATION_TEST_MODE), so the production shape is asserted at exactly 13.
+STATS_REGISTRY_FROZEN_HEAD = 13
+assert len(_STATS_MIGRATIONS) == STATS_REGISTRY_FROZEN_HEAD, (
+    f"stats registry is frozen at {STATS_REGISTRY_FROZEN_HEAD} (DB journal "
+    f"redesign §7.1) but has {len(_STATS_MIGRATIONS)} migrations — a new "
+    f"@stats_migration was added. Schema changes now bump STATS_INDEX_EPOCH; the "
+    f"stats registry is frozen and must not grow."
+)
+
+
 # === Region 8: Test-only migration registration (was bin/cctally:12086-12140) ===
 
 # ──────────────────────────────────────────────────────────────────────
@@ -5966,12 +6289,16 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         "databases": {
             "stats.db": _db_status_for(_cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db"),
             "cache.db": _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
+            "conversations.db": _db_status_for(
+                _cctally_core.CONVERSATIONS_DB_PATH, _CONVERSATIONS_MIGRATIONS,
+                "conversations.db",
+            ),
         },
     }
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
-    for db_label in ("stats.db", "cache.db"):
+    for db_label in ("stats.db", "cache.db", "conversations.db"):
         info = payload["databases"][db_label]
         skipped_count = sum(1 for m in info["migrations"] if m["status"] == "skipped")
         suffix = f" ({skipped_count} skipped)" if skipped_count else ""
@@ -6143,14 +6470,22 @@ def _db_resolve_migration_name(name_arg: str) -> tuple[str, str, list[Migration]
         if any(m.name == unq for m in _CACHE_MIGRATIONS):
             return "cache.db", unq, _CACHE_MIGRATIONS
         raise LookupError(name_arg)
+    if name_arg.startswith("conversations.db:"):
+        unq = name_arg[len("conversations.db:"):]
+        if any(m.name == unq for m in _CONVERSATIONS_MIGRATIONS):
+            return "conversations.db", unq, _CONVERSATIONS_MIGRATIONS
+        raise LookupError(name_arg)
     in_stats = any(m.name == name_arg for m in _STATS_MIGRATIONS)
     in_cache = any(m.name == name_arg for m in _CACHE_MIGRATIONS)
-    if in_stats and in_cache:
+    in_conv = any(m.name == name_arg for m in _CONVERSATIONS_MIGRATIONS)
+    if (in_stats + in_cache + in_conv) > 1:
         raise RuntimeError(name_arg)
     if in_stats:
         return "stats.db", name_arg, _STATS_MIGRATIONS
     if in_cache:
         return "cache.db", name_arg, _CACHE_MIGRATIONS
+    if in_conv:
+        return "conversations.db", name_arg, _CONVERSATIONS_MIGRATIONS
     raise LookupError(name_arg)
 
 
@@ -6159,6 +6494,8 @@ def _db_path_for_label(db_label: str) -> pathlib.Path:
         return _cctally_core.DB_PATH
     if db_label == "cache.db":
         return _cctally_core.CACHE_DB_PATH
+    if db_label == "conversations.db":
+        return _cctally_core.CONVERSATIONS_DB_PATH
     raise ValueError(f"unknown db_label: {db_label}")
 
 
@@ -6175,7 +6512,7 @@ def cmd_db_skip(args: argparse.Namespace) -> int:
     except RuntimeError:
         eprint(
             f"cctally: ambiguous migration name '{name_arg}'; "
-            f"qualify as 'stats.db:{name_arg}' or 'cache.db:{name_arg}'"
+            f"qualify as 'stats.db:{name_arg}', 'cache.db:{name_arg}', or 'conversations.db:{name_arg}'"
         )
         return 2
     except LookupError:
@@ -6256,7 +6593,7 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
     except RuntimeError:
         eprint(
             f"cctally: ambiguous migration name '{name_arg}'; "
-            f"qualify as 'stats.db:{name_arg}' or 'cache.db:{name_arg}'"
+            f"qualify as 'stats.db:{name_arg}', 'cache.db:{name_arg}', or 'conversations.db:{name_arg}'"
         )
         return 2
     except LookupError:
@@ -6306,10 +6643,21 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
     dispatcher. Idempotent: a no-op when the DB is not ahead.
     """
     which = args.db  # "cache" | "stats"
-    if which == "cache":
-        path, registry, label = _cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"
-    else:
-        path, registry, label = _cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db"
+    if which == "stats":
+        # RETIRED (DB journal redesign §7.1). stats.db is now a disposable
+        # journal index — a version mismatch resolves by rebuild, not by
+        # trim-and-revert. The old trim path would mangle an epoch-stamped DB
+        # (user_version 1000 > 13 looks "version-ahead" to the legacy registry).
+        # Point the operator at the rebuild surface instead.
+        eprint(
+            "cctally: `db recover --db stats` is retired — stats.db is now a "
+            "disposable index materialized from the append-only journal, so a "
+            "version mismatch self-heals by rebuild rather than trim-and-revert. "
+            "Run `cctally db rebuild --db stats` to rebuild it from the journal."
+        )
+        return 2
+    path, registry, label = (
+        _cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db")
 
     # Absent file → nothing to recover; do NOT connect (sqlite3.connect would
     # create an empty DB file — mirrors cmd_db_unskip).
@@ -6327,34 +6675,11 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
                 f"(≤ known {head}); nothing to recover."
             )
             return 0
-        # Prod guard (issue #146): a dev/worktree binary must not trim the unknown
-        # migration markers + revert user_version on the installed release's
-        # NON-re-derivable prod stats.db — the destructive cousin of the #142
-        # forward-migration guard (trimmed markers can't be re-derived). Reuses
-        # the same connection-scoped predicate (git checkout AND the DB physically
-        # in the real prod dir, password-DB-resolved, honoring
-        # CCTALLY_ALLOW_PROD_MIGRATION). cache.db is re-derivable and intentionally
-        # exempt — it mirrors the dispatcher's opt-in auto-heal.
-        if which == "stats" and _would_block_prod_migration(conn):
-            eprint(
-                "cctally: refusing to recover stats.db in the prod data dir "
-                "(~/.local/share/cctally) from a dev checkout — trimming the "
-                "unknown migration markers and reverting user_version on the "
-                "installed release's non-re-derivable stats.db could corrupt it. "
-                "Run the installed binary, or override with "
-                "CCTALLY_ALLOW_PROD_MIGRATION=1."
-            )
-            return 2
-        if which == "stats" and not getattr(args, "yes", False):
-            eprint(
-                f"cctally: {label} is at version {cur_version} but this cctally "
-                f"only knows up to {head}. Recovering stats.db trims the unknown "
-                f"migration markers and reverts user_version, but any schema the "
-                f"unknown migration created is left in place and a re-record/"
-                f"re-sync may be needed. Re-run with --yes to proceed, or restore "
-                f"{label} from a backup."
-            )
-            return 2
+        # `--db stats` returned early above (retired, §7.1), so control only
+        # reaches here for cache.db: re-derivable, healed in place with no --yes
+        # and no #146 prod guard (the dispatcher's opt-in auto-heal already covers
+        # it). The former `which == "stats"` prod-guard + --yes gates were dead
+        # after the retirement and have been removed.
         info = _recover_version_ahead(conn, registry, label)
         print(
             f"cctally: reverted {label} v{info['reverted_from']} → "

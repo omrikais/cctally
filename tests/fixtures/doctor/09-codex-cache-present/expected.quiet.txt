@@ -16,6 +16,7 @@ Auth
 Database
   ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
+Journal
 Data
   ⚠ Codex quota              no safely interpreted windows
       → Run `cctally cache-sync --source codex --rebuild`
@@ -25,4 +26,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 32 OK · 8 WARN · 0 FAIL
+Summary: 36 OK · 8 WARN · 0 FAIL

@@ -187,10 +187,13 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     # Both tables must exist with the expected column counts.
     blocks_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_blocks');")
     milestones_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_milestones');")
-    assert_eq "$blocks_cols"     "18" "five_hour_blocks column count"
-    # 15 = 13 base columns + `alerted_at TEXT` (threshold-actions T1 migration)
-    # + `reset_event_id` (migration 006 — 5h in-place credit segment column).
-    assert_eq "$milestones_cols" "15" "five_hour_milestones column count"
+    # 19 = 18 legacy columns + `journal_id TEXT` (DB journal redesign Task 4 —
+    # the nullable replay-identity column added to every journal-covered table).
+    assert_eq "$blocks_cols"     "19" "five_hour_blocks column count"
+    # 16 = 13 base columns + `alerted_at TEXT` (threshold-actions T1 migration)
+    # + `reset_event_id` (migration 006 — 5h in-place credit segment column)
+    # + `journal_id TEXT` (DB journal redesign Task 4 replay-identity column).
+    assert_eq "$milestones_cols" "16" "five_hour_milestones column count"
 
     # Spot-check a few critical columns by name.
     has_window_key=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_blocks') WHERE name='five_hour_window_key';")
@@ -532,6 +535,15 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     # snapshots pre-exist but five_hour_blocks is empty. (Simulates the
     # one-time migration on an upgraded install.)
     sql "$home" "DELETE FROM five_hour_blocks; DELETE FROM five_hour_milestones;"
+    # Task 8 §6.2 backfill gate: the historical block backfill runs only when the
+    # `stats_open_fixups` marker is absent (a genuine pre-journal upgrade DB).
+    # record_usage above stamped it; clear it so the upgrade-path backfill fires.
+    # Task 9 §7.1/§8: the epoch gate SUBSUMES the fixups gate — a steady-state
+    # (user_version == STATS_INDEX_EPOCH == 1000) open does zero schema work, so a
+    # genuine pre-journal upgrade DB must ALSO sit at the legacy head (<= 13). The
+    # next stats-DB open then runs the schema apply (incl. the historical block
+    # backfill) and cuts the DB over to the epoch. Reset both markers.
+    sql "$home" "DELETE FROM stats_open_fixups; PRAGMA user_version = 13;" >/dev/null 2>&1 || true
 
     post_wipe=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
     assert_eq "$post_wipe" "0" "blocks empty after wipe"
@@ -868,6 +880,7 @@ DELETE FROM five_hour_block_models;
 DELETE FROM five_hour_block_projects;
 DELETE FROM five_hour_milestones;
 DELETE FROM schema_migrations;
+DELETE FROM stats_open_fixups;
 PRAGMA user_version = 0;
 EOF
 

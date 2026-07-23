@@ -199,6 +199,7 @@ from _cctally_core import (
     _AlertsConfigError,
     _BudgetConfigError,
     _command_as_of,
+    _as_of_or_command,
 )
 from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
 from _lib_pricing import _calculate_entry_cost
@@ -577,9 +578,37 @@ def _resolve_active_five_hour_reset_event_id(
 
 def maybe_record_milestone(
     saved: dict[str, Any],
+    *,
+    conn=None,
+    as_of: "str | None" = None,
+    alert_sink: "list | None" = None,
+    journal: "tuple | None" = None,
 ) -> None:
     """Check if a new integer percent threshold was crossed, and if so,
-    fetch cost and record the milestone. Errors are logged, not raised."""
+    fetch cost and record the milestone. Errors are logged, not raised.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    when ``conn`` is passed the crossing folds into the caller's transaction —
+    no internal ``open_db()``/``commit()``/``close()``, and alert dispatch is
+    left to the caller (the ingester's post-commit ALERT_DISPATCHER). ``as_of``
+    (ISO-Z) is stamped as the milestone ``captured_at_utc`` / ``alerted_at`` in
+    place of wall clock. Both defaults keep the legacy own-connection,
+    commit-and-dispatch behavior byte-identical.
+
+    ``alert_sink`` (DB journal redesign Task 6): on the passed-conn path the new-
+    crossing alert payloads are APPENDED to this list instead of being dropped,
+    so the ingester dispatches them post-commit (spec §5.2 step 6). The
+    ``alerted_at`` stamp already lands in-txn (before harvest), so it survives a
+    rebuild. ``None`` keeps today's compute-and-drop behavior on the passed-conn
+    path.
+
+    ``journal`` (DB journal redesign Task 6, Design A): the ``(ctx, id_base)``
+    tuple threaded into the milestone's pre-record cost sync so the
+    ``weekly_cost_snapshots`` row it inserts rides a Model-A
+    ``weekly_cost_snapshot`` evt (``wcs:<id_base>:<week>``) instead of a bare
+    insert — the computed cost is journaled and replay reads it back verbatim
+    (Claude Code prunes the source JSONL). Only threaded on the passed-conn
+    (ingest) path; ``None`` / the legacy own-conn path keeps the bare insert."""
     weekly_percent = saved.get("weeklyPercent")
     if weekly_percent is None or weekly_percent < 1:
         return
@@ -599,7 +628,9 @@ def maybe_record_milestone(
     usage_snapshot_id = saved["id"]
     five_hour_percent = saved.get("fiveHourPercent")
 
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         # Resolve the active segment for THIS captured moment. The segment
         # is the latest week_reset_events row keyed on week_end_at whose
@@ -608,7 +639,7 @@ def maybe_record_milestone(
         # +00:00 / Z offsets (see precedent at bin/cctally:_compute_block_totals
         # cross-reset detection; also project gotcha
         # ``unixepoch_for_cross_offset_compare``).
-        captured_at_iso = saved.get("capturedAt") or now_utc_iso()
+        captured_at_iso = saved.get("capturedAt") or as_of or now_utc_iso()
         reset_event_id = 0
         if week_end_at:
             seg_row = conn.execute(
@@ -642,7 +673,18 @@ def maybe_record_milestone(
                 json=False,
                 quiet=True,
             )
-            cmd_sync_week(sync_ns)
+            # On the passed-conn path thread the same connection + capture time
+            # so the cost snapshot folds into the caller's transaction; on the
+            # legacy path cmd_sync_week opens its own connection as today. On the
+            # ingest path also thread `journal=(ctx, id_base)` so the cost
+            # snapshot rides a Model-A `weekly_cost_snapshot` evt (Design A) —
+            # never on the legacy own-conn path.
+            cmd_sync_week(
+                sync_ns,
+                conn=(None if own_conn else conn),
+                as_of=as_of,
+                journal=(None if own_conn else journal),
+            )
         except Exception as exc:
             eprint(f"[milestone] cost sync failed, using latest available: {exc}")
 
@@ -730,6 +772,7 @@ def maybe_record_milestone(
                 five_hour_percent_at_crossing=five_hour_percent,
                 commit=False,
                 reset_event_id=reset_event_id,
+                as_of=as_of,
             )
             # ── Threshold-actions dispatch (set-then-dispatch, spec §3.2) ──
             # Only the genuine-new-crossing winner (rowcount==1) reaches this
@@ -744,7 +787,7 @@ def maybe_record_milestone(
                     and alerts_cfg["enabled"]
                     and pct in alerts_cfg["weekly_thresholds"]
                 ):
-                    crossed_at = now_utc_iso()
+                    crossed_at = as_of or now_utc_iso()
                     # set-then-dispatch: alerted_at lands on the row BEFORE
                     # the osascript Popen, so a dismissed-after-spawn
                     # notification still surfaces in the dashboard alerts
@@ -784,28 +827,52 @@ def maybe_record_milestone(
                         )
                         pending_alerts.append(payload)
         # Single commit after the loop durably writes every milestone row
-        # AND its alerted_at marker together.
-        conn.commit()
-        # Dispatch deferred to AFTER commit (matches 5h path). Per-payload
-        # exception logged so a bad-payload alert can't suppress healthy ones.
-        # Production caller ignores _dispatch_alert_notification's return
-        # value (spec §6.4).
-        for payload in pending_alerts:
-            try:
-                _dispatch_alert_notification(payload, mode="real")
-            except Exception as dispatch_exc:
-                eprint(f"[alerts] dispatch failed: {dispatch_exc}")
+        # AND its alerted_at marker together. On the passed-conn (ingest) path
+        # the caller owns the commit and the post-commit alert dispatch (the
+        # ingester's ALERT_DISPATCHER, spec §5.2.7), so both are skipped here.
+        if own_conn:
+            conn.commit()
+            # Dispatch deferred to AFTER commit (matches 5h path). Per-payload
+            # exception logged so a bad-payload alert can't suppress healthy
+            # ones. Production caller ignores _dispatch_alert_notification's
+            # return value (spec §6.4).
+            for payload in pending_alerts:
+                try:
+                    _dispatch_alert_notification(payload, mode="real")
+                except Exception as dispatch_exc:
+                    eprint(f"[alerts] dispatch failed: {dispatch_exc}")
+        elif alert_sink is not None:
+            # Passed-conn (ingest) path: hand the new-crossing payloads to the
+            # caller's sink so the ingester dispatches them post-commit
+            # (spec §5.2 step 6). alerted_at is already stamped in the caller's
+            # txn above, so a crash between commit and dispatch loses at most
+            # one notification — the set-then-dispatch trade.
+            alert_sink.extend(pending_alerts)
     except Exception as exc:
+        # Exception discipline (6c-gate P1): on the passed-conn (ingest) path a
+        # chokepoint failure must ABORT the cycle — re-raise so the ingester
+        # rolls back and leaves the cursor unmoved (invariant ii). Legacy
+        # own-connection ticks keep the log-and-swallow.
+        if not own_conn:
+            raise
         eprint(f"[milestone] error recording milestone: {exc}")
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def _record_budget_milestone_for_vendor(
     *, vendor, target, thresholds, period, config, tz, build_payload,
-    raise_errors: bool = False,
+    raise_errors: bool = False, conn=None, as_of=None, alert_sink=None,
 ) -> int:
     """Shared budget-milestone firing core for both vendors (#143).
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    when ``conn`` is passed the crossings fold into the caller's transaction —
+    no internal ``open_db()``/``commit()``/``close()``, and alert dispatch is
+    left to the caller (the ingester's ALERT_DISPATCHER). ``as_of`` (ISO-Z) is
+    the capture-time reference for window/spend + the crossing timestamps. Both
+    defaults keep the legacy own-connection, commit-and-dispatch behavior.
 
     Hot-path ordering is preserved verbatim (spec §4.2 / [Pre-probe before
     sync_cache]): ``open_db`` → cheap ``_resolve_budget_window(vendor=…)`` →
@@ -827,9 +894,11 @@ def _record_budget_milestone_for_vendor(
     ``threshold`` / ``crossed_at_utc`` / ``period_key`` / ``period`` /
     ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` keyword args.
     """
-    now_utc = _command_as_of()
+    now_utc = _as_of_or_command(as_of)
     pending_alerts: list[dict[str, Any]] = []
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         start_at = _resolve_budget_window(
             conn, vendor=vendor, now_utc=now_utc, period=period,
@@ -865,6 +934,7 @@ def _record_budget_milestone_for_vendor(
             target=target,
             spent=spent,
             now_utc=now_utc,
+            as_of=as_of,
         ):
             pending_alerts.append(build_payload(
                 threshold=t,
@@ -876,26 +946,44 @@ def _record_budget_milestone_for_vendor(
                 consumption_pct=pct,
             ))
         # Single commit: every INSERT + its alerted_at marker durable together.
-        conn.commit()
+        # On the passed-conn (ingest) path the caller owns the commit + the
+        # post-commit dispatch (the ingester's ALERT_DISPATCHER).
+        if own_conn:
+            conn.commit()
     except Exception as exc:
+        # Exception discipline (6c-gate P1): passed-conn (ingest) path re-raises
+        # so a failure ABORTS the cycle (invariant ii); this covers both budget
+        # axes (claude + codex share this core). Legacy own-connection swallows
+        # (or re-raises when a caller explicitly requested raise_errors).
+        if not own_conn:
+            raise
         eprint(f"[budget-milestone:{vendor}] error recording budget milestone: {exc}")
         if raise_errors:
             raise
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
     # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
     # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
-    # the alerted_at column).
-    for payload in pending_alerts:
-        try:
-            _dispatch_alert_notification(payload, mode="real")
-        except Exception as dispatch_exc:
-            eprint(f"[budget-alerts:{vendor}] dispatch failed: {dispatch_exc}")
+    # the alerted_at column). Skipped on the passed-conn path (caller dispatches).
+    if own_conn:
+        for payload in pending_alerts:
+            try:
+                _dispatch_alert_notification(payload, mode="real")
+            except Exception as dispatch_exc:
+                eprint(f"[budget-alerts:{vendor}] dispatch failed: {dispatch_exc}")
+    elif alert_sink is not None:
+        # Passed-conn (ingest) path: hand the budget crossings to the caller's
+        # sink for the ingester's post-commit dispatch (spec §5.2 step 6).
+        alert_sink.extend(pending_alerts)
     return len(pending_alerts)
 
 
-def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
+def maybe_record_budget_milestone(
+    saved: dict[str, Any], *, conn=None, as_of: "str | None" = None,
+    alert_sink: "list | None" = None,
+) -> None:
     """Fire Claude equiv-$ budget alerts on ACTUAL-spend threshold crossings
     (axis ``budget`` — called from ``cmd_record_usage`` alongside the weekly-% /
     5h-% milestone helpers). Thin vendor adapter over
@@ -940,6 +1028,9 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
         period=period,
         config=config,
         tz=tz,
+        conn=conn,
+        as_of=as_of,
+        alert_sink=alert_sink,
         # The Claude payload builder takes the legacy `week_start_at=` kwarg
         # (its value is the resolved period-start instant, == period_key), so
         # the at-fire dispatch id stays byte-stable `budget:<period_start_at>:<t>`.
@@ -955,7 +1046,10 @@ def maybe_record_budget_milestone(saved: dict[str, Any]) -> None:
     )
 
 
-def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
+def maybe_record_project_budget_milestone(
+    saved: dict[str, Any], *, conn=None, as_of: "str | None" = None,
+    alert_sink: "list | None" = None,
+) -> None:
     """Fire PER-PROJECT equiv-$ budget alerts on ACTUAL-spend threshold
     crossings (spec §6 — called from ``cmd_record_usage`` alongside the
     weekly-% / 5h-% / budget / projected milestone helpers). An independent
@@ -993,9 +1087,11 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
     if not thresholds:
         return
 
-    now_utc = _command_as_of()
+    now_utc = _as_of_or_command(as_of)
     pending_alerts: list[dict[str, Any]] = []
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         window = _resolve_current_budget_window(conn, now_utc)
         if window is None:
@@ -1067,12 +1163,13 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
                 spent_usd=spent,
                 consumption_pct=consumption_pct,
                 commit=False,
+                as_of=as_of,
             )
             # Only the genuine-new-crossing winner (rowcount==1) dispatches; a
             # racing record-usage instance OR an already-recorded pair gets
             # rowcount==0 and skips.
             if inserted == 1:
-                crossed_at = now_utc_iso()
+                crossed_at = as_of or now_utc_iso()
                 # set-then-dispatch: alerted_at lands on the row BEFORE the
                 # Popen, sharing this transaction with the INSERT (commit=False).
                 # `alerted_at IS NULL` is write-once defense-in-depth.
@@ -1101,27 +1198,39 @@ def maybe_record_project_budget_milestone(saved: dict[str, Any]) -> None:
                     consumption_pct=consumption_pct,
                 ))
         # Single commit: every INSERT + its alerted_at marker durable together.
-        conn.commit()
+        # On the passed-conn (ingest) path the caller owns commit + dispatch.
+        if own_conn:
+            conn.commit()
     except Exception as exc:
+        # Exception discipline (6c-gate P1): passed-conn (ingest) path re-raises
+        # so a failure ABORTS the cycle (invariant ii); legacy own-connection
+        # swallows so a standalone record-usage tick never regresses.
+        if not own_conn:
+            raise
         eprint(
             f"[project-budget-milestone] error recording project budget "
             f"milestone: {exc}"
         )
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
     # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
     # (set-then-dispatch invariant — one queue attempt per crossing, deduped on
-    # the alerted_at column).
-    for payload in pending_alerts:
-        try:
-            _dispatch_alert_notification(payload, mode="real")
-        except Exception as dispatch_exc:
-            eprint(f"[project-budget-alerts] dispatch failed: {dispatch_exc}")
+    # the alerted_at column). Skipped on the passed-conn path (caller dispatches).
+    if own_conn:
+        for payload in pending_alerts:
+            try:
+                _dispatch_alert_notification(payload, mode="real")
+            except Exception as dispatch_exc:
+                eprint(f"[project-budget-alerts] dispatch failed: {dispatch_exc}")
+    elif alert_sink is not None:
+        alert_sink.extend(pending_alerts)
 
 
 def maybe_record_codex_budget_milestone(
-    saved: dict[str, Any], *, raise_errors: bool = False,
+    saved: dict[str, Any], *, raise_errors: bool = False, conn=None, as_of=None,
+    alert_sink: "list | None" = None,
 ) -> int:
     """Fire Codex budget alerts on ACTUAL-Codex-spend threshold crossings (axis
     ``codex_budget``, calendar-period-codex-budgets spec §6 — the gap the Codex
@@ -1186,6 +1295,9 @@ def maybe_record_codex_budget_milestone(
             consumption_pct=kw["consumption_pct"],
         ),
         raise_errors=raise_errors,
+        conn=conn,
+        as_of=as_of,
+        alert_sink=alert_sink,
     )
 
 
@@ -1243,7 +1355,8 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
 
 
 def maybe_record_projected_alert(
-    saved: dict[str, Any], *, only_metrics=None
+    saved: dict[str, Any], *, only_metrics=None, conn=None, as_of=None,
+    alert_sink: "list | None" = None,
 ) -> None:
     """Projected-pace detect-and-arm (axis ``projected``, #121 / #135).
 
@@ -1353,9 +1466,11 @@ def maybe_record_projected_alert(
     # forks / double-fires.
     config_tz = resolve_display_tz(argparse.Namespace(tz=None), cfg)
 
-    now_utc = _command_as_of()
+    now_utc = _as_of_or_command(as_of)
     pending: list[dict[str, Any]] = []
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         # ── weekly_pct leg (snapshot-only, cheap) ───────────────────────────
         if weekly_on:
@@ -1495,6 +1610,7 @@ def maybe_record_projected_alert(
                 projected_value=p["projected_value"],
                 denominator=p["denominator"],
                 commit=False,
+                as_of=as_of,
             )
             # Only the genuine-new-crossing winner (rowcount==1) arms+dispatches;
             # a racing record-usage instance gets rowcount==0 and skips. The
@@ -1504,32 +1620,57 @@ def maybe_record_projected_alert(
                     "UPDATE projected_milestones SET alerted_at = ? "
                     "WHERE week_start_at = ? AND period = ? AND metric = ? "
                     "  AND threshold = ? AND alerted_at IS NULL",
-                    (now_utc_iso(), p["week_start_at"], p["period"],
+                    (as_of or now_utc_iso(), p["week_start_at"], p["period"],
                      p["metric"], p["threshold"]),
                 )
                 fired.append(p)
         # Single commit: every INSERT + its alerted_at marker durable together.
-        conn.commit()
+        # On the passed-conn (ingest) path the caller owns commit + dispatch.
+        if own_conn:
+            conn.commit()
     except Exception as exc:
+        # Exception discipline (6c-gate P1): passed-conn (ingest) path re-raises
+        # so a failure ABORTS the cycle (invariant ii); legacy own-connection
+        # swallows so a standalone record-usage tick never regresses.
+        if not own_conn:
+            raise
         eprint(f"[projected-alert] error recording projected milestone: {exc}")
         fired = []
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
     # Dispatch AFTER commit; a dispatch failure NEVER rolls back the milestone
-    # (set-then-dispatch invariant).
-    for p in fired:
-        try:
-            payload = _build_alert_payload_projected(
-                metric=p["metric"],
-                threshold=p["threshold"],
-                projected_value=p["projected_value"],
-                denominator=p["denominator"],
-                week_start_at=p["week_start_at"],
-            )
-            _dispatch_alert_notification(payload, mode="real")
-        except Exception as dispatch_exc:
-            eprint(f"[projected-alert] dispatch failed: {dispatch_exc}")
+    # (set-then-dispatch invariant). Skipped on the passed-conn path (the
+    # ingester's ALERT_DISPATCHER dispatches).
+    if own_conn:
+        for p in fired:
+            try:
+                payload = _build_alert_payload_projected(
+                    metric=p["metric"],
+                    threshold=p["threshold"],
+                    projected_value=p["projected_value"],
+                    denominator=p["denominator"],
+                    week_start_at=p["week_start_at"],
+                )
+                _dispatch_alert_notification(payload, mode="real")
+            except Exception as dispatch_exc:
+                eprint(f"[projected-alert] dispatch failed: {dispatch_exc}")
+    elif alert_sink is not None:
+        # Passed-conn (ingest) path: hand the projected crossings to the caller's
+        # sink for the ingester's post-commit dispatch (spec §5.2 step 6). The
+        # alerted_at stamp already landed in the caller's txn.
+        for p in fired:
+            try:
+                alert_sink.append(_build_alert_payload_projected(
+                    metric=p["metric"],
+                    threshold=p["threshold"],
+                    projected_value=p["projected_value"],
+                    denominator=p["denominator"],
+                    week_start_at=p["week_start_at"],
+                ))
+            except Exception as build_exc:
+                eprint(f"[projected-alert] payload build failed: {build_exc}")
 
 
 def _compute_block_totals(
@@ -1615,14 +1756,24 @@ def _compute_block_totals(
     return totals
 
 
-def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
+def maybe_update_five_hour_block(
+    saved: dict[str, Any], *, conn=None, as_of: "str | None" = None,
+    alert_sink: "list | None" = None,
+) -> None:
     """Upsert the current 5h block in five_hour_blocks; close strictly
     older open blocks; sweep naturally-expired blocks; flag blocks
     spanning a recorded mid-week 7d-reset.
 
     Errors are logged and swallowed — record-usage must not regress
     because of this helper, same posture as maybe_record_milestone.
-    """
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    when ``conn`` is passed the block upsert + milestone fold + cross-flag sweep
+    run on the caller's transaction — no internal ``open_db()``, no
+    ``BEGIN IMMEDIATE``/``commit()``/``close()``, and alert dispatch is left to
+    the caller (the ingester's ALERT_DISPATCHER). ``as_of`` (ISO-Z) is stamped
+    as ``last_updated_at_utc`` / ``alerted_at`` in place of wall clock. Both
+    defaults keep the legacy own-connection, own-transaction behavior."""
     five_hour_percent = saved.get("fiveHourPercent")
     five_hour_resets_at = saved.get("fiveHourResetsAt")
     five_hour_window_key = saved.get("fiveHourWindowKey")
@@ -1645,7 +1796,9 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
     # five_hour_blocks is empty), so the cost is benign — but the count is
     # surprising. If any future helper grows expensive open_db() side effects,
     # consolidate by passing the connection through rather than reopening.
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         # Step 3 (per spec §3.2): read prior state including immutable
         # fields we'll re-use. Re-deriving block_start_at from saved.
@@ -1660,6 +1813,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
             """,
             (int(five_hour_window_key),),
         ).fetchone()
+
+        # Whole-table emptiness BEFORE this tick's upsert — the exact trigger of
+        # the legacy `_backfill_five_hour_blocks` (open_db()-gated on "blocks
+        # empty + snapshots present"). It's dead in the DB journal redesign
+        # (snapshot + block share one cycle txn), so the post-insert close below
+        # replicates only its is_closed = (resets < now) effect for the FIRST
+        # block. Gating on this (not just `resets < now`) keeps a strictly-newer
+        # historical block open — the backfill never touched a non-first insert.
+        blocks_were_empty = conn.execute(
+            "SELECT COUNT(*) FROM five_hour_blocks"
+        ).fetchone()[0] == 0
 
         if prior is None:
             # First observation of this window. Compute block_start_at
@@ -1716,14 +1880,17 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         # Steps 4-5 + 7: transaction wraps close-older + upsert so a
         # mid-sequence failure doesn't leave the prior block closed
         # without the current block opened/updated.
-        now_iso = now_utc_iso()
+        now_iso = as_of or now_utc_iso()
         # BEGIN IMMEDIATE (not deferred): the first DML below is a write (the
         # close-older UPDATE), so this transaction already takes the write lock
         # up front today. Stating IMMEDIATE makes that the explicit contract —
         # a future edit that slips a SELECT before the first write here cannot
         # silently reintroduce a SQLITE_BUSY_SNAPSHOT crash (busy_timeout does
-        # not absorb that). See cctally-dev#87.
-        conn.execute("BEGIN IMMEDIATE")
+        # not absorb that). See cctally-dev#87. On the passed-conn (ingest) path
+        # the caller already owns the transaction, so we do NOT open a nested
+        # one — the DML runs directly in the caller's txn and the caller commits.
+        if own_conn:
+            conn.execute("BEGIN IMMEDIATE")
         try:
             # Step 5: close any STRICTLY OLDER open block. `<` not `!=`
             # — record-usage runs in parallel via background hook-tick &
@@ -1831,6 +1998,22 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                 (int(five_hour_window_key),),
             ).fetchone()
             block_id = int(block_id_row["id"])
+
+            # Close the just-upserted FIRST block if its window already expired at
+            # capture time — replicating the (journal-model-dead)
+            # `_backfill_five_hour_blocks` is_closed = (resets < now) effect. Gated
+            # on `blocks_were_empty` (the backfill's own "first block" trigger) so
+            # a strictly-newer historical block stays open (scenario D), and on
+            # `is_closed = 0` so it is idempotent + a no-op for a legacy own-conn
+            # caller whose backfill already closed the historical block. `<`
+            # ISO-string-compares resets_at against now_iso, same as the sweep.
+            if blocks_were_empty:
+                conn.execute(
+                    "UPDATE five_hour_blocks SET is_closed = 1, last_updated_at_utc = ? "
+                    "WHERE five_hour_window_key = ? AND is_closed = 0 "
+                    "  AND five_hour_resets_at < ?",
+                    (now_iso, int(five_hour_window_key), now_iso),
+                )
 
             # ── Replace-all per-tick: per-(block, model) and per-(block, project_path)
             # rollup-children. DELETE keyed on five_hour_window_key (NOT block_id) so
@@ -2036,7 +2219,7 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                             and alerts_cfg["enabled"]
                             and pct in alerts_cfg["five_hour_thresholds"]
                         ):
-                            crossed_at = now_utc_iso()
+                            crossed_at = as_of or now_utc_iso()
                             # Site D — alerted_at UPDATE scoped to the
                             # active segment, so the post-credit row
                             # gets stamped without overwriting an
@@ -2156,9 +2339,11 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
                 """,
             )
 
-            conn.commit()
+            if own_conn:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if own_conn:
+                conn.rollback()
             raise
 
         # I1: dispatch deferred to AFTER the outer commit. The milestone
@@ -2170,17 +2355,35 @@ def maybe_update_five_hour_block(saved: dict[str, Any]) -> None:
         # caller ignores _dispatch_alert_notification's return value
         # (spec §6.4); a per-payload exception is logged and the loop
         # continues so a bad-payload alert can't suppress healthy ones.
-        for payload in pending_alerts:
-            try:
-                _dispatch_alert_notification(
-                    payload, mode="real", tz=display_tz_for_alerts
-                )
-            except Exception as dispatch_exc:
-                eprint(f"[alerts] dispatch failed: {dispatch_exc}")
+        # On the passed-conn (ingest) path the caller owns the commit and the
+        # post-commit alert dispatch (the ingester's ALERT_DISPATCHER), so both
+        # are skipped here.
+        if own_conn:
+            for payload in pending_alerts:
+                try:
+                    _dispatch_alert_notification(
+                        payload, mode="real", tz=display_tz_for_alerts
+                    )
+                except Exception as dispatch_exc:
+                    eprint(f"[alerts] dispatch failed: {dispatch_exc}")
+        elif alert_sink is not None:
+            # Passed-conn (ingest) path: hand the 5h-milestone new-crossing
+            # payloads to the caller's sink for post-commit dispatch (spec §5.2
+            # step 6). alerted_at was stamped in the caller's txn above.
+            alert_sink.extend(pending_alerts)
     except Exception as exc:
+        # Exception discipline (6b-gate P2): on the passed-conn (ingest) path a
+        # chokepoint exception must ABORT the cycle — re-raise so the ingester
+        # rolls back the txn, leaves the cursor unmoved, and makes no partial
+        # commit (invariant ii). Only the legacy own-connection path keeps the
+        # log-and-swallow so a standalone record-usage tick never regresses on a
+        # 5h-block hiccup.
+        if not own_conn:
+            raise
         eprint(f"[5h-block] error updating block: {exc}")
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 # ── Reset-to-zero debounce marker (issue #128) ─────────────────────────────
@@ -2254,10 +2457,28 @@ def _read_reset_zero_marker():
 
 
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
-                          *, observed_pre_credit_pct, effective_dt):
+                          *, observed_pre_credit_pct, effective_dt,
+                          as_of=None, commit=True, ctx=None):
     """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
     Shared by the immediate >=25pp path and the debounced reset-to-zero
     confirmation path.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``commit=False`` folds the event-row INSERT + stale-replica DELETE into the
+    caller's transaction (the ingester's cycle) instead of committing inline;
+    ``as_of`` (ISO-Z) stamps ``week_reset_events.detected_at_utc`` in place of
+    wall clock (the reset moment itself stays ``effective_dt``, a parameter).
+    Both defaults keep the legacy inline-commit, wall-clock behavior.
+
+    Design B event+effects seam (§5.3): when an ``IngestContext`` ``ctx`` is
+    passed AND this call is the genuine-new-reset winner (the ``already is None``
+    pre-check AND the ``week_reset_events`` INSERT rowcount == 1), the doomed
+    stale-replica snapshots' ``journal_id``s are captured (SAME predicate as the
+    pivot-2 DELETE) into ``ctx.suppression_map`` keyed on the ``wr`` harvest
+    natural key ``(old_week_end_at, new_week_end_at) = (effective_iso,
+    cur_end_canon)`` BEFORE the DELETE runs, so ``_build_harvest_evt`` attaches
+    the list to the ``wr`` evt and the destructive effect replays. ``ctx=None``
+    (legacy) captures nothing.
 
     Side-effect ordering is load-bearing: the event-row INSERT is dedup-gated
     on a pre-check, but the hwm force-write and stale-replica DELETE run
@@ -2281,15 +2502,33 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         # post_map fires on the credited week in _apply_reset_events_to_weekrefs
         # (old==new collapses it to a zero-width window). observed_pre_credit_pct
         # stamps the pre-credit baseline (issue #45).
-        conn.execute(
+        ins_wr = conn.execute(
             "INSERT OR IGNORE INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
             " effective_reset_at_utc, observed_pre_credit_pct) "
             "VALUES (?, ?, ?, ?, ?)",
-            (now_utc_iso(), effective_iso, cur_end_canon,
+            (as_of or now_utc_iso(), effective_iso, cur_end_canon,
              effective_iso, float(observed_pre_credit_pct)),
         )
-        conn.commit()
+        # Design B (§5.3 event+effects): on the ingest path, capture the doomed
+        # stale-replica snapshots' journal_ids BEFORE the pivot-2 DELETE (SAME
+        # predicate), keyed on the wr harvest natural key (old, new) =
+        # (effective_iso, cur_end_canon). Gated on the genuine-new-reset winner
+        # (rowcount == 1) so a crash-replayed reset never re-suppresses; ctx=None
+        # (legacy) captures nothing.
+        if ctx is not None and ins_wr.rowcount == 1:
+            doomed = conn.execute(
+                "SELECT journal_id FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? "
+                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+                "  AND ABS(weekly_percent - ?) < 1.0",
+                (week_start_date, effective_iso, float(observed_pre_credit_pct)),
+            ).fetchall()
+            ctx.suppression_map[(effective_iso, cur_end_canon)] = [
+                r[0] for r in doomed
+            ]
+        if commit:
+            conn.commit()
     # Unconditional pivot 1: force-write hwm-7d so the next status-line render
     # reflects the post-credit value (the monotonic guard at the normal write
     # site would refuse to decrease the file).
@@ -2312,9 +2551,452 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
             "  AND ABS(weekly_percent - ?) < 1.0",
             (week_start_date, effective_iso, float(observed_pre_credit_pct)),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
     except sqlite3.DatabaseError as exc:
         eprint(f"[record-usage] post-credit cleanup failed: {exc}")
+
+
+def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
+                            weekly_percent, five_hour_window_key,
+                            five_hour_percent, as_of=None, commit=True,
+                            ctx=None):
+    """Detect + record weekly and 5h reset/credit artifacts for one usage
+    observation (extracted from ``cmd_record_usage``; DB journal redesign
+    §5.2.3).
+
+    Runs the mid-week ``week_reset_events`` detection, the reset-to-zero
+    debounce + >=25pp in-place-credit fire, and the parallel 5h in-place-
+    credit detection, all on the caller's ``conn``.
+
+    Seam parameters keep legacy behavior at their defaults:
+
+    - ``as_of`` (ISO-8601 ``Z``/offset, or ``None``): the capture-time
+      predicate clock. ``None`` -> ``_command_as_of()`` wall clock
+      (honoring ``CCTALLY_AS_OF``), byte-identical to the pre-extraction
+      inline code; the ingester injects the observation's ``at`` so
+      detection is replay-deterministic. It also anchors the
+      ``detected_at_utc`` audit stamps (``as_of or now_utc_iso()``) and
+      threads into ``_fire_in_place_credit``.
+    - ``commit`` (default ``True``): the legacy own-transaction path
+      commits once at the end; the ingest path passes ``commit=False`` so
+      the cycle owns the single commit (invariant ii). ``commit=False``
+      also flips the two outer handlers from log-and-swallow to re-raise,
+      so a detection failure ABORTS the ingest cycle instead of silently
+      dropping a reset.
+    - ``ctx`` (default ``None``): the ingest cycle's ``IngestContext``.
+      When present, the destructive 5h credit path (and, via the threaded
+      ``ctx``, ``_fire_in_place_credit``) captures its stale-replica
+      DELETE's doomed ``journal_id``s into ``ctx.suppression_map`` BEFORE
+      deleting (Design B event+effects, §5.3), keyed on the reset row's
+      harvest natural key. Legacy (``ctx=None``) captures nothing.
+    """
+    c = _cctally()
+    now_utc = _as_of_or_command(as_of)
+    # Mid-week reset detection. When `resets_at` advances before the
+    # previously-declared reset actually fires (Anthropic-initiated
+    # goodwill reset, or any API-side shift), record one week_reset_events
+    # row so display + cost layers can treat the observed moment as the
+    # old week's effective end AND the new week's effective start. The
+    # monotonic check below stays keyed on week_start_date so it still
+    # guards the new week against stale rate-limit data independently.
+    # Both boundaries canonicalize to hour (same rule make_week_ref uses)
+    # so minute/second-level Anthropic jitter doesn't masquerade as a
+    # reset and the stored values match what WeekRef.week_end_at carries.
+    # The 5h-block cross-flag is no longer threaded from here —
+    # maybe_update_five_hour_block re-derives it every tick by JOINing
+    # against week_reset_events (self-healing, see helper for rationale).
+    try:
+        cur_end_canon = _canonicalize_optional_iso(week_end_at, "record.cur")
+        prior = conn.execute(
+            "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
+            "WHERE week_end_at IS NOT NULL "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if prior and prior["week_end_at"] and cur_end_canon:
+            prior_end_canon = _canonicalize_optional_iso(
+                prior["week_end_at"], "record.prior"
+            )
+            prior_pct = prior["weekly_percent"]
+            # `now_utc` is the capture-time predicate clock, bound once at the
+            # top of the function from `_as_of_or_command(as_of)` — legacy
+            # `as_of=None` resolves it to `_command_as_of()` (CCTALLY_AS_OF /
+            # wall clock, byte-identical to the pre-extraction inline binding
+            # that lived here); the ingester injects the observation's `at` so
+            # mid-week-reset detection replays deterministically.
+            if prior_end_canon and prior_end_canon != cur_end_canon:
+                prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
+                # Fire only when (a) prior window was still in the FUTURE
+                # (Anthropic shifted the boundary before natural expiration),
+                # AND (b) weekly_percent dropped by RESET_PCT_DROP_THRESHOLD
+                # or more (filters out API flaps / transient boundary
+                # jitter where usage stays roughly the same).
+                if (
+                    prior_end_dt > now_utc
+                    and prior_pct is not None
+                    and c._is_reset_drop(prior_pct, weekly_percent)
+                ):
+                    # See _backfill_week_reset_events for why we floor
+                    # the reset moment to the hour (natural display
+                    # boundary, aligned with Anthropic's hour-only
+                    # resets_at values).
+                    effective_iso = _floor_to_hour(now_utc).isoformat(timespec="seconds")
+                    conn.execute(
+                        "INSERT OR IGNORE INTO week_reset_events "
+                        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                        ((as_of or now_utc_iso()), prior_end_canon, cur_end_canon,
+                         effective_iso),
+                    )
+                    # (inline commit removed — the function commits once at the
+                    # end on the legacy path; the ingest cycle owns the commit.)
+            elif prior_end_canon and prior_end_canon == cur_end_canon:
+                # In-place credit branch (v1.7.2) + reset-to-zero debounce
+                # (issue #128). Same end_at across two captures. A >=25pp drop
+                # is a goodwill credit and fires immediately; a reset-to-zero
+                # (post <= floor, 3..25pp drop) is debounced against a
+                # transient API zero — armed on the first ~0, confirmed only
+                # if the next reading stays low (<= half the pre-zero
+                # baseline), cleared on recovery toward baseline. The gate
+                # drops the _is_reset_drop term so the recovery-clear path is
+                # reachable. See the spec for the midpoint rationale.
+                prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
+                if prior_end_dt > now_utc and prior_pct is not None:
+                    # Read the pending reset-to-zero marker up front (pure
+                    # file read) and compute whether it is armed for THIS
+                    # window; the debounce CLASSIFIER (pure) decides the
+                    # action from those values + the c._RESET_* constants,
+                    # then the glue below executes the decided I/O. The 5
+                    # branch outcomes (fire-immediate / confirm / clear /
+                    # arm / none) map 1:1 to the pre-extraction structure.
+                    marker = _read_reset_zero_marker()
+                    armed = (
+                        marker is not None
+                        and marker[0] == week_start_date
+                        and marker[1] == cur_end_canon
+                    )
+                    decision = plan_weekly_credit_debounce(
+                        prior_pct, weekly_percent,
+                        drop_threshold=c._RESET_PCT_DROP_THRESHOLD,
+                        zero_floor_pct=c._RESET_ZERO_FLOOR_PCT,
+                        zero_min_drop_pct=c._RESET_ZERO_MIN_DROP_PCT,
+                        marker_armed=armed,
+                        marker_baseline=(marker[2] if armed else None),
+                    ).action
+                    if decision == FIRE_IMMEDIATE:
+                        # >=25pp goodwill credit — fire immediately, never
+                        # debounced. Clear any pending arm (now moot).
+                        _clear_reset_zero_marker()
+                        _fire_in_place_credit(
+                            conn, week_start_date, cur_end_canon, weekly_percent,
+                            observed_pre_credit_pct=float(prior_pct),
+                            effective_dt=_floor_to_hour(now_utc),
+                            as_of=as_of, commit=commit, ctx=ctx,
+                        )
+                    elif decision == CONFIRM_RESET:
+                        # Second reading stayed low → confirm. Anchor the
+                        # reset at the FIRST-zero instant from the marker
+                        # (UTC-normalized like the backfill in-place path).
+                        first_zero_dt = parse_iso_datetime(
+                            marker[3], "reset_zero_marker.first_zero"
+                        ).astimezone(dt.timezone.utc)
+                        _fire_in_place_credit(
+                            conn, week_start_date, cur_end_canon,
+                            weekly_percent,
+                            observed_pre_credit_pct=marker[2],
+                            effective_dt=_floor_to_hour(first_zero_dt),
+                            as_of=as_of, commit=commit, ctx=ctx,
+                        )
+                        # Clear ONLY after the fire completes (P2a): a
+                        # mid-fire crash leaves the marker armed so the next
+                        # zero re-confirms + re-runs the idempotent pivots.
+                        _clear_reset_zero_marker()
+                    elif decision == CLEAR_MARKER:
+                        # Recovered toward baseline → transient zero, not a
+                        # reset. Clear, do not fire.
+                        _clear_reset_zero_marker()
+                    elif decision == ARM_MARKER:
+                        # First ~0 → arm; do NOT fire. The write clamp
+                        # suppresses this 0 (no event row yet), so the prior
+                        # snapshot stays at the baseline and this shape
+                        # re-evaluates next tick. first_zero_iso is the
+                        # _command_as_of() value (now_utc), NOT wall-clock —
+                        # it becomes the effective anchor.
+                        _arm_reset_zero_marker(
+                            week_start_date, cur_end_canon,
+                            baseline_pct=float(prior_pct),
+                            first_zero_iso=now_utc.isoformat(timespec="seconds"),
+                        )
+                    # else NO_ACTION: not a reset shape and not armed →
+                    #     nothing. A non-matching stale marker is inert
+                    #     (ignored on key mismatch, overwritten by next arm).
+
+        # ── 5h in-place credit detection (parallel to weekly above) ──
+        # Spec §2.2 of
+        # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md.
+        # Slot SECOND so the weekly branch retains control-flow
+        # priority — both branches are independent (they touch
+        # different tables) and the order has no behavioral
+        # interaction. Same outer try/except wraps both so a
+        # 5h-detection failure logs but does not regress the rest
+        # of cmd_record_usage.
+        #
+        # Diverges from weekly in three places:
+        #   - Threshold: 5.0pp (constant on cctally module), not 25.0pp.
+        #     The 5h envelope is smaller so a 5pp move is
+        #     proportionally larger.
+        #   - Effective-iso floor: 10-min (matches
+        #     ``_canonical_5h_window_key``'s 600s floor), not hour.
+        #     Up to ~30 distinct slots per 5h block; same-slot
+        #     collisions absorbed by UNIQUE per spec §2.3.
+        #   - Pre-check: pair-checks the latest event's
+        #     ``(prior_percent, post_percent)`` against this tick's
+        #     ``(prior_5h_pct, five_hour_percent)``, not
+        #     ``new_week_end_at`` equality. A genuine replay matches
+        #     BOTH fields; a NEW credit-with-idle (prior_pct equals
+        #     the prior credit's post_pct because the user didn't
+        #     move between credits) matches only one field and
+        #     correctly proceeds to write a second event row.
+        try:
+            if (
+                five_hour_window_key is not None
+                and five_hour_percent is not None
+            ):
+                prior_5h_row = conn.execute(
+                    "SELECT five_hour_window_key, five_hour_percent, "
+                    "       five_hour_resets_at "
+                    "  FROM weekly_usage_snapshots "
+                    " WHERE five_hour_window_key IS NOT NULL "
+                    "   AND five_hour_percent IS NOT NULL "
+                    " ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+                ).fetchone()
+                if (
+                    prior_5h_row is not None
+                    and int(prior_5h_row["five_hour_window_key"])
+                        == int(five_hour_window_key)
+                    and prior_5h_row["five_hour_resets_at"] is not None
+                ):
+                    prior_5h_pct = float(prior_5h_row["five_hour_percent"])
+                    prior_5h_resets_dt = parse_iso_datetime(
+                        prior_5h_row["five_hour_resets_at"],
+                        "prior.five_hour_resets_at",
+                    )
+                    # ``now_utc`` was bound earlier in this same
+                    # outer try block from
+                    # ``dt.datetime.now(dt.timezone.utc)``; reuse it
+                    # so both branches see the same instant.
+                    if plan_five_hour_credit(
+                        prior_5h_pct, float(five_hour_percent),
+                        drop_threshold=c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD,
+                        prior_resets_in_future=(prior_5h_resets_dt > now_utc),
+                    ):
+                        # Pair-check dedup pre-check (spec §2.2;
+                        # refined by Codex r4 P1 finding). The
+                        # round-1 predicate compared only the
+                        # latest event's ``post_percent`` against
+                        # this tick's ``prior_5h_pct``; that
+                        # false-positived on a legitimate 2nd
+                        # credit where the user was idle between
+                        # credits (Credit 1 lands prior=20/post=5;
+                        # user does nothing; Credit 2 arrives with
+                        # CLI percent=0 so prior_5h_pct=5 reads
+                        # equal to stored post_percent=5 →
+                        # silently swallowed). Pair-checking
+                        # against BOTH fields disambiguates: a
+                        # genuine replay matches BOTH; a new
+                        # credit-with-idle matches at most ONE
+                        # (the prior side coincides but
+                        # post_percent differs).
+                        most_recent = conn.execute(
+                            "SELECT prior_percent, post_percent "
+                            "  FROM five_hour_reset_events "
+                            " WHERE five_hour_window_key = ? "
+                            " ORDER BY id DESC LIMIT 1",
+                            (int(five_hour_window_key),),
+                        ).fetchone()
+                        is_dup = (
+                            most_recent is not None
+                            and round(prior_5h_pct, 1)
+                            == round(float(most_recent["prior_percent"]), 1)
+                            and round(float(five_hour_percent), 1)
+                            == round(float(most_recent["post_percent"]), 1)
+                        )
+                        # 10-min floor (spec §2.3 — bounded
+                        # stacked-credit resolution; one event per
+                        # 10-min slot per block). Resolved BEFORE
+                        # the ``if not is_dup`` branch so it's in
+                        # scope for the pivots below (per memory
+                        # ``project_dedup_must_not_gate_side_effects.md``:
+                        # the recovery-tick path must still force
+                        # HWM + DELETE even when the INSERT is
+                        # absorbed by the pre-check or by
+                        # UNIQUE — see comment below for the
+                        # crash scenario). ``_floor_to_ten_minutes``
+                        # is a cctally module attribute; the
+                        # ``c.X`` accessor resolves at call time
+                        # so test ``monkeypatch.setitem(ns,
+                        # "_floor_to_ten_minutes", …)``
+                        # propagates.
+                        effective_dt = c._floor_to_ten_minutes(now_utc)
+                        effective_iso = effective_dt.isoformat(
+                            timespec="seconds"
+                        )
+                        if not is_dup:
+                            ins_fhc = conn.execute(
+                                "INSERT OR IGNORE INTO five_hour_reset_events "
+                                "(detected_at_utc, five_hour_window_key, "
+                                " prior_percent, post_percent, "
+                                " effective_reset_at_utc) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (
+                                    (as_of or now_utc_iso()),
+                                    int(five_hour_window_key),
+                                    prior_5h_pct,
+                                    float(five_hour_percent),
+                                    effective_iso,
+                                ),
+                            )
+                            # Design B (§5.3 event+effects): on the ingest path,
+                            # capture the doomed stale-replica snapshots'
+                            # journal_ids BEFORE the unconditional DELETE below,
+                            # using the SAME predicate as that DELETE, and stash
+                            # them in ctx.suppression_map keyed on the fhc
+                            # harvest natural key (window_key, effective_iso).
+                            # _build_harvest_evt attaches them to the fhc evt so
+                            # the destructive effect replays deterministically.
+                            # Gated on the genuine-new-reset winner
+                            # (rowcount == 1) so a crash-replayed reset never
+                            # re-suppresses with a divergent list; ctx=None
+                            # (legacy) captures nothing.
+                            if ctx is not None and ins_fhc.rowcount == 1:
+                                doomed = conn.execute(
+                                    "SELECT journal_id "
+                                    "FROM weekly_usage_snapshots "
+                                    " WHERE five_hour_window_key = ? "
+                                    "   AND unixepoch(captured_at_utc) "
+                                    "       >= unixepoch(?) "
+                                    "   AND ABS(five_hour_percent - ?) "
+                                    "       < 1.0",
+                                    (
+                                        int(five_hour_window_key),
+                                        effective_iso,
+                                        prior_5h_pct,
+                                    ),
+                                ).fetchall()
+                                ctx.suppression_map[
+                                    (int(five_hour_window_key), effective_iso)
+                                ] = [r[0] for r in doomed]
+                            # (inline commit removed — one end-of-function commit
+                            # on legacy; the ingest cycle owns the commit.)
+                        # Pivots fire UNCONDITIONALLY whenever a
+                        # credit is detected — NOT gated on
+                        # ``not is_dup`` and NOT on
+                        # ``rowcount == 1``. Memory
+                        # ``project_dedup_must_not_gate_side_effects.md``:
+                        # "Skipping a no-op INSERT must NOT skip
+                        # milestones/rollups/alerts; prior run may
+                        # have died mid-flight." Crash scenario A:
+                        # tick N committed the event row, then died
+                        # before HWM + DELETE. Tick N+1's
+                        # INSERT OR IGNORE returns rowcount == 0
+                        # (UNIQUE absorbs) but the system is still
+                        # wedged on the pre-credit HWM + stale-
+                        # replica rows. Crash scenario B (the
+                        # Codex r4 finding): a recovery tick where
+                        # ``(prior, post)`` pair-matches the
+                        # already-stored event row also takes the
+                        # ``is_dup`` branch; without the hoist the
+                        # pivots would be skipped and the system
+                        # would stay wedged. The pivots are
+                        # individually idempotent (file overwrite
+                        # + DELETE on a stable predicate), so
+                        # re-running them on the recovery tick is
+                        # always safe. Mirrors the weekly hoist at
+                        # ``_cctally_record.py`` after the
+                        # ``if already is None`` block (grep
+                        # ``Force-write hwm-7d``).
+                        #
+                        # Force-write hwm-5h: bypasses the
+                        # monotonic guard at the normal hwm-5h
+                        # writer below. Lands AFTER
+                        # ``conn.commit()`` so a concurrent reader
+                        # doesn't see the new HWM before the
+                        # event row is durable. File format
+                        # matches the canonical writer:
+                        # ``<key> <percent>\n``.
+                        try:
+                            (_cctally_core.APP_DIR / "hwm-5h").write_text(
+                                f"{int(five_hour_window_key)} "
+                                f"{float(five_hour_percent)}\n"
+                            )
+                        except OSError:
+                            pass
+                        # Stale-replica DELETE (spec §4.3).
+                        # Defends against claude-statusline
+                        # replaying the pre-credit
+                        # ``--five-hour-percent`` value past the
+                        # credit moment from its own in-memory
+                        # HWM cache. 1.0pp tolerance band (issue
+                        # #48 — symmetric follow-up to weekly #45)
+                        # around the observed pre-credit baseline
+                        # absorbs any rounding drift between
+                        # cctally's OAuth read and statusline's
+                        # ``--five-hour-percent`` payload (today
+                        # they match byte-identically, but the
+                        # band future-proofs against Anthropic or
+                        # statusline changing 5h rounding). The
+                        # band stays well below the 5.0pp 5h
+                        # in-place credit detection threshold
+                        # (``_FIVE_HOUR_RESET_PCT_DROP_THRESHOLD``)
+                        # — 4pp safety margin — so legitimate
+                        # post-credit values are never caught.
+                        # ``unixepoch()`` on both sides for offset
+                        # robustness (Z vs +00:00). Bind is the
+                        # in-scope ``prior_5h_pct``, which equals
+                        # the just-stamped
+                        # ``five_hour_reset_events.prior_percent``
+                        # on the event row.
+                        try:
+                            conn.execute(
+                                "DELETE FROM weekly_usage_snapshots "
+                                " WHERE five_hour_window_key = ? "
+                                "   AND unixepoch(captured_at_utc) "
+                                "       >= unixepoch(?) "
+                                "   AND ABS(five_hour_percent - ?) "
+                                "       < 1.0",
+                                (
+                                    int(five_hour_window_key),
+                                    effective_iso,
+                                    prior_5h_pct,
+                                ),
+                            )
+                            # (inline commit removed — end-of-function commit on
+                            # legacy; the ingest cycle owns the commit.)
+                        except sqlite3.DatabaseError as exc:
+                            eprint(
+                                "[record-usage] 5h post-credit "
+                                f"cleanup failed: {exc}"
+                            )
+        except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+            # Exception discipline (6c-gate P1): on the ingest path
+            # (commit=False, caller owns the txn) a 5h-detection failure must
+            # ABORT the cycle — re-raise so the ingester rolls back and leaves
+            # the cursor unmoved (invariant ii). Legacy (commit=True) keeps the
+            # log-and-swallow so a standalone record-usage tick never regresses.
+            if not commit:
+                raise
+            eprint(
+                f"[record-usage] 5h in-place-credit detection "
+                f"failed: {exc}"
+            )
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        # Same discipline as the inner 5h handler: propagate on the ingest path,
+        # swallow-and-log on the legacy own-transaction path.
+        if not commit:
+            raise
+        eprint(f"[record-usage] reset-event detection failed: {exc}")
+    if commit:
+        conn.commit()
 
 
 def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
@@ -2341,8 +3023,24 @@ def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
     return None if not row or row[0] is None else float(row[0])
 
 
-def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None)):
-    """Insert the post-credit snapshot at plan.to_pct, tagged source='record-credit'."""
+def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None),
+                            commit=True, journal=None):
+    """Insert the post-credit synthetic snapshot at plan.to_pct, tagged
+    source='record-credit'. The SOLE synthetic-snapshot writer on BOTH paths
+    (legacy inline + ingest), so the non-vacuity stub stays load-bearing.
+
+    ``commit=False`` (DB journal redesign §5.2.3) folds the synthetic-snapshot
+    INSERT into the caller's transaction instead of committing inline; the
+    default keeps the legacy inline-commit behavior. Capture time comes from
+    ``plan.captured_iso`` (already the record's moment), so no ``as_of`` is
+    needed here.
+
+    Design A (rev-3 emission rule): ``journal=(ctx, evt_id)`` routes the insert
+    THROUGH ``emit_model_a`` as a ``snapshot_accept`` evt — the ONLY writer of
+    ``weekly_usage_snapshots`` on the ingest path — so the synthetic is journaled
+    (``evt_id`` = ``sa:<id_base>:syn:0``) and replay reads it back verbatim.
+    Default ``None`` is the legacy direct INSERT. Returns the target rowid on the
+    journal path, or ``conn.total_changes`` on the direct path."""
     fhp, fhr, fhk = five_hour
     # Normalize effective to a +00:00 UTC spelling in the payload (matches the
     # stored weekly_credit_floors.effective_at_utc on a non-UTC host).
@@ -2354,18 +3052,35 @@ def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None)):
          "effective": effective_utc},
         separators=(",", ":"),
     )
+    columns = {
+        "captured_at_utc": plan.captured_iso,
+        "week_start_date": plan.week_start_date,
+        "week_end_date": parse_iso_datetime(plan.week_end_at, "we").date().isoformat(),
+        "week_start_at": plan.week_start_at,
+        "week_end_at": plan.week_end_at,
+        "weekly_percent": plan.to_pct,
+        "page_url": None,
+        "source": "record-credit",
+        "payload_json": payload,
+        "five_hour_percent": fhp,
+        "five_hour_resets_at": fhr,
+        "five_hour_window_key": fhk,
+    }
+    if journal is not None:
+        ctx, evt_id = journal
+        import _cctally_journal as _jr
+        return _jr.emit_model_a(
+            ctx, kind="snapshot_accept", evt_id=evt_id,
+            table="weekly_usage_snapshots", columns=columns,
+            at=plan.captured_iso)
+    colnames = ", ".join(columns.keys())
+    placeholders = ", ".join("?" for _ in columns)
     conn.execute(
-        "INSERT INTO weekly_usage_snapshots "
-        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
-        " week_end_at, weekly_percent, page_url, source, payload_json, "
-        " five_hour_percent, five_hour_resets_at, five_hour_window_key) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plan.captured_iso, plan.week_start_date,
-         parse_iso_datetime(plan.week_end_at, "we").date().isoformat(),
-         plan.week_start_at, plan.week_end_at, plan.to_pct, None,
-         "record-credit", payload, fhp, fhr, fhk),
+        f"INSERT INTO weekly_usage_snapshots ({colnames}) VALUES ({placeholders})",
+        tuple(columns.values()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return conn.total_changes
 
 
@@ -2389,11 +3104,41 @@ def _resolve_prior_5h(conn, at_dt):
     return (None, None, None)
 
 
-def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
+def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
+                  commit=True, ctx=None, id_base=None, forced=False):
     """Apply the M2 same-window partial-credit artifacts (record-credit, #209,
     spec §4). Unlike the >=25pp auto-credit path (`_fire_in_place_credit`), this
     writes NO `week_reset_events` row — the window-resolution code never sees a
     credit, so the week is NOT re-anchored. It only lowers the clamp floor.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``commit=False`` folds the floor INSERT + stale-replay DELETE + synthetic
+    snapshot into the caller's transaction (the ingester's cycle) instead of
+    committing inline; ``as_of`` (ISO-Z) stamps ``weekly_credit_floors``'
+    ``applied_at_utc`` in place of wall clock (the reset moment stays
+    ``plan.effective_iso``). Both defaults keep the legacy behavior.
+
+    Design B/event+effects seam (§5.3): the same-window sub-25pp credit writes
+    NO reset row, so on the ingest path (``ctx`` passed, ``id_base`` = the
+    triggering ``record-credit`` op's journal id) its DESTRUCTIVE effects ride a
+    ``weekly_credit_effects`` Model-A evt (``wce:<id_base>``) carrying the
+    stale-replica suppression list (the doomed snapshots' ``journal_id``s,
+    captured with the SAME predicate as the DELETE) + the forced ``hwm_floor``;
+    the synthetic post-credit snapshot rides its own ``snapshot_accept`` evt
+    (``sa:<id_base>:syn:0``) because ``weekly_usage_snapshots`` is written ONLY
+    via ``snapshot_accept`` now (rev-3 emission rule). ``emit_model_a`` applies
+    each evt through the same fold replay uses, so the inline hwm/DELETE/synthetic
+    are SKIPPED on the ingest path (the evt appliers do them). ``ctx=None``
+    (legacy) keeps the inline path verbatim.
+
+    ``forced`` (ingest path only) journals the ``--force`` re-record's destructive
+    clear that legacy ``_force_clear_credit`` did inline: the ``wce`` evt's
+    ``suppression`` list widens to also delete this week's OLD command-owned
+    synthetic snapshots and a ``floor_suppression`` list deletes its OLD
+    ``weekly_credit_floors`` rows (both by logical ``journal_id``), so a
+    ``--force`` re-record replays deterministically. The NEW floor (op fold,
+    ``journal_id = id_base``) and NEW synthetic (``sa:<id_base>:syn:0``) are
+    excluded from both lists, so the clear is order-independent and idempotent.
 
     Side-effect ordering mirrors `_fire_in_place_credit`'s discipline: the
     INSERT OR IGNORE of the floor row is dedup-gated by UNIQUE(week_start_date,
@@ -2401,8 +3146,8 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
     synthetic-snapshot INSERT run UNCONDITIONALLY so a rerun finishes a crash-
     half-applied credit (memory: project_dedup_must_not_gate_side_effects). All
     are individually idempotent (file overwrite; DELETE on a stable predicate;
-    the synthetic snapshot is re-INSERTed only after `_force_clear_credit` or on
-    the completion path where none exists yet).
+    the synthetic snapshot is re-INSERTed only after a ``--force`` re-record's
+    destructive clear or on the completion path where none exists yet).
 
     `plan.effective_iso` is `floor_to_hour(at)`. parse_iso_datetime returns a
     host-local-offset aware datetime; convert to UTC so `effective_at_utc`
@@ -2416,58 +3161,157 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None)):
     pre_credit = float(plan.from_pct)
 
     # 4a. INSERT the credit floor (no week_reset_events row — the whole point).
-    conn.execute(
-        "INSERT OR IGNORE INTO weekly_credit_floors "
-        "(week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc) "
-        "VALUES (?, ?, ?, ?)",
-        (plan.week_start_date, effective_iso, pre_credit, now_utc_iso()),
-    )
-    conn.commit()
-
-    # 4b. Force-write hwm-7d so the external statusline render reflects the
-    # post-credit value (the normal write-site monotonic guard would refuse to
-    # decrease the file).
-    try:
-        (_cctally_core.APP_DIR / "hwm-7d").write_text(
-            f"{plan.week_start_date} {plan.to_pct}\n"
-        )
-    except OSError:
-        pass
-
-    # 4c. Stale-replay DELETE: drop pre-credit-valued replays that land at/after
-    # the floor (the gotcha_statusline_replay_race_after_credit defense; same
-    # 1.0pp band as the auto path). unixepoch() on both sides for offset safety.
-    try:
+    # LEGACY-ONLY (Option (i), 6e): on the ingest path (`ctx` passed) the floor
+    # row is written by the built-in op fold `_apply_op_weekly_credit_floor`,
+    # which runs FIRST per record from the record-credit `op` line and stamps
+    # `journal_id = record["id"]` — so the floor row is journal-identified and
+    # rebuild-replayable, and the op fold is the SOLE `weekly_credit_floors`
+    # writer on the ingest path. `_apply_credit`'s own INSERT here would race the
+    # op fold for the UNIQUE(week_start_date, effective_at_utc) slot and leave a
+    # NULL-`journal_id` row on the losing INSERT; gating it on `ctx is None`
+    # makes the "op fold owns the floor" invariant explicit and keeps the floor's
+    # journal_id unambiguous. On the legacy path (`ctx=None`) the INSERT is
+    # idempotent via that same UNIQUE.
+    if ctx is None:
         conn.execute(
-            "DELETE FROM weekly_usage_snapshots "
+            "INSERT OR IGNORE INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc) "
+            "VALUES (?, ?, ?, ?)",
+            (plan.week_start_date, effective_iso, pre_credit, as_of or now_utc_iso()),
+        )
+        if commit:
+            conn.commit()
+
+    if ctx is None:
+        # ── Legacy inline path (verbatim) ──────────────────────────────────
+        # 4b. Force-write hwm-7d so the external statusline render reflects the
+        # post-credit value (the normal write-site monotonic guard would refuse
+        # to decrease the file).
+        try:
+            (_cctally_core.APP_DIR / "hwm-7d").write_text(
+                f"{plan.week_start_date} {plan.to_pct}\n"
+            )
+        except OSError:
+            pass
+
+        # 4c. Stale-replay DELETE: drop pre-credit-valued replays that land
+        # at/after the floor (the gotcha_statusline_replay_race_after_credit
+        # defense; same 1.0pp band as the auto path). unixepoch() on both sides
+        # for offset safety.
+        try:
+            conn.execute(
+                "DELETE FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? "
+                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+                "  AND ABS(weekly_percent - ?) < 1.0",
+                (plan.week_start_date, effective_iso, pre_credit),
+            )
+            if commit:
+                conn.commit()
+        except sqlite3.DatabaseError as exc:
+            eprint(f"[record-credit] post-credit cleanup failed: {exc}")
+
+        # 4d. INSERT the synthetic post-credit snapshot at plan.to_pct.
+        c._insert_credit_snapshot(conn, plan, five_hour=five_hour, commit=commit)
+    else:
+        # ── Ingest path (Design B, §5.3 event+effects) ─────────────────────
+        # Journal the destructive effects + synthetic instead of running them
+        # inline. Capture the doomed stale-replica journal_ids BEFORE the effect
+        # applies its DELETE (SAME predicate as the legacy 4c DELETE).
+        import _cctally_journal as _jr
+        # Exclude THIS op's OWN synthetic ids (`sa:<id_base>:syn:%`) from the
+        # doomed stale-replica capture, by deterministic id — NOT merely by
+        # emission timing (6g P2 / Task 7 Item 0, the sibling of the `old_syn`
+        # forced-path fix below). A sub-1.0pp credit (legal) puts the synthetic
+        # (at `plan.to_pct`) INSIDE this band (`ABS(weekly_percent - from_pct) <
+        # 1.0`); under crash-replay (evts fsync'd, COMMIT lost) the next cycle
+        # replays `sa:<id_base>:syn:0` at fold order 10 BEFORE step 4b re-runs
+        # `_apply_credit`, so a timing-only capture would re-fold the just-replayed
+        # NEW synthetic into a second `wce` whose suppression deletes the very row
+        # it must preserve when a rebuild folds all snapshot_accept before all wce.
+        # The prefix exclusion makes `supp` a PURE FUNCTION of the op — identical
+        # whether or not the new synthetic has been replayed — and applies on the
+        # NON-force path too (`supp = doomed` here, before `if forced:`).
+        # (`id_base` is a content digest `o:<hex>`, no LIKE metacharacters.)
+        doomed = conn.execute(
+            "SELECT journal_id FROM weekly_usage_snapshots "
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-            "  AND ABS(weekly_percent - ?) < 1.0",
-            (plan.week_start_date, effective_iso, pre_credit),
+            "  AND ABS(weekly_percent - ?) < 1.0 "
+            "  AND journal_id IS NOT NULL "
+            "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
+            (plan.week_start_date, effective_iso, pre_credit, id_base),
+        ).fetchall()
+        supp = [r[0] for r in doomed]
+        floor_supp: list = []
+        # `--force` re-record: journal the destructive clear that legacy
+        # `_force_clear_credit` did inline (delete this week's command-owned
+        # synthetic snapshots + its credit-floor rows). Ride the SAME wce
+        # vehicle by widening its suppression lists (spec §5.3 event+effects) —
+        # captured BEFORE the new synthetic is emitted, and EXCLUDING the new
+        # op's own floor (journal_id = id_base; the op fold owns it), so replay
+        # is order-independent and idempotent. On the non-force path both extra
+        # lists are empty and the wce is exactly the same shape as before.
+        if forced:
+            # Exclude THIS op's own synthetic ids (`sa:<id_base>:syn:%`) from the
+            # old-synthetic capture, by deterministic id — NOT merely by emission
+            # timing (6f review P1). Under crash-replay (crash between evt fsync
+            # and COMMIT) the next cycle replays `sa:<id_base>:syn:0` at fold
+            # order 10 BEFORE step 4b re-runs `_apply_credit(forced=True)`; a
+            # timing-only exclusion would then re-capture the just-replayed NEW
+            # synthetic into a second `wce` whose suppression deletes the very row
+            # it must preserve. Excluding the whole `sa:<id_base>:syn:%` prefix
+            # makes the `wce` suppression a PURE FUNCTION of the op — identical
+            # whether or not the new synthetic has been replayed — mirroring the
+            # floor list's `journal_id != id_base` filter below. (`id_base` is a
+            # content digest `o:<hex>`, no LIKE metacharacters.)
+            old_syn = conn.execute(
+                "SELECT journal_id FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? AND source = 'record-credit' "
+                "  AND journal_id IS NOT NULL "
+                "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
+                (plan.week_start_date, id_base),
+            ).fetchall()
+            supp.extend(r[0] for r in old_syn if r[0] not in supp)
+            old_floors = conn.execute(
+                "SELECT journal_id FROM weekly_credit_floors "
+                "WHERE week_start_date = ? AND journal_id IS NOT NULL "
+                "  AND journal_id != ?",
+                (plan.week_start_date, id_base),
+            ).fetchall()
+            floor_supp = [r[0] for r in old_floors]
+        # wce evt (effects-only, table=None): snapshot suppression list + floor
+        # suppression list (--force clear) + forced hwm floor. emit_model_a
+        # appends+fsyncs the line then applies it via `_apply_weekly_credit_effects`
+        # (DELETE by journal_id from both tables + hwm-7d write).
+        _jr.emit_model_a(
+            ctx,
+            kind="weekly_credit_effects",
+            evt_id=f"wce:{id_base}",
+            table=None,
+            columns={
+                "suppression": supp,
+                "suppression_table": "weekly_usage_snapshots",
+                "floor_suppression": floor_supp,
+                "hwm_floor": {
+                    "week_start_date": plan.week_start_date,
+                    "weekly_percent": plan.to_pct,
+                },
+            },
+            at=(as_of or plan.captured_iso),
         )
-        conn.commit()
-    except sqlite3.DatabaseError as exc:
-        eprint(f"[record-credit] post-credit cleanup failed: {exc}")
-
-    # 4d. INSERT the synthetic post-credit snapshot at plan.to_pct.
-    c._insert_credit_snapshot(conn, plan, five_hour=five_hour)
+        # Synthetic post-credit snapshot as a snapshot_accept evt (the only
+        # writer of weekly_usage_snapshots on the ingest path). Route it through
+        # `_insert_credit_snapshot(journal=...)` — the SOLE synthetic writer on
+        # both paths — so the non-vacuity stub of `_insert_credit_snapshot` stays
+        # load-bearing (stubbing it disables the synthetic on the ingest path too).
+        c._insert_credit_snapshot(
+            conn, plan, five_hour=five_hour, commit=False,
+            journal=(ctx, f"sa:{id_base}:syn:0"))
 
     # 4e. Clear a stale same-week reset-zero marker so the next record-usage
     # tick can't confirm a phantom reset-to-zero off it.
     _clear_reset_zero_marker()
-
-
-def _force_clear_credit(conn, week_start_date):
-    """--force scope (M2, spec §4): delete ONLY this week's command-owned
-    synthetic snapshots (`source='record-credit'`) + its `weekly_credit_floors`
-    row(s). Never touches real status-line snapshots, and never
-    `week_reset_events` / `percent_milestones` — a partial credit writes
-    neither (no event row -> no segmentation; no milestones)."""
-    conn.execute("DELETE FROM weekly_usage_snapshots "
-                 " WHERE week_start_date=? AND source='record-credit'", (week_start_date,))
-    conn.execute("DELETE FROM weekly_credit_floors "
-                 " WHERE week_start_date=?", (week_start_date,))
-    conn.commit()
 
 
 def _count_stale_replays(conn, plan):
@@ -2648,8 +3492,8 @@ def cmd_record_credit(args) -> int:
         # apply-time completion/refuse/force branch (M2 keys on
         # weekly_credit_floors, NOT week_reset_events — a partial credit never
         # writes a reset-event row). Latest floor wins (a --force re-apply at a
-        # new effective leaves the old row only until _force_clear_credit
-        # deletes it; pick the newest defensively).
+        # new effective leaves the old row only until the ingest-path wce evt's
+        # floor_suppression deletes it; pick the newest defensively).
         existing = conn.execute(
             "SELECT id, effective_at_utc, observed_pre_credit_pct "
             "FROM weekly_credit_floors WHERE week_start_date=? "
@@ -2806,15 +3650,51 @@ def cmd_record_credit(args) -> int:
                 eprint(f"record-credit: could not prepare authoritative state: {exc}")
                 return 3
 
-            # Existing-floor handling remains exactly scoped to this week, but
-            # the weekly tombstone is already fail-closed immediately before
-            # either mutation kernel runs.
-            forced = False
-            if existing is not None and is_force:
-                _force_clear_credit(conn, plan.week_start_date)
-                forced = True
+            # 6f writer reroute (Appendix A): the credit no longer writes stats.db
+            # directly. Build the `record-credit` `op` line (floor columns + the
+            # full 9-field plan + the command-time prior-5h read + the `forced`
+            # flag) and run an AUTHORITATIVE ingest so the command observes its
+            # own write synchronously. The op fold writes the `weekly_credit_floors`
+            # row (Option (i), journal_id = the op line id); `_pipeline_record_credit`
+            # -> `_apply_credit(ctx=..., forced=...)` journals the `weekly_credit_effects`
+            # evt (stale-replica suppression + the `--force` clear of OLD synthetics
+            # + OLD floors) and the synthetic `snapshot_accept` evt. Preview/refusal
+            # paths above appended NOTHING; the weekly tombstone is already
+            # fail-closed immediately before this single append+ingest.
+            forced = bool(existing is not None and is_force)
+            # `five_hour` is the COMMAND-time prior-5h read (before the credit),
+            # carried in the op so the ingest hook derives the synthetic against
+            # the same 5h state the command saw.
             five_hour = _resolve_prior_5h(conn, at_dt)
-            _apply_credit(conn, plan, five_hour=five_hour)
+            capture_iso = now_utc_iso(now)
+            effective_utc = parse_iso_datetime(
+                plan.effective_iso, "op.effective"
+            ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+            import _cctally_journal as _jr
+            import _lib_journal as _lj
+            op = _lj.make_op(
+                at=capture_iso,
+                src="record-credit",
+                payload={
+                    "kind": "weekly_credit_floor",
+                    "week_start_date": plan.week_start_date,
+                    "effective_at_utc": effective_utc,
+                    "observed_pre_credit_pct": float(plan.from_pct),
+                    "applied_at_utc": capture_iso,
+                    "plan": dict(vars(plan)),
+                    "five_hour": list(five_hour),
+                    "forced": forced,
+                },
+            )
+            # Close the command's read connection BEFORE the ingester (the sole
+            # stats.db writer) opens its own — the reroute keeps a single live
+            # stats.db writer. The authoritative cycle runs inline through this
+            # appended op and commits; the stable-projection read below then
+            # observes it.
+            conn.close()
+            conn = None
+            _jr.append_record(op)
+            _jr.run_stats_ingest(mode="authoritative")
 
             # A successful credit is authoritative only after the post-credit
             # DB state has a stable projection and all selected artifacts are
@@ -2862,11 +3742,26 @@ def cmd_record_credit(args) -> int:
             conn.close()
 
 
-def cmd_record_usage(args: argparse.Namespace) -> int:
-    """Record usage data from Claude Code status line rate_limits."""
-    c = _cctally()
-    config = load_config()
-    week_start_name = get_week_start_name(config, getattr(args, "week_start_name", None))
+def cmd_record_usage(
+    args: argparse.Namespace, *,
+    ingest_mode: str = "authoritative",
+    writer: str = "record-usage",
+) -> int:
+    """Record usage from the Claude Code status line rate_limits — DB journal
+    redesign reroute (Appendix A).
+
+    Validates the ingress (weekly plausibility -> exit 2; out-of-band 5h dropped
+    non-fatally), builds the RAW obs line (raw capture only, NO derived week
+    columns), appends it to the journal, and runs the single-flight ingest cycle
+    that derives + journals every stats fact via ``_pipeline_claude_usage``
+    (snapshot_accept / milestones / 5h block / reset-credit / cost snapshot /
+    dollar axes). stats.db is written ONLY through ``run_stats_ingest`` now.
+
+    ``ingest_mode`` -- "authoritative" (default: CLI + statusline publication)
+    observes its own write synchronously; "opportunistic" (hook-tick OAuth /
+    dedup ticks) skips a busy ingest lock and lets the winner consume the line.
+    ``writer`` is the obs line ``src``. Returns 0 on a recorded/deduped tick, 2
+    on an implausible weekly resets_at."""
 
     # ULP-noise sanitization is applied at the cmd_record_usage ingress
     # boundary so every downstream consumer (HWM files, DB rows,
@@ -2939,925 +3834,34 @@ def cmd_record_usage(args: argparse.Namespace) -> int:
         # See _canonical_5h_window_key docstring (spec invariant #3:
         # boundary-straddling jitter must collapse to the first-seen key).
 
-    # Derive week boundaries from resets_at (exact UTC epoch)
-    week_end_at_dt = dt.datetime.fromtimestamp(resets_at, tz=dt.timezone.utc)
-    week_start_at_dt = week_end_at_dt - dt.timedelta(days=7)
-    week_start_date = week_start_at_dt.date().isoformat()
-    week_end_date = week_end_at_dt.date().isoformat()
-    week_start_at = week_start_at_dt.isoformat(timespec="seconds")
-    week_end_at = week_end_at_dt.isoformat(timespec="seconds")
-
-    # Deduplication: skip if nothing changed since last snapshot
-    should_insert = True
-    conn = open_db()
-    try:
-        # Resolve the canonical 5h window key. Pass the most-recent stored
-        # sample as the prior anchor so seconds-level jitter that straddles
-        # a 600-second floor-bucket boundary (e.g. resets_at=1746014999 vs.
-        # 1746015000) collapses to the first-seen key instead of forking
-        # a new one. Without this, both the DB clamp below and the hwm-5h
-        # file write further down would treat the same physical window as
-        # distinct, regressing the monotonic 5h percent (spec invariant #3).
-        if five_hour_resets_at_epoch is not None:
-            prior_5h_epoch: int | None = None
-            prior_5h_key: int | None = None
-            # Tier 1: blocks-table lookup (steady state). Find the closest
-            # canonical block whose five_hour_resets_at is within ±1800s of
-            # the new resets_at. The blocks table has one canonical row per
-            # physical window after the merge_5h_block_duplicates_v1
-            # migration, so this is more reliable than scanning
-            # weekly_usage_snapshots for an "anchor" row — snapshots can be
-            # noisy when the status line returns out-of-order rate-limit
-            # data from older windows (the F4 incident: snap N+1 carrying a
-            # window-A boundary-jitter resets_at, but snap N reported an
-            # OLDER window B; pre-fix the prior-anchor lookup picked B as
-            # the anchor and the |epoch-prior| > 600 check then forked a
-            # new key for what was actually still window A). 1800s is wide
-            # enough to absorb known jitter, narrow enough that consecutive
-            # 5h blocks (>4h apart in resets_at) cannot collide.
-            try:
-                prior_block_row = conn.execute(
-                    """
-                    SELECT five_hour_window_key, five_hour_resets_at
-                      FROM five_hour_blocks
-                     WHERE abs(? - CAST(strftime('%s', five_hour_resets_at) AS INTEGER)) <= ?
-                     ORDER BY abs(? - CAST(strftime('%s', five_hour_resets_at) AS INTEGER)) ASC
-                     LIMIT 1
-                    """,
-                    (
-                        five_hour_resets_at_epoch,
-                        c._FIVE_HOUR_JITTER_FLOOR_SECONDS * 3,
-                        five_hour_resets_at_epoch,
-                    ),
-                ).fetchone()
-                if prior_block_row is not None:
-                    prior_iso = prior_block_row["five_hour_resets_at"]
-                    prior_5h_epoch = int(parse_iso_datetime(
-                        prior_iso, "prior 5h block anchor"
-                    ).timestamp())
-                    prior_5h_key = int(prior_block_row["five_hour_window_key"])
-            except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
-                eprint(f"[record-usage] prior 5h block-anchor lookup failed: {exc}")
-
-            # Tier 2: snapshot lookup (legacy fallback). Only run when Tier
-            # 1 missed (no canonical block row exists yet — the brand-new-
-            # window case before any record-usage tick has materialized a
-            # five_hour_blocks row). Tier 1's empty-result guard is the
-            # `prior_block_row is not None` test above; replicating it
-            # here keeps Tier 2 strictly secondary.
-            if prior_5h_key is None:
-                try:
-                    prior_5h_row = conn.execute(
-                        "SELECT five_hour_resets_at, five_hour_window_key "
-                        "FROM weekly_usage_snapshots "
-                        "WHERE five_hour_resets_at IS NOT NULL "
-                        "  AND five_hour_window_key IS NOT NULL "
-                        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
-                    ).fetchone()
-                    if prior_5h_row is not None:
-                        prior_iso = prior_5h_row["five_hour_resets_at"]
-                        prior_5h_epoch = int(parse_iso_datetime(
-                            prior_iso, "prior 5h anchor"
-                        ).timestamp())
-                        prior_5h_key = int(prior_5h_row["five_hour_window_key"])
-                except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
-                    eprint(f"[record-usage] prior 5h anchor lookup failed: {exc}")
-
-            # Tier 3 is implicit: with no anchor, _canonical_5h_window_key
-            # falls back to the pure 600-second floor.
-            five_hour_window_key = _canonical_5h_window_key(
-                five_hour_resets_at_epoch,
-                prior_epoch=prior_5h_epoch,
-                prior_key=prior_5h_key,
-            )
-
-        # Mid-week reset detection. When `resets_at` advances before the
-        # previously-declared reset actually fires (Anthropic-initiated
-        # goodwill reset, or any API-side shift), record one week_reset_events
-        # row so display + cost layers can treat the observed moment as the
-        # old week's effective end AND the new week's effective start. The
-        # monotonic check below stays keyed on week_start_date so it still
-        # guards the new week against stale rate-limit data independently.
-        # Both boundaries canonicalize to hour (same rule make_week_ref uses)
-        # so minute/second-level Anthropic jitter doesn't masquerade as a
-        # reset and the stored values match what WeekRef.week_end_at carries.
-        # The 5h-block cross-flag is no longer threaded from here —
-        # maybe_update_five_hour_block re-derives it every tick by JOINing
-        # against week_reset_events (self-healing, see helper for rationale).
-        try:
-            cur_end_canon = _canonicalize_optional_iso(week_end_at, "record.cur")
-            prior = conn.execute(
-                "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_end_at IS NOT NULL "
-                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
-            ).fetchone()
-            if prior and prior["week_end_at"] and cur_end_canon:
-                prior_end_canon = _canonicalize_optional_iso(
-                    prior["week_end_at"], "record.prior"
-                )
-                prior_pct = prior["weekly_percent"]
-                # Use _command_as_of() so CCTALLY_AS_OF pins the predicate
-                # for tests (no behavior change in production — falls back
-                # to wall-clock when the env hook is unset). This makes
-                # mid-week-reset detection deterministic against fixtures
-                # whose `prior_end` is a fixed historical instant.
-                now_utc = _command_as_of()
-                if prior_end_canon and prior_end_canon != cur_end_canon:
-                    prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
-                    # Fire only when (a) prior window was still in the FUTURE
-                    # (Anthropic shifted the boundary before natural expiration),
-                    # AND (b) weekly_percent dropped by RESET_PCT_DROP_THRESHOLD
-                    # or more (filters out API flaps / transient boundary
-                    # jitter where usage stays roughly the same).
-                    if (
-                        prior_end_dt > now_utc
-                        and prior_pct is not None
-                        and c._is_reset_drop(prior_pct, weekly_percent)
-                    ):
-                        # See _backfill_week_reset_events for why we floor
-                        # the reset moment to the hour (natural display
-                        # boundary, aligned with Anthropic's hour-only
-                        # resets_at values).
-                        effective_iso = _floor_to_hour(now_utc).isoformat(timespec="seconds")
-                        conn.execute(
-                            "INSERT OR IGNORE INTO week_reset_events "
-                            "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-                            (now_utc_iso(), prior_end_canon, cur_end_canon,
-                             effective_iso),
-                        )
-                        conn.commit()
-                elif prior_end_canon and prior_end_canon == cur_end_canon:
-                    # In-place credit branch (v1.7.2) + reset-to-zero debounce
-                    # (issue #128). Same end_at across two captures. A >=25pp drop
-                    # is a goodwill credit and fires immediately; a reset-to-zero
-                    # (post <= floor, 3..25pp drop) is debounced against a
-                    # transient API zero — armed on the first ~0, confirmed only
-                    # if the next reading stays low (<= half the pre-zero
-                    # baseline), cleared on recovery toward baseline. The gate
-                    # drops the _is_reset_drop term so the recovery-clear path is
-                    # reachable. See the spec for the midpoint rationale.
-                    prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
-                    if prior_end_dt > now_utc and prior_pct is not None:
-                        # Read the pending reset-to-zero marker up front (pure
-                        # file read) and compute whether it is armed for THIS
-                        # window; the debounce CLASSIFIER (pure) decides the
-                        # action from those values + the c._RESET_* constants,
-                        # then the glue below executes the decided I/O. The 5
-                        # branch outcomes (fire-immediate / confirm / clear /
-                        # arm / none) map 1:1 to the pre-extraction structure.
-                        marker = _read_reset_zero_marker()
-                        armed = (
-                            marker is not None
-                            and marker[0] == week_start_date
-                            and marker[1] == cur_end_canon
-                        )
-                        decision = plan_weekly_credit_debounce(
-                            prior_pct, weekly_percent,
-                            drop_threshold=c._RESET_PCT_DROP_THRESHOLD,
-                            zero_floor_pct=c._RESET_ZERO_FLOOR_PCT,
-                            zero_min_drop_pct=c._RESET_ZERO_MIN_DROP_PCT,
-                            marker_armed=armed,
-                            marker_baseline=(marker[2] if armed else None),
-                        ).action
-                        if decision == FIRE_IMMEDIATE:
-                            # >=25pp goodwill credit — fire immediately, never
-                            # debounced. Clear any pending arm (now moot).
-                            _clear_reset_zero_marker()
-                            _fire_in_place_credit(
-                                conn, week_start_date, cur_end_canon, weekly_percent,
-                                observed_pre_credit_pct=float(prior_pct),
-                                effective_dt=_floor_to_hour(now_utc),
-                            )
-                        elif decision == CONFIRM_RESET:
-                            # Second reading stayed low → confirm. Anchor the
-                            # reset at the FIRST-zero instant from the marker
-                            # (UTC-normalized like the backfill in-place path).
-                            first_zero_dt = parse_iso_datetime(
-                                marker[3], "reset_zero_marker.first_zero"
-                            ).astimezone(dt.timezone.utc)
-                            _fire_in_place_credit(
-                                conn, week_start_date, cur_end_canon,
-                                weekly_percent,
-                                observed_pre_credit_pct=marker[2],
-                                effective_dt=_floor_to_hour(first_zero_dt),
-                            )
-                            # Clear ONLY after the fire completes (P2a): a
-                            # mid-fire crash leaves the marker armed so the next
-                            # zero re-confirms + re-runs the idempotent pivots.
-                            _clear_reset_zero_marker()
-                        elif decision == CLEAR_MARKER:
-                            # Recovered toward baseline → transient zero, not a
-                            # reset. Clear, do not fire.
-                            _clear_reset_zero_marker()
-                        elif decision == ARM_MARKER:
-                            # First ~0 → arm; do NOT fire. The write clamp
-                            # suppresses this 0 (no event row yet), so the prior
-                            # snapshot stays at the baseline and this shape
-                            # re-evaluates next tick. first_zero_iso is the
-                            # _command_as_of() value (now_utc), NOT wall-clock —
-                            # it becomes the effective anchor.
-                            _arm_reset_zero_marker(
-                                week_start_date, cur_end_canon,
-                                baseline_pct=float(prior_pct),
-                                first_zero_iso=now_utc.isoformat(timespec="seconds"),
-                            )
-                        # else NO_ACTION: not a reset shape and not armed →
-                        #     nothing. A non-matching stale marker is inert
-                        #     (ignored on key mismatch, overwritten by next arm).
-
-            # ── 5h in-place credit detection (parallel to weekly above) ──
-            # Spec §2.2 of
-            # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md.
-            # Slot SECOND so the weekly branch retains control-flow
-            # priority — both branches are independent (they touch
-            # different tables) and the order has no behavioral
-            # interaction. Same outer try/except wraps both so a
-            # 5h-detection failure logs but does not regress the rest
-            # of cmd_record_usage.
-            #
-            # Diverges from weekly in three places:
-            #   - Threshold: 5.0pp (constant on cctally module), not 25.0pp.
-            #     The 5h envelope is smaller so a 5pp move is
-            #     proportionally larger.
-            #   - Effective-iso floor: 10-min (matches
-            #     ``_canonical_5h_window_key``'s 600s floor), not hour.
-            #     Up to ~30 distinct slots per 5h block; same-slot
-            #     collisions absorbed by UNIQUE per spec §2.3.
-            #   - Pre-check: pair-checks the latest event's
-            #     ``(prior_percent, post_percent)`` against this tick's
-            #     ``(prior_5h_pct, five_hour_percent)``, not
-            #     ``new_week_end_at`` equality. A genuine replay matches
-            #     BOTH fields; a NEW credit-with-idle (prior_pct equals
-            #     the prior credit's post_pct because the user didn't
-            #     move between credits) matches only one field and
-            #     correctly proceeds to write a second event row.
-            try:
-                if (
-                    five_hour_window_key is not None
-                    and five_hour_percent is not None
-                ):
-                    prior_5h_row = conn.execute(
-                        "SELECT five_hour_window_key, five_hour_percent, "
-                        "       five_hour_resets_at "
-                        "  FROM weekly_usage_snapshots "
-                        " WHERE five_hour_window_key IS NOT NULL "
-                        "   AND five_hour_percent IS NOT NULL "
-                        " ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
-                    ).fetchone()
-                    if (
-                        prior_5h_row is not None
-                        and int(prior_5h_row["five_hour_window_key"])
-                            == int(five_hour_window_key)
-                        and prior_5h_row["five_hour_resets_at"] is not None
-                    ):
-                        prior_5h_pct = float(prior_5h_row["five_hour_percent"])
-                        prior_5h_resets_dt = parse_iso_datetime(
-                            prior_5h_row["five_hour_resets_at"],
-                            "prior.five_hour_resets_at",
-                        )
-                        # ``now_utc`` was bound earlier in this same
-                        # outer try block from
-                        # ``dt.datetime.now(dt.timezone.utc)``; reuse it
-                        # so both branches see the same instant.
-                        if plan_five_hour_credit(
-                            prior_5h_pct, float(five_hour_percent),
-                            drop_threshold=c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD,
-                            prior_resets_in_future=(prior_5h_resets_dt > now_utc),
-                        ):
-                            # Pair-check dedup pre-check (spec §2.2;
-                            # refined by Codex r4 P1 finding). The
-                            # round-1 predicate compared only the
-                            # latest event's ``post_percent`` against
-                            # this tick's ``prior_5h_pct``; that
-                            # false-positived on a legitimate 2nd
-                            # credit where the user was idle between
-                            # credits (Credit 1 lands prior=20/post=5;
-                            # user does nothing; Credit 2 arrives with
-                            # CLI percent=0 so prior_5h_pct=5 reads
-                            # equal to stored post_percent=5 →
-                            # silently swallowed). Pair-checking
-                            # against BOTH fields disambiguates: a
-                            # genuine replay matches BOTH; a new
-                            # credit-with-idle matches at most ONE
-                            # (the prior side coincides but
-                            # post_percent differs).
-                            most_recent = conn.execute(
-                                "SELECT prior_percent, post_percent "
-                                "  FROM five_hour_reset_events "
-                                " WHERE five_hour_window_key = ? "
-                                " ORDER BY id DESC LIMIT 1",
-                                (int(five_hour_window_key),),
-                            ).fetchone()
-                            is_dup = (
-                                most_recent is not None
-                                and round(prior_5h_pct, 1)
-                                == round(float(most_recent["prior_percent"]), 1)
-                                and round(float(five_hour_percent), 1)
-                                == round(float(most_recent["post_percent"]), 1)
-                            )
-                            # 10-min floor (spec §2.3 — bounded
-                            # stacked-credit resolution; one event per
-                            # 10-min slot per block). Resolved BEFORE
-                            # the ``if not is_dup`` branch so it's in
-                            # scope for the pivots below (per memory
-                            # ``project_dedup_must_not_gate_side_effects.md``:
-                            # the recovery-tick path must still force
-                            # HWM + DELETE even when the INSERT is
-                            # absorbed by the pre-check or by
-                            # UNIQUE — see comment below for the
-                            # crash scenario). ``_floor_to_ten_minutes``
-                            # is a cctally module attribute; the
-                            # ``c.X`` accessor resolves at call time
-                            # so test ``monkeypatch.setitem(ns,
-                            # "_floor_to_ten_minutes", …)``
-                            # propagates.
-                            effective_dt = c._floor_to_ten_minutes(now_utc)
-                            effective_iso = effective_dt.isoformat(
-                                timespec="seconds"
-                            )
-                            if not is_dup:
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO five_hour_reset_events "
-                                    "(detected_at_utc, five_hour_window_key, "
-                                    " prior_percent, post_percent, "
-                                    " effective_reset_at_utc) "
-                                    "VALUES (?, ?, ?, ?, ?)",
-                                    (
-                                        now_utc_iso(),
-                                        int(five_hour_window_key),
-                                        prior_5h_pct,
-                                        float(five_hour_percent),
-                                        effective_iso,
-                                    ),
-                                )
-                                conn.commit()
-                            # Pivots fire UNCONDITIONALLY whenever a
-                            # credit is detected — NOT gated on
-                            # ``not is_dup`` and NOT on
-                            # ``rowcount == 1``. Memory
-                            # ``project_dedup_must_not_gate_side_effects.md``:
-                            # "Skipping a no-op INSERT must NOT skip
-                            # milestones/rollups/alerts; prior run may
-                            # have died mid-flight." Crash scenario A:
-                            # tick N committed the event row, then died
-                            # before HWM + DELETE. Tick N+1's
-                            # INSERT OR IGNORE returns rowcount == 0
-                            # (UNIQUE absorbs) but the system is still
-                            # wedged on the pre-credit HWM + stale-
-                            # replica rows. Crash scenario B (the
-                            # Codex r4 finding): a recovery tick where
-                            # ``(prior, post)`` pair-matches the
-                            # already-stored event row also takes the
-                            # ``is_dup`` branch; without the hoist the
-                            # pivots would be skipped and the system
-                            # would stay wedged. The pivots are
-                            # individually idempotent (file overwrite
-                            # + DELETE on a stable predicate), so
-                            # re-running them on the recovery tick is
-                            # always safe. Mirrors the weekly hoist at
-                            # ``_cctally_record.py`` after the
-                            # ``if already is None`` block (grep
-                            # ``Force-write hwm-7d``).
-                            #
-                            # Force-write hwm-5h: bypasses the
-                            # monotonic guard at the normal hwm-5h
-                            # writer below. Lands AFTER
-                            # ``conn.commit()`` so a concurrent reader
-                            # doesn't see the new HWM before the
-                            # event row is durable. File format
-                            # matches the canonical writer:
-                            # ``<key> <percent>\n``.
-                            try:
-                                (_cctally_core.APP_DIR / "hwm-5h").write_text(
-                                    f"{int(five_hour_window_key)} "
-                                    f"{float(five_hour_percent)}\n"
-                                )
-                            except OSError:
-                                pass
-                            # Stale-replica DELETE (spec §4.3).
-                            # Defends against claude-statusline
-                            # replaying the pre-credit
-                            # ``--five-hour-percent`` value past the
-                            # credit moment from its own in-memory
-                            # HWM cache. 1.0pp tolerance band (issue
-                            # #48 — symmetric follow-up to weekly #45)
-                            # around the observed pre-credit baseline
-                            # absorbs any rounding drift between
-                            # cctally's OAuth read and statusline's
-                            # ``--five-hour-percent`` payload (today
-                            # they match byte-identically, but the
-                            # band future-proofs against Anthropic or
-                            # statusline changing 5h rounding). The
-                            # band stays well below the 5.0pp 5h
-                            # in-place credit detection threshold
-                            # (``_FIVE_HOUR_RESET_PCT_DROP_THRESHOLD``)
-                            # — 4pp safety margin — so legitimate
-                            # post-credit values are never caught.
-                            # ``unixepoch()`` on both sides for offset
-                            # robustness (Z vs +00:00). Bind is the
-                            # in-scope ``prior_5h_pct``, which equals
-                            # the just-stamped
-                            # ``five_hour_reset_events.prior_percent``
-                            # on the event row.
-                            try:
-                                conn.execute(
-                                    "DELETE FROM weekly_usage_snapshots "
-                                    " WHERE five_hour_window_key = ? "
-                                    "   AND unixepoch(captured_at_utc) "
-                                    "       >= unixepoch(?) "
-                                    "   AND ABS(five_hour_percent - ?) "
-                                    "       < 1.0",
-                                    (
-                                        int(five_hour_window_key),
-                                        effective_iso,
-                                        prior_5h_pct,
-                                    ),
-                                )
-                                conn.commit()
-                            except sqlite3.DatabaseError as exc:
-                                eprint(
-                                    "[record-usage] 5h post-credit "
-                                    f"cleanup failed: {exc}"
-                                )
-            except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
-                eprint(
-                    f"[record-usage] 5h in-place-credit detection "
-                    f"failed: {exc}"
-                )
-        except (sqlite3.DatabaseError, ValueError) as exc:
-            eprint(f"[record-usage] reset-event detection failed: {exc}")
-
-        # 7-day usage is monotonically non-decreasing within a billing week
-        # — UNTIL an in-place weekly credit lowers it. There are TWO credit
-        # shapes and BOTH must floor this clamp, or a real post-credit tick
-        # is suppressed and never stored:
-        #   (a) an Anthropic mid-week reset / >=25pp auto-credit writes a
-        #       `week_reset_events` row (it also re-anchors the window); and
-        #   (b) a manual `record-credit` partial credit writes a
-        #       `weekly_credit_floors` row WITHOUT re-anchoring the week
-        #       (record-credit M2, #209).
-        # `_reset_aware_floor` returns the LATEST in-week effective across
-        # both legs. The MAX query then filters to samples captured at-or-
-        # after that floor, so a fresh post-credit OAuth value (e.g. 37%
-        # after a 46->31 credit) lands instead of being held back by stale
-        # pre-credit history (46%). Without the credit-floor leg, the 37%
-        # tick is `round(37,1) < round(46,1)` -> should_insert=False ->
-        # never stored, cascading to every latest-snapshot surface
-        # (the M2 linchpin; spec §4a, test S13).
-        # When neither leg has a row, the floor is None -> '1970-...' epoch-
-        # zero default -> the filter is a no-op and legacy clamp behavior is
-        # preserved byte-identically.
-        # NB: comparison wrapped with ``unixepoch()`` on BOTH sides.
-        # ``captured_at_utc`` is stored with `Z` suffix, but the floor may
-        # carry a non-UTC / +00:00 offset spelling. Lex string compare on
-        # mixed offsets silently mis-orders moments for non-UTC hosts
-        # (CLAUDE.md gotcha: 5h-block cross-reset flag — "all comparisons go
-        # through unixepoch(), NOT lex BETWEEN/`<`/`>`"). Same rule here, and
-        # inside `_reset_aware_floor`'s own ORDER BY.
-        clamp_floor_iso = _reset_aware_floor(
-            conn, week_start_date, week_start_at, week_end_at,
-        ) or "1970-01-01T00:00:00Z"
-        max_row = conn.execute(
-            """
-            SELECT MAX(weekly_percent) AS v
-              FROM weekly_usage_snapshots
-             WHERE week_start_date = ?
-               AND unixepoch(captured_at_utc) >= unixepoch(?)
-            """,
-            (week_start_date, clamp_floor_iso),
-        ).fetchone()
-        if hwm_clamp_applies(weekly_percent, max_row["v"] if max_row else None):
-            should_insert = False
-        else:
-            # 5-hour usage is monotonically non-decreasing within a window
-            # — UNTIL an in-place 5h credit fires. When a
-            # ``five_hour_reset_events`` row exists for THIS
-            # ``five_hour_window_key``, the MAX query filters to samples
-            # captured at-or-after the event's ``effective_reset_at_utc``
-            # so a fresh post-credit OAuth value (e.g. 4%) lands instead
-            # of being re-clamped to the pre-credit max (e.g. 28%). When
-            # no event row exists, ``COALESCE`` defaults to epoch-zero so
-            # the filter is a no-op and legacy clamp behavior is preserved
-            # byte-identically.
-            #
-            # ``unixepoch()`` on BOTH sides for offset robustness — stored
-            # ``captured_at_utc`` carries ``Z`` while
-            # ``effective_reset_at_utc`` carries ``+00:00``. Lex compare
-            # would silently mis-order moments for non-UTC hosts (same
-            # gotcha as the weekly clamp / 5h-block cross-reset flag).
-            #
-            # Joining on ``five_hour_window_key`` (canonical 10-min-floored
-            # epoch) absorbs Anthropic's seconds-level jitter on
-            # ``resets_at``; an ISO-string equality at this site silently
-            # skipped the clamp every time a jittered fetch landed in
-            # the same physical 5h window (spec Bug B).
-            #
-            # Spec §4.1 of
-            # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md.
-            if five_hour_percent is not None and five_hour_window_key is not None:
-                max_5h_row = conn.execute(
-                    """
-                    SELECT MAX(five_hour_percent) AS v
-                      FROM weekly_usage_snapshots
-                     WHERE five_hour_window_key = ?
-                       AND unixepoch(captured_at_utc) >= unixepoch(COALESCE(
-                         (SELECT effective_reset_at_utc
-                            FROM five_hour_reset_events
-                           WHERE five_hour_window_key = ?
-                           ORDER BY id DESC
-                           LIMIT 1),
-                         '1970-01-01T00:00:00Z'
-                       ))
-                    """,
-                    (int(five_hour_window_key), int(five_hour_window_key)),
-                ).fetchone()
-                if hwm_clamp_applies(
-                    five_hour_percent, max_5h_row["v"] if max_5h_row else None
-                ):
-                    five_hour_percent = float(max_5h_row["v"])
-
-            # Dedup vs last snapshot: if BOTH weekly_percent and
-            # five_hour_percent are unchanged from the most recent row in
-            # this week, swallow the insert. Tests of the 5h clamp must
-            # vary --percent (or --five-hour-percent) between calls, or
-            # the second call is dropped here before the clamp even runs
-            # — see bin/cctally-5h-canonical-test scenario B.
-            last = conn.execute(
-                """
-                SELECT weekly_percent, five_hour_percent
-                FROM weekly_usage_snapshots
-                WHERE week_start_date = ?
-                ORDER BY captured_at_utc DESC, id DESC
-                LIMIT 1
-                """,
-                (week_start_date,),
-            ).fetchone()
-            if last is not None:
-                if float(last["weekly_percent"]) == weekly_percent:
-                    last_5h = last["five_hour_percent"]
-                    if five_hour_percent is None or (
-                        last_5h is not None and float(last_5h) == five_hour_percent
-                    ):
-                        should_insert = False
-
-        # No backfill of 5h data on existing milestones — we don't have
-        # authentic crossing-time values for them.  New milestones created
-        # by the status line path will have 5h data set at creation time
-        # via maybe_record_milestone().
-    finally:
-        conn.close()
-
-    if not should_insert:
-        # Self-heal: a prior record-usage invocation may have inserted
-        # the snapshot but been killed (CC self-update, machine sleep,
-        # OOM) before maybe_record_milestone / maybe_update_five_hour_block
-        # could run. Pre-probe both surfaces with cheap indexed SELECTs
-        # and only invoke the helpers when a row is actually missing or
-        # stale. Steady-state cost: 1-3 SELECTs (latest snapshot always;
-        # +max_milestone if floor>=1; +block last_observed if window_key
-        # is set); ZERO JSONL re-ingest on healthy ticks. The helpers themselves are idempotent under
-        # concurrent record-usage instances (INSERT OR IGNORE for
-        # percent_milestones; SQLite write-lock serialization for the
-        # 5h upsert). Without the pre-probe, every dedup tick would
-        # trigger sync_cache + a window walk + replace-all rollups via
-        # maybe_update_five_hour_block's unconditional _compute_block_totals
-        # call. Regression: bin/cctally-record-usage-selfheal-test.
-        try:
-            heal_conn = open_db()
-            try:
-                latest_row = heal_conn.execute(
-                    "SELECT * FROM weekly_usage_snapshots "
-                    "WHERE week_start_date = ? "
-                    "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-                    (week_start_date,),
-                ).fetchone()
-                if latest_row is None:
-                    return 0
-                latest_saved = _saved_dict_from_usage_row(latest_row)
-
-                # Probe 1: do we owe a percent milestone? Snap up before
-                # floor (status-line API returns 0.N*100 which can fall
-                # one ULP short of N — same convention as
-                # maybe_record_milestone).
-                latest_floor = math.floor(
-                    float(latest_row["weekly_percent"]) + 1e-9
-                )
-                need_milestone_heal = False
-                if latest_floor >= 1:
-                    # v1.7.2: scope the heal probe to the ACTIVE segment.
-                    # Without this, a credited week's MAX over the whole
-                    # ledger would still read the pre-credit ceiling
-                    # (e.g. 67%) and silently suppress the post-credit
-                    # ledger's heal even though it has zero rows.
-                    captured_at_for_probe = latest_row["captured_at_utc"]
-                    week_end_at_for_probe = latest_row["week_end_at"]
-                    heal_segment = 0
-                    if week_end_at_for_probe and captured_at_for_probe:
-                        seg = heal_conn.execute(
-                            "SELECT id FROM week_reset_events "
-                            "WHERE new_week_end_at = ? "
-                            "  AND unixepoch(effective_reset_at_utc) <= unixepoch(?) "
-                            "ORDER BY id DESC LIMIT 1",
-                            (week_end_at_for_probe, captured_at_for_probe),
-                        ).fetchone()
-                        if seg is not None:
-                            heal_segment = int(seg["id"])
-                    max_existing = heal_conn.execute(
-                        "SELECT MAX(percent_threshold) AS m "
-                        "FROM percent_milestones "
-                        "WHERE week_start_date = ? AND reset_event_id = ?",
-                        (week_start_date, heal_segment),
-                    ).fetchone()
-                    existing_m = (
-                        int(max_existing["m"])
-                        if max_existing and max_existing["m"] is not None
-                        else None
-                    )
-                    if milestone_coverage_owes(existing_m, latest_floor):
-                        need_milestone_heal = True
-
-                # Probe 2: do we owe a 5h-block update? Either no row
-                # for this canonical window, or the existing row's
-                # last_observed_at_utc is stale relative to the latest
-                # snapshot's captured_at_utc (the kill landed between
-                # insert_usage_snapshot and maybe_update_five_hour_block).
-                #
-                # Round-3: ALSO scope the milestone-coverage half of
-                # this probe by ACTIVE 5h SEGMENT. Without this, a
-                # credited block's MAX over the whole milestone ledger
-                # would still read the pre-credit ceiling (e.g. 28%) and
-                # silently suppress the post-credit ledger's heal even
-                # though it has zero rows. Mirrors weekly Probe 1's
-                # segment-aware fix above. Uses
-                # ``_resolve_active_five_hour_reset_event_id`` to find
-                # the active segment for the latest snapshot's window.
-                need_5h_heal = False
-                incoming_block_saved: dict[str, Any] | None = None
-                window_key = latest_row["five_hour_window_key"]
-                if window_key is not None:
-                    block_row = heal_conn.execute(
-                        "SELECT last_observed_at_utc "
-                        "FROM five_hour_blocks "
-                        "WHERE five_hour_window_key = ?",
-                        (int(window_key),),
-                    ).fetchone()
-                    if block_row is None:
-                        need_5h_heal = True
-                    elif (
-                        block_row["last_observed_at_utc"]
-                        < latest_row["captured_at_utc"]
-                    ):
-                        need_5h_heal = True
-                    else:
-                        # Block row exists AND last_observed is fresh
-                        # — but the post-credit milestone segment may
-                        # still owe rows. Scope MAX(percent_threshold)
-                        # by the active reset_event_id segment so
-                        # post-credit climbs from threshold 1 trigger
-                        # heal even when the pre-credit segment already
-                        # crossed higher thresholds. Probe shape mirrors
-                        # weekly Probe 1 (lines 1922-1956).
-                        five_hour_percent_for_probe = latest_row[
-                            "five_hour_percent"
-                        ]
-                        if five_hour_percent_for_probe is not None:
-                            latest_5h_floor = math.floor(
-                                float(five_hour_percent_for_probe) + 1e-9
-                            )
-                            if latest_5h_floor >= 1:
-                                heal_5h_segment = (
-                                    _resolve_active_five_hour_reset_event_id(
-                                        heal_conn, int(window_key)
-                                    )
-                                )
-                                max_5h_existing = heal_conn.execute(
-                                    "SELECT MAX(percent_threshold) AS m "
-                                    "FROM five_hour_milestones "
-                                    "WHERE five_hour_window_key = ? "
-                                    "  AND reset_event_id = ?",
-                                    (int(window_key), heal_5h_segment),
-                                ).fetchone()
-                                existing_5h_m = (
-                                    int(max_5h_existing["m"])
-                                    if max_5h_existing
-                                    and max_5h_existing["m"] is not None
-                                    else None
-                                )
-                                if milestone_coverage_owes(
-                                    existing_5h_m, latest_5h_floor
-                                ):
-                                    need_5h_heal = True
-                # Window-rollover heal: this dedup tick observed a NEW 5h
-                # window (its canonical ``five_hour_window_key`` differs
-                # from the latest STORED snapshot's) whose
-                # ``five_hour_blocks`` anchor does not exist yet. The dedup
-                # above swallowed the snapshot insert because the weekly/5h
-                # percents were flat, so ``latest_row`` still points at the
-                # PREVIOUS window and the ``need_5h_heal`` probe only ever
-                # checked that old (still-fresh) window — leaving the
-                # current window unanchored. Materialize the missing block
-                # now so ``blocks`` and the dashboard anchor the ACTIVE
-                # block to its API-derived window instead of falling back to
-                # the heuristic "~" until the percent next moves (the
-                # statusline is unaffected — it renders the live
-                # rate_limits, not the DB). Block-only: NO snapshot is
-                # inserted (the tick stays deduped); the "latest snapshot"
-                # weekly/5h surfaces and monotonicity clamps are untouched.
-                # ``maybe_update_five_hour_block`` is an upsert keyed on
-                # ``five_hour_window_key``, so later flat ticks in the same
-                # window re-run it as an idempotent no-op.
-                if (
-                    five_hour_window_key is not None
-                    and five_hour_percent is not None
-                    and five_hour_resets_at_str is not None
-                    and (
-                        window_key is None
-                        or int(window_key) != int(five_hour_window_key)
-                    )
-                ):
-                    incoming_block_row = heal_conn.execute(
-                        "SELECT 1 FROM five_hour_blocks "
-                        "WHERE five_hour_window_key = ? LIMIT 1",
-                        (int(five_hour_window_key),),
-                    ).fetchone()
-                    if incoming_block_row is None:
-                        incoming_block_saved = {
-                            # ``id`` is extracted-but-unused by
-                            # maybe_update_five_hour_block; reuse latest_row's
-                            # for output-dict shape parity with a real insert.
-                            "id": int(latest_row["id"]),
-                            "capturedAt": now_utc_iso(),
-                            "weeklyPercent": weekly_percent,
-                            "fiveHourPercent": five_hour_percent,
-                            "fiveHourResetsAt": five_hour_resets_at_str,
-                            "fiveHourWindowKey": int(five_hour_window_key),
-                        }
-            finally:
-                heal_conn.close()
-
-            if need_milestone_heal or need_5h_heal or incoming_block_saved:
-                if need_milestone_heal:
-                    try:
-                        maybe_record_milestone(latest_saved)
-                    except Exception as exc:
-                        eprint(f"[milestone] self-heal error: {exc}")
-                if need_5h_heal:
-                    try:
-                        maybe_update_five_hour_block(latest_saved)
-                    except Exception as exc:
-                        eprint(f"[5h-block] self-heal error: {exc}")
-                if incoming_block_saved is not None:
-                    try:
-                        maybe_update_five_hour_block(incoming_block_saved)
-                    except Exception as exc:
-                        eprint(f"[5h-block] window-rollover heal error: {exc}")
-
-            # Dollar-decoupled axes (budget / project-budget / projected) heal on
-            # EVERY dedup tick — USD spend can cross a $ threshold while the
-            # weekly/5h percent is flat (so should_insert is False), and a prior
-            # run may have died after insert_usage_snapshot but before the
-            # post-insert axis block. Each helper gates first on config (a cheap
-            # read for non-users) and pre-probes its recorded set before any cost
-            # scan, so non-budget users pay ~nothing here. Order matches the
-            # post-insert block so the projected budget_usd leg's skip_sync=True
-            # cache-warming dependency on the actual-budget axis still holds.
-            # [Dedup mustn't gate side effects]
-            for _heal_fn, _heal_tag in (
-                (maybe_record_budget_milestone, "budget-milestone"),
-                (maybe_record_project_budget_milestone,
-                 "project-budget-milestone"),
-                (maybe_record_codex_budget_milestone,
-                 "codex-budget-milestone"),
-                (maybe_record_projected_alert, "projected-alert"),
-            ):
-                try:
-                    _heal_fn(latest_saved)
-                except Exception as exc:
-                    eprint(f"[{_heal_tag}] self-heal error: {exc}")
-        except Exception as exc:
-            eprint(f"[record-usage] self-heal lookup failed: {exc}")
-        return 0
-
-    payload = {
-        # Record the true feeder. Defaults to "statusline" for the public
-        # `record-usage` CLI (preserves prior behavior); the OAuth callers
-        # (_hook_tick_oauth_refresh / _refresh_usage_inproc) pass "api", and
-        # the statusline persist feeder passes "statusline". Previously this
-        # was hard-coded "statusline" for EVERY caller, mislabeling OAuth
-        # rows (spec §5). No migration — the column already exists.
+    # Build the RAW observation (spec 4.2 / 5.3 -- raw capture only, NO derived
+    # week columns; `_pipeline_claude_usage` canonicalizes the week boundaries +
+    # the 5h window key at ingest). Append it, then run the single-flight cycle.
+    raw: dict[str, Any] = {
+        "weekly_percent": weekly_percent,
+        "resets_at": resets_at,
         "source": getattr(args, "source", "statusline"),
-        "capturedAt": now_utc_iso(),
-        "weeklyPercent": weekly_percent,
-        "weekStartDate": week_start_date,
-        "weekEndDate": week_end_date,
-        "weekStartAt": week_start_at,
-        "weekEndAt": week_end_at,
+        # The CAPTURE wall clock (now_utc_iso(), NOT _command_as_of()) — the
+        # snapshot `captured_at_utc` + the milestone/5h-block/dollar-axis stamps
+        # + the block cost-sum range end. Legacy used wall clock for these while
+        # DETECTION (reset/credit) used `_command_as_of()`; the obs line `at`
+        # carries `_command_as_of()` (below) so the hook preserves that split.
+        # Captured ONCE here (append time) and journaled, so a delayed ingest is
+        # deterministic (never the ingest wall clock).
+        "captured_at": now_utc_iso(),
     }
     if five_hour_percent is not None:
-        payload["fiveHourPercent"] = five_hour_percent
+        raw["five_hour_percent"] = five_hour_percent
     if five_hour_resets_at_str is not None:
-        payload["fiveHourResetsAt"] = five_hour_resets_at_str
-    if five_hour_window_key is not None:
-        payload["fiveHourWindowKey"] = five_hour_window_key
+        raw["five_hour_resets_at"] = five_hour_resets_at_str
 
-    saved = insert_usage_snapshot(payload, week_start_name)
-    try:
-        maybe_record_milestone(saved)
-    except Exception as exc:
-        eprint(f"[milestone] unexpected error: {exc}")
-
-    # NEW: 5h-block rollup (paired with maybe_record_milestone for 7d).
-    # The helper performs an opportunistic JOIN against week_reset_events
-    # every tick to flag any open block whose interval contains a recorded
-    # reset; no per-call plumbing needed (self-healing).
-    try:
-        maybe_update_five_hour_block(saved)
-    except Exception as exc:
-        eprint(f"[5h-block] unexpected error: {exc}")
-
-    # NEW: equiv-$ budget alert firing (Approach A, issue #19). Gated on a
-    # set budget + alerts_enabled FIRST — non-budget users pay zero overhead.
-    try:
-        maybe_record_budget_milestone(saved)
-    except Exception as exc:
-        eprint(f"[budget-milestone] unexpected error: {exc}")
-
-    # NEW: per-project equiv-$ budget alert firing (axis `project_budget`,
-    # #19/#121). Runs AFTER the global budget axis, but the per-project scan is
-    # self-sufficient — it passes skip_sync=False so a project-only user (no
-    # global budget warming the cache) still resolves live spend on this tick.
-    # Gated FIRST on a non-empty budget.projects + project_alerts_enabled — non-
-    # users pay only one config read.
-    try:
-        maybe_record_project_budget_milestone(saved)
-    except Exception as exc:
-        eprint(f"[project-budget-milestone] unexpected error: {exc}")
-
-    # NEW: Codex budget alert firing (axis `codex_budget`, calendar-period-codex-
-    # budgets). Gated FIRST on a configured budget.codex + alerts_enabled — non-
-    # Codex-budget users pay only one config read. Codex usage never flows through
-    # record-usage, so this is one of the two firing triggers (the other is the
-    # opportunistic fire on `cctally budget`); forward-only/fire-once means the
-    # double-trigger never double-fires.
-    try:
-        maybe_record_codex_budget_milestone(saved)
-    except Exception as exc:
-        eprint(f"[codex-budget-milestone] unexpected error: {exc}")
-
-    # NEW: projected-pace alert firing (axis `projected`, #121/#135). Runs in
-    # its OWN detect-and-arm AFTER the weekly/5h/budget/codex blocks; gated up
-    # front on (alerts.enabled && alerts.projected_enabled) ||
-    # (_budget_alerts_active && budget.projected_enabled — ANY Claude period,
-    # #135) || (codex.alerts_enabled && codex.projected_enabled, #135) — all
-    # toggles default OFF, so non-projected users pay only a cheap config read.
-    # No only_metrics on the record path: every enabled leg runs. The Codex leg
-    # relies on the codex-budget block above (:3129) having warmed the cache,
-    # but is robust even if it short-circuited (skip_sync=False self-syncs, R5).
-    try:
-        maybe_record_projected_alert(saved)
-    except Exception as exc:
-        eprint(f"[projected-alert] unexpected error: {exc}")
-
-    # Write high-water mark so the status line never displays a regression.
-    # The file contains "week_start_date weekly_percent" on one line.
-    try:
-        hwm_path = _cctally_core.APP_DIR / "hwm-7d"
-        existing_hwm = 0.0
-        try:
-            parts = hwm_path.read_text().strip().split()
-            if len(parts) == 2 and parts[0] == week_start_date:
-                existing_hwm = float(parts[1])
-        except (FileNotFoundError, ValueError, OSError):
-            pass
-        if hwm_file_next(existing_hwm, weekly_percent) is not None:
-            hwm_path.write_text(f"{week_start_date} {weekly_percent}\n")
-    except OSError:
-        pass
-
-    # Symmetric 5h HWM. Keyed by the canonical five_hour_window_key derived
-    # under the prior-anchor logic above (NOT a fresh pure-floor recompute) so
-    # boundary-straddling jitter writes to the same file key as the matching
-    # DB row. File format: "<canonical_5h_window_key> <percent>".
-    if (
-        five_hour_percent is not None
-        and five_hour_window_key is not None
-    ):
-        try:
-            five_resets_key = five_hour_window_key
-            hwm5_path = _cctally_core.APP_DIR / "hwm-5h"
-            existing_hwm5 = 0.0
-            try:
-                parts5 = hwm5_path.read_text().strip().split()
-                if len(parts5) == 2 and parts5[0] == str(five_resets_key):
-                    existing_hwm5 = float(parts5[1])
-            except (FileNotFoundError, ValueError, OSError):
-                pass
-            if hwm_file_next(existing_hwm5, five_hour_percent) is not None:
-                hwm5_path.write_text(f"{five_resets_key} {five_hour_percent}\n")
-        except OSError:
-            pass
-
+    import _cctally_journal as _jr
+    import _lib_journal as _lj
+    _jr.append_record(_lj.make_obs(
+        at=now_utc_iso(now_dt), src=writer, provider="claude", payload=raw))
+    # authoritative observes its own write synchronously; opportunistic skips a
+    # busy ingest lock and lets the current holder consume the appended line.
+    _jr.run_stats_ingest(mode=ingest_mode)
     return 0
 
 
@@ -4235,10 +4239,24 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
                 now=dt.datetime.now(dt.timezone.utc),
             )
             # Vendor-scoped spend is intentionally evaluated once per
-            # successful due-set tick, not once per root.
-            budget_alerts = c.maybe_record_codex_budget_milestone(
-                {}, raise_errors=True,
-            )
+            # successful due-set tick, not once per root. Task 7 Item 4: the
+            # on-demand Codex budget firing routes through the single-flight
+            # ingest cycle (the `codex_apply` seam) instead of opening its own
+            # stats connection — so its `budget_milestones` (vendor=codex)
+            # crossings are journaled by the budget harvest and its alerts
+            # dispatch post-commit (set-then-dispatch). AUTHORITATIVE so a failure
+            # propagates to this leg's try/except (raise_errors=True preserved).
+            import _cctally_journal as _jr_codex
+            _budget_holder = {"n": 0}
+
+            def _codex_budget_leg(ictx):
+                _budget_holder["n"] = int(c.maybe_record_codex_budget_milestone(
+                    {}, conn=ictx.conn, alert_sink=ictx.pending_alerts,
+                    raise_errors=True) or 0)
+
+            _jr_codex.run_stats_ingest(
+                mode="authoritative", codex_apply=_codex_budget_leg)
+            budget_alerts = _budget_holder["n"]
         mark_lifecycle_success(locks)
         log_outcome(
             sync="ok", result="success", projection=projection,
@@ -4588,9 +4606,27 @@ def _derive_week_from_payload(payload: dict[str, Any], week_start_name: str) -> 
     return DerivedWeekWindow(week_start=start, week_end=end)
 
 
-def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict[str, Any]:
+_USAGE_SNAPSHOT_COLUMNS = (
+    "captured_at_utc", "week_start_date", "week_end_date", "week_start_at",
+    "week_end_at", "weekly_percent", "page_url", "source", "payload_json",
+    "five_hour_percent", "five_hour_resets_at", "five_hour_window_key",
+)
+
+
+def _usage_snapshot_columns(conn, payload, week_start_name):
+    """Compute the ``weekly_usage_snapshots`` column map + output ``saved`` dict
+    for a payload — the exact canonicalization ``insert_usage_snapshot`` does —
+    WITHOUT inserting (DB journal redesign §5.3).
+
+    Returns ``(cols, saved)`` where ``cols`` is the ordered column→value map
+    (no ``id`` / ``journal_id``, key order == ``_USAGE_SNAPSHOT_COLUMNS``) and
+    ``saved`` is the output dict minus ``id``. Shared by
+    ``insert_usage_snapshot`` (bare INSERT, legacy) and the ingest obs pipeline
+    hook (``snapshot_accept`` Model-A emit) so the two write paths never drift.
+    ``conn`` is used only for the ``_get_canonical_boundary_for_date`` override.
+    """
     weekly_percent = _safe_float(payload.get("weeklyPercent"))
-    captured_at, captured_at_dt = _coerce_payload_captured_at(payload)
+    captured_at, _captured_at_dt = _coerce_payload_captured_at(payload)
 
     page_url = payload.get("pageUrl") if isinstance(payload.get("pageUrl"), str) else None
     source = payload.get("source") if isinstance(payload.get("source"), str) else "userscript"
@@ -4610,10 +4646,6 @@ def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict
             # misbehaving caller doesn't spam the log on every insert.
             global _logged_window_key_coerce_failure
             if not _logged_window_key_coerce_failure:
-                # Use the local (already extracted from payload at line
-                # ~13858) instead of re-reading; payload is mutable and
-                # could in principle change between extraction and the
-                # except branch.
                 eprint(
                     f"[record-usage] fiveHourWindowKey coerce failed "
                     f"(got {type(five_hour_window_key).__name__}: "
@@ -4623,25 +4655,63 @@ def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict
                 _logged_window_key_coerce_failure = True
             five_hour_window_key = None
 
+    week_window = _derive_week_from_payload(payload, week_start_name)
+
+    # Use the canonical boundary already established for this week_start_date.
+    # This prevents relative-reset drift from creating duplicate weeks.
+    date_str = week_window.week_start.isoformat()
+    canon_start, canon_end = _get_canonical_boundary_for_date(conn, date_str)
+    if canon_start and canon_end:
+        week_window = DerivedWeekWindow(
+            week_start=week_window.week_start,
+            week_end=week_window.week_end,
+            week_start_at=canon_start,
+            week_end_at=canon_end,
+        )
+
+    week_start = week_window.week_start
+    week_end = week_window.week_end
+
+    cols = {
+        "captured_at_utc": captured_at,
+        "week_start_date": week_start.isoformat(),
+        "week_end_date": week_end.isoformat(),
+        "week_start_at": week_window.week_start_at,
+        "week_end_at": week_window.week_end_at,
+        "weekly_percent": weekly_percent,
+        "page_url": page_url,
+        "source": source,
+        "payload_json": json.dumps(payload, separators=(",", ":")),
+        "five_hour_percent": five_hour_percent,
+        "five_hour_resets_at": five_hour_resets_at,
+        "five_hour_window_key": five_hour_window_key,
+    }
+
+    saved = {
+        "capturedAt": captured_at,
+        "weekStartDate": week_start.isoformat(),
+        "weekEndDate": week_end.isoformat(),
+        "weeklyPercent": weekly_percent,
+    }
+    if week_window.week_start_at:
+        saved["weekStartAt"] = week_window.week_start_at
+    if week_window.week_end_at:
+        saved["weekEndAt"] = week_window.week_end_at
+    if isinstance(payload.get("resetText"), str):
+        saved["resetText"] = payload["resetText"]
+    if five_hour_percent is not None:
+        saved["fiveHourPercent"] = five_hour_percent
+    if five_hour_resets_at is not None:
+        saved["fiveHourResetsAt"] = five_hour_resets_at
+    if five_hour_window_key is not None:
+        saved["fiveHourWindowKey"] = five_hour_window_key
+    return cols, saved
+
+
+def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict[str, Any]:
     conn = open_db()
     try:
-        week_window = _derive_week_from_payload(payload, week_start_name)
-
-        # Use the canonical boundary already established for this week_start_date.
-        # This prevents relative-reset drift from creating duplicate weeks.
-        date_str = week_window.week_start.isoformat()
-        canon_start, canon_end = _get_canonical_boundary_for_date(conn, date_str)
-        if canon_start and canon_end:
-            week_window = DerivedWeekWindow(
-                week_start=week_window.week_start,
-                week_end=week_window.week_end,
-                week_start_at=canon_start,
-                week_end_at=canon_end,
-            )
-
-        week_start = week_window.week_start
-        week_end = week_window.week_end
-
+        cols, saved = _usage_snapshot_columns(conn, payload, week_start_name)
         cur = conn.execute(
             """
             INSERT INTO weekly_usage_snapshots
@@ -4661,46 +4731,25 @@ def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                captured_at,
-                week_start.isoformat(),
-                week_end.isoformat(),
-                week_window.week_start_at,
-                week_window.week_end_at,
-                weekly_percent,
-                page_url,
-                source,
-                json.dumps(payload, separators=(",", ":")),
-                five_hour_percent,
-                five_hour_resets_at,
-                five_hour_window_key,
-            ),
+            tuple(cols[k] for k in _USAGE_SNAPSHOT_COLUMNS),
+        )
+        snapshot_id = int(cur.lastrowid)
+        # DB journal redesign: every weekly_usage_snapshots row carries a
+        # journal_id now — production writes go through the ``snapshot_accept``
+        # evt (grep-proof: no production caller of this bare-insert helper
+        # remains; it is test/fixture-only). Stamp a deterministic synthetic id
+        # so a row inserted here is still reverse-referenceable by a milestone's
+        # ``usage_snapshot_id`` at ingest harvest (a NULL journal_id would be a
+        # harvest-order violation — the harvest cannot build a logical FK to it).
+        conn.execute(
+            "UPDATE weekly_usage_snapshots SET journal_id = ? WHERE id = ?",
+            (f"sa:direct:{snapshot_id}", snapshot_id),
         )
         conn.commit()
-        snapshot_id = int(cur.lastrowid)
     finally:
         conn.close()
 
-    out = {
-        "id": snapshot_id,
-        "capturedAt": captured_at,
-        "weekStartDate": week_start.isoformat(),
-        "weekEndDate": week_end.isoformat(),
-        "weeklyPercent": weekly_percent,
-    }
-    if week_window.week_start_at:
-        out["weekStartAt"] = week_window.week_start_at
-    if week_window.week_end_at:
-        out["weekEndAt"] = week_window.week_end_at
-    if isinstance(payload.get("resetText"), str):
-        out["resetText"] = payload["resetText"]
-    if five_hour_percent is not None:
-        out["fiveHourPercent"] = five_hour_percent
-    if five_hour_resets_at is not None:
-        out["fiveHourResetsAt"] = five_hour_resets_at
-    if five_hour_window_key is not None:
-        out["fiveHourWindowKey"] = five_hour_window_key
-    return out
+    return {"id": snapshot_id, **saved}
 
 
 def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -4740,3 +4789,417 @@ def _saved_dict_from_usage_row(row: sqlite3.Row) -> dict[str, Any]:
     if row["five_hour_window_key"] is not None:
         out["fiveHourWindowKey"] = int(row["five_hour_window_key"])
     return out
+
+
+# ==========================================================================
+# DB journal redesign — ingest pipeline hooks (spec §5.2 step 4b / §5.3)
+#
+# These are the Task-6 (6e) COMPOSITION of the reviewed machinery: the obs
+# derivation transplant (`_pipeline_claude_usage`), the record-credit op
+# (`_pipeline_record_credit`), and the sync-week op (`_pipeline_sync_week`).
+# Registered ONCE into `_cctally_journal.PIPELINE` at module wiring time (below).
+# The CLI/hook call sites append `make_obs`/`make_op` lines and invoke
+# `run_stats_ingest`; the cycle drives these hooks per record on ctx.conn with
+# `as_of = record["at"]` and the alert sink `ctx.pending_alerts`.
+# ==========================================================================
+
+# Claude rate-limit obs writer identities (spec §4.2 `src`). The obs hook fires
+# only for these + provider==claude + a payload that carries the raw capture
+# (`resets_at` + `weekly_percent`); anything else (a codex quota obs, a minimal
+# test obs) is skipped so a foreign line never mis-drives the Claude derivation.
+_CLAUDE_OBS_SRCS = frozenset(
+    {"statusline", "hook-tick", "refresh-usage", "record-usage"}
+)
+
+
+def _derive_5h_window_key(conn, five_hour_resets_at_epoch):
+    """Resolve the canonical 5h window key for a raw `five_hour_resets_at` epoch,
+    on `conn` (extracted from cmd_record_usage's Tier 1/2/3 prior-anchor logic).
+
+    Tier 1: nearest canonical `five_hour_blocks` row within ±3×jitter-floor;
+    Tier 2: latest snapshot anchor (legacy fallback); Tier 3 (implicit): the pure
+    600s floor. Passing the prior anchor collapses boundary-straddling
+    seconds-jitter to the first-seen key (spec 5h invariant #3). Runs at ingest
+    (not capture) now, so the key is derived against the same DB state the fold
+    decision + clamp read."""
+    c = _cctally()
+    prior_5h_epoch = None
+    prior_5h_key = None
+    try:
+        prior_block_row = conn.execute(
+            """
+            SELECT five_hour_window_key, five_hour_resets_at
+              FROM five_hour_blocks
+             WHERE abs(? - CAST(strftime('%s', five_hour_resets_at) AS INTEGER)) <= ?
+             ORDER BY abs(? - CAST(strftime('%s', five_hour_resets_at) AS INTEGER)) ASC
+             LIMIT 1
+            """,
+            (
+                five_hour_resets_at_epoch,
+                c._FIVE_HOUR_JITTER_FLOOR_SECONDS * 3,
+                five_hour_resets_at_epoch,
+            ),
+        ).fetchone()
+        if prior_block_row is not None:
+            prior_5h_epoch = int(parse_iso_datetime(
+                prior_block_row["five_hour_resets_at"], "prior 5h block anchor"
+            ).timestamp())
+            prior_5h_key = int(prior_block_row["five_hour_window_key"])
+    except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        eprint(f"[ingest] prior 5h block-anchor lookup failed: {exc}")
+
+    if prior_5h_key is None:
+        try:
+            prior_5h_row = conn.execute(
+                "SELECT five_hour_resets_at, five_hour_window_key "
+                "FROM weekly_usage_snapshots "
+                "WHERE five_hour_resets_at IS NOT NULL "
+                "  AND five_hour_window_key IS NOT NULL "
+                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if prior_5h_row is not None:
+                prior_5h_epoch = int(parse_iso_datetime(
+                    prior_5h_row["five_hour_resets_at"], "prior 5h anchor"
+                ).timestamp())
+                prior_5h_key = int(prior_5h_row["five_hour_window_key"])
+        except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+            eprint(f"[ingest] prior 5h anchor lookup failed: {exc}")
+
+    return _canonical_5h_window_key(
+        five_hour_resets_at_epoch,
+        prior_epoch=prior_5h_epoch,
+        prior_key=prior_5h_key,
+    )
+
+
+def _run_dollar_axes(saved, *, conn, as_of, alert_sink):
+    """The four dollar-decoupled alert axes in cmd_record_usage's legacy order
+    (budget → project-budget → codex-budget → projected). Runs on BOTH the accept
+    path AND every dedup-skip tick (spec §4.5: USD spend can cross a $ threshold
+    while the weekly/5h percent is flat). Passed-conn → the chokepoints fold into
+    the cycle txn and re-raise on failure (invariant ii); their crossings' alert
+    payloads land in `alert_sink` for post-commit dispatch."""
+    c = _cctally()
+    c.maybe_record_budget_milestone(
+        saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
+    c.maybe_record_project_budget_milestone(
+        saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
+    c.maybe_record_codex_budget_milestone(
+        saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
+    c.maybe_record_projected_alert(
+        saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
+
+
+def _write_hwm_files(week_start_date, weekly_percent,
+                     five_hour_window_key, five_hour_percent):
+    """Write the hwm-7d / hwm-5h projection files (statusline no-regression), the
+    monotonic-guarded tail of cmd_record_usage's accept path. Projection files
+    (never journaled); re-materialized on rebuild. Best-effort (OSError-swallow),
+    matching the legacy write sites."""
+    try:
+        hwm_path = _cctally_core.APP_DIR / "hwm-7d"
+        existing_hwm = 0.0
+        try:
+            parts = hwm_path.read_text().strip().split()
+            if len(parts) == 2 and parts[0] == week_start_date:
+                existing_hwm = float(parts[1])
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+        if hwm_file_next(existing_hwm, weekly_percent) is not None:
+            hwm_path.write_text(f"{week_start_date} {weekly_percent}\n")
+    except OSError:
+        pass
+
+    if five_hour_percent is not None and five_hour_window_key is not None:
+        try:
+            hwm5_path = _cctally_core.APP_DIR / "hwm-5h"
+            existing_hwm5 = 0.0
+            try:
+                parts5 = hwm5_path.read_text().strip().split()
+                if len(parts5) == 2 and parts5[0] == str(five_hour_window_key):
+                    existing_hwm5 = float(parts5[1])
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+            if hwm_file_next(existing_hwm5, five_hour_percent) is not None:
+                hwm5_path.write_text(
+                    f"{five_hour_window_key} {five_hour_percent}\n")
+        except OSError:
+            pass
+
+
+def _pipeline_claude_usage(ctx, rec):
+    """Obs-derivation pipeline hook (spec §5.2 step 4b) — the ingest-cycle
+    transplant of ``cmd_record_usage``'s derivation body.
+
+    Fires per Claude rate-limit obs (src in the writer set, provider claude, a
+    raw-capture payload). Canonicalizes the RAW capture on ``ctx.conn`` (week
+    boundaries from ``resets_at`` + the Tier 1/2/3 5h window key), runs
+    ``detect_reset_and_credit`` (transaction-neutral, capture-time, Design B
+    ``ctx``), then makes the snapshot accept/skip decision ONCE via
+    ``_usage_snapshot_fold_decision``. On ACCEPT it journals the row through a
+    ``snapshot_accept`` Model-A evt (the sole ``weekly_usage_snapshots`` writer).
+    The fold decision gates ONLY the snapshot insert — the derivation chokepoints
+    run for EVERY line (spec §4.5, "dedup must not gate side effects"): milestone
+    (with the cost-sync ``journal`` threaded), 5h block, then the four dollar
+    axes, in legacy order. On ACCEPT they derive against the fresh row + the hwm
+    projection files are written; on a dedup SKIP they re-run (idempotently)
+    against the latest snapshot, which is what subsumes today's kill-window
+    self-heal probes (a flat tick that owes a milestone or crosses a $ threshold
+    still derives it)."""
+    if rec.get("t") != "obs" or rec.get("provider") != "claude":
+        return
+    if rec.get("src") not in _CLAUDE_OBS_SRCS:
+        return
+    payload = rec.get("payload") or {}
+    if "resets_at" not in payload or "weekly_percent" not in payload:
+        return
+
+    c = _cctally()
+    conn = ctx.conn
+    # `as_of` is the record's `at` (= `_command_as_of()` at capture, CCTALLY_AS_OF
+    # in tests) — DETECTION timing (reset/credit) AND the dollar-axis budget/period
+    # WINDOW clock (6g FIX 2b moved the four dollar axes off `capture_at` onto
+    # `as_of`; see `_run_dollar_axes` below), matching legacy. `capture_at` is the
+    # CAPTURE wall clock — the snapshot `captured_at_utc` + the milestone/5h-block
+    # stamps + the block cost-sum range end, also matching legacy (which used
+    # `now_utc_iso()` for those). In production the
+    # two are the same instant; the split only shows under the CCTALLY_AS_OF test
+    # hook. Falls back to `as_of` for a payload without `captured_at` (robustness).
+    as_of = ctx.as_of_for(rec)
+    capture_at = payload.get("captured_at") or as_of
+    weekly_percent = float(payload["weekly_percent"])
+    resets_at = int(payload["resets_at"])
+    source = payload.get("source", "statusline")
+
+    # Week boundaries from resets_at (cmd_record_usage canonicalization).
+    week_end_at_dt = dt.datetime.fromtimestamp(resets_at, tz=dt.timezone.utc)
+    week_start_at_dt = week_end_at_dt - dt.timedelta(days=7)
+    week_start_date = week_start_at_dt.date().isoformat()
+    week_end_date = week_end_at_dt.date().isoformat()
+    week_start_at = week_start_at_dt.isoformat(timespec="seconds")
+    week_end_at = week_end_at_dt.isoformat(timespec="seconds")
+
+    # 5h fields (raw, post-ingress-drop) + canonical window key on ctx.conn.
+    five_hour_percent = payload.get("five_hour_percent")
+    if five_hour_percent is not None:
+        five_hour_percent = float(five_hour_percent)
+    five_hour_resets_at_str = payload.get("five_hour_resets_at")
+    five_hour_window_key = None
+    if five_hour_resets_at_str is not None:
+        try:
+            fh_epoch = int(parse_iso_datetime(
+                five_hour_resets_at_str, "obs.five_hour_resets_at").timestamp())
+            five_hour_window_key = _derive_5h_window_key(conn, fh_epoch)
+        except (ValueError, TypeError) as exc:
+            eprint(f"[ingest] 5h window-key derivation failed: {exc}")
+
+    # 1. Reset/credit detection (fold into the cycle txn; Design B suppression).
+    c.detect_reset_and_credit(
+        conn,
+        week_start_date=week_start_date,
+        week_end_at=week_end_at,
+        weekly_percent=weekly_percent,
+        five_hour_window_key=five_hour_window_key,
+        five_hour_percent=five_hour_percent,
+        as_of=as_of,
+        commit=False,
+        ctx=ctx,
+    )
+
+    # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the
+    #    snapshot_accept evt (so replay never re-derives it — spec §5.3).
+    import _cctally_journal as jr
+    skip, adjusted_5h = jr._usage_snapshot_fold_decision(conn, {
+        "week_start_date": week_start_date,
+        "week_start_at": week_start_at,
+        "week_end_at": week_end_at,
+        "weekly_percent": weekly_percent,
+        "five_hour_percent": five_hour_percent,
+        "five_hour_window_key": five_hour_window_key,
+    })
+    five_hour_percent = adjusted_5h
+
+    # 3. Resolve the derivation target `saved`. The fold DECISION gates ONLY the
+    #    snapshot INSERT (snapshot_accept); the derivations below run for EVERY
+    #    line (spec §4.5: "the ingester's snapshot-insert dedup is the same rule
+    #    as today's ... while derivations run for every line — preserving the
+    #    'dedup must not gate side effects' invariant structurally"). A dedup-skip
+    #    tick re-runs the (idempotent) chokepoints against the latest snapshot —
+    #    which is exactly what subsumes today's kill-window self-heal probes.
+    #    On ACCEPT `saved` is the freshly-journaled row; on SKIP it is the latest.
+    if not skip:
+        out_payload = {
+            "source": source,
+            "capturedAt": capture_at,
+            "weeklyPercent": weekly_percent,
+            "weekStartDate": week_start_date,
+            "weekEndDate": week_end_date,
+            "weekStartAt": week_start_at,
+            "weekEndAt": week_end_at,
+        }
+        if five_hour_percent is not None:
+            out_payload["fiveHourPercent"] = five_hour_percent
+        if five_hour_resets_at_str is not None:
+            out_payload["fiveHourResetsAt"] = five_hour_resets_at_str
+        if five_hour_window_key is not None:
+            out_payload["fiveHourWindowKey"] = five_hour_window_key
+
+        week_start_name = get_week_start_name(ctx.config or {}, None)
+        cols, saved = _usage_snapshot_columns(conn, out_payload, week_start_name)
+        rowid = jr.emit_model_a(
+            ctx,
+            kind="snapshot_accept",
+            evt_id=f"sa:{rec['id']}",
+            table="weekly_usage_snapshots",
+            columns=cols,
+            at=capture_at,
+        )
+        saved["id"] = rowid
+    else:
+        latest = conn.execute(
+            "SELECT * FROM weekly_usage_snapshots WHERE week_start_date = ? "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (week_start_date,),
+        ).fetchone()
+        if latest is None:
+            return  # nothing recorded yet -> nothing to derive against
+        saved = _saved_dict_from_usage_row(latest)
+
+    # 4. Derivations run for EVERY line, legacy order (milestone → 5h block → $
+    #    axes). maybe_record_milestone threads journal=(ctx, rec id) for its cost
+    #    sync; maybe_update_five_hour_block writes the block before its
+    #    5h-milestone block_id read (P2-8). Idempotent under re-run on a dedup
+    #    tick (INSERT OR IGNORE / upsert), so a flat tick that owes a milestone or
+    #    crosses a $ threshold still derives it.
+    c.maybe_record_milestone(
+        saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
+        journal=(ctx, rec["id"]))
+    c.maybe_update_five_hour_block(
+        saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts)
+    # The dollar-decoupled axes resolve a CURRENT budget/period WINDOW from
+    # "now" and must see the record's DETECTION clock (`as_of` = rec["at"] =
+    # `_command_as_of()`), NOT the wall-clock capture stamp: legacy
+    # cmd_record_usage's dedup self-heal called these with as_of=None ->
+    # `_command_as_of()`, so a CCTALLY_AS_OF-pinned tick resolved the pinned
+    # week's window (capture_at is the raw wall clock, which lands outside a
+    # pinned fixture window and silently drops the crossing). Both collapse to
+    # real-now in production; the split only matters under a pinned as_of.
+    _run_dollar_axes(saved, conn=conn, as_of=as_of,
+                     alert_sink=ctx.pending_alerts)
+
+    # 4'. Window-rollover 5h-block heal (SKIP path only). A dedup skip swallows
+    #     the snapshot insert, so `saved` (the dedup target — the LATEST stored
+    #     row) still carries the PREVIOUS 5h window; the derivations above only
+    #     ever touched that old (still-fresh) window. When the INCOMING record
+    #     observed a NEW canonical `five_hour_window_key` whose `five_hour_blocks`
+    #     anchor doesn't exist yet, materialize it BLOCK-ONLY — no snapshot
+    #     insert, the tick stays deduped — against a saved dict carrying the
+    #     INCOMING record's 5h identity, NOT `saved`'s. Without this the active
+    #     window is left unanchored (blocks/dashboard fall back to the heuristic
+    #     "~") until the percent next moves. Ported from the legacy
+    #     cmd_record_usage dedup self-heal (spec §4.5 "dedup must not gate side
+    #     effects"; regression: bin/cctally-record-usage-selfheal-test
+    #     window-rollover scenario).
+    if (skip and five_hour_window_key is not None
+            and five_hour_percent is not None
+            and five_hour_resets_at_str is not None):
+        latest_wk = saved.get("fiveHourWindowKey")
+        if latest_wk is None or int(latest_wk) != int(five_hour_window_key):
+            if conn.execute(
+                "SELECT 1 FROM five_hour_blocks WHERE five_hour_window_key = ? "
+                "LIMIT 1", (int(five_hour_window_key),),
+            ).fetchone() is None:
+                c.maybe_update_five_hour_block(
+                    {
+                        "id": saved.get("id"),
+                        "capturedAt": capture_at,
+                        "weeklyPercent": weekly_percent,
+                        "fiveHourPercent": five_hour_percent,
+                        "fiveHourResetsAt": five_hour_resets_at_str,
+                        "fiveHourWindowKey": int(five_hour_window_key),
+                    },
+                    conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts)
+
+    # 5. hwm-7d / hwm-5h projection files — ACCEPT path only (the monotonic
+    #    writer; a dedup tick's percent is already <= the stored HWM). In-place
+    #    credit force-writes live in detect_reset_and_credit.
+    if not skip:
+        _write_hwm_files(week_start_date, weekly_percent,
+                         five_hour_window_key, five_hour_percent)
+
+
+def _pipeline_record_credit(ctx, rec):
+    """Op-derivation hook for a ``record-credit`` op line (spec §5.3 event+effects).
+
+    The built-in ``_pipeline_op_fold`` runs FIRST and writes the
+    ``weekly_credit_floors`` row from this op's floor columns (Option (i): the
+    op fold is the SOLE floor writer on the ingest path, stamping
+    ``journal_id = rec['id']``). This hook then reconstructs the ``CreditPlan``
+    from the op payload and applies the same-window credit's DESTRUCTIVE effects
+    via ``_apply_credit(ctx=..., id_base=rec['id'])`` — which emits the
+    ``weekly_credit_effects`` evt (suppression list + forced hwm floor) and the
+    synthetic post-credit ``snapshot_accept`` evt, and (Option (i)) SKIPS its own
+    floor INSERT.
+
+    ``payload['forced']`` (a ``--force`` re-record) threads into ``_apply_credit``
+    so the wce evt ALSO journals the destructive clear of this week's OLD
+    synthetic snapshots + OLD credit-floor rows — the ingest-path replacement for
+    legacy ``_force_clear_credit``'s inline DELETEs (spec §5.3)."""
+    if rec.get("t") != "op":
+        return
+    payload = rec.get("payload") or {}
+    if payload.get("kind") != "weekly_credit_floor":
+        return
+    plan_data = payload.get("plan")
+    if not plan_data:
+        return
+    c = _cctally()
+    plan = argparse.Namespace(**plan_data)
+    five_hour = tuple(payload.get("five_hour") or (None, None, None))
+    c._apply_credit(
+        ctx.conn, plan, five_hour=five_hour, as_of=rec["at"],
+        commit=False, ctx=ctx, id_base=rec["id"],
+        forced=bool(payload.get("forced")))
+
+
+def _pipeline_sync_week(ctx, rec):
+    """Op-derivation hook for a ``sync_week`` op line (spec §5.3 / Appendix A):
+    compute the week cost on ``ctx.conn`` and journal the ``weekly_cost_snapshots``
+    row via a Model-A ``weekly_cost_snapshot`` evt (``journal=(ctx, rec['id'])``),
+    so the authoritative CLI caller reads the row back for output and replay reads
+    the cost verbatim (never recomputing from pruned provider JSONL)."""
+    if rec.get("t") != "op":
+        return
+    payload = rec.get("payload") or {}
+    if payload.get("kind") != "sync_week":
+        return
+    c = _cctally()
+    args = argparse.Namespace(
+        week_start=payload.get("week_start"),
+        week_end=payload.get("week_end"),
+        week_start_name=payload.get("week_start_name"),
+        mode=payload.get("mode", "auto"),
+        offline=payload.get("offline", False),
+        project=payload.get("project"),
+        json=False,
+        quiet=True,
+    )
+    c.cmd_sync_week(args, conn=ctx.conn, as_of=rec["at"],
+                    journal=(ctx, rec["id"]))
+
+
+def _register_ingest_pipeline_hooks():
+    """Register the 6e obs/op derivation hooks into ``_cctally_journal.PIPELINE``
+    exactly once (spec §5.2 — ops fold first via the built-in
+    ``_pipeline_op_fold``, then these). Idempotent: ``load_script()`` drops +
+    reloads both siblings together (fresh ``PIPELINE`` == ``[_pipeline_op_fold]``),
+    and the ``not in`` guard makes a bare re-import of this module without a
+    journal reset a no-op rather than a double-registration."""
+    import _cctally_journal as jr
+    for hook in (_pipeline_claude_usage, _pipeline_record_credit,
+                 _pipeline_sync_week):
+        if hook not in jr.PIPELINE:
+            jr.PIPELINE.append(hook)
+
+
+_register_ingest_pipeline_hooks()

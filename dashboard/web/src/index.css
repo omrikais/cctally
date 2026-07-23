@@ -4480,11 +4480,14 @@ mark.current {
      strip packs into fewer wrapped rows (the wrap growth is what pushed the 320px
      hero ~86px taller than the 390px hero). Harmless at 390 (ample headroom). */
   /* Keep both quota blocks side-by-side even when one contains a wide value
-     (12.0% used to wrap Codex/All into a taller, provider-specific hero). */
+     (12.0% used to wrap Codex/All into a taller, provider-specific hero).
+     Cap the primary track at the width needed by the one-decimal percentage,
+     while still letting its week label wrap, so the value cannot consume the
+     visual gap before the 5-hour metric. */
   .hero-usage {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, .75fr);
-    column-gap: var(--space-2);
+    grid-template-columns: fit-content(110px) minmax(0, 1fr);
+    column-gap: var(--space-3);
     row-gap: var(--space-1);
     align-items: end;
   }

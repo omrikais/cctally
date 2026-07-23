@@ -1461,7 +1461,9 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         conn.close()
 
 
-def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
+def _backfill_five_hour_blocks(
+    conn: sqlite3.Connection, *, only_missing: bool = False,
+) -> int:
     """One-shot historical backfill of five_hour_blocks from existing
     weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
     + INSERT OR IGNORE. Per spec §4.3, five_hour_milestones is NEVER
@@ -1475,6 +1477,14 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
     snapshot keys we're about to insert are jitter-forked. On failure,
     rolls back and returns 0; gate fires again on next open_db() so
     partial state is recoverable.
+
+    ``only_missing`` (Task 8, spec §5.4 rebuild): scope the window scan to
+    windows that have snapshots but NO five_hour_blocks row yet — the OPEN
+    (never-closed) window's projection. On a journal rebuild the CLOSED blocks
+    are already materialized from ``five_hour_block_close`` evts, so this
+    re-materializes only the open block (block-only, no milestones — the
+    journaled 5h-milestone evts carry their own values and resolve block_id
+    against this row), keeping the pass O(open windows) instead of O(all blocks).
     """
     _c = _cctally()
     inserted = 0
@@ -1483,16 +1493,18 @@ def _backfill_five_hour_blocks(conn: sqlite3.Connection) -> int:
         # 5h percent. The percent guard is critical: MAX(five_hour_percent)
         # over a NULL-only window is NULL, which would trip the
         # final_five_hour_percent NOT NULL constraint at insert time.
-        keys = [
-            int(r[0]) for r in conn.execute(
-                """
+        keys_sql = """
                 SELECT DISTINCT five_hour_window_key
                   FROM weekly_usage_snapshots
                  WHERE five_hour_window_key IS NOT NULL
                    AND five_hour_percent     IS NOT NULL
-                """
-            ).fetchall()
-        ]
+        """
+        if only_missing:
+            keys_sql += (
+                "   AND five_hour_window_key NOT IN "
+                "(SELECT five_hour_window_key FROM five_hour_blocks)"
+            )
+        keys = [int(r[0]) for r in conn.execute(keys_sql).fetchall()]
 
         now_iso = now_utc_iso()
         now_dt = parse_iso_datetime(now_iso, "now")

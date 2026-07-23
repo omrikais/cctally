@@ -87,7 +87,7 @@ def _read_first_sse_data_frame(response, *, deadline_s=2.0):
 
 def test_api_doctor_get_returns_full_payload(tmp_path, monkeypatch):
     """`GET /api/doctor` returns the kernel-serialized JSON with the
-    six spec'd category ids and schema_version=1."""
+    nine spec'd category ids and schema_version=1."""
     ns = load_script()
     srv, _snap = _start_handler(ns, tmp_path, monkeypatch)
     try:
@@ -103,8 +103,8 @@ def test_api_doctor_get_returns_full_payload(tmp_path, monkeypatch):
     assert payload["schema_version"] == 1
     cats = {c["id"] for c in payload["categories"]}
     assert cats == {
-        "install", "hooks", "auth", "db", "data", "pricing", "safety",
-        "telemetry",
+        "install", "hooks", "auth", "db", "journal", "data", "pricing",
+        "safety", "telemetry",
     }
     assert set(payload["overall"]["counts"].keys()) == {"ok", "warn", "fail"}
     assert payload["overall"]["severity"] in {"ok", "warn", "fail"}

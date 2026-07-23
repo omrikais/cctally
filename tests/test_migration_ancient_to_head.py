@@ -113,11 +113,18 @@ def test_ancient_stats_and_cache_reach_head(monkeypatch, tmp_path):
         cache_conn.close()
 
     # ── 3. open stats: with the gate satisfied, the whole 12-migration chain
-    #      runs. Iterate a few opens to absorb any transient deferral.
+    #      runs. Iterate a few opens to absorb any transient deferral. DB journal
+    #      redesign §8: once the legacy dispatcher reaches the export baseline
+    #      (head 13), ``open_db`` CUTS THE DB OVER to STATS_INDEX_EPOCH — so the
+    #      "reached head" signal for stats.db is the epoch, not len(registry). A
+    #      still-deferred recompute leaves user_version < 13 and NO cutover (spec
+    #      §8 step 1: never journal a pre-recompute shape), so the epoch value is
+    #      itself the "all migrations applied then cut over" proof.
+    _epoch = core.STATS_INDEX_EPOCH
     for _ in range(4):
         conn = ns["open_db"]()
         conn.close()
-        if _user_version(core.DB_PATH) == len(ns["_STATS_MIGRATIONS"]):
+        if _user_version(core.DB_PATH) == _epoch:
             break
     # And re-open cache once more in case a stats-side eager step left work.
     for _ in range(2):
@@ -129,9 +136,9 @@ def test_ancient_stats_and_cache_reach_head(monkeypatch, tmp_path):
     stats_names = {m.name for m in ns["_STATS_MIGRATIONS"]}
     cache_names = {m.name for m in ns["_CACHE_MIGRATIONS"]}
 
-    # Both DBs at head.
-    assert _user_version(core.DB_PATH) == len(stats_names), (
-        f"stats.db not at head: uv={_user_version(core.DB_PATH)} "
+    # stats.db cut over to the epoch (its "at head" signal); cache.db at head.
+    assert _user_version(core.DB_PATH) == _epoch, (
+        f"stats.db not cut over to epoch {_epoch}: uv={_user_version(core.DB_PATH)} "
         f"markers={sorted(_markers(core.DB_PATH))}"
     )
     assert _user_version(core.CACHE_DB_PATH) == len(cache_names), (

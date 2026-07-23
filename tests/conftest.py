@@ -354,6 +354,13 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "CONVERSATIONS_LOCK_PATH": share / "conversations.db.lock",
         "CONVERSATIONS_LOCK_CODEX_PATH": share / "conversations.db.codex.lock",
         "CONVERSATIONS_LOCK_MAINTENANCE_PATH": share / "conversations.db.maintenance.lock",
+        "STATS_LOCK_MAINTENANCE_PATH": share / "stats.db.maintenance.lock",
+        # Append-only observation journal (2026-07-22 DB journal redesign).
+        # Pinned so any journal append/ingest a test triggers lands in the
+        # per-test tmp APP_DIR, never the developer's real prod journal dir.
+        "JOURNAL_DIR": share / "journal",
+        "JOURNAL_LOCK_PATH": share / "journal.lock",
+        "JOURNAL_INGEST_LOCK_PATH": share / "journal.ingest.lock",
         "CONFIG_LOCK_PATH": share / "config.json.lock",
         "CONFIG_PATH": share / "config.json",
         "MIGRATION_ERROR_LOG_PATH": share / "logs" / "migration-errors.log",

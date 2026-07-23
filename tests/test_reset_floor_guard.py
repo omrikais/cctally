@@ -57,8 +57,11 @@ WIRED, EXEMPT = "wired", "exempt"
 ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
     ("_cctally_statusline.py", "_build_statusline_injections.<locals>._hwm_clamp"):
         (WIRED, "statusline 7d HWM clamp"),
-    ("_cctally_record.py", "cmd_record_usage"):
-        (WIRED, "record-usage write-site monotonic clamp"),
+    ("_cctally_journal.py", "_usage_snapshot_fold_decision"):
+        (WIRED, "record-usage apply-time monotonic clamp — the DB journal "
+                "redesign moved cmd_record_usage's write-site clamp here (the "
+                "single-flight ingest fold decision); ported predicate, same "
+                "_reset_aware_floor chokepoint"),
     ("_cctally_record.py", "_resolve_reset_aware_hwm"):
         (WIRED, "the --from default / record-credit HWM helper"),
     ("_cctally_project.py", "_load_week_snapshots"):
@@ -75,7 +78,7 @@ ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
 # MUST consult the reset-aware floor. Keyed the same (filename, qualname) way.
 MUST_CALL_FLOOR: list[tuple[str, str]] = [
     ("_cctally_statusline.py", "_build_statusline_injections.<locals>._hwm_clamp"),
-    ("_cctally_record.py", "cmd_record_usage"),
+    ("_cctally_journal.py", "_usage_snapshot_fold_decision"),
     ("_cctally_record.py", "_resolve_reset_aware_hwm"),
     ("_cctally_project.py", "_load_week_snapshots"),
     ("_cctally_core.py", "_floored_week_max"),

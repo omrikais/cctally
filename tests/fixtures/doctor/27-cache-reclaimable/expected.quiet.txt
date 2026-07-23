@@ -12,6 +12,7 @@ Database
       → Run any cctally command — opens the DB and applies pending migrations
   ⚠ Reclaimable cache space  high — 97.1% of cache.db pages are free
       → Run `cctally db vacuum --db cache` to reclaim disk space.
+Journal
 Data
 Pricing
 Safety
@@ -19,4 +20,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 35 OK · 5 WARN · 0 FAIL
+Summary: 39 OK · 5 WARN · 0 FAIL

@@ -64,75 +64,36 @@ def test_recover_cache_ahead_heals(ns_factory, capsys):
     assert "reverted cache.db" in capsys.readouterr().out
 
 
-def test_recover_stats_ahead_requires_yes(ns_factory, capsys):
-    c, tmp_path = ns_factory
-    head = [m.name for m in c._STATS_MIGRATIONS]
-    _seed(c._cctally_core.DB_PATH, user_version=len(head) + 1,
-          registry_head_names=head, extra_unknown=["999_unknown"])
-    rc = c.cmd_db_recover(argparse.Namespace(db="stats", yes=False))
-    assert rc == 2 and "--yes" in capsys.readouterr().err
-    conn = sqlite3.connect(c._cctally_core.DB_PATH)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head) + 1  # untouched
-
-
-def test_recover_stats_ahead_with_yes_heals(ns_factory, capsys):
+# ── stats recovery RETIRED (DB journal redesign §7.1) ────────────────────
+# stats.db is now a disposable journal index — a version mismatch self-heals by
+# rebuild, so `db recover --db stats` is retired (trim-and-revert would mangle an
+# epoch-stamped DB). It always points the operator at `db rebuild --db stats`,
+# regardless of --yes / prod, and leaves the DB untouched.
+def test_recover_stats_retired_points_to_rebuild(ns_factory, capsys):
     c, tmp_path = ns_factory
     head = [m.name for m in c._STATS_MIGRATIONS]
     _seed(c._cctally_core.DB_PATH, user_version=len(head) + 1,
           registry_head_names=head, extra_unknown=["999_unknown"])
     rc = c.cmd_db_recover(argparse.Namespace(db="stats", yes=True))
-    assert rc == 0
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "db rebuild --db stats" in err
+    assert "retired" in err
     conn = sqlite3.connect(c._cctally_core.DB_PATH)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head)
+    # the retired command touches nothing (version + markers intact).
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head) + 1
+    names = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+    assert "999_unknown" in names
 
 
-# ── #146: prod guard on stats recovery ───────────────────────────────────
 def _wire_prod_guard(c, tmp_path, monkeypatch, *, prod_dir):
     """Make the redirected data dir look like the REAL prod dir to the #146/#142
-    guard: a fake .git checkout + _real_prod_data_dir → prod_dir. Patches the
-    SAME _cctally_core instance _cctally_db imported (one load_script() call) and
-    clears the escape hatch so the guard is genuinely exercised."""
+    guard: a fake .git checkout + _real_prod_data_dir → prod_dir."""
     monkeypatch.setattr(c._cctally_core, "_real_prod_data_dir", lambda: prod_dir)
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
     monkeypatch.setattr(c._cctally_core, "_repo_root", lambda: repo)
     monkeypatch.delenv("CCTALLY_ALLOW_PROD_MIGRATION", raising=False)
-
-
-def test_recover_stats_refuses_prod_from_dev_checkout(ns_factory, monkeypatch, capsys):
-    """A git-checkout binary must NOT trim+revert the real prod stats.db: rc 2,
-    the version-ahead DB is left fully untouched (user_version AND markers)."""
-    c, tmp_path = ns_factory
-    head = [m.name for m in c._STATS_MIGRATIONS]
-    _seed(c._cctally_core.DB_PATH, user_version=len(head) + 1,
-          registry_head_names=head, extra_unknown=["999_unknown"])
-    _wire_prod_guard(c, tmp_path, monkeypatch,
-                     prod_dir=c._cctally_core.DB_PATH.parent)
-    rc = c.cmd_db_recover(argparse.Namespace(db="stats", yes=True))
-    err = capsys.readouterr().err
-    assert rc == 2
-    assert "refusing to recover stats.db" in err
-    assert "CCTALLY_ALLOW_PROD_MIGRATION" in err
-    conn = sqlite3.connect(c._cctally_core.DB_PATH)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head) + 1
-    names = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
-    assert "999_unknown" in names  # marker NOT trimmed
-
-
-def test_recover_stats_prod_override_allows(ns_factory, monkeypatch, capsys):
-    """Non-vacuity: with CCTALLY_ALLOW_PROD_MIGRATION=1 the identical prod setup
-    recovers — proving the guard is what blocks above."""
-    c, tmp_path = ns_factory
-    head = [m.name for m in c._STATS_MIGRATIONS]
-    _seed(c._cctally_core.DB_PATH, user_version=len(head) + 1,
-          registry_head_names=head, extra_unknown=["999_unknown"])
-    _wire_prod_guard(c, tmp_path, monkeypatch,
-                     prod_dir=c._cctally_core.DB_PATH.parent)
-    monkeypatch.setenv("CCTALLY_ALLOW_PROD_MIGRATION", "1")
-    rc = c.cmd_db_recover(argparse.Namespace(db="stats", yes=True))
-    assert rc == 0
-    conn = sqlite3.connect(c._cctally_core.DB_PATH)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head)
 
 
 def test_recover_cache_prod_exempt(ns_factory, monkeypatch, capsys):

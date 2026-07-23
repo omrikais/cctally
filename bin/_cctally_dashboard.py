@@ -5534,12 +5534,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # forward-only, exactly like the CLI `config set budget.period` path
             # (`_cctally_config.py`) — else the next record-usage tick would
             # instant-popup retroactive alerts under the new period window.
+            # 6f writer reroute: the DYNAMIC per-leaf axis union is UNCHANGED,
+            # but the reconciles now run THROUGH the ingest cycle (opportunistic
+            # + exception-wrapped) so their latched crossings are journaled and
+            # rebuild-replayable — the last budget-config write site off the
+            # bespoke-stats.db-connection path. `touched_projects=None` (the
+            # dashboard write is wholesale, never project-scoped).
+            _reconcile_axes: set = set()
             if touched & {"weekly_usd", "alerts_enabled", "alert_thresholds", "period"}:
-                _cctally()._reconcile_budget_on_config_write(validated_budget)
+                _reconcile_axes.add("budget")
             if touched & {"project_alerts_enabled", "alert_thresholds"}:
-                _cctally()._reconcile_project_budget_milestones_on_write(
-                    validated_budget
-                )
+                _reconcile_axes.add("project_budget")
             # Codex actual-spend reconcile (#134). Key it on the ``alerts_enabled``
             # SUB-leaf specifically — NOT ``"codex" in touched``. The helper
             # (`_reconcile_codex_budget_on_config_write`) is itself gated on
@@ -5552,9 +5557,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # live-pace, Q4).
             codex_in = budget_in.get("codex")
             if isinstance(codex_in, dict) and "alerts_enabled" in codex_in:
-                _cctally()._reconcile_codex_budget_on_config_write(
-                    validated_budget
-                )
+                _reconcile_axes.add("codex_budget")
+            if _reconcile_axes:
+                import _cctally_journal as _jr
+                _jr.reconcile_budget_config(validated_budget, axes=_reconcile_axes)
         if (
             update_check_validated is not None
             or update_channel_validated is not None

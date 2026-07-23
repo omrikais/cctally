@@ -1,7 +1,7 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Eight actions: `status`, `skip`,
-`unskip`, `recover`, `repair`, `backup`, `checkpoint`, and `vacuum`.
+Migration / DB-management subcommand. Nine actions: `status`, `skip`,
+`unskip`, `rebuild`, `recover`, `repair`, `backup`, `checkpoint`, and `vacuum`.
 
 ## Synopsis
 
@@ -9,7 +9,8 @@ Migration / DB-management subcommand. Eight actions: `status`, `skip`,
 cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
-cctally db recover --db {cache,stats} [--yes]
+cctally db rebuild --db stats [--json]
+cctally db recover --db cache [--yes]   # --db stats is retired (see below)
 cctally db repair --db stats --yes
 cctally db backup --db {cache,stats} [--output <path>]
 cctally db checkpoint [--db {cache,stats}] [--json]
@@ -18,14 +19,23 @@ cctally db vacuum [--db {cache,conversations,stats,all}]
 
 ## Description
 
-`cctally` runs schema migrations on every `open_db()` (stats.db) and
-`open_cache_db()` (cache.db) invocation via a small in-process framework.
-Migrations are numbered (`001_…`, `002_…`), per-DB, registered via
-`@stats_migration` / `@cache_migration` decorators in `bin/cctally`. The
-`db` subcommand surfaces this state and offers a manual poison-pill
-escape.
+`cctally` runs schema migrations on `open_cache_db()` (cache.db) and
+`open_conversations_db()` (conversations.db) via a small in-process
+framework. Migrations are numbered (`001_…`, `002_…`), per-DB, registered
+via `@cache_migration` / `@conversations_migration` decorators in
+`bin/cctally`. The `db` subcommand surfaces this state and offers a manual
+poison-pill escape.
 
-Spec: `docs/superpowers/specs/2026-05-06-migration-framework-design.md`.
+**`stats.db` is different since the journal redesign (§7.1):** it is a
+disposable index materialized from the append-only journal, stamped at a
+single `STATS_INDEX_EPOCH` (1000) rather than versioned by migrations.
+Its 13-migration legacy registry is **frozen** — no new stats migration is
+ever written; a schema change bumps the epoch, and any version mismatch
+self-heals by **rebuild** (`db rebuild --db stats`), never by trim-and-revert.
+`db status` still lists the frozen stats registry for provenance.
+
+Spec: `docs/superpowers/specs/2026-05-06-migration-framework-design.md`,
+`docs/superpowers/specs/2026-07-22-db-journal-redesign-design.md`.
 
 ## `cctally db status`
 
@@ -96,50 +106,80 @@ walk.
 `0` success (including no-op when the migration wasn't skipped); `1`
 unknown name; `2` ambiguous bare name.
 
-## `cctally db recover --db {cache,stats} [--yes]`
+## `cctally db rebuild --db stats`
 
-Reverts a **version-ahead** DB to this binary's known schema head
-(issue #145). A DB whose `PRAGMA user_version` exceeds the running
-binary's registry head was last touched by a newer/unreleased cctally
-(e.g. a `main`/dev checkout that carries an unreleased migration was
-run against the shared prod data dir). Without recovery every
-DB-opening command errors with `DowngradeDetected` and bricks.
+Rebuilds `stats.db` from the append-only journal (DB journal redesign
+§9). Since the journal redesign, `stats.db` is a **disposable index**
+materialized from `~/.local/share/cctally/journal/` — the durable truth
+is the journal, not the SQLite file. `db rebuild` is the explicit
+remediation surface: it forensics-quarantines the current `stats.db`
+(the same forensics-first way auto-heal does, even when the DB is
+healthy — this is a deliberate operator reset) and replays the whole
+journal into a fresh index, then reports per-table row counts, lines
+folded, and duration.
+
+It is held under the stats **maintenance lock** and takes the bounded
+**ingest lock**, so it serializes with a concurrent auto-heal and with a
+live ingest cycle. Journal replay is side-effect-free — a rebuild
+**never fires an alert**.
+
+| Flag | Description |
+| --- | --- |
+| `--db stats` | **Required.** Only `stats.db` is journal-backed. cache.db / conversations.db rebuild from surviving provider JSONL — use `cctally cache-sync --rebuild`. |
+| `--json` | Emit a `schemaVersion: 1` envelope (`segmentsRead`, `linesFolded`, `malformed`, `durationSeconds`, `rowsByTable`, `totalRows`, `quarantineDir`, `forensicsPath`) instead of text. |
+
+- **Prod guard (issue #146).** A **dev/worktree checkout** binary
+  refuses to rebuild the real prod `stats.db` (`~/.local/share/cctally`)
+  unless overridden with `CCTALLY_ALLOW_PROD_MIGRATION=1`. Run the
+  installed binary instead.
+- Auto-heal already runs this path automatically on positively-classified
+  corruption (forensics → quarantine → rebuild → retry, no human step);
+  `db rebuild` is the manual, on-demand form.
+
+### Exit codes
+
+`0` rebuilt; `2` the #146 prod guard refused a dev-checkout rebuild of
+the real prod stats.db; `3` the rebuild itself failed.
+
+## `cctally db recover --db cache [--yes]`
+
+Reverts a **version-ahead** `cache.db` to this binary's known schema
+head (issue #145). A cache.db whose `PRAGMA user_version` exceeds the
+running binary's registry head was last touched by a newer/unreleased
+cctally (e.g. a `main`/dev checkout that carries an unreleased migration
+was run against the shared prod data dir). Without recovery every
+cache-opening command errors with `DowngradeDetected` and bricks.
+
+> **`--db stats` is RETIRED** (DB journal redesign §7.1). `stats.db` is
+> now a disposable index stamped at a single `STATS_INDEX_EPOCH`, not a
+> versioned migration target, so a version mismatch self-heals by
+> **rebuild** rather than trim-and-revert. `cctally db recover --db
+> stats` exits 2 with a pointer to `cctally db rebuild --db stats`.
 
 `recover` trims the unknown (ahead) markers from both
 `schema_migrations` and `schema_migrations_skipped`, then reconciles
 `user_version` to the known head (or to `0` when a known marker is
 missing, so the next open re-runs the still-pending known migrations
 idempotently). Any extra tables/columns the unknown migration created
-are left inert. It bypasses `open_db()` / `open_cache_db()` (raw
-`sqlite3.connect`) so it never re-triggers the dispatcher, and is a
-no-op when the DB is not ahead.
+are left inert. It bypasses `open_cache_db()` (raw `sqlite3.connect`) so
+it never re-triggers the dispatcher, and is a no-op when the DB is not
+ahead.
 
 | Flag | Description |
 | --- | --- |
-| `--db {cache,stats}` | **Required.** Which DB to recover. |
-| `--yes` | **Required for `--db stats`.** stats.db holds non-re-derivable snapshots/milestones; the revert may leave orphan schema behind and need a re-record/re-sync, so it refuses without explicit consent. |
+| `--db {cache,stats}` | **Required.** `cache` recovers; `stats` is retired (exits 2 → `db rebuild`). |
+| `--yes` | Accepted but not required for `--db cache` (re-derivable). |
 
 - **`--db cache`** heals **without** `--yes` — cache.db is fully
   re-derivable (`cctally cache-sync --rebuild` rebuilds it). In normal
   operation a version-ahead cache.db **auto-heals** on the next
   cache-opening command (the dispatcher opts cache.db into in-place
   recovery); `db recover --db cache` is the explicit, on-demand path.
-- **`--db stats`** without `--yes` prints the hazard and refuses
-  (exit 2); with `--yes` it trims the markers and reverts
-  `user_version`.
-- **Prod guard (issue #146).** `--db stats` also refuses (exit 2,
-  DB untouched) when a **dev/worktree checkout** binary is pointed at
-  the real prod data dir (`~/.local/share/cctally`) — trimming markers
-  on the installed release's non-re-derivable stats.db could corrupt
-  it. Run the installed binary instead, or override with
-  `CCTALLY_ALLOW_PROD_MIGRATION=1`. This mirrors the #142 migration
-  guard; `--db cache` is exempt (re-derivable).
 
 ### Exit codes
 
-`0` heal or no-op (not ahead / file absent); `2` `--db stats` invoked
-without `--yes` while the DB is ahead, **or** the #146 prod guard
-refused a dev-checkout recovery of the real prod stats.db.
+`0` heal or no-op (not ahead / file absent); `2` `--db stats` (retired —
+use `db rebuild`).
 
 ## `cctally db repair --db stats --yes`
 

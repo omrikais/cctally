@@ -28,6 +28,7 @@ import datetime as dt
 import fcntl
 import json
 import math
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -42,6 +43,23 @@ from _lib_dashboard_json import encode_dashboard_json
 def _cctally():
     """Resolve the current `cctally` module at call-time (spec §3.1)."""
     return sys.modules["cctally"]
+
+
+def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
+    """One auto-heal artifact record for the doctor journal leg (§9). Parses the
+    ``%Y%m%dT%H%M%SZ`` timestamp trailing the name (quarantine dir
+    ``<db>.db-<ts>`` or forensics file ``<db>.db-corruption-forensics-<ts>.json``)
+    into an age; a name that doesn't parse degrades to ``age_s=None``."""
+    base = name[:-5] if name.endswith(".json") else name
+    ts = base.rsplit("-", 1)[-1]
+    age_s = None
+    try:
+        parsed = dt.datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=dt.timezone.utc)
+        age_s = int((now_utc - parsed).total_seconds())
+    except ValueError:
+        pass
+    return {"kind": kind, "name": name, "age_s": age_s}
 
 
 def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
@@ -290,6 +308,11 @@ def doctor_gather_state(
         stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
                            "registry_size": len(c._STATS_MIGRATIONS),
                            "migrations": [], "_open_error": str(exc)}
+    # stats.db is the epoch-versioned journal index (DB journal redesign §7.1):
+    # feed the epoch constant to the pure kernel so db.version_ahead classifies
+    # uv==1000 as HEALTHY (not a #145 version-ahead FAIL). registry_size stays the
+    # frozen legacy head (13) and serves as the legacy-range boundary.
+    stats_db_status["epoch"] = _cctally_core.STATS_INDEX_EPOCH
     try:
         cache_db_status = c._db_status_for(_cctally_core.CACHE_DB_PATH, c._CACHE_MIGRATIONS, "cache.db")
         if not _cctally_core.CACHE_DB_PATH.exists():
@@ -863,6 +886,129 @@ def doctor_gather_state(
         pricing_coverage = None
 
     # ── Meta ─────────────────────────────────────────────────────────
+    # ── Journal (DB journal redesign §9) ─────────────────────────────
+    # Read-only legs over the append-only journal: presence + appendability,
+    # torn-tail/malformed counts (deep-gated — reads whole segments), the ingest
+    # cursor lag vs. the high-water, and the auto-heal incident history. Every
+    # probe degrades to its always-OK posture on any error (the pure kernel then
+    # reports "no journal" / "not scanned").
+    import _lib_journal as _jl
+    journal_present = False
+    journal_appendable = None
+    journal_segment_count = 0
+    journal_malformed_count = None
+    journal_torn_tail_count = None
+    journal_cursor_lag_bytes = None
+    journal_hw_segment = None
+    journal_cursor_segment = None
+    try:
+        jdir = _cctally_core.JOURNAL_DIR
+        journal_present = jdir.exists()
+        if journal_present:
+            try:
+                journal_appendable = os.access(str(jdir), os.W_OK)
+            except OSError:
+                journal_appendable = None
+            import _cctally_journal as _jr
+            try:
+                segs = _jr.list_segments()  # canonical (segment) order
+            except Exception:
+                segs = []
+            journal_segment_count = len(segs)
+            sizes: dict = {}
+            for seg in segs:
+                try:
+                    sizes[seg] = (jdir / seg).stat().st_size
+                except OSError:
+                    sizes[seg] = 0
+            if segs:
+                journal_hw_segment = segs[-1]
+            # deep-gated malformed / torn-tail scan (reads the whole journal;
+            # the dashboard's per-rebuild gather stays deep=False so it never
+            # pays this at the 10× envelope — mirrors the quick_check legs).
+            if deep and segs:
+                malformed = 0
+                torn = 0
+                for seg in segs:
+                    try:
+                        data = (jdir / seg).read_bytes()
+                    except OSError:
+                        continue
+                    if not data:
+                        continue
+                    if not data.endswith(b"\n"):
+                        torn += 1
+                    # every element except the last is a complete line; the last
+                    # is either "" (ended in \n) or the torn partial — not a
+                    # mid-file line, so it is never counted as malformed.
+                    for raw in data.split(b"\n")[:-1]:
+                        if raw and _jl.decode_line(raw) is None:
+                            malformed += 1
+                journal_malformed_count = malformed
+                journal_torn_tail_count = torn
+            # ingest cursor lag: unconsumed bytes between the stats index cursor
+            # and the journal high-water, in canonical (segment, offset) order.
+            cursor = None
+            try:
+                if _cctally_core.DB_PATH.exists():
+                    jc = sqlite3.connect(
+                        f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True)
+                    try:
+                        crow = jc.execute(
+                            "SELECT segment, offset FROM journal_cursor "
+                            "WHERE id = 1").fetchone()
+                        if crow:
+                            cursor = (crow[0], int(crow[1]))
+                    except sqlite3.OperationalError:
+                        pass  # pre-cutover DB has no journal_cursor table
+                    finally:
+                        jc.close()
+            except sqlite3.Error:
+                cursor = None
+            if cursor is not None and segs:
+                cseg, coff = cursor
+                journal_cursor_segment = cseg
+                order = {s: i for i, s in enumerate(segs)}
+                if cseg in order:
+                    ci = order[cseg]
+                    lag = max(0, sizes.get(segs[ci], 0) - coff)
+                    for s in segs[ci + 1:]:
+                        lag += sizes.get(s, 0)
+                    journal_cursor_lag_bytes = lag
+    except Exception:
+        pass
+    # Auto-heal incident history — independent of journal presence (a corruption
+    # incident can predate cutover). None only if BOTH dirs were unreadable.
+    journal_heal_incidents = None
+    _incidents: list = []
+    _incident_read_ok = False
+    try:
+        qroot = _cctally_core.APP_DIR / "quarantine"
+        if qroot.exists():
+            _incident_read_ok = True
+            for entry in qroot.iterdir():
+                if entry.is_dir():
+                    _incidents.append(
+                        _journal_heal_incident("quarantine", entry.name, now_utc))
+    except OSError:
+        pass
+    try:
+        logdir = _cctally_core.LOG_DIR
+        if logdir.exists():
+            _incident_read_ok = True
+            for entry in logdir.iterdir():
+                n = entry.name
+                if "-corruption-forensics-" in n and n.endswith(".json"):
+                    _incidents.append(
+                        _journal_heal_incident("forensics", n, now_utc))
+    except OSError:
+        pass
+    if _incident_read_ok:
+        # most-recent first; unparseable ages (None) sort last.
+        _incidents.sort(key=lambda d: (d["age_s"] is None,
+                                       d["age_s"] if d["age_s"] is not None else 0))
+        journal_heal_incidents = _incidents
+
     cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
     cctally_version = (
         cctally_version_tuple[0] if cctally_version_tuple else "unknown"
@@ -944,6 +1090,16 @@ def doctor_gather_state(
         # #311: precomputed statusLine.refreshInterval classification.
         statusline_refresh_state=statusline_refresh_state,
         statusline_pipeline=statusline_pipeline,
+        # DB journal redesign §9: append-only journal legs.
+        journal_present=journal_present,
+        journal_appendable=journal_appendable,
+        journal_segment_count=journal_segment_count,
+        journal_malformed_count=journal_malformed_count,
+        journal_torn_tail_count=journal_torn_tail_count,
+        journal_cursor_lag_bytes=journal_cursor_lag_bytes,
+        journal_hw_segment=journal_hw_segment,
+        journal_cursor_segment=journal_cursor_segment,
+        journal_heal_incidents=journal_heal_incidents,
     )
 
 

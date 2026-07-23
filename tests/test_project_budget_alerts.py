@@ -82,7 +82,7 @@ def _seed_window(ns):
     window. The percent is irrelevant to budget spend."""
     conn = ns["open_db"]()
     try:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO weekly_usage_snapshots "
             "(captured_at_utc, week_start_date, week_end_date, "
             " week_start_at, week_end_at, weekly_percent, "
@@ -99,6 +99,14 @@ def _seed_window(ns):
                 "fixture",
                 json.dumps({"fixture": True}),
             ),
+        )
+        # Stamp the cutover-scheme journal_id (spec §8: no NULL journal_id
+        # survives cutover) so the dedup tick's milestone harvest can reverse-ref
+        # this snapshot instead of raising a JournalError harvest-order violation.
+        rowid = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE weekly_usage_snapshots SET journal_id = ? WHERE id = ?",
+            (f"b:weekly_usage_snapshots:{rowid}", rowid),
         )
         conn.commit()
     finally:

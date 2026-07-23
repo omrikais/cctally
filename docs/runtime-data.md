@@ -23,7 +23,7 @@ All persistent state lives under `~/.local/share/cctally/` (a dev checkout uses 
 
 ## `stats.db` schema
 
-The authoritative store. Schema evolution follows the migration framework, not inline `ALTER TABLE` in `open_db()`: column additions use `add_column_if_missing(...)`, and data-shape changes run through `@stats_migration` handlers dispatched on open and tracked in `schema_migrations` alongside `PRAGMA user_version` (see [architecture.md#schema-migrations](architecture.md#schema-migrations)). A version-ahead `stats.db` (opened by an older binary) is reverted to the known head with `cctally db recover --db stats --yes`.
+A **disposable index** materialized from the append-only journal (`~/.local/share/cctally/journal/`), which is the durable truth since the DB journal redesign (§7.1). `stats.db` is stamped at a single `STATS_INDEX_EPOCH` (1000) rather than versioned by migrations; its 13-migration legacy registry is **frozen** (only used to bring a pre-cutover install to the export baseline). A version mismatch — newer or older binary — self-heals by **rebuild from the journal** (`cctally db rebuild --db stats`); `DowngradeDetected`-bricking no longer applies to `stats.db`, and `db recover --db stats` is retired. Corruption self-heals the same way (forensics → quarantine → rebuild, no human step). A schema change bumps the epoch, never adds a stats migration.
 
 The live schema is **15 tables**. The three original snapshot tables keep their full detail below; the rest are the 5-hour, reset/credit, budget, and framework-ledger tables added since.
 

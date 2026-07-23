@@ -5,6 +5,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.80.0] - 2026-07-23
+
+### Added
+- Your usage history is now backed by an append-only journal (`~/.local/share/cctally/journal/`) that is the durable source of truth; `stats.db` becomes a disposable, rebuildable index, so a corrupted or deleted stats database now self-heals on the very next command — forensics bundle, quarantine of the damaged file, then an automatic rebuild from the journal — with zero loss of usage history and no manual repair step. (#336)
+- `cctally db rebuild --db stats` rebuilds the stats index from the journal on demand (the manual form of the automatic self-heal), reporting per-table row counts and timing. (#336)
+- `cctally doctor` gains a Journal section reporting the journal's presence and writability, torn/malformed-line counts, how far the stats index has fallen behind the journal, and the most recent self-heal incident. (#336)
+
+### Changed
+- Upgrading to this version migrates existing installs in place automatically on first run, with zero loss of irreplaceable usage history and no manual steps (a slow first run is expected while the one-time journal is written). (#336)
+- Every stats write now flows through a single-flight ingester, ending the `database is locked` pile-ups and wedged handles that concurrent multi-agent hook storms used to cause. (#336)
+- Opening any database is faster: schema work now runs only when the schema version actually changes, not on every open (the status line opens databases several times per render). (#336)
+- Codex quota observations are now preserved durably in the journal, so that history is no longer silently lost when the source rollout files are pruned. (#336)
+- Back up `~/.local/share/cctally/journal/` — hand-copying a `.db` file is now pointless rather than risky, because every database rebuilds from the journal plus surviving provider logs. (#336)
+
+### Fixed
+- The mobile dashboard hero now keeps a clear gap between its 7-day and 5-hour usage values instead of letting a wide 7-day percentage overflow into the adjacent metric.
+
+### Removed
+- `cctally db recover --db stats` is retired: a stats-index version mismatch now self-heals by rebuild, so use `cctally db rebuild --db stats` instead (`db recover --db cache` is unchanged). (#336)
+
 ## [1.79.2] - 2026-07-23
 
 ### Fixed

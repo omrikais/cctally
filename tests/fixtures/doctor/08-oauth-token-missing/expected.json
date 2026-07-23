@@ -214,8 +214,9 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "ahead": false,
-                            "registry_size": 13,
+                            "epoch": 1000,
+                            "legacy_head": 13,
+                            "mismatch": false,
                             "user_version": 0
                         }
                     },
@@ -521,6 +522,49 @@
             "checks": [
                 {
                     "details": {
+                        "present": false
+                    },
+                    "id": "journal.presence",
+                    "severity": "ok",
+                    "summary": "no journal (pre-cutover install)",
+                    "title": "Journal"
+                },
+                {
+                    "details": {
+                        "present": false
+                    },
+                    "id": "journal.integrity",
+                    "severity": "ok",
+                    "summary": "no journal",
+                    "title": "Journal integrity"
+                },
+                {
+                    "details": {
+                        "lag_bytes": null
+                    },
+                    "id": "journal.index_freshness",
+                    "severity": "ok",
+                    "summary": "no cursor yet",
+                    "title": "Journal index"
+                },
+                {
+                    "details": {
+                        "incidents": 0
+                    },
+                    "id": "journal.auto_heal",
+                    "severity": "ok",
+                    "summary": "no auto-heal incidents",
+                    "title": "Auto-heal"
+                }
+            ],
+            "id": "journal",
+            "severity": "ok",
+            "title": "Journal"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
                         "latest_snapshot_age_s": 2,
                         "latest_snapshot_at": "2026-05-13T14:22:29+00:00"
                     },
@@ -730,7 +774,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 32,
+            "ok": 36,
             "warn": 7
         },
         "severity": "fail"

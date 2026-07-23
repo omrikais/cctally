@@ -37,7 +37,7 @@ usable as a healthcheck without false-positive noise:
 
 ## Check inventory
 
-Eight categories. Each check has a stable `id` (used as the
+Nine categories. Each check has a stable `id` (used as the
 JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
@@ -75,13 +75,21 @@ severity != `OK`.
 - `db.stats.file` — WARN when stats.db is absent (fresh install); FAIL when present but cannot open.
 - `db.cache.file` — WARN when cache.db is absent; FAIL when present but cannot open.
 - `db.integrity` — runs `PRAGMA quick_check(1)` on each database. FAIL when **stats.db** (the non-re-derivable DB) reports corruption or cannot be opened for the check; remediation points to `cctally db repair --db stats --yes`, which preserves the corrupt original before a verified atomic replacement. WARN when only **cache.db** is corrupt (re-derivable — `cctally cache-sync --rebuild`). OK when both report `ok`. This check runs **only from the CLI** (`cctally doctor` gathers with a `deep=True` flag); the dashboard health modal, whose gather runs on every rebuild, skips it because `quick_check` on a large cache.db costs seconds — there it shows "not checked (fast gather — run `cctally doctor`)".
-- `db.version_ahead` — flags a DB whose `user_version` exceeds this binary's migration-registry head (a newer/unreleased cctally touched the data dir; issue #145). FAIL when **stats.db** is ahead — it bricks every stats-opening command and is not re-derivable; remediation: `cctally db recover --db stats --yes` (or restore from backup). WARN when only **cache.db** is ahead — it auto-heals on the next open (cache is re-derivable); remediation: it heals automatically, or run `cctally db recover --db cache`. OK ("none ahead") otherwise. `doctor` reads the raw `user_version` (no migration dispatcher), so it can report version-ahead without itself healing or bricking.
+- `db.version_ahead` — classifies each DB's `user_version` versus what this binary expects. **stats.db** follows the EPOCH model (DB journal redesign §7.1): `user_version == STATS_INDEX_EPOCH` (a cut-over install) is HEALTHY, `user_version <= 13` (a pre-cutover legacy install) is HEALTHY (it cuts over on the next open), and `user_version > 13` but `!= epoch` is a §7.1 index **mismatch** → WARN, because it self-heals by journal **rebuild** on the next open (it never bricks, unlike the retired #145 version-ahead FAIL); remediation: `cctally db rebuild --db stats` (NOT the retired `db recover --db stats`). **cache.db** is unchanged (issue #145): a `user_version` past the cache registry head → WARN, auto-heals on the next open (remediation: it heals automatically, or run `cctally db recover --db cache`). OK ("none ahead") otherwise. `doctor` reads the raw `user_version` (no migration dispatcher), so it reports without itself healing or bricking.
 - `db.migrations.applied` — WARN on `skipped` rows; FAIL on `failed` rows.
 - `db.migrations.pending` — WARN when any migration is pending.
 - `db.lock_state` — informational (always OK). A non-blocking flock probe reports whether a core sync lock (`cache.db.lock` / `cache.db.codex.lock`) or transcript lock (`conversations.db.lock` / `conversations.db.codex.lock` / `conversations.db.maintenance.lock`) is currently held; a held lock usually just means an active sync, transcript maintenance, or dashboard is running, so it never WARNs. The summary notes that a hold persisting across repeated `doctor` runs may indicate a wedged process. Read-only — the probe never creates the data dir or the lock files (it opens existing files read-only).
 - `db.wal_size` — WARN when `cache.db-wal` exceeds 256 MiB, indicating that the normal WAL cap/checkpoint defenses have not contained it; remediation is `cctally db checkpoint`.
 - `db.reclaimable` — WARN when at least 25% of `cache.db` pages are on SQLite's freelist, meaning a substantial part of the file can be returned to the filesystem. Remediation is `cctally db vacuum --db cache`. The probe reads `PRAGMA page_count` and `PRAGMA freelist_count` only; it never vacuums or otherwise mutates the database. An absent or unreadable cache degrades to OK, and the raw counts plus ratio are available in the unstable `details` block.
 - `db.conversations_reclaimable` — applies the same read-only 25% freelist threshold to `conversations.db`, with remediation `cctally db vacuum --db conversations`. The transcript-store probe uses a zero-timeout read-only connection, so a large reingest or maintenance lock cannot stall `doctor`; a locked, absent, or unreadable transcript store degrades to OK with unavailable counts.
+
+### Journal
+
+The append-only journal is the durable truth for stats.db (DB journal redesign §9). All four legs are read-only.
+- `journal.presence` — reports the `journal/` directory. A pre-cutover (legacy) install has NO journal yet: that is INFO/OK ("no journal (pre-cutover install)"), never a FAIL. When present it is OK ("N segment(s), writable"), or WARN if the directory is not writable.
+- `journal.integrity` — mid-file **malformed** lines are external damage → WARN (every other line stays independently parseable — the ingester skips + counts the bad ones); a **torn final line** is a known crash artifact healed by the next append → INFO. The scan reads whole segments, so it runs **only from the CLI** (`deep=True`); the dashboard's per-rebuild gather shows "not scanned".
+- `journal.index_freshness` — the stats index **cursor** vs. the journal high-water, in bytes. WARN when the unconsumed gap exceeds 4 MiB (no ingest cycle has run for a long stretch; a monthly segment is MB-scale), remediation `cctally db rebuild --db stats` (or just run any cctally command — the ingester consumes the backlog). Caught-up / small-gap → OK with the gap shown. No journal/cursor yet → OK.
+- `journal.auto_heal` — the most recent auto-heal incident (a quarantine dir under `quarantine/` + a `logs/<db>-corruption-forensics-*.json` bundle). INFO listing the latest; WARN when it fired within the last 7 days (a DB corrupted and self-healed — inspect the forensics bundle).
 
 ### Data
 - `data.latest_snapshot_age` — WARN at 5min-1h, FAIL >1h or never.

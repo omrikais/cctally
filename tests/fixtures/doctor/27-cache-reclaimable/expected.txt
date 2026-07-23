@@ -31,6 +31,11 @@ Database
   ⚠ Reclaimable cache space  high — 97.1% of cache.db pages are free
       → Run `cctally db vacuum --db cache` to reclaim disk space.
   ✓ Reclaimable transcript space below threshold
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+  ✓ Journal integrity        no journal
+  ✓ Journal index            no cursor yet
+  ✓ Auto-heal                no auto-heal incidents
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -54,4 +59,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 35 OK · 5 WARN · 0 FAIL
+Summary: 39 OK · 5 WARN · 0 FAIL

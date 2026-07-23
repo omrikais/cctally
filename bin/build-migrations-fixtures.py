@@ -5027,6 +5027,82 @@ def build_per_migration_006_conversation_reingest_source_tool_use_id(
     )
 
 
+def build_per_migration_conversations_001_adopt_schema_version_marker(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for conversations migration
+    ``001_adopt_schema_version_marker`` (DB journal redesign spec §7.2).
+
+    Adoption, not migration: the handler brings an existing populated
+    conversations.db under the framework without touching its data. pre.sqlite =
+    the conversations schema (``_apply_conversations_schema`` — creates the
+    transcript tables + the ``conversation_schema_version='1'`` marker) + one
+    ``conversation_source_files`` row + an EMPTY ``schema_migrations`` ledger
+    (001 is the first conversations migration, no predecessor) + user_version 0.
+    post.sqlite = the row UNCHANGED, the marker still '1', plus the 001 marker
+    stamped. Loaded by
+    ``tests/test_conversations_migration_001_per_migration_goldens.py``."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        mod = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            mod._apply_conversations_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO conversation_source_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 128, 1, 128, "2026-04-15T15:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = None
+        for m in mod._CONVERSATIONS_MIGRATIONS:
+            if m.name == "001_adopt_schema_version_marker":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit(
+                "conversations migration 001_adopt_schema_version_marker not registered"
+            )
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("001_adopt_schema_version_marker", TS_STATS_FIVE_APPLIED),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def main() -> int:
     os.environ["TZ"] = "Etc/UTC"
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -5165,6 +5241,10 @@ def main() -> int:
     build_per_migration_006_conversation_reingest_source_tool_use_id(
         FIXTURES_ROOT / "per-migration"
         / "006_conversation_reingest_source_tool_use_id"
+    )
+    build_per_migration_conversations_001_adopt_schema_version_marker(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_001_adopt_schema_version_marker"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

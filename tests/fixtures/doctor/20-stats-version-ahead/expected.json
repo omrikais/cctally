@@ -195,15 +195,16 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "ahead": true,
-                            "registry_size": 13,
+                            "epoch": 1000,
+                            "legacy_head": 13,
+                            "mismatch": true,
                             "user_version": 99
                         }
                     },
                     "id": "db.version_ahead",
-                    "remediation": "Run `cctally db recover --db stats --yes` (or restore from backup)",
-                    "severity": "fail",
-                    "summary": "stats.db ahead (v99 > known v13)",
+                    "remediation": "Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`",
+                    "severity": "warn",
+                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1000) \u2014 rebuilds from journal",
                     "title": "Version ahead"
                 },
                 {
@@ -496,8 +497,51 @@
                 }
             ],
             "id": "db",
-            "severity": "fail",
+            "severity": "warn",
             "title": "Database"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "present": false
+                    },
+                    "id": "journal.presence",
+                    "severity": "ok",
+                    "summary": "no journal (pre-cutover install)",
+                    "title": "Journal"
+                },
+                {
+                    "details": {
+                        "present": false
+                    },
+                    "id": "journal.integrity",
+                    "severity": "ok",
+                    "summary": "no journal",
+                    "title": "Journal integrity"
+                },
+                {
+                    "details": {
+                        "lag_bytes": null
+                    },
+                    "id": "journal.index_freshness",
+                    "severity": "ok",
+                    "summary": "no cursor yet",
+                    "title": "Journal index"
+                },
+                {
+                    "details": {
+                        "incidents": 0
+                    },
+                    "id": "journal.auto_heal",
+                    "severity": "ok",
+                    "summary": "no auto-heal incidents",
+                    "title": "Auto-heal"
+                }
+            ],
+            "id": "journal",
+            "severity": "ok",
+            "title": "Journal"
         },
         {
             "checks": [
@@ -711,11 +755,11 @@
     "generated_at": "2026-05-13T14:22:31Z",
     "overall": {
         "counts": {
-            "fail": 1,
-            "ok": 34,
-            "warn": 5
+            "fail": 0,
+            "ok": 38,
+            "warn": 6
         },
-        "severity": "fail"
+        "severity": "warn"
     },
     "schema_version": 1
 }

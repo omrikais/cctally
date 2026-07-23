@@ -938,12 +938,15 @@ DowngradeDetected = _cctally_db.DowngradeDetected
 ProdMigrationRefused = _cctally_db.ProdMigrationRefused
 StatsDbCorruptError = _cctally_db.StatsDbCorruptError
 StatsDbMaintenanceError = _cctally_db.StatsDbMaintenanceError
+StatsEpochMismatchError = _cctally_db.StatsEpochMismatchError
 _is_sqlite_corruption_error = _cctally_db._is_sqlite_corruption_error
 _stats_corruption_guidance = _cctally_db._stats_corruption_guidance
 _STATS_MIGRATIONS = _cctally_db._STATS_MIGRATIONS
 _CACHE_MIGRATIONS = _cctally_db._CACHE_MIGRATIONS
+_CONVERSATIONS_MIGRATIONS = _cctally_db._CONVERSATIONS_MIGRATIONS
 _make_migration_decorator = _cctally_db._make_migration_decorator
 stats_migration = _cctally_db.stats_migration
+conversations_migration = _cctally_db.conversations_migration
 cache_migration = _cctally_db.cache_migration
 _LEGACY_MARKER_ALIASES_BY_DB = _cctally_db._LEGACY_MARKER_ALIASES_BY_DB
 _bootstrap_rename_legacy_markers = _cctally_db._bootstrap_rename_legacy_markers
@@ -964,6 +967,7 @@ _db_path_for_label = _cctally_db._db_path_for_label
 cmd_db_skip = _cctally_db.cmd_db_skip
 cmd_db_unskip = _cctally_db.cmd_db_unskip
 cmd_db_recover = _cctally_db.cmd_db_recover
+cmd_db_rebuild = _cctally_db.cmd_db_rebuild
 cmd_db_repair = _cctally_db.cmd_db_repair
 cmd_db_backup = _cctally_db.cmd_db_backup
 cmd_db_checkpoint = _cctally_db.cmd_db_checkpoint
@@ -1058,7 +1062,7 @@ _resolve_prior_5h = _cctally_record._resolve_prior_5h
 _resolve_active_five_hour_reset_event_id = _cctally_record._resolve_active_five_hour_reset_event_id
 _apply_credit = _cctally_record._apply_credit
 _fire_in_place_credit = _cctally_record._fire_in_place_credit
-_force_clear_credit = _cctally_record._force_clear_credit
+detect_reset_and_credit = _cctally_record.detect_reset_and_credit
 _count_stale_replays = _cctally_record._count_stale_replays
 _credit_preview_text = _cctally_record._credit_preview_text
 _credit_json = _cctally_record._credit_json
@@ -3255,6 +3259,12 @@ def main(argv: list[str] | None = None) -> int:
         eprint(f"cctally: {exc}")
         return 3
     except StatsDbMaintenanceError as exc:
+        eprint(f"cctally: {exc}")
+        return 3
+    except StatsEpochMismatchError as exc:
+        # A version-mismatched stats.db with no journal to rebuild from — hard
+        # error with guidance (DB journal redesign §7.1). Caught before the
+        # generic DatabaseError so it never renders as a raw traceback.
         eprint(f"cctally: {exc}")
         return 3
     except sqlite3.DatabaseError as exc:

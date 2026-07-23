@@ -398,6 +398,17 @@ PY
     assert_eq "$pre_count" "1" "pre_count_non_null"
 
     sql "$home" "UPDATE weekly_usage_snapshots SET five_hour_window_key = NULL;" >/dev/null
+    # Task 8 §6.2 backfill gate: the resumable window-key backfill runs only when
+    # the `stats_open_fixups` marker is absent (a genuine pre-journal upgrade DB).
+    # record_usage above already stamped the marker via its open_db, so simulate
+    # the pre-gate state by clearing it — otherwise the gated backfill correctly
+    # no-ops and the NULL key would (correctly, for a marked DB) stay NULL.
+    # Task 9 §7.1/§8: the epoch gate SUBSUMES the fixups gate — a steady-state
+    # (user_version == STATS_INDEX_EPOCH == 1000) open does zero schema work, so a
+    # genuine pre-journal upgrade DB must ALSO sit at the legacy head (<= 13). The
+    # next stats-DB open then runs the schema apply (incl. the resumable window-key
+    # backfill) and cuts the DB over to the epoch.
+    sql "$home" "DELETE FROM stats_open_fixups; PRAGMA user_version = 13;" >/dev/null 2>&1 || true
 
     null_count=$(sql "$home" \
         "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE five_hour_window_key IS NULL;")

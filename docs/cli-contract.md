@@ -21,13 +21,16 @@ cctally exit codes fall into three groups.
 | `refresh-usage` | `2` no OAuth token · `3` network failure · `4` malformed response · `5` internal `record-usage` failure |
 | `alerts test` | `1` notifier binary missing · `2` `--threshold` out of range · `3` other spawn error |
 | `db skip` / `db unskip` | `1` unknown name / already-applied · `2` ambiguous bare name |
-| `db recover` | `2` `--db stats` without `--yes`, or prod-guard refusal |
+| `db rebuild` | `0` rebuilt from the journal · `2` #146 prod-guard refusal (dev-checkout on prod stats.db) · `3` rebuild failure |
+| `db recover` | `2` `--db stats` (retired — use `db rebuild`), or the cache prod-guard refusal (`--db cache` heals otherwise) |
 | `db repair` | `2` missing `--yes`, healthy target, or prod-guard refusal · `3` active DB, missing recovery tool, recovery/import failure, or verification failure |
 | `db backup` | `2` invalid/existing destination · `3` backup or integrity failure |
 | `db checkpoint` | `3` the target DB stayed busy / the WAL was not fully truncated through the timeout (`0` = drained, already-small, or DB absent) |
 | `tui` | `1` fatal (missing `rich`, narrow terminal, renderer crash) · `2` argument error |
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |
 | share surface | `2` flag-combo error · `3` output-filename collision exhaustion |
+
+**Stats-index open failures are exit `3` for every stats-reading command.** Since the DB journal redesign (§7.1) `stats.db` is a disposable journal index; a `StatsEpochMismatchError` (a version-mismatched stats.db with no journal to rebuild from) or a `StatsDbCorruptError` (corruption the auto-heal could not resolve) is caught before the generic `DatabaseError` handler and returns `3` with one-line guidance, on whichever command opened the DB. The normal mismatch/corruption case never reaches here — it self-heals by rebuild on open.
 
 ## JSON envelope (`--json`)
 

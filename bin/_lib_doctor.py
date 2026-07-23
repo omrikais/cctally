@@ -241,6 +241,37 @@ class DoctorState:
     # check (WARN on beta+brew, else OK). Defaulted (placed last) so existing
     # constructors stay valid and default to the stable posture.
     update_channel: str = "stable"
+    # DB journal redesign §9: the append-only journal legs. All gathered by
+    # `doctor_gather_state` (read-only), defaulted (tail) so existing
+    # constructors stay valid and a pre-cutover install (no journal dir) reads
+    # the always-OK "no journal" posture.
+    #   * journal_present — the journal/ dir exists (a cut-over install has one;
+    #     a legacy pre-cutover install does NOT — that is INFO, never FAIL).
+    #   * journal_appendable — the dir is writable (os.access W_OK); None when
+    #     absent or the probe errored.
+    #   * journal_segment_count — number of segments (bootstrap + monthly).
+    #   * journal_malformed_count / journal_torn_tail_count — mid-file malformed
+    #     lines (external damage → WARN) and torn final lines (a known crash
+    #     artifact healed by the next append → INFO). None = not scanned (the
+    #     scan is `deep`-gated, like the quick_check legs, so the dashboard's
+    #     per-rebuild gather never reads the whole journal).
+    #   * journal_cursor_lag_bytes — unconsumed bytes between the stats index
+    #     cursor and the journal high-water. None when there is no journal /
+    #     cursor / the DB could not be read.
+    #   * journal_hw_segment / journal_cursor_segment — the high-water segment
+    #     and the cursor's segment, for the verbose detail.
+    #   * journal_heal_incidents — most-recent-first list of the auto-heal
+    #     artifacts (quarantine/ dirs + logs/<db>-corruption-forensics-*.json);
+    #     each dict carries {kind, name, age_s}. None = the dirs were unreadable.
+    journal_present: bool = False
+    journal_appendable: Optional[bool] = None
+    journal_segment_count: int = 0
+    journal_malformed_count: Optional[int] = None
+    journal_torn_tail_count: Optional[int] = None
+    journal_cursor_lag_bytes: Optional[int] = None
+    journal_hw_segment: Optional[str] = None
+    journal_cursor_segment: Optional[str] = None
+    journal_heal_incidents: Optional[list] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -731,29 +762,58 @@ def _check_db_migrations_pending(s: DoctorState) -> CheckResult:
 
 
 def _check_db_version_ahead(s: DoctorState) -> CheckResult:
-    """FAIL/WARN when a DB's user_version exceeds the running binary's
-    registry head (issue #145). stats.db ahead bricks commands (FAIL);
-    cache.db ahead auto-heals on the next open (WARN). doctor reads raw
-    user_version (no dispatcher), so it can report without healing/bricking.
+    """Classify each DB's ``user_version`` versus what this binary expects.
+
+    stats.db follows the EPOCH model (DB journal redesign §7.1): it is a
+    DISPOSABLE index stamped at ``STATS_INDEX_EPOCH`` (injected as ``epoch``
+    into ``stats_db_status`` by the gather layer), NOT a versioned migration
+    target. Classification:
+      * ``uv == epoch`` (a cut-over install)      → HEALTHY (steady state)
+      * ``uv <= legacy_head`` (pre-cutover, ≤13)  → HEALTHY (cuts over on open)
+      * ``uv > legacy_head`` AND ``!= epoch``      → §7.1 index MISMATCH: WARN.
+        It self-heals by journal REBUILD on the next open (never bricks, unlike
+        the retired #145 version-ahead FAIL), so the remediation points at
+        `db rebuild --db stats`, NOT the retired `db recover --db stats`.
+
+    cache.db is unchanged (issue #145): a ``user_version`` past the cache
+    registry head auto-heals on the next open → WARN. doctor reads raw
+    ``user_version`` (no dispatcher), so it reports without healing/bricking.
     """
-    def _eval(status):
+    def _eval_stats(status):
+        if not status:
+            return None
+        uv = status.get("user_version", 0) or 0
+        legacy_head = status.get("registry_size", 0) or 0  # frozen stats head (13)
+        epoch = status.get("epoch")
+        if epoch is None:
+            # Fallback kept in lockstep with _cctally_core.STATS_INDEX_EPOCH; the
+            # gather layer injects the real constant, so this only guards a hand-
+            # built DoctorState that omitted it.
+            epoch = 1000
+        mismatch = uv > legacy_head and uv != epoch
+        return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
+                "mismatch": mismatch}
+
+    def _eval_cache(status):
         if not status:
             return None
         uv = status.get("user_version", 0) or 0
         rs = status.get("registry_size", 0) or 0
         return {"user_version": uv, "registry_size": rs, "ahead": uv > rs}
 
-    stats = _eval(s.stats_db_status)
-    cache = _eval(s.cache_db_status)
+    stats = _eval_stats(s.stats_db_status)
+    cache = _eval_cache(s.cache_db_status)
     details = {"stats.db": stats, "cache.db": cache}
-    stats_ahead = bool(stats and stats["ahead"])
+    stats_mismatch = bool(stats and stats["mismatch"])
     cache_ahead = bool(cache and cache["ahead"])
 
-    if stats_ahead:
+    if stats_mismatch:
         return CheckResult(
-            id="db.version_ahead", title="Version ahead", severity="fail",
-            summary=f"stats.db ahead (v{stats['user_version']} > known v{stats['registry_size']})",
-            remediation="Run `cctally db recover --db stats --yes` (or restore from backup)",
+            id="db.version_ahead", title="Version ahead", severity="warn",
+            summary=(f"stats.db index mismatch (v{stats['user_version']} ≠ epoch "
+                     f"v{stats['epoch']}) — rebuilds from journal"),
+            remediation=("Auto-heals by journal rebuild on next command; if it "
+                         "persists, run `cctally db rebuild --db stats`"),
             details=details,
         )
     if cache_ahead:
@@ -1858,6 +1918,137 @@ def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
     )
 
 
+# ── DB journal redesign §9 — append-only journal legs ────────────────────
+# A monthly segment is MB-scale (§4.5), so a multi-MB unconsumed cursor gap
+# means no ingest cycle has run for a long stretch. An auto-heal incident within
+# a week is worth surfacing loudly (the DB corrupted and self-healed).
+_JOURNAL_CURSOR_LAG_WARN_BYTES = 4 * 1024 * 1024
+_JOURNAL_HEAL_RECENT_SECONDS = 7 * 24 * 3600
+
+
+def _check_journal_presence(s: DoctorState) -> CheckResult:
+    """The journal directory exists and is appendable. A pre-cutover (legacy)
+    install has NO journal yet — that is INFO (OK), never a FAIL."""
+    if not s.journal_present:
+        return CheckResult(
+            id="journal.presence", title="Journal", severity="ok",
+            summary="no journal (pre-cutover install)", remediation=None,
+            details={"present": False},
+        )
+    details = {"present": True, "appendable": s.journal_appendable,
+               "segments": s.journal_segment_count}
+    if s.journal_appendable is False:
+        return CheckResult(
+            id="journal.presence", title="Journal", severity="warn",
+            summary="journal directory not writable",
+            remediation="Fix permissions on ~/.local/share/cctally/journal/",
+            details=details,
+        )
+    return CheckResult(
+        id="journal.presence", title="Journal", severity="ok",
+        summary=f"{s.journal_segment_count} segment(s), writable",
+        remediation=None, details=details,
+    )
+
+
+def _check_journal_integrity(s: DoctorState) -> CheckResult:
+    """Mid-file malformed lines are external damage (WARN); a torn final line is
+    a known crash artifact healed by the next append (INFO). The scan is
+    deep-gated — a None count means "not scanned", always OK."""
+    if not s.journal_present:
+        return CheckResult(
+            id="journal.integrity", title="Journal integrity", severity="ok",
+            summary="no journal", remediation=None, details={"present": False},
+        )
+    if s.journal_malformed_count is None:
+        return CheckResult(
+            id="journal.integrity", title="Journal integrity", severity="ok",
+            summary="not scanned", remediation=None, details={"scanned": False},
+        )
+    torn = s.journal_torn_tail_count or 0
+    details = {"malformed": s.journal_malformed_count, "torn_tail": torn}
+    if s.journal_malformed_count > 0:
+        return CheckResult(
+            id="journal.integrity", title="Journal integrity", severity="warn",
+            summary=f"{s.journal_malformed_count} malformed line(s)",
+            remediation=("External damage to a journal segment — inspect "
+                         "~/.local/share/cctally/journal/ (every other line stays "
+                         "parseable; the ingester skips + counts the bad ones)"),
+            details=details,
+        )
+    if torn > 0:
+        return CheckResult(
+            id="journal.integrity", title="Journal integrity", severity="ok",
+            summary=f"{torn} torn tail (heals on next append)",
+            remediation=None, details=details,
+        )
+    return CheckResult(
+        id="journal.integrity", title="Journal integrity", severity="ok",
+        summary="no malformed lines", remediation=None, details=details,
+    )
+
+
+def _check_journal_index_freshness(s: DoctorState) -> CheckResult:
+    """The stats index cursor vs. the journal high-water. A large unconsumed gap
+    → WARN; a small gap or caught-up cursor → OK (with the gap shown)."""
+    if not s.journal_present or s.journal_cursor_lag_bytes is None:
+        return CheckResult(
+            id="journal.index_freshness", title="Journal index", severity="ok",
+            summary="no cursor yet", remediation=None,
+            details={"lag_bytes": None},
+        )
+    lag = s.journal_cursor_lag_bytes
+    details = {"lag_bytes": lag, "hw_segment": s.journal_hw_segment,
+               "cursor_segment": s.journal_cursor_segment,
+               "warn_bytes": _JOURNAL_CURSOR_LAG_WARN_BYTES}
+    if lag == 0:
+        return CheckResult(
+            id="journal.index_freshness", title="Journal index", severity="ok",
+            summary="index caught up", remediation=None, details=details,
+        )
+    if lag > _JOURNAL_CURSOR_LAG_WARN_BYTES:
+        return CheckResult(
+            id="journal.index_freshness", title="Journal index", severity="warn",
+            summary=f"index {lag:,} bytes behind journal",
+            remediation=("Run any cctally command (or `cctally db rebuild --db "
+                         "stats`) — the ingester consumes the backlog"),
+            details=details,
+        )
+    return CheckResult(
+        id="journal.index_freshness", title="Journal index", severity="ok",
+        summary=f"index {lag:,} bytes behind (within threshold)",
+        remediation=None, details=details,
+    )
+
+
+def _check_journal_auto_heal(s: DoctorState) -> CheckResult:
+    """The most recent auto-heal incident (quarantine dir + forensics bundle).
+    INFO listing the latest; WARN when it fired within the last 7 days."""
+    incidents = s.journal_heal_incidents
+    if not incidents:
+        return CheckResult(
+            id="journal.auto_heal", title="Auto-heal", severity="ok",
+            summary="no auto-heal incidents", remediation=None,
+            details={"incidents": 0},
+        )
+    latest = incidents[0]
+    age_s = latest.get("age_s")
+    name = latest.get("name", "?")
+    details = {"incidents": len(incidents), "latest": latest}
+    if age_s is not None and age_s <= _JOURNAL_HEAL_RECENT_SECONDS:
+        return CheckResult(
+            id="journal.auto_heal", title="Auto-heal", severity="warn",
+            summary=f"auto-heal fired recently ({name}, {age_s // 86400}d ago)",
+            remediation=("A DB corrupted and self-healed — inspect the forensics "
+                         "bundle in ~/.local/share/cctally/logs/"),
+            details=details,
+        )
+    return CheckResult(
+        id="journal.auto_heal", title="Auto-heal", severity="ok",
+        summary=f"last incident {name}", remediation=None, details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -1895,6 +2086,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.wal_size", "_check_db_wal_size"),
         ("db.reclaimable", "_check_db_reclaimable"),
         ("db.conversations_reclaimable", "_check_db_conversations_reclaimable"),
+    )),
+    ("journal", "Journal", (
+        ("journal.presence", "_check_journal_presence"),
+        ("journal.integrity", "_check_journal_integrity"),
+        ("journal.index_freshness", "_check_journal_index_freshness"),
+        ("journal.auto_heal", "_check_journal_auto_heal"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),

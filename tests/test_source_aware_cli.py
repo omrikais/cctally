@@ -1325,9 +1325,14 @@ def test_codex_leaf_reconcile_receives_full_budget_outside_config_lock(
             state["inside"] = False
 
     monkeypatch.setattr(config_module, "config_writer_lock", tracking_lock)
+    # 6f writer reroute: the codex leaf reconcile now runs THROUGH the ingest
+    # cycle, which passes `conn=ctx.conn`. Accept the kwarg; the assertion (it
+    # runs OUTSIDE the config lock, receiving the full `{"codex": ...}` budget)
+    # is unchanged — `reconcile_budget_config` is called after the `with
+    # config_writer_lock()` block exits.
     monkeypatch.setitem(
         ns, "_reconcile_codex_budget_on_config_write",
-        lambda budget: calls.append((state["inside"], budget)),
+        lambda budget, **_k: calls.append((state["inside"], budget)),
     )
 
     assert ns["cmd_config"](argparse.Namespace(
@@ -2354,7 +2359,13 @@ def test_codex_leaf_mutations_reconcile_once_per_remaining_configured_block(
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     calls: list[dict] = []
-    monkeypatch.setitem(ns, "_reconcile_codex_budget_on_config_write", lambda block: calls.append(block))
+    # 6f writer reroute: the codex config-set/unset paths now route the reconcile
+    # THROUGH the ingest cycle (`reconcile_budget_config` -> run_stats_ingest ->
+    # `_run_config_reconcile`), which calls the reconcile fn with `conn=ctx.conn`.
+    # Accept the extra kwarg; the assertion (one call per remaining configured
+    # block, carrying `{"codex": <block>}`) is unchanged.
+    monkeypatch.setitem(ns, "_reconcile_codex_budget_on_config_write",
+                        lambda block, **_k: calls.append(block))
 
     def invoke(action: str, key: str, value: str | None = None) -> int:
         return ns["cmd_config"](argparse.Namespace(

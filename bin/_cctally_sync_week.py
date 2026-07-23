@@ -43,15 +43,49 @@ from _cctally_core import (
     format_local_iso,
     make_week_ref,
     get_latest_usage_for_week,
+    now_utc_iso,
 )
 
 
-def cmd_sync_week(args: argparse.Namespace) -> int:
+def cmd_sync_week(
+    args: argparse.Namespace, *, conn=None, as_of: "str | None" = None,
+    journal: "tuple | None" = None,
+) -> int:
+    """Compute + persist the week's cost snapshot.
+
+    Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
+    ``conn`` runs the cost-snapshot insert on the caller's connection (no
+    internal open/commit/close), and ``as_of`` (ISO-Z) stamps the snapshot's
+    ``captured_at_utc``. Both defaults keep the legacy own-connection,
+    wall-clock behavior — so `record`/`maybe_record_milestone`'s existing
+    bare `cmd_sync_week(ns)` calls are byte-identical.
+
+    Design A (DB journal redesign §5.3, Model-A ``weekly_cost_snapshot``):
+    ``journal=(ctx, id_base)`` routes the ``insert_cost_snapshot`` THROUGH
+    ``emit_model_a`` so the computed cost rides a journaled evt
+    (``wcs:<id_base>:<week>``) and replay reads it back verbatim rather than
+    recomputing from the (pruned) provider JSONL. Threaded by the
+    milestone-cost-sync (id_base = the obs line id) and the sync-week op fold
+    (id_base = the op line id). Default ``None`` keeps the bare insert.
+
+    6f writer reroute (Appendix A): the pure-CLI / bare-call path (``conn`` is
+    None AND ``journal`` is None — the ``sync-week`` subcommand entry and the
+    ``report --sync-current`` lazy-sync) no longer computes + inserts on its own
+    connection. It appends a ``sync_week`` ``op`` line and runs an AUTHORITATIVE
+    ingest — ``_pipeline_sync_week`` re-derives args from the op payload and
+    re-enters THIS function with ``conn``+``journal`` set (the inline body below),
+    which computes the cost on the cycle connection and journals the
+    ``weekly_cost_snapshots`` row — then reads that row back for its output. The
+    passed-conn / journal callers stay inline and byte-identical."""
     c = _cctally()
+    if conn is None and journal is None:
+        return _cmd_sync_week_via_ingest(c, args)
     config = c.load_config()
     week_start_name = get_week_start_name(config, args.week_start_name)
 
-    conn = open_db()
+    own_conn = conn is None
+    if own_conn:
+        conn = open_db()
     try:
         selection = c.pick_week_selection(
             conn,
@@ -83,6 +117,9 @@ def cmd_sync_week(args: argparse.Namespace) -> int:
             cost_usd=result.cost_usd,
             mode=args.mode,
             project=args.project,
+            commit=own_conn,
+            as_of=as_of,
+            journal=journal,
         )
 
         week_ref = make_week_ref(
@@ -106,6 +143,106 @@ def cmd_sync_week(args: argparse.Namespace) -> int:
             "rangeStartIso": result.start_iso,
             "rangeEndIso": result.end_iso,
             "costUSD": round(result.cost_usd, 9),
+            "weeklyPercent": weekly_percent,
+            "dollarsPerPercent": round(dollars_per_percent, 9) if dollars_per_percent is not None else None,
+        }
+
+        if args.json:
+            print(json.dumps(c.stamp_schema_version(payload), indent=2))
+        elif not args.quiet:
+            print(
+                f"Synced week {payload['weekStartDate']}..{payload['weekEndDate']} "
+                f"=> ${payload['costUSD']:.6f}"
+            )
+            if weekly_percent is not None:
+                print(f"Latest weekly usage: {weekly_percent:.2f}%")
+            if dollars_per_percent is not None:
+                print(f"$ per 1% usage: ${dollars_per_percent:.6f}")
+        return 0
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _cmd_sync_week_via_ingest(c, args: argparse.Namespace) -> int:
+    """CLI / bare-call sync-week (6f writer reroute): append a ``sync_week`` op
+    + AUTHORITATIVE ingest, then read the journaled ``weekly_cost_snapshots`` row
+    back for output. The op carries the raw ``sync-week`` args; the
+    ``_pipeline_sync_week`` hook re-enters ``cmd_sync_week`` with the cycle
+    connection to compute + journal the cost (Model-A ``wcs:<op id>:<week>``).
+
+    The command observes its own write synchronously (authoritative ingest, then
+    a fresh read-back). Exit codes stay byte-identical: a genuine compute/insert
+    failure propagates out of the authoritative ingest exactly as the old inline
+    path let ``compute_week_cost``/``insert_cost_snapshot`` raise, and the CLI
+    dispatch maps it to the same exit code."""
+    import _cctally_journal as _jr
+    import _lib_journal as _lj
+
+    op = _lj.make_op(
+        at=now_utc_iso(),
+        src="sync-week",
+        payload={
+            "kind": "sync_week",
+            "week_start": args.week_start,
+            "week_end": args.week_end,
+            "week_start_name": args.week_start_name,
+            "mode": args.mode,
+            "offline": args.offline,
+            "project": args.project,
+        },
+    )
+    _jr.append_record(op)
+    res = _jr.run_stats_ingest(mode="authoritative")
+    # authoritative blocks up to the ingest-lock timeout; on the rare timeout
+    # (busy lock) it returns ran=False without consuming the op — retry once so
+    # the CLI observes its own write.
+    if not res.ran:
+        res = _jr.run_stats_ingest(mode="authoritative")
+
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT id, week_start_date, week_end_date, week_start_at, "
+            "       week_end_at, range_start_iso, range_end_iso, cost_usd, mode "
+            "  FROM weekly_cost_snapshots "
+            " WHERE journal_id LIKE ? "
+            " ORDER BY id DESC LIMIT 1",
+            (f"wcs:{op['id']}:%",),
+        ).fetchone()
+        if row is None:
+            # The op did not journal a cost row (only reachable if the ingest
+            # never ran — a sustained ingest-lock timeout). Surface it rather
+            # than printing a phantom success.
+            import sys
+            print(
+                "sync-week: cost ingest did not run (ingest lock busy); retry",
+                file=sys.stderr,
+            )
+            return 3
+
+        (row_id, wsd, wed, wsa, wea, r_start, r_end, cost_usd, _mode) = row
+        week_ref = make_week_ref(
+            week_start_date=wsd,
+            week_end_date=wed,
+            week_start_at=wsa,
+            week_end_at=wea,
+        )
+        usage_row = get_latest_usage_for_week(conn, week_ref)
+        weekly_percent = float(usage_row["weekly_percent"]) if usage_row else None
+        dollars_per_percent = (
+            cost_usd / weekly_percent if weekly_percent and weekly_percent > 0 else None
+        )
+
+        payload = {
+            "id": row_id,
+            "weekStartDate": wsd,
+            "weekEndDate": wed,
+            "weekStartAt": wsa,
+            "weekEndAt": wea,
+            "rangeStartIso": r_start,
+            "rangeEndIso": r_end,
+            "costUSD": round(cost_usd, 9),
             "weeklyPercent": weekly_percent,
             "dollarsPerPercent": round(dollars_per_percent, 9) if dollars_per_percent is not None else None,
         }

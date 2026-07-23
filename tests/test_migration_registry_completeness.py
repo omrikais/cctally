@@ -41,9 +41,11 @@ PER_MIGRATION_ROOT = (
     / "fixtures" / "migrations" / "per-migration"
 )
 
-# Pinned registry sizes. Bump BOTH when a migration ships (see module docstring).
+# Pinned registry sizes. Bump the matching one when a migration ships (see
+# module docstring).
 EXPECTED_STATS_COUNT = 13
 EXPECTED_CACHE_COUNT = 28
+EXPECTED_CONVERSATIONS_COUNT = 1
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -95,7 +97,15 @@ MANIFEST = {
     "026_codex_conversation_key_backfill": "test_cache_migration_026_codex_conversation_key_backfill",
     "027_codex_fork_preamble_rebuild": "test_cache_migration_027_codex_fork_preamble_rebuild",
     "028_split_conversation_store": "test_cache_migration_028_split_conversation_store",
+    # ── conversations registry (DB journal redesign spec §7.2) ──
+    "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
 }
+
+# Golden dir names for conversations migrations carry a ``conversations_``
+# prefix (the builder-function/auto-discovery convention uses underscores) so
+# the three registries' goldens stay unambiguous in the shared per-migration
+# namespace. stats/cache goldens use the bare migration name.
+_CONVERSATIONS_GOLDEN_PREFIX = "conversations_"
 
 
 def _registry_names():
@@ -110,11 +120,23 @@ def _registry_names():
     ns = load_script()
     stats = [m.name for m in ns["_STATS_MIGRATIONS"]]
     cache = [m.name for m in ns["_CACHE_MIGRATIONS"]]
-    return stats, cache
+    conv = [m.name for m in ns["_CONVERSATIONS_MIGRATIONS"]]
+    return stats, cache, conv
+
+
+def _golden_dir_names(stats, cache, conv) -> set:
+    """The expected per-migration golden dir name for every registered
+    migration. stats/cache use the bare migration name; conversations use the
+    ``conversations_`` prefix (see ``_CONVERSATIONS_GOLDEN_PREFIX``)."""
+    return (
+        set(stats)
+        | set(cache)
+        | {f"{_CONVERSATIONS_GOLDEN_PREFIX}{n}" for n in conv}
+    )
 
 
 def test_registry_counts_are_pinned():
-    stats, cache = _registry_names()
+    stats, cache, conv = _registry_names()
     assert len(stats) == EXPECTED_STATS_COUNT, (
         f"stats registry is {len(stats)}, expected {EXPECTED_STATS_COUNT}; a "
         f"new migration landed — bump EXPECTED_STATS_COUNT + add its golden + "
@@ -125,33 +147,39 @@ def test_registry_counts_are_pinned():
         f"new migration landed — bump EXPECTED_CACHE_COUNT + add its golden + "
         f"MANIFEST row."
     )
+    assert len(conv) == EXPECTED_CONVERSATIONS_COUNT, (
+        f"conversations registry is {len(conv)}, expected "
+        f"{EXPECTED_CONVERSATIONS_COUNT}; a new migration landed — bump "
+        f"EXPECTED_CONVERSATIONS_COUNT + add its golden + MANIFEST row."
+    )
 
 
 def test_registry_golden_dir_bijection():
     """Every migration has a golden dir (pre+post); every golden dir maps back
     to a registered migration (no orphans)."""
-    stats, cache = _registry_names()
-    registry_names = set(stats) | set(cache)
-    # stats and cache full names are disjoint (distinct descriptive suffixes).
-    assert len(registry_names) == len(stats) + len(cache), (
-        "a stats and a cache migration share a full name — unexpected collision"
+    stats, cache, conv = _registry_names()
+    expected_dirs = _golden_dir_names(stats, cache, conv)
+    # names disjoint across the three registries (distinct descriptive suffixes,
+    # plus the conversations dir prefix).
+    assert len(expected_dirs) == len(stats) + len(cache) + len(conv), (
+        "two migrations map to the same golden dir — unexpected collision"
     )
     golden_dirs = {p.name for p in PER_MIGRATION_ROOT.iterdir() if p.is_dir()}
 
-    missing = registry_names - golden_dirs
+    missing = expected_dirs - golden_dirs
     assert not missing, f"migrations without a per-migration golden dir: {sorted(missing)}"
-    orphans = golden_dirs - registry_names
+    orphans = golden_dirs - expected_dirs
     assert not orphans, f"orphan golden dirs (no registered migration): {sorted(orphans)}"
 
-    for name in sorted(registry_names):
-        d = PER_MIGRATION_ROOT / name
-        assert (d / "pre.sqlite").exists(), f"{name}: missing pre.sqlite"
-        assert (d / "post.sqlite").exists(), f"{name}: missing post.sqlite"
+    for dname in sorted(expected_dirs):
+        d = PER_MIGRATION_ROOT / dname
+        assert (d / "pre.sqlite").exists(), f"{dname}: missing pre.sqlite"
+        assert (d / "post.sqlite").exists(), f"{dname}: missing post.sqlite"
 
 
 def test_manifest_covers_every_migration():
-    stats, cache = _registry_names()
-    registry_names = set(stats) | set(cache)
+    stats, cache, conv = _registry_names()
+    registry_names = set(stats) | set(cache) | set(conv)
     assert set(MANIFEST) == registry_names, (
         "MANIFEST is out of sync with the registries — "
         f"missing rows: {sorted(registry_names - set(MANIFEST))}; "

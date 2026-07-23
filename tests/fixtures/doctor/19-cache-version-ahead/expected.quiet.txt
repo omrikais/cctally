@@ -12,6 +12,7 @@ Database
       → Auto-heals on next command, or run `cctally db recover --db cache`
   ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
+Journal
 Data
 Pricing
 Safety
@@ -19,4 +20,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 35 OK · 5 WARN · 0 FAIL
+Summary: 39 OK · 5 WARN · 0 FAIL

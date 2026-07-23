@@ -2834,13 +2834,14 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
     db_unskip.set_defaults(func=c.cmd_db_unskip)
     db_recover = db_sub.add_parser(
         "recover",
-        help="Revert a version-ahead DB to the known schema head (#145)",
+        help="Revert a version-ahead cache.db to the known schema head (#145; "
+             "--db stats is retired — use `db rebuild --db stats`)",
     )
     db_recover.add_argument(
         "--db",
         required=True,
         choices=("cache", "stats"),
-        help="Which DB to recover",
+        help="Which DB to recover (stats is retired; rebuild it instead)",
     )
     db_recover.add_argument(
         "--yes",
@@ -2848,9 +2849,26 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Required for --db stats (non-re-derivable; may need a re-record)",
     )
     db_recover.set_defaults(func=c.cmd_db_recover)
+    db_rebuild = db_sub.add_parser(
+        "rebuild",
+        help="Rebuild stats.db from the append-only journal (disposable index)",
+    )
+    db_rebuild.add_argument(
+        "--db",
+        required=True,
+        choices=("stats",),
+        help="Database to rebuild (stats only; rebuild cache.db via cache-sync)",
+    )
+    db_rebuild.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON to stdout",
+    )
+    db_rebuild.set_defaults(func=c.cmd_db_rebuild)
     db_repair = db_sub.add_parser(
         "repair",
-        help="Recover a malformed stats.db through a verified fresh copy",
+        help="Recover a malformed pre-cutover stats.db through a verified fresh "
+             "copy (transitional — post-cutover this folds into journal auto-heal)",
     )
     db_repair.add_argument(
         "--db",

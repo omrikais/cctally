@@ -17,6 +17,7 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
+Journal
 Data
 Pricing
 Safety
@@ -24,4 +25,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 32 OK · 7 WARN · 1 FAIL
+Summary: 36 OK · 7 WARN · 1 FAIL

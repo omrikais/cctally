@@ -136,8 +136,10 @@ describe('#312 mobile source-layout containment', () => {
     expect(mobile).toMatch(/#panel-blocks\.blocks-collapsed:has\(\.blocks-row\)\s*\{(?=[^}]*height:\s*216px)(?=[^}]*max-height:\s*216px)/);
   });
 
-  it('keeps both quota values and the three support slots in one shared hero grid', () => {
-    expect(mobile).toMatch(/\.hero-usage\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(0,\s*\.75fr\)/);
+  it('keeps both quota values separated and the three support slots in one shared hero grid', () => {
+    expect(mobile).toMatch(
+      /\.hero-usage\s*\{(?=[^}]*grid-template-columns:\s*fit-content\(110px\)\s+minmax\(0,\s*1fr\))(?=[^}]*column-gap:\s*var\(--space-3\))/,
+    );
     expect(mobile).toMatch(/\.hero-support\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
   });
 

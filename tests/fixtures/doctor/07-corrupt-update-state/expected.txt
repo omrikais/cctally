@@ -32,6 +32,11 @@ Database
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
   ✓ Reclaimable transcript space below threshold
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+  ✓ Journal integrity        no journal
+  ✓ Journal index            no cursor yet
+  ✓ Auto-heal                no auto-heal incidents
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -55,4 +60,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 33 OK · 6 WARN · 1 FAIL
+Summary: 37 OK · 6 WARN · 1 FAIL

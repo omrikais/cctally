@@ -331,9 +331,14 @@ def _iter_claude_jsonl_files():
                 yield jp
 
 _cctally_db_sib = _load_lib("_cctally_db")
+# Unified store opener (spec §6.1/§6.2). Owns the per-store PRAGMA policy and
+# the version gate; open_cache_db / open_conversations_db route their
+# connect+policy through it and skip the schema apply when schema_current().
+_cctally_store = _load_lib("_cctally_store")
 add_column_if_missing = _cctally_db_sib.add_column_if_missing
 _run_pending_migrations = _cctally_db_sib._run_pending_migrations
 _CACHE_MIGRATIONS = _cctally_db_sib._CACHE_MIGRATIONS
+_CONVERSATIONS_MIGRATIONS = _cctally_db_sib._CONVERSATIONS_MIGRATIONS
 # Storm-free conversation_messages + FTS full-clear (#138). Owns the trigger
 # drop/recreate dance so the per-row delete trigger never fires O(rows) under
 # the held lock on a rebuild / truncation escalation.
@@ -1189,6 +1194,61 @@ def _prune_inactive_codex_source_roots(
               """,
         tuple(params),
     )
+
+
+def _append_codex_quota_obs(quota_rows: list) -> None:
+    """Journal one Codex quota `obs` per newly-read quota observation (Task 7
+    Item 1, spec §4.2 / §5.3 / Appendix A).
+
+    The direct cache.db write in ``_write_codex_file_batch`` stays byte-identical;
+    this obs is the DURABLE truth for the observation. Codex rollout JSONL
+    evaporates over time (§1 latent data-loss hole), so ``quota_window_snapshots``
+    are silently irreplaceable today — journaling the raw capture closes that
+    hole, and the ingest cycle's ``QUOTA_APPLIER`` (spec §5.2 step 3)
+    re-materializes cache.db from these obs.
+
+    Called UNDER the ``cache.db.codex.lock`` provider flock (the journal append
+    lock is a LEAF — legal to take inside a provider flock, spec §4.3) and BEFORE
+    the cache write / offset advance, so a crash re-reads the same bytes and
+    re-appends (idempotent at the QUOTA_APPLIER's natural-key INSERT OR IGNORE)
+    rather than losing the observation. ``at`` is the detection clock
+    (``_command_as_of()``-aware, honoring the CCTALLY_AS_OF test hook); the raw
+    row (incl. its own ``captured_at_utc``) rides the payload (spec §4.2 raw
+    capture — no derivation baked into the stored line). $CODEX_HOME multi-root
+    scoping is preserved: each row carries its own ``source_root_key`` and roots
+    are never combined."""
+    if not quota_rows:
+        return
+    import _cctally_journal as _jr
+    import _lib_journal as _jl
+    at = (
+        _cctally_core._command_as_of()
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    for row in quota_rows:
+        (source, source_root_key, source_path, line_offset, captured_at_utc,
+         observed_slot, logical_limit_key, limit_id, limit_name, window_minutes,
+         used_percent, resets_at_utc, plan_type, individual_limit_json,
+         reached_type, observed_model) = row
+        try:
+            _jr.append_record(_jl.make_obs(
+                at=at, src="codex-quota", provider="codex",
+                payload={
+                    "kind": "quota_window_snapshot",
+                    "source": source, "source_root_key": source_root_key,
+                    "source_path": source_path, "line_offset": line_offset,
+                    "captured_at_utc": captured_at_utc,
+                    "observed_slot": observed_slot,
+                    "logical_limit_key": logical_limit_key, "limit_id": limit_id,
+                    "limit_name": limit_name, "window_minutes": window_minutes,
+                    "used_percent": used_percent, "resets_at_utc": resets_at_utc,
+                    "plan_type": plan_type,
+                    "individual_limit_json": individual_limit_json,
+                    "reached_type": reached_type, "observed_model": observed_model,
+                }))
+        except Exception as exc:  # best-effort; a journal append must not break sync
+            eprint(f"[codex-cache] quota obs journal append failed: {exc}")
 
 
 def _write_codex_file_batch(
@@ -4333,6 +4393,15 @@ def sync_codex_cache(
             # owns the authoritative transcript-local value.
             new_last_turn_id = prev_turn_id
 
+            # Task 7 Item 1: journal the Codex quota observations BEFORE the cache
+            # write (and before the offset advances), under the codex flock this
+            # function already holds. Durable-first: a crash after the append but
+            # before the commit re-reads the same bytes next sync and re-appends
+            # (idempotent at the QUOTA_APPLIER natural key) rather than losing the
+            # observation. Appended once here, not inside the retry loop, so a DB
+            # retry never double-journals.
+            _append_codex_quota_obs(quota_rows)
+
             # Every derived row above was buffered before the first DML. A
             # late database failure therefore rolls the whole file back and
             # retries that same in-memory batch exactly once.
@@ -4738,15 +4807,22 @@ def open_cache_db() -> sqlite3.Connection:
     except OSError as exc:
         eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
     try:
-        conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
+        # Connect + install row factory / test trace hook via the unified
+        # opener (spec §6.1). PRAGMAs are applied AFTER the corruption probe so
+        # a mode-change never writes a WAL onto a DB we are about to unlink.
+        conn = _cctally_store.open_index("cache")
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
         eprint(f"[cache] corrupt cache DB ({exc}); recreating")
         try:
+            conn.close()
+        except Exception:
+            pass
+        try:
             _cctally_core.CACHE_DB_PATH.unlink()
         except FileNotFoundError:
             pass
-        conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
+        conn = _cctally_store.open_index("cache")
 
     # Best-effort 0600 on cache.db itself (the 0700 dir above backstops the
     # sidecars until the first write hardens them in sync_cache).
@@ -4755,56 +4831,46 @@ def open_cache_db() -> sqlite3.Connection:
     except OSError as exc:
         eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
-    # #313 P3 reclaim: create a fresh cache.db in INCREMENTAL auto-vacuum mode so
-    # the transcript-retention prune can return freed pages to the OS via
-    # `PRAGMA incremental_vacuum` instead of only growing the freelist — the
-    # conversation-transcript store is what bloated cache.db to multiple GB and
-    # slowed every sync tick. This MUST run before the first page is written
-    # (before journal_mode=WAL / any CREATE TABLE) to take effect; it is a
-    # harmless no-op on an already-created DB, which keeps its existing mode
-    # until a full VACUUM (`cctally db vacuum`) or a `cache-sync --rebuild`.
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-    conn.execute("PRAGMA journal_mode=WAL")
-    # #297: 15 s (was 5 s) lets a writer wait out a slow-but-normal sync (>5 s)
-    # instead of instantly erroring with "database is locked". Covers plain
-    # writer-vs-writer SQLITE_BUSY, not SQLITE_BUSY_SNAPSHOT (defended by
-    # write-lock-up-front at the write sites, #87).
-    conn.execute("PRAGMA busy_timeout=15000")
-    # #297: bound the persistent WAL file so a resetting checkpoint truncates it
-    # back to this cap instead of leaving it at its multi-GB high-water size.
-    conn.execute(f"PRAGMA journal_size_limit={CACHE_WAL_SIZE_LIMIT_BYTES}")
-    # Re-derivable DB under WAL: NORMAL risks at most the tail transaction on
-    # power loss, and cache.db can always be rebuilt (cache-sync --rebuild).
-    # Fewer ingest fsyncs than the default FULL. Matches stats.db
-    # (bin/_cctally_core.py open_db). #279 S1 F8.
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # §6.1 PRAGMA policy (auto_vacuum=INCREMENTAL emitted first — #313 P3
+    # reclaim needs it before the first page; journal_mode=WAL / busy_timeout /
+    # journal_size_limit #297; synchronous=NORMAL #279 S1 F8). Byte-equivalent
+    # to the former inline block, now owned by the shared policy table.
+    _cctally_store.apply_policy(conn, "cache")
 
-    # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
-    # indexes, the session_id / project_path column adds on session_files
-    # (A2 `session` metadata, populated lazily in sync_cache() /
-    # _ensure_session_files_row()), the Codex base tables + indexes, and the
-    # cache_meta sentinel table. This is the single cache.db schema source —
-    # the eager-apply path (_eagerly_apply_cache_migrations) uses the SAME
-    # helper, so the two can no longer drift. The Codex last_total_tokens
-    # ALTER + purge stays below (out of the shared helper — D4/P1#3).
-    _cctally_db_sib._apply_cache_schema(conn)
+    # §6.2 version gate: run the full schema executescript + add_column_if_missing
+    # probes + the codex last_total_tokens ALTER/purge ONLY when the stamped
+    # user_version differs from the registry head. On a steady-state open of an
+    # up-to-date cache.db this whole block is skipped — the open becomes
+    # connect → PRAGMAs → one user_version read → the dispatcher fast-path.
+    if not _cctally_store.schema_current(conn, "cache"):
+        # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
+        # indexes, the session_id / project_path column adds on session_files
+        # (A2 `session` metadata, populated lazily in sync_cache() /
+        # _ensure_session_files_row()), the Codex base tables + indexes, and the
+        # cache_meta sentinel table. This is the single cache.db schema source —
+        # the eager-apply path (_eagerly_apply_cache_migrations) uses the SAME
+        # helper, so the two can no longer drift. The Codex last_total_tokens
+        # ALTER + purge stays below (out of the shared helper — D4/P1#3).
+        _cctally_db_sib._apply_cache_schema(conn)
 
-    # Migration: add last_total_tokens to codex_session_files. When the column
-    # is newly added (i.e. this is the first run after upgrade), purge the
-    # Codex cache so the duplicate-counted rows produced by the previous
-    # iterator are reingested cleanly by sync_codex_cache(). The cache is
-    # fully re-derivable from ~/.codex/sessions/*.jsonl so this is safe.
-    if add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER"):
-        conn.execute("DELETE FROM codex_session_entries")
-        conn.execute("DELETE FROM codex_session_files")
-        conn.commit()
-        eprint("[cache] migrated codex cache — re-ingesting")
+        # Migration: add last_total_tokens to codex_session_files. When the
+        # column is newly added (i.e. this is the first run after upgrade),
+        # purge the Codex cache so the duplicate-counted rows produced by the
+        # previous iterator are reingested cleanly by sync_codex_cache(). The
+        # cache is fully re-derivable from ~/.codex/sessions/*.jsonl so this is
+        # safe. Under the version gate now (spec §6.2): on an up-to-date DB the
+        # column already exists so add_column_if_missing was a no-op / no purge,
+        # making the gate byte-equivalent.
+        if add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER"):
+            conn.execute("DELETE FROM codex_session_entries")
+            conn.execute("DELETE FROM codex_session_files")
+            conn.commit()
+            eprint("[cache] migrated codex cache — re-ingesting")
 
-    # Migration framework dispatcher for cache.db. The registry is empty in
-    # v1 — this is preparatory wiring that activates when the next cache.db
-    # migration ships. With an empty registry the dispatcher hits the
-    # fast-path or fresh-install branch and returns immediately. See spec
-    # §2.5, §3.3 + the @cache_migration decorator further down in this file.
+    # Migration framework dispatcher for cache.db. Runs unconditionally (spec
+    # §6.2: only the schema apply moves under the gate; the dispatcher keeps its
+    # own fast-path that returns early when user_version == registry head). See
+    # the @cache_migration decorator further down in this file.
     _run_pending_migrations(
         conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
         recover_version_ahead=True,
@@ -4854,10 +4920,13 @@ def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
     path = _cctally_core.CONVERSATIONS_DB_PATH
     conn: sqlite3.Connection | None = None
     try:
-        # URI mode belongs to the connection, not only the later ATTACH value.
-        # Without it, some supported system-Python SQLite builds interpret the
-        # read-only ``file:...cache.db?mode=ro`` attachment as a literal path.
-        conn = sqlite3.connect(path, uri=True)
+        # Connect via the unified opener (spec §6.1). URI mode belongs to the
+        # connection, not only the later ATTACH value — without it, some
+        # supported system-Python SQLite builds interpret the read-only
+        # ``file:...cache.db?mode=ro`` attachment as a literal path; the
+        # conversations policy carries ``uri=True``. PRAGMAs are applied after
+        # the corruption probe.
+        conn = _cctally_store.open_index("conversations")
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
         if conn is not None:
@@ -4878,13 +4947,31 @@ def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
             f"[conversations] could not chmod conversations.db 0600 ({exc}); continuing"
         )
 
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute(f"PRAGMA journal_size_limit={CACHE_WAL_SIZE_LIMIT_BYTES}")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    _cctally_db_sib._apply_conversations_schema(conn)
+    # §6.1 PRAGMA policy (auto_vacuum=INCREMENTAL first / WAL / busy_timeout /
+    # journal_size_limit / synchronous=NORMAL) via the shared table.
+    _cctally_store.apply_policy(conn, "conversations")
+    # §6.2 version gate. conversations.db is under the migration framework
+    # (spec §7.2): the schema apply runs only when the stamped user_version is
+    # behind the registry head; the dispatcher below then stamps user_version to
+    # the head so the next open gates the schema apply out. On an existing
+    # populated DB _apply_conversations_schema short-circuits on its own marker,
+    # so no transcript row is touched even when the gate re-runs it.
+    if not _cctally_store.schema_current(conn, "conversations"):
+        _cctally_db_sib._apply_conversations_schema(conn)
+    # Commit the schema apply BEFORE the dispatcher: _apply_conversations_schema
+    # can leave an open implicit transaction (its trailing marker INSERT), and
+    # the dispatcher's bootstrap-rename opens its own BEGIN — which would collide
+    # with a still-open transaction. Committing here leaves the connection in
+    # autocommit so the dispatcher starts clean.
     conn.commit()
+    # Migration framework dispatcher for conversations.db (spec §7.2). Runs
+    # unconditionally with its own fast-path (user_version == registry head).
+    # recover_version_ahead=True because conversations.db is re-derivable from
+    # provider JSONL, matching the cache.db posture.
+    _run_pending_migrations(
+        conn, registry=_CONVERSATIONS_MIGRATIONS, db_label="conversations.db",
+        recover_version_ahead=True,
+    )
 
     if attach_cache:
         # Ensure the compact schema exists before opening it read-only.  This

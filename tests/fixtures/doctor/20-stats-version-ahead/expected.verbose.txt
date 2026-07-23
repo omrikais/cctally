@@ -68,10 +68,10 @@ Database
       details:
         stats_quick_check: ok
         cache_quick_check: None
-  ✗ Version ahead            stats.db ahead (v99 > known v13)
-      → Run `cctally db recover --db stats --yes` (or restore from backup)
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1000) — rebuilds from journal
+      → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
       details:
-        stats.db: {'user_version': 99, 'registry_size': 13, 'ahead': True}
+        stats.db: {'user_version': 99, 'legacy_head': 13, 'epoch': 1000, 'mismatch': True}
         cache.db: {'user_version': 0, 'registry_size': 28, 'ahead': False}
   ✓ Migrations               0/41 applied
       details:
@@ -98,6 +98,19 @@ Database
         conversations_db_freelist_count: None
         conversations_db_free_ratio: None
         warn_ratio: 0.25
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+      details:
+        present: False
+  ✓ Journal integrity        no journal
+      details:
+        present: False
+  ✓ Journal index            no cursor yet
+      details:
+        lag_bytes: None
+  ✓ Auto-heal                no auto-heal incidents
+      details:
+        incidents: 0
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -177,4 +190,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 34 OK · 5 WARN · 1 FAIL
+Summary: 38 OK · 6 WARN · 0 FAIL

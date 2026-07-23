@@ -21,6 +21,7 @@ Database
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
   ⚠ Pending migrations       40 pending
       → Run any cctally command — opens the DB and applies pending migrations
+Journal
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
@@ -30,4 +31,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 29 OK · 8 WARN · 3 FAIL
+Summary: 33 OK · 8 WARN · 3 FAIL

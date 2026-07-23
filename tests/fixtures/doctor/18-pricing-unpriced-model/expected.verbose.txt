@@ -72,7 +72,7 @@ Database
         cache_quick_check: ok
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'registry_size': 13, 'ahead': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1000, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 28, 'ahead': False}
   ✓ Migrations               0/41 applied
       details:
@@ -99,6 +99,19 @@ Database
         conversations_db_freelist_count: None
         conversations_db_free_ratio: None
         warn_ratio: 0.25
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+      details:
+        present: False
+  ✓ Journal integrity        no journal
+      details:
+        present: False
+  ✓ Journal index            no cursor yet
+      details:
+        lag_bytes: None
+  ✓ Auto-heal                no auto-heal incidents
+      details:
+        incidents: 0
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -180,4 +193,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 34 OK · 6 WARN · 0 FAIL
+Summary: 38 OK · 6 WARN · 0 FAIL

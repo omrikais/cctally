@@ -64,6 +64,8 @@ def _init_paths_from_env() -> None:
     global CACHE_LOCK_PATH, CACHE_LOCK_CODEX_PATH, CACHE_LOCK_MAINTENANCE_PATH
     global CONVERSATIONS_LOCK_PATH, CONVERSATIONS_LOCK_CODEX_PATH
     global CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    global STATS_LOCK_MAINTENANCE_PATH
+    global JOURNAL_DIR, JOURNAL_LOCK_PATH, JOURNAL_INGEST_LOCK_PATH
     global CONFIG_LOCK_PATH
     global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
     global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
@@ -119,6 +121,26 @@ def _init_paths_from_env() -> None:
     CONVERSATIONS_LOCK_MAINTENANCE_PATH = (
         APP_DIR / "conversations.db.maintenance.lock"
     )
+    # Stats index maintenance flock (2026-07-22 DB journal redesign, spec §6.3 /
+    # §6.4). Held at the TOP of the lock-order law (maintenance → ingest →
+    # provider flocks → txn → journal.lock) by the classifier-gated corruption
+    # auto-heal and the `db rebuild --db stats` operator command, so a rebuild
+    # never races a concurrent healer/vacuum and only one process quarantines +
+    # recreates stats.db at a time. cache.db already has its own maintenance
+    # flock above; stats gets the symmetric one now that it, too, auto-heals.
+    STATS_LOCK_MAINTENANCE_PATH = APP_DIR / "stats.db.maintenance.lock"
+    # Append-only observation journal (2026-07-22 DB journal redesign, spec
+    # docs/superpowers/specs/2026-07-22-db-journal-redesign-design.md §4).
+    # JOURNAL_DIR holds the monthly observations-YYYY-MM.jsonl segments plus
+    # the one-time bootstrap-<ts>.jsonl export; the two lock files sit
+    # alongside the DBs in APP_DIR. journal.lock is the µs-scale, blocking,
+    # LEAF append lock (spec §4.3 — no other lock is ever taken while it is
+    # held); journal.ingest.lock admits at most one stats.db writer (spec
+    # §5.1). All three are APP_DIR-derived so dev/data-dir redirection carries
+    # them along, exactly like the cache/conversations locks above.
+    JOURNAL_DIR = APP_DIR / "journal"
+    JOURNAL_LOCK_PATH = APP_DIR / "journal.lock"
+    JOURNAL_INGEST_LOCK_PATH = APP_DIR / "journal.ingest.lock"
     CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
 
     CONFIG_PATH = APP_DIR / "config.json"
@@ -287,6 +309,22 @@ _init_paths_from_env()
 # the contention that bloated cache.db to multi-GB), so a tighter 16 MB cap is
 # ample. See docs/superpowers/specs/2026-07-13-cache-db-wal-hardening-design.md.
 STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
+
+
+# === stats.db epoch-rebuild versioning (DB journal redesign §7.1/§8) ==
+#
+# stats.db is no longer a versioned migration target — it is a DISPOSABLE index
+# materialized from the append-only journal. A single ``STATS_INDEX_EPOCH``
+# integer (stamped via ``PRAGMA user_version``, safely above the legacy 0–13
+# range) versions the index; ANY mismatch resolves by journal rebuild, and
+# ``DowngradeDetected``-bricking ceases for stats. ``LEGACY_STATS_HEAD`` is the
+# frozen legacy migration head (``len(_STATS_MIGRATIONS)``): a stats.db whose
+# ``user_version`` is still in the legacy range (<= 13) is a pre-journal install
+# that ``open_db`` cuts over to the epoch on first open (spec §8). Schema change
+# = bump ``STATS_INDEX_EPOCH`` (never a new stats migration — the registry is
+# frozen).
+STATS_INDEX_EPOCH = 1000
+LEGACY_STATS_HEAD = 13
 
 
 # === Telemetry constants (non-path; see spec 2026-07-07) =============
@@ -491,6 +529,34 @@ def _command_as_of() -> dt.datetime:
             override = override[:-1] + "+00:00"
         return dt.datetime.fromisoformat(override).astimezone(dt.timezone.utc)
     return dt.datetime.now(dt.timezone.utc)
+
+
+def _as_of_or_command(as_of: "str | None") -> dt.datetime:
+    """Capture-time reference datetime for the derivation chokepoints (DB
+    journal redesign spec §5.2.3). When the ingester injects a record's ``at``
+    as ``as_of`` (ISO-8601 with ``Z`` / explicit offset), parse it to UTC so
+    derivation is replay-deterministic; otherwise fall back to the legacy
+    ``_command_as_of()`` wall clock (honoring the ``CCTALLY_AS_OF`` test hook).
+    Passing ``None`` keeps today's behavior bit-identical for legacy callers.
+    """
+    if as_of:
+        s = as_of.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(s)
+        # I3 gate pickup: reject a naive capture time. `.astimezone()` on a
+        # naive datetime silently assumes HOST-LOCAL, which would make
+        # capture-time-pure derivation non-deterministic across hosts (the very
+        # thing §5.2.3 injection exists to prevent). A journal `at` is always
+        # UTC ISO-Z / explicit-offset by construction, so a naive value here is
+        # a caller bug — fail loud instead of guessing the offset.
+        if parsed.tzinfo is None:
+            raise ValueError(
+                f"_as_of_or_command: naive capture time {as_of!r} "
+                "(expected ISO-8601 with 'Z' or an explicit offset)"
+            )
+        return parsed.astimezone(dt.timezone.utc)
+    return _command_as_of()
 
 
 def _now_utc() -> dt.datetime:
@@ -1094,7 +1160,14 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def open_db() -> sqlite3.Connection:
+def open_db(*, _target_path=None) -> sqlite3.Connection:
+    # ``_target_path`` (internal, keyword-only) builds/opens the stats index at
+    # an ALTERNATE path instead of the module-global ``DB_PATH`` — the seam
+    # ``rebuild_stats_index`` uses to materialize a FRESH schema'd index at a
+    # scratch/target path without rebinding the global (thread-safe: no other
+    # caller's ``open_db()`` is affected). Every existing call passes nothing and
+    # is byte-identical (spec §5.4 rebuild / §6.3 heal). ``None`` -> ``DB_PATH``.
+    db_path = pathlib.Path(_target_path) if _target_path is not None else DB_PATH
     c = _cctally()
     # Spec §2.6 carve-out: open_db reaches the migration framework
     # (lives in _cctally_db + bin/cctally). Direct imports would
@@ -1111,14 +1184,27 @@ def open_db() -> sqlite3.Connection:
     _STATS_MIGRATIONS = c._STATS_MIGRATIONS
     _log_migration_error = c._log_migration_error
     _clear_migration_error_log_entries = c._clear_migration_error_log_entries
+    # Unified opener policy (spec §6.1). Call-time import so the shared PRAGMA
+    # policy applies without a module-load cycle (_cctally_store imports this
+    # module). Routed through importlib.import_module rather than a bare
+    # `import _cctally_store` statement so core stays a static IMPORT leaf
+    # (tests/test_kernel_extraction_invariants.py::test_core_imports_no_siblings):
+    # the leaf rule guards against module-LOAD cycles, and a call-time reach
+    # inside open_db() creates none — but the guard's regex matches any
+    # `import _cctally_*` statement, so the deliberate call-time reach uses the
+    # importlib form (still a recognized runtime-loader edge for the package
+    # closure test). stats keeps its own schema-apply until Task 9 flips it to
+    # the epoch gate — this task only routes the PRAGMAs through the shared table.
+    import importlib
+    _cctally_store = importlib.import_module("_cctally_store")
 
-    repair_marker = DB_PATH.with_name("stats.db.repairing")
+    repair_marker = db_path.with_name("stats.db.repairing")
     if repair_marker.exists():
         raise c.StatsDbMaintenanceError()
     ensure_dirs()
     if repair_marker.exists():
         raise c.StatsDbMaintenanceError()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     if repair_marker.exists():
         conn.close()
         raise c.StatsDbMaintenanceError()
@@ -1132,33 +1218,105 @@ def open_db() -> sqlite3.Connection:
     # (corruption that only surfaces mid-DDL stays a raw error; the probe
     # catches the common case).
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # Explicit for intent + symmetry with open_cache_db (bin/_cctally_cache.py).
-        # #297: raised 5000 -> 15000 so a writer waits out a slow-but-normal
-        # sync (>5 s) instead of instantly erroring with "database is locked".
-        # NOTE: busy_timeout does NOT absorb SQLITE_BUSY_SNAPSHOT (a WAL
-        # read-then-write transaction whose snapshot is invalidated by a
-        # competing commit raises "database is locked" instantly, bypassing the
-        # busy handler). The write paths defend against that by taking the write
-        # lock up front — BEGIN IMMEDIATE, or a write as the transaction's first
-        # DML. See cctally-dev#87.
-        conn.execute("PRAGMA busy_timeout=15000")
-        # #297: bound the persistent WAL file (symmetry with open_cache_db).
-        conn.execute(f"PRAGMA journal_size_limit={STATS_WAL_SIZE_LIMIT_BYTES}")
+        # §6.1 PRAGMA policy via the shared table (stats: WAL / NORMAL /
+        # busy_timeout 15000 / journal_size_limit 16 MiB / auto_vacuum unset).
+        # #297: busy_timeout 15000 lets a writer wait out a slow-but-normal sync
+        # (>5 s) instead of erroring "database is locked"; it does NOT absorb
+        # SQLITE_BUSY_SNAPSHOT (defended by BEGIN IMMEDIATE / write-first at the
+        # write sites, cctally-dev#87). journal_size_limit bounds the persistent
+        # WAL. The corruption probe (SELECT 1) stays here inside the narrow
+        # StatsDbCorruptError boundary.
+        _cctally_store.apply_policy(conn, "stats")
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
         try:
             conn.close()
         except Exception:
             pass
-        raise c.StatsDbCorruptError(
-            f"stats.db appears corrupt or unreadable ({exc}). path: {DB_PATH}. "
-            f"Not auto-recreated — it holds your recorded usage history. "
-            "Recovery: run `cctally db repair --db stats --yes`; it preserves "
-            "the corrupt original before replacing anything. Do not copy, "
-            "restore, or move the live DB by hand."
-        ) from exc
+        # Classifier-gated corruption auto-heal (spec §6.3, Task 8). On a
+        # POSITIVELY classified corruption of the REAL stats index (never a
+        # ``_target_path`` rebuild build — that path is disarmed to avoid
+        # recursion), hand off to the store's HEAL_HOOK: it re-checks under the
+        # maintenance lock, writes the forensics bundle FIRST, quarantines the
+        # damaged family into an incident dir, rebuilds a fresh index from the
+        # journal, and returns True. A single retry of the connect+probe then
+        # runs against the fresh index; a second failure surfaces loudly. HEAL
+        # returns False (declined) for a non-corruption ``DatabaseError`` (BUSY,
+        # disk-full, permissions), the dev-checkout-on-prod guard, or when a
+        # concurrent healer already fixed it — all of which fall through to the
+        # original guided StatsDbCorruptError so the manual path still applies.
+        heal = getattr(_cctally_store, "HEAL_HOOK", None)
+        if _target_path is None and heal is not None and heal("stats", exc):
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                _cctally_store.apply_policy(conn, "stats")
+                conn.execute("SELECT 1").fetchone()
+            except sqlite3.DatabaseError as exc2:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise c.StatsDbCorruptError(
+                    f"stats.db is still unreadable after an auto-heal rebuild "
+                    f"({exc2}). path: {db_path}. The damaged original was "
+                    "quarantined under quarantine/ with a forensics bundle in "
+                    "logs/. This is not expected — please report it."
+                ) from exc2
+        else:
+            raise c.StatsDbCorruptError(
+                f"stats.db appears corrupt or unreadable ({exc}). path: {db_path}. "
+                f"Not auto-recreated — it holds your recorded usage history. "
+                "Recovery: run `cctally db repair --db stats --yes`; it preserves "
+                "the corrupt original before replacing anything. Do not copy, "
+                "restore, or move the live DB by hand."
+            ) from exc
+
+    # ── stats.db epoch gate / in-place cutover (DB journal redesign §7.1/§8) ──
+    # The epoch machinery engages ONLY against the FROZEN production stats
+    # registry (len(_STATS_MIGRATIONS) == LEGACY_STATS_HEAD); under
+    # CCTALLY_MIGRATION_TEST_MODE the injected 14th stats migration lifts the
+    # count and disables it, so the migration-framework harness keeps exercising
+    # the legacy dispatcher path with no cutover.
+    _epoch_engaged = _cctally_store.stats_epoch_enabled()
+    if _epoch_engaged:
+        _uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        if _uv == STATS_INDEX_EPOCH:
+            # STEADY STATE — zero schema work (spec §6.2/§7.1). Applies to a
+            # ``_target_path`` open too: a rebuilt/scratch index is stamped at the
+            # epoch, so opening it must be a pure connect + PRAGMA + version read.
+            return conn
+        if _target_path is None:
+            if _uv > LEGACY_STATS_HEAD:
+                # Neither legacy (<=13) nor the current epoch — a future epoch or
+                # a stray value. Resolve by journal REBUILD (spec §7.1), never by
+                # the corruption heal path (disjoint); a mismatch with no journal
+                # is a hard error, never a silent rebuild-to-empty.
+                conn.close()
+                return _cctally_store.resolve_stats_epoch_mismatch()
+            # _uv <= LEGACY_STATS_HEAD → a pre-journal install: cut over below. A
+            # dev/worktree binary must REFUSE to cut over a DB in the real prod
+            # dir (mirrors #146 — the epoch stamp would brick the installed
+            # release via DowngradeDetected). Leave the DB untouched; exit like
+            # ProdMigrationRefused.
+            if _cctally_store.would_block_prod_stats_cutover(db_path):
+                conn.close()
+                raise c.ProdMigrationRefused("stats.db", "cutover→epoch")
+        # else: a ``_target_path`` build below LEGACY_STATS_HEAD (a fresh scratch
+        # index) — fall through to the schema apply; the final block stamps the
+        # epoch directly (no cutover export).
+
+    # §6.2 one-shot backfill gate (Task 8). Read the ``stats_open_fixups`` marker
+    # ONCE, right after the corruption probe. When True (the marker is stamped at
+    # the binary's current fixup version) the three self-extinguishing open-time
+    # backfills below — five_hour_window_key backfill, quota-projection schema,
+    # historical five_hour_blocks rollup — plus their probe SELECTs are skipped
+    # entirely, so the steady-state open does ZERO backfill work. Fresh / pre-gate
+    # DBs read False, run all three once, and re-stamp the marker at the end. The
+    # surrounding schema apply (CREATE TABLE IF NOT EXISTS / add_column_if_missing
+    # / dispatcher) still runs every open — Task 9 folds THAT under the
+    # STATS_INDEX_EPOCH gate; this task only removes the recurring backfill cost.
+    _fixups_current = _cctally_store.stats_open_fixups_current(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS weekly_usage_snapshots (
@@ -1224,13 +1382,19 @@ def open_db() -> sqlite3.Connection:
     needs_5h_key_backfill = add_column_if_missing(
         conn, "weekly_usage_snapshots", "five_hour_window_key", "INTEGER"
     )
-    if not needs_5h_key_backfill and conn.execute(
-        "SELECT 1 FROM weekly_usage_snapshots "
-        "WHERE five_hour_resets_at IS NOT NULL "
-        "  AND five_hour_window_key IS NULL "
-        "LIMIT 1"
-    ).fetchone() is not None:
-        needs_5h_key_backfill = True
+    # §6.2 backfill gate (Task 8): the resumable-partial probe + the backfill
+    # loop are open-time backfill work — skipped once the fixups marker is
+    # stamped. (The `add_column_if_missing` above is schema apply, Task 9's.)
+    if not _fixups_current:
+        if not needs_5h_key_backfill and conn.execute(
+            "SELECT 1 FROM weekly_usage_snapshots "
+            "WHERE five_hour_resets_at IS NOT NULL "
+            "  AND five_hour_window_key IS NULL "
+            "LIMIT 1"
+        ).fetchone() is not None:
+            needs_5h_key_backfill = True
+    else:
+        needs_5h_key_backfill = False
 
     if needs_5h_key_backfill:
         backfill_rows = conn.execute(
@@ -1667,7 +1831,13 @@ def open_db() -> sqlite3.Connection:
     # schema in the fresh-install path before the dispatcher, exactly like the
     # existing live CREATE tables; its handler calls this same idempotent helper
     # for an older stats.db and the dispatcher central-stamps on clean return.
-    _apply_quota_projection_schema(conn)
+    # §6.2 backfill gate (Task 8): the quota-projection schema apply is one of
+    # the three open-time backfills — skipped once the fixups marker is stamped
+    # (the marker is set only AFTER this ran, so marker-present ⇒ tables present).
+    # Fresh installs read False and apply it here (the dispatcher fast-stamps 013
+    # without running its handler, so this open-time call is the sole creator).
+    if not _fixups_current:
+        _apply_quota_projection_schema(conn)
 
     # Migration framework dispatcher. Replaces the prior inline gate stack
     # (has_blocks + _migration_done) with the framework's _run_pending_-
@@ -1692,63 +1862,147 @@ def open_db() -> sqlite3.Connection:
     # Runs AFTER the dispatcher so `schema_migrations` exists for the
     # marker INSERTs inside the backfill body, and so any fresh-install
     # stamp-only path the dispatcher took above is already committed.
-    existing = conn.execute(
-        "SELECT 1 FROM five_hour_blocks LIMIT 1"
-    ).fetchone()
-    has_snapshots = conn.execute(
-        "SELECT 1 FROM weekly_usage_snapshots "
-        "WHERE five_hour_window_key IS NOT NULL "
-        "  AND five_hour_percent     IS NOT NULL "
-        "LIMIT 1"
-    ).fetchone()
-    if not existing and has_snapshots:
-        inserted = _backfill_five_hour_blocks(conn)
-        # Re-run the 5h dedup migration AFTER backfill creates parents.
-        # The dispatcher above ran while five_hour_blocks was empty, so
-        # the dedup handler no-op'd and stamped its marker. Snapshot
-        # keys can carry jitter beyond the 600s canonical floor (the
-        # 003_* migration handles up to 1800s grouping), so the
-        # backfill's `DISTINCT five_hour_window_key` over those keys
-        # can produce duplicate parent rows for one physical 5h
-        # window. Without this re-invocation those duplicates persist
-        # forever — the marker says it ran. Handler owns its own
-        # BEGIN/COMMIT and is idempotent (no groups → no-op).
-        #
-        # Honor `db skip` here as well: if the operator marked 003 as
-        # skipped (e.g., poison pill on their machine), we must NOT
-        # back-door run the handler. Duplicates introduced by the
-        # backfill will persist until they `db unskip` — which is the
-        # explicit choice the skip records. Failure path mirrors the
-        # dispatcher's contract: route through _log_migration_error so
-        # the next interactive command renders the banner, and clear
-        # the log entry on success so the banner auto-dismisses.
-        if inserted > 0:
-            target_name = "003_merge_5h_block_duplicates_v1"
-            try:
-                skipped = {
-                    row[0] for row in conn.execute(
-                        "SELECT name FROM schema_migrations_skipped"
-                    ).fetchall()
-                }
-            except sqlite3.OperationalError:
-                skipped = set()
-            if target_name not in skipped:
-                for _m in _STATS_MIGRATIONS:
-                    if _m.name == target_name:
-                        qualified = f"stats.db:{target_name}"
-                        try:
-                            _m.handler(conn)
-                            _clear_migration_error_log_entries(qualified)
-                        except Exception as exc:
-                            _log_migration_error(
-                                name=qualified,
-                                exc=exc,
-                                tb=traceback.format_exc(),
-                            )
-                            eprint(f"[migration {qualified}] failed: {exc}")
-                        break
+    # §6.2 backfill gate (Task 8): the two probe SELECTs + the backfill + its
+    # migration-003 re-invocation are open-time backfill work — skipped once the
+    # fixups marker is stamped. Dead in the journal world (the ingest cycle writes
+    # blocks with their snapshots), so it fires only on a pre-journal upgrade DB's
+    # first open; after that the marker gates it out permanently.
+    if not _fixups_current:
+        existing = conn.execute(
+            "SELECT 1 FROM five_hour_blocks LIMIT 1"
+        ).fetchone()
+        has_snapshots = conn.execute(
+            "SELECT 1 FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key IS NOT NULL "
+            "  AND five_hour_percent     IS NOT NULL "
+            "LIMIT 1"
+        ).fetchone()
+        if not existing and has_snapshots:
+            inserted = _backfill_five_hour_blocks(conn)
+            # Re-run the 5h dedup migration AFTER backfill creates parents.
+            # The dispatcher above ran while five_hour_blocks was empty, so
+            # the dedup handler no-op'd and stamped its marker. Snapshot
+            # keys can carry jitter beyond the 600s canonical floor (the
+            # 003_* migration handles up to 1800s grouping), so the
+            # backfill's `DISTINCT five_hour_window_key` over those keys
+            # can produce duplicate parent rows for one physical 5h
+            # window. Without this re-invocation those duplicates persist
+            # forever — the marker says it ran. Handler owns its own
+            # BEGIN/COMMIT and is idempotent (no groups → no-op).
+            #
+            # Honor `db skip` here as well: if the operator marked 003 as
+            # skipped (e.g., poison pill on their machine), we must NOT
+            # back-door run the handler. Duplicates introduced by the
+            # backfill will persist until they `db unskip` — which is the
+            # explicit choice the skip records. Failure path mirrors the
+            # dispatcher's contract: route through _log_migration_error so
+            # the next interactive command renders the banner, and clear
+            # the log entry on success so the banner auto-dismisses.
+            if inserted > 0:
+                target_name = "003_merge_5h_block_duplicates_v1"
+                try:
+                    skipped = {
+                        row[0] for row in conn.execute(
+                            "SELECT name FROM schema_migrations_skipped"
+                        ).fetchall()
+                    }
+                except sqlite3.OperationalError:
+                    skipped = set()
+                if target_name not in skipped:
+                    for _m in _STATS_MIGRATIONS:
+                        if _m.name == target_name:
+                            qualified = f"stats.db:{target_name}"
+                            try:
+                                _m.handler(conn)
+                                _clear_migration_error_log_entries(qualified)
+                            except Exception as exc:
+                                _log_migration_error(
+                                    name=qualified,
+                                    exc=exc,
+                                    tb=traceback.format_exc(),
+                                )
+                                eprint(f"[migration {qualified}] failed: {exc}")
+                            break
+
+    # ── Append-only journal replay-identity columns + ingest cursor ──
+    # (2026-07-22 DB journal redesign, spec §4.2 / §5.2). Every row a
+    # journal fold materializes carries the originating line's stable `id`
+    # in `journal_id`, with a partial UNIQUE index so the ingester's
+    # INSERT OR IGNORE fold is idempotent under replay/re-ingest. Runs AFTER
+    # the migration dispatcher so the columns land on the final (migrated)
+    # table shape — migrations 005/006 recreate percent/5h milestone tables
+    # and must not drop the column. All additive (add_column_if_missing /
+    # CREATE ... IF NOT EXISTS), framework-untracked — same posture as
+    # weekly_credit_floors / project_budget_milestones. Task 9 folds this
+    # under the STATS_INDEX_EPOCH version gate; until then it is idempotent
+    # per open (add_column_if_missing / IF NOT EXISTS no-op once present).
+    for _jtable in (
+        "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
+        "five_hour_reset_events", "five_hour_blocks", "weekly_credit_floors",
+        "percent_milestones", "five_hour_milestones", "budget_milestones",
+        "projected_milestones", "project_budget_milestones",
+    ):
+        add_column_if_missing(conn, _jtable, "journal_id", "TEXT")
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_jtable}_journal_id "
+            f"ON {_jtable}(journal_id) WHERE journal_id IS NOT NULL"
+        )
+    # Companion partial index (spec §5.3 harvest / Task 6 gate P2): the ingest
+    # cycle's harvest scans every natural-keyed family for rows the pipeline
+    # inserted this cycle (`WHERE journal_id IS NULL`). A partial index over
+    # exactly those un-stamped rows keeps that scan O(this-cycle inserts), not
+    # O(table) — at the 10x envelope the stamped rows are ~all of the table, so
+    # a full scan would be pathological. Only the 8 HARVEST families need it
+    # (the Model-A / op-fold tables — weekly_usage_snapshots, weekly_cost_
+    # snapshots, weekly_credit_floors — are never harvest-scanned).
+    for _htable in (
+        "week_reset_events", "five_hour_reset_events", "five_hour_blocks",
+        "percent_milestones", "five_hour_milestones", "budget_milestones",
+        "projected_milestones", "project_budget_milestones",
+    ):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{_htable}_journal_id_null "
+            f"ON {_htable}(id) WHERE journal_id IS NULL"
+        )
+    # Single-row segment+offset consumption watermark (spec §5.2). The cursor
+    # never advances past a byte range the ingest cycle did not read.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS journal_cursor ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "segment TEXT NOT NULL, "
+        "offset INTEGER NOT NULL)"
+    )
+
+    # §6.2 backfill gate (Task 8): stamp the one-shot marker AFTER the three
+    # open-time backfills ran, so the next open skips them (and their probes)
+    # entirely. The marker table DDL runs ONLY on this "fixups ran" path, never
+    # on the steady-state open. A crash before this commit leaves the marker
+    # unset and everything re-runs idempotently next open (invariant).
+    if not _fixups_current:
+        _cctally_store.mark_stats_open_fixups_done(conn)
 
     conn.commit()
+
+    # ── Epoch stamp / in-place cutover (DB journal redesign §7.1/§8) ──
+    # The full schema is now applied (head 13 + journal_id columns + cursor). A
+    # ``_target_path`` build (rebuild scratch) stamps the epoch DIRECTLY (no
+    # export — the rebuild folds the journal itself). A real legacy install runs
+    # the cutover: export history to a bootstrap segment, stamp ``journal_id`` on
+    # every row, advance the cursor, and stamp the epoch — all atomic (spec §8).
+    # Under test mode (epoch disabled) neither runs, so the DB stays at
+    # len(registry) for the migration-framework harness.
+    if _epoch_engaged:
+        if _target_path is not None:
+            conn.execute(f"PRAGMA user_version = {STATS_INDEX_EPOCH}")
+            conn.commit()
+        elif conn.execute("PRAGMA user_version").fetchone()[0] == LEGACY_STATS_HEAD:
+            # Cut over ONLY once the legacy dispatcher reached the export baseline
+            # (head 13). A DEFERRED migration (MigrationGateNotMet — e.g. the
+            # 008/009/010 recompute gate) leaves user_version < 13; skip the
+            # cutover so the next open retries the dispatcher first, then cuts over
+            # (spec §8 step 1: "run any pending legacy stats migrations, reaching
+            # the export baseline"). Never journal a pre-recompute stats shape.
+            importlib.import_module("_cctally_journal").run_cutover(conn)
     return conn
 
 
