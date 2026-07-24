@@ -23,11 +23,11 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.81.0** (2026-07-24)
+**Latest stable: v1.82.1** (2026-07-24)
 
-- cctally now tracks usage per account for each provider: if you use more than one Claude or Codex account on this machine, each account's percent, 5-hour, and quota milestones, and their alerts, are recorded and fire independently instead of silently colliding.
-- New `cctally account list|show|label` subcommand shows every observed account (provider, label, email, plan, first/last seen, and which is currently active) and lets you set a durable friendly label that survives a stats rebuild.
-- Optional per-account weekly budgets via `config set budget.accounts` (Claude) and `config set budget.codex.accounts` (Codex); a budget targets an immutable account even after you rename its label, and a Codex per-account budget works without a vendor-wide amount.
+- The public README is a fresh, shorter screenshot-led tour, and it now refreshes itself on every stable release: promoting a release regenerates the screenshots against that exact version and updates a "Latest stable" highlights block on the GitHub page automatically.
+- The dashboard's Recent Sessions card shows session names again. Splitting transcript storage into its own database dropped the name lookup, so every row in the Session column had rendered a dash since then. Names come back from the stored conversation index, and a transcript store that is missing, locked, or rebuilding simply leaves the dash in place instead of holding up the rest of the dashboard.
+- The All tab's Recent Sessions rows now show Claude session names too, matching the Codex rows beside them; previously only Codex rows were named there. Names still appear only for a local viewer, exactly as on the Claude tab.
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
