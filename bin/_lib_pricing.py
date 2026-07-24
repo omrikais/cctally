@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-07-19"
+PRICING_SNAPSHOT_DATE = "2026-07-24"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -99,7 +99,7 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-07-19 (see PRICING_SNAPSHOT_DATE)
+# - Captured: 2026-07-24 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 #   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
@@ -114,6 +114,22 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   value_drift on all four cost fields. Suppressed via PRICING_DRIFT_ALLOWLIST
 #   above (the non-vacuity guard forces removal once LiteLLM reverts to the
 #   standard rate after 2026-08-31).
+#   2026-07-24: added claude-opus-5 ($5/$25 per MTok — identical to Opus
+#   4.5/4.6/4.7/4.8; $6.25 5-minute cache write and $0.50 cache read at the
+#   standard 1.25x/0.1x multipliers). 1M context at standard pricing, so NO
+#   above-200k tier. Dateless pinned id with no dated twin (matches Anthropic's
+#   published ID/alias table). LiteLLM has no opus-5 entry yet, so this table is
+#   simply ahead of it — `ahead_of_litellm` is never a drift finding, so no
+#   PRICING_DRIFT_ALLOWLIST entry is needed.
+#
+# Known gap — Claude *fast mode* is not modelled. Anthropic bills fast mode at a
+# premium ($10/$50 per MTok on Opus 5 and Opus 4.8; $30/$150 on Opus 4.7), and
+# Claude Code records the tier per assistant entry at `message.usage.speed`
+# ("standard" | "fast"), so it IS derivable from the JSONL we already ingest —
+# but this table is one rate per model and `_calculate_entry_cost` ignores speed,
+# so a fast-mode entry is priced at the standard rate (2x undercount on Opus 5).
+# The Codex side already carries the shape for this
+# (`_calculate_codex_entry_cost(..., speed=...)` + its fast-tier multiplier).
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
     "claude-3-5-haiku-20241022": {
         "input_cost_per_token": 8e-07,
@@ -269,6 +285,12 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_creation_input_token_cost": 6.25e-06,
         "cache_read_input_token_cost": 5e-07,
     },
+    "claude-opus-5": {
+        "input_cost_per_token": 5e-06,
+        "output_cost_per_token": 2.5e-05,
+        "cache_creation_input_token_cost": 6.25e-06,
+        "cache_read_input_token_cost": 5e-07,
+    },
     "claude-sonnet-4-20250514": {
         "input_cost_per_token": 3e-06,
         "output_cost_per_token": 1.5e-05,
@@ -321,7 +343,9 @@ _unknown_model_warnings: set[str] = set()
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-07-19 (see PRICING_SNAPSHOT_DATE)
+# - Captured: 2026-07-19 — the last full Codex sync. PRICING_SNAPSHOT_DATE moved
+#   ahead to 2026-07-24 for the Claude-side opus-5 sync; these Codex values were
+#   NOT re-verified that day.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`

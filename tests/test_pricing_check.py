@@ -34,6 +34,60 @@ def test_pricing_constants_present_and_wellformed():
             dt.date.fromisoformat(e["expires"])
 
 
+# Vendor-verified per-MTok rates for the current Claude generation, as
+# (input, output, 5-minute cache write, cache read) per-token costs, taken from
+# platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
+# Cache tiers follow the documented multipliers (write 1.25x base input, read
+# 0.1x). claude-sonnet-5 is deliberately the durable STANDARD $3/$15 rate, not
+# the $2/$10 introductory rate in effect through 2026-08-31 (#274) — the table
+# is date-blind. Extend this map when Anthropic ships a model.
+_CURRENT_GENERATION_RATES = {
+    "claude-fable-5":   (1e-05,  5e-05,   1.25e-05, 1e-06),
+    "claude-haiku-4-5": (1e-06,  5e-06,   1.25e-06, 1e-07),
+    "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),
+    "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
+    "claude-sonnet-5":  (3e-06,  1.5e-05, 3.75e-06, 3e-07),
+}
+
+
+@pytest.mark.parametrize("model,rates", sorted(_CURRENT_GENERATION_RATES.items()))
+def test_current_generation_models_priced_at_vendor_rates(model, rates):
+    """A shipped model absent from the table costs $0 on every surface.
+
+    `_resolve_model_pricing` returns None for an unknown id and
+    `_calculate_entry_cost` then yields 0.0 — so a missing entry silently
+    undercounts real spend instead of failing loudly. This is the day-0
+    backstop the offline coverage leg can only catch *after* usage lands.
+    """
+    got = pricing._resolve_model_pricing(model, warn=False)
+    assert got is not None, f"{model} is unpriced — every cost surface reads $0"
+    assert (
+        got["input_cost_per_token"],
+        got["output_cost_per_token"],
+        got["cache_creation_input_token_cost"],
+        got["cache_read_input_token_cost"],
+    ) == rates
+    # Claude 4.6 and later carry the full 1M window at standard pricing, so
+    # these entries must NOT gain a >200K premium tier (unlike sonnet-4-5).
+    assert not [k for k in got if k.endswith("_above_200k_tokens")]
+
+
+def test_opus_5_entry_cost_is_computed_not_zeroed():
+    """End-to-end non-vacuity companion: the table entry actually prices a
+    real usage block (1 MTok on each of the four axes)."""
+    cost = pricing._calculate_entry_cost(
+        "claude-opus-5",
+        {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "cache_creation_input_tokens": 1_000_000,
+            "cache_read_input_tokens": 1_000_000,
+        },
+    )
+    # $5 in + $25 out + $6.25 5m-cache-write + $0.50 cache-read.
+    assert cost == pytest.approx(36.75)
+
+
 pc = _load("_lib_pricing_check")
 
 # Fakes mirroring the real predicates' contracts.
@@ -750,6 +804,7 @@ def test_issue_script_bad_payload_exit2(tmp_path):
 # ---- _chip_for_model family bucketing (#244) -------------------------------
 
 @pytest.mark.parametrize("model,chip", [
+    ("claude-opus-5", "opus"),            # dateless id — family token still matches
     ("claude-opus-4-8", "opus"),
     ("claude-sonnet-4-6", "sonnet"),
     ("claude-haiku-4-5-20251001", "haiku"),

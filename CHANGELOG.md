@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.82.0] - 2026-07-24
+
+### Added
+- Embedded pricing for Claude Opus 5 (`claude-opus-5`) so Opus 5 sessions are costed correctly instead of contributing $0 as an unrecognized model. Anthropic ships it at the standard Opus rate — $5 / MTok input, $25 / MTok output, $6.25 / MTok 5-minute cache write, $0.50 / MTok cache read — with the full 1M-token context window at standard pricing (no long-context premium), verified against Anthropic's published pricing table; the pricing snapshot date moves to 2026-07-24. LiteLLM carries no Opus 5 entry yet, so the embedded table is simply ahead of it and `pricing-check` does not report drift.
+
+### Fixed
+- `cctally statusline`'s 🧠 context segment now measures a `claude-opus-5[1m]` session against its real 1,000,000-token window instead of silently falling back to the 200K family default, which inflated the reported context percentage roughly fivefold.
+
 ## [1.81.0] - 2026-07-24
 
 ### Added
