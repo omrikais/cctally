@@ -20,6 +20,12 @@ import type { AllSourceData, CodexSourceData, Envelope, FreshnessEnvelope } from
 // Independent provider quota percentages are always labelled and never summed.
 // Mounted only on the dashboard branch of App.tsx.
 
+// #350 — the single disclosure string for a Codex hero bounded by stale quota
+// evidence. Shared with the current-week modal so both surfaces agree.
+export const CODEX_STALE_CYCLE_NOTE =
+  'Codex quota evidence is stale — this spend is current, but the forecast is paused '
+  + 'until Codex reports again.';
+
 export function HeroStrip() {
   const env = useSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
@@ -135,6 +141,11 @@ function SharedHero({
   const fiveHour = windows.find((window) => window.windowMinutes === 300);
   const codexUnavailable = codexEntry?.capabilities?.hero?.status === 'unavailable'
     || codex?.hero?.cost_usd == null;
+  // #350 — disclosure ONLY. Codex has no background quota poll, so a weekly
+  // observation goes stale after an idle hour while the spend, tokens and cycle
+  // bounds it bounds stay correct. This must never gate rendering: the values
+  // are real, and `Forecast @ reset` already pauses through `forecast.status`.
+  const codexCycleStale = codex?.hero?.cycle_freshness === 'stale';
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
   const quotaForecast = codex?.quota.histories.find((row) => row.key === weekly?.key)?.forecast;
   const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
@@ -196,6 +207,7 @@ function SharedHero({
         unavailableReason={codexUnavailable
           ? warning?.message ?? 'Cycle accounting unavailable'
           : null}
+        spentNote={codexCycleStale ? CODEX_STALE_CYCLE_NOTE : null}
       />
     );
   }
@@ -275,6 +287,7 @@ function CanonicalHero({
   freshness,
   showFiveHour,
   unavailableReason = null,
+  spentNote = null,
 }: {
   weekLabel: string | null | undefined;
   usedPct: number | null | undefined;
@@ -290,6 +303,10 @@ function CanonicalHero({
   freshness: FreshnessEnvelope | null;
   showFiveHour: boolean;
   unavailableReason?: string | null;
+  // #350 — disclosure for a hero whose values ARE present but whose bounding
+  // quota evidence is stale. Distinct from `unavailableReason`, which explains
+  // an ABSENT hero; when both apply the unavailable reason wins.
+  spentNote?: string | null;
 }) {
   return (
     <>
@@ -312,7 +329,19 @@ function CanonicalHero({
         </div>
       </div>
 
-      <div className="hero-zone hero-spent" title={unavailableReason ?? undefined}>
+      <div
+        className="hero-zone hero-spent"
+        title={unavailableReason ?? spentNote ?? undefined}
+        // #350 QA [P2]: a `title` on a non-interactive div is hover-only — it is
+        // unreachable on touch and not reliably announced by screen readers. The
+        // visual design stays as chosen (spec §3.8, no new hero visual), but the
+        // reason must at least reach assistive tech.
+        aria-label={
+          unavailableReason ?? spentNote
+            ? `Spent this week. ${unavailableReason ?? spentNote}`
+            : undefined
+        }
+      >
         <div className="hs-label">SPENT THIS WEEK</div>
         <div className="hs-big">{fmt.usd0(spentUsd)}</div>
         <div className="hs-sub">
@@ -366,9 +395,18 @@ function CanonicalHero({
             <span
               className={`sup-v sup-fresh chip-${heroLabel}`}
               data-freshness={heroLabel}
-              title={`Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`}
+              // #350 QA [P3]: this is the one element a desktop user hovers to
+              // interrogate the red warning glyph, so it must say WHY it is red —
+              // the visible text is only an age and never the word "stale".
+              title={
+                `Captured ${fmt.datetimeShort(freshness.captured_at, ctx)}`
+                + (heroLabel === 'stale' ? ' · stale' : '')
+              }
             >
-              {heroLabel === 'stale' ? '⚠ ' : ''}
+              {/* #350 QA [P2]: name the state, don't only tint it. A red glyph
+                  plus a colour shift is the ENTIRE visible delta from fresh
+                  otherwise, which a colourblind or touch user cannot read. */}
+              {heroLabel === 'stale' ? '⚠ stale · ' : ''}
               {humanizeAge(freshness.age_seconds)}
             </span>
           </div>

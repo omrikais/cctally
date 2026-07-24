@@ -302,7 +302,20 @@ _run_scenario_inner () {
     # Belt-and-braces: fail loudly if the HTML parse surfaced nothing at
     # all — a future regression that ships an empty HTML shell should
     # trip the harness instead of passing a trivially-empty check.
-    if ! printf '%s\n' "$asset_paths" | grep -q '\.js$'; then
+    # Matched in-shell rather than through `printf | grep -q`: under
+    # `set -o pipefail` that pipeline reports non-zero whenever the forked
+    # helper dies for any reason (fork pressure, OOM kill, a stray signal on
+    # a loaded runner), which is indistinguishable from a genuine "no JS
+    # asset" regression. Public CI run 30115369729 hit exactly that — a FAIL
+    # whose own "got:" listing plainly contained the bundle, against the same
+    # committed dashboard.html that passed on the 3.12 and 3.13 matrix legs.
+    # `case` forks nothing, so the verdict can only come from the data.
+    # Issue #356.
+    local has_js=0
+    case "$asset_paths" in
+        *.js|*.js$'\n'*) has_js=1 ;;
+    esac
+    if [ "$has_js" -ne 1 ]; then
         echo "FAIL $name: dashboard.html referenced no JS assets; got:"
         printf '%s\n' "$asset_paths" | sed 's/^/    /'
         ok=0

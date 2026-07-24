@@ -21,7 +21,35 @@ from conftest import load_script, redirect_paths
 UTC = dt.timezone.utc
 
 
-def _state(source, now, *, total_cost, daily_label=None):
+def _quota_history(*, status, projected=82.5, current=61.0, now=None, stale_after=3600):
+    """One Codex weekly quota history row with an explicit forecast status."""
+    return {
+        "key": "quota:codex:weekly",
+        "source": "codex",
+        "label": "Weekly limit",
+        "observed_slot": "primary",
+        "window_minutes": 10_080,
+        "current_percent": current,
+        "captured_at": (now or dt.datetime(2026, 7, 16, tzinfo=UTC)).isoformat(),
+        "freshness": "stale" if status == "stale" else "fresh",
+        "stale_after_seconds": stale_after,
+        "forecast": {
+            "status": status,
+            "current_percent": current,
+            "rate_percent_per_hour": 0.5,
+            "projected_percent": projected,
+            "resets_at": (
+                (now or dt.datetime(2026, 7, 16, tzinfo=UTC)) + dt.timedelta(days=2)
+            ).isoformat(),
+            "remaining_seconds": 172_800,
+            "sample_count": 6,
+            "sample_span_seconds": 7_200,
+            "confidence": "high",
+        },
+    }
+
+
+def _state(source, now, *, total_cost, daily_label=None, quota_histories=()):
     return SourceDashboardState(
         source=source,
         availability="ok",
@@ -79,7 +107,9 @@ def _state(source, now, *, total_cost, daily_label=None):
                     },),
                 },
             },
-            "quota": {"blocks": (), "histories": (), "milestones": ()},
+            "quota": {
+                "blocks": (), "histories": tuple(quota_histories), "milestones": (),
+            },
         },
     )
 
@@ -529,6 +559,157 @@ def test_source_compose_expands_all_and_supports_native_forecast(monkeypatch, tm
         assert status == 200
         assert forecast["snapshot"]["source"] == "codex"
         assert "Forecast" in forecast["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+# =========================================================================
+# #350 spec §3.6 — the shared forecast never publishes a stale projection.
+#
+# Both the build and the idle clock deliberately PRESERVE `projected_percent`
+# alongside `status = "stale"`. Today that is masked because a stale Codex source
+# collapses to `unavailable` in the share adapter; §3.4 unmasks it by keeping the
+# source coherent, so a shared forecast would publish a stale projection in
+# violation of "Projections blank. Actuals stay."
+# =========================================================================
+
+
+def _boot_forecast(ns, tmp_path, monkeypatch, *, status, projected=82.5):
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    now = dt.datetime(2026, 7, 16, tzinfo=UTC)
+    claude = _state("claude", now, total_cost=1.0)
+    codex = _state(
+        "codex", now, total_cost=2.0,
+        quota_histories=(_quota_history(status=status, projected=projected, now=now),),
+    )
+    snap = ns["_empty_dashboard_snapshot"]()
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=1,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
+    )
+    handler = ns["DashboardHTTPHandler"]
+    handler.snapshot_ref = ns["_SnapshotRef"](snap)
+    handler.hub = ns["SSEHub"]()
+    handler.sync_lock = threading.Lock()
+    handler.run_sync_now = staticmethod(lambda: None)
+    handler.run_sync_now_locked = staticmethod(lambda: None)
+    handler.no_sync = True
+    handler.display_tz_pref_override = None
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _forecast_recipe():
+    return {
+        "panel": "forecast", "template_id": "forecast-recap", "source": "codex",
+        "options": {"format": "md"},
+    }
+
+
+@pytest.mark.parametrize(
+    "status", ("stale", "future", "insufficient-history", "unavailable"),
+)
+def test_share_forecast_blanks_a_projection_whose_status_is_not_ok(
+    monkeypatch, tmp_path, status,
+):
+    ns = load_script()
+    server, thread = _boot_forecast(ns, tmp_path, monkeypatch, status=status)
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render", _forecast_recipe(),
+        )
+        assert status_code == 200
+        # The backward-looking actual is untouched — only the projection blanks.
+        assert "| 61.0% | \u2014 |" in forecast["body"]
+        assert "82.5%" not in forecast["body"]
+
+        # Same rule on the compose path.
+        status_code, composed = _request(server, "POST", "/api/share/compose", {
+            "title": "Forecast", "theme": "light", "format": "html",
+            "no_branding": False, "reveal_projects": False,
+            "sections": [{
+                "snapshot": {
+                    "panel": "forecast", "template_id": "forecast-recap",
+                    "source": "codex",
+                    "options": {
+                        "format": "html", "theme": "light",
+                        "reveal_projects": False, "no_branding": False,
+                        "show_chart": True, "show_table": True,
+                    },
+                    "data_digest_at_add": "sha256:outdated",
+                    "kernel_version": 1,
+                },
+            }],
+        })
+        assert status_code == 200
+        assert "82.5%" not in composed["body"]
+        assert "61.0%" in composed["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_share_forecast_publishes_an_ok_projection_unchanged(monkeypatch, tmp_path):
+    """Non-vacuity: an `ok` forecast still publishes its projection verbatim."""
+    ns = load_script()
+    server, thread = _boot_forecast(ns, tmp_path, monkeypatch, status="ok")
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render", _forecast_recipe(),
+        )
+        assert status_code == 200
+        assert "| 61.0% | 82.5% |" in forecast["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_share_forecast_blanks_after_an_idle_clock_turns_the_status_stale(
+    monkeypatch, tmp_path,
+):
+    """The clock re-stamps `forecast.status = "stale"` while PRESERVING
+    `projected_percent`, so the share gate must read the status, not the value."""
+    import _cctally_dashboard_sources as source_module
+
+    ns = load_script()
+    server, thread = _boot_forecast(ns, tmp_path, monkeypatch, status="ok")
+    try:
+        snap = ns["DashboardHTTPHandler"].snapshot_ref.get()
+        bundle = snap.source_bundle
+        idle_now = dt.datetime(2026, 7, 16, tzinfo=UTC) + dt.timedelta(hours=4)
+        clocked = source_module.refresh_codex_source_clock(
+            bundle.sources["codex"], now_utc=idle_now,
+        )
+        history = clocked.data["quota"]["histories"][0]
+        assert history["forecast"]["status"] == "stale"
+        assert history["forecast"]["projected_percent"] is not None
+
+        claude = bundle.sources["claude"]
+        snap.source_bundle = SourceDashboardBundle(
+            source_schema_version=1,
+            default_source="claude",
+            source_order=("claude", "codex", "all"),
+            sources={
+                "claude": claude, "codex": clocked,
+                "all": compose_all_state(claude, clocked),
+            },
+        )
+        ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](snap)
+
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render", _forecast_recipe(),
+        )
+        assert status_code == 200
+        assert "| 61.0% | \u2014 |" in forecast["body"]
     finally:
         server.shutdown()
         server.server_close()

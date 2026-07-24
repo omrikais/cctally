@@ -5569,6 +5569,57 @@ def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
     return conn
 
 
+def read_session_titles_bounded(
+    session_ids,
+    *,
+    timeout_s: float = 0.05,
+) -> dict:
+    """{session_id: title} for the dashboard Sessions panel — bounded, fail-soft.
+
+    The Sessions panel is an ACCOUNTING surface that shows one piece of
+    transcript-derived decoration (the session title). #320 made the transcript
+    corpus an independent store precisely so accounting can never wait on it, so
+    this read is deliberately not ``open_conversations_db``: that opener applies
+    the schema, runs the migration dispatcher, attaches ``cache.db``, and carries
+    the 15s store-policy ``busy_timeout`` — a locked or rebuilding store would
+    stall the whole sync tick before a fail-soft caller could give up.
+
+    Instead: one RAW ``mode=ro`` connection with a ``timeout_s`` busy timeout
+    (the same idiom the Codex sessions rows use for Codex's own
+    ``state_5.sqlite``), reading only the two INDEXED title sources via
+    ``session_titles_indexed_map`` — never the windowed ``conversation_messages``
+    scan. Every failure path — no store on disk, locked store, absent tables,
+    corruption — degrades to ``{}`` and the panel renders its em-dash fallback,
+    which self-heals on a later tick. Never creates the store.
+    """
+    ids = [sid for sid in dict.fromkeys(session_ids or ()) if sid]
+    if not ids:
+        return {}
+    path = _cctally_core.CONVERSATIONS_DB_PATH
+    try:
+        if not path.is_file():
+            return {}
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+    except OSError:
+        return {}
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=max(timeout_s, 0.0))
+        return dict(
+            _load_lib("_lib_conversation_query").session_titles_indexed_map(
+                conn, ids,
+            )
+        )
+    except (sqlite3.Error, OSError):
+        return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
 def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
     """Bridge pre-028/compatibility rows into an empty conversation store.
 

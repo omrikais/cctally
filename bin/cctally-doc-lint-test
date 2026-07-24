@@ -139,5 +139,18 @@ scan "'no migration framework'" 'no migration framework' regex "${SCOPE[@]}"
 scan "'no ip.*leaves'"         'no ip.*leaves'          regex "${SCOPE[@]}"
 scan "MIT (standalone word, README+CONTRIBUTING)" "$MIT_PATTERN" word "${MIT_SCOPE[@]}"
 
+# --- readme-refresh guard: README copy lint + latest-stable markers --------
+# Stdlib-only kernel check (issue #354). doc-lint.yml runs this harness on
+# Markdown-only edits, which the normal CI workflow ignores — so a README-only
+# edit still gets the em/en-dash / emoji / spaced-hyphen scan and the
+# marker-well-formedness assertion.
+if python3 "$REPO_ROOT/bin/_lib_readme_refresh.py" --check "$REPO_ROOT/README.md"; then
+    echo "ok: readme-refresh guard (README.md copy lint + markers)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: readme-refresh guard — bin/_lib_readme_refresh.py --check README.md reported issues"
+    fail_count=$((fail_count + 1))
+fi
+
 emit_summary
 [ "$fail_count" -eq 0 ]

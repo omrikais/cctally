@@ -1073,6 +1073,12 @@ export interface CodexHero {
   reasoning_output_tokens: number | null;
   total_tokens: number | null;
   cycle: CodexCycle | null;
+  // #350 — ADDITIVE and OMITTED while the cycle is fresh (never emitted as
+  // `"fresh"`), which is what keeps existing envelope goldens byte-identical.
+  // Drives disclosure only; it must never gate whether the hero renders. Codex
+  // has no background quota poll, so an idle weekly observation goes stale
+  // after one hour while its spend, tokens and cycle bounds stay correct.
+  cycle_freshness?: 'stale';
   quota: CodexQuotaSummary;
   budget: CodexBudgetStatus | null;
   alerts: { count: number };

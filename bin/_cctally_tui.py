@@ -266,6 +266,7 @@ from _cctally_dashboard_sources import (
     _claude_accounts_wire,
     accounts_identity_digest,
     build_codex_source_state,
+    codex_decision_deadline_passed,
     refresh_codex_source_clock,
     resolve_dashboard_source_semantics,
 )
@@ -1724,6 +1725,7 @@ def _tui_build_sessions(
     limit: int = 100,
     skip_sync: bool = False,
     use_session_cache: bool = False,
+    with_titles: bool = False,
 ) -> list[TuiSessionRow]:
     """Load the last `limit` Claude sessions (merged across resumes).
 
@@ -1753,6 +1755,13 @@ def _tui_build_sessions(
     ``False`` → the from-scratch 365-day fetch, so a non-sync-thread caller
     with a shifted ``now`` can NEVER pollute the shared cache (the Bundle 2
     Group A lesson). The visible rows are byte-identical either way.
+
+    ``with_titles``: attach each row's transcript-derived title from the
+    independent conversation store. DASHBOARD-only — ``TuiSessionRow.title`` is
+    read by the dashboard envelope alone (the terminal TUI never renders it), so
+    the default keeps the core/TUI build free of any transcript-store access
+    (#320). The read itself is bounded and fail-soft; see
+    ``read_session_titles_bounded``.
     """
     # Bounded scan window — the sessions pane promises "last `limit`". A
     # 365-day scan covers virtually all users (even one-session-every-few-days
@@ -1781,12 +1790,33 @@ def _tui_build_sessions(
             (), now_utc=now_utc, limit=limit, display_tz=None,
             aggregated_override=aggregated_override,
         )
-    # #320: transcript-derived titles are optional decoration. The core
-    # dashboard/TUI snapshot must never open conversations.db, because even a
-    # fail-soft read pays SQLite's lock timeout before it can fail. Conversation
-    # routes retain title derivation; the accounting Sessions panel renders its
-    # existing em-dash fallback when the independent store is unavailable.
-    return list(view.rows)
+    rows = list(view.rows)
+    if not with_titles:
+        # #320: transcript-derived titles are optional decoration, and the TUI
+        # has no consumer for them (the field is dashboard-only), so the core
+        # build never touches the independent transcript store at all.
+        return rows
+    # Dashboard build (see ``with_titles`` in the docstring): re-attach the
+    # Session-column titles the #320 store split dropped. ``read_session_titles_bounded``
+    # never uses ``open_conversations_db`` and never waits out a lock — a store
+    # that is missing, locked, or mid-rebuild yields no titles and the panel
+    # renders its em-dash fallback, which self-heals on a later tick. Titles are
+    # stashed unconditionally on this server-internal row; the privacy gate is
+    # applied later, at envelope serialization
+    # (``snapshot_to_envelope(transcripts_visible=...)``).
+    session_ids = [r.session_id for r in rows if r.session_id]
+    if not session_ids:
+        return rows
+    titles = c._load_sibling("_cctally_cache").read_session_titles_bounded(
+        session_ids,
+    )
+    if not titles:
+        return rows
+    return [
+        dataclasses.replace(r, title=titles[r.session_id])
+        if r.session_id in titles else r
+        for r in rows
+    ]
 
 
 def _tui_sessions_cached(
@@ -2542,10 +2572,20 @@ def _tui_build_source_bundle(
             # incoherence generation is intentionally not retained through
             # that repair opportunity; all other fresh partial states remain
             # eligible for exact reuse.
+            # #350 spec §3.3: a passed cycle decision deadline forces an
+            # AUTHORITATIVE rebuild. Weekly-cycle resolution is time-dependent
+            # even on frozen evidence, and the reuse path would otherwise hand
+            # back the exact prior object with no re-check at all — so an idle
+            # dashboard would diverge from a freshly rebuilt one. Leaving
+            # ``codex = None`` routes to the existing build below. Bounded by
+            # construction: one rebuild per crossing, not one per tick.
             codex = (
-                None if prior_codex is not None and any(
-                    warning.code == "codex_projection_incoherent"
-                    for warning in prior_codex.warnings
+                None if prior_codex is not None and (
+                    any(
+                        warning.code == "codex_projection_incoherent"
+                        for warning in prior_codex.warnings
+                    )
+                    or codex_decision_deadline_passed(prior_codex, now_utc)
                 ) else reuse_coherent_source_state(
                     prior_codex, data_version=codex_version,
                 )
@@ -2582,6 +2622,14 @@ def _tui_build_source_bundle(
                     if prior_codex is not None
                     else unavailable_source_state("codex", warning)
                 )
+        # #350 spec §3.3: clock Codex UNCONDITIONALLY — after every build /
+        # reuse / degrade branch and before composition — so the retained
+        # cycle's expiry invariant holds on EVERY path, including the reuse
+        # path that returns the exact prior object (§2.5). Same-instant identity
+        # is preserved by ``refresh_codex_source_clock``'s own data-equality
+        # guard, so a freshly built state is handed back unchanged. Claude is
+        # deliberately untouched.
+        codex = refresh_codex_source_clock(codex, now_utc=now_utc)
         combined = compose_all_state(claude, codex)
         bundle = SourceDashboardBundle(
             source_schema_version=1,
@@ -3108,6 +3156,12 @@ def _tui_build_snapshot(
                 # both avoid ingest latency/lock contention.
                 sessions = _tui_build_sessions(
                     now_utc, skip_sync=skip_sync, use_session_cache=True,
+                    # ``precompute_envelope`` is this build's documented
+                    # DASHBOARD marker (set by the sync-thread rebuild + the
+                    # initial snapshot, never by the terminal TUI), and the
+                    # Session-column title is a dashboard-only field — so it
+                    # also gates the bounded transcript-store title read.
+                    with_titles=precompute_envelope,
                 )
             except Exception as exc:
                 errors.append(f"sessions: {exc}")
@@ -3773,7 +3827,14 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         try:
             prior_claude = source_bundle.sources["claude"]
             prior_codex = source_bundle.sources["codex"]
-            if _tui_source_bundle_can_idle(source_bundle):
+            # #350 spec §3.3: once the Codex cycle decision deadline has passed
+            # the idle clock is no longer entitled to speak for the cycle — its
+            # public-history view cannot re-resolve it — so fall through to the
+            # bounded source-adapter path, which rebuilds Codex authoritatively.
+            if (
+                _tui_source_bundle_can_idle(source_bundle)
+                and not codex_decision_deadline_passed(prior_codex, now_utc)
+            ):
                 codex = refresh_codex_source_clock(prior_codex, now_utc=now_utc)
                 if codex is not prior_codex:
                     source_bundle = SourceDashboardBundle(

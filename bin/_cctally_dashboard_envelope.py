@@ -52,6 +52,9 @@ from _cctally_core import (
     _get_alerts_config,
     _get_budget_config,
 )
+from _lib_dashboard_sources import (
+    dashboard_resource_key as _dashboard_resource_key,
+)
 from _lib_display_tz import _compute_display_block, format_display_dt
 from _lib_pricing import _chip_for_model, _short_model_name
 
@@ -1647,7 +1650,74 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         **sys.modules["_cctally_dashboard"]._channel_env_fragment(),
     }
     envelope.update(_source_bundle_to_envelope(getattr(snap, "source_bundle", None)))
+    _overlay_claude_source_session_titles(envelope, snap, transcripts_visible)
     return envelope
+
+
+def _claude_source_session_rows(envelope: dict) -> list:
+    """The SOURCE-scoped Claude session row lists, both of the places the All
+    tab may read them from (``sourceRows.ts::collectSourceSessionRows`` prefers
+    the nested provider payload and falls back to the sibling source entry)."""
+    sources = envelope.get("sources")
+    if not isinstance(sources, Mapping):
+        return []
+    out = []
+    candidates = [(sources.get("claude") or {}).get("data")]
+    all_data = (sources.get("all") or {}).get("data")
+    if isinstance(all_data, Mapping):
+        providers = all_data.get("providers")
+        if isinstance(providers, Mapping):
+            candidates.append(providers.get("claude"))
+    for data in candidates:
+        if not isinstance(data, Mapping):
+            continue
+        sessions = data.get("sessions")
+        if not isinstance(sessions, Mapping):
+            continue
+        rows = sessions.get("rows")
+        if isinstance(rows, list):
+            out.append(rows)
+    return out
+
+
+def _overlay_claude_source_session_titles(
+    envelope: dict, snap, transcripts_visible: bool,
+) -> None:
+    """Inject the gated session title into the source-scoped Claude rows (#363).
+
+    The Sessions card reads a DIFFERENT payload per tab: the legacy
+    ``sessions.rows`` block on the Claude tab, but the source-scoped rows on the
+    All tab. Those source rows are projected into the published source bundle on
+    the sync thread — one frozen bundle shared by every SSE client — so the
+    bundle deliberately carries NO transcript content: a build-time gate
+    decision cannot be right for every later connection, and the projection is
+    fed a fail-closed envelope precisely so nothing leaks into it.
+
+    The title therefore rides the SAME per-request gate as the legacy block, by
+    injection here rather than publication upstream: gate closed → the key stays
+    absent, exactly as before. Injection (rather than publish-then-strip) is what
+    makes it fail closed — a missed site omits a title, it never leaks one.
+
+    Safe to mutate: ``_source_wire_value`` rebuilds plain dicts/lists per call,
+    so these rows are this request's own copies.
+    """
+    if not transcripts_visible:
+        return
+    titles = {}
+    for session in getattr(snap, "sessions", ()) or ():
+        session_id = getattr(session, "session_id", None)
+        title = getattr(session, "title", None)
+        if isinstance(session_id, str) and session_id and title is not None:
+            titles[_dashboard_resource_key("session", "claude", session_id)] = title
+    if not titles:
+        return
+    for rows in _claude_source_session_rows(envelope):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = titles.get(row.get("key"))
+            if title is not None:
+                row["title"] = title
 
 
 def _session_detail_to_envelope(detail: "TuiSessionDetail") -> dict:

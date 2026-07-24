@@ -43,6 +43,7 @@ def _provider_state(
     total_tokens: int = 0,
     alerts: tuple[dict[str, object], ...] = (),
     hero_capability: CapabilityRecord | None = None,
+    cycle_freshness: str | None = None,
 ) -> SourceDashboardState:
     return SourceDashboardState(
         source=source,
@@ -56,7 +57,11 @@ def _provider_state(
             "quota": CapabilityRecord("supported", "native-windows"),
         },
         data={
-            "hero": {"cost_usd": cost_usd, "total_tokens": total_tokens},
+            "hero": {
+                "cost_usd": cost_usd,
+                "total_tokens": total_tokens,
+                **({"cycle_freshness": cycle_freshness} if cycle_freshness else {}),
+            },
             "quota": {"label": f"{source} native quota"},
             "budget": {"label": f"{source} calendar budget"},
             "alerts": {"rows": alerts},
@@ -227,6 +232,81 @@ def test_all_composition_keeps_fresh_provider_sections_when_codex_hero_is_unavai
     assert combined.freshness == "fresh"
     assert combined.data["combined"] is None
     assert set(combined.data["providers"]) == {"claude", "codex"}
+
+
+_STALE_CYCLE_REASON = (
+    "Codex quota evidence is stale, so combined totals are withheld."
+)
+
+
+def test_all_withholds_combined_totals_when_a_provider_cycle_is_stale():
+    """#350 spec §3.5. The combined NUMBER is unchanged from today (still
+    withheld), because §3.4 keeps both providers coherent and `compose_all_state`
+    would otherwise mark a sum over stale evidence `fresh` — and the All hero has
+    no Snapshot row or staleness marker at all, which would be a silent
+    disclosure bug."""
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
+    codex = _provider_state(
+        "codex", cost_usd=3.75, total_tokens=70, cycle_freshness="stale",
+    )
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert combined.data["combined"] is None
+    assert combined.availability == "partial"
+    assert combined.freshness == "fresh"
+    # The All status must state the REAL reason instead of falling through to a
+    # generic `degraded` while both provider envelopes claim health.
+    assert [(w.code, w.domain, w.message) for w in combined.warnings] == [
+        ("combined_totals_withheld", "hero", _STALE_CYCLE_REASON),
+    ]
+    # The Codex envelope itself is NOT degraded by All composition.
+    assert (codex.availability, codex.freshness, codex.warnings) == ("ok", "fresh", ())
+    assert combined.data["providers"]["codex"]["hero"]["cost_usd"] == 3.75
+
+
+def test_all_composition_is_unchanged_when_the_codex_cycle_is_fresh():
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
+    codex = _provider_state("codex", cost_usd=3.75, total_tokens=70)
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert combined.data["combined"] == {"cost_usd": 6.25, "total_tokens": 100}
+    assert (combined.availability, combined.freshness) == ("ok", "fresh")
+    assert combined.warnings == ()
+
+
+def test_all_stale_cycle_reason_is_emitted_once_and_names_every_provider():
+    """The warning is All-LOCAL: it never appears on a provider envelope, and it
+    names each provider whose cycle evidence is stale."""
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30,
+                             cycle_freshness="stale")
+    codex = _provider_state("codex", cost_usd=3.75, total_tokens=70,
+                            cycle_freshness="stale")
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert combined.data["combined"] is None
+    assert [w.code for w in combined.warnings] == ["combined_totals_withheld"]
+    assert combined.warnings[0].message == (
+        "Claude and Codex quota evidence is stale, so combined totals are withheld."
+    )
+
+
+def test_all_stale_cycle_reason_is_not_emitted_when_a_provider_is_incoherent():
+    """An incoherent provider already publishes its own reason and already
+    withholds the combined number, so the §3.5 reason must not pile on."""
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
+    codex = _provider_state(
+        "codex", availability="partial", freshness="stale",
+        cost_usd=3.75, total_tokens=70, cycle_freshness="stale",
+    )
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert combined.data["combined"] is None
+    assert (combined.availability, combined.freshness) == ("partial", "stale")
+    assert combined.warnings == ()
 
 
 def test_stale_partial_provider_is_not_reusable_or_composable():

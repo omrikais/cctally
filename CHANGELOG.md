@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.82.1] - 2026-07-24
+
+### Changed
+- The public README is a fresh, shorter screenshot-led tour, and it now refreshes itself on every stable release: promoting a release regenerates the screenshots against that exact version and updates a "Latest stable" highlights block on the GitHub page automatically. (#354)
+
+### Fixed
+- The dashboard's Recent Sessions card shows session names again. Splitting transcript storage into its own database dropped the name lookup, so every row in the Session column had rendered a dash since then. Names come back from the stored conversation index, and a transcript store that is missing, locked, or rebuilding simply leaves the dash in place instead of holding up the rest of the dashboard. (#362)
+- The All tab's Recent Sessions rows now show Claude session names too, matching the Codex rows beside them; previously only Codex rows were named there. Names still appear only for a local viewer, exactly as on the Claude tab. (#363)
+- The Codex dashboard tab no longer blanks `SPENT THIS WEEK` (and `$/1% used`, `$/1% vs last week`, and the week label) after Codex has been idle for an hour. Codex only reports its quota while you are using it, so the weekly reading goes stale on an idle machine — the spend was never lost, just hidden. It now stays on screen, with the Snapshot chip naming the reading as stale and showing its age. (#350)
+- Forecasts still pause on stale Codex quota evidence, on the dashboard and in a shared report: `Forecast @ reset` and a shared forecast's `Projected` column show `—` rather than projecting from a reading that may be an hour old. (#350)
+- The All tab keeps withholding its combined total while a provider's quota evidence is stale, but now says that is the reason instead of reporting a generic degraded state. (#350)
+
 ## [1.82.0] - 2026-07-24
 
 ### Added

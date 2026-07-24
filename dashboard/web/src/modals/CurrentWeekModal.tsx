@@ -12,6 +12,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
+import { CODEX_STALE_CYCLE_NOTE } from '../components/HeroStrip';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { dispatch, getState, subscribeStore, topmostStoreFocusLayer } from '../store/store';
 import type { Binding } from '../store/keymap';
@@ -677,6 +678,19 @@ function CodexCurrentCycleModal({
             <span className="m-pill accent-orange">Codex · native 7-day quota</span>
           </div>
         )}
+        {/* #350 — this modal renders cost, percent and cycle bounds without
+            consulting freshness, and `providerReason` checks only warnings and
+            cycle nullity, so a stale-but-valid cycle is otherwise invisible
+            here. Disclosure only: nothing above is gated on it. Suppressed for
+            a historic cycle (evidence age is irrelevant there) and for the
+            EMBEDDED All variant, which per spec §3.7 shows the All-local §3.5
+            reason and nothing more; a visible All-tab stale marker is a
+            deliberate §4 follow-up. */}
+        {!embedded && !isHistoric && hero?.cycle_freshness === 'stale' ? (
+          <p className="mcw-ms-sub" data-testid="codex-cycle-stale-note">
+            {CODEX_STALE_CYCLE_NOTE}
+          </p>
+        ) : null}
 
         <div className="mcw-herobar">
           <div className="mcw-bignum" id={singleId('mcw-bignum')}>
@@ -1249,6 +1263,11 @@ function AllCurrentWeekModal({
 }) {
   const claudeReason = providerReason(env, 'claude');
   const codexReason = providerReason(env, 'codex');
+  // #350 §3.7: the All-local reason (e.g. `combined_totals_withheld`) lives on
+  // the `all` source, NOT on either provider — `providerReason` reads only
+  // provider warnings and would leave this modal the one fully silent surface
+  // when a provider's cycle evidence is stale.
+  const allReason = warningForDomain(env?.sources?.all?.warnings, 'hero')?.message ?? null;
   return (
     <Modal
       title="Current Usage — provider cycles"
@@ -1263,6 +1282,9 @@ function AllCurrentWeekModal({
         />
       }
     >
+      {allReason && (
+        <p className="provider-section-reason" data-testid="all-current-week-reason">{allReason}</p>
+      )}
       <div className="provider-composition provider-composition--modal current-week-provider-composition">
         <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="claude">
           <div className="source-provider-head provider-composition-head">

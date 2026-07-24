@@ -453,3 +453,97 @@ def test_walk_models_current_and_include_fable(tmp_path):
     assert not any("opus-4-7" in m for m in models), (
         f"stale Opus 4.7 must not appear in the walk; got {models}"
     )
+
+
+def test_codex_leg_seeds_relative_paths_and_renders(tmp_path):
+    """The marketing fixture seeds a Codex leg for the `cctally codex daily`
+    README SVG (issue #354).
+
+    Seeded `codex_session_entries.source_path` values MUST be relative — cold
+    sync deliberately preserves relative fixture rows while pruning unreachable
+    absolute paths (bin/_cctally_cache.py). `codex_session_files` rows carry
+    `size_bytes=0` so no orphan-scan warning bakes into the captured SVG. Then
+    `cctally codex daily` against the staged fixture renders a nonzero cost with
+    no stderr noise (source-silence discipline)."""
+    import os
+    import re as _re
+
+    mod = _load_builder()
+    out = _isolated_build(mod, tmp_path)  # as_of 2026-05-05 -> Thursday 2026-05-07 14:00Z
+
+    with sqlite3.connect(out / "cache.db") as conn:
+        rows = conn.execute(
+            "SELECT source_path FROM codex_session_entries"
+        ).fetchall()
+        assert rows, "expected seeded codex_session_entries"
+        for (sp,) in rows:
+            assert not os.path.isabs(sp), f"absolute source_path leaks: {sp!r}"
+            assert sp.startswith(".codex/sessions/"), sp
+        files = conn.execute(
+            "SELECT path, size_bytes FROM codex_session_files"
+        ).fetchall()
+        assert files, "expected seeded codex_session_files"
+        for path, size in files:
+            assert size == 0, f"{path}: size_bytes={size} (must be 0)"
+
+    home = out.parents[2]  # <home>/.local/share/cctally -> <home>
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(home),
+            "CCTALLY_DATA_DIR": str(out),
+            "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+            "CCTALLY_DISABLE_UPDATE_CHECK": "1",
+            "NO_COLOR": "1",
+            "TZ": "Etc/UTC",
+            "CCTALLY_AS_OF": "2026-05-07T14:00:00Z",
+        }
+    )
+    for var in ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY"):
+        env.pop(var, None)
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "bin" / "cctally"), "codex", "daily"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == "", f"unexpected stderr: {result.stderr!r}"
+    amounts = _re.findall(r"\$(\d+(?:\.\d+)?)", result.stdout)
+    assert any(float(a) > 0 for a in amounts), (
+        f"expected a nonzero $ amount in codex daily output:\n{result.stdout}"
+    )
+
+
+def test_codex_leg_rooted_identity(tmp_path):
+    """The dashboard's Codex read model fails closed on entries lacking rooted
+    identity (load_cached_rooted_codex_accounting_entries raises "rooted
+    accounting identity is absent" -> QualifiedMetadataUnavailable, which bakes
+    an ERROR into the marketing capture's dashboard log). Every seeded Codex
+    row must therefore carry a 32-hex source_root_key registered in
+    codex_source_roots (issue #354, found by the first real pipeline run)."""
+    import re as _re
+
+    mod = _load_builder()
+    out = _isolated_build(mod, tmp_path)
+
+    with sqlite3.connect(out / "cache.db") as conn:
+        entry_keys = {
+            k for (k,) in conn.execute(
+                "SELECT DISTINCT source_root_key FROM codex_session_entries")
+        }
+        assert entry_keys, "expected seeded codex_session_entries"
+        for key in entry_keys:
+            assert isinstance(key, str) and _re.fullmatch(r"[0-9a-f]{32}", key), (
+                f"codex_session_entries.source_root_key must be 32-hex, got {key!r}")
+        file_keys = {
+            k for (k,) in conn.execute(
+                "SELECT DISTINCT source_root_key FROM codex_session_files")
+        }
+        assert file_keys == entry_keys, (
+            f"files/entries root keys diverge: {file_keys!r} != {entry_keys!r}")
+        registered = {
+            k for (k,) in conn.execute(
+                "SELECT source_root_key FROM codex_source_roots")
+        }
+        assert entry_keys <= registered, (
+            f"root keys not registered in codex_source_roots: "
+            f"{entry_keys - registered!r}")

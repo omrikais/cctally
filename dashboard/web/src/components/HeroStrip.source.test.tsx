@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, screen } from '@testing-library/react';
 import { HeroStrip } from './HeroStrip';
+import { SourceStatusChip } from './SourceStatusChip';
+import { resolveSourceView } from '../store/sourceView';
+import { gateSessions } from '../lib/sourceGating';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
 import type { Envelope } from '../types/envelope';
@@ -182,6 +185,91 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
     render(<HeroStrip />);
     expect(document.querySelector('.hero-usage')).toHaveTextContent('5-HOUR42%');
     expect(document.querySelector('.hero-spent')).toHaveTextContent('$12');
+  });
+});
+
+// =========================================================================
+// #350 — a stale-but-valid Codex cycle keeps its ACTUALS and blanks only the
+// projection. Spec §3.0: "Projections blank. Actuals stay."
+// =========================================================================
+
+function staleCycleEnv(): Envelope {
+  const env = parityEnv();
+  const codex = env.sources!.codex.data!;
+  // Build time stamped the additive hero-local marker; the envelope metadata
+  // (availability / freshness / warnings / capabilities) is deliberately
+  // untouched, because five separate gates read it as one meaning.
+  (codex.hero as unknown as { cycle_freshness?: string }).cycle_freshness = 'stale';
+  const weekly = codex.quota.histories.find((row) => row.window_minutes === 10_080)!;
+  weekly.freshness = 'stale';
+  weekly.forecast.status = 'stale';
+  // The clock PRESERVES projected_percent alongside a stale status — the hero
+  // must gate on the status, not on the value being null.
+  weekly.forecast.projected_percent = 80.0;
+  const active = codex.hero.quota.active.find((row) => row.key === weekly.key)!;
+  active.freshness = 'stale';
+  // Two hours old, so the client-derived Snapshot chip reads `stale`.
+  active.captured_at = '2026-04-24T11:00:00Z';
+  return env;
+}
+
+describe('HeroStrip — stale Codex cycle disclosure (#350)', () => {
+  beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-04-24T13:07:00Z'));
+    updateSnapshot(staleCycleEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+  });
+
+  it('keeps every backward-looking actual and blanks only the forecast', () => {
+    const { container } = render(<HeroStrip />);
+    const hero = container.querySelector('.hero-strip')!;
+
+    expect(hero).toHaveTextContent('SPENT THIS WEEK$12');
+    expect(hero).toHaveTextContent('$0.20 / 1% used');
+    expect(hero).toHaveTextContent('$/1% vs last week$0.05');
+    expect(hero).toHaveTextContent('WEEK USAGE · Apr 23–Apr 30');
+    expect(hero).toHaveTextContent('61.0%');
+    // The projection pauses through its OWN forecast.status gate.
+    expect(hero).toHaveTextContent('Forecast @ reset—');
+    // Token totals are retained on the wire but never displayed for Codex.
+    expect(hero).not.toHaveTextContent('total tokens');
+  });
+
+  it('reads the existing Snapshot stale marker rather than a new visual', () => {
+    render(<HeroStrip />);
+    const chip = document.querySelector('.sup-fresh')!;
+
+    expect(chip).toHaveAttribute('data-freshness', 'stale');
+    expect(chip).toHaveTextContent('⚠');
+    // The state must be NAMED, not only tinted: colour plus a glyph is
+    // unreadable to a colourblind user and carries no meaning on its own.
+    expect(chip).toHaveTextContent(/stale/i);
+    expect(chip.getAttribute('title')).toMatch(/stale/i);
+  });
+
+  it('discloses the stale cycle on the hero-spent zone without hiding the spend', () => {
+    render(<HeroStrip />);
+    const spent = document.querySelector('.hero-spent')!;
+
+    expect(spent).toHaveTextContent('$12');
+    expect(spent.getAttribute('title')).toMatch(/stale/i);
+    // `title` alone is hover-only — unreachable on touch and unreliable for
+    // screen readers, so the reason must also ride an aria-label.
+    expect(spent.getAttribute('aria-label')).toMatch(/stale/i);
+  });
+
+  it('leaves the source status chip reading fresh, never "Hero unavailable"', () => {
+    render(<SourceStatusChip />);
+    const chip = screen.getByTestId('source-status-chip');
+
+    expect(chip).toHaveTextContent('fresh');
+    expect(chip.textContent).not.toContain('Hero unavailable');
+    expect(chip.className).not.toContain('is-degraded');
+  });
+
+  it('leaves Sessions gating untouched', () => {
+    const view = resolveSourceView(staleCycleEnv(), 'codex');
+    expect(gateSessions(view).mode).toBe('render');
   });
 });
 

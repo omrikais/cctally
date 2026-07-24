@@ -297,11 +297,40 @@ def reuse_coherent_source_state(
     return prior if _coherent_provider(prior) and prior.data_version == data_version else None
 
 
+def _hero_cycle_is_stale(state: SourceDashboardState) -> bool:
+    """Whether a provider's hero is bounded by STALE quota evidence (#350 §3.4).
+
+    ``hero.cycle_freshness`` is additive and OMITTED while the cycle is fresh, so
+    this is false for every provider and every generation that predates #350.
+    """
+    if not isinstance(state.data, Mapping):
+        return False
+    hero = state.data.get("hero")
+    return isinstance(hero, Mapping) and hero.get("cycle_freshness") == "stale"
+
+
+def _stale_cycle_providers(
+    claude: SourceDashboardState,
+    codex: SourceDashboardState,
+) -> tuple[str, ...]:
+    return tuple(
+        label for label, state in (("Claude", claude), ("Codex", codex))
+        if _hero_cycle_is_stale(state)
+    )
+
+
 def _combined_metrics(
     claude: SourceDashboardState,
     codex: SourceDashboardState,
 ) -> Mapping[str, object] | None:
     if not (_coherent_provider(claude) and _coherent_provider(codex)):
+        return None
+    # #350 spec §3.5: a stale-cycle hero is NOT combinable. Retaining it would
+    # let a sum over stale evidence be published while `compose_all_state` marks
+    # the result fresh — and the All hero carries no Snapshot row or staleness
+    # marker at all, so the staleness would be silently undisclosed. The
+    # combined NUMBER therefore behaves exactly as it does today.
+    if _stale_cycle_providers(claude, codex):
         return None
     for state in (claude, codex):
         hero_capability = state.capabilities.get("hero")
@@ -366,7 +395,24 @@ def compose_all_state(
         raise ValueError("all composition requires Claude and Codex provider states")
     combined = _combined_metrics(claude, codex)
     providers_coherent = _coherent_provider(claude) and _coherent_provider(codex)
+    # #350 spec §3.5: "All behaves exactly as today" is true only of the combined
+    # NUMBER. Under §3.4 both providers stay coherent, so All now publishes
+    # partial/fresh with no provider warning to explain it — the status chip
+    # would fall through to a generic `degraded` and the All hero fallback would
+    # claim a provider is degraded while both provider envelopes say otherwise.
+    # This All-LOCAL warning states the real reason without touching either
+    # provider envelope. It is emitted only when the providers are otherwise
+    # coherent; an incoherent provider already publishes its own reason.
+    all_local_warnings: tuple[SourceDashboardWarning, ...] = ()
     if providers_coherent:
+        stale_cycle_providers = _stale_cycle_providers(claude, codex)
+        if stale_cycle_providers:
+            all_local_warnings = (SourceDashboardWarning(
+                "combined_totals_withheld",
+                f"{' and '.join(stale_cycle_providers)} quota evidence is stale, "
+                "so combined totals are withheld.",
+                "hero",
+            ),)
         availability: Availability = (
             "partial"
             if combined is None or "partial" in (claude.availability, codex.availability)
@@ -395,7 +441,11 @@ def compose_all_state(
         source="all",
         availability=availability,
         freshness=freshness,
-        warnings=tuple((*claude.warnings, *codex.warnings)),
+        # All-LOCAL warnings lead: `warningForSource` on the client falls back to
+        # the FIRST warning, so a merely-partial provider warning (e.g.
+        # `codex_metadata_incomplete`) would otherwise pre-empt the chip label
+        # and hide the real reason combined totals are withheld.
+        warnings=tuple((*all_local_warnings, *claude.warnings, *codex.warnings)),
         data_version=data_version,
         last_success_at=last_success_at,
         capabilities={

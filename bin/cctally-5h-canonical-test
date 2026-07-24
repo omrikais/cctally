@@ -374,7 +374,13 @@ else:
     print("OK", len(test_epochs))
 PY
 )
-    if ! printf '%s\n' "$out" | grep -q '^OK '; then
+    # In-shell match (no forked pipeline), for the same reason as the
+    # dashboard harness's JS-asset guard: under `pipefail` a helper that
+    # dies transiently would otherwise read as a real assertion failure.
+    # Issue #356.
+    _has_ok=0
+    case "$out" in "OK "*|*$'\n'"OK "*) _has_ok=1 ;; esac
+    if [ "$_has_ok" -ne 1 ]; then
         # Compose detail from any "FAIL" lines.
         _err=$(printf '%s\n' "$out" | tr '\n' '; ')
     fi

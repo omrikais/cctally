@@ -6,12 +6,12 @@
 #   2. Build the marketing fixture (bin/build-readme-fixtures.py)
 #   3. Stage the fixture under <scratch>/home/
 #   4. Export CCTALLY_AS_OF + HOME for all subsequent invocations
-#   5. Capture 4 CLI SVGs via freeze (charm.sh static-frame SVG tool)
+#   5. Capture 5 CLI SVGs via freeze (charm.sh static-frame SVG tool)
 #   6. Start `cctally dashboard` ONCE against the marketing fixture;
 #      run bin/_capture_dashboard.py for ALL 4 dashboard shots (the
 #      marketing fixture's tuned ~103% projection now produces the
 #      WARN state inline — no separate warn-fixture restage needed).
-#   7. Verify all 8 outputs landed in docs/img/
+#   7. Verify all 11 outputs landed in docs/img/
 #
 # Idempotent (overwrites docs/img/ in place). Not run in CI; refreshing
 # the README assets is a maintainer task.
@@ -19,6 +19,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_IMG="$REPO_ROOT/docs/img"
+# Execution contract (issue #354): consumed by `cctally-release readme-refresh`.
+# Pin the product binary (default: THIS checkout's bin/cctally, never whatever
+# `cctally` sits on PATH) and the output dir (default docs/img; overridable so
+# readme-refresh can capture into a temp dir + copy back only manifest-listed
+# files). README_SCREENSHOTS_CONTRACT=1 is the capability marker it greps for.
+README_SCREENSHOTS_CONTRACT=1
+CCTALLY_BIN="${CCTALLY_BIN:-$REPO_ROOT/bin/cctally}"
+export CCTALLY_BIN
+OUT_DIR="${README_SCREENSHOTS_OUT_DIR:-$DOCS_IMG}"
+mkdir -p "$OUT_DIR"
 MARKETING_FIXTURE="$REPO_ROOT/tests/fixtures/readme/home"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8789}"
 DASHBOARD_URL="http://127.0.0.1:$DASHBOARD_PORT/"
@@ -115,11 +125,26 @@ PY
 )"
 export CCTALLY_AS_OF="$AS_OF_INSTANT"
 export HOME="$SCRATCH/home"
+# A linked worktree is a git checkout, so `_is_dev_checkout()` is true and would
+# resolve ~/.local/share/cctally-dev instead of the staged fixture HOME. Pin the
+# data dir explicitly to neutralize the dev-checkout autodetect.
+export CCTALLY_DATA_DIR="$SCRATCH/home/.local/share/cctally"
+
+# Version canary: prove no installed `cctally` leaked in and the captured binary
+# is exactly the version we intend (the dashboard header chip renders
+# `cctally vX.Y.Z` into every PNG). readme-refresh sets README_EXPECTED_VERSION.
+if [[ -n "${README_EXPECTED_VERSION:-}" ]]; then
+    got="$("$CCTALLY_BIN" --version)"
+    if [[ "$got" != "cctally ${README_EXPECTED_VERSION}"* ]]; then
+        echo "build-readme-screenshots: version canary failed: got '$got', want cctally ${README_EXPECTED_VERSION}" >&2
+        exit 1
+    fi
+fi
 
 # 5. CLI SVGs via freeze (charm.sh) — static-frame SVGs, no animation.
 # freeze produces clean static SVGs for terminal output (no animation;
 # works in all SVG viewers + GitHub).
-mkdir -p "$DOCS_IMG"
+mkdir -p "$OUT_DIR"
 echo "[3/5] Capturing CLI SVGs"
 
 FREEZE_OPTS=(--window --background "#0d1117" --padding "20,40" --margin 0)
@@ -133,9 +158,10 @@ FREEZE_OPTS=(--window --background "#0d1117" --padding "20,40" --margin 0)
 # would also zero the pre-walk trend weeks). Both live in
 # bin/build-readme-fixtures.py. A cold `cctally report/forecast` against
 # the fixture now emits zero stderr, so no pre-warm is needed.
-freeze "${FREEZE_OPTS[@]}" --execute "cctally report"           --output "$DOCS_IMG/cli-report.svg"
-freeze "${FREEZE_OPTS[@]}" --execute "cctally forecast"         --output "$DOCS_IMG/cli-forecast.svg"
-freeze "${FREEZE_OPTS[@]}" --execute "cctally five-hour-blocks --breakdown=model" --output "$DOCS_IMG/cli-five-hour-blocks.svg"
+freeze "${FREEZE_OPTS[@]}" --execute "$CCTALLY_BIN report"           --output "$OUT_DIR/cli-report.svg"
+freeze "${FREEZE_OPTS[@]}" --execute "$CCTALLY_BIN forecast"         --output "$OUT_DIR/cli-forecast.svg"
+freeze "${FREEZE_OPTS[@]}" --execute "$CCTALLY_BIN five-hour-blocks --breakdown=model" --output "$OUT_DIR/cli-five-hour-blocks.svg"
+freeze "${FREEZE_OPTS[@]}" --execute "$CCTALLY_BIN codex daily"      --output "$OUT_DIR/cli-codex-daily.svg"
 # TUI uses the hidden --render-once / --snapshot-module / --force-size
 # dev path. These flags are argparse.SUPPRESS'd in cctally tui --help
 # but verified to exist (see bin/cctally argparse setup ~L19975).
@@ -144,8 +170,8 @@ freeze "${FREEZE_OPTS[@]}" --execute "cctally five-hour-blocks --breakdown=model
 # captures the ANSI and renders a colored SVG. Goldens never set
 # FORCE_COLOR, so existing fixture tests are unaffected.
 FORCE_COLOR=1 PYTHONPATH="$ORIGINAL_USER_SITE${PYTHONPATH:+:$PYTHONPATH}" freeze "${FREEZE_OPTS[@]}" \
-    --execute "cctally tui --render-once --snapshot-module $REPO_ROOT/tests/fixtures/readme/tui_snapshot.py --force-size 120x40" \
-    --output "$DOCS_IMG/cli-tui.svg"
+    --execute "$CCTALLY_BIN tui --render-once --snapshot-module $REPO_ROOT/tests/fixtures/readme/tui_snapshot.py --force-size 120x40" \
+    --output "$OUT_DIR/cli-tui.svg"
 
 # 6. Dashboard shots — start dashboard ONCE against the marketing
 # fixture and capture all 4 shots in a single pass. The marketing
@@ -155,7 +181,7 @@ FORCE_COLOR=1 PYTHONPATH="$ORIGINAL_USER_SITE${PYTHONPATH:+:$PYTHONPATH}" freeze
 echo "[4/5] Starting dashboard against marketing fixture"
 # NOTE: flag is `--no-browser`, NOT `--no-open` (which would error). See
 # `cctally dashboard --help`.
-cctally dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser &
+"$CCTALLY_BIN" dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser &
 DASH_PID=$!
 
 # Wait for dashboard to come up (poll up to 15s)
@@ -174,25 +200,26 @@ fi
 # the same reason as the TUI invocation above (playwright is typically
 # pip-installed into the user-site, which HOME redirect hides).
 PYTHONPATH="$ORIGINAL_USER_SITE${PYTHONPATH:+:$PYTHONPATH}" \
-    "$REPO_ROOT/bin/_capture_dashboard.py" --url "$DASHBOARD_URL" --out-dir "$DOCS_IMG"
+    "$REPO_ROOT/bin/_capture_dashboard.py" --url "$DASHBOARD_URL" --out-dir "$OUT_DIR"
 
 kill -TERM "$DASH_PID" 2>/dev/null || true
 wait "$DASH_PID" 2>/dev/null || true
 DASH_PID=""
 
-# 7. Verify all 8 outputs exist and are non-empty.
+# 7. Verify all 11 outputs exist and are non-empty.
 echo "[5/5] Verifying outputs"
 EXPECTED=(
-    "$DOCS_IMG/dashboard-desktop.png"
-    "$DOCS_IMG/dashboard-modal.png"
-    "$DOCS_IMG/dashboard-mobile.png"
-    "$DOCS_IMG/dashboard-warn.png"
-    "$DOCS_IMG/conversation-reader.png"
-    "$DOCS_IMG/conversation-mobile.png"
-    "$DOCS_IMG/cli-report.svg"
-    "$DOCS_IMG/cli-forecast.svg"
-    "$DOCS_IMG/cli-five-hour-blocks.svg"
-    "$DOCS_IMG/cli-tui.svg"
+    "$OUT_DIR/dashboard-desktop.png"
+    "$OUT_DIR/dashboard-modal.png"
+    "$OUT_DIR/dashboard-mobile.png"
+    "$OUT_DIR/dashboard-warn.png"
+    "$OUT_DIR/conversation-reader.png"
+    "$OUT_DIR/conversation-mobile.png"
+    "$OUT_DIR/cli-report.svg"
+    "$OUT_DIR/cli-forecast.svg"
+    "$OUT_DIR/cli-five-hour-blocks.svg"
+    "$OUT_DIR/cli-codex-daily.svg"
+    "$OUT_DIR/cli-tui.svg"
 )
 MISSING=0
 for f in "${EXPECTED[@]}"; do
@@ -209,5 +236,16 @@ if [[ $MISSING -gt 0 ]]; then
     exit 1
 fi
 
+# Machine-readable manifest (issue #354): readme-refresh copies back ONLY the
+# files listed here into the main checkout's docs/img/.
+python3 - "$OUT_DIR" "${EXPECTED[@]}" <<'PYMANIFEST'
+import json, os, sys
+out = sys.argv[1]
+files = sorted(os.path.basename(p) for p in sys.argv[2:])
+with open(os.path.join(out, "manifest.json"), "w") as fh:
+    json.dump({"files": files}, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PYMANIFEST
+
 echo
-echo "All ${#EXPECTED[@]} README assets refreshed in $DOCS_IMG"
+echo "All ${#EXPECTED[@]} README assets refreshed in $OUT_DIR"

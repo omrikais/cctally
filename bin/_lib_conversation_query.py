@@ -325,6 +325,51 @@ def _session_first_prompt_titles_map(conn, session_ids):
     return titles
 
 
+def _session_rollup_titles_map(conn, session_ids):
+    """{sid: title} from the STORED ``conversation_sessions.title`` rollup — the
+    first-prompt title #302 materializes so the hot read paths never re-run
+    ``_session_first_prompt_titles_map``'s windowed ``conversation_messages``
+    scan. One PK lookup per id.
+
+    Falsey titles are DROPPED (a rollup row exists for every indexed session,
+    titled or not), so an untitled session is simply absent. Tolerates the table
+    being absent (pre-migration / rebuilding store) by returning {}."""
+    if not session_ids:
+        return {}
+    out = {}
+    try:
+        ph = ",".join("?" for _ in session_ids)
+        for sid, title in conn.execute(
+            f"SELECT session_id, title FROM conversation_sessions "
+            f"WHERE session_id IN ({ph})", tuple(session_ids)
+        ).fetchall():
+            if title:
+                out[sid] = title
+    except sqlite3.OperationalError:
+        pass  # table absent -> {} (caller degrades to no title)
+    return out
+
+
+def session_titles_indexed_map(conn, session_ids):
+    """{sid: title} composed from INDEXED reads only — the truthy AI title wins,
+    else the stored rollup title. Same precedence as ``_session_titles_map``,
+    and identical values whenever the rollup is current (#302: the stored title
+    IS the first-prompt title), but it NEVER falls back to the windowed
+    ``conversation_messages`` scan.
+
+    That bound is the contract: this is what a latency-sensitive, fail-soft
+    caller (the dashboard Sessions panel, which reads the transcript store over
+    a bounded read-only connection) may run per tick. A session missing from
+    both indexes is simply absent — the caller renders its em-dash fallback and
+    the next rollup recompute fills it in."""
+    if not session_ids:
+        return {}
+    titles = dict(_session_ai_titles_map(conn, session_ids))
+    for sid, t in _session_rollup_titles_map(conn, session_ids).items():
+        titles.setdefault(sid, t)   # AI title (truthy) wins; else the rollup
+    return titles
+
+
 def _session_titles_map(conn, session_ids):
     """{sid: title} — the TRUTHY AI title wins, else the first-prompt title.
     Contract UNCHANGED (the live/degraded rail branch still calls this as-is); now

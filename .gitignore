@@ -87,3 +87,7 @@ baseline/
 # regenerated each session. Anchored to root.
 /cctally-qa-*/
 .agentmem/local/
+
+# Screenshot-pipeline output manifest (README_SCREENSHOTS_OUT_DIR contract artifact,
+# consumed by cctally-release readme-refresh; regenerated every run, never published)
+docs/img/manifest.json

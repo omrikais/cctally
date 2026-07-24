@@ -1504,7 +1504,16 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
                 continue
             forecast = row.get("forecast") if isinstance(row.get("forecast"), Mapping) else {}
             current = row.get("current_percent")
-            projected = forecast.get("projected_percent")
+            # #350 spec §3.6 — "Projections blank. Actuals stay." BOTH the build
+            # and the idle clock deliberately preserve `projected_percent`
+            # alongside a non-ok `status`, and this site formatted it with no
+            # status check at all. That was masked while a stale Codex source
+            # collapsed to `unavailable` here; §3.4 keeps the source coherent, so
+            # a shared forecast would otherwise publish a stale projection.
+            projected = (
+                forecast.get("projected_percent")
+                if forecast.get("status") == "ok" else None
+            )
             rows.append(ls.Row(cells={
                 "limit": ls.TextCell(str(row.get("label") or "Codex quota")),
                 "current": ls.TextCell("—" if current is None else f"{float(current):.1f}%"),

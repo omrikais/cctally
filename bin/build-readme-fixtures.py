@@ -41,12 +41,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    seed_codex_session_entry,
+    seed_codex_session_file,
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
     stamp_all_stats_migrations_applied,
 )
 from _cctally_cache import _recompute_conversation_sessions  # noqa: E402
+from _lib_source_identity import source_root_key  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_DIR = REPO_ROOT / "tests/fixtures/readme/home/.local/share/cctally"
@@ -66,6 +69,15 @@ MODELS = (SONNET_MODEL, OPUS_MODEL, HAIKU_MODEL, FABLE_MODEL)
 # The three established models rotate evenly across the usage walk (this is
 # the original, cost-tuned assignment).
 BASE_CYCLE = (SONNET_MODEL, OPUS_MODEL, HAIKU_MODEL)
+
+# --- Codex marketing leg (issue #354) ---
+# Two REAL keys from CODEX_MODEL_PRICING (bin/_lib_pricing.py): a codex flagship
+# plus its mini, so `cctally codex daily` shows a model mix (and both price via
+# the embedded table, never the unknown-model fallback). Projects are synthetic
+# and never leak a real repo name (codex daily buckets by date, not project).
+CODEX_FLAGSHIP_MODEL = "gpt-5.1-codex"
+CODEX_MINI_MODEL = "gpt-5.1-codex-mini"
+CODEX_PROJECTS = ("api-service", "cli-tools")
 
 
 def DEFAULT_AS_OF_FN() -> str:
@@ -985,6 +997,132 @@ def _populate_session_entries(
             line_offset += 1
 
 
+def _codex_days(as_of: dt.datetime) -> list[dict]:
+    """Deterministic per-day Codex seeding plan (14 days back from ``as_of``).
+
+    No randomness and nothing date-dependent beyond ``as_of``, so the fixture
+    stays byte-stable (``test_deterministic_for_fixed_as_of``). Token counts
+    follow the LiteLLM convention the seeders document: ``input`` INCLUDES
+    ``cached``, ``output`` INCLUDES ``reasoning``. ``source_path`` is
+    bare-relative (``.codex/sessions/<project>/rollout-<date>.jsonl``) so cold
+    sync PRESERVES the rows (it only prunes unreachable ABSOLUTE paths;
+    bin/_cctally_cache.py).
+    """
+    days: list[dict] = []
+    for d in range(14):
+        day_anchor = as_of - dt.timedelta(days=d)
+        date_str = day_anchor.strftime("%Y-%m-%d")
+        project = CODEX_PROJECTS[d % len(CODEX_PROJECTS)]
+        source_path = f".codex/sessions/{project}/rollout-{date_str}.jsonl"
+        session_id = f"codex-{project}-{date_str}"
+        base = day_anchor.replace(hour=8, minute=0, second=0, microsecond=0)
+        n = 2 + (d % 3)  # 2..4 entries per day
+        entries: list[dict] = []
+        last_model = CODEX_FLAGSHIP_MODEL
+        for j in range(n):
+            ts = base + dt.timedelta(hours=j)
+            if ts > as_of:
+                continue
+            # j=0 is always the flagship, so every day carries >=1 flagship
+            # entry (and both models appear across the week).
+            model = CODEX_FLAGSHIP_MODEL if j % 2 == 0 else CODEX_MINI_MODEL
+            inp = 20_000 + 10_000 * ((d + j) % 8)       # 20k..90k
+            cached = inp // 2                            # about half
+            out = 1_500 + 500 * ((d + 2 * j) % 14)       # 1.5k..8k
+            reasoning = out // 3                         # about a third
+            entries.append(
+                {
+                    "line_offset": j,
+                    "ts": _iso(ts),
+                    "model": model,
+                    "input": inp,
+                    "cached": cached,
+                    "output": out,
+                    "reasoning": reasoning,
+                    "total": inp + out,
+                }
+            )
+            last_model = model
+        days.append(
+            {
+                "source_path": source_path,
+                "session_id": session_id,
+                "last_model": last_model,
+                "entries": entries,
+            }
+        )
+    return days
+
+
+# Synthetic canonical root for the marketing fixture's Codex leg. The value is
+# opaque-hashed by source_root_key(), so only determinism matters, not realism.
+# The dashboard's Codex read model fails closed on rows lacking rooted identity
+# (load_cached_rooted_codex_accounting_entries: "rooted accounting identity is
+# absent"), which would bake an ERROR into the capture-time dashboard log —
+# found by the first real pipeline run (#354).
+CODEX_CANONICAL_ROOT = "/home/user/.codex"
+CODEX_SOURCE_ROOT_KEY = source_root_key(CODEX_CANONICAL_ROOT)
+
+
+def _populate_codex_files(
+    cache_conn: sqlite3.Connection, *, as_of: dt.datetime
+) -> None:
+    """Seed one ``codex_session_files`` row per day.
+
+    ``size_bytes=0`` keeps the orphan scan quiet (it only flags non-zero-size
+    tracked paths absent on disk), so no ``[cache]`` warning bakes into the
+    captured ``cli-codex-daily.svg`` at freeze time.
+    """
+    for day in _codex_days(as_of):
+        seed_codex_session_file(
+            cache_conn,
+            path=day["source_path"],
+            last_session_id=day["session_id"],
+            last_model=day["last_model"],
+            size_bytes=0,
+        )
+    cache_conn.execute(
+        "UPDATE codex_session_files SET source_root_key = ?",
+        (CODEX_SOURCE_ROOT_KEY,),
+    )
+
+
+def _populate_codex_entries(
+    cache_conn: sqlite3.Connection, *, as_of: dt.datetime
+) -> None:
+    """Seed ``codex_session_entries`` for the ``cctally codex daily`` SVG."""
+    for day in _codex_days(as_of):
+        for e in day["entries"]:
+            seed_codex_session_entry(
+                cache_conn,
+                source_path=day["source_path"],
+                line_offset=e["line_offset"],
+                timestamp_utc=e["ts"],
+                session_id=day["session_id"],
+                model=e["model"],
+                input_tokens=e["input"],
+                cached_input_tokens=e["cached"],
+                output_tokens=e["output"],
+                reasoning_output_tokens=e["reasoning"],
+                total_tokens=e["total"],
+            )
+    cache_conn.execute(
+        "UPDATE codex_session_entries SET source_root_key = ?",
+        (CODEX_SOURCE_ROOT_KEY,),
+    )
+    cache_conn.execute(
+        "INSERT OR REPLACE INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            CODEX_SOURCE_ROOT_KEY,
+            CODEX_CANONICAL_ROOT,
+            as_of.isoformat(),
+            as_of.isoformat(),
+        ),
+    )
+
+
 def _populate_blocks(
     stats_conn: sqlite3.Connection, *, as_of: dt.datetime
 ) -> tuple[int, float, str]:
@@ -1261,6 +1399,11 @@ def build(
     with sqlite3.connect(cache_path) as cache_conn:
         cache_conn.execute("PRAGMA journal_mode=WAL")
         _populate_session_entries(cache_conn, as_of=as_of)
+        # Codex marketing leg (issue #354): relative source_path rows survive
+        # cold sync; files before entries. Seeded BEFORE conversations, which
+        # deliberately does not add codex data.
+        _populate_codex_files(cache_conn, as_of=as_of)
+        _populate_codex_entries(cache_conn, as_of=as_of)
         _populate_conversations(cache_conn, as_of=as_of)
         _recompute_conversation_sessions(cache_conn)
         cache_conn.commit()

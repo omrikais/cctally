@@ -4,6 +4,8 @@
 
 cctally ships through three channels. They land identical functionality; pick the one that matches your environment.
 
+Every release ships to an opt-in beta channel first and is promoted to stable once it proves out (Homebrew tracks stable only). To follow the newest builds as they land, opt in with `cctally config set update.channel beta`, and flip back with `cctally config set update.channel stable`. See [Beta channel](commands/update.md#beta-channel) for the full behavior.
+
 ### Homebrew tap
 
 ```bash
@@ -27,6 +29,8 @@ If you have a custom Python install, set `CCTALLY_PYTHON`:
 ```bash
 export CCTALLY_PYTHON=/opt/homebrew/bin/python3.13
 ```
+
+The Node shim needs a `python3` on your `PATH`. If `cctally setup` reports `python3 not found`, install Python (`brew install python` on macOS) and re-run, or point `CCTALLY_PYTHON` at your interpreter.
 
 ### From source
 

@@ -43,9 +43,11 @@ from _lib_quota import (
     build_blocks,
     build_history,
     forecast_quota,
+    latest_physical_observation,
     percent_milestones,
     quota_freshness,
     select_baseline,
+    stale_after_seconds,
 )
 from _lib_jsonl import CodexEntry, codex_model_scoped_quota_pool
 from _lib_fmt import stable_sum
@@ -140,6 +142,10 @@ class CodexCycleBoundary:
     # Exact server-side quota identity selected for the hero. It is never
     # serialized; milestone-history keys hash it opaquely.
     quota_identity: QuotaWindowIdentity | None = None
+    # #350: whether this boundary won the §3.2 ranking on STALE evidence (no
+    # fresh boundary existed for the account). Backward-looking actuals stay
+    # bounded, but the hero discloses it through ``hero.cycle_freshness``.
+    evidence_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,10 +186,29 @@ def _resolve_codex_weekly_cycle(
     Raises ``CodexCycleUnavailable`` only when NO account yields a live cycle. A
     single-account install returns a 1-element list = today's boundary
     byte-for-byte (the hero path is unchanged, spec R8).
+
+    #350 — FRESH-FIRST ranking (spec §3.2). Codex has no background quota poll,
+    so ``stale_after_seconds(10_080) == 3600`` makes an idle weekly observation
+    stale after exactly one hour. Discarding a stale-but-FUTURE boundary blanked
+    the hero's backward-looking actuals even though the spend was never lost, so
+    each account's future weekly boundaries are now collected into a fresh set
+    and a stale set and ranked:
+
+    1. exactly one FRESH boundary -> valid, cycle fresh;
+    2. else, no fresh boundaries and exactly one STALE boundary -> valid, cycle
+       stale (``CodexCycleBoundary.evidence_stale``, surfaced as the additive
+       ``hero.cycle_freshness``);
+    3. else -> invalid, with today's ``conflicting``/``stale``/``missing`` reason.
+
+    Fresh-first ordering is load-bearing: a flat count over the union would
+    regress one-fresh-plus-one-stale, which resolves valid today. Only the EXACT
+    ``"stale"`` freshness state is eligible — ``"future"`` (a capture ahead of
+    ``now``) and ``"unavailable"`` stay invalid and keep today's reason.
     """
-    per_account: dict[str, dict[tuple[int, dt.datetime], list[tuple[object, object]]]] = {}
+    fresh_by_account: dict[str, dict[tuple[int, dt.datetime], list[tuple[object, object]]]] = {}
+    stale_by_account: dict[str, dict[tuple[int, dt.datetime], list[tuple[object, object]]]] = {}
     accounts_seen: set[str] = set()
-    stale_by_account: dict[str, bool] = {}
+    ineligible_by_account: dict[str, bool] = {}
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
             continue
@@ -194,20 +219,33 @@ def _resolve_codex_weekly_cycle(
         baseline = select_baseline(history.observations, now_utc)
         if baseline is None or baseline.resets_at <= now_utc:
             continue
-        if quota_freshness(history.physical_observations, now_utc).state != "fresh":
-            stale_by_account[account] = True
-            continue
+        state = quota_freshness(history.physical_observations, now_utc).state
         boundary = (history.identity.window_minutes, baseline.resets_at)
-        per_account.setdefault(account, {}).setdefault(boundary, []).append((history, baseline))
+        if state == "fresh":
+            bucket = fresh_by_account
+        elif state == "stale":
+            bucket = stale_by_account
+        else:
+            # "future"/"unavailable" evidence is never a stale fallback; it keeps
+            # today's non-fresh reason so the envelope degrades exactly as before.
+            ineligible_by_account[account] = True
+            continue
+        bucket.setdefault(account, {}).setdefault(boundary, []).append((history, baseline))
     cycles: list[CodexCycleBoundary] = []
     reasons: list[str] = []
-    for account in sorted(accounts_seen | set(per_account)):
-        boundaries = per_account.get(account, {})
-        if len(boundaries) != 1:
-            # Within one account: 0 boundaries -> stale/missing; >=2 -> conflicting.
+    for account in sorted(accounts_seen | set(fresh_by_account) | set(stale_by_account)):
+        fresh_boundaries = fresh_by_account.get(account, {})
+        stale_boundaries = stale_by_account.get(account, {})
+        if len(fresh_boundaries) == 1:
+            boundaries, evidence_stale = fresh_boundaries, False
+        elif not fresh_boundaries and len(stale_boundaries) == 1:
+            boundaries, evidence_stale = stale_boundaries, True
+        else:
+            # Within one account: >=2 fresh, or no fresh and >=2 stale ->
+            # conflicting; nothing eligible -> today's stale/missing reason.
             reasons.append(
-                "conflicting" if boundaries
-                else ("stale" if stale_by_account.get(account) else "missing")
+                "conflicting" if (fresh_boundaries or stale_boundaries)
+                else ("stale" if ineligible_by_account.get(account) else "missing")
             )
             continue
         (window_minutes, resets_at), candidates = next(iter(boundaries.items()))
@@ -232,6 +270,7 @@ def _resolve_codex_weekly_cycle(
             source_root_keys=(selected_identity.source_root_key,),
             used_percent=float(baseline.used_percent),
             quota_identity=selected_identity,
+            evidence_stale=evidence_stale,
         ))
     if not cycles:
         # Aggregate reason: for a single account this is exactly the old reason
@@ -242,6 +281,97 @@ def _resolve_codex_weekly_cycle(
             raise CodexCycleUnavailable("stale")
         raise CodexCycleUnavailable("missing")
     return cycles
+
+
+def _codex_next_decision_at(
+    observations: Iterable[object],
+    cycles: Iterable[CodexCycleBoundary],
+    now_utc: dt.datetime,
+) -> dt.datetime | None:
+    """The earliest future instant at which weekly-cycle resolution can change.
+
+    #350 spec §3.3. Cycle validity is time-dependent even on FROZEN evidence:
+    ``_resolve_codex_weekly_cycle`` passes ``now_utc`` to both ``select_baseline``
+    (a future-dated capture becomes baseline-eligible purely because time passed,
+    which can switch the selected reset) and ``quota_freshness`` (fresh flips to
+    stale as age crosses ``stale_after_seconds``). One fresh plus one stale
+    boundary resolves FRESH today and ``conflicting`` an hour later on the very
+    same rows. The idle clock cannot re-resolve that itself — the public
+    histories it sees are capped at ``SOURCE_HISTORY_LIMIT`` and omit
+    ``logical_limit_key`` (§2.3) — so build time instead records WHEN the clock
+    must stop trusting its verdict, and the tick rebuilds authoritatively at the
+    crossing. That is one rebuild per deadline (a handful per weekly cycle), not
+    one per tick.
+
+    The deadline is the ``min`` of three candidate kinds, dropping any candidate
+    at or before ``now_utc``:
+
+    1. every selected cycle's ``resets_at`` (expiry — including the
+       #341 multi-account case where account A expires while B stays live);
+    2. ``latest_physical_capture + stale_after_seconds(window)`` for every weekly
+       history with a live baseline (fresh -> stale). This is a deliberate
+       SUPERSET of the §3.2 ranking participants — it also covers histories whose
+       freshness is ``"future"``/``"unavailable"`` and so never enter the ranking
+       — because an extra candidate can only pull the deadline EARLIER, and an
+       earlier deadline is always the conservative direction;
+    3. the ``captured_at`` of any future-dated weekly observation
+       (future -> fresh / baseline eligibility).
+
+    Returns ``None`` when nothing can flip. Server-only: it rides ``clock_data``
+    and never reaches the public source envelope.
+    """
+    candidates: list[dt.datetime] = []
+    for cycle in cycles:
+        candidates.append(cycle.resets_at.astimezone(UTC))
+    for history in build_history(tuple(observations)):
+        if history.identity.window_minutes != 10_080:
+            continue
+        if _is_model_scoped_codex_quota(history.identity.logical_limit_key):
+            continue
+        baseline = select_baseline(history.observations, now_utc)
+        if baseline is not None and baseline.resets_at > now_utc:
+            latest = latest_physical_observation(history.physical_observations)
+            if latest is not None:
+                candidates.append(
+                    latest.captured_at.astimezone(UTC)
+                    + dt.timedelta(
+                        seconds=stale_after_seconds(history.identity.window_minutes),
+                    )
+                )
+        # A capture ahead of ``now`` is not baseline-eligible yet, so this runs
+        # even for a history with no live baseline at all.
+        for observation in (
+            *history.observations, *history.physical_observations,
+        ):
+            captured_at = observation.captured_at.astimezone(UTC)
+            if captured_at > now_utc:
+                candidates.append(captured_at)
+    live = [candidate for candidate in candidates if candidate > now_utc]
+    return min(live) if live else None
+
+
+def codex_decision_deadline_passed(
+    state: object,
+    now_utc: dt.datetime,
+) -> bool:
+    """Whether a published Codex state's cycle decision deadline has elapsed.
+
+    #350 spec §3.3. When this holds the tick MUST rebuild Codex authoritatively
+    via ``build_codex_source_state`` — bypassing both the idle clock and
+    ``reuse_coherent_source_state`` — because the frozen evidence would now
+    resolve to a different cycle (or to none). A state with no recorded deadline
+    (``None``, or an older generation that predates the field) never forces a
+    rebuild; the clock's expiry guard remains its safety net.
+    """
+    clock_data = getattr(state, "clock_data", None)
+    if not isinstance(clock_data, Mapping):
+        return False
+    deadline = clock_data.get("codex_next_decision_at")
+    if not isinstance(deadline, dt.datetime):
+        return False
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        return False
+    return now_utc.astimezone(UTC) >= deadline.astimezone(UTC)
 
 
 def _codex_weekly_periods(
@@ -1298,10 +1428,14 @@ def _quota_read_model(
     milestone_rows: list[dict[str, object]] = []
     active_rows: list[dict[str, object]] = []
     # R8 (#341 Task 4): the per-account `account_key` is serialized onto each
-    # history row ONLY when the Codex provider has >1 REAL account, so the idle
-    # clock (`_clock_cycle_validity`) can scope weekly-cycle validity per account
-    # instead of degrading a genuine multi-account state to `conflicting`. A
-    # <=1-real-account install (all fixtures) stays byte-identical (no key added).
+    # history row ONLY when the Codex provider has >1 REAL account, so the
+    # dashboard client can scope per-account quota rows instead of merging them.
+    # A <=1-real-account install (all fixtures) stays byte-identical (no key
+    # added). #350 removed the original consumer, `_clock_cycle_validity`: the
+    # idle clock no longer re-derives weekly-cycle validity at all, because this
+    # public history view is LOSSY — capped at `SOURCE_HISTORY_LIMIT` and without
+    # `logical_limit_key` — so it cannot resolve the cycle authoritatively. Build
+    # time owns resolution; a `clock_data` decision deadline forces the rebuild.
     _codex_decorated = False
     try:
         import _cctally_account
@@ -1501,67 +1635,25 @@ def _clock_freshness(
     return "stale" if age_seconds > stale_after else "fresh"
 
 
-def _clock_cycle_validity(
-    histories: Iterable[object],
-    now_utc: dt.datetime,
-) -> tuple[bool, str]:
-    """Re-evaluate frozen weekly evidence without touching cache or rollouts.
+def _clock_cycle_expired(cycle: object, now_utc: dt.datetime) -> bool:
+    """Whether a retained hero cycle has already reset (#350 spec §3.3).
 
-    Per-account (#341 Task 4): boundaries are grouped by the history row's
-    ``account_key`` (serialized only when the Codex provider is DECORATED, i.e.
-    >1 real account — R8). The idle clock mirrors the build-time
-    ``_resolve_codex_weekly_cycle`` resolution: an account yields a live cycle iff
-    it has EXACTLY ONE fresh future boundary, and the hero is valid iff AT LEAST
-    ONE account does (raising the aggregate ``conflicting > stale > missing``
-    reason only when NO account yields one). When ``account_key`` is absent
-    (<=1-real-account install — no decoration) every row falls into one global
-    bucket, so this reduces EXACTLY to the prior single-boundary logic
-    (byte-stable). This removes the documented placeholder degrade where two real
-    accounts with distinct weekly cycles collapsed the whole hero to
-    ``conflicting`` on the idle clock.
+    The one invariant the idle clock still enforces on frozen evidence: a cycle
+    whose ``resets_at`` is at or before ``now_utc`` cannot bound current
+    accounting. Fails CLOSED on an unparseable or absent boundary, matching the
+    prior behavior where malformed evidence yielded no valid boundary.
     """
-    per_account: dict[str, set[dt.datetime]] = {}
-    stale_by_account: dict[str, bool] = {}
-    for raw_history in histories:
-        if not isinstance(raw_history, Mapping):
-            continue
-        if raw_history.get("window_minutes") != 10_080:
-            continue
-        current = raw_history.get("current_percent")
-        forecast = raw_history.get("forecast")
-        if current is None or not isinstance(forecast, Mapping):
-            continue
-        try:
-            resets_at = dt.datetime.fromisoformat(
-                str(forecast.get("resets_at")).replace("Z", "+00:00")
-            ).astimezone(UTC)
-        except (TypeError, ValueError):
-            continue
-        if resets_at <= now_utc:
-            continue
-        # None account_key (undecorated / <=1 real account) -> one global bucket
-        # == today's behavior. A real key buckets per account.
-        acct = raw_history.get("account_key")
-        bucket = acct if acct is not None else "__all__"
-        if raw_history.get("freshness") != "fresh":
-            stale_by_account[bucket] = True
-            continue
-        per_account.setdefault(bucket, set()).add(resets_at)
-    accounts = set(per_account) | set(stale_by_account)
-    reasons: list[str] = []
-    for acct in accounts:
-        boundaries = per_account.get(acct, set())
-        if len(boundaries) == 1:
-            return True, "ok"  # at least one account yields a live cycle
-        reasons.append(
-            "conflicting" if boundaries
-            else ("stale" if stale_by_account.get(acct) else "missing")
+    if not isinstance(cycle, Mapping):
+        return True
+    try:
+        resets_at = dt.datetime.fromisoformat(
+            str(cycle.get("resets_at")).replace("Z", "+00:00")
         )
-    if "conflicting" in reasons:
-        return False, "conflicting"
-    if "stale" in reasons:
-        return False, "stale"
-    return False, "missing"
+    except (TypeError, ValueError):
+        return True
+    if resets_at.tzinfo is None or resets_at.utcoffset() is None:
+        return True
+    return resets_at.astimezone(UTC) <= now_utc
 
 
 def _refresh_budget_status_clock(
@@ -1646,10 +1738,16 @@ def refresh_codex_source_clock(
             if not isinstance(raw_history, Mapping):
                 continue
             history = dict(raw_history)
-            freshness = _clock_freshness(
+            # #350 spec §3.9: this is a PER-ROW value and must never shadow the
+            # envelope-level `freshness`. It used to, so after the loop the
+            # envelope held the LAST retained history row's freshness — often an
+            # inactive row, and with a single weekly history the active weekly
+            # one, which silently marked the whole provider stale on an idle
+            # stale crossing and tripped idle eligibility on its own.
+            row_freshness = _clock_freshness(
                 history.get("captured_at"), history.get("stale_after_seconds"), now_utc,
             )
-            history["freshness"] = freshness
+            history["freshness"] = row_freshness
             forecast = history.get("forecast")
             if isinstance(forecast, Mapping):
                 forecast = dict(forecast)
@@ -1663,9 +1761,9 @@ def refresh_codex_source_clock(
                 remaining = max(0, int((reset - now_utc).total_seconds())) if reset else None
                 forecast["remaining_seconds"] = remaining
                 sample_count = int(forecast.get("sample_count") or 0)
-                if freshness == "future":
+                if row_freshness == "future":
                     forecast["status"] = "future"
-                elif freshness == "stale":
+                elif row_freshness == "stale":
                     forecast["status"] = "stale"
                 elif sample_count == 0:
                     forecast["status"] = "insufficient-history"
@@ -1688,7 +1786,7 @@ def refresh_codex_source_clock(
                         "current_percent": current,
                         "captured_at": history.get("captured_at"),
                         "resets_at": resets_at,
-                        "freshness": freshness,
+                        "freshness": row_freshness,
                         "stale_after_seconds": history.get("stale_after_seconds"),
                     })
             refreshed_histories.append(history)
@@ -1727,8 +1825,18 @@ def refresh_codex_source_clock(
             and hero_capability is not None
             and hero_capability.status == "supported"
         ):
-            cycle_valid, cycle_reason = _clock_cycle_validity(refreshed_histories, now_utc)
-            if not cycle_valid:
+            # #350 spec §3.3: the clock no longer RE-DERIVES cycle validity.
+            # Its public-history view is lossy (capped, no `logical_limit_key`,
+            # no `quota_identity`), so it cannot resolve the cycle correctly —
+            # and per §2.2 it cannot simply trust the old verdict forever either,
+            # because resolution is time-dependent on frozen evidence. Build time
+            # owns resolution and records a decision deadline in `clock_data`; the
+            # tick rebuilds authoritatively at the crossing. All the clock keeps
+            # is this cheap invariant guard: a cycle that has already RESET cannot
+            # bound current accounting, so it degrades exactly as before.
+            # Expiry is also deadline candidate #1, so the two paths are disjoint
+            # belt-and-suspenders rather than a single mechanism.
+            if _clock_cycle_expired(hero.get("cycle"), now_utc):
                 hero = dict(hero)
                 for field in (
                     "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
@@ -1750,8 +1858,6 @@ def refresh_codex_source_clock(
                     "hero",
                 ),)
                 availability = "partial"
-                if cycle_reason == "stale":
-                    freshness = "stale"
                 cycle_changed = True
     budget_domain = data.get("budget")
     budget_changed = False
@@ -2609,6 +2715,16 @@ def build_codex_source_state(
                     }
                     if cycle is not None and not hero_failure else None
                 ),
+                # #350 (spec §3.4): additive, hero-local staleness disclosure.
+                # OMITTED when the cycle is fresh — never emitted as "fresh" —
+                # which is what keeps every existing envelope golden byte-
+                # identical. availability/freshness/warnings/capabilities stay
+                # untouched because five separate gates read them as one meaning.
+                **(
+                    {"cycle_freshness": "stale"}
+                    if cycle is not None and not hero_failure and cycle.evidence_stale
+                    else {}
+                ),
                 "quota": quota["summary"],
                 "budget": configured_budget,
                 "alerts": {"count": len(alerts)},
@@ -2635,5 +2751,13 @@ def build_codex_source_state(
             },
             "cache_report": cache_report,
         },
-        clock_data={"codex_budget_cost_events": budget_cost_events},
+        clock_data={
+            "codex_budget_cost_events": budget_cost_events,
+            # #350 spec §3.3: when the tick passes this instant it must rebuild
+            # Codex authoritatively instead of idle-clocking or reusing, because
+            # weekly-cycle resolution can change on identical frozen evidence.
+            "codex_next_decision_at": _codex_next_decision_at(
+                quota_observations, cycles_all, context.now_utc,
+            ),
+        },
     )

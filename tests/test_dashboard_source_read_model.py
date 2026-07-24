@@ -1,6 +1,7 @@
 """Provider-native Codex dashboard read model contracts for #294 S4."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import pathlib
 import sqlite3
@@ -38,6 +39,8 @@ def _quota_observation(
     logical_limit_key: str = "limit",
     observed_slot: str = "primary",
     used_percent: float = 25.0,
+    account_key: str | None = None,
+    line_offset: int = 1,
 ) -> QuotaObservation:
     return QuotaObservation(
         identity=QuotaWindowIdentity(
@@ -47,12 +50,13 @@ def _quota_observation(
             observed_slot=observed_slot,
             window_minutes=window_minutes,
             limit_name=limit_name,
+            **({"account_key": account_key} if account_key is not None else {}),
         ),
         captured_at=captured_at,
         used_percent=used_percent,
         resets_at=resets_at,
         source_path=f"/private/{root}.jsonl",
-        line_offset=1,
+        line_offset=line_offset,
     )
 
 
@@ -333,18 +337,342 @@ def test_codex_weekly_rows_follow_native_reset_reanchors_not_calendar_weeks(
         stats.close()
 
 
-def test_codex_cycle_rejects_stale_weekly_evidence_even_before_its_reset():
+# =========================================================================
+# #350 — build-time weekly-cycle ranking (spec §3.2, §5.2).
+#
+# "Projections blank. Actuals stay." A weekly quota observation goes STALE after
+# exactly one idle hour (`stale_after_seconds(10_080) == 3600`), and Codex has no
+# background poll, so a lone stale-but-future boundary must still bound the hero's
+# backward-looking actuals. Ranking is FRESH-FIRST: one fresh boundary wins; else
+# one stale boundary wins and the cycle is marked stale. Only the EXACT `"stale"`
+# freshness state is eligible — `"future"` and `"unavailable"` stay invalid.
+# =========================================================================
+
+
+def _stale_weekly_observation(
+    *, root: str = "root", resets_at: dt.datetime | None = None,
+    logical_limit_key: str = "limit", account_key: str | None = None,
+    used_percent: float = 25.0, now_utc: dt.datetime = NOW,
+) -> QuotaObservation:
+    """One weekly observation whose capture is older than its 3600s stale bound."""
+    return _quota_observation(
+        root=root,
+        window_minutes=10_080,
+        resets_at=resets_at if resets_at is not None else now_utc + dt.timedelta(days=2),
+        captured_at=now_utc - dt.timedelta(hours=2),
+        logical_limit_key=logical_limit_key,
+        account_key=account_key,
+        used_percent=used_percent,
+    )
+
+
+def test_lone_stale_future_weekly_boundary_yields_a_live_cycle():
+    """#350: the headline. A stale-but-future weekly boundary keeps the hero's
+    actuals bounded instead of raising `CodexCycleUnavailable("stale")`."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+
+    cycles = source_module._resolve_codex_weekly_cycle(
+        (_stale_weekly_observation(resets_at=reset),), NOW,
+    )
+
+    assert len(cycles) == 1
+    assert cycles[0].resets_at == reset
+    assert cycles[0].resets_at > NOW
+    assert cycles[0].start_at == reset - dt.timedelta(days=7)
+    assert cycles[0].used_percent == 25.0
+    assert cycles[0].evidence_stale is True
+
+
+def test_one_fresh_plus_one_stale_boundary_prefers_the_fresh_one():
+    """Regression guard for the ranking rule: a FLAT count would call this
+    `conflicting`. It resolves valid TODAY and must keep doing so — fresh-first."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    fresh_reset = NOW + dt.timedelta(days=2)
+    stale_reset = NOW + dt.timedelta(days=5)
+
+    cycles = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(
+            root="root-fresh", window_minutes=10_080, resets_at=fresh_reset,
+            captured_at=NOW - dt.timedelta(minutes=10), logical_limit_key="limit-fresh",
+        ),
+        _stale_weekly_observation(
+            root="root-stale", resets_at=stale_reset, logical_limit_key="limit-stale",
+        ),
+    ), NOW)
+
+    assert len(cycles) == 1
+    assert cycles[0].resets_at == fresh_reset
+    assert cycles[0].evidence_stale is False
+
+
+def test_two_stale_boundaries_with_no_fresh_is_conflicting():
     source_module = sys.modules["_cctally_dashboard_sources"]
 
-    with pytest.raises(source_module.CodexCycleUnavailable, match="stale"):
+    with pytest.raises(source_module.CodexCycleUnavailable, match="conflicting"):
         source_module._resolve_codex_weekly_cycle((
-            _quota_observation(
-                root="root",
-                window_minutes=10_080,
-                resets_at=NOW + dt.timedelta(days=2),
-                captured_at=NOW - dt.timedelta(hours=2),
+            _stale_weekly_observation(
+                root="root-a", resets_at=NOW + dt.timedelta(days=1),
+                logical_limit_key="limit-a",
+            ),
+            _stale_weekly_observation(
+                root="root-b", resets_at=NOW + dt.timedelta(days=2),
+                logical_limit_key="limit-b",
             ),
         ), NOW)
+
+
+def test_future_dated_weekly_evidence_is_never_a_stale_fallback():
+    """`"future"` freshness must stay INVALID. The identity carries a live
+    baseline (an already-captured point) plus a future-dated latest physical
+    capture, so `quota_freshness` reports exactly `"future"` — not `"stale"`."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+
+    with pytest.raises(source_module.CodexCycleUnavailable):
+        source_module._resolve_codex_weekly_cycle((
+            _quota_observation(
+                root="root", window_minutes=10_080, resets_at=reset,
+                captured_at=NOW - dt.timedelta(minutes=10), used_percent=25.0,
+            ),
+            _quota_observation(
+                root="root", window_minutes=10_080, resets_at=reset,
+                captured_at=NOW + dt.timedelta(minutes=10), used_percent=30.0,
+                line_offset=2,
+            ),
+        ), NOW)
+
+
+def test_lone_future_dated_weekly_observation_is_missing_not_stale():
+    """A capture entirely ahead of ``now`` is not baseline-eligible at all, so it
+    never reaches the stale branch."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    with pytest.raises(source_module.CodexCycleUnavailable, match="missing"):
+        source_module._resolve_codex_weekly_cycle((
+            _quota_observation(
+                root="root", window_minutes=10_080,
+                resets_at=NOW + dt.timedelta(days=2),
+                captured_at=NOW + dt.timedelta(minutes=10),
+            ),
+        ), NOW)
+
+
+def test_model_scoped_stale_weekly_identity_stays_excluded():
+    """The spark-week exclusion is unchanged: a model-scoped stale weekly
+    identity is not a candidate, so the standard stale boundary wins alone."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    standard_reset = NOW + dt.timedelta(days=5)
+
+    cycles = source_module._resolve_codex_weekly_cycle((
+        _stale_weekly_observation(
+            resets_at=standard_reset, logical_limit_key="standard-limit",
+        ),
+        _stale_weekly_observation(
+            resets_at=NOW + dt.timedelta(days=7),
+            logical_limit_key='{"modelPool":"gpt-5.3-codex-spark"}',
+        ),
+    ), NOW)
+
+    assert len(cycles) == 1
+    assert cycles[0].resets_at == standard_reset
+    assert cycles[0].evidence_stale is True
+
+
+def test_stale_ranking_without_account_key_reduces_to_one_bucket():
+    """R8 byte-stability: with no real accounts every row falls into the single
+    reserved bucket, so two distinct stale boundaries still conflict."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    with pytest.raises(source_module.CodexCycleUnavailable, match="conflicting"):
+        source_module._resolve_codex_weekly_cycle((
+            _stale_weekly_observation(
+                root="root-a", resets_at=NOW + dt.timedelta(days=1),
+                logical_limit_key="limit-a",
+            ),
+            _stale_weekly_observation(
+                root="root-b", resets_at=NOW + dt.timedelta(days=2),
+                logical_limit_key="limit-b",
+            ),
+        ), NOW)
+
+
+def test_stale_ranking_is_scoped_per_account():
+    """Two real accounts each with ONE stale boundary each yield a live cycle —
+    the same per-account scoping the fresh path already has."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    a_reset = NOW + dt.timedelta(days=1)
+    b_reset = NOW + dt.timedelta(days=3)
+
+    cycles = source_module._resolve_codex_weekly_cycle((
+        _stale_weekly_observation(
+            root="root-a", resets_at=a_reset, logical_limit_key="limit-a",
+            account_key="acct-a",
+        ),
+        _stale_weekly_observation(
+            root="root-b", resets_at=b_reset, logical_limit_key="limit-b",
+            account_key="acct-b",
+        ),
+    ), NOW)
+
+    assert [cycle.resets_at for cycle in cycles] == [a_reset, b_reset]
+    assert all(cycle.evidence_stale for cycle in cycles)
+
+
+def test_one_account_fresh_another_stale_keeps_both_cycles():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    a_reset = NOW + dt.timedelta(days=1)
+    b_reset = NOW + dt.timedelta(days=3)
+
+    cycles = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(
+            root="root-a", window_minutes=10_080, resets_at=a_reset,
+            captured_at=NOW - dt.timedelta(minutes=10),
+            logical_limit_key="limit-a", account_key="acct-a",
+        ),
+        _stale_weekly_observation(
+            root="root-b", resets_at=b_reset, logical_limit_key="limit-b",
+            account_key="acct-b",
+        ),
+    ), NOW)
+
+    assert [(cycle.resets_at, cycle.evidence_stale) for cycle in cycles] == [
+        (a_reset, False), (b_reset, True),
+    ]
+
+
+# =========================================================================
+# #350 — the cycle decision deadline (spec §3.3, §5.3).
+#
+# Cycle validity is TIME-DEPENDENT even on frozen evidence (spec §2.2), and the
+# idle clock's public-history view is lossy (§2.3), so the clock may neither
+# re-resolve nor trust an old verdict forever. Build time therefore records the
+# earliest future instant at which any time-dependent resolution input flips;
+# the tick rebuilds authoritatively when it passes. One rebuild per crossing —
+# a handful per weekly cycle — not one per tick.
+# =========================================================================
+
+
+def _next_decision_at(observations, now_utc=NOW):
+    """Resolve the cycle list the way the builder does, then compute the deadline."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        cycles = source_module._resolve_codex_weekly_cycle(observations, now_utc)
+    except source_module.CodexCycleUnavailable:
+        cycles = []
+    return source_module._codex_next_decision_at(observations, cycles, now_utc)
+
+
+def test_weekly_stale_after_seconds_is_3600():
+    """Guards the `max(900, min(window*60//10, 3600))` arithmetic the whole
+    design rests on: an idle weekly observation goes stale after ONE hour."""
+    from _lib_quota import stale_after_seconds
+
+    assert stale_after_seconds(10_080) == 3600
+
+
+def test_deadline_is_the_reset_when_nothing_flips_sooner():
+    reset = NOW + dt.timedelta(days=2)
+
+    # Already stale: its fresh->stale flip is in the past, so only expiry remains.
+    assert _next_decision_at((_stale_weekly_observation(resets_at=reset),)) == reset
+
+
+def test_deadline_is_capture_plus_stale_after_when_that_is_sooner():
+    reset = NOW + dt.timedelta(days=2)
+    captured_at = NOW - dt.timedelta(minutes=10)
+
+    deadline = _next_decision_at((
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=captured_at,
+        ),
+    ))
+
+    assert deadline == captured_at + dt.timedelta(seconds=3600)
+    assert deadline < reset
+
+
+def test_deadline_is_a_future_dated_capture_when_that_is_soonest():
+    """A future-dated capture becomes baseline-eligible purely because time
+    passed, which can switch the selected reset (spec §2.2)."""
+    reset = NOW + dt.timedelta(days=2)
+    future_capture = NOW + dt.timedelta(minutes=5)
+
+    deadline = _next_decision_at((
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=NOW - dt.timedelta(minutes=10), used_percent=25.0,
+        ),
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=future_capture, used_percent=30.0, line_offset=2,
+        ),
+    ))
+
+    assert deadline == future_capture
+
+
+def test_deadline_is_the_min_across_all_three_input_kinds():
+    a_reset = NOW + dt.timedelta(days=3)
+    b_reset = NOW + dt.timedelta(minutes=20)
+    future_capture = NOW + dt.timedelta(minutes=45)
+
+    deadline = _next_decision_at((
+        # (2) fresh -> stale at NOW+30m; (1) expiry at NOW+3d
+        _quota_observation(
+            root="root-a", window_minutes=10_080, resets_at=a_reset,
+            captured_at=NOW - dt.timedelta(minutes=30),
+            logical_limit_key="limit-a", account_key="acct-a",
+        ),
+        # (1) expiry at NOW+20m — the soonest of every candidate
+        _quota_observation(
+            root="root-b", window_minutes=10_080, resets_at=b_reset,
+            captured_at=NOW - dt.timedelta(minutes=10),
+            logical_limit_key="limit-b", account_key="acct-b",
+        ),
+        # (3) a future-dated capture at NOW+45m
+        _quota_observation(
+            root="root-c", window_minutes=10_080, resets_at=NOW + dt.timedelta(days=2),
+            captured_at=NOW - dt.timedelta(minutes=10),
+            logical_limit_key="limit-c", account_key="acct-c",
+        ),
+        _quota_observation(
+            root="root-c", window_minutes=10_080, resets_at=NOW + dt.timedelta(days=2),
+            captured_at=future_capture, used_percent=30.0,
+            logical_limit_key="limit-c", account_key="acct-c", line_offset=2,
+        ),
+    ))
+
+    assert deadline == b_reset
+    assert deadline < future_capture
+
+
+def test_deadline_is_none_when_no_weekly_evidence_can_flip():
+    assert _next_decision_at((
+        _quota_observation(
+            root="root", window_minutes=300, resets_at=NOW + dt.timedelta(hours=4),
+        ),
+    )) is None
+
+
+def test_deadline_is_none_for_an_expired_stale_weekly_boundary():
+    """Nothing left to flip: the boundary already reset and its evidence is
+    already stale, so no future instant changes the resolution."""
+    assert _next_decision_at((
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=NOW - dt.timedelta(hours=1),
+            captured_at=NOW - dt.timedelta(hours=2),
+        ),
+    )) is None
+
+
+def test_deadline_is_never_at_or_before_now():
+    deadline = _next_decision_at((
+        _stale_weekly_observation(resets_at=NOW + dt.timedelta(days=2)),
+    ))
+
+    assert deadline is not None and deadline > NOW
 
 
 def test_codex_cycle_selects_one_full_identity_for_one_boundary():
@@ -528,69 +856,268 @@ def test_codex_cycle_failure_replaces_a_prior_generation_without_retained_hero_t
         stats.close()
 
 
-def test_stale_weekly_baseline_builds_a_stale_partial_generation_without_a_hero(
+_HERO_WIRE_KEYS = (
+    "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+    "reasoning_output_tokens", "total_tokens", "cycle", "quota", "budget",
+    "alerts",
+)
+
+
+def _install_weekly_only_cycle(
+    monkeypatch, source_module, *, reset: dt.datetime, root: str,
+    captured_at: dt.datetime,
+) -> None:
+    """Freeze exactly one weekly observation so its freshness is the only variable."""
+    monkeypatch.setattr(
+        source_module,
+        "load_codex_quota_observations",
+        lambda **_kwargs: (
+            _quota_observation(
+                root=root,
+                window_minutes=10_080,
+                resets_at=reset,
+                captured_at=captured_at,
+            ),
+        ),
+    )
+
+
+def _copy_accounting_row_at(cache: sqlite3.Connection, *, timestamp: dt.datetime,
+                            source_path: str) -> None:
+    """Clone a COMPLETE cached accounting row to a new instant (metadata stays healthy)."""
+    row_id = cache.execute(
+        "SELECT id FROM codex_session_entries ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, source_root_key, conversation_key) "
+        "SELECT ?, ?, ?, session_id, model, input_tokens, cached_input_tokens, "
+        "output_tokens, reasoning_output_tokens, total_tokens, source_root_key, "
+        "conversation_key FROM codex_session_entries WHERE id=?",
+        (source_path, 1, timestamp.isoformat(), row_id),
+    )
+    cache.commit()
+
+
+def test_stale_weekly_baseline_retains_the_hero_and_stamps_cycle_freshness(
     tmp_path, monkeypatch,
 ):
+    """#350 build-time contract (spec §3.2, §3.4, §5.5). The stale-but-future
+    boundary keeps every backward-looking hero field, the envelope metadata is
+    untouched, and staleness rides the additive hero-local `cycle_freshness`."""
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
     try:
-        root_key = str(cache.execute(
-            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
-        ).fetchone()[0])
+        root_key = _cache_root_key(cache)
+        _copy_accounting_row_at(
+            cache, timestamp=NOW - dt.timedelta(days=1),
+            source_path="/private/350-in-cycle.jsonl",
+        )
+        context = DashboardReadContext(
+            cache_conn=cache, stats_conn=stats, range_start=START,
+            now_utc=NOW, display_tz_name="UTC",
+        )
+        _install_weekly_only_cycle(
+            monkeypatch, source_module, reset=reset, root=root_key,
+            captured_at=NOW - dt.timedelta(hours=2),
+        )
+        state = source_module.build_codex_source_state(
+            context, data_version="stale-cycle-v1",
+        )
+
+        # Envelope metadata is deliberately UNTOUCHED (§3.4): five gates read
+        # availability/freshness as one meaning, so neither may move.
+        assert state.availability == "ok"
+        assert state.freshness == "fresh"
+        assert state.warnings == ()
+        assert state.capabilities["hero"].status == "supported"
+        assert state.capabilities["hero"].semantics == "native-reset-cycle"
+
+        hero = state.data["hero"]
+        assert hero["cycle_freshness"] == "stale"
+        assert hero["cost_usd"] > 0
+        assert hero["cycle"] == {
+            "window_minutes": 10_080,
+            "start_at": (reset - dt.timedelta(days=7)).isoformat(),
+            "resets_at": reset.isoformat(),
+        }
+        for field in (
+            "input_tokens", "cached_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens",
+        ):
+            assert hero[field], field
+        # The quota domain keeps reporting the real (stale) evidence age; the
+        # client's Snapshot chip derives its marker from that, not the envelope.
+        assert state.data["quota"]["summary"]["freshness"] == "stale"
+        # Undecorated (<=1 real account) stays byte-stable: no per-account wire.
+        assert "cycles" not in hero
+        assert "accounts" not in state.data
+        assert state.data["periods"]["daily"]["rows"]
+
+        # §5.5 non-hero pins. The selected cycle also feeds native weekly
+        # periods, the 5h quota-block wire, the cycle index and the per-account
+        # wires, so pin the stale build against a FRESH build at the same reset:
+        # evidence age must change nothing but the hero's disclosure field.
+        _install_weekly_only_cycle(
+            monkeypatch, source_module, reset=reset, root=root_key,
+            captured_at=NOW - dt.timedelta(minutes=10),
+        )
+        fresh = source_module.build_codex_source_state(
+            context, data_version="stale-cycle-v1",
+        )
+        assert state.data["periods"]["weekly"] == fresh.data["periods"]["weekly"]
+        assert state.data["quota"]["blocks"] == fresh.data["quota"]["blocks"]
+        assert state.data["quota"]["cycle_index"] == fresh.data["quota"]["cycle_index"]
+        assert state.data["hero"]["cycle"] == fresh.data["hero"]["cycle"]
+        assert state.data["hero"]["cost_usd"] == fresh.data["hero"]["cost_usd"]
+        assert "cycle_freshness" not in fresh.data["hero"]
+        # This fixture has no durable 300-minute projection, so both wires are
+        # empty; pin the exact value so a future emission trips this test.
+        assert state.data["quota"]["blocks"] == ()
+        assert state.data["quota"]["cycle_index"] == ()
+
+        # Quota histories / milestones / alerts are untouched by this change:
+        # compare against the pre-#350 behavior (resolver refuses the boundary).
+        _install_weekly_only_cycle(
+            monkeypatch, source_module, reset=reset, root=root_key,
+            captured_at=NOW - dt.timedelta(hours=2),
+        )
         monkeypatch.setattr(
             source_module,
-            "load_codex_quota_observations",
-            lambda **_kwargs: (
-                _quota_observation(
-                    root=root_key,
-                    window_minutes=10_080,
-                    resets_at=NOW + dt.timedelta(days=2),
-                    captured_at=NOW - dt.timedelta(hours=2),
-                ),
+            "_resolve_codex_weekly_cycle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                source_module.CodexCycleUnavailable("stale")
             ),
         )
-
-        state = source_module.build_codex_source_state(
-            DashboardReadContext(
-                cache_conn=cache, stats_conn=stats, range_start=START,
-                now_utc=NOW, display_tz_name="UTC",
-            ),
-            data_version="stale-cycle-v1",
+        blanked = source_module.build_codex_source_state(
+            context, data_version="stale-cycle-v1",
         )
-
-        assert state.availability == "partial"
-        assert state.freshness == "stale"
-        assert state.data["quota"]["summary"]["freshness"] == "stale"
-        assert state.capabilities["hero"].status == "unavailable"
-        assert state.data["hero"]["cycle"] is None
-        assert state.data["hero"]["total_tokens"] is None
-        assert state.warnings[-1].code == "codex_cycle_unavailable"
-        assert state.data["periods"]["daily"]["rows"]
+        assert state.data["quota"]["histories"] == blanked.data["quota"]["histories"]
+        assert state.data["quota"]["milestones"] == blanked.data["quota"]["milestones"]
+        assert state.data["alerts"] == blanked.data["alerts"]
+        # Non-vacuity: the reference build IS the old full-blank behavior, and
+        # the cycle-driven weekly periods genuinely differ without a live cycle.
+        assert blanked.data["hero"]["cost_usd"] is None
+        assert blanked.availability == "partial"
+        assert blanked.freshness == "stale"
+        assert state.data["periods"]["weekly"] != blanked.data["periods"]["weekly"]
     finally:
         cache.close()
         stats.close()
 
 
-def test_idle_clock_stale_weekly_evidence_withdraws_the_hero_without_a_cache_read(
+def test_fresh_live_cycle_omits_cycle_freshness_and_keeps_the_old_hero_wire(
     tmp_path, monkeypatch,
 ):
+    """No golden exercises a live Codex cycle (all nine publish `empty`), so the
+    fresh path's byte stability is asserted directly (spec §5.5)."""
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     try:
-        root_key = str(cache.execute(
-            "SELECT source_root_key FROM codex_session_entries ORDER BY id LIMIT 1"
-        ).fetchone()[0])
         _install_active_native_cycle(
-            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=root_key,
+            monkeypatch, source_module, reset=NOW + dt.timedelta(days=2),
+            root=_cache_root_key(cache),
         )
         state = source_module.build_codex_source_state(
             DashboardReadContext(
                 cache_conn=cache, stats_conn=stats, range_start=START,
                 now_utc=NOW, display_tz_name="UTC",
             ),
-            data_version="clock-cycle-v1",
+            data_version="fresh-cycle-v1",
+        )
+
+        hero = state.data["hero"]
+        assert "cycle_freshness" not in hero
+        assert tuple(hero) == _HERO_WIRE_KEYS
+        assert state.availability == "ok"
+        assert state.freshness == "fresh"
+        assert state.warnings == ()
+        assert state.capabilities["hero"].status == "supported"
+        wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(state)
+        assert "cycle_freshness" not in wire["data"]["hero"]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_build_records_the_cycle_decision_deadline_in_private_clock_data(
+    tmp_path, monkeypatch,
+):
+    """The deadline is server-only: it drives the tick, never the public wire."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    captured_at = NOW - dt.timedelta(minutes=10)
+    try:
+        _install_weekly_only_cycle(
+            monkeypatch, source_module, reset=reset, root=_cache_root_key(cache),
+            captured_at=captured_at,
+        )
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="deadline-v1",
+        )
+
+        # A fresh boundary goes stale before it resets, so that is the deadline.
+        assert state.clock_data["codex_next_decision_at"] == (
+            captured_at + dt.timedelta(seconds=3600)
+        )
+        assert "codex_budget_cost_events" in state.clock_data
+        wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(state)
+        assert "clock_data" not in wire
+        assert "codex_next_decision_at" not in repr(wire)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _codex_state_with_in_cycle_spend(
+    cache, stats, source_module, monkeypatch, *, reset: dt.datetime,
+    captured_at: dt.datetime, data_version: str,
+):
+    """Build a Codex source state that has real in-cycle spend to retain."""
+    _copy_accounting_row_at(
+        cache, timestamp=NOW - dt.timedelta(days=1),
+        source_path=f"/private/350-{data_version}.jsonl",
+    )
+    _install_weekly_only_cycle(
+        monkeypatch, source_module, reset=reset, root=_cache_root_key(cache),
+        captured_at=captured_at,
+    )
+    return source_module.build_codex_source_state(
+        DashboardReadContext(
+            cache_conn=cache, stats_conn=stats, range_start=START,
+            now_utc=NOW, display_tz_name="UTC",
+        ),
+        data_version=data_version,
+    )
+
+
+def test_idle_clock_retains_actuals_for_a_stale_but_future_cycle(
+    tmp_path, monkeypatch,
+):
+    """#350 (spec §3.1, §3.3, §5.5). The idle clock no longer re-derives cycle
+    validity — its public-history view is lossy, so it CANNOT resolve correctly
+    (§2.3). It keeps only a cheap expiry guard, so a stale-but-future cycle
+    retains every backward-looking hero field and touches no envelope metadata."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    try:
+        state = _codex_state_with_in_cycle_spend(
+            cache, stats, source_module, monkeypatch, reset=reset,
+            captured_at=NOW - dt.timedelta(hours=2), data_version="clock-stale-v1",
         )
         assert state.capabilities["hero"].status == "supported"
+        assert state.data["hero"]["cycle_freshness"] == "stale"
+        expected_cost = state.data["hero"]["cost_usd"]
+        assert expected_cost > 0
         before_rows = cache.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0]
 
         monkeypatch.setattr(
@@ -599,16 +1126,170 @@ def test_idle_clock_stale_weekly_evidence_withdraws_the_hero_without_a_cache_rea
             lambda **_kwargs: (_ for _ in ()).throw(AssertionError("idle clock must not read cache")),
         )
         refreshed = source_module.refresh_codex_source_clock(
-            state, now_utc=NOW + dt.timedelta(hours=2),
+            state, now_utc=NOW + dt.timedelta(hours=4),
         )
 
         assert cache.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == before_rows
-        assert refreshed.availability == "partial"
-        assert refreshed.freshness == "stale"
+        hero = refreshed.data["hero"]
+        assert hero["cost_usd"] == pytest.approx(expected_cost)
+        assert hero["cycle"] == state.data["hero"]["cycle"]
+        assert hero["cycle_freshness"] == "stale"
+        for field in (
+            "input_tokens", "cached_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens",
+        ):
+            assert hero[field] == state.data["hero"][field], field
+        assert refreshed.capabilities["hero"].status == "supported"
+        # Envelope metadata untouched on the retain path (§3.4, §5.5).
+        assert refreshed.availability == state.availability
+        assert refreshed.freshness == state.freshness
+        assert refreshed.warnings == state.warnings
+        assert not any(
+            warning.code == "codex_cycle_unavailable" for warning in refreshed.warnings
+        )
+        # Forward-looking projections still pause: the forecast stamps its OWN
+        # status, which is what blanks `Forecast @ reset` on the client.
+        weekly_row = next(
+            row for row in refreshed.data["quota"]["histories"]
+            if row["window_minutes"] == 10_080
+        )
+        assert weekly_row["freshness"] == "stale"
+        assert weekly_row["forecast"]["status"] == "stale"
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_idle_clock_retains_a_cycle_that_was_fresh_at_build(tmp_path, monkeypatch):
+    """A cycle built FRESH that goes stale while idle keeps its actuals. The
+    clock deliberately does NOT stamp `cycle_freshness` — only the build-time
+    resolver does, which is exactly why the §3.3 decision deadline exists."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    reset = NOW + dt.timedelta(days=2)
+    try:
+        state = _codex_state_with_in_cycle_spend(
+            cache, stats, source_module, monkeypatch, reset=reset,
+            captured_at=NOW - dt.timedelta(minutes=10), data_version="clock-fresh-v1",
+        )
+        assert "cycle_freshness" not in state.data["hero"]
+
+        refreshed = source_module.refresh_codex_source_clock(
+            state, now_utc=NOW + dt.timedelta(hours=2),
+        )
+
+        hero = refreshed.data["hero"]
+        assert hero["cost_usd"] == pytest.approx(state.data["hero"]["cost_usd"])
+        assert hero["cycle"] == state.data["hero"]["cycle"]
+        assert refreshed.capabilities["hero"].status == "supported"
+        assert "cycle_freshness" not in hero
+        assert refreshed.availability == state.availability
+        assert refreshed.warnings == state.warnings
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_envelope_freshness_is_not_taken_from_the_last_retained_history_row(
+    tmp_path, monkeypatch,
+):
+    """Spec §3.9. The envelope-level `freshness` was assigned `state.freshness`
+    and then SHADOWED by the per-row loop variable, so after the loop it held
+    the LAST retained history row's freshness. With a single weekly history that
+    row is the active weekly one, so an idle stale crossing silently marked the
+    whole provider stale and tripped idle eligibility on its own."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        state = _codex_state_with_in_cycle_spend(
+            cache, stats, source_module, monkeypatch,
+            reset=NOW + dt.timedelta(days=2),
+            captured_at=NOW - dt.timedelta(minutes=10), data_version="shadow-v1",
+        )
+        assert state.freshness == "fresh"
+        assert len(state.data["quota"]["histories"]) == 1
+
+        refreshed = source_module.refresh_codex_source_clock(
+            state, now_utc=NOW + dt.timedelta(hours=2),
+        )
+
+        # Non-vacuity: the trailing (only) retained row really did go stale.
+        assert refreshed.data["quota"]["histories"][-1]["freshness"] == "stale"
+        assert refreshed.freshness == "fresh"
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_idle_clock_expiry_degrade_is_byte_identical_to_the_build_degrade(
+    tmp_path, monkeypatch,
+):
+    """The retained expiry guard must reproduce today's degrade exactly (§3.3)."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        state = _codex_state_with_in_cycle_spend(
+            cache, stats, source_module, monkeypatch,
+            reset=NOW + dt.timedelta(minutes=10),
+            captured_at=NOW - dt.timedelta(minutes=10), data_version="expiry-v1",
+        )
+        assert state.capabilities["hero"].status == "supported"
+
+        refreshed = source_module.refresh_codex_source_clock(
+            state, now_utc=NOW + dt.timedelta(minutes=20),
+        )
+
+        hero = refreshed.data["hero"]
+        for field in (
+            "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens", "cycle",
+        ):
+            assert hero[field] is None, field
         assert refreshed.capabilities["hero"].status == "unavailable"
-        assert refreshed.data["hero"]["cycle"] is None
-        assert refreshed.data["hero"]["total_tokens"] is None
-        assert any(warning.code == "codex_cycle_unavailable" for warning in refreshed.warnings)
+        assert refreshed.capabilities["hero"].semantics == "missing-or-conflicting-native-cycle"
+        assert refreshed.availability == "partial"
+        assert [warning.code for warning in refreshed.warnings].count(
+            "codex_cycle_unavailable"
+        ) == 1
+        expiry_warning = next(
+            warning for warning in refreshed.warnings
+            if warning.code == "codex_cycle_unavailable"
+        )
+        assert expiry_warning.domain == "hero"
+        assert expiry_warning.message == "Codex native reset cycle is unavailable."
+        # Clocking again must not duplicate the warning.
+        twice = source_module.refresh_codex_source_clock(
+            refreshed, now_utc=NOW + dt.timedelta(minutes=25),
+        )
+        assert [warning.code for warning in twice.warnings].count(
+            "codex_cycle_unavailable"
+        ) == 1
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_same_instant_codex_clocking_is_idempotent(tmp_path, monkeypatch):
+    """No 'does not republish' assertion: `remaining_seconds` advances `data`
+    every tick, so a NEW object is expected whenever time moves (spec §2.5).
+    What must hold is that clocking twice at an IDENTICAL instant agrees."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    idle_now = NOW + dt.timedelta(hours=4)
+    try:
+        state = _codex_state_with_in_cycle_spend(
+            cache, stats, source_module, monkeypatch,
+            reset=NOW + dt.timedelta(days=2),
+            captured_at=NOW - dt.timedelta(hours=2), data_version="idempotent-v1",
+        )
+
+        once = source_module.refresh_codex_source_clock(state, now_utc=idle_now)
+        twice = source_module.refresh_codex_source_clock(once, now_utc=idle_now)
+
+        assert twice.data == once.data
+        assert twice.availability == once.availability
+        assert twice.freshness == once.freshness
+        assert twice.warnings == once.warnings
     finally:
         cache.close()
         stats.close()
@@ -2473,98 +3154,319 @@ def test_codex_projection_incoherence_is_scoped_to_the_current_hero_generation(
         stats.close()
 
 
-# ==========================================================================
-# #341 Task 4 — _clock_cycle_validity per-account grouping. When history rows
-# carry `account_key` (serialized only for a DECORATED >1-real-account Codex
-# provider, R8), the idle clock scopes weekly-cycle validity PER ACCOUNT instead
-# of degrading a genuine multi-account state to `conflicting`. Without
-# `account_key` (<=1 real account) it reduces EXACTLY to the prior single-
-# boundary logic (byte-stable).
-# ==========================================================================
+# =========================================================================
+# #350 — the tick honors the decision deadline (spec §3.3, §5.4).
+#
+# A clock-only fix survives exactly one tick: `_tui_source_bundle_can_idle`
+# requires `availability in ("ok","empty")` AND `freshness == "fresh"`, so any
+# degraded result forces the full source-bundle path — which then re-nulls
+# through the build-time site. And `reuse_coherent_source_state` returns the
+# EXACT prior object for a coherent provider, bypassing the clock entirely
+# (§2.5). Both holes are closed here: a passed deadline forces an authoritative
+# rebuild, and every path is clocked before `compose_all_state`.
+# =========================================================================
 
-from _cctally_dashboard_sources import _clock_cycle_validity  # noqa: E402
-
-_CLOCK_NOW = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
-
-
-def _weekly_history(*, resets_at, freshness="fresh", account_key=None,
-                    current_percent=25.0):
-    row = {
-        "window_minutes": 10_080,
-        "current_percent": current_percent,
-        "freshness": freshness,
-        "forecast": {"resets_at": resets_at.astimezone(UTC).isoformat()},
-    }
-    if account_key is not None:
-        row["account_key"] = account_key
-    return row
+_TICK_CONFIG = {"collector": {"week_start": "sunday"}}
 
 
-def test_clock_validity_two_accounts_distinct_cycles_stay_valid():
-    """The fix: two real accounts each with ONE distinct fresh future boundary
-    are each valid -> the hero stays `ok` instead of degrading to `conflicting`."""
-    a_reset = _CLOCK_NOW + dt.timedelta(days=1)
-    b_reset = _CLOCK_NOW + dt.timedelta(days=3)
-    histories = [
-        _weekly_history(resets_at=a_reset, account_key="acct-a"),
-        _weekly_history(resets_at=b_reset, account_key="acct-b"),
-    ]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+def _install_observations(monkeypatch, source_module, observations):
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_kwargs: observations,
+    )
 
 
-def test_clock_validity_no_account_key_two_boundaries_is_conflicting():
-    """Non-vacuity + byte-stability: WITHOUT `account_key` (a <=1-real-account
-    install) two distinct fresh boundaries fall into one global bucket and stay
-    `conflicting`, exactly like today. This is the SAME input shape as the fix
-    test minus the keys — so it proves `account_key` is the genuine discriminator."""
-    a_reset = _CLOCK_NOW + dt.timedelta(days=1)
-    b_reset = _CLOCK_NOW + dt.timedelta(days=3)
-    histories = [
-        _weekly_history(resets_at=a_reset),
-        _weekly_history(resets_at=b_reset),
-    ]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "conflicting")
+def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None):
+    return tui._tui_build_source_bundle(
+        stats_conn=stats,
+        now_utc=now_utc,
+        display_tz_name="UTC",
+        codex_ingest_contended=False,
+        claude_cost_usd=0.0,
+        claude_total_tokens=0,
+        common_range_start=now_utc - dt.timedelta(days=30),
+        prior_bundle=prior_bundle,
+        raw_config=_TICK_CONFIG,
+    )
 
 
-def test_clock_validity_single_boundary_ok_byte_stable():
-    histories = [_weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1))]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monkeypatch):
+    """A fresh cycle that goes stale while idle acquires the marker at the
+    crossing. Without the deadline, `reuse_coherent_source_state` would hand back
+    the EXACT prior object and the hero would never learn its evidence aged."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = ns["_cctally_tui"]
+    reset = NOW + dt.timedelta(days=2)
+    captured_at = NOW - dt.timedelta(minutes=10)
+    try:
+        _copy_accounting_row_at(
+            cache, timestamp=NOW - dt.timedelta(days=1),
+            source_path="/private/350-tick-deadline.jsonl",
+        )
+        _install_observations(monkeypatch, source_module, (
+            _quota_observation(
+                root=_cache_root_key(cache), window_minutes=10_080,
+                resets_at=reset, captured_at=captured_at,
+            ),
+        ))
+        initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        initial = initial_bundle.sources["codex"]
+        assert initial.capabilities["hero"].status == "supported"
+        assert "cycle_freshness" not in initial.data["hero"]
+        assert initial.clock_data["codex_next_decision_at"] == (
+            captured_at + dt.timedelta(seconds=3600)
+        )
+
+        # Before the deadline: the coherent prior is reused verbatim (only the
+        # clock's time-derived fields move), so no marker yet.
+        #
+        # The guard is what makes this half of the test discriminating. Every
+        # assertion below (`data_version`, absent marker, equal `cost_usd`) also
+        # holds under a REBUILD, so without it the test would still pass if the
+        # deadline check regressed into rebuilding on every tick — which is
+        # precisely the per-tick rebuild storm AC5 forbids.
+        with monkeypatch.context() as no_rebuild:
+            no_rebuild.setattr(
+                tui, "build_codex_source_state",
+                lambda *_a, **_k: pytest.fail(
+                    "a pre-deadline tick must reuse the prior state, not rebuild"
+                ),
+            )
+            before_bundle = _build_tick_bundle(
+                tui, stats, now_utc=NOW + dt.timedelta(minutes=20),
+                prior_bundle=initial_bundle,
+            )
+        before = before_bundle.sources["codex"]
+        assert before.data_version == initial.data_version
+        assert "cycle_freshness" not in before.data["hero"]
+        assert before.data["hero"]["cost_usd"] == initial.data["hero"]["cost_usd"]
+        assert before_bundle.sources["all"].data["combined"] is not None
+        assert before_bundle.sources["all"].warnings == ()
+
+        # After the deadline: an authoritative rebuild stamps the marker while
+        # every backward-looking actual survives.
+        after_bundle = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(hours=2),
+            prior_bundle=initial_bundle,
+        )
+        after = after_bundle.sources["codex"]
+        assert after.data["hero"]["cycle_freshness"] == "stale"
+        assert after.data["hero"]["cost_usd"] == initial.data["hero"]["cost_usd"]
+        assert after.data["hero"]["cycle"] == initial.data["hero"]["cycle"]
+        assert after.capabilities["hero"].status == "supported"
+        assert after.availability == "ok"
+        assert after.freshness == "fresh"
+
+        # #350 §3.5: All stops combining and states the real reason, without
+        # degrading the Codex envelope.
+        all_after = after_bundle.sources["all"]
+        assert all_after.data["combined"] is None
+        assert [warning.code for warning in all_after.warnings] == [
+            "combined_totals_withheld",
+        ]
+        assert all_after.warnings[0].domain == "hero"
+        assert all_after.warnings[0].message == (
+            "Codex quota evidence is stale, so combined totals are withheld."
+        )
+        assert (all_after.availability, all_after.freshness) == ("partial", "fresh")
+    finally:
+        cache.close()
+        stats.close()
 
 
-def test_clock_validity_one_account_fresh_other_stale_stays_valid():
-    """At least one account yields a live cycle -> hero valid (mirrors the
-    build-time `_resolve_codex_weekly_cycle` 'raise only when NO account yields
-    a cycle')."""
-    histories = [
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
-                        account_key="acct-a"),
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=2),
-                        freshness="stale", account_key="acct-b"),
-    ]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+def test_reused_codex_state_is_clocked_before_all_composition(tmp_path, monkeypatch):
+    """Spec §2.5's hole: `reuse_coherent_source_state` returns the EXACT prior
+    object when `_coherent_provider` holds, so without unconditional clocking an
+    expired cycle would be carried forward with no re-check at all."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = ns["_cctally_tui"]
+    reset = NOW + dt.timedelta(minutes=10)
+    try:
+        _copy_accounting_row_at(
+            cache, timestamp=NOW - dt.timedelta(days=1),
+            source_path="/private/350-tick-reuse.jsonl",
+        )
+        _install_observations(monkeypatch, source_module, (
+            _quota_observation(
+                root=_cache_root_key(cache), window_minutes=10_080,
+                resets_at=reset, captured_at=NOW - dt.timedelta(minutes=10),
+            ),
+        ))
+        initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        initial = initial_bundle.sources["codex"]
+        assert initial.capabilities["hero"].status == "supported"
+
+        # Strip the deadline so ONLY the reuse path can be under test — this is
+        # the shape any state without a recorded deadline presents.
+        no_deadline = dataclasses.replace(
+            initial, clock_data={"codex_budget_cost_events": ()},
+        )
+        prior_claude = initial_bundle.sources["claude"]
+        prior_bundle = tui.SourceDashboardBundle(
+            source_schema_version=1,
+            default_source="claude",
+            source_order=("claude", "codex", "all"),
+            sources={
+                "claude": prior_claude,
+                "codex": no_deadline,
+                "all": tui.compose_all_state(prior_claude, no_deadline),
+            },
+        )
+        monkeypatch.setattr(
+            tui, "build_codex_source_state",
+            lambda *_a, **_k: pytest.fail("the reuse path must not rebuild here"),
+        )
+
+        rebuilt = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(minutes=20),
+            prior_bundle=prior_bundle,
+        ).sources["codex"]
+
+        assert rebuilt.data["hero"]["cost_usd"] is None
+        assert rebuilt.data["hero"]["cycle"] is None
+        assert rebuilt.capabilities["hero"].status == "unavailable"
+        assert rebuilt.availability == "partial"
+        assert any(
+            warning.code == "codex_cycle_unavailable" for warning in rebuilt.warnings
+        )
+    finally:
+        cache.close()
+        stats.close()
 
 
-def test_clock_validity_all_accounts_stale_is_stale():
-    histories = [
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
-                        freshness="stale", account_key="acct-a"),
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=2),
-                        freshness="stale", account_key="acct-b"),
-    ]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "stale")
+def test_a_baseline_switch_is_picked_up_at_its_deadline(tmp_path, monkeypatch):
+    """Spec §2.2: a future-dated capture becomes baseline-eligible purely because
+    time passed, switching the selected reset on IDENTICAL frozen evidence."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = ns["_cctally_tui"]
+    first_reset = NOW + dt.timedelta(days=2)
+    second_reset = NOW + dt.timedelta(days=5)
+    # Within the 300s clock-skew tolerance, so freshness is "fresh", not "future".
+    future_capture = NOW + dt.timedelta(seconds=200)
+    try:
+        root_key = _cache_root_key(cache)
+        _install_observations(monkeypatch, source_module, (
+            _quota_observation(
+                root=root_key, window_minutes=10_080, resets_at=first_reset,
+                captured_at=NOW - dt.timedelta(minutes=10), used_percent=25.0,
+            ),
+            _quota_observation(
+                root=root_key, window_minutes=10_080, resets_at=second_reset,
+                captured_at=future_capture, used_percent=30.0, line_offset=2,
+            ),
+        ))
+        initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        initial = initial_bundle.sources["codex"]
+        assert initial.data["hero"]["cycle"]["resets_at"] == first_reset.isoformat()
+        assert initial.clock_data["codex_next_decision_at"] == future_capture
+
+        switched = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(seconds=250),
+            prior_bundle=initial_bundle,
+        ).sources["codex"]
+
+        assert switched.data["hero"]["cycle"]["resets_at"] == second_reset.isoformat()
+        assert switched.capabilities["hero"].status == "supported"
+    finally:
+        cache.close()
+        stats.close()
 
 
-def test_clock_validity_no_weekly_histories_is_missing():
-    assert _clock_cycle_validity((), _CLOCK_NOW) == (False, "missing")
+def test_drift_to_two_stale_boundaries_resolves_conflicting(tmp_path, monkeypatch):
+    """Spec §2.2's counterexample: one fresh plus one stale boundary resolves
+    FRESH now and `conflicting` an hour later on the very same rows."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = ns["_cctally_tui"]
+    fresh_reset = NOW + dt.timedelta(days=2)
+    captured_at = NOW - dt.timedelta(minutes=10)
+    try:
+        _install_observations(monkeypatch, source_module, (
+            _quota_observation(
+                root="root-a", window_minutes=10_080, resets_at=fresh_reset,
+                captured_at=captured_at, logical_limit_key="limit-a",
+            ),
+            _quota_observation(
+                root="root-b", window_minutes=10_080,
+                resets_at=NOW + dt.timedelta(days=5),
+                captured_at=NOW - dt.timedelta(hours=2), logical_limit_key="limit-b",
+            ),
+        ))
+        initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        initial = initial_bundle.sources["codex"]
+        assert initial.data["hero"]["cycle"]["resets_at"] == fresh_reset.isoformat()
+        assert initial.clock_data["codex_next_decision_at"] == (
+            captured_at + dt.timedelta(seconds=3600)
+        )
+
+        drifted = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(hours=1),
+            prior_bundle=initial_bundle,
+        ).sources["codex"]
+
+        assert drifted.data["hero"]["cycle"] is None
+        assert drifted.data["hero"]["cost_usd"] is None
+        assert drifted.capabilities["hero"].status == "unavailable"
+        assert drifted.availability == "partial"
+    finally:
+        cache.close()
+        stats.close()
 
 
-def test_clock_validity_one_account_two_boundaries_conflicting():
-    """A single account with two distinct fresh boundaries is itself
-    `conflicting` (per-account never-combine)."""
-    histories = [
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
-                        account_key="acct-a"),
-        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=3),
-                        account_key="acct-a"),
-    ]
-    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "conflicting")
+def test_account_a_expiry_repins_the_hero_to_a_live_sibling(tmp_path, monkeypatch):
+    """#341 at-least-one-live-cycle behavior across the crossing: when the
+    selected account's cycle expires, a rebuilt dashboard re-pins to the live
+    sibling — so an idle one must too, or the two disagree."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = ns["_cctally_tui"]
+    a_reset = NOW + dt.timedelta(minutes=30)
+    b_reset = NOW + dt.timedelta(days=3)
+    try:
+        _install_observations(monkeypatch, source_module, (
+            _quota_observation(
+                root="root-a", window_minutes=10_080, resets_at=a_reset,
+                captured_at=NOW - dt.timedelta(minutes=10),
+                logical_limit_key="limit-a", account_key="acct-a",
+            ),
+            _quota_observation(
+                root="root-b", window_minutes=10_080, resets_at=b_reset,
+                captured_at=NOW - dt.timedelta(minutes=10),
+                logical_limit_key="limit-b", account_key="acct-b",
+            ),
+        ))
+        initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        initial = initial_bundle.sources["codex"]
+        # Two distinct live cycles resolve; the aggregate hero pins the first.
+        assert initial.data["hero"]["cycle"]["resets_at"] == a_reset.isoformat()
+        assert initial.clock_data["codex_next_decision_at"] == a_reset
+        assert len(
+            source_module._resolve_codex_weekly_cycle(
+                source_module.load_codex_quota_observations(), NOW,
+            )
+        ) == 2
+
+        # Both survive idle ticks before the crossing.
+        idle = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(minutes=10),
+            prior_bundle=initial_bundle,
+        ).sources["codex"]
+        assert idle.data["hero"]["cycle"]["resets_at"] == a_reset.isoformat()
+        assert idle.capabilities["hero"].status == "supported"
+
+        repinned = _build_tick_bundle(
+            tui, stats, now_utc=NOW + dt.timedelta(minutes=40),
+            prior_bundle=initial_bundle,
+        ).sources["codex"]
+
+        assert repinned.data["hero"]["cycle"]["resets_at"] == b_reset.isoformat()
+        assert repinned.capabilities["hero"].status == "supported"
+        assert repinned.availability == "ok"
+        # Undecorated (<=1 REAL registered account): no per-account wire appears.
+        assert "accounts" not in repinned.data
+        assert "cycles" not in repinned.data["hero"]
+    finally:
+        cache.close()
+        stats.close()
